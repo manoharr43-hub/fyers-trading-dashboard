@@ -1,183 +1,88 @@
 import streamlit as st
+import pandas as pd
 from fyers_apiv3 import fyersModel
 
-# ====================================
 # PAGE CONFIG
-# ====================================
+st.set_page_config(page_title="NSE AI PRO V11.11", layout="wide")
 
-st.set_page_config(
-    page_title="FYERS Trading Dashboard",
-    page_icon="📈",
-    layout="wide"
-)
-
-# ====================================
-# SECRETS
-# ====================================
-
+# LOGIN & SESSION
 CLIENT_ID = st.secrets["FYERS_CLIENT_ID"]
 SECRET_KEY = st.secrets["FYERS_SECRET_KEY"]
 REDIRECT_URI = st.secrets["FYERS_REDIRECT_URI"]
 
-# ====================================
-# TITLE
-# ====================================
+if "access_token" not in st.session_state: st.session_state["access_token"] = None
 
-st.title("📈 FYERS Trading Dashboard")
+def get_fyers():
+    return fyersModel.FyersModel(client_id=CLIENT_ID, token=st.session_state["access_token"], is_async=False, log_path="")
 
-# ====================================
-# SESSION MODEL
-# ====================================
+# NAVIGATION
+menu = st.sidebar.radio("Navigation", ["Dashboard", "AI Scanner", "Trade Console"])
 
-session = fyersModel.SessionModel(
-    client_id=CLIENT_ID,
-    secret_key=SECRET_KEY,
-    redirect_uri=REDIRECT_URI,
-    response_type="code",
-    grant_type="authorization_code"
-)
+# AI SCANNER LOGIC
+if menu == "AI Scanner":
+    st.title("🚀 NSE AI PRO V11.11 - Big Move Hunter")
+    
+    # Segment selection
+    seg = st.sidebar.selectbox("Select Segment", ["Stocks", "Index", "F&O", "Futures"])
+    
+    if seg == "Index":
+        watch_list = ["NSE:NIFTY50-INDEX", "NSE:NIFTYBANK-INDEX", "NSE:NIFTYMID50-INDEX", "NSE:FINNIFTY-INDEX"]
+    elif seg == "Stocks":
+        watch_list = ["NSE:SBIN-EQ", "NSE:RELIANCE-EQ", "NSE:TCS-EQ"]
+    else:
+        watch_list = ["NSE:NIFTY26JUN2026FUT", "NSE:BANKNIFTY26JUN2026FUT"]
 
-# ====================================
-# GET URL PARAMS
-# ====================================
+    if st.button("RUN AI SCANNER"):
+        fyers = get_fyers()
+        report = []
+        
+        for sym in watch_list:
+            res = fyers.history(data={"symbol": sym, "resolution": "15", "date_format": "1", "range_from": "2026-06-24", "range_to": "2026-06-25", "cont_flag": "1"})
+            
+            if res['s'] == 'ok':
+                df = pd.DataFrame(res['candles'], columns=['ts', 'o', 'h', 'l', 'c', 'v'])
+                
+                # Logic
+                range_size = df['h'].max() - df['l'].min()
+                avg_vol = df['v'].rolling(20).mean().iloc[-1]
+                volume_burst = df['v'].iloc[-1] > (avg_vol * 1.5)
+                
+                if range_size > (df['c'].iloc[-1] * 0.008) and volume_burst:
+                    status = "🚀 STRONG BIG MOVE"
+                elif range_size > (df['c'].iloc[-1] * 0.005):
+                    status = "📈 MOMENTUM"
+                else:
+                    status = "➖ SIDEWAYS"
+                
+                report.append({"Symbol": sym, "LTP": df['c'].iloc[-1], "Status": status})
+        
+        st.session_state.v11_master_data = pd.DataFrame(report)
+        st.success("✅ Scanning Complete!")
 
-params = st.query_params
+    if not st.session_state.get("v11_master_data") is None:
+        st.dataframe(st.session_state.v11_master_data, use_container_width=True)
+        # Alert Box
+        big_moves = st.session_state.v11_master_data[st.session_state.v11_master_data['Status'] == "🚀 STRONG BIG MOVE"]
+        if not big_moves.empty:
+            st.error("🚨 ALERT: BIG MOVES IDENTIFIED")
+            st.table(big_moves)
 
-auth_code = None
+# TRADE CONSOLE
+elif menu == "Trade Console":
+    st.title("🛒 Trade Console")
+    symbol = st.text_input("Symbol", "NSE:SBIN-EQ")
+    qty = st.number_input("Quantity", value=1)
+    if st.button("Buy"):
+        st.write(get_fyers().place_order(data={"symbol": symbol, "qty": qty, "type": 1, "side": 1, "productType": "INTRADAY", "validity": "DAY"}))
+    if st.button("Sell"):
+        st.write(get_fyers().place_order(data={"symbol": symbol, "qty": qty, "type": 1, "side": -1, "productType": "INTRADAY", "validity": "DAY"}))
 
-if "auth_code" in params:
-    auth_code = params["auth_code"]
-
-elif "code" in params:
-    auth_code = params["code"]
-
-# ====================================
-# LOGIN SUCCESS FLOW
-# ====================================
-
-if auth_code:
-
-    try:
-
-        session.set_token(auth_code)
-
-        token_response = session.generate_token()
-
-        access_token = token_response["access_token"]
-
-        st.session_state["access_token"] = access_token
-
-        st.success("✅ FYERS Login Successful")
-
-        fyers = fyersModel.FyersModel(
-            client_id=CLIENT_ID,
-            token=access_token,
-            is_async=False,
-            log_path=""
-        )
-
-        # =============================
-        # PROFILE
-        # =============================
-
-        profile = fyers.get_profile()
-
-        st.subheader("👤 Profile")
-
-        st.json(profile)
-
-        # =============================
-        # FUNDS
-        # =============================
-
-        try:
-
-            funds = fyers.funds()
-
-            st.subheader("💰 Funds")
-
-            st.json(funds)
-
-        except:
-
-            st.warning("Funds Not Available")
-
-        # =============================
-        # HOLDINGS
-        # =============================
-
-        try:
-
-            holdings = fyers.holdings()
-
-            st.subheader("📦 Holdings")
-
-            st.json(holdings)
-
-        except:
-
-            st.warning("Holdings Not Available")
-
-        # =============================
-        # POSITIONS
-        # =============================
-
-        try:
-
-            positions = fyers.positions()
-
-            st.subheader("📊 Positions")
-
-            st.json(positions)
-
-        except:
-
-            st.warning("Positions Not Available")
-
-        # =============================
-        # ORDERS
-        # =============================
-
-        try:
-
-            orders = fyers.orderbook()
-
-            st.subheader("📝 Orders")
-
-            st.json(orders)
-
-        except:
-
-            st.warning("Orders Not Available")
-
-    except Exception as e:
-
-        st.error(f"Login Error : {e}")
-
-# ====================================
-# LOGIN BUTTON
-# ====================================
-
+# DASHBOARD
 else:
-
-    login_url = session.generate_authcode()
-
-    st.markdown(
-        f"""
-        <a href="{login_url}">
-            <button style="
-                background:#0066ff;
-                color:white;
-                border:none;
-                padding:15px 30px;
-                border-radius:10px;
-                font-size:18px;
-                cursor:pointer;">
-                🔐 Login With FYERS
-            </button>
-        </a>
-        """,
-        unsafe_allow_html=True
-    )
-
-    st.info("Click Login Button To Connect FYERS Account")
+    st.title("📈 Dashboard")
+    if st.session_state["access_token"]:
+        fyers = get_fyers()
+        st.subheader("Positions")
+        st.json(fyers.positions())
+    else:
+        st.write("Please login to see data.")
