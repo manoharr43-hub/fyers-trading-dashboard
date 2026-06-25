@@ -1,67 +1,183 @@
 import streamlit as st
 from fyers_apiv3 import fyersModel
-import pandas as pd
-import numpy as np
-import yfinance as yf
-import os
 
-# Page Config
-st.set_page_config(page_title="NSE AI PRO V11.11", layout="wide")
+# ====================================
+# PAGE CONFIG
+# ====================================
 
-# Fyers Session Setup (Streamlit Secrets లో కీస్ ఉండాలి)
-client_id = st.secrets.get("FYERS_CLIENT_ID")
-secret_key = st.secrets.get("FYERS_SECRET_KEY")
-redirect_uri = "https://manoharr43-hub-norenrestapipy-ap-hk1emv.streamlit.app/"
+st.set_page_config(
+    page_title="FYERS Trading Dashboard",
+    page_icon="📈",
+    layout="wide"
+)
 
-if "access_token" not in st.session_state:
-    st.session_state["access_token"] = None
+# ====================================
+# SECRETS
+# ====================================
 
-# Sidebar Navigation
-menu = st.sidebar.radio("Navigation", ["🚀 AI Scanner", "🛒 Trade Entry", "💰 Portfolio/Funds"])
+CLIENT_ID = st.secrets["FYERS_CLIENT_ID"]
+SECRET_KEY = st.secrets["FYERS_SECRET_KEY"]
+REDIRECT_URI = st.secrets["FYERS_REDIRECT_URI"]
 
-# Login logic
-if st.session_state["access_token"] is None:
-    session = fyersModel.SessionModel(client_id=client_id, secret_key=secret_key, redirect_uri=redirect_uri, response_type="code", grant_type="authorization_code")
-    query_params = st.query_params
-    if "auth_code" in query_params:
-        session.set_token(query_params["auth_code"])
-        response = session.generate_token()
-        if "access_token" in response:
-            st.session_state["access_token"] = response["access_token"]
-            st.rerun()
-    else:
-        st.markdown(f"[🔐 Fyers కి లాగిన్ అవ్వండి]({session.generate_authcode()})")
-        st.stop()
+# ====================================
+# TITLE
+# ====================================
 
-# Fyers Model
-fyers = fyersModel.FyersModel(client_id=client_id, token=st.session_state["access_token"], is_async=False, log_path="")
+st.title("📈 FYERS Trading Dashboard")
 
-# --- NAVIGATION CONTENT ---
+# ====================================
+# SESSION MODEL
+# ====================================
 
-if menu == "🚀 AI Scanner":
-    st.title("🚀 NSE AI PRO V11.11")
-    # ఇక్కడ మీ పాత AI Scanner కోడ్ (Data processing, XGBoost etc.) పేస్ట్ చేయండి
-    st.info("AI Scanner స్క్రీన్ సిద్ధంగా ఉంది...")
+session = fyersModel.SessionModel(
+    client_id=CLIENT_ID,
+    secret_key=SECRET_KEY,
+    redirect_uri=REDIRECT_URI,
+    response_type="code",
+    grant_type="authorization_code"
+)
 
-elif menu == "🛒 Trade Entry":
-    st.title("🛒 Fyers Trading Console")
-    symbol = st.text_input("Enter Symbol (e.g., NSE:SBIN-EQ)", "NSE:SBIN-EQ")
-    qty = st.number_input("Quantity", value=1)
-    
-    col1, col2 = st.columns(2)
-    if col1.button("Buy"):
-        order = fyers.place_order(data={"symbol": symbol, "qty": qty, "type": 1, "side": 1, "productType": "INTRADAY", "validity": "DAY"})
-        st.write(order)
-    if col2.button("Sell"):
-        order = fyers.place_order(data={"symbol": symbol, "qty": qty, "type": 1, "side": -1, "productType": "INTRADAY", "validity": "DAY"})
-        st.write(order)
+# ====================================
+# GET URL PARAMS
+# ====================================
 
-elif menu == "💰 Portfolio/Funds":
-    st.title("💰 Portfolio & Funds")
-    if st.button("Refresh Data"):
-        funds = fyers.funds()
-        pos = fyers.positions()
-        st.subheader("Funds")
-        st.write(funds)
-        st.subheader("Positions")
-        st.write(pos)
+params = st.query_params
+
+auth_code = None
+
+if "auth_code" in params:
+    auth_code = params["auth_code"]
+
+elif "code" in params:
+    auth_code = params["code"]
+
+# ====================================
+# LOGIN SUCCESS FLOW
+# ====================================
+
+if auth_code:
+
+    try:
+
+        session.set_token(auth_code)
+
+        token_response = session.generate_token()
+
+        access_token = token_response["access_token"]
+
+        st.session_state["access_token"] = access_token
+
+        st.success("✅ FYERS Login Successful")
+
+        fyers = fyersModel.FyersModel(
+            client_id=CLIENT_ID,
+            token=access_token,
+            is_async=False,
+            log_path=""
+        )
+
+        # =============================
+        # PROFILE
+        # =============================
+
+        profile = fyers.get_profile()
+
+        st.subheader("👤 Profile")
+
+        st.json(profile)
+
+        # =============================
+        # FUNDS
+        # =============================
+
+        try:
+
+            funds = fyers.funds()
+
+            st.subheader("💰 Funds")
+
+            st.json(funds)
+
+        except:
+
+            st.warning("Funds Not Available")
+
+        # =============================
+        # HOLDINGS
+        # =============================
+
+        try:
+
+            holdings = fyers.holdings()
+
+            st.subheader("📦 Holdings")
+
+            st.json(holdings)
+
+        except:
+
+            st.warning("Holdings Not Available")
+
+        # =============================
+        # POSITIONS
+        # =============================
+
+        try:
+
+            positions = fyers.positions()
+
+            st.subheader("📊 Positions")
+
+            st.json(positions)
+
+        except:
+
+            st.warning("Positions Not Available")
+
+        # =============================
+        # ORDERS
+        # =============================
+
+        try:
+
+            orders = fyers.orderbook()
+
+            st.subheader("📝 Orders")
+
+            st.json(orders)
+
+        except:
+
+            st.warning("Orders Not Available")
+
+    except Exception as e:
+
+        st.error(f"Login Error : {e}")
+
+# ====================================
+# LOGIN BUTTON
+# ====================================
+
+else:
+
+    login_url = session.generate_authcode()
+
+    st.markdown(
+        f"""
+        <a href="{login_url}">
+            <button style="
+                background:#0066ff;
+                color:white;
+                border:none;
+                padding:15px 30px;
+                border-radius:10px;
+                font-size:18px;
+                cursor:pointer;">
+                🔐 Login With FYERS
+            </button>
+        </a>
+        """,
+        unsafe_allow_html=True
+    )
+
+    st.info("Click Login Button To Connect FYERS Account")
