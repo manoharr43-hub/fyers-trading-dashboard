@@ -1,4 +1,5 @@
 streamlit
-yfinance
 fyers-apiv3
 pandas
+requests
+yfinance
