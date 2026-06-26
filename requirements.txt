@@ -3,3 +3,4 @@ fyers-apiv3
 pandas
 requests
 yfinance
+numpy
