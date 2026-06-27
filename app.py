@@ -1,79 +1,77 @@
 import streamlit as st
-import os
 from fyers_apiv3 import fyersModel
 
-st.set_page_config(page_title="FYERS Dashboard", layout="wide")
+st.set_page_config(page_title="FYERS Trading Dashboard", layout="wide")
 
-# 🔑 Credentials
-CLIENT_ID = os.getenv("FYERS_CLIENT_ID", st.secrets.get("FYERS_CLIENT_ID", ""))
-SECRET_KEY = os.getenv("FYERS_SECRET_KEY", st.secrets.get("FYERS_SECRET_KEY", ""))
-REDIRECT_URI = os.getenv("FYERS_REDIRECT_URI", st.secrets.get("FYERS_REDIRECT_URI", ""))
+# ==========================
+# CONFIG
+# ==========================
+CLIENT_ID = st.secrets["FYERS_CLIENT_ID"]
+SECRET_KEY = st.secrets["FYERS_SECRET_KEY"]
+REDIRECT_URI = st.secrets["FYERS_REDIRECT_URI"]
 
 st.title("📈 FYERS Trading Dashboard")
 
-if not CLIENT_ID or not SECRET_KEY or not REDIRECT_URI:
-    st.error("FYERS credentials are missing.")
-    st.stop()
-
-# 🔄 Session create function
-def get_session():
-    return fyersModel.SessionModel(
-        client_id=CLIENT_ID,
-        secret_key=SECRET_KEY,
-        redirect_uri=REDIRECT_URI,
-        response_type="code",
-        grant_type="authorization_code"
-    )
-
-# 🟢 Login Flow
-if "access_token" not in st.session_state:
-    params = st.query_params
-    code = params.get("code")
-
-    if code:
-        if isinstance(code, list):
-            code = code[0]
-        session = get_session()
-        session.set_token(code)
-        response = session.generate_token()
-
-        if isinstance(response, dict) and "access_token" in response:
-            st.session_state["access_token"] = response["access_token"]
-            st.success("✅ Login Successful")
-            st.rerun()
-        else:
-            st.error(response)
-            st.stop()
-    else:
-        session = get_session()
-        login_url = session.generate_authcode()
-        st.info("Click below to login with FYERS")
-        st.link_button("Login to FYERS", login_url)
-        st.stop()
-
-# 🔗 Fyers API object
-fyers = fyersModel.FyersModel(
+# ==========================
+# Session Model
+# ==========================
+session = fyersModel.SessionModel(
     client_id=CLIENT_ID,
-    token=st.session_state["access_token"],
-    is_async=False,
-    log_path=""
+    secret_key=SECRET_KEY,
+    redirect_uri=REDIRECT_URI,
+    response_type="code",
+    grant_type="authorization_code",
 )
 
-# 📊 Dashboard Menu
-menu = st.sidebar.radio("📌 Select Section", ["Profile", "Funds", "Holdings", "Positions"])
+# ==========================
+# Already Logged In
+# ==========================
+if "access_token" in st.session_state:
+    st.success("✅ FYERS Login Successful")
+    st.write("Access Token:")
+    st.code(st.session_state["access_token"])
 
-if menu == "Profile":
-    data = fyers.get_profile()
-    st.json(data)
+    if st.button("Logout"):
+        del st.session_state["access_token"]
+        st.rerun()
 
-elif menu == "Funds":
-    data = fyers.funds()
-    st.json(data)
+    st.stop()
 
-elif menu == "Holdings":
-    data = fyers.holdings()
-    st.json(data)
+# ==========================
+# Read Auth Code
+# ==========================
+params = st.query_params
 
-elif menu == "Positions":
-    data = fyers.positions()
-    st.json(data)
+if "auth_code" in params:
+
+    auth_code = params["auth_code"]
+
+    try:
+
+        session.set_token(auth_code)
+
+        response = session.generate_token()
+
+        if response.get("s") == "ok":
+
+            st.session_state["access_token"] = response["access_token"]
+
+            st.query_params.clear()
+
+            st.rerun()
+
+        else:
+            st.error(response)
+
+    except Exception as e:
+        st.error(e)
+
+else:
+
+    login_url = session.generate_authcode()
+
+    st.link_button(
+        "🔑 Login with FYERS",
+        login_url,
+        use_container_width=True
+    )
