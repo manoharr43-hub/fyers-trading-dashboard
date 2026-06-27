@@ -5,17 +5,23 @@ import os
 from fyers_apiv3 import fyersModel
 
 # -------------------------------------------------
+# PAGE CONFIG
+# -------------------------------------------------
+st.set_page_config(
+    page_title="Fyers Trading Dashboard",
+    page_icon="📈",
+    layout="wide"
+)
+
+# -------------------------------------------------
 # CONFIGURATION
 # -------------------------------------------------
-st.set_page_config(page_title="📊 Fyers Algo Dashboard", layout="wide")
-
-# ✅ Use your actual App ID and Secret from Fyers dashboard
-CLIENT_ID = "GA68CBAJIX-100"      # Full App ID (with version)
-SECRET_KEY = "M2VWI44YFG"         # Secret ID
-REDIRECT_URI = "https://manoharr43-hub-norenrestapipy-ap-hk1emv.streamlit.app"  # Streamlit URL
+CLIENT_ID = os.getenv("FYERS_CLIENT_ID") or st.secrets["FYERS_CLIENT_ID"]
+SECRET_KEY = os.getenv("FYERS_SECRET_KEY") or st.secrets["FYERS_SECRET_KEY"]
+REDIRECT_URI = os.getenv("FYERS_REDIRECT_URI") or "YOUR_REDIRECT_URL"
 
 # -------------------------------------------------
-# SESSION CREATION
+# LOGIN SESSION
 # -------------------------------------------------
 def create_session():
     return fyersModel.SessionModel(
@@ -28,21 +34,22 @@ def create_session():
 
 session = create_session()
 params = st.query_params
-st.title("📈 Fyers Algo Dashboard")
+st.title("📈 Fyers Trading Dashboard")
 
-# -------------------------------------------------
-# LOGIN FLOW
-# -------------------------------------------------
 if "access_token" not in st.session_state:
     if "code" in params:
+        auth_code = params["code"]
         try:
-            session.set_token(params["code"])
+            session.set_token(auth_code)
             token_response = session.generate_token()
-            st.session_state["access_token"] = token_response["access_token"]
-            st.success("✅ Login Successful — ట్రేడింగ్ సిద్ధంగా ఉంది!")
-            st.rerun()
+            if "access_token" in token_response:
+                st.session_state["access_token"] = token_response["access_token"]
+                st.success("✅ Login Successful")
+                st.rerun()
+            else:
+                st.error(token_response)
         except Exception as e:
-            st.error(f"Login Error: {e}")
+            st.error(str(e))
     else:
         auth_url = session.generate_authcode()
         st.markdown(f"[🔐 Login With Fyers]({auth_url})")
@@ -62,7 +69,7 @@ fyers = fyersModel.FyersModel(
 # SIDEBAR MENU
 # -------------------------------------------------
 menu = st.sidebar.radio(
-    "📋 Menu ఎంపిక చేయండి",
+    "Menu",
     ["Profile", "Funds", "Holdings", "Positions", "Place Order", "NSE Scanner"]
 )
 
@@ -71,7 +78,7 @@ menu = st.sidebar.radio(
 # -------------------------------------------------
 if menu == "Profile":
     profile = fyers.get_profile()
-    st.subheader("👤 Profile వివరాలు")
+    st.subheader("👤 Profile")
     st.json(profile)
 
 # -------------------------------------------------
@@ -79,7 +86,7 @@ if menu == "Profile":
 # -------------------------------------------------
 elif menu == "Funds":
     funds = fyers.funds()
-    st.subheader("💰 Funds వివరాలు")
+    st.subheader("💰 Funds")
     st.json(funds)
 
 # -------------------------------------------------
@@ -87,7 +94,7 @@ elif menu == "Funds":
 # -------------------------------------------------
 elif menu == "Holdings":
     holdings = fyers.holdings()
-    st.subheader("📦 Holdings వివరాలు")
+    st.subheader("📦 Holdings")
     st.json(holdings)
 
 # -------------------------------------------------
@@ -95,14 +102,14 @@ elif menu == "Holdings":
 # -------------------------------------------------
 elif menu == "Positions":
     positions = fyers.positions()
-    st.subheader("📊 Positions వివరాలు")
+    st.subheader("📊 Positions")
     st.json(positions)
 
 # -------------------------------------------------
 # PLACE ORDER
 # -------------------------------------------------
 elif menu == "Place Order":
-    st.subheader("🛒 Place Order — ఆర్డర్ పెట్టండి")
+    st.subheader("🛒 Place Order")
 
     symbol = st.text_input("Symbol", "NSE:RELIANCE-EQ")
     qty = st.number_input("Quantity", 1, 10000, 1)
@@ -129,7 +136,7 @@ elif menu == "Place Order":
 # NSE SCANNER
 # -------------------------------------------------
 elif menu == "NSE Scanner":
-    st.subheader("🔍 Simple NSE Scanner — సిగ్నల్ చెక్")
+    st.subheader("🔍 Simple NSE Scanner")
     stocks = ["RELIANCE.NS", "TCS.NS", "INFY.NS", "ICICIBANK.NS", "HDFCBANK.NS", "SBIN.NS", "LT.NS"]
     rows = []
 
@@ -146,5 +153,5 @@ elif menu == "NSE Scanner":
             except Exception:
                 pass
 
-    result_df = pd.DataFrame(rows, columns=["Stock", "Price", "20 SMA", "Signal"])
+    result_df = pd.DataFrame(rows, columns=["Stock", "Price", "20 SMA", "Signal"])
     st.dataframe(result_df, use_container_width=True)
