@@ -6,149 +6,126 @@ def show_portfolio(fyers):
 
     st.title("💼 Portfolio")
 
-    tab1, tab2, tab3 = st.tabs(
-        ["📈 Holdings", "📉 Positions", "💰 Funds"]
-    )
-
     # =====================================
     # Holdings
     # =====================================
-    with tab1:
 
-        try:
+    st.subheader("📦 Holdings")
 
-            data = fyers.holdings()
+    try:
 
-            holdings = data.get("holdings", [])
+        holdings = fyers.holdings()
 
-            if holdings:
+        if holdings.get("holdings"):
 
-                df = pd.DataFrame(holdings)
+            df = pd.DataFrame(holdings["holdings"])
 
-                st.subheader("Holdings")
+            st.dataframe(
+                df,
+                use_container_width=True
+            )
 
-                st.dataframe(
-                    df,
-                    use_container_width=True,
-                    hide_index=True
-                )
+            st.download_button(
+                "⬇ Download Holdings CSV",
+                df.to_csv(index=False),
+                "holdings.csv",
+                "text/csv"
+            )
 
-                # Portfolio Summary
-                total_investment = 0
-                total_value = 0
-                total_pnl = 0
+        else:
 
-                for row in holdings:
+            st.info("No Holdings Available")
 
-                    qty = float(row.get("quantity", 0))
-                    cost = float(row.get("costPrice", 0))
-                    ltp = float(row.get("ltp", 0))
+    except Exception as e:
 
-                    investment = qty * cost
-                    value = qty * ltp
-                    pnl = value - investment
+        st.error(e)
 
-                    total_investment += investment
-                    total_value += value
-                    total_pnl += pnl
-
-                c1, c2, c3 = st.columns(3)
-
-                c1.metric(
-                    "Investment",
-                    f"₹ {total_investment:,.2f}"
-                )
-
-                c2.metric(
-                    "Current Value",
-                    f"₹ {total_value:,.2f}"
-                )
-
-                c3.metric(
-                    "Total P&L",
-                    f"₹ {total_pnl:,.2f}"
-                )
-
-                csv = df.to_csv(index=False)
-
-                st.download_button(
-                    "⬇ Export Holdings",
-                    csv,
-                    "holdings.csv",
-                    "text/csv"
-                )
-
-            else:
-
-                st.info("No Holdings")
-
-        except Exception as e:
-
-            st.error(e)
+    st.divider()
 
     # =====================================
-    # Positions
+    # Open Positions
     # =====================================
-    with tab2:
 
-        try:
+    st.subheader("📈 Open Positions")
 
-            data = fyers.positions()
+    try:
 
-            positions = data.get("netPositions", [])
+        positions = fyers.positions()
 
-            if positions:
+        if positions.get("netPositions"):
 
-                df = pd.DataFrame(positions)
+            df = pd.DataFrame(
+                positions["netPositions"]
+            )
 
-                st.subheader("Open Positions")
+            st.dataframe(
+                df,
+                use_container_width=True
+            )
 
-                st.dataframe(
-                    df,
-                    use_container_width=True,
-                    hide_index=True
-                )
+            st.download_button(
+                "⬇ Download Positions CSV",
+                df.to_csv(index=False),
+                "positions.csv",
+                "text/csv"
+            )
 
-                total_pnl = 0
+        else:
 
-                for row in positions:
-                    total_pnl += float(row.get("pl", 0))
+            st.info("No Open Positions")
 
+    except Exception as e:
+
+        st.error(e)
+
+    st.divider()
+
+    # =====================================
+    # Portfolio Summary
+    # =====================================
+
+    st.subheader("📊 Portfolio Summary")
+
+    try:
+
+        holdings = fyers.holdings()
+
+        if holdings.get("holdings"):
+
+            df = pd.DataFrame(
+                holdings["holdings"]
+            )
+
+            st.write("Total Holdings :", len(df))
+
+            if "marketVal" in df.columns:
                 st.metric(
-                    "Today's P&L",
-                    f"₹ {total_pnl:,.2f}"
+                    "Market Value",
+                    f"₹ {df['marketVal'].sum():,.2f}"
                 )
 
-                csv = df.to_csv(index=False)
-
-                st.download_button(
-                    "⬇ Export Positions",
-                    csv,
-                    "positions.csv",
-                    "text/csv"
+            if "costPrice" in df.columns:
+                st.metric(
+                    "Investment",
+                    f"₹ {df['costPrice'].sum():,.2f}"
                 )
 
-            else:
+        else:
 
-                st.info("No Open Positions")
+            st.info("Portfolio Empty")
 
-        except Exception as e:
+    except Exception as e:
 
-            st.error(e)
+        st.error(e)
+
+    st.divider()
 
     # =====================================
-    # Funds
+    # Refresh
     # =====================================
-    with tab3:
 
-        try:
-
-            funds = fyers.funds()
-
-            st.subheader("Available Funds")
-
-            st.json(funds)
-
-        except Exception as e:
-
-            st.error(e)
+    if st.button(
+        "🔄 Refresh Portfolio",
+        use_container_width=True
+    ):
+        st.rerun()
