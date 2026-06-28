@@ -208,4 +208,49 @@ def show_option_chain(fyers):
 
     except Exception as e:
         st.warning(f"Analytics Error: {e}")
+            # Part 6: AI Institutional Signals & Final Summary
+    st.divider()
+    st.subheader("🤖 AI Institutional Signals")
+
+    try:
+        # సిగ్నల్ లెక్కించడం
+        pcr = (df[df['option_type'] == 'PE']['oi'].sum() / df[df['option_type'] == 'CE']['oi'].sum())
         
+        ai_signal = "NEUTRAL"
+        if pcr >= 1.30: ai_signal = "BUY"
+        elif pcr <= 0.70: ai_signal = "SELL"
+
+        c1, c2, c3 = st.columns(3)
+        c1.metric("AI Signal", ai_signal)
+
+        # ఇన్‌స్టిట్యూషనల్ స్కోర్
+        score = 50
+        if pcr > 1: score += 20
+        else: score -= 20
+        score = max(0, min(score, 100))
+        
+        c2.metric("Institutional Score", f"{score}/100")
+        
+        if score >= 80: status = "🟢 Strong Bullish"
+        elif score >= 60: status = "🟢 Bullish"
+        elif score >= 40: status = "🟡 Neutral"
+        else: status = "🔴 Bearish"
+        
+        c3.metric("Market Status", status)
+
+        # ట్రేడింగ్ సలహా
+        st.info(f"AI Institutional Score: {score}/100. Signal: {ai_signal}")
+
+    except Exception as e:
+        st.warning(f"Signals Error: {e}")
+
+    # Auto Refresh Logic
+    if auto_refresh:
+        with st.spinner("Refreshing..."):
+            time.sleep(refresh_time)
+            st.rerun()
+
+    st.sidebar.divider()
+    st.sidebar.markdown("### 🚀 NSE AI PRO V12")
+    st.sidebar.caption("Institutional Trading Intelligence")
+    
