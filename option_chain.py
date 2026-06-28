@@ -1,91 +1,164 @@
 import streamlit as st
 import pandas as pd
+import time
+
+# ==========================================================
+# OPTION CHAIN - PART 1
+# NSE AI PRO V12 Institutional Edition
+# ==========================================================
 
 
 def show_option_chain(fyers):
 
-    st.title("📊 Option Chain")
+    st.title("📊 NSE AI PRO V12 - Institutional Option Chain")
 
-    index = st.selectbox(
+    # ---------------------------------------
+    # Sidebar Settings
+    # ---------------------------------------
+
+    st.sidebar.header("⚙️ Option Chain Settings")
+
+    index = st.sidebar.selectbox(
+
         "Select Index",
+
         [
             "NIFTY",
             "BANKNIFTY",
             "FINNIFTY",
             "MIDCPNIFTY",
-            "SENSEX"
+            "SENSEX",
+            "BANKEX"
         ]
+
     )
 
-    symbols = {
+    symbol_map = {
+
         "NIFTY": "NSE:NIFTY50-INDEX",
+
         "BANKNIFTY": "NSE:NIFTYBANK-INDEX",
+
         "FINNIFTY": "NSE:FINNIFTY-INDEX",
+
         "MIDCPNIFTY": "NSE:MIDCPNIFTY-INDEX",
-        "SENSEX": "BSE:SENSEX-INDEX"
+
+        "SENSEX": "BSE:SENSEX-INDEX",
+
+        "BANKEX": "BSE:BANKEX-INDEX"
+
     }
 
-    strike_count = st.slider(
+    strike_count = st.sidebar.slider(
+
         "Strike Count",
-        5,
-        25,
-        10
+
+        min_value=5,
+
+        max_value=30,
+
+        value=10
+
     )
 
-    if st.button("Load Option Chain", use_container_width=True):
+    auto_refresh = st.sidebar.checkbox(
 
-        with st.spinner("Loading Option Chain..."):
+        "Auto Refresh",
 
-            try:
+        value=False
 
-                response = fyers.optionchain({
+    )
 
-                    "symbol": symbols[index],
+    refresh_time = st.sidebar.slider(
 
-                    "strikecount": strike_count
+        "Refresh Seconds",
 
-                })
+        5,
 
-                if response.get("s") == "ok":
+        60,
 
-                    st.success("Option Chain Loaded")
+        10
 
-                    # Raw Response
-                    st.json(response)
+    )
 
-                    # Option Data Table
-                    if "data" in response:
+    # ---------------------------------------
+    # Spot Price
+    # ---------------------------------------
 
-                        try:
+    st.subheader("📈 Spot Price")
 
-                            df = pd.DataFrame(response["data"])
+    try:
 
-                            st.dataframe(
-                                df,
-                                use_container_width=True
-                            )
+        quote = fyers.quotes({
 
-                            st.download_button(
-                                "⬇ Download CSV",
-                                df.to_csv(index=False),
-                                "option_chain.csv",
-                                "text/csv"
-                            )
+            "symbols": symbol_map[index]
 
-                        except:
+        })
 
-                            pass
+        if quote.get("s") == "ok":
 
-                else:
+            q = quote["d"][0]["v"]
 
-                    st.error(response)
+            c1, c2, c3 = st.columns(3)
 
-            except Exception as e:
+            c1.metric(
+                "Spot",
+                q.get("lp", 0),
+                q.get("ch", 0)
+            )
 
-                st.error(e)
+            c2.metric(
+                "High",
+                q.get("high_price", "-")
+            )
+
+            c3.metric(
+                "Low",
+                q.get("low_price", "-")
+            )
+
+        else:
+
+            st.error(quote)
+
+    except Exception as e:
+
+        st.error(e)
 
     st.divider()
 
-    if st.button("🔄 Refresh"):
+    # ---------------------------------------
+    # Expiry Selection
+    # ---------------------------------------
+
+    st.subheader("📅 Expiry")
+
+    expiry = st.selectbox(
+
+        "Select Expiry",
+
+        [
+
+            "Current Expiry"
+
+        ]
+
+    )
+
+    st.info(
+        "Expiry list will be loaded automatically from FYERS API in Part 2."
+    )
+
+    st.divider()
+
+    # ---------------------------------------
+    # Placeholder
+    # ---------------------------------------
+
+    option_placeholder = st.empty()
+
+    if auto_refresh:
+
+        time.sleep(refresh_time)
 
         st.rerun()
