@@ -1,129 +1,53 @@
 import streamlit as st
 
-
-# =====================================
-# SETTINGS PAGE
-# =====================================
 def show_settings():
-
     st.title("⚙️ Settings")
 
-    # -----------------------------
-    # User
-    # -----------------------------
-    st.subheader("👤 User")
-
-    if "access_token" in st.session_state:
-        st.success("✅ Logged in to FYERS")
+    # 1. User Status
+    st.subheader("👤 User Account")
+    if st.session_state.get("logged_in"):
+        st.success("✅ Active Session: Logged in to FYERS")
     else:
-        st.warning("❌ Not Logged In")
+        st.warning("❌ No Active Session")
 
     st.divider()
 
-    # -----------------------------
-    # Auto Refresh
-    # -----------------------------
-    st.subheader("🔄 Auto Refresh")
-
-    auto_refresh = st.toggle(
-        "Enable Auto Refresh",
-        value=st.session_state.get("auto_refresh", False)
-    )
-
-    refresh_interval = st.slider(
-        "Refresh Interval (Seconds)",
-        min_value=5,
-        max_value=300,
-        value=st.session_state.get("refresh_interval", 30),
-        step=5
-    )
-
-    st.session_state["auto_refresh"] = auto_refresh
-    st.session_state["refresh_interval"] = refresh_interval
-
-    st.success("Settings Saved")
+    # 2. Refresh & UI Settings
+    st.subheader("🔄 App Preferences")
+    
+    col1, col2 = st.columns(2)
+    with col1:
+        auto_refresh = st.toggle("Auto Refresh", value=st.session_state.get("auto_refresh", False))
+        st.session_state["auto_refresh"] = auto_refresh
+    
+    with col2:
+        refresh_interval = st.slider("Refresh (sec)", 5, 300, st.session_state.get("refresh_interval", 30), step=5)
+        st.session_state["refresh_interval"] = refresh_interval
 
     st.divider()
 
-    # -----------------------------
-    # Theme Preference
-    # -----------------------------
-    st.subheader("🎨 Theme Preference")
-
-    theme = st.selectbox(
-        "Theme",
-        [
-            "System",
-            "Light",
-            "Dark"
-        ],
-        index=0
-    )
-
-    st.session_state["theme"] = theme
-
-    st.info(
-        "Theme preference is stored in the app. "
-        "To actually change Streamlit appearance, "
-        "use Settings → Appearance."
-    )
+    # 3. Danger Zone (Logout/Reset)
+    st.subheader("⚠️ Danger Zone")
+    
+    c1, c2 = st.columns(2)
+    with c1:
+        if st.button("🧹 Clear All Cache & Session"):
+            st.session_state.clear()
+            st.rerun()
+            
+    with c2:
+        if st.button("🚪 Logout Now"):
+            st.session_state["logged_in"] = False
+            st.session_state.pop("access_token", None)
+            st.rerun()
 
     st.divider()
 
-    # -----------------------------
-    # Session
-    # -----------------------------
-    st.subheader("🧹 Session")
-
-    if st.button("Clear Session"):
-
-        for key in list(st.session_state.keys()):
-            del st.session_state[key]
-
-        st.success("Session Cleared")
-
-        st.rerun()
-
-    st.divider()
-
-    # -----------------------------
-    # Logout
-    # -----------------------------
-    st.subheader("🚪 Logout")
-
-    if st.button("Logout"):
-
-        if "access_token" in st.session_state:
-            del st.session_state["access_token"]
-
-        st.success("Logged Out")
-
-        st.rerun()
-
-    st.divider()
-
-    # -----------------------------
-    # About
-    # -----------------------------
-    st.subheader("ℹ️ About")
-
-    st.info("""
-FYERS Trading Dashboard
-
-Version : 1.0
-
-Modules Included
-
-✅ Dashboard
-✅ Market Watch
-✅ Portfolio
-✅ Orders
-✅ Trading
-✅ Option Chain
-✅ AI Scanner
-✅ Charts
-✅ Profile
-✅ Settings
-
-Powered by FYERS API V3 + Streamlit
-""")
+    # 4. About Section
+    with st.expander("ℹ️ About FYERS Dashboard"):
+        st.write("""
+        **Institutional Grade Trading Dashboard**
+        - **Modules:** Real-time Market, Portfolio, AI Scanner, Option Chain.
+        - **API:** FYERS API V3
+        - **Version:** 1.0.0
+        """)
