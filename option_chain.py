@@ -397,3 +397,164 @@ def show_option_chain(fyers):
                 except Exception as e:
 
                     st.warning(e)
+# ==========================================================
+# OPTION CHAIN - PART 4
+# OI BUILDUP | COI | INSTITUTIONAL ANALYSIS
+# ==========================================================
+
+                st.divider()
+                st.subheader("🏦 Institutional OI Analysis")
+
+                try:
+
+                    coi_ce = None
+                    coi_pe = None
+                    ltp_col = None
+
+                    for col in analysis_df.columns:
+
+                        c = str(col).lower()
+
+                        if coi_ce is None and "ce" in c and "change" in c:
+                            coi_ce = col
+
+                        if coi_pe is None and "pe" in c and "change" in c:
+                            coi_pe = col
+
+                        if ltp_col is None and "ltp" in c:
+                            ltp_col = col
+
+                    if coi_ce and coi_pe:
+
+                        analysis_df[coi_ce] = pd.to_numeric(
+                            analysis_df[coi_ce],
+                            errors="coerce"
+                        ).fillna(0)
+
+                        analysis_df[coi_pe] = pd.to_numeric(
+                            analysis_df[coi_pe],
+                            errors="coerce"
+                        ).fillna(0)
+
+                        st.metric(
+                            "Total CE Change OI",
+                            int(analysis_df[coi_ce].sum())
+                        )
+
+                        st.metric(
+                            "Total PE Change OI",
+                            int(analysis_df[coi_pe].sum())
+                        )
+
+                    st.divider()
+
+                    st.subheader("📈 OI Build-up")
+
+                    signal = "Neutral"
+
+                    if pcr > 1.20:
+                        signal = "Bullish"
+
+                    elif pcr < 0.80:
+                        signal = "Bearish"
+
+                    col1, col2 = st.columns(2)
+
+                    col1.metric(
+                        "Market Bias",
+                        signal
+                    )
+
+                    if signal == "Bullish":
+
+                        col2.success(
+                            "Long Build-up Possible"
+                        )
+
+                    elif signal == "Bearish":
+
+                        col2.error(
+                            "Short Build-up Possible"
+                        )
+
+                    else:
+
+                        col2.info(
+                            "Sideways Market"
+                        )
+
+                    st.divider()
+
+                    st.subheader("🎯 Institutional View")
+
+                    if pcr >= 1.40:
+
+                        st.success(
+                            """
+Large Put Writing Detected
+
+• Strong Support
+• Institutions Bullish
+• Buying on Dips
+                            """
+                        )
+
+                    elif pcr <= 0.60:
+
+                        st.error(
+                            """
+Heavy Call Writing Detected
+
+• Strong Resistance
+• Institutions Bearish
+• Sell on Rise
+                            """
+                        )
+
+                    else:
+
+                        st.info(
+                            """
+Balanced Open Interest
+
+No Strong Institutional Bias
+                            """
+                        )
+
+                except Exception as e:
+
+                    st.warning(e)
+
+                st.divider()
+
+                st.subheader("📋 OI Summary")
+
+                summary = pd.DataFrame({
+
+                    "Indicator": [
+
+                        "PCR",
+                        "Support",
+                        "Resistance",
+                        "Market Bias"
+
+                    ],
+
+                    "Value": [
+
+                        round(pcr, 2),
+
+                        pe_row[strike_col] if strike_col else "-",
+
+                        ce_row[strike_col] if strike_col else "-",
+
+                        signal
+
+                    ]
+
+                })
+
+                st.dataframe(
+                    summary,
+                    use_container_width=True
+                )
