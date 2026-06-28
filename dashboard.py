@@ -1,142 +1,58 @@
 import streamlit as st
 import pandas as pd
 
-
 def show_dashboard(fyers):
+    st.title("🏠 Institutional Trading Dashboard")
 
-    st.header("📈 FYERS Trading Dashboard")
-
-    # ===============================
-    # MARKET OVERVIEW
-    # ===============================
+    # 1. MARKET OVERVIEW (Metrics)
     st.subheader("📊 Market Overview")
-
-    col1, col2, col3 = st.columns(3)
-
     try:
-        quote = fyers.quotes({
-            "symbols": "NSE:NIFTY50-INDEX,NSE:NIFTYBANK-INDEX,NSE:FINNIFTY-INDEX"
-        })
-
-        data = quote["d"]
-
-        col1.metric(
-            "NIFTY 50",
-            data[0]["v"]["lp"],
-            data[0]["v"]["ch"]
-        )
-
-        col2.metric(
-            "BANKNIFTY",
-            data[1]["v"]["lp"],
-            data[1]["v"]["ch"]
-        )
-
-        col3.metric(
-            "FINNIFTY",
-            data[2]["v"]["lp"],
-            data[2]["v"]["ch"]
-        )
-
+        quote = fyers.quotes({"symbols": "NSE:NIFTY50-INDEX,NSE:NIFTYBANK-INDEX,NSE:FINNIFTY-INDEX"})
+        data = quote.get("d", [])
+        if data:
+            c1, c2, c3 = st.columns(3)
+            for i, col in enumerate([c1, c2, c3]):
+                val = data[i]["v"]
+                col.metric(val["symbol"].replace("NSE:", ""), val["lp"], val["ch"])
     except Exception as e:
-        st.warning(e)
+        st.warning("Market data unavailable.")
 
     st.divider()
 
-    # ===============================
-    # PORTFOLIO
-    # ===============================
-
-    st.subheader("💰 Holdings")
-
-    try:
-
-        holdings = fyers.holdings()
-
-        if holdings.get("holdings"):
-            df = pd.DataFrame(holdings["holdings"])
-            st.dataframe(df, use_container_width=True)
-        else:
-            st.info("No Holdings Found")
-
-    except Exception as e:
-        st.error(e)
-
-    st.divider()
-
-    # ===============================
-    # POSITIONS
-    # ===============================
-
-    st.subheader("📈 Open Positions")
-
-    try:
-
-        positions = fyers.positions()
-
-        if positions.get("netPositions"):
-            df = pd.DataFrame(positions["netPositions"])
-            st.dataframe(df, use_container_width=True)
-        else:
-            st.info("No Open Positions")
-
-    except Exception as e:
-        st.error(e)
+    # 2. PORTFOLIO & POSITIONS (Summary Cards)
+    c1, c2 = st.columns(2)
+    with c1:
+        st.subheader("💰 Holdings Summary")
+        try:
+            holdings = fyers.holdings()
+            if holdings.get("holdings"):
+                df_h = pd.DataFrame(holdings["holdings"])
+                st.metric("Total Holdings", len(df_h))
+            else: st.info("No holdings.")
+        except: st.error("Error loading holdings.")
+    
+    with c2:
+        st.subheader("📈 Current Positions")
+        try:
+            pos = fyers.positions()
+            if pos.get("netPositions"):
+                df_p = pd.DataFrame(pos["netPositions"])
+                total_pl = df_p["pl"].sum()
+                st.metric("Net P&L", f"₹{total_pl:,.2f}", delta=f"{total_pl:,.2f}")
+            else: st.info("No open positions.")
+        except: st.error("Error loading positions.")
 
     st.divider()
 
-    # ===============================
-    # ORDERS
-    # ===============================
-
-    st.subheader("📋 Orders")
-
+    # 3. FUNDS (Clean View)
+    st.subheader("💳 Funds Status")
     try:
-
-        orders = fyers.orderbook()
-
-        if orders.get("orderBook"):
-            df = pd.DataFrame(orders["orderBook"])
-            st.dataframe(df, use_container_width=True)
-        else:
-            st.info("No Orders")
-
-    except Exception as e:
-        st.error(e)
-
-    st.divider()
-
-    # ===============================
-    # PROFILE
-    # ===============================
-
-    st.subheader("👤 Profile")
-
-    try:
-
-        profile = fyers.get_profile()
-
-        if profile.get("s") == "ok":
-            st.json(profile["data"])
-        else:
-            st.json(profile)
-
-    except Exception as e:
-        st.error(e)
-
-    st.divider()
-
-    # ===============================
-    # FUNDS
-    # ===============================
-
-    st.subheader("💳 Available Funds")
-
-    try:
-
         funds = fyers.funds()
+        if funds.get("fund_limit"):
+            df_f = pd.DataFrame(funds["fund_limit"])
+            st.dataframe(df_f, use_container_width=True)
+    except: st.error("Funds data unavailable.")
 
-        st.json(funds)
-
-    except Exception as e:
-        st.error(e)
+    # 4. QUICK ACTIONS
+    if st.button("🔄 Refresh Data"):
+        st.rerun()
