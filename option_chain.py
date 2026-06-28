@@ -129,3 +129,46 @@ def show_option_chain(fyers):
     except Exception as e:
         st.warning(f"Analysis Error: {e}")
         
+    # Part 4: Institutional OI Build-up & Institutional View
+    st.divider()
+    st.subheader("🏦 Institutional OI Analysis")
+
+    try:
+        if "oc_df" in st.session_state and not st.session_state.oc_df.empty:
+            df = st.session_state.oc_df
+            
+            # OI మార్పులను లెక్కించడం (Change in OI)
+            # ఒకవేళ కాలమ్ పేరు 'change_in_oi' లేకపోతే, అదనపు డేటా కోసం API డాక్యుమెంటేషన్ చూడండి
+            if 'change_in_oi' in df.columns:
+                df['change_in_oi'] = pd.to_numeric(df['change_in_oi'], errors='coerce').fillna(0)
+                ce_coi = df[df['option_type'] == 'CE']['change_in_oi'].sum()
+                pe_coi = df[df['option_type'] == 'PE']['oi'].sum() # PE OI ని కూడా పరిగణనలోకి తీసుకోవచ్చు
+                
+                st.metric("Total CE Change OI", f"{int(ce_coi):,}")
+            
+            # మార్కెట్ బయాస్ (PCR ఆధారంగా)
+            pcr = (df[df['option_type'] == 'PE']['oi'].sum() / df[df['option_type'] == 'CE']['oi'].sum())
+            
+            signal = "Neutral"
+            if pcr > 1.20: signal = "Bullish"
+            elif pcr < 0.80: signal = "Bearish"
+
+            col1, col2 = st.columns(2)
+            col1.metric("Market Bias", signal)
+            
+            if signal == "Bullish": col2.success("Long Build-up Possible")
+            elif signal == "Bearish": col2.error("Short Build-up Possible")
+            else: col2.info("Sideways Market")
+
+            # ఇన్‌స్టిట్యూషనల్ వ్యూ
+            st.subheader("🎯 Institutional View")
+            if pcr >= 1.40:
+                st.success("Large Put Writing Detected • Strong Support • Institutions Bullish")
+            elif pcr <= 0.60:
+                st.error("Heavy Call Writing Detected • Strong Resistance • Institutions Bearish")
+            else:
+                st.info("Balanced Open Interest • No Strong Institutional Bias")
+                
+    except Exception as e:
+        st.warning(f"Institutional Analysis Error: {e}")
+        
