@@ -162,3 +162,118 @@ def show_option_chain(fyers):
         time.sleep(refresh_time)
 
         st.rerun()
+# ==========================================================
+# OPTION CHAIN - PART 2
+# Live Option Chain Data
+# ==========================================================
+
+    st.subheader("📊 Live Option Chain")
+
+    if st.button("🔄 Load Option Chain", use_container_width=True):
+
+        with st.spinner("Loading Option Chain..."):
+
+            try:
+
+                response = fyers.optionchain({
+
+                    "symbol": symbol_map[index],
+
+                    "strikecount": strike_count
+
+                })
+
+                if response.get("s") != "ok":
+
+                    st.error(response)
+                    st.stop()
+
+                st.success("✅ Option Chain Loaded")
+
+                data = response.get("data", {})
+
+                # -----------------------------------
+                # Display Raw Response (Debug)
+                # -----------------------------------
+
+                with st.expander("📦 Raw API Response"):
+
+                    st.json(data)
+
+                # -----------------------------------
+                # Option Chain Table
+                # -----------------------------------
+
+                option_data = None
+
+                if isinstance(data, list):
+
+                    option_data = data
+
+                elif isinstance(data, dict):
+
+                    if "optionsChain" in data:
+                        option_data = data["optionsChain"]
+
+                    elif "optionChain" in data:
+                        option_data = data["optionChain"]
+
+                    elif "chain" in data:
+                        option_data = data["chain"]
+
+                if option_data:
+
+                    df = pd.DataFrame(option_data)
+
+                    st.dataframe(
+                        df,
+                        use_container_width=True,
+                        height=600
+                    )
+
+                    csv = df.to_csv(index=False)
+
+                    st.download_button(
+
+                        "⬇ Download Option Chain CSV",
+
+                        csv,
+
+                        file_name=f"{index}_option_chain.csv",
+
+                        mime="text/csv"
+
+                    )
+
+                    # -----------------------------------
+                    # Summary
+                    # -----------------------------------
+
+                    st.divider()
+
+                    c1, c2, c3 = st.columns(3)
+
+                    c1.metric(
+                        "Total Strikes",
+                        len(df)
+                    )
+
+                    c2.metric(
+                        "Index",
+                        index
+                    )
+
+                    c3.metric(
+                        "Strike Count",
+                        strike_count
+                    )
+
+                else:
+
+                    st.warning(
+                        "⚠ Option Chain table not found in API response."
+                    )
+
+            except Exception as e:
+
+                st.exception(e)
