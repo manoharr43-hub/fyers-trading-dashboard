@@ -172,3 +172,40 @@ def show_option_chain(fyers):
     except Exception as e:
         st.warning(f"Institutional Analysis Error: {e}")
         
+    # Part 5: Max Pain Analysis, Heatmap & Export
+    st.divider()
+    st.subheader("📌 Analytics & Export")
+
+    try:
+        if "oc_df" in st.session_state and not st.session_state.oc_df.empty:
+            df = st.session_state.oc_df
+            
+            # 1. Max Pain Analysis (Strike with highest total OI)
+            # CE OI + PE OI ని కలిపి గరిష్ట విలువ ఉన్న Strike Price ని Max Pain గా భావిస్తాము
+            df_group = df.groupby('strike_price')[['oi']].sum()
+            max_pain_strike = df_group['oi'].idxmax()
+            
+            c1, c2 = st.columns(2)
+            c1.metric("🎯 Max Pain Strike", max_pain_strike)
+            
+            # 2. Top 10 CE/PE Writers
+            c1, c2 = st.columns(2)
+            with c1:
+                st.subheader("🔴 Top CE Writers")
+                st.dataframe(df[df['option_type'] == 'CE'].nlargest(5, 'oi')[['strike_price', 'oi']])
+            with c2:
+                st.subheader("🟢 Top PE Writers")
+                st.dataframe(df[df['option_type'] == 'PE'].nlargest(5, 'oi')[['strike_price', 'oi']])
+            
+            # 3. Heatmap
+            st.subheader("🔥 OI Heatmap")
+            heatmap_data = df.pivot(index='strike_price', columns='option_type', values='oi')
+            st.dataframe(heatmap_data.style.background_gradient(cmap='RdYlGn'), use_container_width=True)
+            
+            # 4. Export
+            csv = df.to_csv(index=False)
+            st.download_button("⬇ Download Institutional Report", csv, "Institutional_Report.csv", "text/csv")
+
+    except Exception as e:
+        st.warning(f"Analytics Error: {e}")
+        
