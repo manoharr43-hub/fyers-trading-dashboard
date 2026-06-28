@@ -8,7 +8,8 @@ def show_option_chain(fyers):
     # 1. Sidebar Settings
     index = st.sidebar.selectbox("Select Index", ["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"])
     strike_count = st.sidebar.slider("Strike Count", 5, 30, 10)
-    
+    auto_refresh = st.sidebar.checkbox("Auto Refresh")
+
     symbol_map = {
         "NIFTY": "NSE:NIFTY50-INDEX", "BANKNIFTY": "NSE:NIFTYBANK-INDEX",
         "FINNIFTY": "NSE:FINNIFTY-INDEX", "MIDCPNIFTY": "NSE:MIDCPNIFTY-INDEX"
@@ -21,38 +22,45 @@ def show_option_chain(fyers):
                 res = fyers.optionchain({"symbol": symbol_map[index], "strikecount": strike_count})
                 df = pd.DataFrame(res["data"]["optionsChain"])
                 st.session_state.oc_df = df
-            except Exception as e: st.error(f"Error: {e}")
+            except Exception as e: 
+                st.error(f"Error fetching data: {e}")
 
-    # 3. Analysis Dashboard (Safe Mode)
+    # 3. Analysis Dashboard
     if "oc_df" in st.session_state:
         df = st.session_state.oc_df
         
-        # డైనమిక్ కాలమ్ ఫైండింగ్
-        ce_cols = [c for c in df.columns if 'ce' in c.lower() and 'oi' in c.lower()]
-        pe_cols = [c for c in df.columns if 'pe' in c.lower() and 'oi' in c.lower()]
-        ce_name = ce_cols[0] if ce_cols else df.columns[1]
-        pe_name = pe_cols[0] if pe_cols else df.columns[2]
+        # డేటా క్లీనింగ్: కాలమ్స్ నంబర్లుగా మార్చడం
+        numeric_cols = ['ce_oi', 'pe_oi', 'ce_ltp', 'pe_ltp', 'strike_price']
+        for col in numeric_cols:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
 
-        # డేటా టైప్ కన్వర్షన్ (TypeError నివారించడానికి)
-        df[ce_name] = pd.to_numeric(df[ce_name], errors='coerce').fillna(0)
-        df[pe_name] = pd.to_numeric(df[pe_name], errors='coerce').fillna(0)
+        # కాలమ్స్ క్రమబద్ధీకరించడం (Expiry ముందు ఉండేలా)
+        cols = ['expiry'] + [c for c in df.columns if c != 'expiry']
+        df = df[cols]
 
         # Calculations
-        total_ce_oi = df[ce_name].sum()
-        total_pe_oi = df[pe_name].sum()
+        total_ce_oi = df['ce_oi'].sum()
+        total_pe_oi = df['pe_oi'].sum()
         pcr = total_pe_oi / total_ce_oi if total_ce_oi != 0 else 0
         
-        # UI Metrics
-        c1, c2 = st.columns(2)
+        # Metrics UI
+        c1, c2, c3 = st.columns(3)
         c1.metric("PCR Ratio", round(pcr, 2))
-        c2.metric("Market Sentiment", "Bullish" if pcr > 1 else "Bearish")
+        c2.metric("Total CE OI", int(total_ce_oi))
+        c3.metric("Total PE OI", int(total_pe_oi))
 
         # OI Heatmap
         st.subheader("🔥 OI Heatmap")
-        st.dataframe(df.style.background_gradient(cmap='RdYlGn'), use_container_width=True)
-        
-        # AI Logic
-        st.info(f"Analysis: Institutional money is moving towards {'Calls' if pcr < 0.9 else 'Puts'}")
+        st.dataframe(df.style.background_gradient(cmap='RdYlGn', subset=['ce_oi', 'pe_oi']), use_container_width=True)
 
-    st.divider()
+        # AI Signals
+        st.subheader("🤖 AI Institutional Signals")
+        sentiment = "🟢 Bullish" if pcr > 1.0 else "🔴 Bearish"
+        st.info(f"Market Sentiment: {sentiment}")
+
+    if auto_refresh:
+        time.sleep(10)
+        st.rerun()
+
     st.caption("NSE AI PRO V12 | Institutional Edition")
