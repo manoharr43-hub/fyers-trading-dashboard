@@ -2,53 +2,58 @@ import streamlit as st
 import pandas as pd
 
 def show_option_chain(fyers):
-    st.title("📊 NSE AI PRO V12 - Full F&O Option Chain")
+    st.title("📊 NSE AI PRO V12 - Institutional Option Chain")
 
-    # 1. Sidebar: Index and Expiry Selection
-    index_options = {
-        "NIFTY": "NSE:NIFTY50-INDEX", 
-        "BANKNIFTY": "NSE:NIFTYBANK-INDEX", 
-        "FINNIFTY": "NSE:FINNIFTY-INDEX", 
-        "MIDCPNIFTY": "NSE:MIDCPNIFTY-INDEX",
-        "RELIANCE": "NSE:RELIANCE-EQ", # F&O Stocks ಉದಾಹరణ
-        "HDFCBANK": "NSE:HDFCBANK-EQ"
-    }
-    
-    selected_index = st.sidebar.selectbox("Select Index/Stock", list(index_options.keys()))
+    # 1. Sidebar
+    index = st.sidebar.selectbox("Select Index", ["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"])
     strike_count = st.sidebar.slider("Strike Count", 5, 30, 10)
+    
+    symbol_map = {
+        "NIFTY": "NSE:NIFTY50-INDEX", "BANKNIFTY": "NSE:NIFTYBANK-INDEX",
+        "FINNIFTY": "NSE:FINNIFTY-INDEX", "MIDCPNIFTY": "NSE:MIDCPNIFTY-INDEX"
+    }
 
     # 2. Load Data
     if st.button("🔄 Load Institutional Option Chain"):
-        try:
-            res = fyers.optionchain({"symbol": index_options[selected_index], "strikecount": strike_count})
-            df = pd.DataFrame(res["data"]["optionsChain"])
-            st.session_state.oc_df = df
-        except Exception as e: st.error(f"Error: {e}")
+        with st.spinner("Fetching Data..."):
+            try:
+                res = fyers.optionchain({"symbol": symbol_map[index], "strikecount": strike_count})
+                df = pd.DataFrame(res["data"]["optionsChain"])
+                st.session_state.oc_df = df
+            except Exception as e: st.error(f"Error: {e}")
 
     # 3. Analysis Dashboard
     if "oc_df" in st.session_state:
         df = st.session_state.oc_df
         
-        # Expiry Selection Box
-        if 'expiry' in df.columns:
-            unique_expiries = df['expiry'].unique()
-            selected_expiry = st.sidebar.selectbox("Select Expiry Date", unique_expiries)
-            df = df[df['expiry'] == selected_expiry]
+        # డేటా క్లీనింగ్: మీ CSV ప్రకారం 'oi' మరియు 'option_type' ఉన్నాయి
+        df['oi'] = pd.to_numeric(df['oi'], errors='coerce').fillna(0)
+        
+        # CE మరియు PE ని విడదీయడం
+        ce_df = df[df['option_type'] == 'CE']
+        pe_df = df[df['option_type'] == 'PE']
+        
+        # ఎక్స్‌పైరీ సెలక్షన్
+        unique_expiries = df['expiry'].unique()
+        selected_expiry = st.sidebar.selectbox("Select Expiry Date", unique_expiries)
+        
+        # ఫిల్టర్ చేసిన డేటా
+        display_df = df[df['expiry'] == selected_expiry]
+        
+        # Metrics
+        total_ce_oi = ce_df[ce_df['expiry'] == selected_expiry]['oi'].sum()
+        total_pe_oi = pe_df[pe_df['expiry'] == selected_expiry]['oi'].sum()
+        pcr = total_pe_oi / total_ce_oi if total_ce_oi != 0 else 0
+        
+        # UI
+        c1, c2, c3 = st.columns(3)
+        c1.metric("PCR Ratio", round(pcr, 2))
+        c2.metric("Total CE OI", int(total_ce_oi))
+        c3.metric("Total PE OI", int(total_pe_oi))
 
-        # Cleanup numeric data
-        numeric_cols = ['ce_oi', 'pe_oi', 'strike_price']
-        for col in numeric_cols:
-            if col in df.columns:
-                df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
+        st.subheader(f"🔥 OI Analysis - {selected_expiry}")
+        st.dataframe(display_df[['strike_price', 'option_type', 'oi', 'ltp', 'volume']], use_container_width=True)
 
-        # OI Heatmap
-        st.subheader(f"🔥 OI Heatmap - {selected_index} ({selected_expiry})")
-        st.dataframe(df.style.background_gradient(cmap='RdYlGn', subset=['ce_oi', 'pe_oi']), use_container_width=True)
-
-        # PCR Logic
-        total_ce = df['ce_oi'].sum()
-        total_pe = df['pe_oi'].sum()
-        pcr = total_pe / total_ce if total_ce != 0 else 0
-        st.metric("PCR Ratio", round(pcr, 2))
+        st.info(f"Market Sentiment: {'🟢 Bullish' if pcr > 1.0 else '🔴 Bearish'}")
 
     st.caption("NSE AI PRO V12 | Institutional Edition")
