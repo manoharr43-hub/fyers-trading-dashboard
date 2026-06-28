@@ -1,42 +1,164 @@
 import streamlit as st
 import pandas as pd
+import time
+
+# ==========================================================
+# OPTION CHAIN - PART 1
+# NSE AI PRO V12 Institutional Edition
+# ==========================================================
+
 
 def show_option_chain(fyers):
+
     st.title("📊 NSE AI PRO V12 - Institutional Option Chain")
 
+    # ---------------------------------------
+    # Sidebar Settings
+    # ---------------------------------------
+
+    st.sidebar.header("⚙️ Option Chain Settings")
+
+    index = st.sidebar.selectbox(
+
+        "Select Index",
+
+        [
+            "NIFTY",
+            "BANKNIFTY",
+            "FINNIFTY",
+            "MIDCPNIFTY",
+            "SENSEX",
+            "BANKEX"
+        ]
+
+    )
+
     symbol_map = {
-        "NIFTY": "NSE:NIFTY50-INDEX", "BANKNIFTY": "NSE:NIFTYBANK-INDEX",
-        "FINNIFTY": "NSE:FINNIFTY-INDEX", "MIDCPNIFTY": "NSE:MIDCPNIFTY-INDEX",
-        "SENSEX": "BSE:SENSEX-INDEX", "RELIANCE": "NSE:RELIANCE-EQ"
+
+        "NIFTY": "NSE:NIFTY50-INDEX",
+
+        "BANKNIFTY": "NSE:NIFTYBANK-INDEX",
+
+        "FINNIFTY": "NSE:FINNIFTY-INDEX",
+
+        "MIDCPNIFTY": "NSE:MIDCPNIFTY-INDEX",
+
+        "SENSEX": "BSE:SENSEX-INDEX",
+
+        "BANKEX": "BSE:BANKEX-INDEX"
+
     }
-    
-    selected_symbol = st.sidebar.selectbox("Select Index/Stock", list(symbol_map.keys()))
-    strike_count = st.sidebar.slider("Strike Count", 5, 20, 10)
 
-    if st.button("🔄 Load Institutional Data"):
-        try:
-            res = fyers.optionchain({"symbol": symbol_map[selected_symbol], "strikecount": strike_count})
-            data = res.get("data", {}).get("optionsChain", [])
-            if data:
-                st.session_state.oc_df = pd.DataFrame(data)
-                st.rerun()
-        except Exception as e:
-            st.error(f"Error: {e}")
+    strike_count = st.sidebar.slider(
 
-    # FIX: కేవలం డేటా ఉంటేనే ఎక్స్‌పైరీ సెలెక్ట్ బాక్స్ చూపిస్తాం
-    if "oc_df" in st.session_state and not st.session_state.oc_df.empty:
-        df = st.session_state.oc_df
-        
-        if 'expiry' in df.columns:
-            unique_expiries = df['expiry'].unique()
-            # డిఫాల్ట్ వాల్యూ సెట్ చేస్తున్నాం
-            selected_expiry = st.sidebar.selectbox("📅 Select Expiry", unique_expiries, index=0)
-            
-            # ఫిల్టరింగ్
-            df_filtered = df[df['expiry'] == selected_expiry].copy()
-            df_filtered['oi'] = pd.to_numeric(df_filtered['oi'], errors='coerce').fillna(0)
-            
-            st.subheader(f"🔥 Analysis - {selected_expiry}")
-            st.dataframe(df_filtered[['strike_price', 'option_type', 'oi', 'ltp', 'volume']], use_container_width=True)
-    else:
-        st.info("డేటా లోడ్ చేయడానికి బటన్ నొక్కండి.")
+        "Strike Count",
+
+        min_value=5,
+
+        max_value=30,
+
+        value=10
+
+    )
+
+    auto_refresh = st.sidebar.checkbox(
+
+        "Auto Refresh",
+
+        value=False
+
+    )
+
+    refresh_time = st.sidebar.slider(
+
+        "Refresh Seconds",
+
+        5,
+
+        60,
+
+        10
+
+    )
+
+    # ---------------------------------------
+    # Spot Price
+    # ---------------------------------------
+
+    st.subheader("📈 Spot Price")
+
+    try:
+
+        quote = fyers.quotes({
+
+            "symbols": symbol_map[index]
+
+        })
+
+        if quote.get("s") == "ok":
+
+            q = quote["d"][0]["v"]
+
+            c1, c2, c3 = st.columns(3)
+
+            c1.metric(
+                "Spot",
+                q.get("lp", 0),
+                q.get("ch", 0)
+            )
+
+            c2.metric(
+                "High",
+                q.get("high_price", "-")
+            )
+
+            c3.metric(
+                "Low",
+                q.get("low_price", "-")
+            )
+
+        else:
+
+            st.error(quote)
+
+    except Exception as e:
+
+        st.error(e)
+
+    st.divider()
+
+    # ---------------------------------------
+    # Expiry Selection
+    # ---------------------------------------
+
+    st.subheader("📅 Expiry")
+
+    expiry = st.selectbox(
+
+        "Select Expiry",
+
+        [
+
+            "Current Expiry"
+
+        ]
+
+    )
+
+    st.info(
+        "Expiry list will be loaded automatically from FYERS API in Part 2."
+    )
+
+    st.divider()
+
+    # ---------------------------------------
+    # Placeholder
+    # ---------------------------------------
+
+    option_placeholder = st.empty()
+
+    if auto_refresh:
+
+        time.sleep(refresh_time)
+
+        st.rerun()
