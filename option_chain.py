@@ -4,7 +4,6 @@ import pandas as pd
 def show_option_chain(fyers):
     st.title("📊 NSE AI PRO V12 - Institutional Option Chain")
 
-    # 1. Index/Stock Mapping
     symbol_map = {
         "NIFTY": "NSE:NIFTY50-INDEX", "BANKNIFTY": "NSE:NIFTYBANK-INDEX",
         "FINNIFTY": "NSE:FINNIFTY-INDEX", "MIDCPNIFTY": "NSE:MIDCPNIFTY-INDEX",
@@ -14,53 +13,53 @@ def show_option_chain(fyers):
     selected_symbol = st.sidebar.selectbox("Select Index/Stock", list(symbol_map.keys()))
     strike_count = st.sidebar.slider("Strike Count", 5, 20, 10)
 
-    # 2. Load Data Button
+    # 1. Load Data logic
     if st.button("🔄 Load Institutional Option Chain"):
-        try:
-            res = fyers.optionchain({"symbol": symbol_map[selected_symbol], "strikecount": strike_count})
-            data = res.get("data", {}).get("optionsChain", [])
-            df = pd.DataFrame(data)
-            
-            # Spot Price పొందడం
-            quote = fyers.quotes({"symbols": symbol_map[selected_symbol]})
-            st.session_state.spot_price = quote["d"][0]["v"]["lp"]
-            
-            st.session_state.oc_df = df
-            st.rerun()
-        except Exception as e:
-            st.error(f"Error Loading Data: {e}")
+        with st.spinner("Fetching data from FYERS..."):
+            try:
+                res = fyers.optionchain({"symbol": symbol_map[selected_symbol], "strikecount": strike_count})
+                data = res.get("data", {}).get("optionsChain", [])
+                
+                if data:
+                    df = pd.DataFrame(data)
+                    st.session_state.oc_df = df
+                    # Spot Price
+                    quote = fyers.quotes({"symbols": symbol_map[selected_symbol]})
+                    st.session_state.spot_price = quote["d"][0]["v"]["lp"]
+                    st.success("Data Loaded Successfully!")
+                    st.rerun()
+                else:
+                    st.error("API నుండి డేటా రాలేదు. ఫ్యర్స్ API ని ఒకసారి చెక్ చేయండి.")
+            except Exception as e:
+                st.error(f"Error: {e}")
 
-    # 3. Analysis Dashboard (ఎర్రర్ ఫిక్స్ ఇక్కడ ఉంది)
-    if "oc_df" in st.session_state:
+    # 2. Display Data logic
+    if "oc_df" in st.session_state and not st.session_state.oc_df.empty:
         df = st.session_state.oc_df
         
-        # డేటా ఖాళీగా లేదని నిర్ధారించుకోవడం
-        if not df.empty and 'expiry' in df.columns:
+        # Expiry సెలక్షన్
+        if 'expiry' in df.columns:
             unique_expiries = df['expiry'].unique()
-            # ఎప్పుడూ ఒక వాల్యూ ఉండేలా selectbox
             selected_expiry = st.sidebar.selectbox("📅 Select Expiry", unique_expiries)
-            df = df[df['expiry'] == selected_expiry]
+            df_filtered = df[df['expiry'] == selected_expiry].copy()
 
             # Data Cleaning
-            df['oi'] = pd.to_numeric(df['oi'], errors='coerce').fillna(0)
-            ce_df = df[df['option_type'] == 'CE']
-            pe_df = df[df['option_type'] == 'PE']
+            df_filtered['oi'] = pd.to_numeric(df_filtered['oi'], errors='coerce').fillna(0)
+            ce_df = df_filtered[df_filtered['option_type'] == 'CE']
+            pe_df = df_filtered[df_filtered['option_type'] == 'PE']
 
-            # Top Metrics
+            # Metrics
             c1, c2, c3 = st.columns(3)
             c1.metric("Spot Price", st.session_state.get("spot_price", "N/A"))
             c2.metric("Total CE OI", f"{int(ce_df['oi'].sum()):,}")
             c3.metric("Total PE OI", f"{int(pe_df['oi'].sum()):,}")
 
-            # Colored Data Table
+            # Styling
             def style_df(row):
                 color = '#ffcccc' if row['option_type'] == 'CE' else '#ccffcc'
                 return [f'background-color: {color}'] * len(row)
 
             st.subheader(f"🔥 Analysis - {selected_expiry}")
-            # 'strike_price' మరియు 'oi' కాలమ్స్ కరెక్ట్‌గా ఉన్నాయని నిర్ధారించుకోండి
-            st.dataframe(df[['strike_price', 'option_type', 'oi', 'ltp', 'volume']].style.apply(style_df, axis=1), width=None)
-        else:
-            st.warning("డేటా అందుబాటులో లేదు. దయచేసి 'Load Data' బటన్ నొక్కండి.")
-
-    st.caption("NSE AI PRO V12 | Institutional Edition")
+            st.dataframe(df_filtered[['strike_price', 'option_type', 'oi', 'ltp', 'volume']].style.apply(style_df, axis=1), use_container_width=True)
+    else:
+        st.warning("డేటా లోడ్ అవ్వలేదు. పైన ఉన్న బటన్ నొక్కండి.")
