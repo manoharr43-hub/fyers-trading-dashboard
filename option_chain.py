@@ -43,3 +43,46 @@ def show_option_chain(fyers):
     st.divider()
     
     # ఇక్కడి నుండి Part 2 (Load Data) మొదలవుతుంది
+    # Part 2: Data Loading & Table Display
+    st.subheader("📊 Live Option Chain Data")
+    
+    # 1. Load Data Button
+    if st.button("🔄 Load Institutional Data", use_container_width=True):
+        with st.spinner("Fetching Data..."):
+            try:
+                res = fyers.optionchain({"symbol": symbol_map[index], "strikecount": strike_count})
+                data = res.get("data", {}).get("optionsChain", [])
+                st.session_state.oc_df = pd.DataFrame(data)
+                st.rerun() # డేటా లోడ్ అయ్యాక పేజీని రీఫ్రెష్ చేస్తుంది
+            except Exception as e:
+                st.error(f"Error: {e}")
+
+    # 2. Display logic (డేటా ఉంటేనే చూపుతుంది)
+    if "oc_df" in st.session_state and not st.session_state.oc_df.empty:
+        df = st.session_state.oc_df
+        
+        # Expiry Selection Box (టాప్‌లో)
+        if 'expiry' in df.columns:
+            selected_expiry = st.selectbox("📅 Select Expiry", df['expiry'].unique())
+            df = df[df['expiry'] == selected_expiry].copy()
+        
+        # Calculations (Totals)
+        df['oi'] = pd.to_numeric(df['oi'], errors='coerce').fillna(0)
+        ce_total = df[df['option_type'] == 'CE']['oi'].sum()
+        pe_total = df[df['option_type'] == 'PE']['oi'].sum()
+
+        # Top Metrics
+        c1, c2 = st.columns(2)
+        c1.metric("Total CE OI", f"{int(ce_total):,}")
+        c2.metric("Total PE OI", f"{int(pe_total):,}")
+
+        # Color Coding (CE=Red, PE=Green)
+        def highlight_rows(row):
+            color = '#ffcccc' if row.get('option_type') == 'CE' else '#ccffcc'
+            return [f'background-color: {color}'] * len(row)
+
+        st.dataframe(df.style.apply(highlight_rows, axis=1), use_container_width=True)
+        
+    else:
+        st.info("👈 సెట్టింగ్స్ మార్చి, బటన్ క్లిక్ చేసి డేటాను లోడ్ చేయండి.")
+        
