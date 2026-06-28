@@ -1,130 +1,121 @@
 import streamlit as st
 import pandas as pd
-import time
 
 
-# ======================================
-# MARKET WATCH
-# ======================================
 def show_market(fyers):
 
-    st.title("📊 Live Market Watch")
+    st.title("📊 Live Market")
 
-    # -----------------------------
-    # Default Watchlist
-    # -----------------------------
-    default_symbols = [
-        "NSE:NIFTY50-INDEX",
-        "NSE:NIFTYBANK-INDEX",
-        "NSE:FINNIFTY-INDEX",
-        "NSE:RELIANCE-EQ",
-        "NSE:TCS-EQ",
-        "NSE:HDFCBANK-EQ",
-        "NSE:INFY-EQ",
-        "NSE:ICICIBANK-EQ",
-        "NSE:SBIN-EQ"
-    ]
-
-    symbols = st.multiselect(
-        "Select Symbols",
-        default_symbols,
-        default=default_symbols
+    symbol = st.text_input(
+        "Enter Symbol",
+        "NSE:RELIANCE-EQ"
     )
-
-    custom = st.text_input(
-        "Custom Symbol",
-        placeholder="Example: NSE:ITC-EQ"
-    )
-
-    if custom:
-        symbols.append(custom)
 
     col1, col2 = st.columns(2)
 
-    auto_refresh = col1.checkbox("Auto Refresh")
+    # ===========================
+    # LIVE QUOTE
+    # ===========================
+    with col1:
 
-    refresh_time = col2.slider(
-        "Refresh (Seconds)",
-        2,
-        30,
-        5
-    )
+        if st.button("📈 Get Quote", use_container_width=True):
 
-    if st.button("Refresh Quotes"):
-        load_quotes(fyers, symbols)
+            try:
 
-    if auto_refresh:
+                quote = fyers.quotes({
+                    "symbols": symbol
+                })
 
-        placeholder = st.empty()
+                if quote.get("s") == "ok":
 
-        while auto_refresh:
+                    data = quote["d"][0]["v"]
 
-            with placeholder.container():
+                    st.metric(
+                        "Last Price",
+                        data["lp"],
+                        data["ch"]
+                    )
 
-                load_quotes(fyers, symbols)
+                    st.json(data)
 
-            time.sleep(refresh_time)
+                else:
+                    st.error(quote)
 
-            st.rerun()
+            except Exception as e:
+                st.error(e)
 
+    # ===========================
+    # MARKET DEPTH
+    # ===========================
+    with col2:
 
-# ======================================
-# LOAD QUOTES
-# ======================================
-def load_quotes(fyers, symbols):
+        if st.button("📚 Market Depth", use_container_width=True):
 
-    if len(symbols) == 0:
-        st.warning("Select at least one symbol.")
-        return
+            try:
 
-    try:
+                depth = fyers.depth({
+                    "symbol": symbol,
+                    "ohlcv_flag": "1"
+                })
 
-        data = fyers.quotes(
-            {
-                "symbols": ",".join(symbols)
-            }
-        )
+                st.json(depth)
 
-        rows = []
+            except Exception as e:
 
-        for item in data["d"]:
+                st.error(e)
 
-            q = item["v"]
+    st.divider()
 
-            rows.append({
+    # ===========================
+    # HISTORICAL DATA
+    # ===========================
+    st.subheader("📉 Historical Data")
 
-                "Symbol": item["n"],
+    if st.button("Load History"):
 
-                "LTP": q.get("lp"),
+        try:
 
-                "Open": q.get("o"),
+            history = fyers.history({
 
-                "High": q.get("h"),
+                "symbol": symbol,
 
-                "Low": q.get("l"),
+                "resolution": "5",
 
-                "Prev Close": q.get("prev_close"),
+                "date_format": "1",
 
-                "Change": q.get("ch"),
+                "range_from": "2026-01-01",
 
-                "% Change": q.get("chp"),
+                "range_to": "2026-12-31",
 
-                "Volume": q.get("volume")
+                "cont_flag": "1"
 
             })
 
-        df = pd.DataFrame(rows)
+            if history.get("candles"):
 
-        st.dataframe(
-            df,
-            use_container_width=True,
-            hide_index=True
-        )
+                df = pd.DataFrame(
 
-        st.subheader("JSON Response")
+                    history["candles"],
 
-        st.json(data)
+                    columns=[
+                        "Timestamp",
+                        "Open",
+                        "High",
+                        "Low",
+                        "Close",
+                        "Volume"
+                    ]
+                )
 
-    except Exception as e:
+                st.dataframe(
+                    df,
+                    use_container_width=True
+                )
 
-        st.error(e)
+            else:
+
+                st.warning("No Data")
+
+        except Exception as e:
+
+            st.error(e)
