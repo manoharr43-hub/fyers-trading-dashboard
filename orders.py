@@ -6,8 +6,8 @@ def show_orders(fyers):
 
     st.title("📋 Orders & Trades")
 
-    tab1, tab2, tab3 = st.tabs(
-        ["📋 Order Book", "📑 Trade Book", "⚙️ Manage Order"]
+    tab1, tab2 = st.tabs(
+        ["📋 Order Book", "📑 Trade Book"]
     )
 
     # =====================================
@@ -15,33 +15,66 @@ def show_orders(fyers):
     # =====================================
     with tab1:
 
+        st.subheader("Order Book")
+
         try:
 
-            response = fyers.orderbook()
+            orders = fyers.orderbook()
 
-            orders = response.get("orderBook", [])
+            if orders.get("orderBook"):
 
-            if orders:
-
-                df = pd.DataFrame(orders)
+                df = pd.DataFrame(
+                    orders["orderBook"]
+                )
 
                 st.dataframe(
                     df,
-                    use_container_width=True,
-                    hide_index=True
+                    use_container_width=True
                 )
 
+                # Summary
+                st.divider()
+
+                col1, col2, col3 = st.columns(3)
+
+                col1.metric(
+                    "Total Orders",
+                    len(df)
+                )
+
+                if "status" in df.columns:
+
+                    pending = len(
+                        df[df["status"] == 6]
+                    )
+
+                    completed = len(
+                        df[df["status"] == 2]
+                    )
+
+                    col2.metric(
+                        "Pending",
+                        pending
+                    )
+
+                    col3.metric(
+                        "Completed",
+                        completed
+                    )
+
                 st.download_button(
-                    "⬇ Export Orders",
+                    "⬇ Download Order Book",
                     df.to_csv(index=False),
-                    "orders.csv",
+                    "orderbook.csv",
                     "text/csv"
                 )
 
             else:
+
                 st.info("No Orders Found")
 
         except Exception as e:
+
             st.error(e)
 
     # =====================================
@@ -49,92 +82,51 @@ def show_orders(fyers):
     # =====================================
     with tab2:
 
+        st.subheader("Trade Book")
+
         try:
 
-            response = fyers.tradebook()
+            trades = fyers.tradebook()
 
-            trades = response.get("tradeBook", [])
+            if trades.get("tradeBook"):
 
-            if trades:
-
-                df = pd.DataFrame(trades)
+                df = pd.DataFrame(
+                    trades["tradeBook"]
+                )
 
                 st.dataframe(
                     df,
-                    use_container_width=True,
-                    hide_index=True
+                    use_container_width=True
+                )
+
+                st.metric(
+                    "Total Trades",
+                    len(df)
                 )
 
                 st.download_button(
-                    "⬇ Export Trades",
+                    "⬇ Download Trade Book",
                     df.to_csv(index=False),
-                    "trades.csv",
+                    "tradebook.csv",
                     "text/csv"
                 )
 
             else:
+
                 st.info("No Trades Found")
 
         except Exception as e:
+
             st.error(e)
 
+    st.divider()
+
     # =====================================
-    # MANAGE ORDERS
+    # REFRESH
     # =====================================
-    with tab3:
 
-        st.subheader("Cancel Order")
-
-        order_id = st.text_input("Order ID")
-
-        if st.button("❌ Cancel Order"):
-
-            if order_id:
-
-                try:
-
-                    data = {
-                        "id": order_id
-                    }
-
-                    response = fyers.cancel_order(data)
-
-                    st.write(response)
-
-                except Exception as e:
-                    st.error(e)
-
-        st.divider()
-
-        st.subheader("Modify Order")
-
-        modify_order_id = st.text_input("Modify Order ID")
-
-        qty = st.number_input(
-            "Quantity",
-            min_value=1,
-            value=1
-        )
-
-        price = st.number_input(
-            "Price",
-            min_value=0.0,
-            value=0.0
-        )
-
-        if st.button("✏️ Modify Order"):
-
-            try:
-
-                data = {
-                    "id": modify_order_id,
-                    "qty": qty,
-                    "limitPrice": price
-                }
-
-                response = fyers.modify_order(data)
-
-                st.write(response)
-
-            except Exception as e:
-                st.error(e)
+    if st.button(
+        "🔄 Refresh Orders",
+        use_container_width=True
+    ):
+        st.rerun()
