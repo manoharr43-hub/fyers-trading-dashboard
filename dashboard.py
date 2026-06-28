@@ -2,194 +2,141 @@ import streamlit as st
 import pandas as pd
 
 
-# ===============================
-# Dashboard
-# ===============================
 def show_dashboard(fyers):
 
-    st.title("📈 FYERS Trading Dashboard")
+    st.header("📈 FYERS Trading Dashboard")
 
-    tab1, tab2, tab3, tab4, tab5 = st.tabs(
-        [
-            "🏠 Dashboard",
-            "💰 Portfolio",
-            "📋 Orders",
-            "📊 Market",
-            "👤 Profile"
-        ]
-    )
+    # ===============================
+    # MARKET OVERVIEW
+    # ===============================
+    st.subheader("📊 Market Overview")
 
-    # =====================================
-    # Dashboard
-    # =====================================
-    with tab1:
+    col1, col2, col3 = st.columns(3)
 
-        st.subheader("Market Overview")
+    try:
+        quote = fyers.quotes({
+            "symbols": "NSE:NIFTY50-INDEX,NSE:NIFTYBANK-INDEX,NSE:FINNIFTY-INDEX"
+        })
 
-        col1, col2, col3 = st.columns(3)
+        data = quote["d"]
 
-        try:
-
-            quote = fyers.quotes(
-                {
-                    "symbols": "NSE:NIFTY50-INDEX,NSE:NIFTYBANK-INDEX,NSE:INDIAVIX-INDEX"
-                }
-            )
-
-            data = quote["d"]
-
-            col1.metric(
-                "NIFTY",
-                data[0]["v"]["lp"],
-                data[0]["v"]["ch"]
-            )
-
-            col2.metric(
-                "BANKNIFTY",
-                data[1]["v"]["lp"],
-                data[1]["v"]["ch"]
-            )
-
-            col3.metric(
-                "INDIA VIX",
-                data[2]["v"]["lp"],
-                data[2]["v"]["ch"]
-            )
-
-        except Exception as e:
-            st.error(e)
-
-    # =====================================
-    # Portfolio
-    # =====================================
-    with tab2:
-
-        st.subheader("Holdings")
-
-        try:
-
-            holdings = fyers.holdings()
-
-            if holdings.get("holdings"):
-
-                df = pd.DataFrame(holdings["holdings"])
-
-                st.dataframe(
-                    df,
-                    use_container_width=True
-                )
-
-            else:
-                st.info("No Holdings")
-
-        except Exception as e:
-            st.error(e)
-
-        st.divider()
-
-        st.subheader("Open Positions")
-
-        try:
-
-            positions = fyers.positions()
-
-            if positions.get("netPositions"):
-
-                df = pd.DataFrame(
-                    positions["netPositions"]
-                )
-
-                st.dataframe(
-                    df,
-                    use_container_width=True
-                )
-
-            else:
-                st.info("No Positions")
-
-        except Exception as e:
-            st.error(e)
-
-    # =====================================
-    # Orders
-    # =====================================
-    with tab3:
-
-        st.subheader("Order Book")
-
-        try:
-
-            orders = fyers.orderbook()
-
-            if orders.get("orderBook"):
-
-                df = pd.DataFrame(
-                    orders["orderBook"]
-                )
-
-                st.dataframe(
-                    df,
-                    use_container_width=True
-                )
-
-            else:
-                st.info("No Orders")
-
-        except Exception as e:
-            st.error(e)
-
-    # =====================================
-    # Market Watch
-    # =====================================
-    with tab4:
-
-        st.subheader("Live Quotes")
-
-        symbol = st.text_input(
-            "Enter Symbol",
-            "NSE:RELIANCE-EQ"
+        col1.metric(
+            "NIFTY 50",
+            data[0]["v"]["lp"],
+            data[0]["v"]["ch"]
         )
 
-        if st.button("Get Quote"):
+        col2.metric(
+            "BANKNIFTY",
+            data[1]["v"]["lp"],
+            data[1]["v"]["ch"]
+        )
 
-            try:
+        col3.metric(
+            "FINNIFTY",
+            data[2]["v"]["lp"],
+            data[2]["v"]["ch"]
+        )
 
-                quote = fyers.quotes(
-                    {
-                        "symbols": symbol
-                    }
-                )
+    except Exception as e:
+        st.warning(e)
 
-                st.json(quote)
+    st.divider()
 
-            except Exception as e:
-                st.error(e)
+    # ===============================
+    # PORTFOLIO
+    # ===============================
 
-    # =====================================
-    # Profile
-    # =====================================
-    with tab5:
+    st.subheader("💰 Holdings")
 
-        st.subheader("Profile")
+    try:
 
-        try:
+        holdings = fyers.holdings()
 
-            profile = fyers.get_profile()
+        if holdings.get("holdings"):
+            df = pd.DataFrame(holdings["holdings"])
+            st.dataframe(df, use_container_width=True)
+        else:
+            st.info("No Holdings Found")
 
+    except Exception as e:
+        st.error(e)
+
+    st.divider()
+
+    # ===============================
+    # POSITIONS
+    # ===============================
+
+    st.subheader("📈 Open Positions")
+
+    try:
+
+        positions = fyers.positions()
+
+        if positions.get("netPositions"):
+            df = pd.DataFrame(positions["netPositions"])
+            st.dataframe(df, use_container_width=True)
+        else:
+            st.info("No Open Positions")
+
+    except Exception as e:
+        st.error(e)
+
+    st.divider()
+
+    # ===============================
+    # ORDERS
+    # ===============================
+
+    st.subheader("📋 Orders")
+
+    try:
+
+        orders = fyers.orderbook()
+
+        if orders.get("orderBook"):
+            df = pd.DataFrame(orders["orderBook"])
+            st.dataframe(df, use_container_width=True)
+        else:
+            st.info("No Orders")
+
+    except Exception as e:
+        st.error(e)
+
+    st.divider()
+
+    # ===============================
+    # PROFILE
+    # ===============================
+
+    st.subheader("👤 Profile")
+
+    try:
+
+        profile = fyers.get_profile()
+
+        if profile.get("s") == "ok":
+            st.json(profile["data"])
+        else:
             st.json(profile)
 
-        except Exception as e:
-            st.error(e)
+    except Exception as e:
+        st.error(e)
 
-        st.divider()
+    st.divider()
 
-        st.subheader("Funds")
+    # ===============================
+    # FUNDS
+    # ===============================
 
-        try:
+    st.subheader("💳 Available Funds")
 
-            funds = fyers.funds()
+    try:
 
-            st.json(funds)
+        funds = fyers.funds()
 
-        except Exception as e:
-            st.error(e)
+        st.json(funds)
+
+    except Exception as e:
+        st.error(e)
