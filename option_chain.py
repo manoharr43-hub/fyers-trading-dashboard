@@ -14,31 +14,30 @@ def show_option_chain(fyers):
     strike_count = st.sidebar.slider("Strike Count", 5, 20, 10)
 
     if st.button("🔄 Load Data"):
-        res = fyers.optionchain({"symbol": symbol_map[selected_symbol], "strikecount": strike_count})
-        st.session_state.oc_df = pd.DataFrame(res.get("data", {}).get("optionsChain", []))
-        st.rerun()
+        try:
+            res = fyers.optionchain({"symbol": symbol_map[selected_symbol], "strikecount": strike_count})
+            data = res.get("data", {}).get("optionsChain", [])
+            df = pd.DataFrame(data)
+            st.session_state.oc_df = df
+            st.rerun()
+        except Exception as e:
+            st.error(f"API Error: {e}")
 
     if "oc_df" in st.session_state:
         df = st.session_state.oc_df
         
-        # 2. Expiry Box Highlight
+        # ఆటోమేటిక్ కాలమ్ మ్యాపింగ్ (KeyError రాకుండా)
+        col_map = {c.lower(): c for c in df.columns}
+        sp_col = col_map.get('strike_price') or col_map.get('strikeprice') or df.columns[0]
+        oi_col = col_map.get('oi') or df.columns[2]
+
+        # Expiry సెలక్షన్
         if 'expiry' in df.columns:
-            unique_expiries = df['expiry'].unique()
-            selected_expiry = st.sidebar.selectbox("📅 Select Expiry Date", unique_expiries)
+            selected_expiry = st.sidebar.selectbox("📅 Select Expiry", df['expiry'].unique())
             df = df[df['expiry'] == selected_expiry]
 
-        # 3. Data Cleaning (CE/PE separation)
-        df['oi'] = pd.to_numeric(df['oi'], errors='coerce').fillna(0)
-        ce_df = df[df['option_type'] == 'CE']
-        pe_df = df[df['option_type'] == 'PE']
-
-        # 4. Display Logic
-        st.subheader(f"🔥 OI Analysis - {selected_expiry}")
-        
-        # Color coding: CE (Red-ish), PE (Green-ish)
-        def highlight_cols(x):
-            return 'background-color: #ffcccc' if x.name == 'CE' else 'background-color: #ccffcc'
-
-        st.dataframe(df[['strike_price', 'option_type', 'oi', 'ltp', 'volume']], use_container_width=True)
+        # డిస్‌ప్లే డేటా
+        st.subheader(f"🔥 OI Analysis")
+        st.dataframe(df[[sp_col, 'option_type', oi_col, 'ltp', 'volume']], use_container_width=True)
 
     st.caption("NSE AI PRO V12 | Institutional Edition")
