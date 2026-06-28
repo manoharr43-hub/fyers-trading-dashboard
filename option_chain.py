@@ -354,3 +354,186 @@ No Strong Institutional Bias
                     summary,
                     use_container_width=True
                 )
+# ==========================================================
+# OPTION CHAIN - PART 5
+# MAX PAIN | TOP WRITERS | HEATMAP | EXPORT
+# ==========================================================
+
+                st.divider()
+                st.subheader("📌 Max Pain Analysis")
+
+                try:
+
+                    if ce_oi_col and pe_oi_col and strike_col:
+
+                        analysis_df["TOTAL_OI"] = (
+                            analysis_df[ce_oi_col] +
+                            analysis_df[pe_oi_col]
+                        )
+
+                        max_pain = analysis_df.loc[
+                            analysis_df["TOTAL_OI"].idxmax()
+                        ]
+
+                        col1, col2, col3 = st.columns(3)
+
+                        col1.metric(
+                            "🎯 Max Pain",
+                            max_pain[strike_col]
+                        )
+
+                        col2.metric(
+                            "Total OI",
+                            f"{int(max_pain['TOTAL_OI']):,}"
+                        )
+
+                        if pcr > 1:
+                            bias = "Bullish"
+                        elif pcr < 1:
+                            bias = "Bearish"
+                        else:
+                            bias = "Neutral"
+
+                        col3.metric(
+                            "Market Bias",
+                            bias
+                        )
+
+                except Exception as e:
+                    st.warning(e)
+
+                # =====================================
+                # TOP CE WRITING
+                # =====================================
+
+                st.divider()
+
+                st.subheader("🔴 Top CE Writers")
+
+                try:
+
+                    top_ce = analysis_df.sort_values(
+                        ce_oi_col,
+                        ascending=False
+                    ).head(10)
+
+                    st.dataframe(
+                        top_ce,
+                        use_container_width=True
+                    )
+
+                except:
+                    pass
+
+                # =====================================
+                # TOP PE WRITING
+                # =====================================
+
+                st.subheader("🟢 Top PE Writers")
+
+                try:
+
+                    top_pe = analysis_df.sort_values(
+                        pe_oi_col,
+                        ascending=False
+                    ).head(10)
+
+                    st.dataframe(
+                        top_pe,
+                        use_container_width=True
+                    )
+
+                except:
+                    pass
+
+                # =====================================
+                # OI HEATMAP
+                # =====================================
+
+                st.divider()
+
+                st.subheader("🔥 OI Heatmap")
+
+                try:
+
+                    heat = analysis_df[[
+                        strike_col,
+                        ce_oi_col,
+                        pe_oi_col
+                    ]]
+
+                    st.dataframe(
+                        heat.style.background_gradient(
+                            cmap="RdYlGn"
+                        ),
+                        use_container_width=True
+                    )
+
+                except:
+                    pass
+
+                # =====================================
+                # EXPORT
+                # =====================================
+
+                st.divider()
+
+                st.subheader("📥 Export")
+
+                csv = analysis_df.to_csv(index=False)
+
+                st.download_button(
+
+                    "⬇ Download Institutional Report",
+
+                    csv,
+
+                    file_name=f"{index}_Institutional_Report.csv",
+
+                    mime="text/csv"
+
+                )
+
+                # =====================================
+                # DASHBOARD SUMMARY
+                # =====================================
+
+                st.divider()
+
+                st.subheader("📊 Dashboard Summary")
+
+                summary = pd.DataFrame({
+
+                    "Metric": [
+
+                        "Spot Price",
+                        "PCR",
+                        "Support",
+                        "Resistance",
+                        "Market Bias",
+                        "Max Pain"
+
+                    ],
+
+                    "Value": [
+
+                        q.get("lp", "-"),
+
+                        round(pcr, 2),
+
+                        pe_row[strike_col],
+
+                        ce_row[strike_col],
+
+                        bias,
+
+                        max_pain[strike_col]
+
+                    ]
+
+                })
+
+                st.dataframe(
+                    summary,
+                    use_container_width=True
+                )
