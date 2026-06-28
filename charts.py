@@ -4,146 +4,53 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import time
 
-# ==========================================================
-# NSE AI PRO V12 Institutional
-# CHARTS - PART 1
-# ==========================================================
-
 def show_charts(fyers):
-
     st.title("📈 Advanced Trading Charts")
 
-    # =====================================
     # Sidebar
-    # =====================================
-
     st.sidebar.header("⚙ Chart Settings")
+    symbol = st.sidebar.text_input("Symbol", "NSE:RELIANCE-EQ")
+    resolution = st.sidebar.selectbox("Timeframe", ["1", "5", "15", "30", "60", "D"])
+    days = st.sidebar.slider("History (Days)", 5, 365, 30)
 
-    symbol = st.sidebar.text_input(
-        "Symbol",
-        "NSE:RELIANCE-EQ"
-    )
-
-    resolution = st.sidebar.selectbox(
-
-        "Timeframe",
-
-        [
-
-            "1",
-            "3",
-            "5",
-            "10",
-            "15",
-            "30",
-            "60",
-            "120",
-            "240",
-            "D",
-            "W",
-            "M"
-
-        ]
-
-    )
-
-    days = st.sidebar.slider(
-
-        "History (Days)",
-
-        5,
-
-        365,
-
-        100
-
-    )
-
-    auto_refresh = st.sidebar.checkbox(
-        "Auto Refresh"
-    )
-
-    refresh_time = st.sidebar.slider(
-
-        "Refresh Seconds",
-
-        5,
-
-        60,
-
-        10
-
-    )
-
-    st.divider()
-
-    # =====================================
-    # Download Data
-    # =====================================
-
-    if st.button(
-        "📊 Load Chart",
-        use_container_width=True
-    ):
-
+    if st.button("📊 Load Chart", use_container_width=True):
         try:
-
+            # FYERS API call
             data = fyers.history({
-
                 "symbol": symbol,
-
                 "resolution": resolution,
-
                 "date_format": "0",
-
-                "range_from": str(days),
-
-                "range_to": "0",
-
+                "range_from": "2026-01-01", # ఇక్కడ తేదీ ఫార్మాట్ సరిచూసుకోండి
+                "range_to": "2026-12-31",
                 "cont_flag": "1"
-
             })
 
             if data.get("s") != "ok":
-
-                st.error(data)
-
-                st.stop()
+                st.error("Data Load Error")
+                return
 
             candles = data["candles"]
+            df = pd.DataFrame(candles, columns=["Time", "Open", "High", "Low", "Close", "Volume"])
+            df["Time"] = pd.to_datetime(df["Time"], unit="s")
 
-            df = pd.DataFrame(
+            # Plotly CandleStick Chart
+            fig = make_subplots(rows=2, cols=1, shared_xaxes=True, 
+                                vertical_spacing=0.03, subplot_titles=(symbol, 'Volume'), 
+                                row_width=[0.2, 0.7])
 
-                candles,
+            fig.add_trace(go.Candlestick(x=df['Time'], open=df['Open'], high=df['High'],
+                                         low=df['Low'], close=df['Close'], name='Price'), row=1, col=1)
 
-                columns=[
+            fig.add_trace(go.Bar(x=df['Time'], y=df['Volume'], name='Volume'), row=2, col=1)
 
-                    "Time",
+            fig.update_layout(xaxis_rangeslider_visible=False, height=600)
+            
+            st.plotly_chart(fig, use_container_width=True)
 
-                    "Open",
+        except Exception as e:
+            st.error(f"Error: {e}")
 
-                    "High",
-
-                    "Low",
-
-                    "Close",
-
-                    "Volume"
-
-                ]
-
-            )
-
-            df["Time"] = pd.to_datetime(
-                df["Time"],
-                unit="s"
-            )
-
-            st.success("Historical Data Loaded")
-
-            st.dataframe(
-                df.tail(),
-                use_container_width=True
-            )
-
-            chart_placeholder = st.empty()
+    # Auto Refresh Logic
+    if st.sidebar.checkbox("Auto Refresh"):
+        time.sleep(10)
+        st.rerun()
