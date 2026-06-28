@@ -273,3 +273,219 @@ def show_scanner(fyers):
         else:
 
             st.warning("No market data received.")
+# ==========================================================
+# SCANNER - PART 3
+# RSI | EMA | MACD | VWAP | SUPERTREND ANALYSIS
+# ==========================================================
+
+    st.divider()
+    st.subheader("📊 Technical Scanner")
+
+    if len(results):
+
+        tech_results = []
+
+        progress = st.progress(0)
+
+        total = len(results)
+
+        for i, stock in enumerate(results):
+
+            symbol = stock["Symbol"]
+
+            try:
+
+                history = fyers.history({
+
+                    "symbol": symbol,
+
+                    "resolution": "D",
+
+                    "date_format": "1",
+
+                    "range_from": "2026-01-01",
+
+                    "range_to": "2026-12-31",
+
+                    "cont_flag": "1"
+
+                })
+
+                if history.get("s") != "ok":
+                    continue
+
+                candles = history.get("candles", [])
+
+                if len(candles) < 30:
+                    continue
+
+                df = pd.DataFrame(
+
+                    candles,
+
+                    columns=[
+                        "timestamp",
+                        "open",
+                        "high",
+                        "low",
+                        "close",
+                        "volume"
+                    ]
+
+                )
+
+                # =====================================
+                # EMA
+                # =====================================
+
+                ema20 = df["close"].ewm(
+                    span=20,
+                    adjust=False
+                ).mean().iloc[-1]
+
+                close = df["close"].iloc[-1]
+
+                # =====================================
+                # RSI
+                # =====================================
+
+                delta = df["close"].diff()
+
+                gain = delta.clip(lower=0)
+
+                loss = -delta.clip(upper=0)
+
+                avg_gain = gain.rolling(14).mean()
+
+                avg_loss = loss.rolling(14).mean()
+
+                rs = avg_gain / avg_loss
+
+                rsi = (
+                    100 - (100 / (1 + rs))
+                ).iloc[-1]
+
+                # =====================================
+                # MACD
+                # =====================================
+
+                ema12 = df["close"].ewm(
+                    span=12,
+                    adjust=False
+                ).mean()
+
+                ema26 = df["close"].ewm(
+                    span=26,
+                    adjust=False
+                ).mean()
+
+                macd = ema12 - ema26
+
+                signal = macd.ewm(
+                    span=9,
+                    adjust=False
+                ).mean()
+
+                macd_signal = "BUY"
+
+                if macd.iloc[-1] < signal.iloc[-1]:
+                    macd_signal = "SELL"
+
+                # =====================================
+                # VWAP
+                # =====================================
+
+                tp = (
+                    df["high"] +
+                    df["low"] +
+                    df["close"]
+                ) / 3
+
+                vwap = (
+                    tp * df["volume"]
+                ).cumsum() / df["volume"].cumsum()
+
+                vwap_signal = "BUY"
+
+                if close < vwap.iloc[-1]:
+                    vwap_signal = "SELL"
+
+                # =====================================
+                # EMA Signal
+                # =====================================
+
+                ema_signal = "BUY"
+
+                if close < ema20:
+                    ema_signal = "SELL"
+
+                # =====================================
+                # RSI Signal
+                # =====================================
+
+                if rsi > 70:
+                    rsi_signal = "OVERBOUGHT"
+
+                elif rsi < 30:
+                    rsi_signal = "OVERSOLD"
+
+                else:
+                    rsi_signal = "NEUTRAL"
+
+                tech_results.append({
+
+                    "Symbol": symbol,
+
+                    "Close": round(close, 2),
+
+                    "EMA20": round(ema20, 2),
+
+                    "RSI": round(rsi, 2),
+
+                    "EMA Signal": ema_signal,
+
+                    "MACD": macd_signal,
+
+                    "VWAP": vwap_signal,
+
+                    "RSI Status": rsi_signal
+
+                })
+
+            except Exception:
+
+                pass
+
+            progress.progress((i + 1) / total)
+
+        progress.empty()
+
+        if len(tech_results):
+
+            tech_df = pd.DataFrame(tech_results)
+
+            st.dataframe(
+
+                tech_df,
+
+                use_container_width=True,
+
+                height=600
+
+            )
+
+            st.download_button(
+
+                "⬇ Download Technical Scanner",
+
+                tech_df.to_csv(index=False),
+
+                file_name="technical_scanner.csv",
+
+                mime="text/csv"
+
+            )
+
+        else:
+
+            st.warning("No technical scan results available.")
