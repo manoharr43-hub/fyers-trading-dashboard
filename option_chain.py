@@ -4,7 +4,7 @@ import pandas as pd
 def show_option_chain(fyers):
     st.title("📊 NSE AI PRO V12 - Institutional Option Chain")
 
-    # 1. Sidebar
+    # 1. Sidebar Settings
     index = st.sidebar.selectbox("Select Index", ["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"])
     strike_count = st.sidebar.slider("Strike Count", 5, 30, 10)
     
@@ -18,7 +18,9 @@ def show_option_chain(fyers):
         with st.spinner("Fetching Data..."):
             try:
                 res = fyers.optionchain({"symbol": symbol_map[index], "strikecount": strike_count})
-                df = pd.DataFrame(res["data"]["optionsChain"])
+                # 'optionsChain' లో డేటా వస్తుందని నిర్ధారించుకోవడం
+                data = res.get("data", {}).get("optionsChain", [])
+                df = pd.DataFrame(data)
                 st.session_state.oc_df = df
             except Exception as e: st.error(f"Error: {e}")
 
@@ -26,34 +28,35 @@ def show_option_chain(fyers):
     if "oc_df" in st.session_state:
         df = st.session_state.oc_df
         
-        # డేటా క్లీనింగ్: మీ CSV ప్రకారం 'oi' మరియు 'option_type' ఉన్నాయి
-        df['oi'] = pd.to_numeric(df['oi'], errors='coerce').fillna(0)
-        
-        # CE మరియు PE ని విడదీయడం
-        ce_df = df[df['option_type'] == 'CE']
-        pe_df = df[df['option_type'] == 'PE']
-        
-        # ఎక్స్‌పైరీ సెలక్షన్
-        unique_expiries = df['expiry'].unique()
-        selected_expiry = st.sidebar.selectbox("Select Expiry Date", unique_expiries)
-        
-        # ఫిల్టర్ చేసిన డేటా
-        display_df = df[df['expiry'] == selected_expiry]
-        
-        # Metrics
-        total_ce_oi = ce_df[ce_df['expiry'] == selected_expiry]['oi'].sum()
-        total_pe_oi = pe_df[pe_df['expiry'] == selected_expiry]['oi'].sum()
-        pcr = total_pe_oi / total_ce_oi if total_ce_oi != 0 else 0
-        
-        # UI
-        c1, c2, c3 = st.columns(3)
-        c1.metric("PCR Ratio", round(pcr, 2))
-        c2.metric("Total CE OI", int(total_ce_oi))
-        c3.metric("Total PE OI", int(total_pe_oi))
+        # డేటా క్లీనింగ్: 'oi' కాలమ్ ఉందో లేదో చెక్ చేయడం
+        if 'oi' in df.columns:
+            df['oi'] = pd.to_numeric(df['oi'], errors='coerce').fillna(0)
+            
+            # Expiry ఫిల్టర్
+            unique_expiries = df['expiry'].unique()
+            selected_expiry = st.sidebar.selectbox("Select Expiry Date", unique_expiries)
+            df = df[df['expiry'] == selected_expiry]
 
-        st.subheader(f"🔥 OI Analysis - {selected_expiry}")
-        st.dataframe(display_df[['strike_price', 'option_type', 'oi', 'ltp', 'volume']], use_container_width=True)
+            # CE మరియు PE ని విడదీయడం
+            ce_df = df[df['option_type'] == 'CE']
+            pe_df = df[df['option_type'] == 'PE']
 
-        st.info(f"Market Sentiment: {'🟢 Bullish' if pcr > 1.0 else '🔴 Bearish'}")
+            # Metrics
+            total_ce_oi = ce_df['oi'].sum()
+            total_pe_oi = pe_df['oi'].sum()
+            pcr = total_pe_oi / total_ce_oi if total_ce_oi != 0 else 0
+
+            # UI
+            c1, c2, c3 = st.columns(3)
+            c1.metric("PCR Ratio", round(pcr, 2))
+            c2.metric("Total CE OI", int(total_ce_oi))
+            c3.metric("Total PE OI", int(total_pe_oi))
+
+            st.subheader(f"🔥 OI Analysis - {selected_expiry}")
+            st.dataframe(df[['strike_price', 'option_type', 'oi', 'ltp', 'volume']], use_container_width=True)
+            
+            st.info(f"Sentiment: {'🟢 Bullish' if pcr > 1.0 else '🔴 Bearish'}")
+        else:
+            st.error("డేటాలో 'oi' కాలమ్ దొరకలేదు. మీ API రెస్పాన్స్ ఫార్మాట్ మారినట్లుంది.")
 
     st.caption("NSE AI PRO V12 | Institutional Edition")
