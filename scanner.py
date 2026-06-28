@@ -827,3 +827,199 @@ def show_scanner(fyers):
     else:
 
         st.info("Run the scanner first to generate AI rankings.")
+# ==========================================================
+# SCANNER - PART 6 (FINAL)
+# SMART MONEY | FINAL SIGNALS | DASHBOARD SUMMARY
+# NSE AI PRO V12 Institutional Edition
+# ==========================================================
+
+    st.divider()
+    st.subheader("🏦 Institutional Analysis")
+
+    if len(ai_results):
+
+        institutional = []
+
+        for row in ai_results:
+
+            score = row["AI Score"]
+
+            if score >= 90:
+
+                money_flow = "Strong Institutional Buying"
+                color = "🟢"
+                action = "BUY"
+
+            elif score >= 75:
+
+                money_flow = "Institutional Buying"
+                color = "🟢"
+                action = "BUY"
+
+            elif score >= 60:
+
+                money_flow = "Accumulation"
+                color = "🟡"
+                action = "WATCH"
+
+            elif score >= 40:
+
+                money_flow = "Distribution"
+                color = "🟠"
+                action = "HOLD"
+
+            else:
+
+                money_flow = "Institutional Selling"
+                color = "🔴"
+                action = "SELL"
+
+            institutional.append({
+
+                "Symbol": row["Symbol"],
+
+                "AI Score": score,
+
+                "Money Flow": money_flow,
+
+                "Action": action
+
+            })
+
+        inst_df = pd.DataFrame(institutional)
+
+        st.dataframe(
+            inst_df,
+            use_container_width=True,
+            height=500
+        )
+
+        # =====================================
+        # Final Alerts
+        # =====================================
+
+        st.divider()
+
+        st.subheader("🚨 AI Alerts")
+
+        buy_list = inst_df[
+            inst_df["Action"] == "BUY"
+        ]
+
+        sell_list = inst_df[
+            inst_df["Action"] == "SELL"
+        ]
+
+        if len(buy_list):
+
+            st.success(
+                f"🟢 BUY Alerts : {len(buy_list)} Stocks"
+            )
+
+            st.dataframe(
+                buy_list,
+                use_container_width=True
+            )
+
+        if len(sell_list):
+
+            st.error(
+                f"🔴 SELL Alerts : {len(sell_list)} Stocks"
+            )
+
+            st.dataframe(
+                sell_list,
+                use_container_width=True
+            )
+
+        # =====================================
+        # Dashboard Summary
+        # =====================================
+
+        st.divider()
+
+        st.subheader("📊 Dashboard Summary")
+
+        total = len(inst_df)
+
+        buy = len(
+            inst_df[
+                inst_df.Action == "BUY"
+            ]
+        )
+
+        watch = len(
+            inst_df[
+                inst_df.Action == "WATCH"
+            ]
+        )
+
+        hold = len(
+            inst_df[
+                inst_df.Action == "HOLD"
+            ]
+        )
+
+        sell = len(
+            inst_df[
+                inst_df.Action == "SELL"
+            ]
+        )
+
+        c1, c2, c3, c4, c5 = st.columns(5)
+
+        c1.metric("Scanned", total)
+
+        c2.metric("BUY", buy)
+
+        c3.metric("WATCH", watch)
+
+        c4.metric("HOLD", hold)
+
+        c5.metric("SELL", sell)
+
+        # =====================================
+        # Export Institutional Report
+        # =====================================
+
+        st.download_button(
+
+            "📥 Download Institutional Report",
+
+            inst_df.to_csv(index=False),
+
+            file_name="Institutional_Scanner_Report.csv",
+
+            mime="text/csv"
+
+        )
+
+        st.divider()
+
+        st.success("✅ NSE AI PRO V12 Institutional Scanner Completed Successfully")
+
+    else:
+
+        st.warning("⚠ Please run the scanner first.")
+
+    # =====================================
+    # Auto Refresh
+    # =====================================
+
+    if refresh:
+
+        with st.spinner("Refreshing Scanner..."):
+
+            time.sleep(refresh_sec)
+
+        st.rerun()
+
+    # =====================================
+    # Footer
+    # =====================================
+
+    st.divider()
+
+    st.caption(
+        "NSE AI PRO V12 Institutional Edition | Powered by FYERS API V3 & Streamlit"
+    )
