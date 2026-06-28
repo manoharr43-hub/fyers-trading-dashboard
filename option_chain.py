@@ -4,71 +4,88 @@ import pandas as pd
 
 def show_option_chain(fyers):
 
-    st.title("⚙️ Option Chain")
+    st.title("📊 Option Chain")
 
     index = st.selectbox(
         "Select Index",
         [
-            "NSE:NIFTY50-INDEX",
-            "NSE:NIFTYBANK-INDEX",
-            "NSE:FINNIFTY-INDEX"
+            "NIFTY",
+            "BANKNIFTY",
+            "FINNIFTY",
+            "MIDCPNIFTY",
+            "SENSEX"
         ]
     )
 
-    expiry = st.text_input(
-        "Expiry (YYYY-MM-DD)",
-        "2026-07-30"
+    symbols = {
+        "NIFTY": "NSE:NIFTY50-INDEX",
+        "BANKNIFTY": "NSE:NIFTYBANK-INDEX",
+        "FINNIFTY": "NSE:FINNIFTY-INDEX",
+        "MIDCPNIFTY": "NSE:MIDCPNIFTY-INDEX",
+        "SENSEX": "BSE:SENSEX-INDEX"
+    }
+
+    strike_count = st.slider(
+        "Strike Count",
+        5,
+        25,
+        10
     )
 
-    if st.button("Load Option Chain"):
+    if st.button("Load Option Chain", use_container_width=True):
 
-        try:
+        with st.spinner("Loading Option Chain..."):
 
-            data = {
-                "symbol": index,
-                "expiry": expiry
-            }
+            try:
 
-            # FYERS Option Chain API
-            response = fyers.optionchain(data)
+                response = fyers.optionchain({
 
-            if response.get("s") == "ok":
+                    "symbol": symbols[index],
 
-                options = response.get("data", [])
+                    "strikecount": strike_count
 
-                if len(options):
+                })
 
-                    df = pd.DataFrame(options)
+                if response.get("s") == "ok":
 
                     st.success("Option Chain Loaded")
 
-                    st.dataframe(
-                        df,
-                        use_container_width=True,
-                        hide_index=True
-                    )
+                    # Raw Response
+                    st.json(response)
 
-                    csv = df.to_csv(index=False)
+                    # Option Data Table
+                    if "data" in response:
 
-                    st.download_button(
-                        "⬇ Download CSV",
-                        csv,
-                        "option_chain.csv",
-                        "text/csv"
-                    )
+                        try:
+
+                            df = pd.DataFrame(response["data"])
+
+                            st.dataframe(
+                                df,
+                                use_container_width=True
+                            )
+
+                            st.download_button(
+                                "⬇ Download CSV",
+                                df.to_csv(index=False),
+                                "option_chain.csv",
+                                "text/csv"
+                            )
+
+                        except:
+
+                            pass
 
                 else:
 
-                    st.warning("No Data Found")
+                    st.error(response)
 
-            else:
+            except Exception as e:
 
-                st.error(response)
+                st.error(e)
 
-        except Exception as e:
+    st.divider()
 
-            st.error(
-                "Option Chain API is not enabled or not available."
-            )
+    if st.button("🔄 Refresh"):
 
-            st.exception(e)
+        st.rerun()
