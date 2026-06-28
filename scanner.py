@@ -1,155 +1,133 @@
 import streamlit as st
 import pandas as pd
-import numpy as np
+import time
 
+# ==========================================================
+# NSE AI PRO V12 INSTITUTIONAL
+# SCANNER - PART 1
+# ==========================================================
 
-# =====================================
-# EMA
-# =====================================
-def ema(series, period):
-    return series.ewm(span=period, adjust=False).mean()
-
-
-# =====================================
-# RSI
-# =====================================
-def rsi(close, period=14):
-
-    delta = close.diff()
-
-    gain = np.where(delta > 0, delta, 0)
-    loss = np.where(delta < 0, -delta, 0)
-
-    gain = pd.Series(gain).rolling(period).mean()
-    loss = pd.Series(loss).rolling(period).mean()
-
-    rs = gain / loss
-
-    return 100 - (100 / (1 + rs))
-
-
-# =====================================
-# AI Scanner
-# =====================================
 def show_scanner(fyers):
 
-    st.title("🤖 AI Stock Scanner")
+    st.title("🚀 NSE AI PRO V12 Institutional Scanner")
 
-    symbols = st.text_area(
-        "Enter Symbols (One Per Line)",
-        """NSE:RELIANCE-EQ
-NSE:TCS-EQ
-NSE:HDFCBANK-EQ
-NSE:INFY-EQ
-NSE:ICICIBANK-EQ"""
-    )
+    # ===========================================
+    # Sidebar
+    # ===========================================
 
-    resolution = st.selectbox(
-        "Time Frame",
+    st.sidebar.header("⚙ Scanner Settings")
+
+    scanner_type = st.sidebar.selectbox(
+
+        "Scanner",
+
         [
-            "5",
-            "15",
-            "30",
-            "60",
-            "D"
+
+            "AI Scanner",
+
+            "Intraday Scanner",
+
+            "Swing Scanner",
+
+            "Breakout Scanner",
+
+            "Volume Breakout",
+
+            "Momentum Scanner",
+
+            "RSI Scanner",
+
+            "EMA Scanner",
+
+            "MACD Scanner",
+
+            "Supertrend Scanner"
+
         ]
+
     )
 
-    if st.button("🔍 Scan Stocks"):
+    market = st.sidebar.selectbox(
 
-        rows = []
+        "Market",
 
-        for symbol in symbols.splitlines():
+        [
 
-            symbol = symbol.strip()
+            "NIFTY50",
 
-            if symbol == "":
-                continue
+            "NIFTY100",
 
-            try:
+            "NIFTY200",
 
-                data = {
-                    "symbol": symbol,
-                    "resolution": resolution,
-                    "date_format": "1",
-                    "range_from": "2026-06-01",
-                    "range_to": "2026-06-30",
-                    "cont_flag": "1"
-                }
+            "NIFTY500",
 
-                response = fyers.history(data)
+            "F&O",
 
-                candles = response.get("candles", [])
+            "CUSTOM"
 
-                if len(candles) == 0:
-                    continue
+        ]
 
-                df = pd.DataFrame(
-                    candles,
-                    columns=[
-                        "Time",
-                        "Open",
-                        "High",
-                        "Low",
-                        "Close",
-                        "Volume"
-                    ]
-                )
+    )
 
-                df["EMA20"] = ema(df["Close"], 20)
-                df["EMA50"] = ema(df["Close"], 50)
-                df["RSI"] = rsi(df["Close"])
+    refresh = st.sidebar.checkbox(
+        "Auto Refresh",
+        False
+    )
 
-                last = df.iloc[-1]
+    refresh_sec = st.sidebar.slider(
+        "Refresh (Seconds)",
+        5,
+        60,
+        10
+    )
 
-                signal = "HOLD"
+    st.divider()
 
-                if (
-                    last["EMA20"] > last["EMA50"]
-                    and last["RSI"] > 60
-                ):
-                    signal = "BUY"
+    # ===========================================
+    # Manual Symbols
+    # ===========================================
 
-                elif (
-                    last["EMA20"] < last["EMA50"]
-                    and last["RSI"] < 40
-                ):
-                    signal = "SELL"
+    custom_symbols = st.text_area(
 
-                rows.append({
-                    "Symbol": symbol,
-                    "Close": round(last["Close"],2),
-                    "EMA20": round(last["EMA20"],2),
-                    "EMA50": round(last["EMA50"],2),
-                    "RSI": round(last["RSI"],2),
-                    "Signal": signal
-                })
+        "Custom Symbols (Comma Separated)",
 
-            except Exception as e:
+        "NSE:RELIANCE-EQ,NSE:TCS-EQ,NSE:INFY-EQ"
 
-                st.error(f"{symbol} : {e}")
+    )
 
-        if len(rows):
+    if market == "CUSTOM":
 
-            result = pd.DataFrame(rows)
+        symbols = [
 
-            st.success("Scan Completed")
+            x.strip()
 
-            st.dataframe(
-                result,
-                use_container_width=True,
-                hide_index=True
-            )
+            for x in custom_symbols.split(",")
 
-            csv = result.to_csv(index=False)
+            if x.strip()
 
-            st.download_button(
-                "⬇ Download CSV",
-                csv,
-                "scanner.csv",
-                "text/csv"
-            )
+        ]
 
-        else:
+    else:
 
-            st.warning("No Stocks Found")
+        # Placeholder
+        symbols = []
+
+    st.success(f"Scanner : {scanner_type}")
+
+    st.info(f"Selected Market : {market}")
+
+    st.write(f"Total Symbols : {len(symbols)}")
+
+    st.divider()
+
+    # ===========================================
+    # Placeholder
+    # ===========================================
+
+    result_placeholder = st.empty()
+
+    if refresh:
+
+        time.sleep(refresh_sec)
+
+        st.rerun()
