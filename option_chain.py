@@ -741,3 +741,133 @@ No Strong Institutional Bias
                     summary,
                     use_container_width=True
                 )
+# ==========================================================
+# OPTION CHAIN - PART 6 (FINAL)
+# AUTO REFRESH | SIGNALS | INSTITUTIONAL SCORE
+# ==========================================================
+
+                st.divider()
+
+                st.subheader("🤖 AI Institutional Signals")
+
+                try:
+
+                    ai_signal = "NEUTRAL"
+
+                    if pcr >= 1.30:
+                        ai_signal = "BUY"
+
+                    elif pcr <= 0.70:
+                        ai_signal = "SELL"
+
+                    c1, c2, c3 = st.columns(3)
+
+                    c1.metric(
+                        "AI Signal",
+                        ai_signal
+                    )
+
+                    score = 50
+
+                    if pcr > 1:
+                        score += 20
+                    else:
+                        score -= 20
+
+                    if bias == "Bullish":
+                        score += 20
+
+                    if bias == "Bearish":
+                        score -= 20
+
+                    score = max(0, min(score, 100))
+
+                    c2.metric(
+                        "Institutional Score",
+                        f"{score}/100"
+                    )
+
+                    if score >= 80:
+                        status = "🟢 Strong Bullish"
+
+                    elif score >= 60:
+                        status = "🟢 Bullish"
+
+                    elif score >= 40:
+                        status = "🟡 Neutral"
+
+                    elif score >= 20:
+                        status = "🔴 Bearish"
+
+                    else:
+                        status = "🔴 Strong Bearish"
+
+                    c3.metric(
+                        "Market Status",
+                        status
+                    )
+
+                except Exception as e:
+
+                    st.warning(e)
+
+                # ====================================
+                # Trading View
+                # ====================================
+
+                st.divider()
+
+                st.subheader("📌 Trading Suggestion")
+
+                if ai_signal == "BUY":
+
+                    st.success("""
+✅ Market Bias : Bullish
+
+• Look for CALL Buying
+• Bullish Spread
+• Bull Put Spread
+• Buy on Dips
+""")
+
+                elif ai_signal == "SELL":
+
+                    st.error("""
+❌ Market Bias : Bearish
+
+• Look for PUT Buying
+• Bear Call Spread
+• Sell on Rise
+""")
+
+                else:
+
+                    st.info("""
+⚠ Sideways Market
+
+• Iron Condor
+• Short Strangle
+• Wait for Breakout
+""")
+
+                # ====================================
+                # Footer
+                # ====================================
+
+                st.divider()
+
+                st.caption(
+                    "NSE AI PRO V12 Institutional Edition | FYERS API V3"
+                )
+
+    # ==========================================
+    # AUTO REFRESH
+    # ==========================================
+
+    if auto_refresh:
+
+        with st.spinner("Refreshing Option Chain..."):
+
+            time.sleep(refresh_time)
+
+        st.rerun()
