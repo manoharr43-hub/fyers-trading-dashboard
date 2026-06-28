@@ -661,3 +661,169 @@ def show_scanner(fyers):
         else:
 
             st.warning("No breakout stocks found.")
+# ==========================================================
+# SCANNER - PART 5
+# AI SCORE | INSTITUTIONAL RANKING | TOP PICKS
+# ==========================================================
+
+    st.divider()
+    st.subheader("🤖 AI Institutional Scanner")
+
+    if len(breakout_results):
+
+        ai_results = []
+
+        for row in breakout_results:
+
+            score = 50
+
+            # RVOL Score
+            if row["RVOL"] >= 3:
+                score += 20
+            elif row["RVOL"] >= 2:
+                score += 10
+
+            # Breakout Score
+            if row["Breakout"]:
+                score += 20
+
+            if row["Breakdown"]:
+                score -= 20
+
+            # Gap Score
+            if row["Gap %"] > 1:
+                score += 5
+
+            elif row["Gap %"] < -1:
+                score -= 5
+
+            score = max(0, min(score, 100))
+
+            # ----------------------------------
+            # AI Recommendation
+            # ----------------------------------
+
+            if score >= 90:
+                recommendation = "⭐⭐⭐⭐⭐ STRONG BUY"
+
+            elif score >= 75:
+                recommendation = "⭐⭐⭐⭐ BUY"
+
+            elif score >= 60:
+                recommendation = "⭐⭐⭐ WATCH"
+
+            elif score >= 40:
+                recommendation = "⭐⭐ HOLD"
+
+            else:
+                recommendation = "⭐ SELL"
+
+            ai_results.append({
+
+                "Symbol": row["Symbol"],
+
+                "Close": row["Close"],
+
+                "RVOL": row["RVOL"],
+
+                "Gap %": row["Gap %"],
+
+                "AI Score": score,
+
+                "Recommendation": recommendation
+
+            })
+
+        ai_df = pd.DataFrame(ai_results)
+
+        ai_df = ai_df.sort_values(
+            "AI Score",
+            ascending=False
+        )
+
+        st.dataframe(
+            ai_df,
+            use_container_width=True,
+            height=600
+        )
+
+        # =====================================
+        # TOP 10 BUY
+        # =====================================
+
+        st.divider()
+
+        st.subheader("🟢 Top 10 Buy Stocks")
+
+        buy_df = ai_df.head(10)
+
+        st.dataframe(
+            buy_df,
+            use_container_width=True
+        )
+
+        # =====================================
+        # TOP 10 SELL
+        # =====================================
+
+        st.subheader("🔴 Lowest Ranked Stocks")
+
+        sell_df = ai_df.tail(10)
+
+        st.dataframe(
+            sell_df,
+            use_container_width=True
+        )
+
+        # =====================================
+        # Dashboard Metrics
+        # =====================================
+
+        st.divider()
+
+        c1, c2, c3, c4 = st.columns(4)
+
+        c1.metric(
+            "Scanned",
+            len(ai_df)
+        )
+
+        c2.metric(
+            "BUY Candidates",
+            len(ai_df[ai_df["AI Score"] >= 75])
+        )
+
+        c3.metric(
+            "WATCH",
+            len(
+                ai_df[
+                    (ai_df["AI Score"] >= 60) &
+                    (ai_df["AI Score"] < 75)
+                ]
+            )
+        )
+
+        c4.metric(
+            "SELL",
+            len(ai_df[ai_df["AI Score"] < 40])
+        )
+
+        # =====================================
+        # Export
+        # =====================================
+
+        st.download_button(
+
+            "⬇ Download AI Scanner Report",
+
+            ai_df.to_csv(index=False),
+
+            file_name="AI_Scanner_Report.csv",
+
+            mime="text/csv"
+
+        )
+
+    else:
+
+        st.info("Run the scanner first to generate AI rankings.")
