@@ -3,7 +3,7 @@ import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
-# టెక్నికల్ ఇండికేటర్ ఫంక్షన్స్
+# టెక్నికల్ ఇండికేటర్ ఫంక్షన్స్ (Pandas ద్వారా)
 def get_ema(data, period):
     return data.ewm(span=period, adjust=False).mean()
 
@@ -20,7 +20,7 @@ def show_charts(fyers):
     
     if st.button("🚀 Load Chart"):
         try:
-            # ఫ్యర్స్ నుండి డేటా పొందడం (ఉదాహరణ)
+            # Fyers API నుండి హిస్టరీ డేటా పొందడం
             history = fyers.history({
                 "symbol": symbol, "resolution": "D",
                 "date_format": "1", "range_from": "2026-01-01",
@@ -36,15 +36,14 @@ def show_charts(fyers):
             # చార్ట్ గీయడం (Plotly)
             fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.1, row_heights=[0.7, 0.3])
             
-            # Candlestick
             fig.add_trace(go.Candlestick(x=df['Timestamp'], open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'], name='Price'), row=1, col=1)
-            # EMA
             fig.add_trace(go.Scatter(x=df['Timestamp'], y=df['EMA_20'], name='EMA 20', line=dict(color='orange')), row=1, col=1)
-            # RSI
             fig.add_trace(go.Scatter(x=df['Timestamp'], y=df['RSI'], name='RSI', line=dict(color='purple')), row=2, col=1)
             
             fig.update_layout(height=600, xaxis_rangeslider_visible=False)
+            
+            # 'use_container_width=True' వాడటం ద్వారా వార్నింగ్ రాదు
             st.plotly_chart(fig, use_container_width=True)
             
         except Exception as e:
-            st.error(f"Error: {e}")
+            st.error(f"Error loading chart: {e}")
