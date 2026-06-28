@@ -489,3 +489,175 @@ def show_scanner(fyers):
         else:
 
             st.warning("No technical scan results available.")
+# ==========================================================
+# SCANNER - PART 4
+# VOLUME BREAKOUT | PRICE BREAKOUT | RVOL | GAP SCANNER
+# ==========================================================
+
+    st.divider()
+    st.subheader("🚀 Breakout Scanner")
+
+    if len(results):
+
+        breakout_results = []
+
+        progress = st.progress(0)
+
+        total = len(results)
+
+        for i, stock in enumerate(results):
+
+            symbol = stock["Symbol"]
+
+            try:
+
+                history = fyers.history({
+
+                    "symbol": symbol,
+                    "resolution": "D",
+                    "date_format": "1",
+                    "range_from": "2026-01-01",
+                    "range_to": "2026-12-31",
+                    "cont_flag": "1"
+
+                })
+
+                if history.get("s") != "ok":
+                    continue
+
+                candles = history["candles"]
+
+                if len(candles) < 21:
+                    continue
+
+                df = pd.DataFrame(
+
+                    candles,
+
+                    columns=[
+                        "timestamp",
+                        "open",
+                        "high",
+                        "low",
+                        "close",
+                        "volume"
+                    ]
+
+                )
+
+                latest = df.iloc[-1]
+
+                avg_volume = df["volume"].tail(20).mean()
+
+                rvol = latest["volume"] / avg_volume if avg_volume > 0 else 0
+
+                breakout = latest["close"] > df["high"].tail(20).max()
+
+                breakdown = latest["close"] < df["low"].tail(20).min()
+
+                gap = (
+                    (latest["open"] - df.iloc[-2]["close"])
+                    / df.iloc[-2]["close"]
+                ) * 100
+
+                signal = "WAIT"
+
+                if breakout and rvol >= 2:
+
+                    signal = "BUY"
+
+                elif breakdown and rvol >= 2:
+
+                    signal = "SELL"
+
+                breakout_results.append({
+
+                    "Symbol": symbol,
+
+                    "Close": round(latest["close"], 2),
+
+                    "RVOL": round(rvol, 2),
+
+                    "Gap %": round(gap, 2),
+
+                    "Breakout": breakout,
+
+                    "Breakdown": breakdown,
+
+                    "Signal": signal
+
+                })
+
+            except Exception:
+
+                pass
+
+            progress.progress((i + 1) / total)
+
+        progress.empty()
+
+        if breakout_results:
+
+            breakout_df = pd.DataFrame(
+                breakout_results
+            )
+
+            st.dataframe(
+
+                breakout_df,
+
+                use_container_width=True,
+
+                height=550
+
+            )
+
+            # -----------------------
+            # Summary
+            # -----------------------
+
+            buy = len(
+                breakout_df[
+                    breakout_df.Signal == "BUY"
+                ]
+            )
+
+            sell = len(
+                breakout_df[
+                    breakout_df.Signal == "SELL"
+                ]
+            )
+
+            wait = len(
+                breakout_df[
+                    breakout_df.Signal == "WAIT"
+                ]
+            )
+
+            c1, c2, c3 = st.columns(3)
+
+            c1.metric("BUY", buy)
+
+            c2.metric("SELL", sell)
+
+            c3.metric("WAIT", wait)
+
+            # -----------------------
+            # Download
+            # -----------------------
+
+            st.download_button(
+
+                "⬇ Download Breakout Scanner",
+
+                breakout_df.to_csv(index=False),
+
+                file_name="breakout_scanner.csv",
+
+                mime="text/csv"
+
+            )
+
+        else:
+
+            st.warning("No breakout stocks found.")
