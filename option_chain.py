@@ -505,4 +505,104 @@ def show_option_chain(fyers):
 
                     "Total CE OI",
 
-                   
+                                   # ==========================================================
+                # OPTION CHAIN V2 - PART 2B
+                # COLOR TABLE | ATM HIGHLIGHT | CSV EXPORT
+                # ==========================================================
+
+                # ---------- Highest OI ----------
+                max_ce = (
+                    df[ce_oi_col].max()
+                    if ce_oi_col else 0
+                )
+
+                max_pe = (
+                    df[pe_oi_col].max()
+                    if pe_oi_col else 0
+                )
+
+                # ---------- Table Style ----------
+                def highlight_row(row):
+
+                    styles = [""] * len(row)
+
+                    # ATM Highlight
+                    if strike_col and row[strike_col] == atm:
+                        for i in range(len(styles)):
+                            styles[i] = "background-color:#FFF59D;"
+
+                    # Highest CE OI
+                    if ce_oi_col:
+                        idx = df.columns.get_loc(ce_oi_col)
+                        if row[ce_oi_col] == max_ce:
+                            styles[idx] = (
+                                "background-color:#ff5252;"
+                                "color:white;"
+                                "font-weight:bold;"
+                            )
+
+                    # Highest PE OI
+                    if pe_oi_col:
+                        idx = df.columns.get_loc(pe_oi_col)
+                        if row[pe_oi_col] == max_pe:
+                            styles[idx] = (
+                                "background-color:#4caf50;"
+                                "color:white;"
+                                "font-weight:bold;"
+                            )
+
+                    # CE Change OI
+                    if ce_change_col:
+                        idx = df.columns.get_loc(ce_change_col)
+                        if row[ce_change_col] > 0:
+                            styles[idx] = (
+                                "background-color:#ffcdd2;"
+                            )
+
+                    # PE Change OI
+                    if pe_change_col:
+                        idx = df.columns.get_loc(pe_change_col)
+                        if row[pe_change_col] > 0:
+                            styles[idx] = (
+                                "background-color:#c8e6c9;"
+                            )
+
+                    return styles
+
+                st.subheader("📊 Live Option Chain")
+
+                styled_df = df.style.apply(
+                    highlight_row,
+                    axis=1
+                )
+
+                st.dataframe(
+                    styled_df,
+                    use_container_width=True,
+                    height=700
+                )
+
+                # ---------- Top OI Summary ----------
+
+                col1, col2 = st.columns(2)
+
+                if ce_oi_col and strike_col:
+
+                    ce_row = df.loc[
+                        df[ce_oi_col].idxmax()
+                    ]
+
+                    col1.error(
+                        f"🔴 Highest CE OI : "
+                        f"{ce_row[strike_col]} | "
+                        f"{int(ce_row[ce_oi_col]):,}"
+                    )
+
+                if pe_oi_col and strike_col:
+
+                    pe_row = df.loc[
+                        df[pe_oi_col].idxmax()
+                    ]
+
+                    col2.success(
+                        f"🟢 Highest PE
