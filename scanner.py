@@ -1265,7 +1265,186 @@ def show_scanner(fyers):
             # ==========================================
             # Final Export
             # ==========================================
+# ==========================================================
+# NSE AI PRO V13 INSTITUTIONAL
+# PART 8
+# FINAL INSTITUTIONAL DASHBOARD
+# ==========================================================
 
+            st.divider()
+            st.subheader("🏆 Institutional Trading Dashboard")
+
+            total = len(smart_df)
+
+            strong_buy = len(
+                smart_df[
+                    smart_df["AI Score"] >= 90
+                ]
+            )
+
+            buy = len(
+                smart_df[
+                    (smart_df["AI Score"] >= 75) &
+                    (smart_df["AI Score"] < 90)
+                ]
+            )
+
+            watch = len(
+                smart_df[
+                    (smart_df["AI Score"] >= 60) &
+                    (smart_df["AI Score"] < 75)
+                ]
+            )
+
+            sell = len(
+                smart_df[
+                    smart_df["AI Score"] < 60
+                ]
+            )
+
+            c1, c2, c3, c4, c5 = st.columns(5)
+
+            c1.metric("Scanned", total)
+            c2.metric("🚀 Strong Buy", strong_buy)
+            c3.metric("🟢 Buy", buy)
+            c4.metric("🟡 Watch", watch)
+            c5.metric("🔴 Sell", sell)
+
+            st.divider()
+
+            # ======================================
+            # Top Picks
+            # ======================================
+
+            st.subheader("🏅 Top 5 Institutional Picks")
+
+            top5 = smart_df.sort_values(
+                "AI Score",
+                ascending=False
+            ).head(5)
+
+            st.dataframe(
+                top5,
+                use_container_width=True
+            )
+
+            # ======================================
+            # AI Recommendation
+            # ======================================
+
+            st.divider()
+
+            avg_ai = smart_df["AI Score"].mean()
+
+            if avg_ai >= 85:
+
+                recommendation = "🟢 Strong Bullish"
+
+            elif avg_ai >= 70:
+
+                recommendation = "🟢 Bullish"
+
+            elif avg_ai >= 55:
+
+                recommendation = "🟡 Neutral"
+
+            else:
+
+                recommendation = "🔴 Bearish"
+
+            st.metric(
+                "Overall Market View",
+                recommendation
+            )
+
+            # ======================================
+            # Portfolio Allocation
+            # ======================================
+
+            st.divider()
+
+            st.subheader("💼 Suggested Allocation")
+
+            allocation = pd.DataFrame({
+
+                "Category":[
+
+                    "Large Cap",
+
+                    "Mid Cap",
+
+                    "Small Cap",
+
+                    "Cash"
+
+                ],
+
+                "Allocation %":[
+
+                    40,
+
+                    30,
+
+                    20,
+
+                    10
+
+                ]
+
+            })
+
+            st.dataframe(
+                allocation,
+                use_container_width=True
+            )
+
+            # ======================================
+            # Risk Meter
+            # ======================================
+
+            st.divider()
+
+            risk = "Medium"
+
+            if avg_ai >= 85:
+                risk = "Low"
+
+            elif avg_ai < 55:
+                risk = "High"
+
+            st.metric(
+                "Risk Level",
+                risk
+            )
+
+            # ======================================
+            # Final Export
+            # ======================================
+
+            report = smart_df.copy()
+
+            report["Market View"] = recommendation
+            report["Risk"] = risk
+
+            st.download_button(
+
+                "📥 Download Final Institutional Report",
+
+                report.to_csv(index=False),
+
+                file_name="NSE_AI_PRO_V13_Final_Report.csv",
+
+                mime="text/csv"
+
+            )
+
+            st.divider()
+
+            st.success("✅ NSE AI PRO V13 Institutional Scanner Loaded Successfully")
+
+            st.info(
+                "Powered by FYERS API V3 | Streamlit | AI Institutional Engine"
+            )
             st.download_button(
                 "📥 Download Complete AI Scanner",
                 smart_df.to_csv(index=False),
