@@ -1,7 +1,6 @@
 import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
-from fyers_apiv3 import fyersModel
 
 def show_option_chain(fyers):
     st.title("📊 Master Options Chain Dashboard")
@@ -25,22 +24,18 @@ def show_option_chain(fyers):
 
     if st.button("Fetch Live Data"):
         try:
+            # API కాల్
             response = fyers.optionchain(data={"symbol": symbol, "strikecount": 20})
             
-            # API Debugging: రెస్పాన్స్ ప్రింట్ అవుతుంది
-            if response.get('s') == 'ok':
-                # ఫైయర్స్ రెస్పాన్స్‌ని పరిశీలిస్తున్నాం
+            # డేటా చెకింగ్
+            if response and response.get('s') == 'ok':
                 data = response.get('data', {})
+                options_data = data.get('options', [])
                 
-                # 'options' కీ ఉందో లేదో చూసి, ఉంటే ప్రాసెస్ చేస్తున్నాం
-                if 'options' in data:
-                    df = pd.DataFrame(data['options'])
-                else:
-                    # ఒకవేళ డేటా నేరుగా ఉంటే (కొన్నిసార్లు 'data' కీ లోనే ఉండొచ్చు)
-                    df = pd.DataFrame(data) if isinstance(data, list) else pd.DataFrame([data])
-                
-                if not df.empty and 'strike_price' in df.columns:
-                    # Key Metrics
+                if options_data:
+                    df = pd.DataFrame(options_data)
+                    
+                    # Metrics
                     col1, col2, col3 = st.columns(3)
                     pcr = df['pe_oi'].sum() / df['ce_oi'].sum() if df['ce_oi'].sum() > 0 else 0
                     col1.metric("Total CE OI", f"{df['ce_oi'].sum():,}")
@@ -48,12 +43,13 @@ def show_option_chain(fyers):
                     col3.metric("PCR", round(pcr, 2))
 
                     # Table
-                    st.dataframe(df[['strike_price', 'ce_ltp', 'ce_oi', 'pe_oi']].style.background_gradient(subset=['ce_oi', 'pe_oi'], cmap='Greens'), use_container_width=True)
+                    st.dataframe(df[['strike_price', 'ce_ltp', 'ce_oi', 'pe_oi', 'pe_ltp']].style.background_gradient(subset=['ce_oi', 'pe_oi'], cmap='Greens'), use_container_width=True)
                 else:
-                    st.warning("సింబల్ డేటా అభం లేదు.")
+                    st.warning("మార్కెట్ క్లోజ్ అయింది లేదా ప్రస్తుతం ఈ సింబల్ డేటా అందుబాటులో లేదు.")
             else:
-                st.error(f"API Error: {response.get('message')}")
+                st.error(f"API Error: {response.get('message', 'Data not found')}")
+                
         except Exception as e:
             st.error(f"System Error: {e}")
 
-
+# 
