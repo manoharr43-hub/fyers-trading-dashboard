@@ -989,4 +989,197 @@ Smart Money Exiting
 
                 else:
 
-                   
+                      # ==========================================================
+                # OPTION CHAIN V2 - PART 5
+                # FINAL ADVANCED DASHBOARD
+                # ==========================================================
+
+                st.divider()
+                st.subheader("📊 Advanced Institutional Dashboard")
+
+                # ------------------------------------------
+                # Market Strength
+                # ------------------------------------------
+
+                if pcr >= 1.30:
+                    market_strength = "🟢 Strong Bullish"
+
+                elif pcr >= 1.00:
+                    market_strength = "🟢 Bullish"
+
+                elif pcr >= 0.80:
+                    market_strength = "🟡 Sideways"
+
+                elif pcr >= 0.60:
+                    market_strength = "🔴 Bearish"
+
+                else:
+                    market_strength = "🔴 Strong Bearish"
+
+                c1, c2, c3 = st.columns(3)
+
+                c1.metric(
+                    "Market Strength",
+                    market_strength
+                )
+
+                c2.metric(
+                    "Spot Price",
+                    round(spot, 2)
+                )
+
+                c3.metric(
+                    "ATM Strike",
+                    atm
+                )
+
+                st.divider()
+
+                # ------------------------------------------
+                # OI Interpretation
+                # ------------------------------------------
+
+                st.subheader("📈 OI Interpretation")
+
+                if total_pe > total_ce:
+
+                    st.success("""
+🟢 Heavy Put Writing
+
+• Strong Support
+
+• Institutions Bullish
+
+• Buy on Dips
+""")
+
+                elif total_ce > total_pe:
+
+                    st.error("""
+🔴 Heavy Call Writing
+
+• Strong Resistance
+
+• Institutions Bearish
+
+• Sell on Rise
+""")
+
+                else:
+
+                    st.info("""
+🟡 Balanced OI
+
+No Clear Direction
+""")
+
+                # ------------------------------------------
+                # Support & Resistance Table
+                # ------------------------------------------
+
+                st.divider()
+
+                sr = pd.DataFrame({
+
+                    "Level":[
+
+                        "Support",
+
+                        "ATM",
+
+                        "Resistance",
+
+                        "Max Pain"
+
+                    ],
+
+                    "Strike":[
+
+                        support,
+
+                        atm,
+
+                        resistance,
+
+                        max_pain
+
+                    ]
+
+                })
+
+                st.subheader("🎯 Important Levels")
+
+                st.dataframe(
+                    sr,
+                    use_container_width=True
+                )
+
+                # ------------------------------------------
+                # Institutional Checklist
+                # ------------------------------------------
+
+                st.divider()
+
+                checklist = pd.DataFrame({
+
+                    "Parameter":[
+
+                        "PCR",
+
+                        "Long Build-up",
+
+                        "Support",
+
+                        "Resistance",
+
+                        "Max Pain",
+
+                        "AI Score"
+
+                    ],
+
+                    "Status":[
+
+                        round(pcr,2),
+
+                        build_up,
+
+                        support,
+
+                        resistance,
+
+                        max_pain,
+
+                        score
+
+                    ]
+
+                })
+
+                st.subheader("✅ Institutional Checklist")
+
+                st.dataframe(
+
+                    checklist,
+
+                    use_container_width=True
+
+                )
+
+                # ------------------------------------------
+                # Excel Ready Export
+                # ------------------------------------------
+
+                st.download_button(
+
+                    "📥 Download Complete Option Chain",
+
+                    df.to_csv(index=False),
+
+                    file_name=f"{name}_Institutional_OptionChain.csv",
+
+                    mime="text/csv"
+
+                )
+
+                            
