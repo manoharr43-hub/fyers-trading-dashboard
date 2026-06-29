@@ -1,74 +1,179 @@
 import streamlit as st
 import pandas as pd
+import numpy as np
+from datetime import datetime
 import time
 
+# ==========================================================
+# NSE AI PRO V13 INSTITUTIONAL
+# ADVANCED AI SCANNER
+# PART 1
+# ==========================================================
+
 def show_scanner(fyers):
-    st.title("🚀 NSE AI PRO V12 Institutional Scanner")
 
-    # 1. Sidebar
-    st.sidebar.header("⚙ Scanner Settings")
-    scanner_type = st.sidebar.selectbox("Scanner", ["AI Scanner", "Intraday Scanner", "Breakout Scanner"])
-    market = st.sidebar.selectbox("Market", ["NIFTY50", "NIFTY500", "CUSTOM"])
-    refresh = st.sidebar.checkbox("Auto Refresh", False)
-    refresh_sec = st.sidebar.slider("Refresh (Seconds)", 5, 60, 10)
+    st.title("🚀 NSE AI PRO V13 Institutional Scanner")
 
-    # 2. Variable Initialization (Fixes the UnboundLocalError)
-    results = []
-    breakout_results = []
-    ai_results = []
+    # ======================================================
+    # Sidebar
+    # ======================================================
 
-    # Custom Symbols
-    custom_symbols = st.text_area("Custom Symbols (Comma Separated)", "NSE:RELIANCE-EQ,NSE:TCS-EQ,NSE:INFY-EQ")
-    symbols = [x.strip() for x in custom_symbols.split(",") if x.strip()] if market == "CUSTOM" else []
+    st.sidebar.header("⚙ Scanner Filters")
 
-    if st.button("🚀 Run Scanner", use_container_width=True):
-        progress = st.progress(0)
-        total = max(len(symbols), 1)
+    scanner_type = st.sidebar.selectbox(
 
-        # Part 2: Live Quotes
-        for i, symbol in enumerate(symbols):
-            try:
-                quote = fyers.quotes({"symbols": symbol})
-                if quote.get("s") == "ok":
-                    q = quote["d"][0]["v"]
-                    results.append({"Symbol": symbol, "LTP": q.get("lp"), "Change %": q.get("chp"), "Volume": q.get("volume")})
-            except: pass
-            progress.progress((i + 1) / total)
-        progress.empty()
+        "Scanner Type",
 
-        # Part 3 & 4: Technical & Breakout Logic
-        for stock in results:
-            # Simulated Breakout Logic for Demo
-            breakout_results.append({
-                "Symbol": stock["Symbol"], "Close": stock["LTP"], 
-                "RVOL": 2.5, "Gap %": 0.5, "Breakout": True, "Breakdown": False, "Signal": "BUY"
-            })
+        [
 
-        # Part 5: AI Scoring
-        for row in breakout_results:
-            ai_results.append({
-                "Symbol": row["Symbol"], "AI Score": 85, "Recommendation": "⭐⭐⭐⭐ BUY"
-            })
+            "AI Institutional",
 
-    # Part 6: Display Tables (These will work now even if scanner hasn't run)
+            "Intraday",
+
+            "Swing",
+
+            "Momentum",
+
+            "Breakout",
+
+            "Volume Breakout",
+
+            "Golden Cross",
+
+            "Smart Money",
+
+            "52 Week High",
+
+            "52 Week Low"
+
+        ]
+
+    )
+
+    market = st.sidebar.selectbox(
+
+        "Market",
+
+        [
+
+            "NIFTY50",
+
+            "NIFTY100",
+
+            "NIFTY200",
+
+            "NIFTY500",
+
+            "F&O"
+
+        ]
+
+    )
+
+    min_rvol = st.sidebar.slider(
+
+        "Minimum RVOL",
+
+        1.0,
+
+        10.0,
+
+        2.0,
+
+        0.1
+
+    )
+
+    min_ai = st.sidebar.slider(
+
+        "Minimum AI Score",
+
+        0,
+
+        100,
+
+        70
+
+    )
+
+    only_golden = st.sidebar.checkbox(
+
+        "Golden Cross Only"
+
+    )
+
+    only_smart = st.sidebar.checkbox(
+
+        "Smart Money Only"
+
+    )
+
+    only_52high = st.sidebar.checkbox(
+
+        "Near 52 Week High"
+
+    )
+
+    only_fnO = st.sidebar.checkbox(
+
+        "F&O Stocks Only"
+
+    )
+
+    auto_refresh = st.sidebar.checkbox(
+
+        "Auto Refresh"
+
+    )
+
+    refresh = st.sidebar.slider(
+
+        "Refresh Seconds",
+
+        5,
+
+        60,
+
+        10
+
+    )
+
     st.divider()
-    st.subheader("🚀 Breakout Scanner Results")
-    if breakout_results:
-        st.dataframe(pd.DataFrame(breakout_results), use_container_width=True)
-    else:
-        st.info("Run scanner to see Breakout results.")
 
-    st.subheader("🤖 AI Institutional Scanner")
-    if ai_results:
-        st.dataframe(pd.DataFrame(ai_results), use_container_width=True)
-        st.success("✅ AI Scan Complete")
-    else:
-        st.info("Run scanner to see AI rankings.")
+    # ======================================================
+    # Dashboard
+    # ======================================================
 
-    # Refresh
-    if refresh:
-        time.sleep(refresh_sec)
+    c1,c2,c3,c4,c5,c6 = st.columns(6)
+
+    c1.metric("Stocks","0")
+
+    c2.metric("BUY","0")
+
+    c3.metric("SELL","0")
+
+    c4.metric("Golden","0")
+
+    c5.metric("Smart","0")
+
+    c6.metric("52W High","0")
+
+    st.divider()
+
+    st.subheader("📊 AI Scanner")
+
+    scan_button = st.button(
+
+        "🚀 Run AI Scanner",
+
+        use_container_width=True
+
+    )
+
+    result_placeholder = st.empty()
+
+    if auto_refresh:
+
+        time.sleep(refresh)
+
         st.rerun()
-
-    st.divider()
-    st.caption("NSE AI PRO V12 Institutional Edition | Powered by FYERS API V3")
