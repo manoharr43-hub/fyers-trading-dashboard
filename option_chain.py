@@ -170,3 +170,173 @@ def show_option_chain(fyers):
         return
 
     # ===== PART 2 STARTS BELOW =====
+    # ==========================================================
+    # PART 2
+    # LOAD OPTION CHAIN DATA
+    # ==========================================================
+
+    with st.spinner("Loading Option Chain..."):
+
+        try:
+
+            response = fyers.optionchain({
+                "symbol": symbol,
+                "strikecount": strike_count
+            })
+
+        except Exception as e:
+
+            st.error(f"Option Chain API Error : {e}")
+            return
+
+    if not isinstance(response, dict):
+
+        st.error("Invalid API Response")
+        return
+
+    if response.get("s") != "ok":
+
+        st.error(response)
+        return
+
+    option_data = response.get("data", {})
+
+    # ==========================================
+    # Expiry Dates
+    # ==========================================
+
+    expiry_list = []
+
+    if isinstance(option_data, dict):
+
+        expiry_list = (
+            option_data.get("expiryData")
+            or option_data.get("expiryDates")
+            or option_data.get("expiries")
+            or []
+        )
+
+    if expiry_list:
+
+        expiry = st.selectbox(
+            "Select Expiry",
+            expiry_list
+        )
+
+    # ==========================================
+    # Option Chain
+    # ==========================================
+
+    chain = (
+        option_data.get("optionsChain")
+        or option_data.get("optionChain")
+        or option_data.get("chain")
+    )
+
+    if chain is None:
+
+        st.warning("Option Chain data not available.")
+        return
+
+    df = pd.DataFrame(chain)
+
+    if df.empty:
+
+        st.warning("Empty Option Chain")
+        return
+
+    # ==========================================
+    # Auto Detect Columns
+    # ==========================================
+
+    strike_col = None
+    ce_oi_col = None
+    pe_oi_col = None
+    ce_change_col = None
+    pe_change_col = None
+
+    for col in df.columns:
+
+        x = str(col).lower()
+
+        if "strike" in x:
+
+            strike_col = col
+
+        elif "ce" in x and "oi" in x and "change" not in x:
+
+            ce_oi_col = col
+
+        elif "pe" in x and "oi" in x and "change" not in x:
+
+            pe_oi_col = col
+
+        elif "ce" in x and "change" in x:
+
+            ce_change_col = col
+
+        elif "pe" in x and "change" in x:
+
+            pe_change_col = col
+
+    # ==========================================
+    # Convert Numeric
+    # ==========================================
+
+    numeric_cols = [
+        strike_col,
+        ce_oi_col,
+        pe_oi_col,
+        ce_change_col,
+        pe_change_col
+    ]
+
+    for col in numeric_cols:
+
+        if col:
+
+            df[col] = pd.to_numeric(
+                df[col],
+                errors="coerce"
+            ).fillna(0)
+
+    # ==========================================
+    # Total OI
+    # ==========================================
+
+    total_ce = df[ce_oi_col].sum() if ce_oi_col else 0
+    total_pe = df[pe_oi_col].sum() if pe_oi_col else 0
+
+    total_ce_change = (
+        df[ce_change_col].sum()
+        if ce_change_col else 0
+    )
+
+    total_pe_change = (
+        df[pe_change_col].sum()
+        if pe_change_col else 0
+    )
+
+    pcr = round(
+        total_pe / total_ce,
+        2
+    ) if total_ce else 0
+
+    # ==========================================
+    # ATM Strike
+    # ==========================================
+
+    atm = "--"
+
+    if strike_col:
+
+        df["DIFF"] = (
+            df[strike_col] - spot
+        ).abs()
+
+        atm = df.loc[
+            df["DIFF"].idxmin(),
+            strike_col
+        ]
+
+    # ===== PART 3 STARTS BELOW =====
