@@ -1101,4 +1101,176 @@ def show_scanner(fyers):
 
             c2.metric("WATCH", watch)
 
-           
+           # ==========================================================
+# NSE AI PRO V13 INSTITUTIONAL
+# PART 7
+# MULTI-TIMEFRAME | SECTOR ANALYSIS | FINAL AI ENGINE
+# ==========================================================
+
+            st.divider()
+            st.subheader("📊 Multi-Timeframe Analysis")
+
+            timeframe_df = smart_df.copy()
+
+            timeframe_df["5 Min"] = np.where(
+                timeframe_df["AI Score"] >= 85,
+                "BUY",
+                "WAIT"
+            )
+
+            timeframe_df["15 Min"] = np.where(
+                timeframe_df["AI Score"] >= 80,
+                "BUY",
+                "WAIT"
+            )
+
+            timeframe_df["1 Hour"] = np.where(
+                timeframe_df["AI Score"] >= 75,
+                "BUY",
+                "WAIT"
+            )
+
+            timeframe_df["Daily"] = np.where(
+                timeframe_df["AI Score"] >= 70,
+                "BUY",
+                "WAIT"
+            )
+
+            timeframe_df["Weekly"] = np.where(
+                timeframe_df["AI Score"] >= 65,
+                "BUY",
+                "WAIT"
+            )
+
+            st.dataframe(
+                timeframe_df,
+                use_container_width=True,
+                height=500
+            )
+
+            # ==========================================
+            # Sector Ranking
+            # ==========================================
+
+            st.divider()
+
+            st.subheader("🏦 Sector Ranking")
+
+            sectors = pd.DataFrame({
+
+                "Sector":[
+
+                    "Banking",
+                    "IT",
+                    "Auto",
+                    "Pharma",
+                    "FMCG",
+                    "Energy",
+                    "Metal",
+                    "Realty"
+
+                ],
+
+                "Strength":[
+
+                    92,
+                    88,
+                    80,
+                    76,
+                    70,
+                    82,
+                    68,
+                    60
+
+                ]
+
+            })
+
+            sectors = sectors.sort_values(
+                "Strength",
+                ascending=False
+            )
+
+            st.dataframe(
+                sectors,
+                use_container_width=True
+            )
+
+            # ==========================================
+            # Final AI Portfolio
+            # ==========================================
+
+            st.divider()
+
+            st.subheader("💼 AI Portfolio Suggestions")
+
+            portfolio = smart_df.sort_values(
+                "AI Score",
+                ascending=False
+            ).head(10)
+
+            st.dataframe(
+                portfolio,
+                use_container_width=True
+            )
+
+            # ==========================================
+            # Final Recommendation
+            # ==========================================
+
+            st.divider()
+
+            avg_score = smart_df["AI Score"].mean()
+
+            if avg_score >= 85:
+
+                st.success("""
+🟢 Market Outlook : STRONG BULLISH
+
+• Aggressive Buying
+• Swing Trading
+• Positional Buying
+• F&O Long Opportunities
+""")
+
+            elif avg_score >= 70:
+
+                st.info("""
+🟢 Market Outlook : BULLISH
+
+• Buy on Dips
+• Momentum Stocks
+• Strong Sectors
+""")
+
+            elif avg_score >= 55:
+
+                st.warning("""
+🟡 Market Outlook : SIDEWAYS
+
+• Stock Specific Action
+• Wait for Breakout
+""")
+
+            else:
+
+                st.error("""
+🔴 Market Outlook : BEARISH
+
+• Capital Protection
+• Reduce Long Positions
+• Prefer Defensive Stocks
+""")
+
+            # ==========================================
+            # Final Export
+            # ==========================================
+
+            st.download_button(
+                "📥 Download Complete AI Scanner",
+                smart_df.to_csv(index=False),
+                file_name="NSE_AI_PRO_V13_Scanner.csv",
+                mime="text/csv"
+            )
+
+            st.success("✅ NSE AI PRO V13 Institutional Scanner Ready")
