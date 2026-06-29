@@ -712,3 +712,225 @@ def show_scanner(fyers):
                 mime="text/csv"
 
             )
+# ==========================================================
+# NSE AI PRO V13 INSTITUTIONAL
+# PART 5
+# BREAKOUT | MOMENTUM | HEATMAP | INSTITUTIONAL RANK
+# ==========================================================
+
+            st.divider()
+
+            st.subheader("🏦 Institutional Ranking")
+
+            institutional_data = []
+
+            for _, row in final_df.iterrows():
+
+                breakout = False
+                momentum = "Neutral"
+                rank = "C"
+
+                # ----------------------------------------
+                # Breakout Logic
+                # ----------------------------------------
+
+                if row["AI Score"] >= 90:
+
+                    breakout = True
+                    momentum = "Very Strong"
+                    rank = "A+"
+
+                elif row["AI Score"] >= 80:
+
+                    breakout = True
+                    momentum = "Strong"
+                    rank = "A"
+
+                elif row["AI Score"] >= 70:
+
+                    momentum = "Positive"
+                    rank = "B+"
+
+                elif row["AI Score"] >= 60:
+
+                    momentum = "Average"
+                    rank = "B"
+
+                else:
+
+                    momentum = "Weak"
+                    rank = "C"
+
+                # ----------------------------------------
+                # Swing Probability
+                # ----------------------------------------
+
+                swing = min(
+                    100,
+                    int(row["AI Score"] * 0.95)
+                )
+
+                intraday = min(
+                    100,
+                    int(row["RVOL"] * 25)
+                )
+
+                # ----------------------------------------
+                # Final Institutional Rank
+                # ----------------------------------------
+
+                institutional_data.append({
+
+                    "Symbol": row["Symbol"],
+
+                    "AI Score": row["AI Score"],
+
+                    "Institution Rank": rank,
+
+                    "Momentum": momentum,
+
+                    "Breakout": breakout,
+
+                    "Swing %": swing,
+
+                    "Intraday %": intraday,
+
+                    "Signal": row["Signal"]
+
+                })
+
+            inst_df = pd.DataFrame(institutional_data)
+
+            inst_df = inst_df.sort_values(
+
+                "AI Score",
+
+                ascending=False
+
+            )
+
+            st.dataframe(
+
+                inst_df,
+
+                use_container_width=True,
+
+                height=650
+
+            )
+
+            # ===========================================
+            # HEAT MAP
+            # ===========================================
+
+            st.divider()
+
+            st.subheader("🔥 Market Heat Map")
+
+            strong_buy = len(
+
+                inst_df[
+                    inst_df["AI Score"] >= 90
+                ]
+
+            )
+
+            buy = len(
+
+                inst_df[
+                    (inst_df["AI Score"] >= 75)
+                    &
+                    (inst_df["AI Score"] < 90)
+                ]
+
+            )
+
+            watch = len(
+
+                inst_df[
+                    (inst_df["AI Score"] >= 60)
+                    &
+                    (inst_df["AI Score"] < 75)
+                ]
+
+            )
+
+            sell = len(
+
+                inst_df[
+                    inst_df["AI Score"] < 60
+                ]
+
+            )
+
+            h1,h2,h3,h4 = st.columns(4)
+
+            h1.success(f"🚀 Strong Buy : {strong_buy}")
+
+            h2.info(f"🟢 Buy : {buy}")
+
+            h3.warning(f"🟡 Watch : {watch}")
+
+            h4.error(f"🔴 Sell : {sell}")
+
+            # ===========================================
+            # TOP PICKS
+            # ===========================================
+
+            st.divider()
+
+            st.subheader("🏆 Top Institutional Picks")
+
+            st.dataframe(
+
+                inst_df.head(15),
+
+                use_container_width=True
+
+            )
+
+            st.subheader("⚠ Weak Stocks")
+
+            st.dataframe(
+
+                inst_df.tail(15),
+
+                use_container_width=True
+
+            )
+
+            # ===========================================
+            # ALERTS
+            # ===========================================
+
+            st.divider()
+
+            st.subheader("🚨 Live Scanner Alerts")
+
+            if strong_buy > 0:
+
+                st.success(
+
+                    f"🚀 {strong_buy} Strong Buy opportunities detected."
+
+                )
+
+            if sell > 0:
+
+                st.error(
+
+                    f"🔴 {sell} Weak stocks detected."
+
+                )
+
+            # ===========================================
+            # EXPORT
+            # ===========================================
+
+            st.download_button(
+
+                "📥 Download Institutional Scanner",
+
+                inst_df.to_csv(index=False),
+
+                file_name="Institutional
