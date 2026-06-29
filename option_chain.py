@@ -1,256 +1,290 @@
-1import streamlit as st
+import streamlit as st
+import pandas as pd
+import time
+
+# ==========================================================
+# NSE AI PRO V12 INSTITUTIONAL
+# OPTION CHAIN V2 - PART 1
+# ==========================================================
 
 def show_option_chain(fyers):
-    # Part 1: Settings & Navigation
-    st.title("📊 NSE AI PRO V12 - Institutional Option Chain")
-    
-    st.sidebar.header("⚙️ Option Chain Settings")
-    
-    # 1. Index/Stock Selection
-    symbol_map = {
-        "NIFTY": "NSE:NIFTY50-INDEX", 
-        "BANKNIFTY": "NSE:NIFTYBANK-INDEX", 
-        "FINNIFTY": "NSE:FINNIFTY-INDEX", 
-        "MIDCPNIFTY": "NSE:MIDCPNIFTY-INDEX", 
-        "SENSEX": "BSE:SENSEX-INDEX", 
-        "BANKEX": "BSE:BANKEX-INDEX"
+
+    st.title("📊 NSE AI PRO V12 Institutional Option Chain")
+
+    # ==========================================
+    # Sidebar
+    # ==========================================
+
+    st.sidebar.header("⚙ Option Chain Settings")
+
+    asset_type = st.sidebar.radio(
+
+        "Market",
+
+        [
+
+            "INDEX",
+
+            "F&O STOCK"
+
+        ]
+
+    )
+
+    # ==========================================
+    # Index List
+    # ==========================================
+
+    index_symbols = {
+
+        "NIFTY":"NSE:NIFTY50-INDEX",
+
+        "BANKNIFTY":"NSE:NIFTYBANK-INDEX",
+
+        "FINNIFTY":"NSE:FINNIFTY-INDEX",
+
+        "MIDCPNIFTY":"NSE:MIDCPNIFTY-INDEX",
+
+        "SENSEX":"BSE:SENSEX-INDEX",
+
+        "BANKEX":"BSE:BANKEX-INDEX"
+
     }
-    
-    index = st.sidebar.selectbox("Select Index", list(symbol_map.keys()))
-    
-    # 2. Strike Count Selection
-    strike_count = st.sidebar.slider("Strike Count", min_value=5, max_value=30, value=10)
-    
-    # 3. Auto Refresh Toggle
-    auto_refresh = st.sidebar.checkbox("Auto Refresh", value=False)
-    refresh_time = st.sidebar.slider("Refresh Seconds", 5, 60, 10)
-    
-    # 4. Spot Price Display Section
-    st.subheader("📈 Market Spot Price")
-    try:
-        quote = fyers.quotes({"symbols": symbol_map[index]})
-        if quote.get("s") == "ok":
-            q = quote["d"][0]["v"]
-            c1, c2, c3 = st.columns(3)
-            c1.metric("Spot Price", q.get("lp", 0), q.get("ch", 0))
-            c2.metric("Day High", q.get("high_price", "-"))
-            c3.metric("Day Low", q.get("low_price", "-"))
-        else:
-            st.error("Could not fetch spot price.")
-    except Exception as e:
-        st.error(f"Error: {e}")
-        
-    st.divider()
-    
-    # ఇక్కడి నుండి Part 2 (Load Data) మొదలవుతుంది
-    # Part 2: Data Loading & Table Display
-    st.subheader("📊 Live Option Chain Data")
-    
-    # 1. Load Data Button
-    if st.button("🔄 Load Institutional Data", use_container_width=True):
-        with st.spinner("Fetching Data..."):
-            try:
-                res = fyers.optionchain({"symbol": symbol_map[index], "strikecount": strike_count})
-                data = res.get("data", {}).get("optionsChain", [])
-                st.session_state.oc_df = pd.DataFrame(data)
-                st.rerun() # డేటా లోడ్ అయ్యాక పేజీని రీఫ్రెష్ చేస్తుంది
-            except Exception as e:
-                st.error(f"Error: {e}")
 
-    # 2. Display logic (డేటా ఉంటేనే చూపుతుంది)
-    if "oc_df" in st.session_state and not st.session_state.oc_df.empty:
-        df = st.session_state.oc_df
-        
-        # Expiry Selection Box (టాప్‌లో)
-        if 'expiry' in df.columns:
-            selected_expiry = st.selectbox("📅 Select Expiry", df['expiry'].unique())
-            df = df[df['expiry'] == selected_expiry].copy()
-        
-        # Calculations (Totals)
-        df['oi'] = pd.to_numeric(df['oi'], errors='coerce').fillna(0)
-        ce_total = df[df['option_type'] == 'CE']['oi'].sum()
-        pe_total = df[df['option_type'] == 'PE']['oi'].sum()
+    # ==========================================
+    # Popular F&O Stocks
+    # ==========================================
 
-        # Top Metrics
-        c1, c2 = st.columns(2)
-        c1.metric("Total CE OI", f"{int(ce_total):,}")
-        c2.metric("Total PE OI", f"{int(pe_total):,}")
+    fo_symbols = {
 
-        # Color Coding (CE=Red, PE=Green)
-        def highlight_rows(row):
-            color = '#ffcccc' if row.get('option_type') == 'CE' else '#ccffcc'
-            return [f'background-color: {color}'] * len(row)
+        "RELIANCE":"NSE:RELIANCE-EQ",
 
-        st.dataframe(df.style.apply(highlight_rows, axis=1), use_container_width=True)
-        
+        "TCS":"NSE:TCS-EQ",
+
+        "INFY":"NSE:INFY-EQ",
+
+        "HDFCBANK":"NSE:HDFCBANK-EQ",
+
+        "ICICIBANK":"NSE:ICICIBANK-EQ",
+
+        "SBIN":"NSE:SBIN-EQ",
+
+        "AXISBANK":"NSE:AXISBANK-EQ",
+
+        "LT":"NSE:LT-EQ",
+
+        "BHARTIARTL":"NSE:BHARTIARTL-EQ",
+
+        "MARUTI":"NSE:MARUTI-EQ",
+
+        "TATAMOTORS":"NSE:TATAMOTORS-EQ",
+
+        "ADANIENT":"NSE:ADANIENT-EQ"
+
+    }
+
+    if asset_type=="INDEX":
+
+        name = st.sidebar.selectbox(
+
+            "Select Index",
+
+            list(index_symbols.keys())
+
+        )
+
+        symbol = index_symbols[name]
+
     else:
-        st.info("👈 సెట్టింగ్స్ మార్చి, బటన్ క్లిక్ చేసి డేటాను లోడ్ చేయండి.")
-        
-    # Part 3: Open Interest Analysis (PCR, Support, Resistance)
-    st.divider()
-    st.subheader("📊 Open Interest Analysis")
+
+        search = st.sidebar.text_input(
+
+            "Search Stock"
+
+        )
+
+        stock_list = sorted(fo_symbols.keys())
+
+        if search:
+
+            stock_list = [
+
+                x for x in stock_list
+
+                if search.upper() in x
+
+            ]
+
+        name = st.sidebar.selectbox(
+
+            "Select Stock",
+
+            stock_list
+
+        )
+
+        symbol = fo_symbols[name]
+
+    strike_count = st.sidebar.slider(
+
+        "Strike Count",
+
+        5,
+
+        30,
+
+        15
+
+    )
+
+    auto_refresh = st.sidebar.checkbox(
+
+        "Auto Refresh",
+
+        False
+
+    )
+
+    refresh_time = st.sidebar.slider(
+
+        "Refresh Time",
+
+        5,
+
+        60,
+
+        10
+
+    )
+
+    # ==========================================
+    # Live Spot
+    # ==========================================
+
+    st.subheader("📈 Live Spot")
 
     try:
-        if "oc_df" in st.session_state and not st.session_state.oc_df.empty:
-            analysis_df = st.session_state.oc_df.copy()
-            
-            # CE & PE OI డేటా తయారీ
-            ce_df = analysis_df[analysis_df['option_type'] == 'CE']
-            pe_df = analysis_df[analysis_df['option_type'] == 'PE']
-            
-            total_ce = ce_df['oi'].sum()
-            total_pe = pe_df['oi'].sum()
-            
-            # PCR లెక్కించడం
-            pcr = (total_pe / total_ce) if total_ce != 0 else 0
-            
-            c1, c2, c3 = st.columns(3)
-            c1.metric("PCR", round(pcr, 2))
-            c2.metric("Total CE OI", f"{int(total_ce):,}")
-            c3.metric("Total PE OI", f"{int(total_pe):,}")
-            
-            # సపోర్ట్ మరియు రెసిస్టెన్స్ (Max OI based)
-            resistance = ce_df.loc[ce_df['oi'].idxmax()]['strike_price']
-            support = pe_df.loc[pe_df['oi'].idxmax()]['strike_price']
-            
-            c1, c2 = st.columns(2)
-            c1.error(f"🛑 Resistance (Max CE OI): {resistance}")
-            c2.success(f"🟢 Support (Max PE OI): {support}")
-            
-            # మార్కెట్ ఇంటర్‌ప్రెటేషన్
-            st.subheader("📌 Market Interpretation")
-            if pcr > 1.3:
-                st.success("Bullish Sentiment (High Put Writing)")
-            elif pcr < 0.7:
-                st.error("Bearish Sentiment (High Call Writing)")
-            else:
-                st.info("Neutral Market")
-                
+
+        quote = fyers.quotes({
+
+            "symbols":symbol
+
+        })
+
+        q = quote["d"][0]["v"]
+
+        spot = q["lp"]
+
+        col1,col2,col3,col4 = st.columns(4)
+
+        col1.metric(
+
+            "Spot",
+
+            spot,
+
+            q["ch"]
+
+        )
+
+        col2.metric(
+
+            "High",
+
+            q["high_price"]
+
+        )
+
+        col3.metric(
+
+            "Low",
+
+            q["low_price"]
+
+        )
+
+        col4.metric(
+
+            "Volume",
+
+            f"{q['volume']:,}"
+
+        )
+
     except Exception as e:
-        st.warning(f"Analysis Error: {e}")
-        
-    # Part 4: Institutional OI Build-up & Institutional View
+
+        st.error(e)
+
     st.divider()
-    st.subheader("🏦 Institutional OI Analysis")
 
-    try:
-        if "oc_df" in st.session_state and not st.session_state.oc_df.empty:
-            df = st.session_state.oc_df
-            
-            # OI మార్పులను లెక్కించడం (Change in OI)
-            # ఒకవేళ కాలమ్ పేరు 'change_in_oi' లేకపోతే, అదనపు డేటా కోసం API డాక్యుమెంటేషన్ చూడండి
-            if 'change_in_oi' in df.columns:
-                df['change_in_oi'] = pd.to_numeric(df['change_in_oi'], errors='coerce').fillna(0)
-                ce_coi = df[df['option_type'] == 'CE']['change_in_oi'].sum()
-                pe_coi = df[df['option_type'] == 'PE']['oi'].sum() # PE OI ని కూడా పరిగణనలోకి తీసుకోవచ్చు
-                
-                st.metric("Total CE Change OI", f"{int(ce_coi):,}")
-            
-            # మార్కెట్ బయాస్ (PCR ఆధారంగా)
-            pcr = (df[df['option_type'] == 'PE']['oi'].sum() / df[df['option_type'] == 'CE']['oi'].sum())
-            
-            signal = "Neutral"
-            if pcr > 1.20: signal = "Bullish"
-            elif pcr < 0.80: signal = "Bearish"
+    # ==========================================
+    # Dynamic Expiry
+    # ==========================================
 
-            col1, col2 = st.columns(2)
-            col1.metric("Market Bias", signal)
-            
-            if signal == "Bullish": col2.success("Long Build-up Possible")
-            elif signal == "Bearish": col2.error("Short Build-up Possible")
-            else: col2.info("Sideways Market")
+    st.subheader("📅 Expiry")
 
-            # ఇన్‌స్టిట్యూషనల్ వ్యూ
-            st.subheader("🎯 Institutional View")
-            if pcr >= 1.40:
-                st.success("Large Put Writing Detected • Strong Support • Institutions Bullish")
-            elif pcr <= 0.60:
-                st.error("Heavy Call Writing Detected • Strong Resistance • Institutions Bearish")
-            else:
-                st.info("Balanced Open Interest • No Strong Institutional Bias")
-                
-    except Exception as e:
-        st.warning(f"Institutional Analysis Error: {e}")
-        
-    # Part 5: Max Pain Analysis, Heatmap & Export
+    expiry_placeholder = st.empty()
+
+    expiry = expiry_placeholder.selectbox(
+
+        "Expiry",
+
+        [
+
+            "Loading Expiry..."
+
+        ]
+
+    )
+
+    st.info(
+
+        "✔ Live Expiry dates will load automatically in Part 2."
+
+    )
+
+    # ==========================================
+    # ATM
+    # ==========================================
+
+    st.subheader("🎯 ATM Strike")
+
+    atm_placeholder = st.empty()
+
+    atm_placeholder.metric(
+
+        "ATM Strike",
+
+        "--"
+
+    )
+
     st.divider()
-    st.subheader("📌 Analytics & Export")
 
-    try:
-        if "oc_df" in st.session_state and not st.session_state.oc_df.empty:
-            df = st.session_state.oc_df
-            
-            # 1. Max Pain Analysis (Strike with highest total OI)
-            # CE OI + PE OI ని కలిపి గరిష్ట విలువ ఉన్న Strike Price ని Max Pain గా భావిస్తాము
-            df_group = df.groupby('strike_price')[['oi']].sum()
-            max_pain_strike = df_group['oi'].idxmax()
-            
-            c1, c2 = st.columns(2)
-            c1.metric("🎯 Max Pain Strike", max_pain_strike)
-            
-            # 2. Top 10 CE/PE Writers
-            c1, c2 = st.columns(2)
-            with c1:
-                st.subheader("🔴 Top CE Writers")
-                st.dataframe(df[df['option_type'] == 'CE'].nlargest(5, 'oi')[['strike_price', 'oi']])
-            with c2:
-                st.subheader("🟢 Top PE Writers")
-                st.dataframe(df[df['option_type'] == 'PE'].nlargest(5, 'oi')[['strike_price', 'oi']])
-            
-            # 3. Heatmap
-            st.subheader("🔥 OI Heatmap")
-            heatmap_data = df.pivot(index='strike_price', columns='option_type', values='oi')
-            st.dataframe(heatmap_data.style.background_gradient(cmap='RdYlGn'), use_container_width=True)
-            
-            # 4. Export
-            csv = df.to_csv(index=False)
-            st.download_button("⬇ Download Institutional Report", csv, "Institutional_Report.csv", "text/csv")
+    # ==========================================
+    # Summary Cards
+    # ==========================================
 
-    except Exception as e:
-        st.warning(f"Analytics Error: {e}")
-            # Part 6: AI Institutional Signals & Final Summary
+    c1,c2,c3,c4,c5,c6 = st.columns(6)
+
+    c1.metric("Total CE OI","--")
+
+    c2.metric("Total PE OI","--")
+
+    c3.metric("CE OI Change","--")
+
+    c4.metric("PE OI Change","--")
+
+    c5.metric("PCR","--")
+
+    c6.metric("Max Pain","--")
+
     st.divider()
-    st.subheader("🤖 AI Institutional Signals")
 
-    try:
-        # సిగ్నల్ లెక్కించడం
-        pcr = (df[df['option_type'] == 'PE']['oi'].sum() / df[df['option_type'] == 'CE']['oi'].sum())
-        
-        ai_signal = "NEUTRAL"
-        if pcr >= 1.30: ai_signal = "BUY"
-        elif pcr <= 0.70: ai_signal = "SELL"
+    option_placeholder = st.empty()
 
-        c1, c2, c3 = st.columns(3)
-        c1.metric("AI Signal", ai_signal)
-
-        # ఇన్‌స్టిట్యూషనల్ స్కోర్
-        score = 50
-        if pcr > 1: score += 20
-        else: score -= 20
-        score = max(0, min(score, 100))
-        
-        c2.metric("Institutional Score", f"{score}/100")
-        
-        if score >= 80: status = "🟢 Strong Bullish"
-        elif score >= 60: status = "🟢 Bullish"
-        elif score >= 40: status = "🟡 Neutral"
-        else: status = "🔴 Bearish"
-        
-        c3.metric("Market Status", status)
-
-        # ట్రేడింగ్ సలహా
-        st.info(f"AI Institutional Score: {score}/100. Signal: {ai_signal}")
-
-    except Exception as e:
-        st.warning(f"Signals Error: {e}")
-
-    # Auto Refresh Logic
     if auto_refresh:
-        with st.spinner("Refreshing..."):
-            time.sleep(refresh_time)
-            st.rerun()
 
-    st.sidebar.divider()
-    st.sidebar.markdown("### 🚀 NSE AI PRO V12")
-    st.sidebar.caption("Institutional Trading Intelligence")
-    
+        time.sleep(refresh_time)
+
+        st.rerun()
