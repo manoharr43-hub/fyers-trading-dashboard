@@ -1322,3 +1322,140 @@ Bear Call Spread
             time.sleep(refresh_time)
 
         st.rerun()                    
+# ==========================================================
+# OPTION CHAIN V2 - PART 7
+# WATCHLIST | ALERTS | FAVORITES | SESSION STATS
+# ==========================================================
+
+                st.divider()
+                st.subheader("⭐ Watchlist & Alerts")
+
+                # -----------------------------
+                # Save Current Symbol
+                # -----------------------------
+                if "watchlist" not in st.session_state:
+                    st.session_state.watchlist = []
+
+                col1, col2 = st.columns(2)
+
+                if col1.button("⭐ Add to Watchlist"):
+
+                    if symbol not in st.session_state.watchlist:
+
+                        st.session_state.watchlist.append(symbol)
+
+                        st.success(f"{symbol} added.")
+
+                if col2.button("🗑 Clear Watchlist"):
+
+                    st.session_state.watchlist = []
+
+                    st.success("Watchlist Cleared")
+
+                if st.session_state.watchlist:
+
+                    st.write("### ⭐ My Watchlist")
+
+                    st.dataframe(
+
+                        pd.DataFrame({
+
+                            "Symbols": st.session_state.watchlist
+
+                        }),
+
+                        use_container_width=True
+
+                    )
+
+                # -----------------------------------------
+                # Market Alert
+                # -----------------------------------------
+
+                st.divider()
+
+                st.subheader("🚨 Instant Alert")
+
+                if pcr >= 1.30:
+
+                    st.success("🟢 Strong Bullish Option Chain")
+
+                elif pcr <= 0.70:
+
+                    st.error("🔴 Strong Bearish Option Chain")
+
+                else:
+
+                    st.warning("🟡 Sideways Market")
+
+                # -----------------------------------------
+                # Session Statistics
+                # -----------------------------------------
+
+                st.divider()
+
+                st.subheader("📊 Session Statistics")
+
+                c1, c2, c3 = st.columns(3)
+
+                c1.metric(
+
+                    "Total Strikes",
+
+                    len(df)
+
+                )
+
+                c2.metric(
+
+                    "Current Symbol",
+
+                    name
+
+                )
+
+                c3.metric(
+
+                    "Expiry",
+
+                    expiry
+
+                )
+
+                # -----------------------------------------
+                # Export Summary
+                # -----------------------------------------
+
+                export_df = pd.DataFrame({
+
+                    "Spot":[spot],
+
+                    "ATM":[atm],
+
+                    "PCR":[pcr],
+
+                    "Support":[support],
+
+                    "Resistance":[resistance],
+
+                    "Max Pain":[max_pain],
+
+                    "AI Score":[score]
+
+                })
+
+                st.download_button(
+
+                    "📥 Export Dashboard Summary",
+
+                    export_df.to_csv(index=False),
+
+                    file_name="dashboard_summary.csv",
+
+                    mime="text/csv"
+
+                )
+
+                st.divider()
+
+                st.success("✅ Option Chain V2 Ultimate Ready")
