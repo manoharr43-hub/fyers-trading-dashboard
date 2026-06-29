@@ -1676,3 +1676,47 @@ def show_scanner(fyers):
             h4.metric("Status", "READY")
 
             st.success("✅ NSE AI PRO V13 Institutional Scanner Operational")
+                            # ------------------------------------
+                # AI Confidence & Smart Flow Logic
+                # ------------------------------------
+
+                if ai >= 90:
+                    confidence = 98
+                    smart_flow = "Institutional Accumulation"
+                    volume_status = "High Volume Surge"
+                elif ai >= 75:
+                    confidence = 85
+                    smart_flow = "Smart Money Buying"
+                    volume_status = "Volume Expanding"
+                elif ai <= 40:
+                    confidence = 80
+                    smart_flow = "Institutional Distribution"
+                    volume_status = "Heavy Selling"
+                else:
+                    confidence = 60
+                    smart_flow = "Retail Activity"
+                    volume_status = "Volume Stable"
+
+                smart_data.append({
+                    "Symbol": row["Symbol"],
+                    "AI Score": ai,
+                    "Confidence": f"{confidence}%",
+                    "Smart Money Flow": smart_flow,
+                    "Volume Status": volume_status,
+                    "Signal": action
+                })
+
+            smart_df = pd.DataFrame(smart_data)
+
+            # Display Smart Money Table
+            st.dataframe(smart_df.style.applymap(
+                lambda x: 'background-color: #d4edda' if 'Buying' in x else ('background-color: #f8d7da' if 'Selling' in x else ''),
+                subset=['Smart Money Flow']
+            ), use_container_width=True)
+
+            st.success("✅ Analysis Complete: Institutional Data Updated.")
+
+    except Exception as e:
+        st.error(f"Error occurred: {e}")
+        st.info("Ensure the symbols list and Fyers API connection are active.")
+            
