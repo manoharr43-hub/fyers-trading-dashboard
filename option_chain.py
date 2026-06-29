@@ -759,3 +759,151 @@ def show_option_chain(fyers):
 🟡 Neutral Market
 
 ⚖
+    # ==========================================================
+    # PART 6
+    # INSTITUTIONAL DASHBOARD | ALERTS | EXPORT
+    # ==========================================================
+
+    st.subheader("🏦 Institutional Dashboard")
+
+    col1, col2, col3, col4 = st.columns(4)
+
+    col1.metric(
+        "Support",
+        support
+    )
+
+    col2.metric(
+        "Resistance",
+        resistance
+    )
+
+    col3.metric(
+        "Max Pain",
+        max_pain
+    )
+
+    col4.metric(
+        "Market Bias",
+        market_bias
+    )
+
+    st.divider()
+
+    # ==========================================
+    # Trading View
+    # ==========================================
+
+    st.subheader("📈 Trading View")
+
+    if ai_score >= 80:
+
+        st.success("""
+🟢 STRONG BUY
+
+• Heavy Put Writing
+
+• Strong Support
+
+• Bullish Structure
+
+• Buy on Dips
+""")
+
+    elif ai_score >= 60:
+
+        st.info("""
+🟢 BUY
+
+• Positive OI
+
+• Bullish Bias
+
+• Momentum Positive
+""")
+
+    elif ai_score >= 40:
+
+        st.warning("""
+🟡 HOLD
+
+• Wait for Breakout
+
+• Mixed OI
+
+• Neutral Bias
+""")
+
+    else:
+
+        st.error("""
+🔴 SELL
+
+• Heavy Call Writing
+
+• Bearish Structure
+
+• Sell on Rise
+""")
+
+    st.divider()
+
+    # ==========================================
+    # Live Alerts
+    # ==========================================
+
+    st.subheader("🚨 Live Alerts")
+
+    if pcr >= 1.30:
+
+        st.success("🟢 PCR indicates Strong Bullish Sentiment")
+
+    elif pcr <= 0.70:
+
+        st.error("🔴 PCR indicates Strong Bearish Sentiment")
+
+    else:
+
+        st.warning("🟡 PCR indicates Sideways Market")
+
+    if build_up.startswith("🟢"):
+
+        st.success("📈 Long Build-up Detected")
+
+    elif build_up.startswith("🔴"):
+
+        st.error("📉 Short Build-up Detected")
+
+    else:
+
+        st.info("⚖ No Strong Build-up")
+
+    st.divider()
+
+    # ==========================================
+    # Export Option Chain
+    # ==========================================
+
+    st.download_button(
+
+        "📥 Download Option Chain CSV",
+
+        data=df.to_csv(index=False),
+
+        file_name=f"{name}_OptionChain.csv",
+
+        mime="text/csv"
+
+    )
+
+    st.success("✅ Option Chain Loaded Successfully")
+
+    # ==========================================
+    # Auto Refresh
+    # ==========================================
+
+    if auto_refresh:
+
+        time.sleep(refresh_time)
+
+        st.rerun()
