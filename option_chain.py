@@ -807,3 +807,186 @@ def show_option_chain(fyers):
                             spot,
 
                             atm
+                # ==========================================================
+                # OPTION CHAIN V2 - PART 4
+                # CHARTS | AI SCORE | SMART MONEY | LIVE ALERTS
+                # ==========================================================
+
+                import plotly.express as px
+
+                st.divider()
+                st.subheader("📊 OI Charts")
+
+                try:
+
+                    # -----------------------------
+                    # CE vs PE OI Chart
+                    # -----------------------------
+
+                    if strike_col and ce_oi_col and pe_oi_col:
+
+                        chart_df = df[[
+
+                            strike_col,
+                            ce_oi_col,
+                            pe_oi_col
+
+                        ]].copy()
+
+                        fig = px.bar(
+
+                            chart_df,
+
+                            x=strike_col,
+
+                            y=[ce_oi_col, pe_oi_col],
+
+                            barmode="group",
+
+                            title="CE vs PE Open Interest"
+
+                        )
+
+                        st.plotly_chart(
+
+                            fig,
+
+                            use_container_width=True
+
+                        )
+
+                    # -----------------------------
+                    # OI Change Chart
+                    # -----------------------------
+
+                    if ce_change_col and pe_change_col:
+
+                        fig2 = px.bar(
+
+                            df,
+
+                            x=strike_col,
+
+                            y=[
+
+                                ce_change_col,
+
+                                pe_change_col
+
+                            ],
+
+                            barmode="group",
+
+                            title="Open Interest Change"
+
+                        )
+
+                        st.plotly_chart(
+
+                            fig2,
+
+                            use_container_width=True
+
+                        )
+
+                except Exception as e:
+
+                    st.warning(e)
+
+                # ==================================================
+                # AI SCORE
+                # ==================================================
+
+                st.divider()
+
+                st.subheader("🤖 AI Institutional Score")
+
+                score = 50
+
+                if pcr > 1.20:
+
+                    score += 20
+
+                elif pcr < 0.80:
+
+                    score -= 20
+
+                if build_up == "Long Build-up":
+
+                    score += 20
+
+                elif build_up == "Short Build-up":
+
+                    score -= 20
+
+                score = max(0, min(score, 100))
+
+                col1, col2 = st.columns(2)
+
+                col1.metric(
+
+                    "Institutional Score",
+
+                    f"{score}/100"
+
+                )
+
+                if score >= 80:
+
+                    signal = "🟢 STRONG BUY"
+
+                elif score >= 60:
+
+                    signal = "🟢 BUY"
+
+                elif score >= 40:
+
+                    signal = "🟡 HOLD"
+
+                else:
+
+                    signal = "🔴 SELL"
+
+                col2.metric(
+
+                    "AI Signal",
+
+                    signal
+
+                )
+
+                # ==================================================
+                # SMART MONEY
+                # ==================================================
+
+                st.divider()
+
+                st.subheader("💰 Smart Money Flow")
+
+                if score >= 80:
+
+                    st.success("""
+
+Large Put Writing Detected
+
+Institutional Buying Seen
+
+Smart Money Entering
+
+""")
+
+                elif score <= 30:
+
+                    st.error("""
+
+Heavy Call Writing
+
+Institutional Selling
+
+Smart Money Exiting
+
+""")
+
+                else:
+
+                   
