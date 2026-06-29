@@ -177,3 +177,132 @@ def show_scanner(fyers):
         time.sleep(refresh)
 
         st.rerun()
+# ==========================================================
+# NSE AI PRO V13 INSTITUTIONAL
+# PART 2
+# LIVE DATA | RVOL | EMA | GOLDEN CROSS | 52 WEEK
+# ==========================================================
+
+    if scan_button:
+
+        progress = st.progress(0)
+
+        scanner_data = []
+
+        # ==========================================
+        # Sample Symbols
+        # (Later replace with NIFTY500/F&O list)
+        # ==========================================
+
+        symbols = [
+
+            "NSE:RELIANCE-EQ",
+
+            "NSE:TCS-EQ",
+
+            "NSE:INFY-EQ",
+
+            "NSE:HDFCBANK-EQ",
+
+            "NSE:ICICIBANK-EQ"
+
+        ]
+
+        total = len(symbols)
+
+        for i, symbol in enumerate(symbols):
+
+            try:
+
+                history = fyers.history({
+
+                    "symbol": symbol,
+
+                    "resolution": "D",
+
+                    "date_format": "1",
+
+                    "range_from": "2025-01-01",
+
+                    "range_to": "2026-12-31",
+
+                    "cont_flag": "1"
+
+                })
+
+                if history.get("s") != "ok":
+
+                    continue
+
+                candles = history["candles"]
+
+                df = pd.DataFrame(
+
+                    candles,
+
+                    columns=[
+
+                        "Time",
+
+                        "Open",
+
+                        "High",
+
+                        "Low",
+
+                        "Close",
+
+                        "Volume"
+
+                    ]
+
+                )
+
+                if len(df) < 220:
+
+                    continue
+
+                close = df["Close"]
+
+                volume = df["Volume"]
+
+                # =====================================
+                # EMA
+                # =====================================
+
+                ema20 = close.ewm(
+                    span=20,
+                    adjust=False
+                ).mean().iloc[-1]
+
+                ema50 = close.ewm(
+                    span=50,
+                    adjust=False
+                ).mean().iloc[-1]
+
+                ema200 = close.ewm(
+                    span=200,
+                    adjust=False
+                ).mean().iloc[-1]
+
+                golden_cross = ema50 > ema200
+
+                death_cross = ema50 < ema200
+
+                # =====================================
+                # RVOL
+                # =====================================
+
+                avg_vol = volume.tail(20).mean()
+
+                rvol = volume.iloc[-1] / avg_vol if avg_vol else 0
+
+                # =====================================
+                # 52 Week
+                # =====================================
+
+                high52 = df["High"].tail(252).max()
+
+                low52 = df["Low"].tail(252).min()
+
+                last
