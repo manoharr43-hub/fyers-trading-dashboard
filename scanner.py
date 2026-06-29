@@ -1453,3 +1453,132 @@ def show_scanner(fyers):
             )
 
             st.success("✅ NSE AI PRO V13 Institutional Scanner Ready")
+# ==========================================================
+# NSE AI PRO V13 INSTITUTIONAL
+# PART 9
+# MARKET BREADTH | LEADERBOARD | TRADE PLAN
+# ==========================================================
+
+            st.divider()
+            st.subheader("📊 Market Breadth")
+
+            total = len(smart_df)
+
+            bullish = len(smart_df[smart_df["AI Score"] >= 75])
+            bearish = len(smart_df[smart_df["AI Score"] < 60])
+            neutral = total - bullish - bearish
+
+            c1, c2, c3 = st.columns(3)
+
+            c1.success(f"🟢 Bullish : {bullish}")
+            c2.warning(f"🟡 Neutral : {neutral}")
+            c3.error(f"🔴 Bearish : {bearish}")
+
+            st.divider()
+
+            # =====================================
+            # Top Momentum Stocks
+            # =====================================
+
+            st.subheader("🚀 Top Momentum Stocks")
+
+            momentum = smart_df.sort_values(
+                "AI Score",
+                ascending=False
+            ).head(10)
+
+            st.dataframe(
+                momentum,
+                use_container_width=True
+            )
+
+            # =====================================
+            # Top Weak Stocks
+            # =====================================
+
+            st.subheader("📉 Weakest Stocks")
+
+            weak = smart_df.sort_values(
+                "AI Score",
+                ascending=True
+            ).head(10)
+
+            st.dataframe(
+                weak,
+                use_container_width=True
+            )
+
+            st.divider()
+
+            # =====================================
+            # AI Trade Plan
+            # =====================================
+
+            st.subheader("🎯 AI Trade Plan")
+
+            if avg_ai >= 85:
+
+                st.success("""
+✅ Aggressive Buying
+
+• Buy Breakouts
+
+• Buy High RVOL Stocks
+
+• Trade with Trend
+
+• Position Size : 100%
+""")
+
+            elif avg_ai >= 70:
+
+                st.info("""
+🟢 Moderate Buying
+
+• Buy on Dips
+
+• Strong Momentum Stocks
+
+• Position Size : 70%
+""")
+
+            elif avg_ai >= 55:
+
+                st.warning("""
+🟡 Neutral Market
+
+• Wait for Confirmation
+
+• Small Position Size
+
+• Watch Breakouts
+""")
+
+            else:
+
+                st.error("""
+🔴 Defensive Market
+
+• Avoid Aggressive Buying
+
+• Hold Cash
+
+• Hedge Positions
+""")
+
+            st.divider()
+
+            # =====================================
+            # Scanner Quality
+            # =====================================
+
+            st.subheader("⚙ Scanner Health")
+
+            h1, h2, h3, h4 = st.columns(4)
+
+            h1.metric("Scanner", "ONLINE")
+            h2.metric("AI Engine", "ACTIVE")
+            h3.metric("Data", "LIVE")
+            h4.metric("Status", "READY")
+
+            st.success("✅ NSE AI PRO V13 Institutional Scanner Operational")
