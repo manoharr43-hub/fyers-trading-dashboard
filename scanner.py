@@ -467,3 +467,248 @@ def show_scanner(fyers):
             )
 
             c1
+# ==========================================================
+# NSE AI PRO V13 INSTITUTIONAL
+# PART 4
+# ADVANCED AI ENGINE
+# RSI | MACD | VWAP | ADX | MONEY FLOW
+# ==========================================================
+
+            # ==========================================
+            # ADVANCED AI SCORE
+            # ==========================================
+
+            advanced_results = []
+
+            for _, row in ai_df.iterrows():
+
+                final_score = row["Buy Score"]
+
+                # --------------------------------------
+                # Trend Strength
+                # --------------------------------------
+
+                trend = "SIDEWAYS"
+
+                if row["EMA20"] > row["EMA50"] > row["EMA200"]:
+
+                    trend = "STRONG UP"
+
+                    final_score += 10
+
+                elif row["EMA20"] < row["EMA50"] < row["EMA200"]:
+
+                    trend = "STRONG DOWN"
+
+                    final_score -= 10
+
+                # --------------------------------------
+                # RVOL
+                # --------------------------------------
+
+                if row["RVOL"] >= 3:
+
+                    final_score += 10
+
+                elif row["RVOL"] < 1:
+
+                    final_score -= 10
+
+                # --------------------------------------
+                # Smart Money
+                # --------------------------------------
+
+                if row["Smart Score"] >= 80:
+
+                    money_flow = "Institutional Buying"
+
+                    final_score += 10
+
+                elif row["Smart Score"] <= 30:
+
+                    money_flow = "Institutional Selling"
+
+                    final_score -= 10
+
+                else:
+
+                    money_flow = "Neutral"
+
+                # --------------------------------------
+                # AI Confidence
+                # --------------------------------------
+
+                final_score = max(
+
+                    0,
+
+                    min(
+
+                        final_score,
+
+                        100
+
+                    )
+
+                )
+
+                confidence = round(
+
+                    final_score,
+
+                    1
+
+                )
+
+                # --------------------------------------
+                # Final Rating
+                # --------------------------------------
+
+                if final_score >= 90:
+
+                    rating = "⭐⭐⭐⭐⭐"
+
+                    action = "🚀 STRONG BUY"
+
+                elif final_score >= 75:
+
+                    rating = "⭐⭐⭐⭐"
+
+                    action = "🟢 BUY"
+
+                elif final_score >= 60:
+
+                    rating = "⭐⭐⭐"
+
+                    action = "🟡 WATCH"
+
+                elif final_score >= 40:
+
+                    rating = "⭐⭐"
+
+                    action = "⚪ HOLD"
+
+                else:
+
+                    rating = "⭐"
+
+                    action = "🔴 SELL"
+
+                advanced_results.append({
+
+                    "Symbol": row["Symbol"],
+
+                    "Close": row["Close"],
+
+                    "RVOL": row["RVOL"],
+
+                    "Smart Score": row["Smart Score"],
+
+                    "AI Score": final_score,
+
+                    "Confidence %": confidence,
+
+                    "Trend": trend,
+
+                    "Money Flow": money_flow,
+
+                    "Rating": rating,
+
+                    "Signal": action
+
+                })
+
+            final_df = pd.DataFrame(
+
+                advanced_results
+
+            )
+
+            final_df = final_df.sort_values(
+
+                "AI Score",
+
+                ascending=False
+
+            )
+
+            st.divider()
+
+            st.subheader("🤖 Advanced AI Scanner")
+
+            st.dataframe(
+
+                final_df,
+
+                use_container_width=True,
+
+                height=650
+
+            )
+
+            # ======================================
+            # Dashboard Summary
+            # ======================================
+
+            st.divider()
+
+            col1, col2, col3, col4 = st.columns(4)
+
+            col1.metric(
+
+                "Total",
+
+                len(final_df)
+
+            )
+
+            col2.metric(
+
+                "BUY",
+
+                len(
+
+                    final_df[
+                        final_df["Signal"].str.contains("BUY")
+                    ]
+                )
+
+            )
+
+            col3.metric(
+
+                "WATCH",
+
+                len(
+
+                    final_df[
+                        final_df["Signal"].str.contains("WATCH")
+                    ]
+                )
+
+            )
+
+            col4.metric(
+
+                "SELL",
+
+                len(
+
+                    final_df[
+                        final_df["Signal"].str.contains("SELL")
+                    ]
+                )
+
+            )
+
+            st.download_button(
+
+                "⬇ Download Advanced AI Report",
+
+                final_df.to_csv(index=False),
+
+                file_name="Advanced_AI_Scanner.csv",
+
+                mime="text/csv"
+
+            )
