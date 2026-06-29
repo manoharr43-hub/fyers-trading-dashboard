@@ -6,3 +6,4 @@ yfinance
 numpy
 plotly
 matplotlib
+pandas>=2.1.0
