@@ -1182,4 +1182,143 @@ No Clear Direction
 
                 )
 
-                            
+        # ==========================================================
+# OPTION CHAIN V2 - PART 6 (ULTIMATE)
+# LIVE DASHBOARD | AUTO REFRESH | FINAL SUMMARY
+# ==========================================================
+
+                st.divider()
+                st.subheader("📡 Live Market Dashboard")
+
+                # -------------------------------------
+                # Market Status
+                # -------------------------------------
+
+                market_status = "🟡 SIDEWAYS"
+
+                if pcr > 1.20:
+                    market_status = "🟢 BULLISH"
+
+                elif pcr < 0.80:
+                    market_status = "🔴 BEARISH"
+
+                c1, c2, c3, c4 = st.columns(4)
+
+                c1.metric("Spot", round(spot, 2))
+                c2.metric("ATM", atm)
+                c3.metric("PCR", round(pcr, 2))
+                c4.metric("Status", market_status)
+
+                st.divider()
+
+                # -------------------------------------
+                # Top CE / PE Writing
+                # -------------------------------------
+
+                st.subheader("🏦 Top Writing Levels")
+
+                left, right = st.columns(2)
+
+                if ce_oi_col:
+
+                    top_ce = df.nlargest(5, ce_oi_col)[
+                        [strike_col, ce_oi_col]
+                    ]
+
+                    left.error("🔴 Top 5 CE Writing")
+                    left.dataframe(
+                        top_ce,
+                        use_container_width=True
+                    )
+
+                if pe_oi_col:
+
+                    top_pe = df.nlargest(5, pe_oi_col)[
+                        [strike_col, pe_oi_col]
+                    ]
+
+                    right.success("🟢 Top 5 PE Writing")
+                    right.dataframe(
+                        top_pe,
+                        use_container_width=True
+                    )
+
+                st.divider()
+
+                # -------------------------------------
+                # Trading View
+                # -------------------------------------
+
+                st.subheader("📈 Trading View")
+
+                if score >= 80:
+
+                    st.success("""
+✅ Strong Bullish
+
+• Buy CE
+
+• Bull Call Spread
+
+• Bull Put Spread
+
+• Buy On Dips
+""")
+
+                elif score >= 60:
+
+                    st.success("""
+🟢 Bullish
+
+Trend Positive
+
+Look For Buy Opportunity
+""")
+
+                elif score >= 40:
+
+                    st.warning("""
+🟡 Neutral
+
+Wait For Breakout
+""")
+
+                else:
+
+                    st.error("""
+🔴 Bearish
+
+Buy PE
+
+Sell On Rise
+
+Bear Call Spread
+""")
+
+                st.divider()
+
+                # -------------------------------------
+                # Dashboard Footer
+                # -------------------------------------
+
+                st.success("✅ NSE AI PRO V12 Institutional Option Chain Ready")
+
+                st.caption(
+                    "Version : V12 Institutional Edition"
+                )
+
+                st.caption(
+                    "Powered By FYERS API V3"
+                )
+
+# ==========================================================
+# AUTO REFRESH
+# ==========================================================
+
+    if auto_refresh:
+
+        with st.spinner("Refreshing Option Chain..."):
+
+            time.sleep(refresh_time)
+
+        st.rerun()                    
