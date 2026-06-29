@@ -288,3 +288,221 @@ def show_option_chain(fyers):
         time.sleep(refresh_time)
 
         st.rerun()
+# ==========================================================
+# OPTION CHAIN V2 - PART 2A
+# LIVE EXPIRY | OPTION CHAIN API | PCR | ATM
+# ==========================================================
+
+    st.subheader("📊 Live Option Chain")
+
+    if st.button("🔄 Load Option Chain", use_container_width=True):
+
+        with st.spinner("Loading Option Chain..."):
+
+            try:
+
+                # -----------------------------------------
+                # Live Option Chain API
+                # -----------------------------------------
+
+                response = fyers.optionchain({
+
+                    "symbol": symbol,
+
+                    "strikecount": strike_count
+
+                })
+
+                if response.get("s") != "ok":
+
+                    st.error(response)
+
+                    st.stop()
+
+                option_data = response.get("data", {})
+
+                # -----------------------------------------
+                # Dynamic Expiry
+                # -----------------------------------------
+
+                expiry_list = []
+
+                if isinstance(option_data, dict):
+
+                    expiry_list = option_data.get("expiryData", [])
+
+                    if not expiry_list:
+
+                        expiry_list = option_data.get("expiryDates", [])
+
+                if expiry_list:
+
+                    expiry = st.selectbox(
+
+                        "Select Expiry",
+
+                        expiry_list
+
+                    )
+
+                # -----------------------------------------
+                # Option Chain Table
+                # -----------------------------------------
+
+                chain = None
+
+                if isinstance(option_data, dict):
+
+                    chain = option_data.get("optionsChain")
+
+                    if chain is None:
+
+                        chain = option_data.get("optionChain")
+
+                    if chain is None:
+
+                        chain = option_data.get("chain")
+
+                if chain is None:
+
+                    st.warning("Option Chain data not found.")
+
+                    st.stop()
+
+                df = pd.DataFrame(chain)
+
+                if df.empty:
+
+                    st.warning("Empty Option Chain")
+
+                    st.stop()
+
+                # -----------------------------------------
+                # Auto Detect Columns
+                # -----------------------------------------
+
+                strike_col = None
+
+                ce_oi_col = None
+
+                pe_oi_col = None
+
+                ce_change_col = None
+
+                pe_change_col = None
+
+                for c in df.columns:
+
+                    x = str(c).lower()
+
+                    if "strike" in x:
+
+                        strike_col = c
+
+                    elif "ce" in x and "oi" in x and "change" not in x:
+
+                        ce_oi_col = c
+
+                    elif "pe" in x and "oi" in x and "change" not in x:
+
+                        pe_oi_col = c
+
+                    elif "ce" in x and "change" in x:
+
+                        ce_change_col = c
+
+                    elif "pe" in x and "change" in x:
+
+                        pe_change_col = c
+
+                # -----------------------------------------
+                # Numeric Conversion
+                # -----------------------------------------
+
+                for col in [
+
+                    ce_oi_col,
+
+                    pe_oi_col,
+
+                    ce_change_col,
+
+                    pe_change_col
+
+                ]:
+
+                    if col:
+
+                        df[col] = pd.to_numeric(
+
+                            df[col],
+
+                            errors="coerce"
+
+                        ).fillna(0)
+
+                # -----------------------------------------
+                # Total OI
+                # -----------------------------------------
+
+                total_ce = df[ce_oi_col].sum() if ce_oi_col else 0
+
+                total_pe = df[pe_oi_col].sum() if pe_oi_col else 0
+
+                total_ce_change = (
+
+                    df[ce_change_col].sum()
+
+                    if ce_change_col else 0
+
+                )
+
+                total_pe_change = (
+
+                    df[pe_change_col].sum()
+
+                    if pe_change_col else 0
+
+                )
+
+                pcr = round(
+
+                    total_pe / total_ce,
+
+                    2
+
+                ) if total_ce else 0
+
+                # -----------------------------------------
+                # ATM Strike
+                # -----------------------------------------
+
+                atm = "--"
+
+                if strike_col:
+
+                    df["DIFF"] = (
+
+                        df[strike_col] - spot
+
+                    ).abs()
+
+                    atm = df.loc[
+
+                        df["DIFF"].idxmin(),
+
+                        strike_col
+
+                    ]
+
+                # -----------------------------------------
+                # Dashboard
+                # -----------------------------------------
+
+                m1, m2, m3, m4, m5, m6 = st.columns(6)
+
+                m1.metric(
+
+                    "Total CE OI",
+
+                   
