@@ -606,3 +606,204 @@ def show_option_chain(fyers):
 
                     col2.success(
                         f"🟢 Highest PE
+                # ==========================================================
+                # OPTION CHAIN V2 - PART 3
+                # OI BUILD-UP | MAX PAIN | SUPPORT | RESISTANCE
+                # ==========================================================
+
+                st.divider()
+
+                st.subheader("🏦 Institutional OI Analysis")
+
+                try:
+
+                    # -----------------------------
+                    # Highest CE & PE OI
+                    # -----------------------------
+
+                    resistance = None
+                    support = None
+
+                    if ce_oi_col:
+
+                        ce_row = df.loc[
+                            df[ce_oi_col].idxmax()
+                        ]
+
+                        resistance = ce_row[strike_col]
+
+                    if pe_oi_col:
+
+                        pe_row = df.loc[
+                            df[pe_oi_col].idxmax()
+                        ]
+
+                        support = pe_row[strike_col]
+
+                    # -----------------------------
+                    # Max Pain
+                    # -----------------------------
+
+                    df["TOTAL_OI"] = 0
+
+                    if ce_oi_col:
+                        df["TOTAL_OI"] += df[ce_oi_col]
+
+                    if pe_oi_col:
+                        df["TOTAL_OI"] += df[pe_oi_col]
+
+                    max_pain = df.loc[
+                        df["TOTAL_OI"].idxmax()
+                    ][strike_col]
+
+                    # -----------------------------
+                    # OI Build-Up
+                    # -----------------------------
+
+                    build_up = "Neutral"
+
+                    if total_pe_change > total_ce_change:
+
+                        build_up = "Long Build-up"
+
+                    elif total_ce_change > total_pe_change:
+
+                        build_up = "Short Build-up"
+
+                    # -----------------------------
+                    # Market Bias
+                    # -----------------------------
+
+                    if pcr >= 1.30:
+
+                        bias = "Bullish"
+
+                    elif pcr <= 0.70:
+
+                        bias = "Bearish"
+
+                    else:
+
+                        bias = "Neutral"
+
+                    # -----------------------------
+                    # Dashboard
+                    # -----------------------------
+
+                    a,b,c,d = st.columns(4)
+
+                    a.metric(
+
+                        "Support",
+
+                        support
+
+                    )
+
+                    b.metric(
+
+                        "Resistance",
+
+                        resistance
+
+                    )
+
+                    c.metric(
+
+                        "Max Pain",
+
+                        max_pain
+
+                    )
+
+                    d.metric(
+
+                        "OI Build-up",
+
+                        build_up
+
+                    )
+
+                    st.divider()
+
+                    # -----------------------------
+                    # Institutional View
+                    # -----------------------------
+
+                    if bias=="Bullish":
+
+                        st.success("""
+
+🟢 Institutional View
+
+• Heavy Put Writing
+
+• Strong Support
+
+• Bullish Bias
+
+• Buy On Dips
+
+""")
+
+                    elif bias=="Bearish":
+
+                        st.error("""
+
+🔴 Institutional View
+
+• Heavy Call Writing
+
+• Strong Resistance
+
+• Bearish Bias
+
+• Sell On Rise
+
+""")
+
+                    else:
+
+                        st.info("""
+
+🟡 Institutional View
+
+• Balanced OI
+
+• Sideways Market
+
+• Wait For Breakout
+
+""")
+
+                    # -----------------------------
+                    # OI Summary
+                    # -----------------------------
+
+                    summary = pd.DataFrame({
+
+                        "Indicator":[
+
+                            "Spot",
+
+                            "ATM",
+
+                            "PCR",
+
+                            "Support",
+
+                            "Resistance",
+
+                            "Max Pain",
+
+                            "Market Bias",
+
+                            "OI Build-up"
+
+                        ],
+
+                        "Value":[
+
+                            spot,
+
+                            atm
