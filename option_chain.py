@@ -1251,3 +1251,163 @@ Target : {res
 
     # ==========================================
     # Institutional
+        # ==========================================================
+    # PART 10
+    # ULTIMATE PROFESSIONAL DASHBOARD
+    # ==========================================================
+
+    st.divider()
+    st.subheader("🏆 NSE AI PRO V13 Institutional Dashboard")
+
+    # ==========================================
+    # Overall Score
+    # ==========================================
+
+    overall_score = round(
+        (ai_score + smart_money + breakout) / 3,
+        1
+    )
+
+    c1, c2, c3, c4 = st.columns(4)
+
+    c1.metric(
+        "AI Score",
+        f"{ai_score}/100"
+    )
+
+    c2.metric(
+        "Smart Money",
+        f"{smart_money}/100"
+    )
+
+    c3.metric(
+        "Breakout",
+        f"{breakout}%"
+    )
+
+    c4.metric(
+        "Overall Score",
+        f"{overall_score}/100"
+    )
+
+    st.divider()
+
+    # ==========================================
+    # Final Recommendation
+    # ==========================================
+
+    st.subheader("🎯 Final AI Recommendation")
+
+    if overall_score >= 85:
+
+        recommendation = "🟢 STRONG BUY"
+
+    elif overall_score >= 70:
+
+        recommendation = "🟢 BUY"
+
+    elif overall_score >= 55:
+
+        recommendation = "🟡 HOLD"
+
+    else:
+
+        recommendation = "🔴 SELL"
+
+    st.metric(
+        "Recommendation",
+        recommendation
+    )
+
+    st.divider()
+
+    # ==========================================
+    # Top Important Levels
+    # ==========================================
+
+    st.subheader("🎯 Key Trading Levels")
+
+    levels = pd.DataFrame({
+
+        "Level":[
+            "Spot",
+            "ATM",
+            "Support",
+            "Resistance",
+            "Max Pain"
+        ],
+
+        "Value":[
+            round(spot,2),
+            atm,
+            support,
+            resistance,
+            max_pain
+        ]
+
+    })
+
+    st.dataframe(
+        levels,
+        use_container_width=True
+    )
+
+    st.divider()
+
+    # ==========================================
+    # Market Checklist
+    # ==========================================
+
+    st.subheader("✅ Institutional Checklist")
+
+    checklist = pd.DataFrame({
+
+        "Indicator":[
+            "PCR",
+            "OI Build-up",
+            "AI Score",
+            "Smart Money",
+            "Market Bias"
+        ],
+
+        "Status":[
+            round(pcr,2),
+            build_up,
+            ai_score,
+            smart_money,
+            market_bias
+        ]
+
+    })
+
+    st.dataframe(
+        checklist,
+        use_container_width=True
+    )
+
+    st.divider()
+
+    # ==========================================
+    # Export Report
+    # ==========================================
+
+    report = df.copy()
+
+    report["Spot"] = spot
+    report["ATM"] = atm
+    report["PCR"] = pcr
+    report["Support"] = support
+    report["Resistance"] = resistance
+    report["Max Pain"] = max_pain
+    report["AI Score"] = ai_score
+    report["Smart Money"] = smart_money
+    report["Overall Score"] = overall_score
+    report["Recommendation"] = recommendation
+
+    st.download_button(
+
+        "📥 Download Institutional Report",
+
+        report.to_csv(index=False),
+
+        file_name=f"{
