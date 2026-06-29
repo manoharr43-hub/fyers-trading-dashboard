@@ -306,3 +306,164 @@ def show_scanner(fyers):
                 low52 = df["Low"].tail(252).min()
 
                 last
+# ==========================================================
+# NSE AI PRO V13 INSTITUTIONAL
+# PART 3
+# AI ENGINE | RSI | MACD | BUY/SELL SCORE
+# ==========================================================
+
+        # ==========================================
+        # AI ENGINE
+        # ==========================================
+
+        if not scan_df.empty:
+
+            ai_results = []
+
+            for _, row in scan_df.iterrows():
+
+                buy_score = 0
+                sell_score = 0
+
+                # -------------------------
+                # RVOL
+                # -------------------------
+
+                if row["RVOL"] >= 3:
+                    buy_score += 20
+                elif row["RVOL"] >= 2:
+                    buy_score += 10
+
+                if row["RVOL"] < 1:
+                    sell_score += 10
+
+                # -------------------------
+                # EMA Trend
+                # -------------------------
+
+                if row["EMA20"] > row["EMA50"] > row["EMA200"]:
+                    buy_score += 25
+                else:
+                    sell_score += 10
+
+                # -------------------------
+                # Golden Cross
+                # -------------------------
+
+                if row["Golden Cross"]:
+                    buy_score += 20
+
+                if row["Death Cross"]:
+                    sell_score += 20
+
+                # -------------------------
+                # Smart Money
+                # -------------------------
+
+                if row["Smart Score"] >= 70:
+                    buy_score += 20
+
+                elif row["Smart Score"] <= 30:
+                    sell_score += 20
+
+                # -------------------------
+                # 52 Week Analysis
+                # -------------------------
+
+                if row["Near High %"] <= 5:
+                    buy_score += 10
+
+                if row["Near Low %"] <= 5:
+                    sell_score += 10
+
+                buy_score = min(100, buy_score)
+                sell_score = min(100, sell_score)
+
+                # -------------------------
+                # Recommendation
+                # -------------------------
+
+                if buy_score >= 80:
+
+                    signal = "🟢 STRONG BUY"
+
+                elif buy_score >= 60:
+
+                    signal = "🟢 BUY"
+
+                elif sell_score >= 70:
+
+                    signal = "🔴 SELL"
+
+                else:
+
+                    signal = "🟡 HOLD"
+
+                ai_results.append({
+
+                    "Symbol": row["Symbol"],
+
+                    "Close": row["Close"],
+
+                    "RVOL": row["RVOL"],
+
+                    "Golden Cross": row["Golden Cross"],
+
+                    "Smart Score": row["Smart Score"],
+
+                    "Buy Score": buy_score,
+
+                    "Sell Score": sell_score,
+
+                    "Signal": signal
+
+                })
+
+            ai_df = pd.DataFrame(ai_results)
+
+            ai_df = ai_df.sort_values(
+
+                "Buy Score",
+
+                ascending=False
+
+            )
+
+            st.subheader("🤖 AI Institutional Ranking")
+
+            st.dataframe(
+
+                ai_df,
+
+                use_container_width=True,
+
+                height=600
+
+            )
+
+            # =====================================
+            # Dashboard
+            # =====================================
+
+            buy_count = len(
+
+                ai_df[
+                    ai_df["Signal"].str.contains("BUY")
+                ]
+            )
+
+            sell_count = len(
+
+                ai_df[
+                    ai_df["Signal"].str.contains("SELL")
+                ]
+            )
+
+            hold_count = len(
+
+                ai_df[
+                    ai_df["Signal"].str.contains("HOLD")
+                ]
+            )
+
+            c1
