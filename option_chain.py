@@ -1,172 +1,54 @@
 import streamlit as st
 import pandas as pd
-import numpy as np
-import plotly.express as px
 import plotly.graph_objects as go
-import time
+from fyers_apiv3 import fyersModel
 
-# ==========================================================
-# NSE AI PRO V13 INSTITUTIONAL
-# OPTION CHAIN PRO (FYERS API V3)
-# PART 1
-# ==========================================================
+# Fyers Auth
+client_id = "YOUR_CLIENT_ID"
+access_token = "YOUR_ACCESS_TOKEN"
+fyers = fyersModel.FyersModel(client_id=client_id, token=access_token)
 
-def show_option_chain(fyers):
+st.set_page_config(layout="wide")
+st.title("📊 Master Options Chain Dashboard")
 
-    st.title("📊 NSE AI PRO V13 Institutional Option Chain")
+# 1. Selection Sidebar
+option_type = st.sidebar.radio("Select Type", ["Indices", "F&O Stocks"])
 
-    # ==========================================
-    # Sidebar
-    # ==========================================
+if option_type == "Indices":
+    symbol = st.sidebar.selectbox("Select Index", 
+        ["NSE:NIFTY-INDEX", "NSE:BANKNIFTY-INDEX", "NSE:FINNIFTY-INDEX", "NSE:MIDCPNIFTY-INDEX", "BSE:SENSEX-INDEX"])
+else:
+    # F&O Stocks list (ఉదాహరణకు కొన్ని)
+    symbol = st.sidebar.text_input("Enter Stock Symbol (e.g., NSE:RELIANCE-EQ)", "NSE:RELIANCE-EQ")
 
-    st.sidebar.header("⚙ Settings")
+def get_option_chain(symbol):
+    data = {"symbol": symbol, "strikecount": 20}
+    response = fyers.optionchain(data=data)
+    return pd.DataFrame(response['data']['options'])
 
-    market_type = st.sidebar.radio(
-        "Market",
-        ["INDEX", "F&O STOCK"]
-    )
+# Data Processing
+if st.button("Fetch Data"):
+    df = get_option_chain(symbol)
+    
+    # 2. Key Metrics
+    col1, col2, col3 = st.columns(3)
+    pcr = df['pe_oi'].sum() / df['ce_oi'].sum()
+    col1.metric("Total CE OI", f"{df['ce_oi'].sum():,}")
+    col2.metric("Total PE OI", f"{df['pe_oi'].sum():,}")
+    col3.metric("PCR Ratio", round(pcr, 2))
 
-    index_symbols = {
-        "NIFTY": "NSE:NIFTY50-INDEX",
-        "BANKNIFTY": "NSE:NIFTYBANK-INDEX",
-        "FINNIFTY": "NSE:FINNIFTY-INDEX",
-        "MIDCPNIFTY": "NSE:MIDCPNIFTY-INDEX",
-        "SENSEX": "BSE:SENSEX-INDEX",
-        "BANKEX": "BSE:BANKEX-INDEX"
-    }
+    # 3. Highlight Table
+    st.subheader("Live Option Chain")
+    st.dataframe(df[['strike_price', 'ce_ltp', 'ce_oi', 'pe_oi', 'pe_ltp']].style.format("{:.0f}"), use_container_width=True)
 
-    fo_symbols = {
-        "RELIANCE": "NSE:RELIANCE-EQ",
-        "TCS": "NSE:TCS-EQ",
-        "INFY": "NSE:INFY-EQ",
-        "HDFCBANK": "NSE:HDFCBANK-EQ",
-        "ICICIBANK": "NSE:ICICIBANK-EQ",
-        "SBIN": "NSE:SBIN-EQ",
-        "AXISBANK": "NSE:AXISBANK-EQ",
-        "LT": "NSE:LT-EQ",
-        "MARUTI": "NSE:MARUTI-EQ",
-        "BHARTIARTL": "NSE:BHARTIARTL-EQ",
-        "TATAMOTORS": "NSE:TATAMOTORS-EQ",
-        "ADANIENT": "NSE:ADANIENT-EQ"
-    }
+    # 4. OI Chart
+    fig = go.Figure()
+    fig.add_trace(go.Bar(x=df['strike_price'], y=df['ce_oi'], name='CE OI (Resistance)', marker_color='red'))
+    fig.add_trace(go.Bar(x=df['strike_price'], y=df['pe_oi'], name='PE OI (Support)', marker_color='green'))
+    fig.update_layout(title='Open Interest Analysis', barmode='group')
+    st.plotly_chart(fig, use_container_width=True)
+    
+    # 5. CSV Export
+    csv = df.to_csv(index=False)
+    st.download_button("Download Data as CSV", csv, "option_chain.csv", "text/csv")
 
-    if market_type == "INDEX":
-
-        name = st.sidebar.selectbox(
-            "Select Index",
-            list(index_symbols.keys())
-        )
-
-        symbol = index_symbols[name]
-
-    else:
-
-        search = st.sidebar.text_input(
-            "Search Stock"
-        )
-
-        stocks = sorted(fo_symbols.keys())
-
-        if search:
-            stocks = [
-                x for x in stocks
-                if search.upper() in x
-            ]
-
-        name = st.sidebar.selectbox(
-            "Select Stock",
-            stocks
-        )
-
-        symbol = fo_symbols[name]
-
-    strike_count = st.sidebar.slider(
-        "Strike Count",
-        5,
-        30,
-        15
-    )
-
-    auto_refresh = st.sidebar.checkbox(
-        "Auto Refresh",
-        value=False
-    )
-
-    refresh_time = st.sidebar.slider(
-        "Refresh Time (Seconds)",
-        5,
-        60,
-        10
-    )
-
-    st.divider()
-
-    # ==========================================
-    # Live Spot Quote
-    # ==========================================
-
-    try:
-
-        quote = fyers.quotes({
-            "symbols": symbol
-        })
-
-        q = quote["d"][0]["v"]
-
-        spot = float(q["lp"])
-
-        c1, c2, c3, c4 = st.columns(4)
-
-        c1.metric("Spot", spot, q["ch"])
-        c2.metric("High", q["high_price"])
-        c3.metric("Low", q["low_price"])
-        c4.metric("Volume", f"{int(q['volume']):,}")
-
-    except Exception as e:
-
-        st.error(f"Quote Error : {e}")
-        return
-
-    st.divider()
-
-    # ==========================================
-    # Expiry Placeholder
-    # ==========================================
-
-    st.subheader("📅 Expiry")
-
-    expiry = st.selectbox(
-        "Expiry",
-        ["Loading..."]
-    )
-
-    st.info(
-        "Live expiry dates will load in Part 2."
-    )
-
-    st.divider()
-
-    # ==========================================
-    # Dashboard Cards
-    # ==========================================
-
-    a, b, c, d, e, f = st.columns(6)
-
-    a.metric("CE OI", "--")
-    b.metric("PE OI", "--")
-    c.metric("PCR", "--")
-    d.metric("ATM", "--")
-    e.metric("Max Pain", "--")
-    f.metric("AI Score", "--")
-
-    st.divider()
-
-    load = st.button(
-        "🚀 Load Option Chain",
-        use_container_width=True
-    )
-
-    if not load:
-        return
-
-    # ===== PART 2 STARTS BELOW =====
