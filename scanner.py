@@ -1572,7 +1572,101 @@ def show_scanner(fyers):
             # Scanner Quality
             # =====================================
 
-            st.subheader("⚙ Scanner Health")
+            st.subheader("⚙ Scanner Health")# ==========================================================
+# NSE AI PRO V13 INSTITUTIONAL
+# PART 10
+# ULTIMATE FINAL EDITION
+# MARKET SENTIMENT | POSITION SIZE | FINAL DASHBOARD
+# ==========================================================
+
+            st.divider()
+            st.subheader("🌍 Market Sentiment Meter")
+
+            sentiment = "NEUTRAL"
+
+            if avg_ai >= 85:
+                sentiment = "🟢 EXTREME BULLISH"
+
+            elif avg_ai >= 70:
+                sentiment = "🟢 BULLISH"
+
+            elif avg_ai >= 55:
+                sentiment = "🟡 SIDEWAYS"
+
+            else:
+                sentiment = "🔴 BEARISH"
+
+            st.metric(
+                "Overall Market Sentiment",
+                sentiment
+            )
+
+            # ============================================
+            # Position Size Calculator
+            # ============================================
+
+            st.divider()
+
+            st.subheader("💰 Position Size Calculator")
+
+            capital = st.number_input(
+                "Trading Capital (₹)",
+                value=100000,
+                step=10000
+            )
+
+            risk_percent = st.slider(
+                "Risk Per Trade (%)",
+                1,
+                5,
+                2
+            )
+
+            risk_amount = capital * risk_percent / 100
+
+            st.metric(
+                "Maximum Risk",
+                f"₹{risk_amount:,.0f}"
+            )
+
+            # ============================================
+            # Best Swing Stocks
+            # ============================================
+
+            st.divider()
+
+            st.subheader("🏆 Best Swing Picks")
+
+            swing = smart_df[
+                smart_df["AI Score"] >= 85
+            ]
+
+            st.dataframe(
+                swing.head(10),
+                use_container_width=True
+            )
+
+            # ============================================
+            # Best Intraday Stocks
+            # ============================================
+
+            st.divider()
+
+            st.subheader("⚡ Best Intraday Picks")
+
+            intra = smart_df.sort_values(
+                "RVOL",
+                ascending=False
+            )
+
+            st.dataframe(
+                intra.head(10),
+                use_container_width=True
+            )
+
+            # ============================================
+            # Final Dashboard
+            # ============================================
 
             h1, h2, h3, h4 = st.columns(4)
 
