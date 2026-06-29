@@ -340,3 +340,134 @@ def show_option_chain(fyers):
         ]
 
     # ===== PART 3 STARTS BELOW =====
+    # ==========================================================
+    # PART 3
+    # DASHBOARD | SUPPORT | RESISTANCE | MAX PAIN
+    # ==========================================================
+
+    # ------------------------------------------
+    # Highest CE & PE OI
+    # ------------------------------------------
+
+    support = "-"
+    resistance = "-"
+    max_pain = "-"
+
+    if ce_oi_col:
+
+        ce_row = df.loc[df[ce_oi_col].idxmax()]
+        resistance = ce_row[strike_col]
+
+    if pe_oi_col:
+
+        pe_row = df.loc[df[pe_oi_col].idxmax()]
+        support = pe_row[strike_col]
+
+    # ------------------------------------------
+    # Max Pain
+    # ------------------------------------------
+
+    df["TOTAL_OI"] = 0
+
+    if ce_oi_col:
+        df["TOTAL_OI"] += df[ce_oi_col]
+
+    if pe_oi_col:
+        df["TOTAL_OI"] += df[pe_oi_col]
+
+    if strike_col:
+
+        max_pain = df.loc[
+            df["TOTAL_OI"].idxmax(),
+            strike_col
+        ]
+
+    # ------------------------------------------
+    # OI Build-up
+    # ------------------------------------------
+
+    if total_pe_change > total_ce_change:
+
+        build_up = "🟢 Long Build-up"
+
+    elif total_ce_change > total_pe_change:
+
+        build_up = "🔴 Short Build-up"
+
+    else:
+
+        build_up = "🟡 Neutral"
+
+    # ------------------------------------------
+    # Market Bias
+    # ------------------------------------------
+
+    if pcr >= 1.30:
+
+        market_bias = "🟢 Bullish"
+
+    elif pcr <= 0.70:
+
+        market_bias = "🔴 Bearish"
+
+    else:
+
+        market_bias = "🟡 Sideways"
+
+    # ------------------------------------------
+    # Dashboard Cards
+    # ------------------------------------------
+
+    st.subheader("📊 Option Chain Summary")
+
+    c1, c2, c3 = st.columns(3)
+
+    c1.metric(
+        "Total CE OI",
+        f"{int(total_ce):,}"
+    )
+
+    c2.metric(
+        "Total PE OI",
+        f"{int(total_pe):,}"
+    )
+
+    c3.metric(
+        "PCR",
+        round(pcr, 2)
+    )
+
+    c4, c5, c6 = st.columns(3)
+
+    c4.metric(
+        "ATM Strike",
+        atm
+    )
+
+    c5.metric(
+        "Support",
+        support
+    )
+
+    c6.metric(
+        "Resistance",
+        resistance
+    )
+
+    c7, c8 = st.columns(2)
+
+    c7.metric(
+        "Max Pain",
+        max_pain
+    )
+
+    c8.metric(
+        "OI Build-up",
+        build_up
+    )
+
+    st.info(f"📈 Market Bias : {market_bias}")
+
+    st.divider()
+
+    # ===== PART 4 STARTS BELOW =====
