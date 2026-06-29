@@ -1062,3 +1062,98 @@ def show_option_chain(fyers):
     )
 
     st.caption("🚀 NSE AI PRO V13 Institutional Option Chain")
+        # ==========================================================
+    # PART 8
+    # PCR METER | SMART MONEY | AI ENTRY/EXIT | BREAKOUT
+    # ==========================================================
+
+    st.divider()
+    st.subheader("🤖 AI Institutional Analysis")
+
+    # ==========================================
+    # PCR Meter
+    # ==========================================
+
+    st.write("### 📊 PCR Strength")
+
+    pcr_percent = min(max(pcr / 2, 0), 1)
+
+    st.progress(pcr_percent)
+
+    if pcr >= 1.30:
+        st.success(f"PCR : {pcr} → Strong Bullish")
+
+    elif pcr >= 1.00:
+        st.info(f"PCR : {pcr} → Bullish")
+
+    elif pcr >= 0.80:
+        st.warning(f"PCR : {pcr} → Neutral")
+
+    else:
+        st.error(f"PCR : {pcr} → Bearish")
+
+    st.divider()
+
+    # ==========================================
+    # Smart Money Index
+    # ==========================================
+
+    smart_money = 50
+
+    if total_pe > total_ce:
+        smart_money += 20
+
+    if pcr > 1.20:
+        smart_money += 15
+
+    if build_up.startswith("🟢"):
+        smart_money += 15
+
+    smart_money = min(100, smart_money)
+
+    col1, col2 = st.columns(2)
+
+    col1.metric(
+        "💰 Smart Money",
+        f"{smart_money}/100"
+    )
+
+    if smart_money >= 80:
+
+        money_signal = "Institutional Buying"
+
+    elif smart_money >= 60:
+
+        money_signal = "Accumulation"
+
+    elif smart_money >= 40:
+
+        money_signal = "Neutral"
+
+    else:
+
+        money_signal = "Distribution"
+
+    col2.metric(
+        "Flow",
+        money_signal
+    )
+
+    st.divider()
+
+    # ==========================================
+    # Entry / Exit
+    # ==========================================
+
+    st.subheader("🎯 AI Entry / Exit")
+
+    if ai_score >= 80:
+
+        st.success(f"""
+✅ BUY ZONE
+
+Entry : Above {spot}
+
+Support : {support}
+
+Target : {res
