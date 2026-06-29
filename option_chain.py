@@ -471,3 +471,134 @@ def show_option_chain(fyers):
     st.divider()
 
     # ===== PART 4 STARTS BELOW =====
+    # ==========================================================
+    # PART 4
+    # OPTION CHAIN TABLE | ATM HIGHLIGHT | OI HIGHLIGHT
+    # ==========================================================
+
+    st.subheader("📋 Live Option Chain")
+
+    # ------------------------------------------
+    # Highest OI
+    # ------------------------------------------
+
+    max_ce = df[ce_oi_col].max() if ce_oi_col else 0
+    max_pe = df[pe_oi_col].max() if pe_oi_col else 0
+
+    # ------------------------------------------
+    # Highlight Function
+    # ------------------------------------------
+
+    def highlight_row(row):
+
+        styles = [""] * len(row)
+
+        # ATM Strike
+        if strike_col and row[strike_col] == atm:
+
+            for i in range(len(styles)):
+                styles[i] = (
+                    "background-color:#FFF59D;"
+                    "font-weight:bold;"
+                )
+
+        # Highest CE OI
+        if ce_oi_col:
+
+            idx = df.columns.get_loc(ce_oi_col)
+
+            if row[ce_oi_col] == max_ce:
+
+                styles[idx] = (
+                    "background-color:#ff4d4d;"
+                    "color:white;"
+                    "font-weight:bold;"
+                )
+
+        # Highest PE OI
+        if pe_oi_col:
+
+            idx = df.columns.get_loc(pe_oi_col)
+
+            if row[pe_oi_col] == max_pe:
+
+                styles[idx] = (
+                    "background-color:#00C853;"
+                    "color:white;"
+                    "font-weight:bold;"
+                )
+
+        # CE Change Highlight
+        if ce_change_col:
+
+            idx = df.columns.get_loc(ce_change_col)
+
+            if row[ce_change_col] > 0:
+
+                styles[idx] = (
+                    "background-color:#ffcdd2;"
+                )
+
+        # PE Change Highlight
+        if pe_change_col:
+
+            idx = df.columns.get_loc(pe_change_col)
+
+            if row[pe_change_col] > 0:
+
+                styles[idx] = (
+                    "background-color:#C8E6C9;"
+                )
+
+        return styles
+
+    styled_df = df.style.apply(
+        highlight_row,
+        axis=1
+    )
+
+    st.dataframe(
+        styled_df,
+        use_container_width=True,
+        height=700
+    )
+
+    st.divider()
+
+    # ------------------------------------------
+    # Top OI Levels
+    # ------------------------------------------
+
+    left, right = st.columns(2)
+
+    if ce_oi_col:
+
+        ce_top = df.nlargest(
+            5,
+            ce_oi_col
+        )[[strike_col, ce_oi_col]]
+
+        left.error("🔴 Top 5 CE OI")
+
+        left.dataframe(
+            ce_top,
+            use_container_width=True
+        )
+
+    if pe_oi_col:
+
+        pe_top = df.nlargest(
+            5,
+            pe_oi_col
+        )[[strike_col, pe_oi_col]]
+
+        right.success("🟢 Top 5 PE OI")
+
+        right.dataframe(
+            pe_top,
+            use_container_width=True
+        )
+
+    st.divider()
+
+    # ===== PART 5 STARTS BELOW =====
