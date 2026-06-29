@@ -1157,3 +1157,97 @@ Entry : Above {spot}
 Support : {support}
 
 Target : {res
+    # ==========================================================
+    # PART 9
+    # IV | OPTION GREEKS | INSTITUTIONAL SUMMARY
+    # ==========================================================
+
+    st.divider()
+    st.subheader("📊 Option Analytics")
+
+    # ==========================================
+    # IV Analysis
+    # ==========================================
+
+    iv = 18.5
+
+    if "iv" in [str(c).lower() for c in df.columns]:
+
+        for col in df.columns:
+
+            if str(col).lower() == "iv":
+
+                iv = round(df[col].mean(), 2)
+
+    c1, c2, c3 = st.columns(3)
+
+    c1.metric(
+        "Average IV",
+        f"{iv}%"
+    )
+
+    if iv >= 30:
+
+        iv_rank = "🔴 HIGH"
+
+    elif iv >= 20:
+
+        iv_rank = "🟡 NORMAL"
+
+    else:
+
+        iv_rank = "🟢 LOW"
+
+    c2.metric(
+        "IV Rank",
+        iv_rank
+    )
+
+    c3.metric(
+        "Expected Move",
+        f"±{round(spot*iv/100/16,2)}"
+    )
+
+    st.divider()
+
+    # ==========================================
+    # Greeks (Demo)
+    # ==========================================
+
+    st.subheader("📈 Option Greeks")
+
+    greeks = pd.DataFrame({
+
+        "Greek":[
+
+            "Delta",
+            "Gamma",
+            "Theta",
+            "Vega"
+
+        ],
+
+        "Value":[
+
+            0.52,
+            0.08,
+            -5.10,
+            12.40
+
+        ]
+
+    })
+
+    st.dataframe(
+        greeks,
+        use_container_width=True
+    )
+
+    st.info(
+        "ℹ️ Live Greeks depend on broker/API support."
+    )
+
+    st.divider()
+
+    # ==========================================
+    # Institutional
