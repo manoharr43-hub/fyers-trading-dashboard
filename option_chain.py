@@ -602,3 +602,160 @@ def show_option_chain(fyers):
     st.divider()
 
     # ===== PART 5 STARTS BELOW =====
+    # ==========================================================
+    # PART 5
+    # OI CHARTS | AI SCORE | SMART MONEY
+    # ==========================================================
+
+    st.subheader("📊 Open Interest Analysis")
+
+    try:
+
+        # ------------------------------------------
+        # CE vs PE OI Chart
+        # ------------------------------------------
+
+        if strike_col and ce_oi_col and pe_oi_col:
+
+            chart_df = df[[
+                strike_col,
+                ce_oi_col,
+                pe_oi_col
+            ]].copy()
+
+            fig = px.bar(
+
+                chart_df,
+
+                x=strike_col,
+
+                y=[ce_oi_col, pe_oi_col],
+
+                barmode="group",
+
+                title="CE vs PE Open Interest"
+
+            )
+
+            st.plotly_chart(
+                fig,
+                use_container_width=True
+            )
+
+        # ------------------------------------------
+        # OI Change Chart
+        # ------------------------------------------
+
+        if ce_change_col and pe_change_col:
+
+            fig2 = px.bar(
+
+                df,
+
+                x=strike_col,
+
+                y=[
+                    ce_change_col,
+                    pe_change_col
+                ],
+
+                barmode="group",
+
+                title="Open Interest Change"
+
+            )
+
+            st.plotly_chart(
+                fig2,
+                use_container_width=True
+            )
+
+    except Exception as e:
+
+        st.warning(f"Chart Error : {e}")
+
+    st.divider()
+
+    # ==========================================================
+    # AI SCORE
+    # ==========================================================
+
+    ai_score = 50
+
+    if pcr >= 1.30:
+        ai_score += 20
+    elif pcr <= 0.70:
+        ai_score -= 20
+
+    if build_up.startswith("🟢"):
+        ai_score += 20
+    elif build_up.startswith("🔴"):
+        ai_score -= 20
+
+    if total_pe > total_ce:
+        ai_score += 10
+    else:
+        ai_score -= 10
+
+    ai_score = max(0, min(ai_score, 100))
+
+    if ai_score >= 80:
+        signal = "🟢 STRONG BUY"
+
+    elif ai_score >= 60:
+        signal = "🟢 BUY"
+
+    elif ai_score >= 40:
+        signal = "🟡 HOLD"
+
+    else:
+        signal = "🔴 SELL"
+
+    left, right = st.columns(2)
+
+    left.metric(
+        "🤖 AI Score",
+        f"{ai_score}/100"
+    )
+
+    right.metric(
+        "Signal",
+        signal
+    )
+
+    st.divider()
+
+    # ==========================================================
+    # SMART MONEY
+    # ==========================================================
+
+    st.subheader("💰 Smart Money Flow")
+
+    if ai_score >= 80:
+
+        st.success("""
+🟢 Heavy Put Writing
+
+🏦 Institutional Buying
+
+📈 Strong Bullish Bias
+
+💰 Smart Money Entering
+""")
+
+    elif ai_score >= 60:
+
+        st.info("""
+🟢 Moderate Bullish
+
+📊 Positive OI Structure
+
+🏦 Institutions Active
+""")
+
+    elif ai_score >= 40:
+
+        st.warning("""
+🟡 Neutral Market
+
+⚖
