@@ -907,3 +907,158 @@ def show_option_chain(fyers):
         time.sleep(refresh_time)
 
         st.rerun()
+            # ==========================================================
+    # PART 7
+    # HEATMAP | EXPIRY HIGHLIGHT | F&O SEARCH | OI SUMMARY
+    # ==========================================================
+
+    st.divider()
+    st.subheader("🔥 Institutional OI Dashboard")
+
+    # ==========================================
+    # Top Summary
+    # ==========================================
+
+    s1, s2, s3, s4 = st.columns(4)
+
+    s1.metric(
+        "🔴 Total CE OI",
+        f"{int(total_ce):,}"
+    )
+
+    s2.metric(
+        "🟢 Total PE OI",
+        f"{int(total_pe):,}"
+    )
+
+    s3.metric(
+        "📈 CE OI Change",
+        f"{int(total_ce_change):,}"
+    )
+
+    s4.metric(
+        "📉 PE OI Change",
+        f"{int(total_pe_change):,}"
+    )
+
+    st.divider()
+
+    # ==========================================
+    # Expiry Highlight
+    # ==========================================
+
+    if expiry != "Loading...":
+
+        st.success(
+            f"📅 Selected Expiry : {expiry}"
+        )
+
+    # ==========================================
+    # Heatmap
+    # ==========================================
+
+    st.subheader("🌡 OI Heatmap")
+
+    heat_df = df.copy()
+
+    if ce_oi_col:
+
+        heat_df = heat_df.style.background_gradient(
+            subset=[ce_oi_col],
+            cmap="Reds"
+        )
+
+    if pe_oi_col:
+
+        heat_df = heat_df.background_gradient(
+            subset=[pe_oi_col],
+            cmap="Greens"
+        )
+
+    st.dataframe(
+        heat_df,
+        use_container_width=True,
+        height=700
+    )
+
+    st.divider()
+
+    # ==========================================
+    # Top OI Writers
+    # ==========================================
+
+    left, right = st.columns(2)
+
+    if ce_oi_col:
+
+        left.subheader("🔴 Top CE Writers")
+
+        left.dataframe(
+
+            df.nlargest(
+                10,
+                ce_oi_col
+            )[
+                [strike_col, ce_oi_col]
+            ],
+
+            use_container_width=True
+
+        )
+
+    if pe_oi_col:
+
+        right.subheader("🟢 Top PE Writers")
+
+        right.dataframe(
+
+            df.nlargest(
+                10,
+                pe_oi_col
+            )[
+                [strike_col, pe_oi_col]
+            ],
+
+            use_container_width=True
+
+        )
+
+    st.divider()
+
+    # ==========================================
+    # Institutional Rating
+    # ==========================================
+
+    st.subheader("🏦 Institutional Rating")
+
+    if ai_score >= 90:
+
+        st.success("⭐⭐⭐⭐⭐ Excellent")
+
+    elif ai_score >= 80:
+
+        st.success("⭐⭐⭐⭐ Very Strong")
+
+    elif ai_score >= 70:
+
+        st.info("⭐⭐⭐ Strong")
+
+    elif ai_score >= 60:
+
+        st.warning("⭐⭐ Moderate")
+
+    else:
+
+        st.error("⭐ Weak")
+
+    st.divider()
+
+    # ==========================================
+    # Live F&O Search
+    # ==========================================
+
+    st.success(
+        "✅ Supports NIFTY, BANKNIFTY, FINNIFTY, MIDCPNIFTY, SENSEX, BANKEX and configured F&O Stocks."
+    )
+
+    st.caption("🚀 NSE AI PRO V13 Institutional Option Chain")
