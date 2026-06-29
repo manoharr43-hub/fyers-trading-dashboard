@@ -934,3 +934,171 @@ def show_scanner(fyers):
                 inst_df.to_csv(index=False),
 
                 file_name="Institutional
+# ==========================================================
+# NSE AI PRO V13 INSTITUTIONAL
+# PART 6
+# SMART MONEY | VOLUME SURGE | AI CONFIDENCE
+# ==========================================================
+
+            st.divider()
+            st.subheader("💰 Smart Money Analysis")
+
+            smart_data = []
+
+            for _, row in inst_df.iterrows():
+
+                ai = row["AI Score"]
+
+                confidence = 50
+
+                smart_flow = "Neutral"
+
+                volume_status = "Normal"
+
+                action = row["Signal"]
+
+                # ------------------------------------
+                # AI Confidence
+                # ------------------------------------
+
+                if ai >= 90:
+
+                    confidence = 98
+
+                    smart_flow = "Heavy Institutional Buying"
+
+                    volume_status = "Explosive"
+
+                elif ai >= 80:
+
+                    confidence = 90
+
+                    smart_flow = "Institutional Buying"
+
+                    volume_status = "High"
+
+                elif ai >= 70:
+
+                    confidence = 82
+
+                    smart_flow = "Smart Accumulation"
+
+                    volume_status = "Above Average"
+
+                elif ai >= 60:
+
+                    confidence = 70
+
+                    smart_flow = "Neutral"
+
+                    volume_status = "Average"
+
+                else:
+
+                    confidence = 40
+
+                    smart_flow = "Institutional Selling"
+
+                    volume_status = "Weak"
+
+                # ------------------------------------
+                # Final Grade
+                # ------------------------------------
+
+                if confidence >= 95:
+
+                    grade = "A+"
+
+                elif confidence >= 85:
+
+                    grade = "A"
+
+                elif confidence >= 75:
+
+                    grade = "B+"
+
+                elif confidence >= 60:
+
+                    grade = "B"
+
+                else:
+
+                    grade = "C"
+
+                smart_data.append({
+
+                    "Symbol": row["Symbol"],
+
+                    "AI Score": ai,
+
+                    "Confidence %": confidence,
+
+                    "Smart Money": smart_flow,
+
+                    "Volume": volume_status,
+
+                    "Grade": grade,
+
+                    "Signal": action
+
+                })
+
+            smart_df = pd.DataFrame(smart_data)
+
+            st.dataframe(
+
+                smart_df,
+
+                use_container_width=True,
+
+                height=650
+
+            )
+
+            # ==========================================
+            # Dashboard
+            # ==========================================
+
+            st.divider()
+
+            st.subheader("📊 AI Dashboard")
+
+            buy = len(
+
+                smart_df[
+                    smart_df["Signal"].str.contains("BUY")
+                ]
+
+            )
+
+            watch = len(
+
+                smart_df[
+                    smart_df["Signal"].str.contains("WATCH")
+                ]
+
+            )
+
+            hold = len(
+
+                smart_df[
+                    smart_df["Signal"].str.contains("HOLD")
+                ]
+
+            )
+
+            sell = len(
+
+                smart_df[
+                    smart_df["Signal"].str.contains("SELL")
+                ]
+
+            )
+
+            c1, c2, c3, c4 = st.columns(4)
+
+            c1.metric("BUY", buy)
+
+            c2.metric("WATCH", watch)
+
+           
