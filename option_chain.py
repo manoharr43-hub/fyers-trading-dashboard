@@ -177,7 +177,8 @@ def iv_chart(df: pd.DataFrame) -> go.Figure:
 
 
 def style_chain_table(df: pd.DataFrame) -> pd.DataFrame:
-    cols = ["ce_oi", "ce_chng_oi", "ce_volume", "ce_ltp", "strike_price", "pe_ltp", "pe_volume", "pe_chng_oi", "pe_oi"]
+    cols = ["ce_oi", "ce_chng_oi", "ce_volume", "ce_ltp", "CE Bias", "strike_price",
+            "PE Bias", "pe_ltp", "pe_volume", "pe_chng_oi", "pe_oi", "Strike Signal", "Big Move"]
     available = [c for c in cols if c in df.columns]
     out = df[available].copy()
 
@@ -207,6 +208,39 @@ def extract_options_data(response: dict):
     if isinstance(data, list) and len(data) > 0:
         return data, {}
     return [], data
+
+
+def extract_spot_price(response: dict, data) -> float:
+    """
+    Fyers' spot/underlying price has shown up under different keys
+    across SDK/API versions and response shapes. Try the known
+    variants in order instead of assuming a single key name, which is
+    what was causing Spot Price to always show as nil/—.
+    """
+    candidates = []
+
+    if isinstance(data, dict):
+        candidates.extend([
+            data.get("ltp"), data.get("spot_price"), data.get("spotPrice"),
+            data.get("underlyingValue"), data.get("underlying_value"),
+            data.get("underlyingLtp"), data.get("underlying_ltp"),
+        ])
+
+    # Some Fyers responses nest the spot price at the top level of the
+    # response, not inside "data" at all.
+    candidates.extend([
+        response.get("ltp"), response.get("spot_price"), response.get("spotPrice"),
+        response.get("underlyingValue"), response.get("underlying_value"),
+    ])
+
+    for val in candidates:
+        try:
+            f = float(val)
+            if f > 0:
+                return f
+        except (TypeError, ValueError):
+            continue
+    return 0.0
 
 
 def normalize_chain_shape(options_data: list) -> pd.DataFrame:
@@ -264,6 +298,70 @@ def normalize_chain_shape(options_data: list) -> pd.DataFrame:
     return wide
 
 
+def detect_big_moves(df: pd.DataFrame, top_n: int = 3) -> list:
+    """
+    Flags strikes with unusually large open-interest buildup (chng_oi),
+    which is commonly read as smart-money positioning. Large +ve CE
+    chng_oi at a strike above spot = call writing (resistance forming /
+    bearish near that strike); large +ve PE chng_oi below spot = put
+    writing (support forming / bullish near that strike). Large OI
+    UNWINDING (negative chng_oi) on the side that previously dominated
+    suggests an existing position is being closed, often preceding a
+    breakout through that strike.
+    Returns a list of dicts: {strike, side, direction, oi_change, note}.
+    """
+    alerts = []
+    if "ce_chng_oi" not in df.columns or "pe_chng_oi" not in df.columns:
+        return alerts
+
+    ce_thresh = df["ce_chng_oi"].abs().quantile(0.85) if df["ce_chng_oi"].abs().max() > 0 else 0
+    pe_thresh = df["pe_chng_oi"].abs().quantile(0.85) if df["pe_chng_oi"].abs().max() > 0 else 0
+
+    top_ce = df.reindex(df["ce_chng_oi"].abs().sort_values(ascending=False).index).head(top_n)
+    top_pe = df.reindex(df["pe_chng_oi"].abs().sort_values(ascending=False).index).head(top_n)
+
+    for _, row in top_ce.iterrows():
+        chg = row["ce_chng_oi"]
+        if abs(chg) < ce_thresh or chg == 0:
+            continue
+        if chg > 0:
+            alerts.append({
+                "strike": row["strike_price"], "side": "CE", "direction": "SELL",
+                "oi_change": chg,
+                "note": f"Heavy CALL writing at {row['strike_price']:,.0f} — resistance building, "
+                        f"bearish/range bias near this strike. Consider SELL CE / avoid buying CE here.",
+            })
+        else:
+            alerts.append({
+                "strike": row["strike_price"], "side": "CE", "direction": "BUY",
+                "oi_change": chg,
+                "note": f"CALL OI unwinding at {row['strike_price']:,.0f} — resistance weakening, "
+                        f"possible breakout above. Consider BUY CE on confirmation.",
+            })
+
+    for _, row in top_pe.iterrows():
+        chg = row["pe_chng_oi"]
+        if abs(chg) < pe_thresh or chg == 0:
+            continue
+        if chg > 0:
+            alerts.append({
+                "strike": row["strike_price"], "side": "PE", "direction": "BUY",
+                "oi_change": chg,
+                "note": f"Heavy PUT writing at {row['strike_price']:,.0f} — support building, "
+                        f"bullish bias near this strike. Consider BUY CE / SELL PE here.",
+            })
+        else:
+            alerts.append({
+                "strike": row["strike_price"], "side": "PE", "direction": "SELL",
+                "oi_change": chg,
+                "note": f"PUT OI unwinding at {row['strike_price']:,.0f} — support weakening, "
+                        f"possible breakdown below. Consider BUY PE on confirmation.",
+            })
+
+    alerts.sort(key=lambda a: abs(a["oi_change"]), reverse=True)
+    return alerts
+
+
 def normalize_symbol(stock: str, with_eq: bool = False) -> str:
     """Build an NSE symbol for the option chain endpoint.
     Fyers SDK versions disagree on whether the underlying for stock
@@ -303,6 +401,67 @@ def fetch_optionchain_with_fallback(fyers, symbol: str, strikecount: int, is_sto
             return resp, sym, attempts
 
     return last_response, tried_symbols[-1], attempts
+
+
+def compute_strike_bias(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Classic OI-buildup read per strike, using change-in-OI direction as a
+    proxy for where fresh positioning is happening (price-change data isn't
+    reliably available from the chain endpoint, so this uses the standard
+    simplification: rising Call OI = resistance/sell-side pressure building,
+    rising Put OI = support/buy-side pressure building).
+
+    Adds:
+      - "CE Bias": Sell Side / Unwinding / Flat, based on ce_chng_oi
+      - "PE Bias": Buy Side / Unwinding / Flat, based on pe_chng_oi
+      - "Strike Signal": combined per-strike read (Buy/Sell/Neutral)
+      - "Big Move": flags strikes whose |chng_oi| is in the top 20% of the
+        chain for either leg — i.e. unusually large fresh activity.
+    """
+    out = df.copy()
+    ce_chng = out["ce_chng_oi"] if "ce_chng_oi" in out.columns else pd.Series(0, index=out.index)
+    pe_chng = out["pe_chng_oi"] if "pe_chng_oi" in out.columns else pd.Series(0, index=out.index)
+
+    def ce_label(v):
+        if v > 0:
+            return "🔴 Sell Side (Call Writing)"
+        elif v < 0:
+            return "🟢 Unwinding"
+        return "⚪ Flat"
+
+    def pe_label(v):
+        if v > 0:
+            return "🟢 Buy Side (Put Writing)"
+        elif v < 0:
+            return "🔴 Unwinding"
+        return "⚪ Flat"
+
+    out["CE Bias"] = ce_chng.apply(ce_label)
+    out["PE Bias"] = pe_chng.apply(pe_label)
+
+    # Combined per-strike signal: compare which side has the larger fresh
+    # OI build to call an overall lean for that strike.
+    def combined(row):
+        ce_v, pe_v = row["_ce_chng"], row["_pe_chng"]
+        if pe_v > 0 and pe_v >= max(ce_v, 0):
+            return "🟢 BUY"
+        if ce_v > 0 and ce_v >= max(pe_v, 0):
+            return "🔴 SELL"
+        return "🟡 NEUTRAL"
+
+    out["_ce_chng"] = ce_chng
+    out["_pe_chng"] = pe_chng
+    out["Strike Signal"] = out.apply(combined, axis=1)
+
+    # Big-move flag: top 20% of |chng_oi| across either leg in this chain.
+    magnitudes = pd.concat([ce_chng.abs(), pe_chng.abs()])
+    threshold = magnitudes.quantile(0.8) if len(magnitudes) > 0 and magnitudes.max() > 0 else float("inf")
+    out["Big Move"] = ((ce_chng.abs() >= threshold) | (pe_chng.abs() >= threshold)).map(
+        {True: "🚨 Big Move", False: ""}
+    )
+
+    out.drop(columns=["_ce_chng", "_pe_chng"], inplace=True)
+    return out
 
 
 # ─── Main Function ───────────────────────────────────────────────────────────
@@ -366,7 +525,18 @@ def show_option_chain(fyers):
         symbol = used_symbol
 
         options_data, data = extract_options_data(response)
-        spot_price = data.get("ltp", 0) if isinstance(data, dict) else 0
+        spot_price = extract_spot_price(response, data)
+
+        # Some option chain payloads simply don't carry the underlying
+        # LTP at all. Fall back to a direct quotes call so Spot Price
+        # doesn't show as nil/— even when this happens.
+        if not spot_price:
+            try:
+                quote_resp = fyers.quotes(data={"symbols": symbol})
+                q = quote_resp.get("d", [{}])[0].get("v", {}) if isinstance(quote_resp, dict) else {}
+                spot_price = float(q.get("lp", 0) or 0)
+            except Exception:
+                pass
 
         if not options_data:
             st.warning(
@@ -390,6 +560,7 @@ def show_option_chain(fyers):
 
         df.sort_values("strike_price", inplace=True)
         df.reset_index(drop=True, inplace=True)
+        df = compute_strike_bias(df)
 
         # Stash everything needed for redraw in session_state so switching
         # tabs / touching widgets doesn't wipe the dashboard back to empty.
@@ -424,6 +595,21 @@ def show_option_chain(fyers):
 
     st.markdown("<br>", unsafe_allow_html=True)
 
+    # ── Big Move Alerts ──────────────────────────────────────────────────
+    big_moves = detect_big_moves(df)
+    if big_moves:
+        st.markdown("**⚡ Big Move Alerts — Unusual OI Activity**")
+        for alert in big_moves[:5]:
+            badge = "🟢 BUY" if alert["direction"] == "BUY" else "🔴 SELL"
+            box = st.success if alert["direction"] == "BUY" else st.error
+            box(f"{badge} · Strike **{alert['strike']:,.0f}** ({alert['side']}) · "
+                f"ΔOI {alert['oi_change']:+,.0f} — {alert['note']}")
+        st.caption(
+            "Based on unusual open-interest change (top percentile of ΔOI across strikes). "
+            "This is a positioning signal, not financial advice — confirm with price action before acting."
+        )
+        st.markdown("<br>", unsafe_allow_html=True)
+
     sig_col, gauge_col = st.columns([1, 1])
     with sig_col:
         st.markdown("**Market Sentiment**")
@@ -443,6 +629,18 @@ def show_option_chain(fyers):
     tab1, tab2, tab3 = st.tabs(["📋 Chain Table", "📊 OI Analysis", "📈 IV Skew"])
 
     with tab1:
+        big_moves = df[df["Big Move"] == "🚨 Big Move"] if "Big Move" in df.columns else pd.DataFrame()
+        if not big_moves.empty:
+            buy_strikes = big_moves[big_moves["Strike Signal"] == "🟢 BUY"]["strike_price"].tolist()
+            sell_strikes = big_moves[big_moves["Strike Signal"] == "🔴 SELL"]["strike_price"].tolist()
+            parts = []
+            if buy_strikes:
+                parts.append(f"🟢 **Buy-side build-up:** {', '.join(f'{s:,.0f}' for s in buy_strikes)}")
+            if sell_strikes:
+                parts.append(f"🔴 **Sell-side build-up:** {', '.join(f'{s:,.0f}' for s in sell_strikes)}")
+            if parts:
+                st.markdown("🚨 **Big OI moves detected** — " + "  |  ".join(parts))
+
         display_df = style_chain_table(df)
         st.dataframe(
             display_df.style
