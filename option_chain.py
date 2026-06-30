@@ -465,3 +465,264 @@ st.dataframe(
 )
 
 st.divider()
+# ==========================================================
+# PCR GAUGE
+# ==========================================================
+
+st.markdown("## 📊 Put Call Ratio (PCR)")
+
+gauge = go.Figure(go.Indicator(
+    mode="gauge+number",
+    value=pcr,
+    title={"text": "PCR"},
+    gauge={
+        "axis": {"range": [0, 3]},
+        "bar": {"color": "deepskyblue"},
+        "steps": [
+            {"range": [0, 0.7], "color": "red"},
+            {"range": [0.7, 1.3], "color": "gold"},
+            {"range": [1.3, 3], "color": "green"},
+        ],
+        "threshold": {
+            "line": {"color": "white", "width": 4},
+            "value": pcr
+        }
+    }
+))
+
+gauge.update_layout(
+    template="plotly_dark",
+    height=350
+)
+
+st.plotly_chart(
+    gauge,
+    use_container_width=True
+)
+
+st.divider()
+
+# ==========================================================
+# IMPLIED VOLATILITY
+# ==========================================================
+
+st.markdown("## 📈 IV Skew")
+
+iv_chart = go.Figure()
+
+if "ce_iv" in df.columns:
+
+    iv_chart.add_trace(
+
+        go.Scatter(
+
+            x=df["strike_price"],
+
+            y=df["ce_iv"],
+
+            mode="lines+markers",
+
+            name="CE IV"
+
+        )
+
+    )
+
+if "pe_iv" in df.columns:
+
+    iv_chart.add_trace(
+
+        go.Scatter(
+
+            x=df["strike_price"],
+
+            y=df["pe_iv"],
+
+            mode="lines+markers",
+
+            name="PE IV"
+
+        )
+
+    )
+
+iv_chart.update_layout(
+
+    template="plotly_dark",
+
+    title="Implied Volatility",
+
+    xaxis_title="Strike",
+
+    yaxis_title="IV %",
+
+    height=500
+
+)
+
+st.plotly_chart(
+    iv_chart,
+    use_container_width=True
+)
+
+st.divider()
+
+# ==========================================================
+# MAX PAIN VISUALIZATION
+# ==========================================================
+
+st.markdown("## 🎯 Max Pain Analysis")
+
+pain_chart = go.Figure()
+
+pain_chart.add_trace(
+
+    go.Bar(
+
+        x=df["strike_price"],
+
+        y=df["ce_oi"],
+
+        name="CE OI"
+
+    )
+
+)
+
+pain_chart.add_trace(
+
+    go.Bar(
+
+        x=df["strike_price"],
+
+        y=df["pe_oi"],
+
+        name="PE OI"
+
+    )
+
+)
+
+pain_chart.add_vline(
+
+    x=max_pain,
+
+    line_dash="dash",
+
+    line_color="yellow",
+
+    annotation_text=f"Max Pain {max_pain}"
+
+)
+
+pain_chart.update_layout(
+
+    template="plotly_dark",
+
+    barmode="group",
+
+    height=550,
+
+    xaxis_title="Strike",
+
+    yaxis_title="Open Interest"
+
+)
+
+st.plotly_chart(
+    pain_chart,
+    use_container_width=True
+)
+
+st.divider()
+
+# ==========================================================
+# SUPPORT & RESISTANCE
+# ==========================================================
+
+st.markdown("## 🛡️ Support & Resistance")
+
+sr = go.Figure()
+
+sr.add_trace(
+
+    go.Scatter(
+
+        x=df["strike_price"],
+
+        y=df["pe_oi"],
+
+        mode="lines+markers",
+
+        name="Support (PE)"
+
+    )
+
+)
+
+sr.add_trace(
+
+    go.Scatter(
+
+        x=df["strike_price"],
+
+        y=df["ce_oi"],
+
+        mode="lines+markers",
+
+        name="Resistance (CE)"
+
+    )
+
+)
+
+sr.add_vline(
+
+    x=support,
+
+    line_color="green",
+
+    annotation_text=f"Support {support}"
+
+)
+
+sr.add_vline(
+
+    x=resistance,
+
+    line_color="red",
+
+    annotation_text=f"Resistance {resistance}"
+
+)
+
+sr.add_vline(
+
+    x=atm,
+
+    line_dash="dot",
+
+    line_color="white",
+
+    annotation_text="ATM"
+
+)
+
+sr.update_layout(
+
+    template="plotly_dark",
+
+    height=550,
+
+    xaxis_title="Strike",
+
+    yaxis_title="Open Interest"
+
+)
+
+st.plotly_chart(
+    sr,
+    use_container_width=True
+)
+
+st.divider()
