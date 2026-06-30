@@ -264,13 +264,45 @@ def normalize_chain_shape(options_data: list) -> pd.DataFrame:
     return wide
 
 
-def normalize_symbol(stock: str) -> str:
-    """Fyers' optionchain endpoint expects the underlying symbol, not the
-    equity (-EQ) symbol used for quotes/LTP. Strip -EQ if present."""
+def normalize_symbol(stock: str, with_eq: bool = False) -> str:
+    """Build an NSE symbol for the option chain endpoint.
+    Fyers SDK versions disagree on whether the underlying for stock
+    options needs the '-EQ' suffix, so callers can try both."""
     stock = stock.strip().upper()
-    if stock.endswith("-EQ"):
-        stock = stock[:-3]
-    return f"NSE:{stock}"
+    stock = stock[:-3] if stock.endswith("-EQ") else stock
+    return f"NSE:{stock}-EQ" if with_eq else f"NSE:{stock}"
+
+
+def fetch_optionchain_with_fallback(fyers, symbol: str, strikecount: int, is_stock: bool):
+    """
+    Calls fyers.optionchain, retrying with an alternate symbol format if the
+    first attempt returns a non-'ok' status (commonly a 300/invalid-input
+    error caused by symbol formatting differences between Fyers SDK/API
+    versions). Returns (response, symbol_used, attempts_log).
+    """
+    attempts = []
+    tried_symbols = [symbol]
+
+    # For stocks, also try the -EQ variant as a fallback since some
+    # Fyers API versions require it for the optionchain endpoint.
+    if is_stock:
+        alt = normalize_symbol(symbol.split(":")[-1], with_eq=not symbol.endswith("-EQ"))
+        if alt not in tried_symbols:
+            tried_symbols.append(alt)
+
+    last_response = None
+    for sym in tried_symbols:
+        try:
+            resp = fyers.optionchain(data={"symbol": sym, "strikecount": int(strikecount)})
+        except Exception as e:
+            attempts.append((sym, f"exception: {e}"))
+            continue
+        attempts.append((sym, resp.get("s") if isinstance(resp, dict) else "no response"))
+        last_response = resp
+        if isinstance(resp, dict) and resp.get("s") == "ok":
+            return resp, sym, attempts
+
+    return last_response, tried_symbols[-1], attempts
 
 
 # ─── Main Function ───────────────────────────────────────────────────────────
@@ -289,14 +321,18 @@ def show_option_chain(fyers):
             "NIFTY NXT 50": "NSE:NIFTYNEXT50-INDEX",
         }
         option_type = st.radio("Instrument Type", ["Indices", "F&O Stocks"])
-        if option_type == "Indices":
+        is_stock = option_type == "F&O Stocks"
+        if not is_stock:
             selected_key = st.selectbox("Index", list(symbol_map.keys()))
             symbol = symbol_map[selected_key]
         else:
             stock = st.text_input("Stock Symbol (e.g. RELIANCE)", "RELIANCE")
             symbol = normalize_symbol(stock)
 
-        strike_count = st.slider("Strikes Around ATM", 5, 30, 20, step=5)
+        # Stock option chains commonly reject strikecount values that are
+        # fine for indices; keep the stock max tighter to avoid 300 errors.
+        max_strikes = 20 if is_stock else 30
+        strike_count = st.slider("Strikes Around ATM", 5, max_strikes, min(20, max_strikes), step=5)
         debug_mode = st.checkbox("Show raw API response (debug)", value=False)
         st.divider()
         fetch_btn = st.button("🔄 Fetch Live Data", use_container_width=True, type="primary")
@@ -304,18 +340,30 @@ def show_option_chain(fyers):
     # ── Fetch & Process ──────────────────────────────────────────────────────
     if fetch_btn:
         with st.spinner("Connecting to Fyers API …"):
-            try:
-                response = fyers.optionchain(data={"symbol": symbol, "strikecount": int(strike_count)})
-            except Exception as e:
-                st.error(f"API call failed: {e}")
-                return
+            response, used_symbol, attempts = fetch_optionchain_with_fallback(
+                fyers, symbol, strike_count, is_stock
+            )
 
         if debug_mode:
+            st.write("**Symbols tried:**", attempts)
             st.json(response)
 
-        if not response or response.get("s") != "ok":
-            st.error(f"API Error: {response.get('message', 'No data returned')}")
+        if not response:
+            st.error("API call failed for all symbol variants tried. Check your Fyers connection/token.")
             return
+
+        if response.get("s") != "ok":
+            err_code = response.get("code", "—")
+            err_msg = response.get("message", "No data returned")
+            st.error(
+                f"API Error (code {err_code}): {err_msg}\n\n"
+                f"Tried: {', '.join(s for s, _ in attempts)}. "
+                "If this is a stock, confirm it actually has active F&O "
+                "contracts on NSE — not every stock has listed options."
+            )
+            return
+
+        symbol = used_symbol
 
         options_data, data = extract_options_data(response)
         spot_price = data.get("ltp", 0) if isinstance(data, dict) else 0
