@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import requests
 import time
+import io
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -96,6 +97,7 @@ def _analyse(symbol: str, df: pd.DataFrame) -> dict:
     return {
         "Symbol": symbol.replace("NSE:", "").replace("-EQ", ""),
         "Close": round(close.iloc[-1], 2),
+        "RVOL": round(rvol, 2),
         "AI Score": ai_score,
         "Smart Money": "🏦 Institutional" if ai_score > 70 else "⚖️ Neutral" if ai_score > 45 else "🔻 Distribution",
         "Signal": "🟢 BUY" if ai_score > 65 else "🔴 SELL" if ai_score < 40 else "🟡 HOLD",
@@ -126,6 +128,32 @@ def run_scan(fyers, symbols: list[str]):
 
     progress.empty()
     return results, errors
+
+
+def to_excel_bytes(df: pd.DataFrame) -> bytes:
+    """Builds an in-memory formatted .xlsx from the scan results."""
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="Scan Results")
+        ws = writer.sheets["Scan Results"]
+
+        from openpyxl.styles import Font, PatternFill, Alignment
+
+        header_font = Font(bold=True, color="FFFFFF", name="Arial")
+        header_fill = PatternFill("solid", start_color="1F2937")
+        for cell in ws[1]:
+            cell.font = header_font
+            cell.fill = header_fill
+            cell.alignment = Alignment(horizontal="center")
+
+        for col_cells in ws.columns:
+            length = max(len(str(c.value)) for c in col_cells if c.value is not None)
+            ws.column_dimensions[col_cells[0].column_letter].width = max(length + 2, 10)
+
+        ws.freeze_panes = "A2"
+
+    buf.seek(0)
+    return buf.getvalue()
 
 
 # ── Main Application ──────────────────────────────────────────────────────────
@@ -172,8 +200,16 @@ def show_scanner(fyers):
         if df.empty:
             st.error("Scan returned no usable results. Expand the error log below.")
         else:
-            st.dataframe(df.sort_values("AI Score", ascending=False), use_container_width=True, height=500)
+            sorted_df = df.sort_values("AI Score", ascending=False)
+            st.dataframe(sorted_df, use_container_width=True, height=500)
             st.bar_chart(df.set_index("Symbol")["AI Score"])
+
+            st.download_button(
+                "📥 Download as Excel",
+                data=to_excel_bytes(sorted_df),
+                file_name=f"nse_scan_{datetime.today().strftime('%Y%m%d_%H%M')}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
 
         if st.session_state.get("scan_errors"):
             with st.expander(f"⚠️ Errors / skipped symbols ({len(st.session_state['scan_errors'])})"):
