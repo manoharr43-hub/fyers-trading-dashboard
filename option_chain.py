@@ -939,3 +939,254 @@ if auto_refresh:
     time.sleep(refresh_time)
 
     st.rerun()
+# ==========================================================
+# OPTION GREEKS
+# ==========================================================
+
+st.markdown("## ⚡ Option Greeks")
+
+# ----------------------------------------------------------
+# FALLBACK GREEKS
+# ----------------------------------------------------------
+
+if "ce_delta" not in df.columns:
+    df["ce_delta"] = np.where(
+        df["strike_price"] <= atm,
+        0.70,
+        0.30
+    )
+
+if "pe_delta" not in df.columns:
+    df["pe_delta"] = np.where(
+        df["strike_price"] >= atm,
+        -0.70,
+        -0.30
+    )
+
+if "ce_gamma" not in df.columns:
+    df["ce_gamma"] = 0.02
+
+if "pe_gamma" not in df.columns:
+    df["pe_gamma"] = 0.02
+
+if "ce_theta" not in df.columns:
+    df["ce_theta"] = -4.5
+
+if "pe_theta" not in df.columns:
+    df["pe_theta"] = -4.0
+
+if "ce_vega" not in df.columns:
+    df["ce_vega"] = 1.25
+
+if "pe_vega" not in df.columns:
+    df["pe_vega"] = 1.15
+
+# ==========================================================
+# GREEKS TABLE
+# ==========================================================
+
+greeks = df[[
+    "strike_price",
+    "ce_delta",
+    "ce_gamma",
+    "ce_theta",
+    "ce_vega",
+    "pe_delta",
+    "pe_gamma",
+    "pe_theta",
+    "pe_vega"
+]]
+
+greeks.columns = [
+    "Strike",
+    "CE Δ",
+    "CE Γ",
+    "CE Θ",
+    "CE Vega",
+    "PE Δ",
+    "PE Γ",
+    "PE Θ",
+    "PE Vega"
+]
+
+st.dataframe(
+    greeks,
+    use_container_width=True,
+    height=500
+)
+
+st.divider()
+
+# ==========================================================
+# DELTA EXPOSURE
+# ==========================================================
+
+st.markdown("## 📊 Delta Exposure")
+
+df["DEX"] = (
+    df["ce_delta"] * df["ce_oi"]
+    +
+    abs(df["pe_delta"]) * df["pe_oi"]
+)
+
+dex_fig = go.Figure()
+
+dex_fig.add_trace(
+
+    go.Bar(
+
+        x=df["strike_price"],
+
+        y=df["DEX"],
+
+        name="Delta Exposure"
+
+    )
+
+)
+
+dex_fig.update_layout(
+
+    template="plotly_dark",
+
+    title="Delta Exposure",
+
+    height=500
+
+)
+
+st.plotly_chart(
+    dex_fig,
+    use_container_width=True
+)
+
+st.divider()
+
+# ==========================================================
+# GAMMA EXPOSURE
+# ==========================================================
+
+st.markdown("## 📈 Gamma Exposure")
+
+df["GEX"] = (
+
+    df["ce_gamma"] * df["ce_oi"]
+
+    +
+
+    df["pe_gamma"] * df["pe_oi"]
+
+)
+
+gex_fig = go.Figure()
+
+gex_fig.add_trace(
+
+    go.Scatter(
+
+        x=df["strike_price"],
+
+        y=df["GEX"],
+
+        mode="lines+markers",
+
+        name="Gamma Exposure"
+
+    )
+
+)
+
+gex_fig.update_layout(
+
+    template="plotly_dark",
+
+    title="Gamma Exposure",
+
+    height=500
+
+)
+
+st.plotly_chart(
+    gex_fig,
+    use_container_width=True
+)
+
+st.divider()
+
+# ==========================================================
+# IV RANK
+# ==========================================================
+
+st.markdown("## 📉 IV Rank")
+
+if "ce_iv" in df.columns:
+
+    iv_high = df["ce_iv"].max()
+
+    iv_low = df["ce_iv"].min()
+
+    current_iv = df.loc[
+        (df["strike_price"] - atm).abs().idxmin(),
+        "ce_iv"
+    ]
+
+    iv_rank = (
+        (current_iv - iv_low)
+        /
+        max(iv_high - iv_low, 1)
+    ) * 100
+
+else:
+
+    iv_rank = 0
+
+st.metric(
+    "Current IV Rank",
+    f"{iv_rank:.2f}%"
+)
+
+st.divider()
+
+# ==========================================================
+# INSTITUTIONAL SUMMARY
+# ==========================================================
+
+st.markdown("## 🏦 Institutional Activity")
+
+institution = pd.DataFrame({
+
+    "Metric":[
+
+        "Support",
+
+        "Resistance",
+
+        "Max Pain",
+
+        "PCR",
+
+        "DEX",
+
+        "GEX"
+
+    ],
+
+    "Value":[
+
+        support,
+
+        resistance,
+
+        max_pain,
+
+        round(pcr,2),
+
+        round(df["DEX"].sum(),2),
+
+        round(df["GEX"].sum(),2)
+
+    ]
+
+})
+
+st.table(institution)
