@@ -339,4 +339,3 @@ def show_option_chain(fyers):
     else:
         # Empty state
         st.info("👈 Choose an instrument in the sidebar and click **Fetch Live Data**.")
-
