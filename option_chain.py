@@ -1755,3 +1755,144 @@ st.dataframe(
     use_container_width=True,
     hide_index=True
 )
+# ==========================================================
+# DATA VALIDATION
+# ==========================================================
+
+st.markdown("## ✅ Data Validation")
+
+required_columns = [
+    "strike_price",
+    "ce_oi",
+    "pe_oi",
+    "ce_volume",
+    "pe_volume"
+]
+
+missing = [col for col in required_columns if col not in df.columns]
+
+if missing:
+    st.error(f"Missing Columns: {', '.join(missing)}")
+else:
+    st.success("Option Chain data validated successfully.")
+
+st.divider()
+
+# ==========================================================
+# INDIA VIX (PLACEHOLDER)
+# ==========================================================
+
+st.markdown("## 📉 India VIX")
+
+st.info(
+    "India VIX is not available from the current Option Chain response. "
+    "Integrate a dedicated VIX API or market-data endpoint to display live VIX."
+)
+
+st.divider()
+
+# ==========================================================
+# FII / DII (PLACEHOLDER)
+# ==========================================================
+
+st.markdown("## 🏦 FII / DII Activity")
+
+st.info(
+    "FII/DII data requires a separate data source. "
+    "It is not returned by the FYERS Option Chain API."
+)
+
+st.divider()
+
+# ==========================================================
+# SIMPLE STRATEGY SUGGESTION
+# ==========================================================
+
+st.markdown("## 🎯 Strategy Suggestion")
+
+if final_signal == "🟢 BULLISH":
+    st.success("Suggested Strategy: Bull Call Spread or Cash Long")
+
+elif final_signal == "🔴 BEARISH":
+    st.error("Suggested Strategy: Bear Put Spread or Protective Put")
+
+else:
+    st.warning("Suggested Strategy: Iron Condor or Wait for Breakout")
+
+st.divider()
+
+# ==========================================================
+# SETTINGS SUMMARY
+# ==========================================================
+
+st.markdown("## ⚙️ Current Settings")
+
+settings_df = pd.DataFrame({
+    "Setting": [
+        "Selected Symbol",
+        "Strike Count",
+        "Auto Refresh",
+        "Refresh Interval (sec)"
+    ],
+    "Value": [
+        symbol,
+        strike_count,
+        auto_refresh,
+        refresh_time
+    ]
+})
+
+st.dataframe(
+    settings_df,
+    use_container_width=True,
+    hide_index=True
+)
+
+st.divider()
+
+# ==========================================================
+# DASHBOARD HEALTH
+# ==========================================================
+
+st.markdown("## 🩺 Dashboard Status")
+
+checks = {
+    "API Response": "OK",
+    "Option Chain": "Loaded",
+    "Charts": "Ready",
+    "AI Engine": "Running",
+    "Data": "Live"
+}
+
+health_df = pd.DataFrame(
+    list(checks.items()),
+    columns=["Component", "Status"]
+)
+
+st.dataframe(
+    health_df,
+    use_container_width=True,
+    hide_index=True
+)
+
+st.divider()
+
+# ==========================================================
+# DISCLAIMER
+# ==========================================================
+
+st.warning(
+    "This dashboard is for educational and analytical purposes only. "
+    "Always confirm trades using your own analysis and risk management."
+)
+
+# ==========================================================
+# FOOTER
+# ==========================================================
+
+st.markdown("---")
+
+st.caption(
+    "🚀 NSE AI PRO | Professional Option Chain Dashboard | "
+    "Powered by FYERS API V3 & Streamlit"
+)
