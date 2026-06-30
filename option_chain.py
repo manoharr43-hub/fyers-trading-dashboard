@@ -3,62 +3,157 @@ import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-from streamlit_autorefresh import st_autorefresh
+from fyers_apiv3 import fyersModel
+import time
 
-# ─── Page Config ─────────────────────────────────────────────
-st.set_page_config(page_title="Options Chain Dashboard V3", page_icon="📊", layout="wide")
+# ==========================================================
+# PAGE CONFIG
+# ==========================================================
+st.set_page_config(
+    page_title="📊 Professional Option Chain",
+    page_icon="📈",
+    layout="wide"
+)
 
-# ─── Sidebar ────────────────────────────────────────────────
-with st.sidebar:
-    st.markdown("### ⚙️ Configuration")
-    symbol_map = {
-        "NIFTY 50": "NSE:NIFTY50-OPT",
-        "BANKNIFTY": "NSE:NIFTYBANK-OPT",
+# ==========================================================
+# CUSTOM CSS
+# ==========================================================
+st.markdown("""
+<style>
+
+.stApp{
+    background:#0d1117;
+    color:white;
+}
+
+div[data-testid="metric-container"]{
+    background:#161b22;
+    border-radius:10px;
+    border:1px solid #30363d;
+    padding:10px;
+}
+
+.sidebar .sidebar-content{
+    background:#161b22;
+}
+
+</style>
+""",unsafe_allow_html=True)
+
+# ==========================================================
+# HEADER
+# ==========================================================
+st.title("📊 Professional Option Chain Dashboard")
+st.caption("Powered by FYERS API V3")
+
+# ==========================================================
+# SIDEBAR
+# ==========================================================
+st.sidebar.header("Settings")
+
+symbol = st.sidebar.selectbox(
+    "Index",
+    [
+        "NSE:NIFTY50-INDEX",
+        "NSE:NIFTYBANK-INDEX",
+        "BSE:SENSEX-INDEX",
+        "BSE:BANKEX-INDEX"
+    ]
+)
+
+strike_count = st.sidebar.slider(
+    "Strike Count",
+    5,
+    30,
+    20
+)
+
+auto_refresh = st.sidebar.checkbox("Auto Refresh")
+
+refresh_time = st.sidebar.slider(
+    "Refresh Seconds",
+    5,
+    60,
+    10
+)
+
+# ==========================================================
+# FYERS SESSION
+# ==========================================================
+
+CLIENT_ID = st.secrets["FYERS_CLIENT_ID"]
+TOKEN = st.secrets["FYERS_ACCESS_TOKEN"]
+
+fyers = fyersModel.FyersModel(
+    client_id=CLIENT_ID,
+    token=TOKEN,
+    is_async=False
+)
+
+# ==========================================================
+# FETCH OPTION CHAIN
+# ==========================================================
+
+def fetch_option_chain():
+
+    data = {
+        "symbol":symbol,
+        "strikecount":strike_count
     }
-    selected_key = st.selectbox("Index", list(symbol_map.keys()))
-    symbol = symbol_map[selected_key]
 
-    expiry = st.text_input("Expiry Date (YYYY-MM-DD)", "2026-07-02")
-    strike_count = st.slider("Strikes Around ATM", 5, 30, 20, step=5)
-    auto_refresh = st.checkbox("Auto Refresh (5 min)", True)
-    fetch_btn = st.button("🔄 Fetch Live Data", use_container_width=True)
+    response = fyers.optionchain(data=data)
 
-if auto_refresh:
-    st_autorefresh(interval=5*60*1000, key="refresh")
+    if response["s"]!="ok":
+        st.error(response["message"])
+        return None
 
-# ─── Dummy API Call (replace with fyers.optionchain) ─────────
-def get_data(symbol, expiry, strike_count):
-    # Simulated response for demo
-    return pd.DataFrame({
-        "strike_price": [16000, 16100, 16200],
-        "ce_oi": [12000, 15000, 18000],
-        "pe_oi": [10000, 14000, 20000],
-    })
+    return response
 
-# ─── Main Logic ─────────────────────────────────────────────
-if fetch_btn:
-    df = get_data(symbol, expiry, strike_count)
-    if df.empty:
-        st.error("⚠️ No options data. Market may be closed or symbol unavailable.")
-    else:
-        # KPIs
-        total_ce = df["ce_oi"].sum()
-        total_pe = df["pe_oi"].sum()
-        pcr = total_pe / total_ce if total_ce > 0 else 0
+# ==========================================================
+# CALCULATE PCR
+# ==========================================================
 
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Total CE OI", f"{total_ce:,}")
-        c2.metric("Total PE OI", f"{total_pe:,}")
-        c3.metric("PCR", f"{pcr:.2f}")
+def calculate_pcr(df):
 
-        # PCR Trend (dummy data)
-        pcr_trend = pd.DataFrame({"time": ["9:15","9:30","9:45"], "pcr":[0.8,1.2,1.5]})
-        st.line_chart(pcr_trend.set_index("time"))
+    ce=df["ce_oi"].sum()
 
-        # OI Bar Chart
-        fig = make_subplots(rows=1, cols=2, subplot_titles=("Call OI", "Put OI"), shared_yaxes=True)
-        fig.add_trace(go.Bar(x=-df["ce_oi"], y=df["strike_price"], orientation="h", name="CE OI"), row=1, col=1)
-        fig.add_trace(go.Bar(x=df["pe_oi"], y=df["strike_price"], orientation="h", name="PE OI"), row=1, col=2)
-        st.plotly_chart(fig, use_container_width=True)
-else:
-    st.info("👈 Choose an instrument and click **Fetch Live Data**")
+    pe=df["pe_oi"].sum()
+
+    if ce==0:
+        return 0
+
+    return round(pe/ce,2)
+
+# ==========================================================
+# CALCULATE MAX PAIN
+# ==========================================================
+
+def calculate_max_pain(df):
+
+    strikes=df["strike_price"].tolist()
+
+    pain=[]
+
+    for strike in strikes:
+
+        ce=((strike-df["strike_price"]).clip(lower=0)*df["ce_oi"]).sum()
+
+        pe=((df["strike_price"]-strike).clip(lower=0)*df["pe_oi"]).sum()
+
+        pain.append(ce+pe)
+
+    return strikes[np.argmin(pain)]
+
+# ==========================================================
+# MARKET SIGNAL
+# ==========================================================
+
+def signal(pcr):
+
+    if pcr>1.3:
+        return "🟢 Bullish"
+
+    elif pcr<0.7:
+        return "🔴 Bearish"
+
+    return "🟡 Neutral"
