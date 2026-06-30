@@ -726,3 +726,216 @@ st.plotly_chart(
 )
 
 st.divider()
+# ==========================================================
+# OI CHANGE ANALYSIS
+# ==========================================================
+
+st.markdown("## 🔥 OI Change Analysis")
+
+analysis_df = df.copy()
+
+# ----------------------------------------------------------
+# BUILD-UP DETECTION
+# ----------------------------------------------------------
+
+def build_up(row):
+
+    ce_signal = "Neutral"
+    pe_signal = "Neutral"
+
+    # CALL SIDE
+    if row["ce_chng_oi"] > 0 and row["ce_ltp"] < row["ce_ltp"]:
+        ce_signal = "Short Build-up"
+
+    elif row["ce_chng_oi"] < 0:
+        ce_signal = "Short Covering"
+
+    # PUT SIDE
+    if row["pe_chng_oi"] > 0:
+        pe_signal = "Long Build-up"
+
+    elif row["pe_chng_oi"] < 0:
+        pe_signal = "Long Unwinding"
+
+    return pd.Series([ce_signal, pe_signal])
+
+analysis_df[["CE Signal","PE Signal"]] = analysis_df.apply(
+    build_up,
+    axis=1
+)
+
+display = analysis_df[[
+    "strike_price",
+    "ce_oi",
+    "ce_chng_oi",
+    "CE Signal",
+    "pe_oi",
+    "pe_chng_oi",
+    "PE Signal"
+]]
+
+display.columns = [
+    "Strike",
+    "CE OI",
+    "CE ΔOI",
+    "CE Signal",
+    "PE OI",
+    "PE ΔOI",
+    "PE Signal"
+]
+
+st.dataframe(
+    display,
+    use_container_width=True,
+    height=500
+)
+
+st.divider()
+
+# ==========================================================
+# TOP WRITING STRIKES
+# ==========================================================
+
+st.markdown("## 🏦 Highest OI Writing")
+
+left,right = st.columns(2)
+
+with left:
+
+    st.subheader("📉 Top CE Writing")
+
+    ce_top = (
+        df.nlargest(5,"ce_oi")[
+            ["strike_price","ce_oi","ce_chng_oi"]
+        ]
+    )
+
+    st.dataframe(
+        ce_top,
+        use_container_width=True
+    )
+
+with right:
+
+    st.subheader("📈 Top PE Writing")
+
+    pe_top = (
+        df.nlargest(5,"pe_oi")[
+            ["strike_price","pe_oi","pe_chng_oi"]
+        ]
+    )
+
+    st.dataframe(
+        pe_top,
+        use_container_width=True
+    )
+
+st.divider()
+
+# ==========================================================
+# AI MARKET SIGNAL
+# ==========================================================
+
+st.markdown("## 🤖 AI Trading Signal")
+
+ai_signal = "SIDEWAYS"
+
+reason = []
+
+if pcr > 1.30:
+
+    ai_signal = "BUY"
+
+    reason.append("PCR Bullish")
+
+if support > atm:
+
+    reason.append("Support Above ATM")
+
+if resistance < atm:
+
+    reason.append("Resistance Broken")
+
+if pcr < 0.70:
+
+    ai_signal = "SELL"
+
+    reason.append("PCR Bearish")
+
+if ai_signal == "BUY":
+
+    st.success(f"""
+### 🟢 AI BUY SIGNAL
+
+Reasons
+
+{chr(10).join(reason)}
+""")
+
+elif ai_signal == "SELL":
+
+    st.error(f"""
+### 🔴 AI SELL SIGNAL
+
+Reasons
+
+{chr(10).join(reason)}
+""")
+
+else:
+
+    st.warning("""
+### 🟡 WAIT
+
+Market is sideways.
+
+No strong confirmation.
+""")
+
+st.divider()
+
+# ==========================================================
+# SMART MONEY SUMMARY
+# ==========================================================
+
+st.markdown("## 💰 Smart Money Summary")
+
+summary = pd.DataFrame({
+
+    "Parameter":[
+
+        "Spot Price",
+        "ATM",
+        "PCR",
+        "Support",
+        "Resistance",
+        "Max Pain",
+        "AI Signal"
+
+    ],
+
+    "Value":[
+
+        f"{spot_price:.2f}",
+        atm,
+        pcr,
+        support,
+        resistance,
+        max_pain,
+        ai_signal
+
+    ]
+
+})
+
+st.table(summary)
+
+# ==========================================================
+# AUTO REFRESH
+# ==========================================================
+
+if auto_refresh:
+
+    time.sleep(refresh_time)
+
+    st.rerun()
