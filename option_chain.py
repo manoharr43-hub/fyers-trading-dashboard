@@ -209,6 +209,61 @@ def extract_options_data(response: dict):
     return [], data
 
 
+def normalize_chain_shape(options_data: list) -> pd.DataFrame:
+    """
+    Fyers' optionchain response can come in two shapes:
+
+    1. WIDE: one row per strike, with prefixed columns already
+       (ce_oi, pe_oi, ce_ltp, pe_ltp, ...). Older code assumed this.
+
+    2. LONG: one row per option contract — i.e. a separate row for the
+       CE and a separate row for the PE at each strike — with a field
+       like "option_type" ("CE"/"PE") and shared columns such as "oi",
+       "ltp", "volume", "chng_oi". This is what newer Fyers v3 responses
+       typically return, and is the most common cause of every column
+       showing 0 (the wide ce_/pe_ prefixed columns simply don't exist).
+
+    This function detects which shape we got and always returns a WIDE
+    DataFrame with strike_price, ce_*, pe_* columns.
+    """
+    raw = pd.DataFrame(options_data)
+
+    # Already wide (has at least one ce_/pe_ prefixed column) -> use as-is
+    if any(c.startswith("ce_") or c.startswith("pe_") for c in raw.columns):
+        return raw
+
+    # Long format: look for an option-type-like column
+    type_col = next(
+        (c for c in ("option_type", "optionType", "type", "instrument_type") if c in raw.columns),
+        None,
+    )
+    if type_col is None:
+        # Unknown shape — return raw as-is, downstream code will fill zeros
+        return raw
+
+    raw[type_col] = raw[type_col].astype(str).str.upper()
+
+    field_map = {
+        "oi": "oi", "open_interest": "oi",
+        "ltp": "ltp", "last_price": "ltp",
+        "volume": "volume", "vol": "volume",
+        "chng_oi": "chng_oi", "change_oi": "chng_oi", "oi_change": "chng_oi",
+        "iv": "iv", "implied_volatility": "iv",
+    }
+    raw_renamed = raw.rename(columns={k: v for k, v in field_map.items() if k in raw.columns})
+
+    value_cols = [c for c in ("oi", "ltp", "volume", "chng_oi", "iv") if c in raw_renamed.columns]
+
+    ce_df = raw_renamed[raw_renamed[type_col] == "CE"][["strike_price"] + value_cols].copy()
+    pe_df = raw_renamed[raw_renamed[type_col] == "PE"][["strike_price"] + value_cols].copy()
+
+    ce_df.rename(columns={c: f"ce_{c}" for c in value_cols}, inplace=True)
+    pe_df.rename(columns={c: f"pe_{c}" for c in value_cols}, inplace=True)
+
+    wide = pd.merge(ce_df, pe_df, on="strike_price", how="outer")
+    return wide
+
+
 def normalize_symbol(stock: str) -> str:
     """Fyers' optionchain endpoint expects the underlying symbol, not the
     equity (-EQ) symbol used for quotes/LTP. Strip -EQ if present."""
@@ -275,7 +330,7 @@ def show_option_chain(fyers):
             )
             return
 
-        df = pd.DataFrame(options_data)
+        df = normalize_chain_shape(options_data)
 
         num_cols = ["strike_price", "ce_ltp", "ce_oi", "ce_volume", "ce_chng_oi",
                     "pe_ltp", "pe_oi", "pe_volume", "pe_chng_oi"]
