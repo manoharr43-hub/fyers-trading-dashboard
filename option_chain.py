@@ -1407,3 +1407,149 @@ else:
     for item in alerts:
 
         st.success(item)
+# ==========================================================
+# DASHBOARD SUMMARY
+# ==========================================================
+
+st.markdown("## 📋 Dashboard Summary")
+
+summary_col1, summary_col2 = st.columns(2)
+
+with summary_col1:
+
+    st.info(f"""
+### Market Overview
+
+Spot Price : ₹{spot_price:,.2f}
+
+ATM Strike : {atm}
+
+PCR : {pcr:.2f}
+
+Max Pain : {max_pain}
+
+AI Signal : {ai_signal}
+""")
+
+with summary_col2:
+
+    st.success(f"""
+### Important Levels
+
+Support : {support}
+
+Resistance : {resistance}
+
+Total CE OI : {int(df['ce_oi'].sum()):,}
+
+Total PE OI : {int(df['pe_oi'].sum()):,}
+""")
+
+st.divider()
+
+# ==========================================================
+# QUICK STATISTICS
+# ==========================================================
+
+st.markdown("## 📊 Quick Statistics")
+
+c1, c2, c3, c4 = st.columns(4)
+
+with c1:
+    st.metric(
+        "Highest CE OI",
+        int(df["ce_oi"].max())
+    )
+
+with c2:
+    st.metric(
+        "Highest PE OI",
+        int(df["pe_oi"].max())
+    )
+
+with c3:
+    st.metric(
+        "Highest CE Volume",
+        int(df["ce_volume"].max())
+    )
+
+with c4:
+    st.metric(
+        "Highest PE Volume",
+        int(df["pe_volume"].max())
+    )
+
+st.divider()
+
+# ==========================================================
+# EXPORT CSV
+# ==========================================================
+
+st.markdown("## 💾 Export Data")
+
+csv = df.to_csv(index=False).encode("utf-8")
+
+st.download_button(
+    label="📥 Download Option Chain CSV",
+    data=csv,
+    file_name="option_chain.csv",
+    mime="text/csv"
+)
+
+st.divider()
+
+# ==========================================================
+# MARKET STATUS
+# ==========================================================
+
+st.markdown("## 🟢 Market Status")
+
+market_status = "OPEN"
+
+current_hour = time.localtime().tm_hour
+
+if current_hour < 9 or current_hour >= 16:
+    market_status = "CLOSED"
+
+col1, col2 = st.columns(2)
+
+with col1:
+    st.metric(
+        "Market",
+        market_status
+    )
+
+with col2:
+    st.metric(
+        "Last Update",
+        time.strftime("%H:%M:%S")
+    )
+
+st.divider()
+
+# ==========================================================
+# AUTO REFRESH
+# ==========================================================
+
+if auto_refresh:
+
+    placeholder = st.empty()
+
+    placeholder.info(
+        f"🔄 Refreshing every {refresh_time} seconds..."
+    )
+
+    time.sleep(refresh_time)
+
+    st.rerun()
+
+# ==========================================================
+# FOOTER
+# ==========================================================
+
+st.markdown("---")
+
+st.caption(
+    "📊 Professional Option Chain Dashboard | "
+    "Powered by FYERS API V3 | Streamlit"
+)
