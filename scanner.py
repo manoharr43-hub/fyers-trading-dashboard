@@ -4,6 +4,7 @@ import requests
 import time
 import io
 from datetime import datetime, timedelta
+from typing import List, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ── Configuration ────────────────────────────────────────────────────────────
@@ -26,10 +27,15 @@ BATCH_PAUSE_SECONDS = 1.0
 
 # ── Symbol Universe ──────────────────────────────────────────────────────────
 @st.cache_data(ttl=60 * 60 * 12)  # refresh twice a day at most
-def load_nse_equity_symbols() -> list[str]:
+def load_nse_equity_symbols() -> List[str]:
     """
     Downloads Fyers' NSE Capital Market symbol master and returns all
     NSE equity (-EQ) symbols in 'NSE:SYMBOL-EQ' format.
+
+    Fyers does not guarantee the column layout of this CSV stays fixed,
+    so instead of trusting a hardcoded column index we scan every column
+    on a sample of rows and pick whichever index actually contains
+    'NSE:...-EQ' style values most consistently.
     """
     try:
         resp = requests.get(FYERS_NSE_CM_SYMBOL_MASTER, timeout=20)
@@ -38,15 +44,37 @@ def load_nse_equity_symbols() -> list[str]:
         st.error(f"Could not download Fyers symbol master: {e}")
         return []
 
-    # The CSV has no header row; Fyers' documented columns are positional.
-    # Column 9 (0-indexed) is typically the Fyers trading symbol.
-    lines = resp.text.strip().split("\n")
+    lines = [ln for ln in resp.text.strip().split("\n") if ln.strip()]
+    if not lines:
+        return []
+
+    sample = lines[: min(500, len(lines))]
+    split_sample = [ln.split(",") for ln in sample]
+    max_cols = max((len(p) for p in split_sample), default=0)
+
+    best_col, best_hits = None, 0
+    for col_idx in range(max_cols):
+        hits = sum(
+            1 for parts in split_sample
+            if len(parts) > col_idx and parts[col_idx].strip().startswith("NSE:")
+            and parts[col_idx].strip().endswith("-EQ")
+        )
+        if hits > best_hits:
+            best_col, best_hits = col_idx, hits
+
+    if best_col is None or best_hits == 0:
+        st.error(
+            "Could not locate the trading-symbol column in the Fyers symbol "
+            "master — the file format may have changed."
+        )
+        return []
+
     symbols = []
     for line in lines:
         parts = line.split(",")
-        if len(parts) < 10:
+        if len(parts) <= best_col:
             continue
-        sym = parts[9].strip()
+        sym = parts[best_col].strip()
         if sym.startswith("NSE:") and sym.endswith("-EQ"):
             symbols.append(sym)
 
@@ -196,7 +224,7 @@ def _analyse(symbol: str, df: pd.DataFrame) -> dict:
     }
 
 
-def run_scan(fyers, symbols: list[str]):
+def run_scan(fyers, symbols: List[str]):
     """Threaded, rate-limited scan with a progress bar. Returns (results, errors)."""
     results, errors = [], []
     progress = st.progress(0.0, text=f"Scanning 0 / {len(symbols)}")
@@ -229,6 +257,15 @@ def _color_code(val):
         if any(x in val for x in ["SELL", "Distribution", "🔴", "BOS 📉", "CHOCH 🐻", "Bearish CISD 🩸", "Near Low", "Bearish"]):
             return "color: red; font-weight: bold;"
     return ""
+
+
+def _style_dataframe(df: pd.DataFrame):
+    """pandas deprecated Styler.applymap in favor of .map (added in pandas
+    2.1). Support both old and new pandas without erroring out."""
+    styler = df.style
+    if hasattr(styler, "map"):
+        return styler.map(_color_code)
+    return styler.applymap(_color_code)
 
 
 def to_excel_bytes(df: pd.DataFrame) -> bytes:
@@ -302,7 +339,7 @@ def show_scanner(fyers):
             st.error("Scan returned no usable results. Expand the error log below.")
         else:
             sorted_df = df.sort_values("AI Score", ascending=False)
-            st.dataframe(sorted_df.style.applymap(_color_code), use_container_width=True, height=500)
+            st.dataframe(_style_dataframe(sorted_df), use_container_width=True, height=500)
             st.bar_chart(df.set_index("Symbol")["AI Score"])
 
             st.download_button(
