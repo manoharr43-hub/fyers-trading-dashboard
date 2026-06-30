@@ -7,6 +7,7 @@ from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ── Configuration ────────────────────────────────────────────────────────────
+# 365 days of daily candles also serves as our 52-week high/low window.
 DATE_FROM = (datetime.today() - timedelta(days=365)).strftime("%Y-%m-%d")
 DATE_TO = datetime.today().strftime("%Y-%m-%d")
 
@@ -68,14 +69,65 @@ def _fetch_symbol(fyers, symbol: str):
     if resp.get("s") != "ok":
         return None, f"{symbol}: {resp.get('message', resp.get('s'))}"
     candles = resp.get("candles")
-    if not candles or len(candles) < 10:
+    if not candles or len(candles) < 30:
         return None, f"{symbol}: insufficient history ({len(candles) if candles else 0} candles)"
 
     df = pd.DataFrame(candles, columns=["Time", "Open", "High", "Low", "Close", "Volume"])
+    df["Time"] = pd.to_datetime(df["Time"], unit="s", utc=True).dt.tz_convert("Asia/Kolkata")
+
     try:
         return _analyse(symbol, df), None
     except Exception as e:
         return None, f"{symbol}: analysis error {e}"
+
+
+def _calculate_smc_and_cisd(df: pd.DataFrame):
+    """Simplified Smart Money Concepts structure + CISD detection on daily candles.
+    Returns (smc_structure, cisd_signal, signal_time_str)."""
+    if len(df) < 30:
+        return "Range ➖", "None", "N/A"
+
+    d = df.copy()
+    d["Prev_High"] = d["High"].shift(1)
+    d["Prev_Low"] = d["Low"].shift(1)
+    d["Bullish_CISD"] = (d["Low"] < d["Prev_Low"]) & (d["Close"] > d["Prev_High"])
+    d["Bearish_CISD"] = (d["High"] > d["Prev_High"]) & (d["Close"] < d["Prev_Low"])
+
+    d["Local_High"] = d["High"].rolling(window=10).max().shift(1)
+    d["Local_Low"] = d["Low"].rolling(window=10).min().shift(1)
+    d["EMA20"] = d["Close"].ewm(span=20).mean()
+    d["EMA50"] = d["Close"].ewm(span=50).mean()
+    d["Bullish_Trend"] = d["EMA20"] > d["EMA50"]
+    d["Break_Up"] = d["Close"] > d["Local_High"]
+    d["Break_Down"] = d["Close"] < d["Local_Low"]
+
+    recent = d.tail(20)
+
+    cisd_events = recent[recent["Bullish_CISD"] | recent["Bearish_CISD"]]
+    cisd_signal = "None"
+    cisd_time_str = "N/A"
+    if not cisd_events.empty:
+        is_bull = bool(cisd_events["Bullish_CISD"].iloc[-1])
+        cisd_signal = "Bullish CISD 🚀" if is_bull else "Bearish CISD 🩸"
+        cisd_time_str = cisd_events["Time"].iloc[-1].strftime("%d-%b-%Y")
+
+    smc_events = recent[recent["Break_Up"] | recent["Break_Down"]]
+    smc_structure = "Range ➖"
+    smc_time_str = "N/A"
+    if not smc_events.empty:
+        is_up = bool(smc_events["Break_Up"].iloc[-1])
+        is_bull_trend = bool(smc_events["Bullish_Trend"].iloc[-1])
+        if is_up:
+            smc_structure = "BOS 📈" if is_bull_trend else "CHOCH 🐂"
+        else:
+            smc_structure = "BOS 📉" if not is_bull_trend else "CHOCH 🐻"
+        smc_time_str = smc_events["Time"].iloc[-1].strftime("%d-%b-%Y")
+
+    signal_time = cisd_time_str if cisd_signal != "None" else (
+        smc_time_str if smc_structure != "Range ➖" else df["Time"].iloc[-1].strftime("%d-%b-%Y")
+    )
+
+    return smc_structure, cisd_signal, signal_time
 
 
 def _analyse(symbol: str, df: pd.DataFrame) -> dict:
@@ -94,6 +146,40 @@ def _analyse(symbol: str, df: pd.DataFrame) -> dict:
 
     ai_score = min(round((rvol * 15) + (trend_score * 40) + min(max(roc, 0), 10) * 2 + 20, 1), 100)
 
+    # ── Gap % (today's open vs previous close) ─────────────────────────────
+    gap_pct = 0.0
+    if len(df) >= 2:
+        gap_pct = ((df["Open"].iloc[-1] - df["Close"].iloc[-2]) / df["Close"].iloc[-2]) * 100
+    gap_str = f"{gap_pct:.2f}%"
+    if gap_pct >= 0.5:
+        gap_str += " 🟢"
+    elif gap_pct <= -0.5:
+        gap_str += " 🔴"
+
+    # ── SMC structure / CISD / signal time ──────────────────────────────────
+    smc_structure, cisd_signal, signal_time = _calculate_smc_and_cisd(df)
+
+    # ── 52-week high/low status (DATE_FROM window ≈ 52 weeks) ──────────────
+    h52w = df["High"].max()
+    l52w = df["Low"].min()
+    last_close = close.iloc[-1]
+    if last_close >= h52w * 0.97:
+        status_52w = "🟢 Near High"
+    elif last_close <= l52w * 1.03:
+        status_52w = "🔴 Near Low"
+    else:
+        status_52w = "Mid Range"
+
+    # ── Breakout (vs prior 20-day high/low, excluding today) ───────────────
+    breakout_high = df["High"].rolling(20).max().shift(1).iloc[-1]
+    breakout_low = df["Low"].rolling(20).min().shift(1).iloc[-1]
+    if pd.notna(breakout_high) and last_close > breakout_high:
+        breakout = "📈 Bullish"
+    elif pd.notna(breakout_low) and last_close < breakout_low:
+        breakout = "📉 Bearish"
+    else:
+        breakout = "NO"
+
     return {
         "Symbol": symbol.replace("NSE:", "").replace("-EQ", ""),
         "Close": round(close.iloc[-1], 2),
@@ -101,6 +187,12 @@ def _analyse(symbol: str, df: pd.DataFrame) -> dict:
         "AI Score": ai_score,
         "Smart Money": "🏦 Institutional" if ai_score > 70 else "⚖️ Neutral" if ai_score > 45 else "🔻 Distribution",
         "Signal": "🟢 BUY" if ai_score > 65 else "🔴 SELL" if ai_score < 40 else "🟡 HOLD",
+        "Signal Time": signal_time,
+        "Gap %": gap_str,
+        "SMC Structure": smc_structure,
+        "CISD": cisd_signal,
+        "52W Status": status_52w,
+        "Breakout": breakout,
     }
 
 
@@ -130,6 +222,15 @@ def run_scan(fyers, symbols: list[str]):
     return results, errors
 
 
+def _color_code(val):
+    if isinstance(val, str):
+        if any(x in val for x in ["BUY", "Institutional", "🟢", "BOS 📈", "CHOCH 🐂", "Bullish CISD 🚀", "Near High", "Bullish"]):
+            return "color: green; font-weight: bold;"
+        if any(x in val for x in ["SELL", "Distribution", "🔴", "BOS 📉", "CHOCH 🐻", "Bearish CISD 🩸", "Near Low", "Bearish"]):
+            return "color: red; font-weight: bold;"
+    return ""
+
+
 def to_excel_bytes(df: pd.DataFrame) -> bytes:
     """Builds an in-memory formatted .xlsx from the scan results."""
     buf = io.BytesIO()
@@ -147,7 +248,7 @@ def to_excel_bytes(df: pd.DataFrame) -> bytes:
             cell.alignment = Alignment(horizontal="center")
 
         for col_cells in ws.columns:
-            length = max(len(str(c.value)) for c in col_cells if c.value is not None)
+            length = max((len(str(c.value)) for c in col_cells if c.value is not None), default=10)
             ws.column_dimensions[col_cells[0].column_letter].width = max(length + 2, 10)
 
         ws.freeze_panes = "A2"
@@ -201,7 +302,7 @@ def show_scanner(fyers):
             st.error("Scan returned no usable results. Expand the error log below.")
         else:
             sorted_df = df.sort_values("AI Score", ascending=False)
-            st.dataframe(sorted_df, use_container_width=True, height=500)
+            st.dataframe(sorted_df.style.applymap(_color_code), use_container_width=True, height=500)
             st.bar_chart(df.set_index("Symbol")["AI Score"])
 
             st.download_button(
