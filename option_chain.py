@@ -1553,3 +1553,205 @@ st.caption(
     "📊 Professional Option Chain Dashboard | "
     "Powered by FYERS API V3 | Streamlit"
 )
+# ==========================================================
+# ADVANCED AI SCORE
+# ==========================================================
+
+st.markdown("## 🤖 AI Market Intelligence")
+
+bull_score = 0
+bear_score = 0
+
+# PCR Analysis
+if pcr > 1.20:
+    bull_score += 2
+elif pcr < 0.80:
+    bear_score += 2
+
+# Spot Position
+if spot_price > support:
+    bull_score += 1
+else:
+    bear_score += 1
+
+# Max Pain
+if abs(spot_price - max_pain) < 100:
+    bull_score += 1
+
+# OI Comparison
+if df["pe_oi"].sum() > df["ce_oi"].sum():
+    bull_score += 2
+else:
+    bear_score += 2
+
+# ----------------------------------------------------------
+# AI DECISION
+# ----------------------------------------------------------
+
+if bull_score > bear_score:
+    final_signal = "🟢 BULLISH"
+elif bear_score > bull_score:
+    final_signal = "🔴 BEARISH"
+else:
+    final_signal = "🟡 SIDEWAYS"
+
+c1, c2, c3 = st.columns(3)
+
+c1.metric("Bull Score", bull_score)
+c2.metric("Bear Score", bear_score)
+c3.metric("AI Decision", final_signal)
+
+st.divider()
+
+# ==========================================================
+# SMART MONEY
+# ==========================================================
+
+st.markdown("## 💰 Smart Money Analysis")
+
+smart_money = "Neutral"
+
+if pcr > 1.30:
+    smart_money = "Institutions likely accumulating PUT positions"
+
+elif pcr < 0.70:
+    smart_money = "Institutions likely writing CALL positions"
+
+st.info(smart_money)
+
+st.divider()
+
+# ==========================================================
+# OI CONCENTRATION
+# ==========================================================
+
+st.markdown("## 📊 Open Interest Concentration")
+
+top_ce = df.nlargest(3, "ce_oi")
+top_pe = df.nlargest(3, "pe_oi")
+
+left, right = st.columns(2)
+
+with left:
+    st.subheader("Top CE OI")
+
+    st.dataframe(
+        top_ce[
+            ["strike_price", "ce_oi"]
+        ],
+        use_container_width=True
+    )
+
+with right:
+    st.subheader("Top PE OI")
+
+    st.dataframe(
+        top_pe[
+            ["strike_price", "pe_oi"]
+        ],
+        use_container_width=True
+    )
+
+st.divider()
+
+# ==========================================================
+# RISK METER
+# ==========================================================
+
+st.markdown("## ⚠️ Risk Meter")
+
+risk = "Medium"
+
+if abs(spot_price - support) < 30:
+    risk = "Low"
+
+elif abs(spot_price - resistance) < 30:
+    risk = "High"
+
+risk_color = {
+    "Low": "green",
+    "Medium": "orange",
+    "High": "red"
+}
+
+st.markdown(
+    f"<h3 style='color:{risk_color[risk]};'>Risk : {risk}</h3>",
+    unsafe_allow_html=True
+)
+
+st.divider()
+
+# ==========================================================
+# TRADING PLAN
+# ==========================================================
+
+st.markdown("## 🎯 Trading Plan")
+
+if final_signal == "🟢 BULLISH":
+
+    st.success(f"""
+BUY ABOVE : {atm}
+
+TARGET 1 : {resistance}
+
+TARGET 2 : {resistance + 100}
+
+STOPLOSS : {support}
+""")
+
+elif final_signal == "🔴 BEARISH":
+
+    st.error(f"""
+SELL BELOW : {atm}
+
+TARGET 1 : {support}
+
+TARGET 2 : {support - 100}
+
+STOPLOSS : {resistance}
+""")
+
+else:
+
+    st.warning("""
+WAIT FOR CONFIRMATION
+
+No high probability setup available.
+""")
+
+st.divider()
+
+# ==========================================================
+# MARKET SNAPSHOT
+# ==========================================================
+
+snapshot = pd.DataFrame({
+    "Parameter": [
+        "Spot",
+        "ATM",
+        "PCR",
+        "Support",
+        "Resistance",
+        "Max Pain",
+        "AI Signal",
+        "Risk"
+    ],
+    "Value": [
+        spot_price,
+        atm,
+        round(pcr, 2),
+        support,
+        resistance,
+        max_pain,
+        final_signal,
+        risk
+    ]
+})
+
+st.markdown("## 📋 Market Snapshot")
+
+st.dataframe(
+    snapshot,
+    use_container_width=True,
+    hide_index=True
+)
