@@ -1190,3 +1190,220 @@ institution = pd.DataFrame({
 })
 
 st.table(institution)
+# ==========================================================
+# VOLUME ANALYSIS
+# ==========================================================
+
+st.markdown("## 📊 Volume Analysis")
+
+df["Total Volume"] = df["ce_volume"] + df["pe_volume"]
+
+avg_volume = df["Total Volume"].mean()
+
+df["Volume Breakout"] = np.where(
+    df["Total Volume"] > (avg_volume * 2),
+    "🔥 High Volume",
+    ""
+)
+
+volume_table = df[
+    [
+        "strike_price",
+        "ce_volume",
+        "pe_volume",
+        "Total Volume",
+        "Volume Breakout"
+    ]
+]
+
+volume_table.columns = [
+    "Strike",
+    "CE Volume",
+    "PE Volume",
+    "Total Volume",
+    "Signal"
+]
+
+st.dataframe(
+    volume_table,
+    use_container_width=True,
+    height=450
+)
+
+# ==========================================================
+# VOLUME CHART
+# ==========================================================
+
+fig = go.Figure()
+
+fig.add_trace(
+    go.Bar(
+        x=df["strike_price"],
+        y=df["ce_volume"],
+        name="CE Volume"
+    )
+)
+
+fig.add_trace(
+    go.Bar(
+        x=df["strike_price"],
+        y=df["pe_volume"],
+        name="PE Volume"
+    )
+)
+
+fig.update_layout(
+    template="plotly_dark",
+    barmode="group",
+    title="Option Volume Distribution",
+    height=500
+)
+
+st.plotly_chart(
+    fig,
+    use_container_width=True
+)
+
+st.divider()
+
+# ==========================================================
+# ADVANCED OI HEATMAP
+# ==========================================================
+
+st.markdown("## 🔥 Advanced OI Heatmap")
+
+heatmap = go.Figure()
+
+heatmap.add_trace(
+    go.Heatmap(
+        z=[
+            df["ce_oi"],
+            df["pe_oi"]
+        ],
+        x=df["strike_price"],
+        y=["CE OI", "PE OI"],
+        colorscale="Viridis"
+    )
+)
+
+heatmap.update_layout(
+    template="plotly_dark",
+    height=350
+)
+
+st.plotly_chart(
+    heatmap,
+    use_container_width=True
+)
+
+st.divider()
+
+# ==========================================================
+# AI ENTRY / EXIT
+# ==========================================================
+
+st.markdown("## 🤖 AI Entry & Exit")
+
+entry = "WAIT"
+target = "-"
+stoploss = "-"
+
+if ai_signal == "BUY":
+    entry = f"BUY above {atm}"
+    target = resistance
+    stoploss = support
+
+elif ai_signal == "SELL":
+    entry = f"SELL below {atm}"
+    target = support
+    stoploss = resistance
+
+col1, col2, col3 = st.columns(3)
+
+with col1:
+    st.metric("Entry", entry)
+
+with col2:
+    st.metric("Target", target)
+
+with col3:
+    st.metric("Stop Loss", stoploss)
+
+st.divider()
+
+# ==========================================================
+# OI vs VOLUME
+# ==========================================================
+
+st.markdown("## 📈 OI vs Volume")
+
+comparison = go.Figure()
+
+comparison.add_trace(
+    go.Scatter(
+        x=df["strike_price"],
+        y=df["Total Volume"],
+        mode="lines+markers",
+        name="Volume"
+    )
+)
+
+comparison.add_trace(
+    go.Scatter(
+        x=df["strike_price"],
+        y=df["ce_oi"] + df["pe_oi"],
+        mode="lines+markers",
+        name="Total OI"
+    )
+)
+
+comparison.update_layout(
+    template="plotly_dark",
+    height=500,
+    title="Volume vs Open Interest"
+)
+
+st.plotly_chart(
+    comparison,
+    use_container_width=True
+)
+
+st.divider()
+
+# ==========================================================
+# ALERT PANEL
+# ==========================================================
+
+st.markdown("## 🚨 Live Alerts")
+
+alerts = []
+
+if pcr > 1.30:
+    alerts.append("🟢 High PCR - Bullish Bias")
+
+if pcr < 0.70:
+    alerts.append("🔴 Low PCR - Bearish Bias")
+
+if support == atm:
+    alerts.append("🛡️ Strong Support at ATM")
+
+if resistance == atm:
+    alerts.append("🧱 Strong Resistance at ATM")
+
+high_volume = df[df["Volume Breakout"] != ""]
+
+if len(high_volume):
+
+    alerts.append(
+        f"🔥 {len(high_volume)} High Volume Strike(s) Detected"
+    )
+
+if len(alerts) == 0:
+
+    st.info("No important alerts.")
+
+else:
+
+    for item in alerts:
+
+        st.success(item)
