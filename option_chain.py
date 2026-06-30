@@ -157,3 +157,153 @@ def signal(pcr):
         return "🔴 Bearish"
 
     return "🟡 Neutral"
+# ==========================================================
+# LOAD OPTION CHAIN DATA
+# ==========================================================
+
+response = fetch_option_chain()
+
+if response is None:
+    st.stop()
+
+data = response["data"]
+
+spot_price = data.get("ltp", 0)
+
+options = data.get("options", [])
+
+if len(options) == 0:
+    st.warning("No Option Chain Data Available")
+    st.stop()
+
+# ==========================================================
+# DATAFRAME
+# ==========================================================
+
+df = pd.DataFrame(options)
+
+numeric_columns = [
+    "strike_price",
+    "ce_ltp",
+    "ce_oi",
+    "ce_volume",
+    "ce_chng_oi",
+    "pe_ltp",
+    "pe_oi",
+    "pe_volume",
+    "pe_chng_oi",
+    "ce_iv",
+    "pe_iv"
+]
+
+for col in numeric_columns:
+    if col in df.columns:
+        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
+
+df = df.sort_values("strike_price").reset_index(drop=True)
+
+# ==========================================================
+# CALCULATIONS
+# ==========================================================
+
+pcr = calculate_pcr(df)
+
+max_pain = calculate_max_pain(df)
+
+atm_index = (df["strike_price"] - spot_price).abs().idxmin()
+
+atm = df.loc[atm_index, "strike_price"]
+
+support = df.loc[df["pe_oi"].idxmax(), "strike_price"]
+
+resistance = df.loc[df["ce_oi"].idxmax(), "strike_price"]
+
+total_ce = int(df["ce_oi"].sum())
+
+total_pe = int(df["pe_oi"].sum())
+
+signal_text = signal(pcr)
+
+# ==========================================================
+# KPI DASHBOARD
+# ==========================================================
+
+st.markdown("## 📊 Live Market Overview")
+
+col1, col2, col3, col4, col5 = st.columns(5)
+
+with col1:
+    st.metric(
+        "Spot Price",
+        f"₹{spot_price:,.2f}"
+    )
+
+with col2:
+    st.metric(
+        "ATM Strike",
+        f"{atm:,.0f}"
+    )
+
+with col3:
+    st.metric(
+        "PCR",
+        pcr
+    )
+
+with col4:
+    st.metric(
+        "Max Pain",
+        f"{max_pain:,.0f}"
+    )
+
+with col5:
+    st.metric(
+        "Signal",
+        signal_text
+    )
+
+# ==========================================================
+# OI SUMMARY
+# ==========================================================
+
+left, right = st.columns(2)
+
+with left:
+
+    st.success(f"""
+### 🟢 CALL SIDE
+
+Total CE OI : **{total_ce:,}**
+
+Resistance : **{resistance:,.0f}**
+""")
+
+with right:
+
+    st.error(f"""
+### 🔴 PUT SIDE
+
+Total PE OI : **{total_pe:,}**
+
+Support : **{support:,.0f}**
+""")
+
+st.divider()
+
+# ==========================================================
+# MARKET SUMMARY
+# ==========================================================
+
+summary = f"""
+### 📈 Market Summary
+
+- Spot Price : **₹{spot_price:,.2f}**
+- ATM Strike : **{atm:,.0f}**
+- PCR : **{pcr}**
+- Max Pain : **{max_pain:,.0f}**
+- Strong Support : **{support:,.0f}**
+- Strong Resistance : **{resistance:,.0f}**
+- Market Signal : **{signal_text}**
+"""
+
+st.markdown(summary)
