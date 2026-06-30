@@ -307,3 +307,161 @@ summary = f"""
 """
 
 st.markdown(summary)
+# ==========================================================
+# OPTION CHAIN TABLE
+# ==========================================================
+
+st.markdown("## 📋 Live Option Chain")
+
+display_cols = [
+    "ce_oi",
+    "ce_chng_oi",
+    "ce_volume",
+    "ce_ltp",
+    "strike_price",
+    "pe_ltp",
+    "pe_volume",
+    "pe_chng_oi",
+    "pe_oi"
+]
+
+display_df = df[display_cols].copy()
+
+display_df.columns = [
+    "CE OI",
+    "CE ΔOI",
+    "CE Volume",
+    "CE LTP",
+    "Strike",
+    "PE LTP",
+    "PE Volume",
+    "PE ΔOI",
+    "PE OI"
+]
+
+# Highlight ATM Strike
+def highlight_atm(row):
+    if row["Strike"] == atm:
+        return ["background-color:#FFD700;color:black;font-weight:bold"] * len(row)
+    return [""] * len(row)
+
+styled_df = (
+    display_df.style
+    .apply(highlight_atm, axis=1)
+    .background_gradient(subset=["CE OI"], cmap="Greens")
+    .background_gradient(subset=["PE OI"], cmap="Reds")
+    .format("{:,.0f}")
+)
+
+st.dataframe(
+    styled_df,
+    use_container_width=True,
+    height=650
+)
+
+st.divider()
+
+# ==========================================================
+# OPEN INTEREST BAR CHART
+# ==========================================================
+
+st.markdown("## 📊 Open Interest Analysis")
+
+fig = go.Figure()
+
+fig.add_trace(
+    go.Bar(
+        y=df["strike_price"],
+        x=-df["ce_oi"],
+        orientation="h",
+        name="CE OI"
+    )
+)
+
+fig.add_trace(
+    go.Bar(
+        y=df["strike_price"],
+        x=df["pe_oi"],
+        orientation="h",
+        name="PE OI"
+    )
+)
+
+fig.add_vline(
+    x=0,
+    line_width=2
+)
+
+fig.update_layout(
+
+    barmode="overlay",
+
+    height=700,
+
+    template="plotly_dark",
+
+    title="Call vs Put Open Interest",
+
+    yaxis_title="Strike",
+
+    xaxis_title="Open Interest"
+)
+
+st.plotly_chart(
+    fig,
+    use_container_width=True
+)
+
+# ==========================================================
+# OI HEATMAP
+# ==========================================================
+
+st.markdown("## 🔥 OI Heatmap")
+
+heat_df = df[[
+    "strike_price",
+    "ce_oi",
+    "pe_oi",
+    "ce_chng_oi",
+    "pe_chng_oi"
+]].copy()
+
+heat_df.columns = [
+    "Strike",
+    "CE OI",
+    "PE OI",
+    "CE ΔOI",
+    "PE ΔOI"
+]
+
+st.dataframe(
+
+    heat_df.style
+
+    .background_gradient(
+        subset=["CE OI"],
+        cmap="Greens"
+    )
+
+    .background_gradient(
+        subset=["PE OI"],
+        cmap="Reds"
+    )
+
+    .background_gradient(
+        subset=["CE ΔOI"],
+        cmap="Blues"
+    )
+
+    .background_gradient(
+        subset=["PE ΔOI"],
+        cmap="Oranges"
+    ),
+
+    use_container_width=True,
+
+    height=500
+
+)
+
+st.divider()
