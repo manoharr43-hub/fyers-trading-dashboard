@@ -1,1 +1,342 @@
+import streamlit as st
+import pandas as pd
+import plotly.graph_objects as go
+import plotly.express as px
+from plotly.subplots import make_subplots
+import numpy as np
+
+# ─── Page Config ────────────────────────────────────────────────────────────
+st.set_page_config(
+    page_title="Options Chain Dashboard",
+    page_icon="📊",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+# ─── Custom CSS ─────────────────────────────────────────────────────────────
+st.markdown("""
+<style>
+    /* Dark trading terminal theme */
+    .stApp { background-color: #0d1117; }
+    section[data-testid="stSidebar"] { background-color: #161b22; border-right: 1px solid #30363d; }
+
+    /* Metric cards */
+    div[data-testid="metric-container"] {
+        background: #161b22;
+        border: 1px solid #30363d;
+        border-radius: 8px;
+        padding: 16px 20px;
+    }
+    div[data-testid="metric-container"] label { color: #8b949e !important; font-size: 12px; text-transform: uppercase; letter-spacing: 0.08em; }
+    div[data-testid="metric-container"] div[data-testid="stMetricValue"] { color: #e6edf3 !important; font-size: 24px; font-weight: 700; font-family: 'Courier New', monospace; }
+
+    /* Headers */
+    h1, h2, h3 { color: #e6edf3 !important; }
+    .block-title { color: #58a6ff; font-size: 13px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.1em; margin-bottom: 8px; }
+
+    /* CE/PE color chips */
+    .ce-badge { background: #0d3b2e; color: #3fb950; border: 1px solid #238636; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 700; }
+    .pe-badge { background: #3b0d1a; color: #f85149; border: 1px solid #da3633; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 700; }
+
+    /* Tabs */
+    button[data-baseweb="tab"] { color: #8b949e !important; }
+    button[data-baseweb="tab"][aria-selected="true"] { color: #58a6ff !important; border-bottom: 2px solid #58a6ff; }
+
+    /* DataFrames */
+    .stDataFrame { border: 1px solid #30363d; border-radius: 8px; overflow: hidden; }
+
+    /* Divider */
+    hr { border-color: #30363d; }
+
+    /* Signal pill */
+    .signal-bull { background: #0d3b2e; color: #3fb950; border: 1px solid #238636; padding: 4px 14px; border-radius: 20px; font-size: 13px; font-weight: 700; display: inline-block; }
+    .signal-bear { background: #3b0d1a; color: #f85149; border: 1px solid #da3633; padding: 4px 14px; border-radius: 20px; font-size: 13px; font-weight: 700; display: inline-block; }
+    .signal-neu  { background: #1c2128; color: #d29922; border: 1px solid #9e6a03; padding: 4px 14px; border-radius: 20px; font-size: 13px; font-weight: 700; display: inline-block; }
+</style>
+""", unsafe_allow_html=True)
+
+# ─── Helpers ────────────────────────────────────────────────────────────────
+def calculate_max_pain(df: pd.DataFrame) -> float:
+    """Strike where total option pain is minimum for writers."""
+    strikes = df["strike_price"].values
+    ce_oi = df["ce_oi"].values
+    pe_oi = df["pe_oi"].values
+    pain = []
+    for s in strikes:
+        ce_loss = np.sum(np.maximum(s - strikes, 0) * ce_oi)
+        pe_loss = np.sum(np.maximum(strikes - s, 0) * pe_oi)
+        pain.append(ce_loss + pe_loss)
+    return float(strikes[np.argmin(pain)])
+
+
+def pcr_signal(pcr: float) -> str:
+    if pcr > 1.3:
+        return '<span class="signal-bull">🟢 Bullish (High PCR)</span>'
+    elif pcr < 0.7:
+        return '<span class="signal-bear">🔴 Bearish (Low PCR)</span>'
+    else:
+        return '<span class="signal-neu">🟡 Neutral</span>'
+
+
+def oi_bar_chart(df: pd.DataFrame, max_pain: float) -> go.Figure:
+    fig = make_subplots(
+        rows=1, cols=2,
+        subplot_titles=("Call OI  (CE)", "Put OI  (PE)"),
+        shared_yaxes=True,
+        horizontal_spacing=0.04,
+    )
+    max_oi = max(df["ce_oi"].max(), df["pe_oi"].max())
+
+    # CE bars — reversed so ATM is at top
+    fig.add_trace(go.Bar(
+        x=-df["ce_oi"], y=df["strike_price"], orientation="h",
+        marker_color=[
+            "#1a7f37" if abs(s - max_pain) < (df["strike_price"].iloc[1] - df["strike_price"].iloc[0]) / 2
+            else "#238636"
+            for s in df["strike_price"]
+        ],
+        name="CE OI", showlegend=False,
+        customdata=df["ce_oi"],
+        hovertemplate="Strike %{y}<br>CE OI: %{customdata:,}<extra></extra>",
+    ), row=1, col=1)
+
+    # PE bars
+    fig.add_trace(go.Bar(
+        x=df["pe_oi"], y=df["strike_price"], orientation="h",
+        marker_color=[
+            "#b91c1c" if abs(s - max_pain) < (df["strike_price"].iloc[1] - df["strike_price"].iloc[0]) / 2
+            else "#da3633"
+            for s in df["strike_price"]
+        ],
+        name="PE OI", showlegend=False,
+        hovertemplate="Strike %{y}<br>PE OI: %{x:,}<extra></extra>",
+    ), row=1, col=2)
+
+    # Max Pain horizontal line
+    for col in [1, 2]:
+        fig.add_hline(y=max_pain, line_dash="dot", line_color="#f0c814",
+                      annotation_text=f"Max Pain {max_pain:,.0f}",
+                      annotation_font_color="#f0c814", row=1, col=col)
+
+    fig.update_layout(
+        paper_bgcolor="#0d1117", plot_bgcolor="#0d1117",
+        font=dict(color="#8b949e", family="Courier New"),
+        height=500, margin=dict(l=10, r=10, t=40, b=10),
+        xaxis=dict(showticklabels=False, zeroline=False, showgrid=False, range=[-max_oi * 1.1, 0]),
+        xaxis2=dict(showticklabels=False, zeroline=False, showgrid=False, range=[0, max_oi * 1.1]),
+        yaxis=dict(showgrid=True, gridcolor="#21262d", tickfont=dict(color="#e6edf3", size=11)),
+    )
+    fig.update_annotations(font_color="#8b949e")
+    return fig
+
+
+def pcr_gauge(pcr: float) -> go.Figure:
+    fig = go.Figure(go.Indicator(
+        mode="gauge+number",
+        value=pcr,
+        number={"font": {"color": "#e6edf3", "size": 36, "family": "Courier New"}, "suffix": ""},
+        gauge={
+            "axis": {"range": [0, 3], "tickcolor": "#8b949e", "tickfont": {"color": "#8b949e"}},
+            "bar": {"color": "#58a6ff", "thickness": 0.25},
+            "bgcolor": "#161b22",
+            "borderwidth": 0,
+            "steps": [
+                {"range": [0, 0.7],   "color": "#3b0d1a"},
+                {"range": [0.7, 1.3], "color": "#1c2128"},
+                {"range": [1.3, 3.0], "color": "#0d3b2e"},
+            ],
+            "threshold": {"line": {"color": "#f0c814", "width": 3}, "value": pcr},
+        },
+        title={"text": "PUT/CALL RATIO", "font": {"color": "#8b949e", "size": 12}},
+        domain={"x": [0, 1], "y": [0, 1]},
+    ))
+    fig.update_layout(
+        paper_bgcolor="#0d1117", font=dict(color="#8b949e"),
+        height=220, margin=dict(l=20, r=20, t=30, b=0),
+    )
+    return fig
+
+
+def iv_chart(df: pd.DataFrame) -> go.Figure:
+    """IV Skew chart — uses ce_iv / pe_iv if present, else skips."""
+    has_ce_iv = "ce_iv" in df.columns
+    has_pe_iv = "pe_iv" in df.columns
+    fig = go.Figure()
+    if has_ce_iv:
+        fig.add_trace(go.Scatter(
+            x=df["strike_price"], y=df["ce_iv"],
+            mode="lines+markers", name="CE IV",
+            line=dict(color="#238636", width=2),
+            marker=dict(size=5),
+        ))
+    if has_pe_iv:
+        fig.add_trace(go.Scatter(
+            x=df["strike_price"], y=df["pe_iv"],
+            mode="lines+markers", name="PE IV",
+            line=dict(color="#da3633", width=2),
+            marker=dict(size=5),
+        ))
+    if not has_ce_iv and not has_pe_iv:
+        fig.add_annotation(text="IV data not available from this API response",
+                           xref="paper", yref="paper", x=0.5, y=0.5,
+                           font=dict(color="#8b949e"), showarrow=False)
+    fig.update_layout(
+        paper_bgcolor="#0d1117", plot_bgcolor="#0d1117",
+        font=dict(color="#8b949e", family="Courier New"),
+        height=280, margin=dict(l=10, r=10, t=10, b=30),
+        xaxis=dict(showgrid=True, gridcolor="#21262d", title="Strike"),
+        yaxis=dict(showgrid=True, gridcolor="#21262d", title="IV %"),
+        legend=dict(bgcolor="#161b22", bordercolor="#30363d", borderwidth=1),
+    )
+    return fig
+
+
+def style_chain_table(df: pd.DataFrame, spot: float) -> pd.DataFrame:
+    """Return display-ready DataFrame with ATM highlighted columns."""
+    cols = ["ce_oi", "ce_chng_oi", "ce_volume", "ce_ltp", "strike_price", "pe_ltp", "pe_volume", "pe_chng_oi", "pe_oi"]
+    available = [c for c in cols if c in df.columns]
+    out = df[available].copy()
+
+    rename = {
+        "ce_oi": "CE OI", "ce_chng_oi": "CE ΔOI", "ce_volume": "CE Vol",
+        "ce_ltp": "CE LTP", "strike_price": "Strike ⚡",
+        "pe_ltp": "PE LTP", "pe_volume": "PE Vol",
+        "pe_chng_oi": "PE ΔOI", "pe_oi": "PE OI",
+    }
+    out.rename(columns={k: v for k, v in rename.items() if k in out.columns}, inplace=True)
+    return out
+
+
+# ─── Main Function ───────────────────────────────────────────────────────────
+def show_option_chain(fyers):
+    st.markdown("## 📊 Master Options Chain Dashboard")
+    st.markdown("<hr style='border-color:#30363d;margin:0 0 20px 0'>", unsafe_allow_html=True)
+
+    # ── Sidebar ──────────────────────────────────────────────────────────────
+    with st.sidebar:
+        st.markdown("### ⚙️ Configuration")
+        symbol_map = {
+            "NIFTY 50":     "NSE:NIFTY50-INDEX",
+            "NIFTY BANK":   "NSE:NIFTYBANK-INDEX",
+            "SENSEX":       "BSE:SENSEX-INDEX",
+            "BANKEX":       "BSE:BANKEX-INDEX",
+            "NIFTY NXT 50": "NSE:NIFTYNEXT50-INDEX",
+        }
+        option_type = st.radio("Instrument Type", ["Indices", "F&O Stocks"])
+        if option_type == "Indices":
+            selected_key = st.selectbox("Index", list(symbol_map.keys()))
+            symbol = symbol_map[selected_key]
+        else:
+            stock = st.text_input("Stock Symbol (e.g. RELIANCE)", "RELIANCE")
+            symbol = f"NSE:{stock.upper()}-EQ"
+
+        strike_count = st.slider("Strikes Around ATM", 5, 30, 20, step=5)
+        st.divider()
+        fetch_btn = st.button("🔄 Fetch Live Data", use_container_width=True, type="primary")
+
+    # ── Fetch & Process ──────────────────────────────────────────────────────
+    if fetch_btn:
+        with st.spinner("Connecting to Fyers API …"):
+            try:
+                response = fyers.optionchain(data={"symbol": symbol, "strikecount": strike_count})
+            except Exception as e:
+                st.error(f"API call failed: {e}")
+                return
+
+        if not response or response.get("s") != "ok":
+            st.error(f"API Error: {response.get('message', 'No data returned')}")
+            return
+
+        data = response.get("data", {})
+        options_data = data.get("options", [])
+        spot_price = data.get("ltp", 0)
+
+        if not options_data:
+            st.warning("⚠️ No options data. Market may be closed or symbol unavailable.")
+            return
+
+        df = pd.DataFrame(options_data)
+
+        # Ensure numerics
+        num_cols = ["strike_price", "ce_ltp", "ce_oi", "ce_volume", "ce_chng_oi",
+                    "pe_ltp", "pe_oi", "pe_volume", "pe_chng_oi"]
+        for col in num_cols:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
+
+        df.sort_values("strike_price", inplace=True)
+        df.reset_index(drop=True, inplace=True)
+
+        # ── KPIs ─────────────────────────────────────────────────────────────
+        total_ce = df["ce_oi"].sum()
+        total_pe = df["pe_oi"].sum()
+        pcr = total_pe / total_ce if total_ce > 0 else 0
+        max_pain = calculate_max_pain(df)
+        atm_strike = df.iloc[(df["strike_price"] - spot_price).abs().argsort()[:1]]["strike_price"].values[0]
+
+        c1, c2, c3, c4, c5 = st.columns(5)
+        c1.metric("Spot Price", f"₹{spot_price:,.2f}" if spot_price else "—")
+        c2.metric("ATM Strike", f"₹{atm_strike:,.0f}")
+        c3.metric("Total CE OI", f"{total_ce/1e5:.1f}L")
+        c4.metric("Total PE OI", f"{total_pe/1e5:.1f}L")
+        c5.metric("Max Pain", f"₹{max_pain:,.0f}")
+
+        st.markdown("<br>", unsafe_allow_html=True)
+
+        # ── Signal Row ────────────────────────────────────────────────────────
+        sig_col, gauge_col = st.columns([1, 1])
+        with sig_col:
+            st.markdown("**Market Sentiment**")
+            st.markdown(pcr_signal(pcr), unsafe_allow_html=True)
+            st.markdown(f"<br>PCR = **{pcr:.3f}**  |  Max Pain = **{max_pain:,.0f}**", unsafe_allow_html=True)
+
+            # Strongest support / resistance
+            top_pe = df.loc[df["pe_oi"].idxmax(), "strike_price"]
+            top_ce = df.loc[df["ce_oi"].idxmax(), "strike_price"]
+            st.markdown(f"🛡️ Support (max PE OI): **{top_pe:,.0f}**")
+            st.markdown(f"🧱 Resistance (max CE OI): **{top_ce:,.0f}**")
+
+        with gauge_col:
+            st.plotly_chart(pcr_gauge(pcr), use_container_width=True, config={"displayModeBar": False})
+
+        st.divider()
+
+        # ── Tabs ─────────────────────────────────────────────────────────────
+        tab1, tab2, tab3 = st.tabs(["📋 Chain Table", "📊 OI Analysis", "📈 IV Skew"])
+
+        with tab1:
+            display_df = style_chain_table(df, spot_price)
+            st.dataframe(
+                display_df.style
+                    .background_gradient(subset=[c for c in ["CE OI", "PE OI"] if c in display_df.columns],
+                                         cmap="RdYlGn", vmin=0)
+                    .format({c: "{:,.0f}" for c in display_df.select_dtypes("number").columns}),
+                use_container_width=True,
+                height=520,
+            )
+
+        with tab2:
+            st.markdown("##### Open Interest — Calls vs Puts")
+            st.plotly_chart(oi_bar_chart(df, max_pain), use_container_width=True,
+                            config={"displayModeBar": False})
+
+            # Top 5 OI strikes
+            st.markdown("**Top 5 CE OI Strikes**")
+            top5_ce = df.nlargest(5, "ce_oi")[["strike_price", "ce_oi", "ce_ltp"]].reset_index(drop=True)
+            st.dataframe(top5_ce.style.format({"ce_oi": "{:,.0f}", "ce_ltp": "{:.2f}"}),
+                         use_container_width=True, height=215)
+
+            st.markdown("**Top 5 PE OI Strikes**")
+            top5_pe = df.nlargest(5, "pe_oi")[["strike_price", "pe_oi", "pe_ltp"]].reset_index(drop=True)
+            st.dataframe(top5_pe.style.format({"pe_oi": "{:,.0f}", "pe_ltp": "{:.2f}"}),
+                         use_container_width=True, height=215)
+
+        with tab3:
+            st.markdown("##### Implied Volatility Skew")
+            st.plotly_chart(iv_chart(df), use_container_width=True,
+                            config={"displayModeBar": False})
+
+    else:
+        # Empty state
+        st.info("👈 Choose an instrument in the sidebar and click **Fetch Live Data**.")
 
