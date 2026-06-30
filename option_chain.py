@@ -3,6 +3,8 @@ import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import numpy as np
+import math
+from datetime import datetime
 
 # ─── Page Config ────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -362,6 +364,100 @@ def detect_big_moves(df: pd.DataFrame, top_n: int = 3) -> list:
     return alerts
 
 
+def extract_expiry_list(response: dict) -> list:
+    """
+    Fyers' optionchain response typically includes an 'expiryData' array
+    (each item has a human-readable date and a unix 'expiry' timestamp).
+    Returns a list of (label, timestamp) tuples sorted by date, or []
+    if the response doesn't carry expiry info (e.g. before any fetch).
+    """
+    data = response.get("data", {}) if isinstance(response, dict) else {}
+    raw = data.get("expiryData") or data.get("expirydata") or []
+    out = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        label = item.get("date") or item.get("expiry_date") or str(item.get("expiry", ""))
+        ts = item.get("expiry") or item.get("timestamp")
+        if ts is not None:
+            out.append((label, str(ts)))
+    return out
+
+
+def _norm_cdf(x: float) -> float:
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+
+def _bs_price(spot, strike, t, r, sigma, is_call: bool) -> float:
+    if t <= 0 or sigma <= 0 or spot <= 0 or strike <= 0:
+        return max(0.0, (spot - strike) if is_call else (strike - spot))
+    d1 = (math.log(spot / strike) + (r + 0.5 * sigma ** 2) * t) / (sigma * math.sqrt(t))
+    d2 = d1 - sigma * math.sqrt(t)
+    if is_call:
+        return spot * _norm_cdf(d1) - strike * math.exp(-r * t) * _norm_cdf(d2)
+    return strike * math.exp(-r * t) * _norm_cdf(-d2) - spot * _norm_cdf(-d1)
+
+
+def implied_volatility(price, spot, strike, t, is_call: bool, r: float = 0.07) -> float:
+    """
+    Newton-Raphson IV solver. Fyers' optionchain endpoint commonly does
+    NOT return ce_iv/pe_iv fields at all, which is why the IV Skew chart
+    was showing empty — IV needs to be derived from the option premium
+    via Black-Scholes instead of read directly from the API response.
+    Returns IV as a percentage (e.g. 18.5), or 0.0 if it can't solve.
+    """
+    if price <= 0 or spot <= 0 or strike <= 0 or t <= 0:
+        return 0.0
+    sigma = 0.3
+    for _ in range(50):
+        model_price = _bs_price(spot, strike, t, r, sigma, is_call)
+        d1 = (math.log(spot / strike) + (r + 0.5 * sigma ** 2) * t) / (sigma * math.sqrt(t))
+        vega = spot * math.exp(-0.5 * d1 ** 2) / math.sqrt(2 * math.pi) * math.sqrt(t)
+        diff = model_price - price
+        if abs(diff) < 1e-4:
+            break
+        if vega < 1e-8:
+            break
+        sigma -= diff / vega
+        sigma = max(0.001, min(sigma, 5.0))
+    return round(sigma * 100, 2)
+
+
+def add_iv_columns(df: pd.DataFrame, spot: float, expiry_label: str) -> pd.DataFrame:
+    """Derives ce_iv/pe_iv via Black-Scholes when the API didn't supply them."""
+    if "ce_iv" in df.columns and "pe_iv" in df.columns and df["ce_iv"].abs().sum() > 0:
+        return df  # API already gave usable IVs
+
+    days_to_expiry = parse_days_to_expiry(expiry_label)
+    t = max(days_to_expiry, 0.5) / 365.0
+
+    if not spot:
+        return df
+
+    df = df.copy()
+    df["ce_iv"] = df.apply(
+        lambda row: implied_volatility(row.get("ce_ltp", 0), spot, row["strike_price"], t, True), axis=1
+    )
+    df["pe_iv"] = df.apply(
+        lambda row: implied_volatility(row.get("pe_ltp", 0), spot, row["strike_price"], t, False), axis=1
+    )
+    return df
+
+
+def parse_days_to_expiry(expiry_label: str) -> float:
+    """Parses a 'DD-MM-YYYY' style expiry label into days-from-today. Falls back to 7 days if unparseable."""
+    if not expiry_label:
+        return 7.0
+    for fmt in ("%d-%m-%Y", "%d-%b-%Y", "%Y-%m-%d"):
+        try:
+            exp_date = datetime.strptime(expiry_label, fmt)
+            delta = (exp_date - datetime.now()).total_seconds() / 86400
+            return max(delta, 0.5)
+        except ValueError:
+            continue
+    return 7.0
+
+
 def normalize_symbol(stock: str, with_eq: bool = False) -> str:
     """Build an NSE symbol for the option chain endpoint.
     Fyers SDK versions disagree on whether the underlying for stock
@@ -371,7 +467,7 @@ def normalize_symbol(stock: str, with_eq: bool = False) -> str:
     return f"NSE:{stock}-EQ" if with_eq else f"NSE:{stock}"
 
 
-def fetch_optionchain_with_fallback(fyers, symbol: str, strikecount: int, is_stock: bool):
+def fetch_optionchain_with_fallback(fyers, symbol: str, strikecount: int, is_stock: bool, expiry_timestamp: str = ""):
     """
     Calls fyers.optionchain, retrying with an alternate symbol format if the
     first attempt returns a non-'ok' status (commonly a 300/invalid-input
@@ -390,8 +486,11 @@ def fetch_optionchain_with_fallback(fyers, symbol: str, strikecount: int, is_sto
 
     last_response = None
     for sym in tried_symbols:
+        req = {"symbol": sym, "strikecount": int(strikecount)}
+        if expiry_timestamp:
+            req["timestamp"] = expiry_timestamp
         try:
-            resp = fyers.optionchain(data={"symbol": sym, "strikecount": int(strikecount)})
+            resp = fyers.optionchain(data=req)
         except Exception as e:
             attempts.append((sym, f"exception: {e}"))
             continue
@@ -473,11 +572,13 @@ def show_option_chain(fyers):
     with st.sidebar:
         st.markdown("### ⚙️ Configuration")
         symbol_map = {
-            "NIFTY 50":     "NSE:NIFTY50-INDEX",
-            "NIFTY BANK":   "NSE:NIFTYBANK-INDEX",
-            "SENSEX":       "BSE:SENSEX-INDEX",
-            "BANKEX":       "BSE:BANKEX-INDEX",
-            "NIFTY NXT 50": "NSE:NIFTYNEXT50-INDEX",
+            "NIFTY 50":       "NSE:NIFTY50-INDEX",
+            "NIFTY BANK":     "NSE:NIFTYBANK-INDEX",
+            "FINNIFTY":       "NSE:FINNIFTY-INDEX",
+            "MIDCAP NIFTY":   "NSE:MIDCPNIFTY-INDEX",
+            "SENSEX":         "BSE:SENSEX-INDEX",
+            "BANKEX":         "BSE:BANKEX-INDEX",
+            "NIFTY NXT 50":   "NSE:NIFTYNEXT50-INDEX",
         }
         option_type = st.radio("Instrument Type", ["Indices", "F&O Stocks"])
         is_stock = option_type == "F&O Stocks"
@@ -492,6 +593,17 @@ def show_option_chain(fyers):
         # fine for indices; keep the stock max tighter to avoid 300 errors.
         max_strikes = 20 if is_stock else 30
         strike_count = st.slider("Strikes Around ATM", 5, max_strikes, min(20, max_strikes), step=5)
+
+        expiry_options = st.session_state.get("oc_expiry_list", [])
+        if expiry_options:
+            expiry_labels = [label for label, _ in expiry_options]
+            selected_expiry_label = st.selectbox("Expiry", expiry_labels)
+            expiry_timestamp = dict(expiry_options).get(selected_expiry_label, "")
+        else:
+            st.caption("Expiry list loads after first fetch (uses nearest expiry by default).")
+            expiry_timestamp = ""
+            selected_expiry_label = ""
+
         debug_mode = st.checkbox("Show raw API response (debug)", value=False)
         st.divider()
         fetch_btn = st.button("🔄 Fetch Live Data", use_container_width=True, type="primary")
@@ -500,7 +612,7 @@ def show_option_chain(fyers):
     if fetch_btn:
         with st.spinner("Connecting to Fyers API …"):
             response, used_symbol, attempts = fetch_optionchain_with_fallback(
-                fyers, symbol, strike_count, is_stock
+                fyers, symbol, strike_count, is_stock, expiry_timestamp
             )
 
         if debug_mode:
@@ -523,6 +635,13 @@ def show_option_chain(fyers):
             return
 
         symbol = used_symbol
+
+        # Capture the expiry list from this response so the sidebar dropdown
+        # populates for the *next* fetch (Fyers only returns expiryData
+        # alongside the chain itself, so we can't know it beforehand).
+        new_expiry_list = extract_expiry_list(response)
+        if new_expiry_list:
+            st.session_state["oc_expiry_list"] = new_expiry_list
 
         options_data, data = extract_options_data(response)
         spot_price = extract_spot_price(response, data)
@@ -561,6 +680,7 @@ def show_option_chain(fyers):
         df.sort_values("strike_price", inplace=True)
         df.reset_index(drop=True, inplace=True)
         df = compute_strike_bias(df)
+        df = add_iv_columns(df, spot_price, selected_expiry_label)
 
         # Stash everything needed for redraw in session_state so switching
         # tabs / touching widgets doesn't wipe the dashboard back to empty.
