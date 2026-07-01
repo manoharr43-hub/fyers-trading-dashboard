@@ -617,7 +617,7 @@ def show_option_chain(fyers):
 
     with st.sidebar:
         st.markdown("### ⚙️ Configuration")
-        option_type = st.radio("Instrument Type", ["Indices", "F&O Stocks"])
+       option_type = st.radio("Instrument Type", ["Indices", "F&O Stocks"], key="instr_type_radio")
         is_stock = option_type == "F&O Stocks"
         
         if not is_stock:
