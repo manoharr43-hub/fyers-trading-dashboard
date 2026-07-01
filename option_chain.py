@@ -6,7 +6,10 @@ Streamlit + FYERS API v3 dashboard with:
     MIDCPNIFTY / NIFTYNEXT50 / SENSEX / BANKEX) — always resolves the
     nearest available expiry, tags Weekly vs Monthly, auto-refreshes on
     instrument change and after every fetch, and auto-falls-back to the
-    next valid expiry if the selected one returns no data.
+    next valid expiry if the selected one returns no data. The dashboard
+    makes NO assumption about which indices are weekly vs monthly-only —
+    every expiry the FYERS API actually returns is shown, unfiltered, and
+    the raw API expiry payload is surfaced in the UI for inspection.
   • AI Engine: independent 0-100 CE Score / PE Score per strike, star
     ratings (Strong Buy / Buy / Hold / Avoid / Ignore), AI Confidence,
     and a Big Move table (Strike, CE/PE Score, Overall Score, BUY/SELL
@@ -112,15 +115,12 @@ INDEX_SYMBOL_CANDIDATES = {
     "BANKEX":      ["BSE:BANKEX-INDEX"],
 }
 
-# As of the SEBI derivatives-reform circular (effective Nov 2024, further
-# revised Sept 2025), only ONE weekly index-options contract is permitted
-# per exchange: NIFTY on NSE and SENSEX on BSE. BANKNIFTY, FINNIFTY,
-# MIDCPNIFTY and BANKEX now trade MONTHLY (+ quarterly/half-yearly for
-# some) contracts only — there is no weekly expiry for them to fetch.
-# NIFTYNEXT50 has never had a weekly options contract. This is exchange
-# policy, not a bug in this dashboard — the sidebar surfaces it so it
-# isn't mistaken for a broken expiry fetch.
-INDICES_WITHOUT_WEEKLY = {"BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "NIFTYNEXT50", "BANKEX"}
+# NOTE: We intentionally make NO assumption here about which indices are
+# "weekly" vs "monthly-only" (exchange rules around this have changed more
+# than once and vary by index). Whatever expiries the FYERS API actually
+# returns for the selected instrument are shown, in full, unfiltered — see
+# section 2 below. The sidebar surfaces the raw API payload so this can be
+# verified directly rather than trusted to a hard-coded list.
 
 
 def get_stock_symbol_candidates(stock: str) -> list:
@@ -173,8 +173,8 @@ def fetch_optionchain_with_fallback(fyers, symbol_candidates: list, strikecount:
 
 # ══════════════════════════════════════════════════════════════════════════
 # 2. EXPIRY HANDLING  (weekly + monthly, auto refresh, nearest-first,
-#    auto fallback to next valid expiry — fixes the BANKNIFTY / FINNIFTY /
-#    MIDCPNIFTY / NIFTYNEXT50 / SENSEX / BANKEX "always shows monthly" bug)
+#    auto fallback to next valid expiry, RAW-API inspection — no hard-coded
+#    assumptions about which indices are weekly vs monthly-only)
 # ══════════════════════════════════════════════════════════════════════════
 
 def format_expiry_label(ts) -> str:
@@ -188,25 +188,35 @@ def _to_int_ts(ts) -> int:
     """Robust timestamp→int coercion. The original dashboard sorted expiries
     with `int(x) if x.isdigit() else 0`, which silently broke ordering (and
     therefore 'nearest expiry' selection) whenever FYERS returned a
-    timestamp with a decimal point or any non-digit character — which is
-    exactly what happened for BANKNIFTY/FINNIFTY/MIDCPNIFTY/NIFTYNEXT50/
-    SENSEX/BANKEX but not for NIFTY50. This handles ints, floats, and
-    numeric strings of either form."""
+    timestamp with a decimal point or any non-digit character. This handles
+    ints, floats, and numeric strings of either form."""
     try:
         return int(float(ts))
     except (TypeError, ValueError):
         return 0
 
 
-def extract_expiry_list(response: dict) -> list:
+def extract_raw_expiry_payload(response: dict) -> list:
     """
-    Returns a list of (label, timestamp) tuples, sorted chronologically
-    (nearest expiry first), with labels always normalised to DD-MMM-YYYY
-    regardless of what FYERS sent, since the raw 'date' field format has
-    been inconsistent across index/stock responses.
+    Returns the RAW expiryData list exactly as received from the FYERS API
+    — no filtering, no dedup, no reformatting. This exists purely so the
+    UI can display precisely what the API sent back, for inspection.
     """
     data = response.get("data", {}) if isinstance(response, dict) else {}
     raw = data.get("expiryData") or data.get("expirydata") or []
+    return raw if isinstance(raw, list) else []
+
+
+def extract_expiry_list(response: dict) -> list:
+    """
+    Returns a list of (label, timestamp) tuples, sorted chronologically
+    (nearest expiry first), with labels normalised to DD-MMM-YYYY for
+    display. This does NOT drop any expiry the API returned — every
+    unique timestamp present in the raw payload is kept; only exact
+    duplicate (label, ts) pairs are collapsed, and sorting is applied
+    purely for chronological ordering in the dropdown.
+    """
+    raw = extract_raw_expiry_payload(response)
     out = []
     for item in raw:
         if not isinstance(item, dict):
@@ -215,7 +225,8 @@ def extract_expiry_list(response: dict) -> list:
         if ts is None:
             continue
         out.append((format_expiry_label(ts), str(ts)))
-    # de-duplicate while preserving order, then sort by the numeric timestamp
+    # de-duplicate exact repeats while preserving every distinct expiry,
+    # then sort by the numeric timestamp (nearest first)
     seen = set()
     deduped = []
     for label, ts in out:
@@ -228,10 +239,12 @@ def extract_expiry_list(response: dict) -> list:
 
 def classify_expiries(expiry_list: list) -> list:
     """
-    Tags each (label, ts) as ('Weekly' | 'Monthly'). The monthly expiry for
-    a given calendar month is the LAST expiry that falls within that
-    month; every other expiry in that month is a weekly. Returns a list
-    of (label, ts, tag), preserving the input (chronological) order.
+    Tags each (label, ts) as ('Weekly' | 'Monthly') purely for display
+    convenience in the dropdown. This is a descriptive label derived from
+    the data itself (last expiry in a calendar month = Monthly, everything
+    else in that month = Weekly) — it is NOT used to filter, hide, or
+    exclude any expiry the API returned. Every expiry in expiry_list is
+    still present in the output, in the same order.
     """
     if not expiry_list:
         return []
@@ -252,14 +265,16 @@ def fetch_expiry_list(fyers, symbol_candidates: list) -> tuple:
     Fetches ONLY the expiry list (cheap call, strikecount=2, no timestamp)
     so the sidebar dropdown can be populated automatically the moment an
     instrument is chosen — the user never has to hand-edit a timestamp.
-    Returns (expiry_list, symbol_used) or ([], "") on failure.
+    Returns (expiry_list, symbol_used, raw_expiry_payload) or
+    ([], "", []) on failure. raw_expiry_payload is the untouched
+    expiryData array from the API response, for on-screen inspection.
     """
     response, used_symbol, _ = fetch_optionchain_with_fallback(
         fyers, symbol_candidates, strikecount=2, expiry_timestamp=""
     )
     if not response or response.get("s") != "ok":
-        return [], ""
-    return extract_expiry_list(response), used_symbol
+        return [], "", []
+    return extract_expiry_list(response), used_symbol, extract_raw_expiry_payload(response)
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -831,10 +846,6 @@ def compute_ai_engine(df: pd.DataFrame, spot_price: float, atm_strike: float,
     d["Final Signal"] = d.apply(_final_signal, axis=1)
 
     # ── Independent CE / PE BUY & SELL probability ──────────────────────
-    # BUY probability for a side = that side's own favourability score.
-    # SELL probability for a side = how favourable the *opposite* side
-    # looks (strength of the opposing flow is the classic read for why
-    # you'd exit/avoid this side), floored/ceilinged to 0-100.
     d["CE BUY Probability"] = d["CE Score"]
     d["PE BUY Probability"] = d["PE Score"]
     d["CE SELL Probability"] = (100 - d["CE Score"]).clip(0, 100).round(1)
@@ -857,9 +868,6 @@ def compute_ai_engine(df: pd.DataFrame, spot_price: float, atm_strike: float,
     d["PE Target 1"], d["PE Target 2"], d["PE Target 3"] = pe_levels["T1"], pe_levels["T2"], pe_levels["T3"]
 
     # ── Per-strike Institutional Buying / Selling / Smart Money ─────────
-    # Institutional Buying = put-writing pressure + put OI base (support
-    # building from large players). Institutional Selling = call-writing
-    # pressure + call OI base (resistance building from large players).
     d["Institutional Buying"] = ((pe_oi_s * 0.5 + pe_dchng_s * 0.5) * 100).round(1)
     d["Institutional Selling"] = ((ce_oi_s * 0.5 + ce_dchng_s * 0.5) * 100).round(1)
     d["Smart Money Activity"] = d.get("Smart Money Score", pd.Series(0, index=d.index))
@@ -1443,29 +1451,40 @@ def show_option_chain(fyers):
             symbol_key = symbol_candidates[0]
 
         # Auto-reload expiry list whenever the chosen instrument changes —
-        # no manual timestamp editing required.
+        # no manual timestamp editing required. We fetch the RAW expiry
+        # payload here too, and store it untouched for on-screen inspection
+        # — no assumption is made about which instruments are weekly vs
+        # monthly-only; whatever the API returns is what gets shown.
         if st.session_state.get("oc_current_symbol_key") != symbol_key:
             st.session_state["oc_current_symbol_key"] = symbol_key
             st.session_state["oc_expiry_list"] = []
+            st.session_state["oc_raw_expiry_payload"] = []
             st.session_state.pop("oc_df", None)
             with st.spinner("Loading expiry dates …"):
-                expiry_list, _used = fetch_expiry_list(fyers, symbol_candidates)
+                expiry_list, _used, raw_payload = fetch_expiry_list(fyers, symbol_candidates)
             st.session_state["oc_expiry_list"] = expiry_list
-
-        if not is_stock and selected_key in INDICES_WITHOUT_WEEKLY:
-            st.caption(
-                f"ℹ️ {selected_key} currently trades **monthly expiry only** on the exchange "
-                "(SEBI's derivatives-reform circular limits weekly index options to one "
-                "instrument per exchange — NIFTY on NSE, SENSEX on BSE). This dropdown will "
-                "show every expiry the exchange actually lists for this index."
-            )
+            st.session_state["oc_raw_expiry_payload"] = raw_payload
 
         max_strikes = 20 if is_stock else 30
         strike_count = st.slider("Strikes Around ATM", 5, max_strikes, min(20, max_strikes), step=5)
 
         expiry_options = st.session_state.get("oc_expiry_list", [])
+        raw_expiry_payload = st.session_state.get("oc_raw_expiry_payload", [])
+
+        # ── Raw API expiry inspection (always shown, never filtered) ────
+        with st.expander("🔍 Raw FYERS Expiry Response (debug/inspection)", expanded=False):
+            st.markdown(f"**Number of expiries returned by API:** {len(raw_expiry_payload)}")
+            if len(raw_expiry_payload) == 1:
+                st.warning("Only one expiry is available from FYERS API.")
+            elif len(raw_expiry_payload) == 0:
+                st.caption("No expiry data returned yet — select an instrument or click Retry below.")
+            st.markdown("**Raw `expiryData` payload (exactly as received):**")
+            st.json(raw_expiry_payload if raw_expiry_payload else {})
+            st.markdown("**Parsed expiry list (label, timestamp) — every expiry above, unfiltered:**")
+            st.write(expiry_options if expiry_options else "—")
+
         if expiry_options:
-            tagged = classify_expiries(expiry_options)  # (label, ts, tag) — already nearest-first
+            tagged = classify_expiries(expiry_options)  # (label, ts, tag) — every expiry preserved, nearest-first
             display_labels = [f"{label}  ·  {tag}" for label, ts, tag in tagged]
             label_to_ts = {f"{label}  ·  {tag}": ts for label, ts, tag in tagged}
             label_to_plain = {f"{label}  ·  {tag}": label for label, ts, tag in tagged}
@@ -1474,14 +1493,23 @@ def show_option_chain(fyers):
             )
             expiry_timestamp = label_to_ts.get(selected_display, "")
             selected_expiry_label = label_to_plain.get(selected_display, "")
+
+            if len(expiry_options) == 1:
+                st.info("Only one expiry is available from FYERS API.")
+
+            st.caption(
+                f"Selected expiry: **{selected_expiry_label}**  |  "
+                f"API request expiry (timestamp sent to FYERS): **{expiry_timestamp or '—'}**"
+            )
         else:
             st.caption("⏳ Fetching available expiry dates for this instrument …")
             expiry_timestamp = ""
             selected_expiry_label = ""
             if st.button("🔁 Retry Loading Expiry List"):
                 with st.spinner("Loading expiry dates …"):
-                    expiry_list, _used = fetch_expiry_list(fyers, symbol_candidates)
+                    expiry_list, _used, raw_payload = fetch_expiry_list(fyers, symbol_candidates)
                 st.session_state["oc_expiry_list"] = expiry_list
+                st.session_state["oc_raw_expiry_payload"] = raw_payload
                 st.rerun()
 
         ai_min_conf = st.slider("AI Min Confidence % (Trade Signals)", 50, 95, 80, step=5)
@@ -1497,7 +1525,9 @@ def show_option_chain(fyers):
             )
             # If the selected expiry itself returns no usable data, walk
             # forward through the remaining expiries automatically instead
-            # of failing outright.
+            # of failing outright. This never drops an expiry from the
+            # dropdown — it only changes which one is actively displayed
+            # if the chosen one comes back empty.
             if (not response or response.get("s") != "ok") and expiry_options:
                 for _, ts in expiry_options:
                     if ts == expiry_timestamp:
@@ -1532,9 +1562,16 @@ def show_option_chain(fyers):
 
         symbol = used_symbol
 
+        # Re-derive both the raw and parsed expiry lists straight from this
+        # fetch's response too, so the sidebar inspection panel always
+        # reflects the most recent API payload for the chosen instrument —
+        # every expiry present is kept, nothing is filtered out.
+        new_raw_payload = extract_raw_expiry_payload(response)
         new_expiry_list = extract_expiry_list(response)
         if new_expiry_list:
             st.session_state["oc_expiry_list"] = new_expiry_list
+        if new_raw_payload:
+            st.session_state["oc_raw_expiry_payload"] = new_raw_payload
 
         options_data, data = extract_options_data(response)
         spot_price = extract_spot_price(response, data)
@@ -1567,6 +1604,7 @@ def show_option_chain(fyers):
         st.session_state["oc_spot"] = spot_price
         st.session_state["oc_symbol"] = symbol
         st.session_state["oc_expiry_label"] = selected_expiry_label
+        st.session_state["oc_expiry_timestamp"] = expiry_timestamp
         st.session_state["oc_ai_min_conf"] = ai_min_conf
 
     # ── Render from session_state (persists across reruns/tab switches) ─
@@ -1578,11 +1616,21 @@ def show_option_chain(fyers):
     spot_price = st.session_state["oc_spot"]
     symbol = st.session_state.get("oc_symbol", "")
     expiry_label = st.session_state.get("oc_expiry_label", "")
+    request_expiry_ts = st.session_state.get("oc_expiry_timestamp", "")
     ai_min_conf = st.session_state.get("oc_ai_min_conf", ai_min_conf)
 
     if df.empty:
         st.warning("No strikes available in the current chain snapshot.")
         return
+
+    # ── Expiry inspection banner (always visible above the chain) ───────
+    exp_i1, exp_i2, exp_i3, exp_i4 = st.columns(4)
+    exp_i1.metric("Expiries Returned by API", len(st.session_state.get("oc_raw_expiry_payload", [])))
+    exp_i2.metric("Selected Expiry", expiry_label or "—")
+    exp_i3.metric("API Request Expiry (ts)", request_expiry_ts or "—")
+    exp_i4.metric("Symbol Used", symbol or "—")
+    if len(st.session_state.get("oc_raw_expiry_payload", [])) == 1:
+        st.info("Only one expiry is available from FYERS API.")
 
     total_ce = df["ce_oi"].sum()
     total_pe = df["pe_oi"].sum()
