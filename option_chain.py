@@ -613,7 +613,31 @@ def compute_strike_bias(df: pd.DataFrame) -> pd.DataFrame:
 # ─── Main Function ───────────────────────────────────────────────────────────
 def show_option_chain(fyers):
     st.markdown("## 📊 Master Options Chain Dashboard")
-    st.markdown("<hr style='border-color:#30363d;margin:0 0 20px 0'>", unsafe_allow_html=True)
+    # ... (మిగతా కోడ్) ...
+
+    with st.sidebar:
+        st.markdown("### ⚙️ Configuration")
+        option_type = st.radio("Instrument Type", ["Indices", "F&O Stocks"])
+        is_stock = option_type == "F&O Stocks"
+        
+        if not is_stock:
+            selected_key = st.selectbox("Index", list(symbol_map.keys()))
+            symbol = symbol_map[selected_key]
+        else:
+            stock = st.text_input("Stock Symbol (e.g. RELIANCE)", "RELIANCE")
+            symbol = normalize_symbol(stock)
+
+        # --- ఇక్కడ పేస్ట్ చేయండి (సింబల్ సెలెక్ట్ చేసుకున్న తర్వాత) ---
+        if "current_symbol" not in st.session_state:
+            st.session_state["current_symbol"] = symbol
+
+        if st.session_state["current_symbol"] != symbol:
+            st.session_state["oc_expiry_data"] = None  # పాత డేటాను క్లియర్ చేస్తుంది
+            st.session_state["current_symbol"] = symbol
+            st.rerun() # యాప్‌ని రిఫ్రెష్ చేస్తుంది
+        # -----------------------------------------------------
+
+        # ... (మిగిలిన కోడ్ - strike_count, expiry dropdown, మొదలైనవి) ...
 
     # ── Sidebar ──────────────────────────────────────────────────────────────
     with st.sidebar:
