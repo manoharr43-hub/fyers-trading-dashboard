@@ -495,6 +495,10 @@ def show_option_chain(fyers):
 
         df = normalize_chain_shape(options_data)
         for col in ["strike_price","ce_ltp","ce_oi","ce_volume","ce_chng_oi","pe_ltp","pe_oi","pe_volume","pe_chng_oi"]:
+    if col in df.columns:
+        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
+    else:
+        df[col] = 0 #
             df[col] = pd.to_numeric(df.get(col, 0), errors="coerce").fillna(0)
         df.sort_values("strike_price", inplace=True)
         df.reset_index(drop=True, inplace=True)
@@ -531,8 +535,8 @@ def show_option_chain(fyers):
         st.markdown("**⚡ Big Move Alerts — Unusual OI Activity**")
         for alert in big_moves[:5]:
             (st.success if alert["direction"]=="BUY" else st.error)(
-                f"{'🟢 BUY' if alert['direction']=='BUY' else '🔴 SELL'} · "
-                f"Strike **{alert['strike']:,.0f}** ({alert['side']}) · "
+                f"{'🟢 BUY' if alert['direction']=='BUY' else '🔴 SELL'} • "
+                f"Strike **{alert['strike']:,.0f}** ({alert['side']}) • "
                 f"ΔOI {alert['oi_change']:+,.0f} — {alert['note']}")
         st.caption("Positioning signal only — confirm with price action before acting.")
         st.markdown("<br>", unsafe_allow_html=True)
@@ -581,8 +585,8 @@ def show_option_chain(fyers):
 
     with tab4:
         st.markdown("##### 🔥 Big Move Ready Strike Analysis — 7-Point Scoring")
-        st.caption("Each strike scored 0–100 across: ΔOI surge · OI level · Volume · OI+Vol confirmation · "
-                   "Spot proximity · PCR alignment · Max Pain distance. Positioning signal only.")
+        st.caption("Each strike scored 0–100 across: ΔOI surge • OI level • Volume • OI+Vol confirmation • "
+                   "Spot proximity • PCR alignment • Max Pain distance. Positioning signal only.")
 
         scored = compute_big_move_scores(df, spot_price, pcr, max_pain)
         if scored.empty:
