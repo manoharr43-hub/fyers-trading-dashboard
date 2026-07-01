@@ -1497,6 +1497,15 @@ def show_option_chain(fyers):
             if len(expiry_options) == 1:
                 st.info("Only one expiry is available from FYERS API.")
 
+            # Data-driven check against what THIS fetch actually returned —
+            # not a hard-coded per-index assumption. If none of the
+            # expiries the API returned classify as "Weekly" (classify_
+            # expiries logic is unmodified), the FYERS API is not currently
+            # listing a weekly contract for this instrument.
+            has_weekly = any(tag == "Weekly" for _, _, tag in tagged)
+            if not has_weekly:
+                st.warning("Weekly expiries are not available from the FYERS API for this instrument.")
+
             st.caption(
                 f"Selected expiry: **{selected_expiry_label}**  |  "
                 f"API request expiry (timestamp sent to FYERS): **{expiry_timestamp or '—'}**"
@@ -1631,6 +1640,10 @@ def show_option_chain(fyers):
     exp_i4.metric("Symbol Used", symbol or "—")
     if len(st.session_state.get("oc_raw_expiry_payload", [])) == 1:
         st.info("Only one expiry is available from FYERS API.")
+    else:
+        _tagged_now = classify_expiries(st.session_state.get("oc_expiry_list", []))
+        if _tagged_now and not any(tag == "Weekly" for _, _, tag in _tagged_now):
+            st.warning("Weekly expiries are not available from the FYERS API for this instrument.")
 
     total_ce = df["ce_oi"].sum()
     total_pe = df["pe_oi"].sum()
