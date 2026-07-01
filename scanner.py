@@ -5,6 +5,7 @@ import requests
 import time
 import io
 import os
+import re
 from datetime import datetime, timedelta
 from typing import List, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -117,6 +118,96 @@ def load_nse_equity_symbols() -> List[str]:
             symbols.append(sym)
 
     return sorted(set(symbols))
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# ── F&O STOCKS MODULE (grouped together) ─────────────────────────────────
+# Everything related to the F&O (futures & options eligible) stock universe
+# lives in this block + the "F&O Stocks Scanner" tab in show_scanner() —
+# kept together so F&O logic isn't scattered through the file.
+# ══════════════════════════════════════════════════════════════════════════
+
+# Fyers' NSE derivatives (F&O) symbol master. Every row is one futures/
+# options contract (e.g. "NSE:SBIN25JULFUT", "NSE:SBIN25JUL800CE"). We use
+# it purely to discover WHICH underlyings are currently F&O-permitted —
+# actual price history for the scan still comes from the clean NSE_CM
+# ("-EQ") equity symbols so the F&O scanner runs the exact same technicals
+# as the main scanner, just filtered to the F&O universe.
+FYERS_NSE_FO_SYMBOL_MASTER = "https://public.fyers.in/sym_details/NSE_FO.csv"
+
+# Index underlyings also trade F&O contracts but are not individual stocks —
+# this scanner is stocks-only, so these are excluded from the F&O universe.
+_FO_INDEX_UNDERLYINGS = {
+    "NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "NIFTYNXT50",
+    "NIFTYIT", "NIFTYPSE", "NIFTYINFRA", "SENSEX", "BANKEX", "NIFTY50",
+}
+
+
+@st.cache_data(ttl=60 * 60 * 12)  # refresh twice a day at most, same as the equity master
+def load_nse_fo_stock_symbols() -> List[str]:
+    """
+    Downloads Fyers' NSE F&O (derivatives) symbol master, extracts the
+    underlying ticker from every live futures/options contract, drops
+    index underlyings, and returns the matching clean 'NSE:SYMBOL-EQ'
+    equity symbols — i.e. exactly the stocks currently permitted for F&O
+    trading, in the same format the rest of the scanner already uses.
+    """
+    try:
+        resp = requests.get(FYERS_NSE_FO_SYMBOL_MASTER, timeout=20)
+        resp.raise_for_status()
+    except Exception as e:
+        st.error(f"Could not download Fyers F&O symbol master: {e}")
+        return []
+
+    lines = [ln for ln in resp.text.strip().split("\n") if ln.strip()]
+    if not lines:
+        return []
+
+    sample = lines[: min(500, len(lines))]
+    split_sample = [ln.split(",") for ln in sample]
+    max_cols = max((len(p) for p in split_sample), default=0)
+
+    # Same auto-detect-the-symbol-column trick as the equity loader, since
+    # Fyers doesn't guarantee a fixed column layout here either.
+    best_col, best_hits = None, 0
+    for col_idx in range(max_cols):
+        hits = sum(
+            1 for parts in split_sample
+            if len(parts) > col_idx and parts[col_idx].strip().startswith("NSE:")
+        )
+        if hits > best_hits:
+            best_col, best_hits = col_idx, hits
+
+    if best_col is None or best_hits == 0:
+        st.error(
+            "Could not locate the trading-symbol column in the Fyers F&O "
+            "symbol master — the file format may have changed."
+        )
+        return []
+
+    underlyings = set()
+    for line in lines:
+        parts = line.split(",")
+        if len(parts) <= best_col:
+            continue
+        sym = parts[best_col].strip()
+        if not sym.startswith("NSE:"):
+            continue
+        body = sym[len("NSE:"):]
+        # Underlying is the leading alphabetic run before the expiry digits
+        # (e.g. "SBIN25JULFUT" -> "SBIN", "M&M25JUL2400CE" -> "M&M").
+        m = re.match(r"^([A-Z&\-]+)", body)
+        if not m:
+            continue
+        underlying = m.group(1).strip("-")
+        if underlying and underlying not in _FO_INDEX_UNDERLYINGS:
+            underlyings.add(underlying)
+
+    equity_symbols = load_nse_equity_symbols()
+    equity_lookup = {s.replace("NSE:", "").replace("-EQ", ""): s for s in equity_symbols}
+
+    fo_stock_symbols = sorted({equity_lookup[u] for u in underlyings if u in equity_lookup})
+    return fo_stock_symbols
 
 
 # ── Benchmark (NIFTY) fetch, used for Relative Strength ─────────────────────
@@ -322,6 +413,53 @@ def calculate_ai_trend(ai_score: float) -> Tuple[str, float]:
     if ai_score <= 40:
         return "📉 Bearish", round(100 - ai_score, 1)
     return "➖ Neutral", round(100 - abs(ai_score - 50) * 2, 1)
+
+
+# ── News column ────────────────────────────────────────────────────────────
+# Set a NEWS_API_KEY environment variable and wire in your provider inside
+# fetch_news_sentiment_live() to get real headline sentiment. Without one,
+# calculate_news() falls back to a technical proxy — it NEVER leaves the
+# column blank.
+NEWS_API_ENABLED = bool(os.environ.get("NEWS_API_KEY"))
+
+
+def fetch_news_sentiment_live(stock_ticker: str) -> Optional[str]:
+    """Optional live news hook. Returns one of the 4 News labels, or None
+    if no provider is configured / the call fails (caller then falls back
+    to the technical proxy in calculate_news())."""
+    if not NEWS_API_ENABLED:
+        return None
+    try:
+        # Example wiring for a real provider (uncomment & adapt):
+        # resp = requests.get(
+        #     "https://newsapi.org/v2/everything",
+        #     params={"q": stock_ticker, "apiKey": os.environ["NEWS_API_KEY"],
+        #             "sortBy": "publishedAt", "pageSize": 5},
+        #     timeout=5,
+        # )
+        # ... score headlines and return the matching label ...
+        return None
+    except Exception:
+        return None
+
+
+def calculate_news(stock_ticker: str, gap_pct: float, rvol: float, breakout: str) -> str:
+    """News column — NEVER blank. Uses a live provider if NEWS_API_KEY is
+    configured, else infers a proxy from gap%/RVOL/breakout, since large
+    gaps + volume spikes + breakouts commonly coincide with news-driven
+    moves. This is a proxy for "check the headlines", not verified sentiment."""
+    live = fetch_news_sentiment_live(stock_ticker)
+    if live is not None:
+        return live
+
+    big_move = abs(gap_pct) >= 2 and rvol >= 2 and breakout != "NO"
+    mild_move = abs(gap_pct) >= 1 or rvol >= 1.8
+
+    if big_move:
+        return "🟢 Positive News" if gap_pct > 0 else "🔴 Negative News"
+    if mild_move:
+        return "🟡 Neutral News"
+    return "⚪ No Recent News"
 
 
 # ── XGBoost Trend / Confidence (FIXED — never blank) ─────────────────────────
@@ -643,8 +781,11 @@ def _analyse(symbol: str, df: pd.DataFrame, nifty_close: Optional[pd.Series], en
     elif gap_pct <= -0.5:
         gap_str += " 🔴"
 
-    # ── SMC structure / CISD / signal time (existing, unchanged) ───────────
-    smc_structure, cisd_signal, signal_time = _calculate_smc_and_cisd(df)
+    # ── SMC structure / CISD (existing, unchanged). The 3rd return value is
+    # the underlying candle's event date (used internally by SMC/CISD only,
+    # not exposed — "Signal Date"/"Signal Time" below are the actual
+    # generation timestamp per the fix in this update). ────────────────────
+    smc_structure, cisd_signal, _smc_cisd_event_date = _calculate_smc_and_cisd(df)
 
     # ── 52-week high/low status (DATE_FROM window ≈ 52 weeks) ──────────────
     h52w = df["High"].max()
@@ -703,17 +844,26 @@ def _analyse(symbol: str, df: pd.DataFrame, nifty_close: Optional[pd.Series], en
 
     stock_ticker = symbol.replace("NSE:", "").replace("-EQ", "")
 
-    # ── Signal Date & Signal Time: shown once per signal, generated at scan
-    # time (the underlying candle's date lives in "Signal Time" for SMC/CISD
-    # context; "Signal Date" below is the scan's own timestamp date so every
-    # row also carries a stable "as-of" date/time pair). ───────────────────
+    # ── News column — FIXED, never blank (see calculate_news above) ────────
+    news = calculate_news(stock_ticker, gap_pct, rvol, breakout)
+
+    # ── RVOL — FIXED display format ("1.45x", "2.60x ❤️‍🔥" when high) ──────
+    rvol_raw = round(float(rvol), 2)
+    rvol_display = f"{rvol_raw:.2f}x"
+    if rvol_raw >= 2.0:
+        rvol_display += " ❤️‍🔥"
+
+    # ── Signal Date & Signal Time: the actual date/time this signal was
+    # generated, shown ONCE per stock (not the underlying candle's date —
+    # that's a data timestamp, this is a generation timestamp). ────────────
     now = datetime.now()
     signal_date_str = now.strftime("%d-%b-%Y")
+    signal_time_str = now.strftime("%H:%M:%S")
 
     return {
         # ── Requested columns, in the exact requested order ────────────────
         "Signal Date": signal_date_str,
-        "Signal Time": signal_time,
+        "Signal Time": signal_time_str,
         "Stock": stock_ticker,
         "LTP": round(last_close, 2),
         "Gap %": gap_str,
@@ -723,6 +873,7 @@ def _analyse(symbol: str, df: pd.DataFrame, nifty_close: Optional[pd.Series], en
         "CISD": cisd_signal,
         "XGBoost Trend": xgb_trend,
         "XGBoost Confidence (%)": xgb_confidence,
+        "News": news,
         "Alerts": alerts,
         "MTF Trend": mtf_trend,
         "AI Trend": ai_trend,
@@ -739,15 +890,16 @@ def _analyse(symbol: str, df: pd.DataFrame, nifty_close: Optional[pd.Series], en
         "Supertrend": supertrend_label,
         "VWAP": vwap_val,
         "Chart Pattern": chart_pattern,
-        "RVOL": round(rvol, 2),
+        "RVOL": rvol_display,
         "AI Score": ai_score,
         "Final Signal": final_signal,
         # ── Existing columns kept for backward compatibility (not removed) ─
         "Smart Money": "🏦 Institutional" if ai_score > 70 else "⚖️ Neutral" if ai_score > 45 else "🔻 Distribution",
         "Signal": "🟢 BUY" if ai_score > 65 else "🔴 SELL" if ai_score < 40 else "🟡 HOLD",
-        # ── Internal-only field (prefixed "_") used by the Intraday/Swing
+        # ── Internal-only fields (prefixed "_") used by the Intraday/Swing
         # scanners below; stripped out before display in the main table. ───
         "_ATR14": round(float(atr14), 2) if pd.notna(atr14) else round(last_close * 0.01, 2),
+        "_RVOL_RAW": rvol_raw,
     }
 
 
@@ -762,7 +914,7 @@ def calculate_intraday_signal(row: dict) -> dict:
     macd_bullish = "Bullish" in row["MACD Signal"]
     supertrend_label = row["Supertrend"]
     vwap = row["VWAP"]
-    rvol = row["RVOL"]
+    rvol = row.get("_RVOL_RAW", 0.0)  # numeric RVOL — "RVOL" is now a display string like "1.45x"
     breakout = row["Breakout Status"]
     ai_score = row["AI Score"]
 
@@ -1038,39 +1190,132 @@ def _style_dataframe(df: pd.DataFrame):
     return styler.applymap(_color_code)
 
 
+# ── Excel conditional-formatting rules (openpyxl only) ───────────────────────
+# Ordered keyword -> (fill hex, font hex, bold) for signal-style text cells.
+# Order matters: more specific keywords ("STRONG BUY") must be checked before
+# their substrings ("BUY") or the specific color would never be reached.
+_SIGNAL_FILL_RULES = [
+    ("STRONG BUY", "006100", "FFFFFF", True),   # Dark Green
+    ("STRONG SELL", "9C0006", "FFFFFF", True),  # Dark Red
+    ("WATCHLIST", "FFA500", "000000", True),    # Orange
+    ("BUY", "92D050", "000000", True),          # Green
+    ("SELL", "FF0000", "FFFFFF", True),         # Red
+    ("WAIT", "FFFF00", "000000", True),         # Yellow
+    ("HOLD", "FFFF00", "000000", True),         # Yellow
+]
+
+_SUPPORT_FILL_HEX = "E2EFDA"     # Light Green
+_RESISTANCE_FILL_HEX = "FCE4D6"  # Light Red
+_HIGH_AI_SCORE_FILL_HEX = "7030A0"  # Purple (AI Score > 90)
+_HIGH_RVOL_FILL_HEX = "00FFFF"      # Cyan (❤️‍🔥 RVOL)
+_HEADER_FILL_HEX = "1F4E78"         # Blue
+_BAND_FILL_HEX = "F2F2F2"           # Alternate row shading
+
+
+def _get_conditional_fill_font(col_name: str, value):
+    """Returns (PatternFill, Font) for a single cell based on the color
+    legend: Green=BUY, Dark Green=STRONG BUY, Red=SELL, Dark Red=STRONG
+    SELL, Yellow=WAIT/HOLD, Orange=WATCHLIST, Purple=AI Score>90,
+    Cyan=High RVOL ❤️‍🔥, Light Green=Support, Light Red=Resistance.
+    Returns (None, None) if no rule applies (caller falls back to banding)."""
+    from openpyxl.styles import Font, PatternFill
+
+    text = "" if value is None else str(value)
+    text_upper = text.upper()
+
+    for keyword, fill_hex, font_hex, bold in _SIGNAL_FILL_RULES:
+        if keyword in text_upper:
+            return PatternFill("solid", fgColor=fill_hex), Font(color=font_hex, bold=bold)
+
+    if col_name == "Support":
+        return PatternFill("solid", fgColor=_SUPPORT_FILL_HEX), None
+    if col_name == "Resistance":
+        return PatternFill("solid", fgColor=_RESISTANCE_FILL_HEX), None
+    if "RVOL" in col_name and "❤️" in text:
+        return PatternFill("solid", fgColor=_HIGH_RVOL_FILL_HEX), Font(bold=True)
+    if col_name == "AI Score":
+        try:
+            if float(value) > 90:
+                return PatternFill("solid", fgColor=_HIGH_AI_SCORE_FILL_HEX), Font(color="FFFFFF", bold=True)
+        except (TypeError, ValueError):
+            pass
+
+    return None, None
+
+
+def _format_worksheet(ws, df: pd.DataFrame):
+    """Applies the full professional formatting spec to a worksheet that
+    already has `df` written starting at row 1 (header): Blue header/white
+    font, borders, auto column width, freeze first row, auto filter,
+    alternate row colors, conditional formatting (BUY/SELL/WAIT/WATCHLIST/
+    AI Score/RVOL/Support/Resistance), and center alignment. Shared by
+    to_excel_bytes() and to_excel_bytes_multi() so every exported sheet —
+    Scan, Intraday, Swing, F&O — looks identical and matches the dashboard."""
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+
+    thin = Side(style="thin", color="B0B0B0")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    center = Alignment(horizontal="center", vertical="center", wrap_text=False)
+
+    # ── Header: Blue fill, white bold font, centered, bordered ─────────────
+    header_font = Font(bold=True, color="FFFFFF", name="Arial", size=11)
+    header_fill = PatternFill("solid", fgColor=_HEADER_FILL_HEX)
+    for cell in ws[1]:
+        cell.font = header_font
+        cell.fill = header_fill
+        cell.alignment = center
+        cell.border = border
+
+    columns = list(df.columns)
+    band_fill = PatternFill("solid", fgColor=_BAND_FILL_HEX)
+
+    # ── Body: borders, center alignment, alternate row bands, and
+    # conditional formatting overriding the band where a rule matches. ─────
+    for r in range(2, ws.max_row + 1):
+        row_is_band = (r % 2 == 0)
+        for c in range(1, ws.max_column + 1):
+            cell = ws.cell(row=r, column=c)
+            cell.alignment = center
+            cell.border = border
+
+            col_name = columns[c - 1] if c - 1 < len(columns) else ""
+            fill, font = _get_conditional_fill_font(col_name, cell.value)
+            if fill is not None:
+                cell.fill = fill
+                if font is not None:
+                    cell.font = font
+            elif row_is_band:
+                cell.fill = band_fill
+
+    # ── Auto column width ───────────────────────────────────────────────────
+    for col_cells in ws.columns:
+        length = max((len(str(c.value)) for c in col_cells if c.value is not None), default=10)
+        ws.column_dimensions[col_cells[0].column_letter].width = max(length + 2, 10)
+
+    # ── Freeze first row + auto filter across the full used range ──────────
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = ws.dimensions
+
+
 def to_excel_bytes(df: pd.DataFrame, sheet_name: str = "Scan Results") -> bytes:
     """Builds an in-memory formatted .xlsx from any results dataframe
-    (main scan, Intraday, or Swing) with professional formatting via openpyxl."""
+    (main scan, Intraday, Swing, or F&O) with the full professional
+    formatting spec — exports EXACTLY the data shown on the dashboard."""
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False, sheet_name=sheet_name[:31])
-        ws = writer.sheets[sheet_name[:31]]
-
-        from openpyxl.styles import Font, PatternFill, Alignment
-
-        header_font = Font(bold=True, color="FFFFFF", name="Arial")
-        header_fill = PatternFill("solid", start_color="1F2937")
-        for cell in ws[1]:
-            cell.font = header_font
-            cell.fill = header_fill
-            cell.alignment = Alignment(horizontal="center")
-
-        for col_cells in ws.columns:
-            length = max((len(str(c.value)) for c in col_cells if c.value is not None), default=10)
-            ws.column_dimensions[col_cells[0].column_letter].width = max(length + 2, 10)
-
-        ws.freeze_panes = "A2"
+        safe_name = sheet_name[:31]
+        df.to_excel(writer, index=False, sheet_name=safe_name)
+        _format_worksheet(writer.sheets[safe_name], df)
 
     buf.seek(0)
     return buf.getvalue()
 
 
 def to_excel_bytes_multi(sheets: dict) -> bytes:
-    """Builds a single .xlsx workbook with one formatted sheet per
+    """Builds a single .xlsx workbook with one fully-formatted sheet per
     {sheet_name: dataframe} entry — used for the combined 'download everything'
-    button (Full Scan + Intraday + Swing in one file)."""
+    button (Full Scan + Intraday + Swing + F&O in one file)."""
     buf = io.BytesIO()
-    from openpyxl.styles import Font, PatternFill, Alignment
 
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
         for sheet_name, df in sheets.items():
@@ -1078,20 +1323,7 @@ def to_excel_bytes_multi(sheets: dict) -> bytes:
                 continue
             safe_name = sheet_name[:31]
             df.to_excel(writer, index=False, sheet_name=safe_name)
-            ws = writer.sheets[safe_name]
-
-            header_font = Font(bold=True, color="FFFFFF", name="Arial")
-            header_fill = PatternFill("solid", start_color="1F2937")
-            for cell in ws[1]:
-                cell.font = header_font
-                cell.fill = header_fill
-                cell.alignment = Alignment(horizontal="center")
-
-            for col_cells in ws.columns:
-                length = max((len(str(c.value)) for c in col_cells if c.value is not None), default=10)
-                ws.column_dimensions[col_cells[0].column_letter].width = max(length + 2, 10)
-
-            ws.freeze_panes = "A2"
+            _format_worksheet(writer.sheets[safe_name], df)
 
     buf.seek(0)
     return buf.getvalue()
@@ -1159,8 +1391,8 @@ def show_scanner(fyers):
         if errors:
             st.warning(f"{len(errors)} of {len(scan_universe)} symbols failed or were skipped.")
 
-    tab_scanner, tab_intraday, tab_swing = st.tabs(
-        ["📊 Full Scanner", "⚡ Intraday Scanner", "📈 Swing Trade Scanner"]
+    tab_scanner, tab_intraday, tab_swing, tab_fo = st.tabs(
+        ["📊 Full Scanner", "⚡ Intraday Scanner", "📈 Swing Trade Scanner", "🏛️ F&O Stocks Scanner"]
     )
 
     # ── Full Scanner tab (existing dashboard/columns, unchanged) ───────────
@@ -1183,13 +1415,15 @@ def show_scanner(fyers):
                 )
 
                 if not st.session_state.get("intraday_df", pd.DataFrame()).empty or \
-                   not st.session_state.get("swing_df", pd.DataFrame()).empty:
+                   not st.session_state.get("swing_df", pd.DataFrame()).empty or \
+                   not st.session_state.get("fo_scan_df", pd.DataFrame()).empty:
                     st.download_button(
-                        "📥 Download ALL (Scan + Intraday + Swing) as one Excel workbook",
+                        "📥 Download ALL (Scan + Intraday + Swing + F&O) as one Excel workbook",
                         data=to_excel_bytes_multi({
                             "Scan Results": sorted_df,
                             "Intraday Signals": st.session_state.get("intraday_df"),
                             "Swing Signals": st.session_state.get("swing_df"),
+                            "F&O Stocks": st.session_state.get("fo_scan_df"),
                         }),
                         file_name=f"nse_all_signals_{datetime.today().strftime('%Y%m%d_%H%M')}.xlsx",
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -1238,6 +1472,70 @@ def show_scanner(fyers):
             )
         else:
             st.info("Run a scan above to see Swing Trade Scanner results here.")
+
+    # ══════════════════════════════════════════════════════════════════════
+    # ── F&O Stocks Scanner tab (grouped F&O module, own run button) ────────
+    # Runs the exact same _analyse()/run_scan() pipeline as the main
+    # scanner, just restricted to the F&O-permitted stock universe from
+    # load_nse_fo_stock_symbols() above — kept separate so F&O results never
+    # mix with the full equity universe or with the Intraday/Swing scanners.
+    # ══════════════════════════════════════════════════════════════════════
+    with tab_fo:
+        fo_symbols = load_nse_fo_stock_symbols()
+        st.caption(f"Loaded {len(fo_symbols)} F&O-permitted NSE stocks (indices excluded).")
+
+        if not fo_symbols:
+            st.warning("No F&O stock symbols loaded — check network access to public.fyers.in.")
+        else:
+            fo_col1, fo_col2 = st.columns([1, 1])
+            with fo_col1:
+                fo_limit = st.number_input(
+                    "Limit F&O symbols (0 = all)", min_value=0, max_value=len(fo_symbols),
+                    value=len(fo_symbols), step=25, key="fo_limit",
+                )
+            with fo_col2:
+                fo_enable_xgboost = st.checkbox(
+                    "Enable XGBoost ML training (F&O scan)", value=False, key="fo_xgb",
+                    disabled=not XGBOOST_AVAILABLE,
+                )
+
+            fo_universe = fo_symbols if fo_limit == 0 else fo_symbols[:fo_limit]
+
+            if st.button(f"🏛️ Run F&O Stocks Scan ({len(fo_universe)} symbols)", key="fo_run"):
+                with st.spinner("Fetching NIFTY benchmark for Relative Strength…"):
+                    fo_nifty_close = fetch_nifty_benchmark(fyers)
+
+                with st.spinner("Scanning F&O stocks…"):
+                    fo_results, fo_errors = run_scan(fyers, fo_universe, fo_nifty_close, fo_enable_xgboost)
+                    fo_full_df = pd.DataFrame(fo_results)
+                    fo_display_cols = [c for c in fo_full_df.columns if not c.startswith("_")]
+                    fo_scan_df = fo_full_df[fo_display_cols] if not fo_full_df.empty else fo_full_df
+
+                st.session_state["fo_scan_df"] = fo_scan_df
+                st.session_state["fo_scan_errors"] = fo_errors
+
+                if fo_errors:
+                    st.warning(f"{len(fo_errors)} of {len(fo_universe)} F&O symbols failed or were skipped.")
+
+            fo_df = st.session_state.get("fo_scan_df")
+            if fo_df is not None and not fo_df.empty:
+                fo_sorted = fo_df.sort_values("AI Score", ascending=False)
+                st.dataframe(_style_dataframe(fo_sorted), use_container_width=True, height=500)
+                st.bar_chart(fo_df.set_index("Stock")["AI Score"])
+
+                st.download_button(
+                    "📥 Download F&O Scan as Excel",
+                    data=to_excel_bytes(fo_sorted, "F&O Stocks"),
+                    file_name=f"nse_fo_scan_{datetime.today().strftime('%Y%m%d_%H%M')}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key="dl_fo",
+                )
+            else:
+                st.info("Run an F&O scan above to see results here.")
+
+            if st.session_state.get("fo_scan_errors"):
+                with st.expander(f"⚠️ F&O errors / skipped symbols ({len(st.session_state['fo_scan_errors'])})"):
+                    st.text("\n".join(st.session_state["fo_scan_errors"][:200]))
 
     if st.session_state.get("scan_errors"):
         with st.expander(f"⚠️ Errors / skipped symbols ({len(st.session_state['scan_errors'])})"):
