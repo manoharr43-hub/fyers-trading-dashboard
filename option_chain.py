@@ -112,6 +112,16 @@ INDEX_SYMBOL_CANDIDATES = {
     "BANKEX":      ["BSE:BANKEX-INDEX"],
 }
 
+# As of the SEBI derivatives-reform circular (effective Nov 2024, further
+# revised Sept 2025), only ONE weekly index-options contract is permitted
+# per exchange: NIFTY on NSE and SENSEX on BSE. BANKNIFTY, FINNIFTY,
+# MIDCPNIFTY and BANKEX now trade MONTHLY (+ quarterly/half-yearly for
+# some) contracts only — there is no weekly expiry for them to fetch.
+# NIFTYNEXT50 has never had a weekly options contract. This is exchange
+# policy, not a bug in this dashboard — the sidebar surfaces it so it
+# isn't mistaken for a broken expiry fetch.
+INDICES_WITHOUT_WEEKLY = {"BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "NIFTYNEXT50", "BANKEX"}
+
 
 def get_stock_symbol_candidates(stock: str) -> list:
     """Returns ordered symbol variants to try for an F&O stock (RELIANCE,
@@ -695,6 +705,27 @@ def rating_from_score(score: float) -> tuple:
     return "★ Ignore", "ignore"
 
 
+# Side-aware label bands, e.g. "★★★★★ STRONG CE BUY" / "★★ PE AVOID".
+SIDE_RATING_BANDS = [
+    (90, "★★★★★", "STRONG {side} BUY", "strongbuy"),
+    (75, "★★★★", "{side} BUY", "buy"),
+    (55, "★★★", "{side} HOLD", "hold"),
+    (35, "★★", "{side} AVOID", "avoid"),
+    (0, "★", "{side} IGNORE", "ignore"),
+]
+
+
+def rating_label_for_side(score: float, side: str) -> tuple:
+    """Returns (label, css_key) for a 0-100 score tagged with its side,
+    e.g. (34, 'CE') -> ('★★ CE AVOID', 'avoid'); (94, 'PE') ->
+    ('★★★★★ STRONG PE BUY', 'strongbuy')."""
+    for threshold, stars, template, key in SIDE_RATING_BANDS:
+        if score >= threshold:
+            return f"{stars} {template.format(side=side)}", key
+    stars, template, key = SIDE_RATING_BANDS[-1][1:]
+    return f"{stars} {template.format(side=side)}", key
+
+
 def compute_ai_engine(df: pd.DataFrame, spot_price: float, atm_strike: float,
                        max_pain: float, pcr: float) -> pd.DataFrame:
     """
@@ -798,6 +829,53 @@ def compute_ai_engine(df: pd.DataFrame, spot_price: float, atm_strike: float,
         return f"PE · {row['PE Rating']}"
 
     d["Final Signal"] = d.apply(_final_signal, axis=1)
+
+    # ── Independent CE / PE BUY & SELL probability ──────────────────────
+    # BUY probability for a side = that side's own favourability score.
+    # SELL probability for a side = how favourable the *opposite* side
+    # looks (strength of the opposing flow is the classic read for why
+    # you'd exit/avoid this side), floored/ceilinged to 0-100.
+    d["CE BUY Probability"] = d["CE Score"]
+    d["PE BUY Probability"] = d["PE Score"]
+    d["CE SELL Probability"] = (100 - d["CE Score"]).clip(0, 100).round(1)
+    d["PE SELL Probability"] = (100 - d["PE Score"]).clip(0, 100).round(1)
+
+    # ── Independent CE / PE Entry / SL / Targets (premium-% based) ──────
+    def _levels(ltp: pd.Series) -> dict:
+        entry = ltp.round(2)
+        sl = (ltp * 0.85).round(2)
+        t1 = (ltp * 1.15).round(2)
+        t2 = (ltp * 1.30).round(2)
+        t3 = (ltp * 1.50).round(2)
+        return {"Entry": entry, "SL": sl, "T1": t1, "T2": t2, "T3": t3}
+
+    ce_levels = _levels(d.get("ce_ltp", pd.Series(0, index=d.index)))
+    pe_levels = _levels(d.get("pe_ltp", pd.Series(0, index=d.index)))
+    d["CE Entry"], d["CE SL"] = ce_levels["Entry"], ce_levels["SL"]
+    d["CE Target 1"], d["CE Target 2"], d["CE Target 3"] = ce_levels["T1"], ce_levels["T2"], ce_levels["T3"]
+    d["PE Entry"], d["PE SL"] = pe_levels["Entry"], pe_levels["SL"]
+    d["PE Target 1"], d["PE Target 2"], d["PE Target 3"] = pe_levels["T1"], pe_levels["T2"], pe_levels["T3"]
+
+    # ── Per-strike Institutional Buying / Selling / Smart Money ─────────
+    # Institutional Buying = put-writing pressure + put OI base (support
+    # building from large players). Institutional Selling = call-writing
+    # pressure + call OI base (resistance building from large players).
+    d["Institutional Buying"] = ((pe_oi_s * 0.5 + pe_dchng_s * 0.5) * 100).round(1)
+    d["Institutional Selling"] = ((ce_oi_s * 0.5 + ce_dchng_s * 0.5) * 100).round(1)
+    d["Smart Money Activity"] = d.get("Smart Money Score", pd.Series(0, index=d.index))
+
+    # ── Confidence % (alias of AI Confidence, kept for the spec'd name) ──
+    d["Confidence %"] = d["AI Confidence"]
+
+    # ── Final Recommendation — star + side label, strongest side wins ───
+    def _final_recommendation(row):
+        if row["CE Score"] >= row["PE Score"]:
+            label, _ = rating_label_for_side(row["CE Score"], "CE")
+        else:
+            label, _ = rating_label_for_side(row["PE Score"], "PE")
+        return label
+
+    d["Final Recommendation"] = d.apply(_final_recommendation, axis=1)
     return d
 
 
@@ -869,10 +947,14 @@ def generate_trade_signals(df: pd.DataFrame, pcr: float, support, resistance,
             if not reasons:
                 reasons.append("OI Build-up")
 
+            side_label, side_css_key = rating_label_for_side(score, side)
+
             signals.append({
-                "Strike": row["strike_price"], "Side": side, "Signal": row[rating_col],
+                "Strike": row["strike_price"], "Side": side,
+                "Signal": side_label, "Signal Key": side_css_key,
                 "Confidence": score, "Entry": entry, "SL": sl, "T1": t1, "T2": t2, "T3": t3,
-                "Risk Reward": f"1 : {rr}" if rr > 0 else "—", "Reason": " · ".join(reasons),
+                "Risk Reward": f"1 : {rr}" if rr > 0 else "—",
+                "Reason": " · ".join(reasons), "Reasons": reasons,
             })
 
     signals.sort(key=lambda s: s["Confidence"], reverse=True)
@@ -1116,9 +1198,10 @@ def style_chain_table(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def style_big_move_table(df: pd.DataFrame) -> pd.DataFrame:
-    """Big Move Table exactly as specified: Strike, CE Score, PE Score,
-    Overall Score, BUY Probability, SELL Probability, Breakout %,
-    Breakdown %, Institution Score, Smart Money Score, Final Signal."""
+    """Legacy combined Big Move Table (kept for backward compatibility):
+    Strike, CE Score, PE Score, Overall Score, BUY Probability,
+    SELL Probability, Breakout %, Breakdown %, Institution Score,
+    Smart Money Score, Final Signal."""
     cols = ["strike_price", "CE Score", "PE Score", "Overall Score", "BUY Probability",
             "SELL Probability", "Breakout Probability", "Breakdown Probability",
             "Institutional Score", "Smart Money Score", "Final Signal"]
@@ -1134,17 +1217,52 @@ def style_big_move_table(df: pd.DataFrame) -> pd.DataFrame:
     return out.sort_values(sort_col, ascending=False).reset_index(drop=True)
 
 
+def style_ce_pe_analysis_table(df: pd.DataFrame) -> pd.DataFrame:
+    """Full separate CE/PE Big Move Ready table, one row per strike, with
+    every field requested: CE/PE AI Score, CE/PE BUY/SELL Probability,
+    CE/PE Entry/SL/T1/T2/T3, Confidence %, Institutional Buying/Selling,
+    Smart Money Activity, Breakout/Breakdown Probability, and a single
+    Final Recommendation (the stronger of the two sides)."""
+    cols = [
+        "strike_price",
+        "CE Score", "PE Score",
+        "CE BUY Probability", "PE BUY Probability",
+        "CE SELL Probability", "PE SELL Probability",
+        "CE Entry", "PE Entry",
+        "CE SL", "PE SL",
+        "CE Target 1", "PE Target 1",
+        "CE Target 2", "PE Target 2",
+        "CE Target 3", "PE Target 3",
+        "Confidence %",
+        "Institutional Buying", "Institutional Selling",
+        "Smart Money Activity",
+        "Breakout Probability", "Breakdown Probability",
+        "Final Recommendation",
+    ]
+    available = [c for c in cols if c in df.columns]
+    out = df[available].copy()
+    out.rename(columns={
+        "strike_price": "Strike ⚡",
+        "CE Score": "CE AI Score", "PE Score": "PE AI Score",
+        "Breakout Probability": "Breakout Probability %",
+        "Breakdown Probability": "Breakdown Probability %",
+    }, inplace=True)
+    sort_col = "Confidence %" if "Confidence %" in out.columns else out.columns[0]
+    return out.sort_values(sort_col, ascending=False).reset_index(drop=True)
+
+
 def style_trade_signals_table(signals: list) -> pd.DataFrame:
     if not signals:
         return pd.DataFrame()
     df = pd.DataFrame(signals)
+    df.drop(columns=[c for c in ("Signal Key", "Reasons") if c in df.columns], inplace=True)
     df.rename(columns={"Side": "CE/PE"}, inplace=True)
     return df
 
 
 def _bigmove_row_style(row):
-    signal = str(row.get("Final Signal", "")).upper()
-    if "STRONG BUY" in signal:
+    signal = str(row.get("Final Signal", row.get("Final Recommendation", ""))).upper()
+    if "STRONG" in signal and "BUY" in signal:
         color = "background-color:#0d3b2e;color:#3fb950;"
     elif "BUY" in signal:
         color = "background-color:#123524;color:#7ee787;"
@@ -1203,7 +1321,7 @@ def _color_signal_cells(ws, header_row_values: list, start_row: int = 2):
     Ready, AI Trade Signals)."""
     target_cols = [
         idx + 1 for idx, h in enumerate(header_row_values)
-        if h and any(k in str(h) for k in ("Signal", "Bias", "Build-up", "Label", "Rating"))
+        if h and any(k in str(h) for k in ("Signal", "Bias", "Build-up", "Label", "Rating", "Recommendation"))
     ]
     for row in ws.iter_rows(min_row=start_row):
         for col_idx in target_cols:
@@ -1279,9 +1397,13 @@ def build_excel_report(df: pd.DataFrame, spot_price: float, atm_strike: float, p
     ws_chain = wb.create_sheet("Chain Table")
     _write_dataframe(ws_chain, style_chain_table(df))
 
-    # ── Big Move Ready sheet ──
+    # ── Big Move Ready sheet (full separate CE/PE analysis) ──
     ws_bigmove = wb.create_sheet("Big Move Ready")
-    _write_dataframe(ws_bigmove, style_big_move_table(df))
+    _write_dataframe(ws_bigmove, style_ce_pe_analysis_table(df))
+
+    # ── Legacy combined Big Move sheet (kept for backward compatibility) ──
+    ws_bigmove_legacy = wb.create_sheet("Big Move (Legacy)")
+    _write_dataframe(ws_bigmove_legacy, style_big_move_table(df))
 
     # ── AI Trade Signals sheet ──
     ws_signals = wb.create_sheet("AI Trade Signals")
@@ -1329,6 +1451,14 @@ def show_option_chain(fyers):
             with st.spinner("Loading expiry dates …"):
                 expiry_list, _used = fetch_expiry_list(fyers, symbol_candidates)
             st.session_state["oc_expiry_list"] = expiry_list
+
+        if not is_stock and selected_key in INDICES_WITHOUT_WEEKLY:
+            st.caption(
+                f"ℹ️ {selected_key} currently trades **monthly expiry only** on the exchange "
+                "(SEBI's derivatives-reform circular limits weekly index options to one "
+                "instrument per exchange — NIFTY on NSE, SENSEX on BSE). This dropdown will "
+                "show every expiry the exchange actually lists for this index."
+            )
 
         max_strikes = 20 if is_stock else 30
         strike_count = st.slider("Strikes Around ATM", 5, max_strikes, min(20, max_strikes), step=5)
@@ -1667,22 +1797,38 @@ def show_option_chain(fyers):
         s4.metric("Best Breakdown Strike", _fmt_strike_row(summary2.get("Best Breakdown Strike")))
 
         st.markdown("<br>", unsafe_allow_html=True)
-        st.markdown("**Big Move Table** (color-coded by Final Signal)")
-        bm_table = style_big_move_table(df)
-        numeric_bm_cols = [c for c in bm_table.select_dtypes("number").columns if c != "Strike ⚡"]
+        st.markdown("**Full CE / PE Analysis** — independent AI Score, BUY/SELL Probability, "
+                     "Entry/SL/Targets, Institutional flow and Smart Money Activity for both sides "
+                     "of every strike (color-coded by Final Recommendation)")
+        ce_pe_table = style_ce_pe_analysis_table(df)
+        numeric_ce_pe_cols = [c for c in ce_pe_table.select_dtypes("number").columns if c != "Strike ⚡"]
         st.dataframe(
-            bm_table.style.apply(_bigmove_row_style, axis=1)
-                .format({c: "{:,.1f}" for c in numeric_bm_cols})
+            ce_pe_table.style.apply(_bigmove_row_style, axis=1)
+                .format({c: "{:,.1f}" for c in numeric_ce_pe_cols})
                 .format({"Strike ⚡": "{:,.0f}"}),
-            use_container_width=True, height=520,
+            use_container_width=True, height=560,
         )
         st.caption(
-            "CE Score / PE Score = independent 0-100 favourability for buying a CALL / PUT at that "
-            "strike (OI, ΔOI, Volume, PCR, Max Pain, Spot/ATM distance, IV, writing/unwinding, "
-            "breakout/breakdown probability). Overall Score = average of both. Final Signal shows the "
-            "stronger side with its ★ rating: ★★★★★ 90-100 Strong Buy · ★★★★ 75-89 Buy · "
-            "★★★ 55-74 Hold · ★★ 35-54 Avoid · ★ below 35 Ignore."
+            "CE AI Score / PE AI Score = independent 0-100 favourability for buying a CALL / PUT at "
+            "that strike, built from OI, ΔOI, Volume, PCR, Max Pain, Spot/ATM distance, IV, "
+            "Long/Short Build-up, Long/Short Unwinding, and Heavy Call/Put Writing. BUY Probability = "
+            "the side's own score; SELL Probability = 100 − that score. Entry/SL/Targets are "
+            "premium-percentage based (SL −15%, T1 +15%, T2 +30%, T3 +50%) for each side "
+            "independently. Institutional Buying/Selling and Smart Money Activity are OI-base + "
+            "ΔOI proxies for large-player positioning. Final Recommendation shows the stronger side "
+            "with its ★ rating: ★★★★★ 90-100 Strong Buy · ★★★★ 75-89 Buy · ★★★ 55-74 Hold · "
+            "★★ 35-54 Avoid · ★ below 35 Ignore."
         )
+
+        with st.expander("Legacy combined Big Move Table (Overall Score view)"):
+            bm_table = style_big_move_table(df)
+            numeric_bm_cols = [c for c in bm_table.select_dtypes("number").columns if c != "Strike ⚡"]
+            st.dataframe(
+                bm_table.style.apply(_bigmove_row_style, axis=1)
+                    .format({c: "{:,.1f}" for c in numeric_bm_cols})
+                    .format({"Strike ⚡": "{:,.0f}"}),
+                use_container_width=True, height=420,
+            )
 
     with tab5:
         st.markdown("##### 🤖 AI Trade Signal Engine — High Confidence Only")
@@ -1692,17 +1838,9 @@ def show_option_chain(fyers):
             st.info("No strikes currently meet the selected confidence threshold. Try lowering it in the sidebar.")
         else:
             for sig in signals:
-                signal_upper = sig["Signal"].upper()
-                if "STRONG BUY" in signal_upper:
-                    css_class = "rating-strongbuy"
-                elif "BUY" in signal_upper:
-                    css_class = "rating-buy"
-                elif "HOLD" in signal_upper:
-                    css_class = "rating-hold"
-                elif "AVOID" in signal_upper:
-                    css_class = "rating-avoid"
-                else:
-                    css_class = "rating-ignore"
+                css_class = RATING_CSS_CLASS.get(sig.get("Signal Key", "ignore"), "rating-ignore")
+                reasons_list = sig.get("Reasons") or [r.strip() for r in sig.get("Reason", "").split("·") if r.strip()]
+                reasons_html = "".join(f"<li>{r}</li>" for r in reasons_list)
 
                 st.markdown(f"""
                 <div class="intel-card">
@@ -1713,11 +1851,14 @@ def show_option_chain(fyers):
                       <span style="color:#e6edf3;font-weight:700;font-size:15px;">{sig['Confidence']:.0f}%</span></div>
                   </div>
                   <div style="margin-top:10px;font-family:'Courier New',monospace;color:#e6edf3;font-size:14px;">
-                    Entry <b>{sig['Entry']}</b> &nbsp;|&nbsp; SL <b>{sig['SL']}</b> &nbsp;|&nbsp;
-                    T1 {sig['T1']} &nbsp; T2 {sig['T2']} &nbsp; T3 {sig['T3']}
+                    Entry <b>{sig['Entry']}</b> &nbsp;|&nbsp; Stop Loss <b>{sig['SL']}</b> &nbsp;|&nbsp;
+                    Target 1 {sig['T1']} &nbsp; Target 2 {sig['T2']} &nbsp; Target 3 {sig['T3']}
                     &nbsp;|&nbsp; RR {sig['Risk Reward']}
                   </div>
-                  <div style="margin-top:6px;color:#8b949e;font-size:12px;">Reason: {sig['Reason']}</div>
+                  <div style="margin-top:8px;color:#8b949e;font-size:12px;">
+                    Reason:
+                    <ul style="margin:4px 0 0 18px;padding:0;">{reasons_html}</ul>
+                  </div>
                 </div>
                 """, unsafe_allow_html=True)
 
