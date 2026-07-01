@@ -4,12 +4,15 @@ import numpy as np
 import requests
 import time
 import io
+import os
 from datetime import datetime, timedelta
 from typing import List, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# XGBoost is optional — the app still works fully without it, the
-# "XGBoost Trend / Confidence" columns just show "N/A" until it's installed.
+# XGBoost is optional — the app still works fully without it. When it's
+# unavailable (or when the user leaves ML training off), the "XGBoost Trend /
+# Confidence" columns fall back to a rule-based technical score instead of
+# ever being blank/N-A — see calculate_xgboost_prediction() below.
 try:
     import xgboost as xgb
     XGBOOST_AVAILABLE = True
@@ -36,6 +39,13 @@ MAX_WORKERS = 8
 BATCH_SIZE = 50
 BATCH_PAUSE_SECONDS = 1.0
 
+# Path to an optional pre-trained, persisted XGBoost model (JSON format via
+# model.save_model(...)). If this file exists, calculate_xgboost_prediction()
+# loads it automatically and blends its output with the technical fallback
+# score. If it does not exist, a lightweight model is trained on-the-fly
+# (when ML is enabled) or the pure rule-based technical fallback is used.
+XGB_MODEL_PATH = "xgb_trend_model.json"
+
 # NOTE ON OPEN INTEREST: this scanner runs against the NSE_CM (cash
 # equity) symbol master. Open Interest and Change in OI are futures &
 # options concepts and do not exist for cash equity instruments, so they
@@ -43,6 +53,14 @@ BATCH_PAUSE_SECONDS = 1.0
 # would require mapping every EQ symbol to its current-month FUT contract
 # and pulling OI from a separate Fyers endpoint per symbol — that's a
 # meaningfully different (and much heavier) scan and isn't included here.
+
+# NOTE ON INTRADAY DATA: the Fyers history calls in this file use daily
+# ("D") resolution candles. There is no live 1m/5m intraday feed wired in,
+# so the Intraday Scanner below approximates a quick intraday-style trade
+# off the most recent daily candle's technicals (RSI/MACD/Supertrend/VWAP/
+# RVOL/S-R) rather than reading live intraday ticks. If/when an intraday
+# feed is added, swap "resolution": "D" for "5" or "15" in a dedicated
+# fetch and feed that into calculate_intraday_signal() instead.
 
 
 # ── Symbol Universe ──────────────────────────────────────────────────────────
@@ -306,48 +324,175 @@ def calculate_ai_trend(ai_score: float) -> Tuple[str, float]:
     return "➖ Neutral", round(100 - abs(ai_score - 50) * 2, 1)
 
 
-def calculate_xgboost_prediction(df: pd.DataFrame) -> Tuple[str, float]:
-    """Trains a tiny per-symbol XGBoost classifier on engineered features to
-    predict next-day direction. This is intentionally lightweight (50 trees,
-    depth 3) since it re-trains from scratch for every symbol, every scan —
-    it is NOT a persisted, backtested model. Gate this behind the UI
-    checkbox for large scans; it adds real time per symbol."""
-    if not XGBOOST_AVAILABLE or len(df) < 100:
-        return "N/A", 0.0
+# ── XGBoost Trend / Confidence (FIXED — never blank) ─────────────────────────
+def _rule_based_xgb_score(df: pd.DataFrame, rsi_val: float, macd_bullish: bool,
+                           supertrend_bullish: Optional[bool], vwap_val: float,
+                           rvol: float, support: float, resistance: float) -> float:
+    """Pure technical scorer (0-100, 50 = neutral) used whenever XGBoost is
+    unavailable/untrained, and blended in even when a model IS available for
+    stability. Built from price action, RSI, MACD, Supertrend, VWAP, Volume/
+    RVOL, Support, Resistance and momentum — exactly the inputs requested.
+    This function can NEVER fail to produce a score."""
+    last_close = float(df["Close"].iloc[-1])
+    score = 50.0
 
-    d = df.copy().reset_index(drop=True)
-    d["Return"] = d["Close"].pct_change()
-    d["RSI"] = calculate_rsi(d["Close"])
-    _, _, hist = calculate_macd(d["Close"])
-    d["MACD_Hist"] = hist
-    d["Vol_Ratio"] = d["Volume"] / d["Volume"].rolling(20).mean()
-    d["EMA_Dist"] = d["Close"] / d["Close"].ewm(span=20, adjust=False).mean() - 1
-    d["Target"] = (d["Close"].shift(-1) > d["Close"]).astype(int)
+    # Momentum: 10-day rate of change
+    if len(df) >= 10:
+        roc = (last_close / float(df["Close"].iloc[-10]) - 1) * 100
+        score += max(min(roc * 2, 15), -15)
 
-    feature_cols = ["Return", "RSI", "MACD_Hist", "Vol_Ratio", "EMA_Dist"]
-    d = d.dropna(subset=feature_cols)
-    if len(d) < 60:
-        return "N/A", 0.0
+    # RSI
+    score += (rsi_val - 50) * 0.3
 
-    train = d.iloc[:-1]
-    latest = d.iloc[[-1]]
-    X_train, y_train = train[feature_cols], train["Target"]
-    if y_train.nunique() < 2:
-        return "N/A", 0.0
+    # MACD
+    score += 8 if macd_bullish else -8
 
-    try:
-        model = xgb.XGBClassifier(
-            n_estimators=50, max_depth=3, learning_rate=0.1,
-            eval_metric="logloss", verbosity=0,
-        )
-        model.fit(X_train, y_train)
-        proba = model.predict_proba(latest[feature_cols])[0]
-        pred = model.predict(latest[feature_cols])[0]
-        confidence = round(float(max(proba)) * 100, 1)
-        trend = "📈 Up" if pred == 1 else "📉 Down"
-        return trend, confidence
-    except Exception:
-        return "N/A", 0.0
+    # Supertrend
+    if supertrend_bullish is True:
+        score += 8
+    elif supertrend_bullish is False:
+        score -= 8
+
+    # VWAP position (price action vs volume-weighted average price)
+    if vwap_val:
+        score += 5 if last_close > vwap_val else -5
+
+    # Volume / RVOL — amplifies conviction of the prevailing direction
+    if rvol and rvol >= 2:
+        score += 5 if score >= 50 else -5
+
+    # Resistance / Support proximity
+    if pd.notna(resistance) and resistance > 0:
+        dist_to_r = (resistance - last_close) / last_close
+        if dist_to_r < 0.02:
+            score -= 4  # near resistance — less room to run bullishly
+    if pd.notna(support) and support > 0:
+        dist_to_s = (last_close - support) / last_close
+        if dist_to_s < 0.02:
+            score += 4  # near support — bounce potential
+
+    return max(0.0, min(100.0, score))
+
+
+def _score_to_trend_label(score: float) -> str:
+    if score >= 75:
+        return "🟢 Strong Bullish"
+    if score >= 58:
+        return "🟢 Bullish"
+    if score >= 42:
+        return "🟡 Neutral"
+    if score >= 25:
+        return "🔴 Bearish"
+    return "🔴 Strong Bearish"
+
+
+def calculate_xgboost_prediction(
+    df: pd.DataFrame,
+    rsi_val: Optional[float] = None,
+    macd_bullish: Optional[bool] = None,
+    supertrend_bullish: Optional[bool] = None,
+    vwap_val: Optional[float] = None,
+    rvol: Optional[float] = None,
+    support: Optional[float] = None,
+    resistance: Optional[float] = None,
+    use_ml: bool = True,
+) -> Tuple[str, float]:
+    """Returns (trend_label, confidence_pct). This is FIXED to never return
+    a blank/N-A value:
+      1) If a trained model exists on disk (XGB_MODEL_PATH), load it and
+         predict trend + confidence, blended with the technical score.
+      2) Else, if use_ml is True and there's enough history, train a small
+         ephemeral model and blend it with the technical score.
+      3) Else (xgboost missing, not enough history, use_ml False, or any
+         training/prediction error), fall back to the pure rule-based
+         technical score built from Price Action, RSI, MACD, Supertrend,
+         VWAP, Volume/RVOL, Support, Resistance and Momentum.
+    Every path returns one of: Strong Bullish / Bullish / Neutral / Bearish /
+    Strong Bearish, plus a 0-100% confidence.
+    """
+    close = df["Close"]
+
+    # Fill in any missing technical inputs defensively so this function is
+    # safe to call standalone (e.g. from the Intraday/Swing scanners).
+    if rsi_val is None:
+        rsi_val = float(calculate_rsi(close).iloc[-1])
+    if macd_bullish is None:
+        macd_line, signal_line, _ = calculate_macd(close)
+        macd_bullish = bool(macd_line.iloc[-1] > signal_line.iloc[-1])
+    if supertrend_bullish is None:
+        _, supertrend_bullish, _ = calculate_supertrend(df)
+    if vwap_val is None:
+        vwap_val = calculate_vwap_approx(df)
+    if rvol is None:
+        vol_avg20 = df["Volume"].tail(20).mean()
+        rvol = (df["Volume"].iloc[-1] / vol_avg20) if vol_avg20 > 0 else 0
+    if support is None or resistance is None:
+        resistance = df["High"].rolling(20).max().shift(1).iloc[-1]
+        support = df["Low"].rolling(20).min().shift(1).iloc[-1]
+
+    rule_score = _rule_based_xgb_score(
+        df, rsi_val, macd_bullish, supertrend_bullish, vwap_val, rvol, support, resistance
+    )
+
+    # 1) Persisted, pre-trained model (auto-loaded if present on disk).
+    if XGBOOST_AVAILABLE and os.path.exists(XGB_MODEL_PATH):
+        try:
+            model = xgb.XGBClassifier()
+            model.load_model(XGB_MODEL_PATH)
+            d = df.copy().reset_index(drop=True)
+            d["Return"] = d["Close"].pct_change()
+            d["RSI"] = calculate_rsi(d["Close"])
+            _, _, hist = calculate_macd(d["Close"])
+            d["MACD_Hist"] = hist
+            d["Vol_Ratio"] = d["Volume"] / d["Volume"].rolling(20).mean()
+            d["EMA_Dist"] = d["Close"] / d["Close"].ewm(span=20, adjust=False).mean() - 1
+            feature_cols = ["Return", "RSI", "MACD_Hist", "Vol_Ratio", "EMA_Dist"]
+            latest = d.dropna(subset=feature_cols).iloc[[-1]]
+            if not latest.empty:
+                proba = model.predict_proba(latest[feature_cols])[0]
+                up_proba = float(proba[1]) * 100
+                blended = 0.7 * up_proba + 0.3 * rule_score
+                confidence = round(float(max(proba)) * 100, 1)
+                return _score_to_trend_label(blended), confidence
+        except Exception:
+            pass  # fall through to training / rule-based
+
+    # 2) No persisted model — train a lightweight ephemeral one (only when
+    # the caller has opted into ML, since this is the slow path).
+    if use_ml and XGBOOST_AVAILABLE and len(df) >= 100:
+        try:
+            d = df.copy().reset_index(drop=True)
+            d["Return"] = d["Close"].pct_change()
+            d["RSI"] = calculate_rsi(d["Close"])
+            _, _, hist = calculate_macd(d["Close"])
+            d["MACD_Hist"] = hist
+            d["Vol_Ratio"] = d["Volume"] / d["Volume"].rolling(20).mean()
+            d["EMA_Dist"] = d["Close"] / d["Close"].ewm(span=20, adjust=False).mean() - 1
+            d["Target"] = (d["Close"].shift(-1) > d["Close"]).astype(int)
+            feature_cols = ["Return", "RSI", "MACD_Hist", "Vol_Ratio", "EMA_Dist"]
+            d = d.dropna(subset=feature_cols)
+            if len(d) >= 60:
+                train = d.iloc[:-1]
+                latest = d.iloc[[-1]]
+                X_train, y_train = train[feature_cols], train["Target"]
+                if y_train.nunique() >= 2:
+                    model = xgb.XGBClassifier(
+                        n_estimators=50, max_depth=3, learning_rate=0.1,
+                        eval_metric="logloss", verbosity=0,
+                    )
+                    model.fit(X_train, y_train)
+                    proba = model.predict_proba(latest[feature_cols])[0]
+                    up_proba = float(proba[1]) * 100
+                    blended = 0.6 * up_proba + 0.4 * rule_score
+                    confidence = round(float(max(proba)) * 100, 1)
+                    return _score_to_trend_label(blended), confidence
+        except Exception:
+            pass  # fall through to pure rule-based
+
+    # 3) Pure rule-based technical fallback — guarantees this is NEVER blank.
+    confidence = round(45 + abs(rule_score - 50) * 1.1, 1)  # more extreme => more confident
+    confidence = max(35.0, min(97.0, confidence))
+    return _score_to_trend_label(rule_score), confidence
 
 
 def generate_alerts(rvol: float, breakout: str, cisd_signal: str, mtf_trend: str, gap_pct: float) -> str:
@@ -379,8 +524,13 @@ def calculate_final_signal(
     elif ai_score < 30: score -= 2
     elif ai_score < 45: score -= 1
 
-    if xgb_trend == "📈 Up": score += 1
-    elif xgb_trend == "📉 Down": score -= 1
+    # XGBoost Trend now has 5 tiers (Strong Bullish/Bullish/Neutral/Bearish/
+    # Strong Bearish) instead of the old Up/Down — check "Strong" first
+    # since "Bullish"/"Bearish" are substrings of the Strong labels.
+    if "Strong Bullish" in xgb_trend: score += 2
+    elif "Bullish" in xgb_trend: score += 1
+    elif "Strong Bearish" in xgb_trend: score -= 2
+    elif "Bearish" in xgb_trend: score -= 1
 
     if "Aligned Bullish" in mtf_trend: score += 1
     elif "Aligned Bearish" in mtf_trend: score -= 1
@@ -535,9 +685,13 @@ def _analyse(symbol: str, df: pd.DataFrame, nifty_close: Optional[pd.Series], en
 
     ai_trend, ai_confidence = calculate_ai_trend(ai_score)
 
-    xgb_trend, xgb_confidence = ("N/A", 0.0)
-    if enable_xgboost:
-        xgb_trend, xgb_confidence = calculate_xgboost_prediction(df)
+    # ── XGBoost Trend / Confidence — FIXED, always populated ───────────────
+    xgb_trend, xgb_confidence = calculate_xgboost_prediction(
+        df,
+        rsi_val=rsi_val, macd_bullish=macd_bullish, supertrend_bullish=supertrend_bullish,
+        vwap_val=vwap_val, rvol=rvol, support=support, resistance=resistance,
+        use_ml=enable_xgboost,
+    )
 
     alerts = generate_alerts(rvol, breakout, cisd_signal, mtf_trend, gap_pct)
 
@@ -549,8 +703,16 @@ def _analyse(symbol: str, df: pd.DataFrame, nifty_close: Optional[pd.Series], en
 
     stock_ticker = symbol.replace("NSE:", "").replace("-EQ", "")
 
+    # ── Signal Date & Signal Time: shown once per signal, generated at scan
+    # time (the underlying candle's date lives in "Signal Time" for SMC/CISD
+    # context; "Signal Date" below is the scan's own timestamp date so every
+    # row also carries a stable "as-of" date/time pair). ───────────────────
+    now = datetime.now()
+    signal_date_str = now.strftime("%d-%b-%Y")
+
     return {
         # ── Requested columns, in the exact requested order ────────────────
+        "Signal Date": signal_date_str,
         "Signal Time": signal_time,
         "Stock": stock_ticker,
         "LTP": round(last_close, 2),
@@ -583,6 +745,215 @@ def _analyse(symbol: str, df: pd.DataFrame, nifty_close: Optional[pd.Series], en
         # ── Existing columns kept for backward compatibility (not removed) ─
         "Smart Money": "🏦 Institutional" if ai_score > 70 else "⚖️ Neutral" if ai_score > 45 else "🔻 Distribution",
         "Signal": "🟢 BUY" if ai_score > 65 else "🔴 SELL" if ai_score < 40 else "🟡 HOLD",
+        # ── Internal-only field (prefixed "_") used by the Intraday/Swing
+        # scanners below; stripped out before display in the main table. ───
+        "_ATR14": round(float(atr14), 2) if pd.notna(atr14) else round(last_close * 0.01, 2),
+    }
+
+
+# ── Intraday Scanner ──────────────────────────────────────────────────────────
+def calculate_intraday_signal(row: dict) -> dict:
+    """Builds an Intraday-style signal off the latest daily candle's
+    technicals already computed in _analyse() — see the intraday-data note
+    near the top of this file for the daily-vs-intraday-resolution caveat."""
+    last_close = row["LTP"]
+    atr = row.get("_ATR14") or round(last_close * 0.01, 2)
+    rsi = row["RSI"]
+    macd_bullish = "Bullish" in row["MACD Signal"]
+    supertrend_label = row["Supertrend"]
+    vwap = row["VWAP"]
+    rvol = row["RVOL"]
+    breakout = row["Breakout Status"]
+    ai_score = row["AI Score"]
+
+    bull_votes = sum([
+        macd_bullish,
+        "Buy" in supertrend_label,
+        vwap is not None and last_close > vwap,
+        rsi > 50,
+        breakout == "📈 Bullish",
+    ])
+    bear_votes = sum([
+        not macd_bullish,
+        "Sell" in supertrend_label,
+        vwap is not None and last_close < vwap,
+        rsi < 50,
+        breakout == "📉 Bearish",
+    ])
+
+    if bull_votes >= 4 and rvol >= 1.2:
+        signal = "🟢 BUY"
+    elif bear_votes >= 4 and rvol >= 1.2:
+        signal = "🔴 SELL"
+    else:
+        signal = "🟡 WAIT"
+
+    entry = round(last_close, 2)
+    if signal == "🟢 BUY":
+        sl = round(entry - 1.0 * atr, 2)
+        t1 = round(entry + 1.0 * atr, 2)
+        t2 = round(entry + 1.8 * atr, 2)
+        t3 = round(entry + 2.6 * atr, 2)
+        exit_condition = "Exit if price closes below Stop Loss, or Supertrend flips to Sell"
+    elif signal == "🔴 SELL":
+        sl = round(entry + 1.0 * atr, 2)
+        t1 = round(entry - 1.0 * atr, 2)
+        t2 = round(entry - 1.8 * atr, 2)
+        t3 = round(entry - 2.6 * atr, 2)
+        exit_condition = "Exit if price closes above Stop Loss, or Supertrend flips to Buy"
+    else:
+        sl = round(entry - 1.0 * atr, 2)
+        t1, t2, t3 = entry, entry, entry
+        exit_condition = "No trade — wait for RVOL/MACD/VWAP/Supertrend alignment"
+
+    risk = abs(entry - sl)
+    reward = abs(t1 - entry)
+    rr_ratio = round(reward / risk, 2) if risk > 0 else 0.0
+
+    vote_total = max(bull_votes, bear_votes)
+    confidence = round(min(95.0, 40 + vote_total * 11 + min(rvol, 3) * 5), 1)
+    confidence = max(30.0, confidence)
+
+    atr_pct = (atr / last_close * 100) if last_close else 0
+    if atr_pct >= 3:
+        holding_time = "15–45 Minutes (high volatility)"
+    elif atr_pct >= 1.5:
+        holding_time = "30–90 Minutes"
+    else:
+        holding_time = "1–3 Hours"
+
+    reasons = ["MACD bullish" if macd_bullish else "MACD bearish"]
+    reasons.append(f"Supertrend {supertrend_label.split()[-1]}")
+    if vwap is not None:
+        reasons.append("Above VWAP" if last_close > vwap else "Below VWAP")
+    reasons.append(f"RSI {rsi}")
+    if rvol >= 1.5:
+        reasons.append(f"High RVOL {rvol}x")
+    if breakout != "NO":
+        reasons.append(f"Breakout: {breakout}")
+    reason_str = ", ".join(reasons)
+
+    return {
+        "Signal Date": row["Signal Date"],
+        "Signal Time": row["Signal Time"],
+        "Stock": row["Stock"],
+        "LTP": last_close,
+        "Intraday Signal": signal,
+        "Entry Price": entry,
+        "Stop Loss": sl,
+        "Target 1": t1,
+        "Target 2": t2,
+        "Target 3": t3,
+        "Risk Reward Ratio": rr_ratio,
+        "Confidence %": confidence,
+        "AI Score": ai_score,
+        "Expected Holding Time": holding_time,
+        "Exit Condition": exit_condition,
+        "Reason": reason_str,
+    }
+
+
+# ── Swing Trade Scanner ────────────────────────────────────────────────────────
+def calculate_swing_signal(row: dict) -> dict:
+    """Builds a multi-day Swing signal off MTF trend, Relative Strength vs
+    NIFTY, Supertrend, SMC structure and CISD confirmation."""
+    last_close = row["LTP"]
+    atr = row.get("_ATR14") or round(last_close * 0.01, 2)
+    mtf_trend = row["MTF Trend"]
+    rs_label = row["RS vs NIFTY"]
+    supertrend_label = row["Supertrend"]
+    smc_structure = row["SMC Structure"]
+    cisd_signal = row["CISD"]
+    ai_score = row["AI Score"]
+
+    bull_votes = sum([
+        "Aligned Bullish" in mtf_trend,
+        "Outperform" in rs_label,
+        "Buy" in supertrend_label,
+        "📈" in smc_structure or "🐂" in smc_structure,
+        "Bullish" in cisd_signal,
+    ])
+    bear_votes = sum([
+        "Aligned Bearish" in mtf_trend,
+        "Underperform" in rs_label,
+        "Sell" in supertrend_label,
+        "📉" in smc_structure or "🐻" in smc_structure,
+        "Bearish" in cisd_signal,
+    ])
+
+    if bull_votes >= 3:
+        signal = "🟢 BUY"
+    elif bear_votes >= 3:
+        signal = "🔴 SELL"
+    else:
+        signal = "🟡 HOLD"
+
+    entry = round(last_close, 2)
+    if signal == "🟢 BUY":
+        sl = round(entry - 2.0 * atr, 2)
+        t1 = round(entry + 2.0 * atr, 2)
+        t2 = round(entry + 3.5 * atr, 2)
+        t3 = round(entry + 5.0 * atr, 2)
+        exit_condition = "Exit on daily close below Stop Loss, or MTF trend turning Mixed/Bearish"
+    elif signal == "🔴 SELL":
+        sl = round(entry + 2.0 * atr, 2)
+        t1 = round(entry - 2.0 * atr, 2)
+        t2 = round(entry - 3.5 * atr, 2)
+        t3 = round(entry - 5.0 * atr, 2)
+        exit_condition = "Exit on daily close above Stop Loss, or MTF trend turning Mixed/Bullish"
+    else:
+        sl = round(entry - 2.0 * atr, 2)
+        t1, t2, t3 = entry, entry, entry
+        exit_condition = "No position — wait for MTF/RS/Supertrend alignment"
+
+    risk = abs(entry - sl)
+    reward = abs(t1 - entry)
+    rr_ratio = round(reward / risk, 2) if risk > 0 else 0.0
+
+    vote_total = max(bull_votes, bear_votes)
+    confidence = round(min(95.0, 38 + vote_total * 12 + (ai_score - 50) * 0.15), 1)
+    confidence = max(30.0, confidence)
+
+    if vote_total >= 4:
+        trend_strength = "🟢 Strong"
+    elif vote_total == 3:
+        trend_strength = "🟡 Moderate"
+    else:
+        trend_strength = "🔴 Weak"
+
+    atr_pct = (atr / last_close * 100) if last_close else 0
+    if atr_pct >= 3:
+        holding_days, est_days = "3–7 Days", 5
+    elif atr_pct >= 1.5:
+        holding_days, est_days = "7–14 Days", 10
+    else:
+        holding_days, est_days = "14–25 Days", 18
+    exit_date = (datetime.now() + timedelta(days=est_days)).strftime("%d-%b-%Y")
+
+    reasons = [f"MTF: {mtf_trend}", f"RS vs NIFTY: {rs_label}", f"Supertrend: {supertrend_label}",
+               f"SMC: {smc_structure}"]
+    if cisd_signal != "None":
+        reasons.append(f"CISD: {cisd_signal}")
+    reason_str = ", ".join(reasons)
+
+    return {
+        "Signal Date": row["Signal Date"],
+        "Signal Time": row["Signal Time"],
+        "Stock": row["Stock"],
+        "Swing Signal": signal,
+        "Swing Entry": entry,
+        "Swing Stop Loss": sl,
+        "Swing Target 1": t1,
+        "Swing Target 2": t2,
+        "Swing Target 3": t3,
+        "Expected Holding Period": holding_days,
+        "Estimated Exit Date": exit_date,
+        "Exit Condition": exit_condition,
+        "Trend Strength": trend_strength,
+        "Confidence %": confidence,
+        "AI Score": ai_score,
+        "Risk Reward Ratio": rr_ratio,
+        "Reason": reason_str,
     }
 
 
@@ -653,7 +1024,7 @@ def _color_code(val):
             "Shooting Star", "Lower Highs", "📉", "Down",
         ]):
             return "color: red; font-weight: bold;"
-        if any(x in val for x in ["🟡", "Wait", "HOLD", "Neutral", "Mixed", "Inline"]):
+        if any(x in val for x in ["🟡", "Wait", "HOLD", "Neutral", "Mixed", "Inline", "WAIT"]):
             return "color: #b8860b; font-weight: bold;"
     return ""
 
@@ -667,12 +1038,13 @@ def _style_dataframe(df: pd.DataFrame):
     return styler.applymap(_color_code)
 
 
-def to_excel_bytes(df: pd.DataFrame) -> bytes:
-    """Builds an in-memory formatted .xlsx from the scan results."""
+def to_excel_bytes(df: pd.DataFrame, sheet_name: str = "Scan Results") -> bytes:
+    """Builds an in-memory formatted .xlsx from any results dataframe
+    (main scan, Intraday, or Swing) with professional formatting via openpyxl."""
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False, sheet_name="Scan Results")
-        ws = writer.sheets["Scan Results"]
+        df.to_excel(writer, index=False, sheet_name=sheet_name[:31])
+        ws = writer.sheets[sheet_name[:31]]
 
         from openpyxl.styles import Font, PatternFill, Alignment
 
@@ -688,6 +1060,38 @@ def to_excel_bytes(df: pd.DataFrame) -> bytes:
             ws.column_dimensions[col_cells[0].column_letter].width = max(length + 2, 10)
 
         ws.freeze_panes = "A2"
+
+    buf.seek(0)
+    return buf.getvalue()
+
+
+def to_excel_bytes_multi(sheets: dict) -> bytes:
+    """Builds a single .xlsx workbook with one formatted sheet per
+    {sheet_name: dataframe} entry — used for the combined 'download everything'
+    button (Full Scan + Intraday + Swing in one file)."""
+    buf = io.BytesIO()
+    from openpyxl.styles import Font, PatternFill, Alignment
+
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        for sheet_name, df in sheets.items():
+            if df is None or df.empty:
+                continue
+            safe_name = sheet_name[:31]
+            df.to_excel(writer, index=False, sheet_name=safe_name)
+            ws = writer.sheets[safe_name]
+
+            header_font = Font(bold=True, color="FFFFFF", name="Arial")
+            header_fill = PatternFill("solid", start_color="1F2937")
+            for cell in ws[1]:
+                cell.font = header_font
+                cell.fill = header_fill
+                cell.alignment = Alignment(horizontal="center")
+
+            for col_cells in ws.columns:
+                length = max((len(str(c.value)) for c in col_cells if c.value is not None), default=10)
+                ws.column_dimensions[col_cells[0].column_letter].width = max(length + 2, 10)
+
+            ws.freeze_panes = "A2"
 
     buf.seek(0)
     return buf.getvalue()
@@ -713,19 +1117,20 @@ def show_scanner(fyers):
         )
     with col2:
         enable_xgboost = st.checkbox(
-            "Enable XGBoost predictions", value=False,
-            help="Trains a small model per stock, per scan. Adds noticeable time — "
-                 "recommended only with a limited symbol count." + (
+            "Enable XGBoost ML training", value=False,
+            help="When ON, trains (or auto-loads a saved) XGBoost model and blends it into "
+                 "'XGBoost Trend'/'Confidence %'. When OFF, those columns still populate using "
+                 "the technical rule-based fallback (Price Action, RSI, MACD, Supertrend, VWAP, "
+                 "Volume/RVOL, Support/Resistance, Momentum) — never blank, just faster to scan." + (
                      "" if XGBOOST_AVAILABLE else " (xgboost package not installed — install with `pip install xgboost`)"
                  ),
-            disabled=not XGBOOST_AVAILABLE,
         )
     with col3:
         st.caption(
             f"Estimated time at {MAX_WORKERS} concurrent workers: "
             f"~{((limit or len(symbols)) / MAX_WORKERS) * 0.3 / 60:.1f}–"
             f"{((limit or len(symbols)) / MAX_WORKERS) * 1.0 / 60:.1f} min (rough estimate, "
-            f"longer with XGBoost enabled)."
+            f"longer with XGBoost training enabled)."
         )
 
     scan_universe = symbols if limit == 0 else symbols[:limit]
@@ -738,36 +1143,107 @@ def show_scanner(fyers):
 
         with st.spinner("Scanning…"):
             results, errors = run_scan(fyers, scan_universe, nifty_close, enable_xgboost)
-            scan_df = pd.DataFrame(results)
+
+            full_df = pd.DataFrame(results)
+            display_cols = [c for c in full_df.columns if not c.startswith("_")]
+            scan_df = full_df[display_cols] if not full_df.empty else full_df
+
+            intraday_df = pd.DataFrame([calculate_intraday_signal(r) for r in results])
+            swing_df = pd.DataFrame([calculate_swing_signal(r) for r in results])
 
         st.session_state["scan_df"] = scan_df
+        st.session_state["intraday_df"] = intraday_df
+        st.session_state["swing_df"] = swing_df
         st.session_state["scan_errors"] = errors
 
         if errors:
             st.warning(f"{len(errors)} of {len(scan_universe)} symbols failed or were skipped.")
 
-    if "scan_df" in st.session_state:
-        df = st.session_state["scan_df"]
+    tab_scanner, tab_intraday, tab_swing = st.tabs(
+        ["📊 Full Scanner", "⚡ Intraday Scanner", "📈 Swing Trade Scanner"]
+    )
 
-        if df.empty:
-            st.error("Scan returned no usable results. Expand the error log below.")
+    # ── Full Scanner tab (existing dashboard/columns, unchanged) ───────────
+    with tab_scanner:
+        if "scan_df" in st.session_state:
+            df = st.session_state["scan_df"]
+            if df.empty:
+                st.error("Scan returned no usable results. Expand the error log below.")
+            else:
+                sorted_df = df.sort_values("AI Score", ascending=False)
+                st.dataframe(_style_dataframe(sorted_df), use_container_width=True, height=500)
+                st.bar_chart(df.set_index("Stock")["AI Score"])
+
+                st.download_button(
+                    "📥 Download Full Scan as Excel",
+                    data=to_excel_bytes(sorted_df, "Scan Results"),
+                    file_name=f"nse_scan_{datetime.today().strftime('%Y%m%d_%H%M')}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key="dl_scan",
+                )
+
+                if not st.session_state.get("intraday_df", pd.DataFrame()).empty or \
+                   not st.session_state.get("swing_df", pd.DataFrame()).empty:
+                    st.download_button(
+                        "📥 Download ALL (Scan + Intraday + Swing) as one Excel workbook",
+                        data=to_excel_bytes_multi({
+                            "Scan Results": sorted_df,
+                            "Intraday Signals": st.session_state.get("intraday_df"),
+                            "Swing Signals": st.session_state.get("swing_df"),
+                        }),
+                        file_name=f"nse_all_signals_{datetime.today().strftime('%Y%m%d_%H%M')}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        key="dl_all",
+                    )
         else:
-            sorted_df = df.sort_values("AI Score", ascending=False)
-            st.dataframe(_style_dataframe(sorted_df), use_container_width=True, height=500)
-            st.bar_chart(df.set_index("Stock")["AI Score"])
+            st.info("Run a scan above to see Full Scanner results here.")
 
+    # ── Intraday Scanner tab (new) ──────────────────────────────────────────
+    with tab_intraday:
+        st.caption(
+            "Intraday-style signals derived from the latest daily candle's technicals "
+            "(RSI, MACD, Supertrend, VWAP, RVOL, Breakout). No live intraday feed is "
+            "wired in — see the note at the top of the source file."
+        )
+        idf = st.session_state.get("intraday_df")
+        if idf is not None and not idf.empty:
+            idf_sorted = idf.sort_values("Confidence %", ascending=False)
+            st.dataframe(_style_dataframe(idf_sorted), use_container_width=True, height=500)
             st.download_button(
-                "📥 Download as Excel",
-                data=to_excel_bytes(sorted_df),
-                file_name=f"nse_scan_{datetime.today().strftime('%Y%m%d_%H%M')}.xlsx",
+                "📥 Download Intraday Signals as Excel",
+                data=to_excel_bytes(idf_sorted, "Intraday Signals"),
+                file_name=f"nse_intraday_{datetime.today().strftime('%Y%m%d_%H%M')}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="dl_intraday",
             )
+        else:
+            st.info("Run a scan above to see Intraday Scanner results here.")
 
-        if st.session_state.get("scan_errors"):
-            with st.expander(f"⚠️ Errors / skipped symbols ({len(st.session_state['scan_errors'])})"):
-                st.text("\n".join(st.session_state["scan_errors"][:200]))
-                if len(st.session_state["scan_errors"]) > 200:
-                    st.caption(f"...and {len(st.session_state['scan_errors']) - 200} more.")
+    # ── Swing Trade Scanner tab (new) ───────────────────────────────────────
+    with tab_swing:
+        st.caption(
+            "Swing signals derived from MTF Trend, Relative Strength vs NIFTY, "
+            "Supertrend, SMC structure and CISD confirmation."
+        )
+        sdf = st.session_state.get("swing_df")
+        if sdf is not None and not sdf.empty:
+            sdf_sorted = sdf.sort_values("Confidence %", ascending=False)
+            st.dataframe(_style_dataframe(sdf_sorted), use_container_width=True, height=500)
+            st.download_button(
+                "📥 Download Swing Signals as Excel",
+                data=to_excel_bytes(sdf_sorted, "Swing Signals"),
+                file_name=f"nse_swing_{datetime.today().strftime('%Y%m%d_%H%M')}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="dl_swing",
+            )
+        else:
+            st.info("Run a scan above to see Swing Trade Scanner results here.")
+
+    if st.session_state.get("scan_errors"):
+        with st.expander(f"⚠️ Errors / skipped symbols ({len(st.session_state['scan_errors'])})"):
+            st.text("\n".join(st.session_state["scan_errors"][:200]))
+            if len(st.session_state["scan_errors"]) > 200:
+                st.caption(f"...and {len(st.session_state['scan_errors']) - 200} more.")
 
 
 # Fyers ఆబ్జెక్ట్‌ను ఇక్కడ పాస్ చేయండి
