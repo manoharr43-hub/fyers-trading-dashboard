@@ -14,6 +14,53 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
+# ─── Helpers ────────────────────────────────────────────────────────────────
+def calculate_max_pain(df):
+    strikes = df["strike_price"].values
+    ce_oi, pe_oi = df["ce_oi"].values, df["pe_oi"].values
+    pain = [np.sum(np.maximum(s - strikes, 0) * ce_oi) + np.sum(np.maximum(strikes - s, 0) * pe_oi) for s in strikes]
+    return float(strikes[int(np.argmin(pain))])
+
+def pcr_signal(pcr):
+    if pcr > 1.3: return '<span class="signal-bull">🟢 Bullish (High PCR)</span>'
+    elif pcr < 0.7: return '<span class="signal-bear">🔴 Bearish (Low PCR)</span>'
+    return '<span class="signal-neu">🟡 Neutral</span>'
+
+# ─── Fetching Logic ─────────────────────────────────────────────────────────
+def fetch_optionchain_with_fallback(fyers, symbol, strikecount, is_stock, expiry_timestamp=""):
+    """
+    API ద్వారా ఆప్షన్స్ డేటాను తెస్తుంది. ఎక్స్‌పైరీ డేటా ఉంటేనే timestamp పంపుతుంది.
+    """
+    attempts = []
+    tried_symbols = [symbol]
+    
+    # స్టాక్ అయితే కరెక్ట్ సింబల్ ఫార్మాట్ కోసం
+    if is_stock:
+        # నార్మలైజ్ సింబల్ ఫంక్షన్ ఇక్కడ ఉండాలి
+        alt = f"NSE:{symbol.split(':')[-1]}-EQ"
+        if alt not in tried_symbols:
+            tried_symbols.append(alt)
+
+    last_response = None
+    for sym in tried_symbols:
+        req = {"symbol": sym, "strikecount": int(strikecount)}
+        
+        # KEY FIX: ఎక్స్‌పైరీ డేటా ఉంటేనే timestamp పంపాలి
+        if expiry_timestamp and expiry_timestamp.strip():
+            req["timestamp"] = expiry_timestamp.strip()
+            
+        try:
+            resp = fyers.optionchain(data=req)
+        except Exception as e:
+            attempts.append((sym, f"exception: {e}"))
+            continue
+            
+        attempts.append((sym, resp.get("s") if isinstance(resp, dict) else "no response"))
+        last_response = resp
+        if isinstance(resp, dict) and resp.get("s") == "ok":
+            return resp, sym, attempts
+
+    return last_response, tried_symbols[-1], attempts
 # ─── Custom CSS ─────────────────────────────────────────────────────────────
 st.markdown("""
 <style>
