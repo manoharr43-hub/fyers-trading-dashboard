@@ -93,7 +93,17 @@ def _now_ist() -> datetime:
 # `df` (whose "Time" column is already tz-aware, built via
 # pd.to_datetime(..., utc=True).dt.tz_convert("Asia/Kolkata")) into this
 # function instead of calling the old system-clock-based helper.
-def _candle_signal_timestamp(df: pd.DataFrame) -> Tuple[str, str]:
+from datetime import time as _dtime  # noqa: E402  (local import kept near usage)
+
+# NSE cash-equity market close — the true "close time" a *daily* candle
+# represents. Fyers' "D" resolution candles are stamped at day-start
+# (00:00:00 UTC), which converts to 05:30:00 IST — that is NOT when the
+# candle actually closed, so daily signals must display 15:30:00 IST
+# instead of the raw epoch-derived time.
+_NSE_MARKET_CLOSE_IST = _dtime(15, 30, 0)
+
+
+def _candle_signal_timestamp(df: pd.DataFrame, is_daily: bool = False) -> Tuple[str, str]:
     """Returns (Signal Date, Signal Time) derived from df's last completed
     candle. Formatted as ('DD-MMM-YYYY', 'HH:MM:SS IST').
 
@@ -101,6 +111,16 @@ def _candle_signal_timestamp(df: pd.DataFrame) -> Tuple[str, str]:
     wall clock), calling it again later for the same df/candle always
     returns the identical value — it does NOT drift on re-render, re-scan,
     or Excel export.
+
+    is_daily=True: for "D" resolution candles, Fyers stamps the timestamp
+    at day-start (00:00:00 UTC), which naively converts to 05:30:00 IST —
+    not a real close time. In that case the DATE still comes from the
+    candle, but the TIME is set to the actual NSE market close
+    (15:30:00 IST), since that's genuinely when that daily candle closed.
+
+    is_daily=False (default): used for real intraday candles (5-min,
+    15-min, etc.) where the timestamp already reflects the true candle
+    close (e.g. 09:20, 09:30, 10:15) — displayed as-is, unmodified.
     """
     ts = df["Time"].iloc[-1]
 
@@ -111,6 +131,15 @@ def _candle_signal_timestamp(df: pd.DataFrame) -> Tuple[str, str]:
         ts = ts.tz_localize("UTC")
 
     ts_ist = ts.tz_convert(IST)
+
+    if is_daily:
+        ts_ist = ts_ist.replace(
+            hour=_NSE_MARKET_CLOSE_IST.hour,
+            minute=_NSE_MARKET_CLOSE_IST.minute,
+            second=_NSE_MARKET_CLOSE_IST.second,
+            microsecond=0,
+        )
+
     return ts_ist.strftime("%d-%b-%Y"), ts_ist.strftime("%H:%M:%S") + " IST"
 
 
@@ -1108,8 +1137,9 @@ def _analyse(symbol: str, df: pd.DataFrame, nifty_close: Optional[pd.Series], en
     )
 
     # Signal Date & Signal Time come from the last completed candle in `df`
-    # that actually produced this signal — not scan/system time.
-    signal_date_str, signal_time_str = _candle_signal_timestamp(df)
+    # that actually produced this signal — not scan/system time. This is a
+    # daily ("D") candle, so Signal Time is the NSE market close (15:30 IST).
+    signal_date_str, signal_time_str = _candle_signal_timestamp(df, is_daily=True)
 
     return {
         "Signal Date": signal_date_str,
@@ -1679,7 +1709,9 @@ def _fetch_intraday_cisd_signal(fyers, symbol: str, resolution: str, timeframe_l
         stock_ticker = symbol.replace("NSE:", "").replace("-EQ", "")
         # Signal Date/Time = timestamp of the last completed intraday
         # candle in `df` — the exact candle whose close produced this CISD
-        # shift — never scan/system time.
+        # shift — never scan/system time. This IS a real 5-min/15-min
+        # candle (not daily), so its own timestamp is used as-is
+        # (is_daily=False, the default) — e.g. 09:20/09:30/10:15 IST.
         signal_date_str, signal_time_str = _candle_signal_timestamp(df)
         reason = (
             f"{timeframe_label} CISD {'bullish' if is_up else 'bearish'} shift confirmed on candle close "
@@ -1802,7 +1834,8 @@ def _fetch_fo_cisd_signal(fyers, symbol: str):
         stock_ticker = symbol.replace("NSE:", "").replace("-EQ", "")
         # Signal Date/Time = timestamp of the last completed daily candle in
         # `df` that produced this CISD event — never scan/system time.
-        signal_date_str, signal_time_str = _candle_signal_timestamp(df)
+        # Daily candle → Signal Time is the NSE market close (15:30 IST).
+        signal_date_str, signal_time_str = _candle_signal_timestamp(df, is_daily=True)
 
         row = {
             "Signal Date": signal_date_str,
@@ -1945,7 +1978,8 @@ def _fetch_golden_death_cross_signal(fyers, symbol: str):
         stock_ticker = symbol.replace("NSE:", "").replace("-EQ", "")
         # Signal Date/Time = timestamp of the last completed daily candle in
         # `df` that confirmed the Golden/Death Cross — never scan/system time.
-        signal_date_str, signal_time_str = _candle_signal_timestamp(df)
+        # Daily candle → Signal Time is the NSE market close (15:30 IST).
+        signal_date_str, signal_time_str = _candle_signal_timestamp(df, is_daily=True)
 
         row = {
             "Signal Date": signal_date_str,
@@ -2053,7 +2087,8 @@ def _fetch_premarket_signal(fyers, symbol: str):
         stock_ticker = symbol.replace("NSE:", "").replace("-EQ", "")
         # Signal Date/Time = timestamp of the last completed daily candle in
         # `df` used for this pre-market read — never scan/system time.
-        signal_date_str, signal_time_str = _candle_signal_timestamp(df)
+        # Daily candle → Signal Time is the NSE market close (15:30 IST).
+        signal_date_str, signal_time_str = _candle_signal_timestamp(df, is_daily=True)
 
         row = {
             "Signal Date": signal_date_str,
