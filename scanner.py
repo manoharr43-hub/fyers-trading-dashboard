@@ -817,6 +817,127 @@ def calculate_final_signal(
     return "🔴 Strong Sell"
 
 
+# ══════════════════════════════════════════════════════════════════════════
+# ── SIGNAL QUALITY ENGINE (new) ──────────────────────────────────────────
+# Scores every stock against a fixed 10-condition checklist, in whichever
+# direction (BUY/SELL) more of those conditions confirm, then derives a
+# star rating, an entry-confirmation verdict, a plain-English reason list,
+# a trade-quality tag, and a strict BUY/SELL/WAIT decision. Purely additive
+# — every existing column/function above is untouched.
+# ══════════════════════════════════════════════════════════════════════════
+
+# Minimum confirmations (out of 10) required for a stock to count as a
+# "high quality" signal and be shown at all in the Full/F&O scanners.
+SIGNAL_QUALITY_MIN_CONFIRMATIONS = 6
+
+
+def _calculate_signal_quality(
+    ema20: float, ema50: float, rsi_val: float, macd_bullish: bool,
+    supertrend_bullish: Optional[bool], vwap_val: Optional[float], last_close: float,
+    rvol_raw: float, breakout: str, cisd_signal: str, smc_structure: str,
+    last_volume: float, vol_avg20: float,
+) -> Tuple[str, int, bool, str, str]:
+    """Checks the fixed 10-condition quality checklist in both directions,
+    picks whichever direction (BUY/SELL) confirms more conditions, and
+    returns (direction, confirmed_count, is_high_quality, star_rating, reason_str)."""
+
+    rvol_ok = bool(rvol_raw and rvol_raw >= 1.5)
+    volume_ok = bool(vol_avg20 and vol_avg20 > 0 and last_volume > vol_avg20)
+
+    bull_checks = {
+        "Bullish CISD": "Bullish" in cisd_signal,
+        "BOS Confirmed": smc_structure in ("BOS 📈", "CHOCH 🐂"),
+        "EMA20 > EMA50": ema20 > ema50,
+        "MACD Bullish": macd_bullish is True,
+        "Supertrend Buy": supertrend_bullish is True,
+        "VWAP Support": vwap_val is not None and last_close > vwap_val,
+        "RSI Bullish (50-80)": 50 < rsi_val < 80,
+        "High RVOL": rvol_ok,
+        "Breakout": breakout == "📈 Bullish",
+        "Strong Volume": volume_ok,
+    }
+    bear_checks = {
+        "Bearish CISD": "Bearish" in cisd_signal,
+        "CHOCH/BOS Down": smc_structure in ("BOS 📉", "CHOCH 🐻"),
+        "EMA20 < EMA50": ema20 < ema50,
+        "MACD Bearish": macd_bullish is False,
+        "Supertrend Sell": supertrend_bullish is False,
+        "VWAP Resistance": vwap_val is not None and last_close < vwap_val,
+        "RSI Bearish (20-50)": 20 < rsi_val < 50,
+        "High RVOL": rvol_ok,
+        "Breakdown": breakout == "📉 Bearish",
+        "Strong Volume": volume_ok,
+    }
+
+    bull_count = sum(bull_checks.values())
+    bear_count = sum(bear_checks.values())
+
+    if bull_count >= bear_count:
+        direction = "BUY"
+        confirmed_count = bull_count
+        reasons = [label for label, ok in bull_checks.items() if ok]
+    else:
+        direction = "SELL"
+        confirmed_count = bear_count
+        reasons = [label for label, ok in bear_checks.items() if ok]
+
+    is_high_quality = confirmed_count >= SIGNAL_QUALITY_MIN_CONFIRMATIONS
+
+    if confirmed_count >= 10:
+        star_rating = "★★★★★ Very Strong"
+    elif confirmed_count >= 8:
+        star_rating = "★★★★ Strong"
+    elif confirmed_count >= 6:
+        star_rating = "★★★ Medium"
+    elif confirmed_count >= 4:
+        star_rating = "★★ Weak"
+    else:
+        star_rating = "★ Very Weak"
+
+    reason_str = ", ".join(reasons) if reasons else "No strong confluence"
+
+    return direction, confirmed_count, is_high_quality, star_rating, reason_str
+
+
+def _determine_entry_and_decision(
+    direction: str, confirmed_count: int, ai_score: float, confidence: float,
+    rvol_raw: float, volume_ok: bool,
+) -> Tuple[str, str, str]:
+    """Applies the strict BUY/SELL filter (AI Score / Confidence / RVOL /
+    Volume / Trend Confirmed) and returns
+    (Entry Confirmation, Trade Quality, Trade Decision)."""
+
+    trend_confirmed = confirmed_count >= SIGNAL_QUALITY_MIN_CONFIRMATIONS
+
+    strict_buy = (
+        direction == "BUY" and ai_score >= 80 and confidence >= 75
+        and rvol_raw >= 1.5 and volume_ok and trend_confirmed
+    )
+    strict_sell = (
+        direction == "SELL" and ai_score <= 20 and confidence >= 75
+        and rvol_raw >= 1.5 and volume_ok and trend_confirmed
+    )
+
+    if strict_buy:
+        entry_confirmation = "✅ Confirmed BUY"
+        trade_decision = "🟢 BUY"
+    elif strict_sell:
+        entry_confirmation = "❌ Avoid Trade"
+        trade_decision = "🔴 SELL"
+    else:
+        entry_confirmation = "⚠️ Wait for Confirmation"
+        trade_decision = "🟡 WAIT"
+
+    if confirmed_count >= 8:
+        trade_quality = "🟢 High Probability"
+    elif confirmed_count >= 6:
+        trade_quality = "🟡 Medium Probability"
+    else:
+        trade_quality = "🔴 Low Probability"
+
+    return entry_confirmation, trade_quality, trade_decision
+
+
 # ── Existing SMC / CISD logic (unchanged) ────────────────────────────────────
 def _calculate_smc_and_cisd(df: pd.DataFrame):
     if len(df) < 30:
@@ -951,6 +1072,20 @@ def _analyse(symbol: str, df: pd.DataFrame, nifty_close: Optional[pd.Series], en
     rvol_raw = round(float(rvol), 2)
     rvol_display = _format_rvol_display(rvol_raw)
 
+    # ── Signal Quality Engine: 10-condition checklist → direction, count,
+    # high-quality flag, star rating, reason string. ───────────────────────
+    quality_direction, quality_count, is_high_quality, signal_strength, signal_reason = _calculate_signal_quality(
+        ema20=float(ema20), ema50=float(ema50), rsi_val=rsi_val, macd_bullish=macd_bullish,
+        supertrend_bullish=supertrend_bullish, vwap_val=vwap_val, last_close=float(last_close),
+        rvol_raw=rvol_raw, breakout=breakout, cisd_signal=cisd_signal, smc_structure=smc_structure,
+        last_volume=float(volume.iloc[-1]), vol_avg20=float(vol_avg20),
+    )
+    entry_confirmation, trade_quality, trade_decision = _determine_entry_and_decision(
+        direction=quality_direction, confirmed_count=quality_count, ai_score=ai_score,
+        confidence=xgb_confidence, rvol_raw=rvol_raw,
+        volume_ok=bool(vol_avg20 and vol_avg20 > 0 and float(volume.iloc[-1]) > vol_avg20),
+    )
+
     # ── FIX 1: Signal Date & Signal Time are generated in IST, at the exact
     # moment the signal is created — never UTC/server time. ────────────────
     signal_date_str, signal_time_str = _signal_timestamp()
@@ -969,6 +1104,11 @@ def _analyse(symbol: str, df: pd.DataFrame, nifty_close: Optional[pd.Series], en
         "XGBoost Confidence (%)": xgb_confidence,
         "News": news,
         "Alerts": alerts,
+        "Signal Strength": signal_strength,
+        "Entry Confirmation": entry_confirmation,
+        "Signal Reason": signal_reason,
+        "Trade Quality": trade_quality,
+        "Trade Decision": trade_decision,
         "MTF Trend": mtf_trend,
         "AI Trend": ai_trend,
         "AI Confidence (%)": ai_confidence,
@@ -991,6 +1131,8 @@ def _analyse(symbol: str, df: pd.DataFrame, nifty_close: Optional[pd.Series], en
         "Signal": "🟢 BUY" if ai_score > 65 else "🔴 SELL" if ai_score < 40 else "🟡 HOLD",
         "_ATR14": round(float(atr14), 2) if pd.notna(atr14) else round(last_close * 0.01, 2),
         "_RVOL_RAW": rvol_raw,
+        "_Is_High_Quality": is_high_quality,
+        "_Quality_Count": quality_count,
     }
 
 
@@ -1975,6 +2117,11 @@ def show_scanner(fyers):
             results, errors, stats = run_scan(fyers, scan_universe, nifty_close, enable_xgboost)
 
             full_df = pd.DataFrame(results)
+            # ── Signal Quality filter: only keep stocks confirming ≥6/10 of
+            # the quality checklist (see _calculate_signal_quality) so the
+            # Full Scanner only ever shows high-conviction setups. ─────────
+            if not full_df.empty and "_Is_High_Quality" in full_df.columns:
+                full_df = full_df[full_df["_Is_High_Quality"] == True]
             display_cols = [c for c in full_df.columns if not c.startswith("_")]
             scan_df = full_df[display_cols] if not full_df.empty else full_df
 
@@ -1999,10 +2146,19 @@ def show_scanner(fyers):
 
     # ── Full Scanner tab ─────────────────────────────────────────────────
     with tab_scanner:
+        st.caption(
+            f"Showing only High-Quality signals — stocks confirming at least "
+            f"{SIGNAL_QUALITY_MIN_CONFIRMATIONS}/10 checklist conditions "
+            f"(CISD, SMC, EMA20/50, MACD, Supertrend, VWAP, RSI, RVOL, Breakout, Volume). "
+            f"Weak/low-confluence signals are hidden."
+        )
         if "scan_df" in st.session_state:
             df = st.session_state["scan_df"]
             if df.empty:
-                st.info("No stocks returned usable results for this scan. Try increasing the symbol limit or check the summary above.")
+                st.info(
+                    "No stocks met the high-quality bar (≥6/10 conditions) for this scan. "
+                    "Try increasing the symbol limit, or check the summary above."
+                )
             else:
                 sorted_df = df.sort_values("AI Score", ascending=False)
                 st.dataframe(_style_dataframe(sorted_df), use_container_width=True, height=500)
@@ -2104,6 +2260,9 @@ def show_scanner(fyers):
                 with st.spinner("Scanning F&O stocks…"):
                     fo_results, fo_errors, fo_stats = run_scan(fyers, fo_universe, fo_nifty_close, fo_enable_xgboost)
                     fo_full_df = pd.DataFrame(fo_results)
+                    # Same ≥6/10 Signal Quality filter as the Full Scanner.
+                    if not fo_full_df.empty and "_Is_High_Quality" in fo_full_df.columns:
+                        fo_full_df = fo_full_df[fo_full_df["_Is_High_Quality"] == True]
                     fo_display_cols = [c for c in fo_full_df.columns if not c.startswith("_")]
                     fo_scan_df = fo_full_df[fo_display_cols] if not fo_full_df.empty else fo_full_df
 
@@ -2114,6 +2273,10 @@ def show_scanner(fyers):
             if "fo_scan_stats" in st.session_state:
                 _display_scan_summary(st.session_state["fo_scan_stats"])
 
+            st.caption(
+                f"Showing only High-Quality signals — stocks confirming at least "
+                f"{SIGNAL_QUALITY_MIN_CONFIRMATIONS}/10 checklist conditions. Weak signals are hidden."
+            )
             fo_df = st.session_state.get("fo_scan_df")
             if fo_df is not None and not fo_df.empty:
                 fo_sorted = fo_df.sort_values("AI Score", ascending=False)
@@ -2127,6 +2290,8 @@ def show_scanner(fyers):
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     key="dl_fo",
                 )
+            elif "fo_scan_df" in st.session_state:
+                st.info("No F&O stocks met the high-quality bar (≥6/10 conditions) for this scan.")
             else:
                 st.info("Run an F&O scan above to see results here.")
 
