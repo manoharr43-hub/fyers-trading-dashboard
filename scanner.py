@@ -103,33 +103,27 @@ from datetime import time as _dtime  # noqa: E402  (local import kept near usage
 _NSE_MARKET_CLOSE_IST = _dtime(15, 30, 0)
 
 
-def _candle_signal_timestamp(df: pd.DataFrame, is_daily: bool = False) -> Tuple[str, str]:
-    """Returns (Signal Date, Signal Time) derived from df's last completed
-    candle. Formatted as ('DD-MMM-YYYY', 'HH:MM:SS IST').
+def _format_signal_timestamp(ts, is_daily: bool = False) -> Tuple[str, str]:
+    """Formats a raw candle Timestamp into (Signal Date, Signal Time), as
+    ('DD-MMM-YYYY', 'HH:MM:SS IST') — always in IST (Asia/Kolkata).
 
-    Because this reads df["Time"].iloc[-1] (the candle timestamp, not the
-    wall clock), calling it again later for the same df/candle always
-    returns the identical value — it does NOT drift on re-render, re-scan,
-    or Excel export.
+    This is the low-level formatter shared by every scanner. It takes the
+    actual candle Timestamp that GENERATED the signal (which is not
+    necessarily df's last row — e.g. a CISD/SMC shift may have confirmed
+    a candle or two before the most recent one), so re-scanning never
+    changes the value for the same underlying signal.
 
-    is_daily=True: for "D" resolution candles, Fyers stamps the timestamp
-    at day-start (00:00:00 UTC), which naively converts to 05:30:00 IST —
-    not a real close time. In that case the DATE still comes from the
-    candle, but the TIME is set to the actual NSE market close
-    (15:30:00 IST), since that's genuinely when that daily candle closed.
+    is_daily=True: "D" resolution candles are stamped at day-start
+    (00:00:00 UTC → 05:30:00 IST naive), which is NOT the real close time,
+    so the DATE still comes from the candle but the TIME is pinned to the
+    actual NSE market close (15:30:00 IST).
 
-    is_daily=False (default): used for real intraday candles (5-min,
-    15-min, etc.) where the timestamp already reflects the true candle
-    close (e.g. 09:20, 09:30, 10:15) — displayed as-is, unmodified.
+    is_daily=False (default): real intraday candles (5-min, 15-min, etc.)
+    already carry their true close time (e.g. 09:20, 09:30, 10:15) and are
+    displayed as-is, unmodified.
     """
-    ts = df["Time"].iloc[-1]
-
-    # Safety net: if the Time column ever arrives tz-naive, localize to UTC
-    # first (per spec), then convert — normally it's already tz-aware IST
-    # by the time it reaches this function.
     if ts.tzinfo is None:
         ts = ts.tz_localize("UTC")
-
     ts_ist = ts.tz_convert(IST)
 
     if is_daily:
@@ -141,6 +135,24 @@ def _candle_signal_timestamp(df: pd.DataFrame, is_daily: bool = False) -> Tuple[
         )
 
     return ts_ist.strftime("%d-%b-%Y"), ts_ist.strftime("%H:%M:%S") + " IST"
+
+
+def _candle_signal_timestamp(df: pd.DataFrame, is_daily: bool = False) -> Tuple[str, str]:
+    """Returns (Signal Date, Signal Time) derived from df's last completed
+    candle. Formatted as ('DD-MMM-YYYY', 'HH:MM:SS IST').
+
+    Because this reads df["Time"].iloc[-1] (the candle timestamp, not the
+    wall clock), calling it again later for the same df/candle always
+    returns the identical value — it does NOT drift on re-render, re-scan,
+    or Excel export.
+
+    Use this when the signal is inherently tied to the LATEST candle (pure
+    AI Score / Breakout / XGBoost / Golden-Death-Cross reads). For signals
+    whose confirming candle may be earlier than df's last row (CISD/SMC
+    events), use _format_signal_timestamp(event_ts, ...) directly with the
+    actual event candle's Timestamp instead — see _calculate_smc_and_cisd.
+    """
+    return _format_signal_timestamp(df["Time"].iloc[-1], is_daily=is_daily)
 
 
 # ── FIX 2/3/5: Resilient, retrying Fyers history fetch ───────────────────────
@@ -988,10 +1000,20 @@ def _determine_entry_and_decision(
     return entry_confirmation, trade_quality, trade_decision
 
 
-# ── Existing SMC / CISD logic (unchanged) ────────────────────────────────────
+# ── Existing SMC / CISD logic ────────────────────────────────────────────────
 def _calculate_smc_and_cisd(df: pd.DataFrame):
+    """Detects CISD and SMC (BOS/CHOCH) events in the trailing window and
+    returns (smc_structure, cisd_signal, event_ts).
+
+    event_ts is the actual candle Timestamp that produced the signal (the
+    CISD confirmation candle if one fired, else the SMC break candle, else
+    None). It is NOT necessarily df's last row — a CISD/SMC shift may have
+    confirmed a candle or two before the most recent one, and this must be
+    preserved so "Signal Date"/"Signal Time" reflect exactly when the
+    signal fired rather than whenever the scan happens to run.
+    """
     if len(df) < 30:
-        return "Range ➖", "None", "N/A"
+        return "Range ➖", "None", None
 
     d = df.copy()
     d["Prev_High"] = d["High"].shift(1)
@@ -1011,15 +1033,15 @@ def _calculate_smc_and_cisd(df: pd.DataFrame):
 
     cisd_events = recent[recent["Bullish_CISD"] | recent["Bearish_CISD"]]
     cisd_signal = "None"
-    cisd_time_str = "N/A"
+    cisd_event_ts = None
     if not cisd_events.empty:
         is_bull = bool(cisd_events["Bullish_CISD"].iloc[-1])
         cisd_signal = "Bullish CISD 🚀" if is_bull else "Bearish CISD 🩸"
-        cisd_time_str = cisd_events["Time"].iloc[-1].strftime("%d-%b-%Y")
+        cisd_event_ts = cisd_events["Time"].iloc[-1]
 
     smc_events = recent[recent["Break_Up"] | recent["Break_Down"]]
     smc_structure = "Range ➖"
-    smc_time_str = "N/A"
+    smc_event_ts = None
     if not smc_events.empty:
         is_up = bool(smc_events["Break_Up"].iloc[-1])
         is_bull_trend = bool(smc_events["Bullish_Trend"].iloc[-1])
@@ -1027,13 +1049,15 @@ def _calculate_smc_and_cisd(df: pd.DataFrame):
             smc_structure = "BOS 📈" if is_bull_trend else "CHOCH 🐂"
         else:
             smc_structure = "BOS 📉" if not is_bull_trend else "CHOCH 🐻"
-        smc_time_str = smc_events["Time"].iloc[-1].strftime("%d-%b-%Y")
+        smc_event_ts = smc_events["Time"].iloc[-1]
 
-    signal_time = cisd_time_str if cisd_signal != "None" else (
-        smc_time_str if smc_structure != "Range ➖" else df["Time"].iloc[-1].strftime("%d-%b-%Y")
-    )
+    # CISD is the confirming event, so it takes priority when both are
+    # present; otherwise the SMC break candle; otherwise None, in which
+    # case callers fall back to df's latest candle (pure AI/breakout reads
+    # with no CISD/SMC event to anchor to).
+    event_ts = cisd_event_ts if cisd_event_ts is not None else smc_event_ts
 
-    return smc_structure, cisd_signal, signal_time
+    return smc_structure, cisd_signal, event_ts
 
 
 # ── Analysis core ─────────────────────────────────────────────────────────────
@@ -1062,7 +1086,7 @@ def _analyse(symbol: str, df: pd.DataFrame, nifty_close: Optional[pd.Series], en
     elif gap_pct <= -0.5:
         gap_str += " 🔴"
 
-    smc_structure, cisd_signal, _smc_cisd_event_date = _calculate_smc_and_cisd(df)
+    smc_structure, cisd_signal, _signal_event_ts = _calculate_smc_and_cisd(df)
 
     h52w = df["High"].max()
     l52w = df["Low"].min()
@@ -1136,10 +1160,18 @@ def _analyse(symbol: str, df: pd.DataFrame, nifty_close: Optional[pd.Series], en
         volume_ok=bool(vol_avg20 and vol_avg20 > 0 and float(volume.iloc[-1]) > vol_avg20),
     )
 
-    # Signal Date & Signal Time come from the last completed candle in `df`
-    # that actually produced this signal — not scan/system time. This is a
-    # daily ("D") candle, so Signal Time is the NSE market close (15:30 IST).
-    signal_date_str, signal_time_str = _candle_signal_timestamp(df, is_daily=True)
+    # Signal Date & Signal Time come from the candle that actually produced
+    # this signal — not scan/system time. If a CISD/SMC event fired (i.e.
+    # _signal_event_ts is set), use THAT candle's timestamp exactly, even
+    # if it's earlier than df's most recent candle — this is what keeps
+    # the displayed time from drifting to "now" on every rescan. If there
+    # is no CISD/SMC event, fall back to the latest daily candle (which is
+    # what a pure AI-Score/Breakout/XGBoost-only read is anchored to).
+    # Daily candle → Signal Time is pinned to NSE market close (15:30 IST).
+    if _signal_event_ts is not None:
+        signal_date_str, signal_time_str = _format_signal_timestamp(_signal_event_ts, is_daily=True)
+    else:
+        signal_date_str, signal_time_str = _candle_signal_timestamp(df, is_daily=True)
 
     return {
         "Signal Date": signal_date_str,
@@ -1675,7 +1707,7 @@ def _fetch_intraday_cisd_signal(fyers, symbol: str, resolution: str, timeframe_l
         if len(df) < 30:
             return None, None
 
-        smc_structure, cisd_signal, _event_date = _calculate_smc_and_cisd(df)
+        smc_structure, cisd_signal, event_ts = _calculate_smc_and_cisd(df)
         if cisd_signal == "None":
             return None, None
 
@@ -1707,12 +1739,16 @@ def _fetch_intraday_cisd_signal(fyers, symbol: str, resolution: str, timeframe_l
         confidence = round(min(95.0, max(35.0, 55 + min(rvol_raw, 3) * 8 + rr_ratio * 3)), 1)
 
         stock_ticker = symbol.replace("NSE:", "").replace("-EQ", "")
-        # Signal Date/Time = timestamp of the last completed intraday
-        # candle in `df` — the exact candle whose close produced this CISD
-        # shift — never scan/system time. This IS a real 5-min/15-min
-        # candle (not daily), so its own timestamp is used as-is
-        # (is_daily=False, the default) — e.g. 09:20/09:30/10:15 IST.
-        signal_date_str, signal_time_str = _candle_signal_timestamp(df)
+        # Signal Date/Time = timestamp of the actual candle whose close
+        # confirmed this CISD shift — from _calculate_smc_and_cisd's
+        # event_ts, NOT necessarily df's last row, and NEVER scan/system
+        # time. This is a real 5-min/15-min candle (not daily), so its
+        # timestamp is used as-is (is_daily=False, the default) —
+        # e.g. 09:20/09:30/10:15 IST.
+        signal_date_str, signal_time_str = (
+            _format_signal_timestamp(event_ts) if event_ts is not None
+            else _candle_signal_timestamp(df)
+        )
         reason = (
             f"{timeframe_label} CISD {'bullish' if is_up else 'bearish'} shift confirmed on candle close "
             f"(RSI {rsi_val}, RVOL {_format_rvol_display(rvol_raw)})"
@@ -1794,7 +1830,7 @@ def _fetch_fo_cisd_signal(fyers, symbol: str):
         if len(df) < 30:
             return None, f"{symbol}: insufficient valid candle data after cleaning"
 
-        smc_structure, cisd_signal, _event_date = _calculate_smc_and_cisd(df)
+        smc_structure, cisd_signal, event_ts = _calculate_smc_and_cisd(df)
         if cisd_signal == "None":
             return None, None
 
@@ -1832,10 +1868,15 @@ def _fetch_fo_cisd_signal(fyers, symbol: str):
             gap_pct = ((df["Open"].iloc[-1] - df["Close"].iloc[-2]) / df["Close"].iloc[-2]) * 100
 
         stock_ticker = symbol.replace("NSE:", "").replace("-EQ", "")
-        # Signal Date/Time = timestamp of the last completed daily candle in
-        # `df` that produced this CISD event — never scan/system time.
-        # Daily candle → Signal Time is the NSE market close (15:30 IST).
-        signal_date_str, signal_time_str = _candle_signal_timestamp(df, is_daily=True)
+        # Signal Date/Time = timestamp of the actual candle whose close
+        # confirmed this CISD event — from _calculate_smc_and_cisd's
+        # event_ts, NOT necessarily df's last row, and NEVER scan/system
+        # time. Daily candle → Signal Time is pinned to NSE market close
+        # (15:30 IST).
+        signal_date_str, signal_time_str = (
+            _format_signal_timestamp(event_ts, is_daily=True) if event_ts is not None
+            else _candle_signal_timestamp(df, is_daily=True)
+        )
 
         row = {
             "Signal Date": signal_date_str,
