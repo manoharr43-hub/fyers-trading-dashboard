@@ -2105,6 +2105,12 @@ def run_premarket_scan(fyers, symbols: List[str]):
 def show_scanner(fyers):
     st.title("🚀 NSE AI PRO V13 — Institutional Scanner")
 
+    # Live India Standard Time clock — shows current IST at page load/refresh.
+    # This is separate from "Signal Date"/"Signal Time" (which come from the
+    # candle that generated each signal, per _candle_signal_timestamp) — this
+    # is just "what time is it right now in India" context for the user.
+    st.caption(f"🕒 Current Time (IST): {_now_ist().strftime('%d-%b-%Y %H:%M:%S')} IST")
+
     symbols = load_nse_equity_symbols()
     st.caption(f"Loaded {len(symbols)} NSE equity symbols from Fyers symbol master.")
 
