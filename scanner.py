@@ -85,12 +85,33 @@ def _now_ist() -> datetime:
     return datetime.now(IST)
 
 
-def _signal_timestamp() -> Tuple[str, str]:
-    """Returns (Signal Date, Signal Time) as of right now, in IST, formatted
-    as ('DD-MMM-YYYY', 'HH:MM:SS IST'). Call this exactly when a signal is
-    generated — never earlier/later, and never from datetime.now() directly."""
-    now = _now_ist()
-    return now.strftime("%d-%b-%Y"), now.strftime("%H:%M:%S") + " IST"
+# ── FIX (candle-based signal timestamp) ──────────────────────────────────────
+# Signal Date/Signal Time must reflect the last COMPLETED CANDLE that
+# actually generated the trading signal (CISD / SMC / Breakout / XGBoost /
+# AI Signal) — never datetime.now(), never scan-run time, never Excel
+# download time. Every place that builds a signal row must pass its OHLCV
+# `df` (whose "Time" column is already tz-aware, built via
+# pd.to_datetime(..., utc=True).dt.tz_convert("Asia/Kolkata")) into this
+# function instead of calling the old system-clock-based helper.
+def _candle_signal_timestamp(df: pd.DataFrame) -> Tuple[str, str]:
+    """Returns (Signal Date, Signal Time) derived from df's last completed
+    candle. Formatted as ('DD-MMM-YYYY', 'HH:MM:SS IST').
+
+    Because this reads df["Time"].iloc[-1] (the candle timestamp, not the
+    wall clock), calling it again later for the same df/candle always
+    returns the identical value — it does NOT drift on re-render, re-scan,
+    or Excel export.
+    """
+    ts = df["Time"].iloc[-1]
+
+    # Safety net: if the Time column ever arrives tz-naive, localize to UTC
+    # first (per spec), then convert — normally it's already tz-aware IST
+    # by the time it reaches this function.
+    if ts.tzinfo is None:
+        ts = ts.tz_localize("UTC")
+
+    ts_ist = ts.tz_convert(IST)
+    return ts_ist.strftime("%d-%b-%Y"), ts_ist.strftime("%H:%M:%S") + " IST"
 
 
 # ── FIX 2/3/5: Resilient, retrying Fyers history fetch ───────────────────────
@@ -1086,9 +1107,9 @@ def _analyse(symbol: str, df: pd.DataFrame, nifty_close: Optional[pd.Series], en
         volume_ok=bool(vol_avg20 and vol_avg20 > 0 and float(volume.iloc[-1]) > vol_avg20),
     )
 
-    # ── FIX 1: Signal Date & Signal Time are generated in IST, at the exact
-    # moment the signal is created — never UTC/server time. ────────────────
-    signal_date_str, signal_time_str = _signal_timestamp()
+    # Signal Date & Signal Time come from the last completed candle in `df`
+    # that actually produced this signal — not scan/system time.
+    signal_date_str, signal_time_str = _candle_signal_timestamp(df)
 
     return {
         "Signal Date": signal_date_str,
@@ -1326,7 +1347,8 @@ def calculate_swing_signal(row: dict) -> dict:
             holding_days, est_days = "7–14 Days", 10
         else:
             holding_days, est_days = "14–25 Days", 18
-        # FIX 1: exit date projected from IST "now", not server/UTC time.
+        # Note: this is a FORWARD-LOOKING projected exit date (not a signal
+        # timestamp), so it intentionally still uses system "now" (IST).
         exit_date = (_now_ist() + timedelta(days=est_days)).strftime("%d-%b-%Y")
 
         reasons = [f"MTF: {mtf_trend}", f"RS vs NIFTY: {rs_label}", f"Supertrend: {supertrend_label}",
@@ -1655,7 +1677,10 @@ def _fetch_intraday_cisd_signal(fyers, symbol: str, resolution: str, timeframe_l
         confidence = round(min(95.0, max(35.0, 55 + min(rvol_raw, 3) * 8 + rr_ratio * 3)), 1)
 
         stock_ticker = symbol.replace("NSE:", "").replace("-EQ", "")
-        signal_date_str, signal_time_str = _signal_timestamp()
+        # Signal Date/Time = timestamp of the last completed intraday
+        # candle in `df` — the exact candle whose close produced this CISD
+        # shift — never scan/system time.
+        signal_date_str, signal_time_str = _candle_signal_timestamp(df)
         reason = (
             f"{timeframe_label} CISD {'bullish' if is_up else 'bearish'} shift confirmed on candle close "
             f"(RSI {rsi_val}, RVOL {_format_rvol_display(rvol_raw)})"
@@ -1775,7 +1800,9 @@ def _fetch_fo_cisd_signal(fyers, symbol: str):
             gap_pct = ((df["Open"].iloc[-1] - df["Close"].iloc[-2]) / df["Close"].iloc[-2]) * 100
 
         stock_ticker = symbol.replace("NSE:", "").replace("-EQ", "")
-        signal_date_str, signal_time_str = _signal_timestamp()
+        # Signal Date/Time = timestamp of the last completed daily candle in
+        # `df` that produced this CISD event — never scan/system time.
+        signal_date_str, signal_time_str = _candle_signal_timestamp(df)
 
         row = {
             "Signal Date": signal_date_str,
@@ -1895,7 +1922,8 @@ def _fetch_golden_death_cross_signal(fyers, symbol: str):
             holding_days, est_days = "7–14 Days", 10
         else:
             holding_days, est_days = "14–25 Days", 18
-        # FIX 1: IST-based exit date projection.
+        # Forward-looking projected exit date — intentionally still uses
+        # system "now" (IST), unlike Signal Date/Signal Time above.
         exit_date = (_now_ist() + timedelta(days=est_days)).strftime("%d-%b-%Y")
 
         ema200_last = float(ema200.iloc[-1])
@@ -1915,7 +1943,9 @@ def _fetch_golden_death_cross_signal(fyers, symbol: str):
         confidence = round(min(95.0, max(35.0, 55 + ema_gap_pct * 4 + min(rvol_raw, 3) * 5)), 1)
 
         stock_ticker = symbol.replace("NSE:", "").replace("-EQ", "")
-        signal_date_str, signal_time_str = _signal_timestamp()
+        # Signal Date/Time = timestamp of the last completed daily candle in
+        # `df` that confirmed the Golden/Death Cross — never scan/system time.
+        signal_date_str, signal_time_str = _candle_signal_timestamp(df)
 
         row = {
             "Signal Date": signal_date_str,
@@ -2021,7 +2051,9 @@ def _fetch_premarket_signal(fyers, symbol: str):
             expected_trend = "🟡 Flat/Uncertain"
 
         stock_ticker = symbol.replace("NSE:", "").replace("-EQ", "")
-        signal_date_str, signal_time_str = _signal_timestamp()
+        # Signal Date/Time = timestamp of the last completed daily candle in
+        # `df` used for this pre-market read — never scan/system time.
+        signal_date_str, signal_time_str = _candle_signal_timestamp(df)
 
         row = {
             "Signal Date": signal_date_str,
