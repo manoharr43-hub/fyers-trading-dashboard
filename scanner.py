@@ -47,6 +47,11 @@ BATCH_PAUSE_SECONDS = 1.0
 # (when ML is enabled) or the pure rule-based technical fallback is used.
 XGB_MODEL_PATH = "xgb_trend_model.json"
 
+# Lookback window (days) for the new intraday (5m/15m) CISD scanner below —
+# separate from DATE_FROM/DATE_TO (which stay at 365 days for the existing
+# daily-resolution pipeline, untouched).
+INTRADAY_CISD_LOOKBACK_DAYS = 5
+
 # NOTE ON OPEN INTEREST: this scanner runs against the NSE_CM (cash
 # equity) symbol master. Open Interest and Change in OI are futures &
 # options concepts and do not exist for cash equity instruments, so they
@@ -405,6 +410,19 @@ def calculate_target_stoploss(last_close: float, atr: float, direction: str) -> 
     else:
         target, stoploss = last_close + 1.5 * atr, last_close - 1.5 * atr
     return round(target, 2), round(stoploss, 2)
+
+
+# ── RVOL display formatter (FIXED/extended) ──────────────────────────────────
+# Shared by the main scanner AND every new scanner added below, so the RVOL
+# highlight tiers are identical everywhere: plain "x" below 2.0x, ❤️‍🔥 from
+# 2.0x, and 🔥🔥 from 3.0x.
+def _format_rvol_display(rvol_raw: float) -> str:
+    display = f"{rvol_raw:.2f}x"
+    if rvol_raw >= 3.0:
+        display += " 🔥🔥"
+    elif rvol_raw >= 2.0:
+        display += " ❤️‍🔥"
+    return display
 
 
 def calculate_ai_trend(ai_score: float) -> Tuple[str, float]:
@@ -847,11 +865,9 @@ def _analyse(symbol: str, df: pd.DataFrame, nifty_close: Optional[pd.Series], en
     # ── News column — FIXED, never blank (see calculate_news above) ────────
     news = calculate_news(stock_ticker, gap_pct, rvol, breakout)
 
-    # ── RVOL — FIXED display format ("1.45x", "2.60x ❤️‍🔥" when high) ──────
+    # ── RVOL — FIXED display format via shared _format_rvol_display() ──────
     rvol_raw = round(float(rvol), 2)
-    rvol_display = f"{rvol_raw:.2f}x"
-    if rvol_raw >= 2.0:
-        rvol_display += " ❤️‍🔥"
+    rvol_display = _format_rvol_display(rvol_raw)
 
     # ── Signal Date & Signal Time: the actual date/time this signal was
     # generated, shown ONCE per stock (not the underlying candle's date —
@@ -1202,12 +1218,18 @@ _SIGNAL_FILL_RULES = [
     ("SELL", "FF0000", "FFFFFF", True),         # Red
     ("WAIT", "FFFF00", "000000", True),         # Yellow
     ("HOLD", "FFFF00", "000000", True),         # Yellow
+    # ── Added: new CISD-style labels used by the Intraday CISD Scanner
+    # ("▲ CISD UP" / "▼ CISD DOWN") don't literally contain BUY/SELL, so
+    # they need their own keyword rule (purely additive — doesn't affect
+    # any existing keyword above). ──────────────────────────────────────
+    ("CISD UP", "92D050", "000000", True),      # Green
+    ("CISD DOWN", "FF0000", "FFFFFF", True),    # Red
 ]
 
 _SUPPORT_FILL_HEX = "E2EFDA"     # Light Green
 _RESISTANCE_FILL_HEX = "FCE4D6"  # Light Red
 _HIGH_AI_SCORE_FILL_HEX = "7030A0"  # Purple (AI Score > 90)
-_HIGH_RVOL_FILL_HEX = "00FFFF"      # Cyan (❤️‍🔥 RVOL)
+_HIGH_RVOL_FILL_HEX = "00FFFF"      # Cyan (❤️‍🔥 / 🔥🔥 RVOL)
 _HEADER_FILL_HEX = "1F4E78"         # Blue
 _BAND_FILL_HEX = "F2F2F2"           # Alternate row shading
 
@@ -1216,7 +1238,7 @@ def _get_conditional_fill_font(col_name: str, value):
     """Returns (PatternFill, Font) for a single cell based on the color
     legend: Green=BUY, Dark Green=STRONG BUY, Red=SELL, Dark Red=STRONG
     SELL, Yellow=WAIT/HOLD, Orange=WATCHLIST, Purple=AI Score>90,
-    Cyan=High RVOL ❤️‍🔥, Light Green=Support, Light Red=Resistance.
+    Cyan=High RVOL (❤️‍🔥 or 🔥🔥), Light Green=Support, Light Red=Resistance.
     Returns (None, None) if no rule applies (caller falls back to banding)."""
     from openpyxl.styles import Font, PatternFill
 
@@ -1231,7 +1253,7 @@ def _get_conditional_fill_font(col_name: str, value):
         return PatternFill("solid", fgColor=_SUPPORT_FILL_HEX), None
     if col_name == "Resistance":
         return PatternFill("solid", fgColor=_RESISTANCE_FILL_HEX), None
-    if "RVOL" in col_name and "❤️" in text:
+    if "RVOL" in col_name and ("❤️" in text or "🔥" in text):
         return PatternFill("solid", fgColor=_HIGH_RVOL_FILL_HEX), Font(bold=True)
     if col_name == "AI Score":
         try:
@@ -1329,6 +1351,459 @@ def to_excel_bytes_multi(sheets: dict) -> bytes:
     return buf.getvalue()
 
 
+# ══════════════════════════════════════════════════════════════════════════
+# ── NEW ADDITIVE MODULES (this update) ──────────────────────────────────────
+# Everything below is NEW and does not modify any function/tab above.
+# Each module does its OWN Fyers fetch (reusing existing pure helpers like
+# _calculate_smc_and_cisd / calculate_atr / calculate_supertrend / calculate_rsi
+# / calculate_news / _format_rvol_display) so the existing _fetch_symbol /
+# _analyse / run_scan pipeline used by the Full Scanner, Intraday Scanner,
+# Swing Trade Scanner and F&O Stocks Scanner tabs is completely untouched.
+# ══════════════════════════════════════════════════════════════════════════
+
+# ── 2. Intraday CISD Signals (5-Minute / 15-Minute) ─────────────────────────
+_INTRADAY_RESOLUTION_MAP = {"5 Minutes": "5", "15 Minutes": "15"}
+
+
+def _fetch_intraday_cisd_signal(fyers, symbol: str, resolution: str, timeframe_label: str):
+    """Fetches short-history intraday candles and detects a fresh CISD event
+    on them. Returns (row_dict_or_None, error_or_None). row is None (no
+    error) when there's simply no live CISD signal on this symbol right now
+    — that's normal, not a failure."""
+    date_from = (datetime.today() - timedelta(days=INTRADAY_CISD_LOOKBACK_DAYS)).strftime("%Y-%m-%d")
+    date_to = datetime.today().strftime("%Y-%m-%d")
+    try:
+        resp = fyers.history({
+            "symbol": symbol, "resolution": resolution, "date_format": "1",
+            "range_from": date_from, "range_to": date_to, "cont_flag": "1"
+        })
+    except Exception as e:
+        return None, f"{symbol}: exception {e}"
+
+    if not isinstance(resp, dict) or resp.get("s") != "ok":
+        return None, f"{symbol}: {resp.get('message', resp.get('s')) if isinstance(resp, dict) else 'no response'}"
+    candles = resp.get("candles")
+    if not candles or len(candles) < 30:
+        return None, None  # too little intraday history yet — not an error
+
+    df = pd.DataFrame(candles, columns=["Time", "Open", "High", "Low", "Close", "Volume"])
+    df["Time"] = pd.to_datetime(df["Time"], unit="s", utc=True).dt.tz_convert("Asia/Kolkata")
+
+    smc_structure, cisd_signal, _event_date = _calculate_smc_and_cisd(df)
+    if cisd_signal == "None":
+        return None, None
+
+    last_close = float(df["Close"].iloc[-1])
+    atr = float(calculate_atr(df).iloc[-1])
+    if pd.isna(atr) or atr <= 0:
+        atr = last_close * 0.005
+
+    is_up = "Bullish" in cisd_signal
+    signal_label = "🟢 ▲ CISD UP Signal" if is_up else "🔴 ▼ CISD DOWN Signal"
+
+    entry = round(last_close, 2)
+    if is_up:
+        sl = round(entry - 1.0 * atr, 2)
+        target = round(entry + 2.0 * atr, 2)
+    else:
+        sl = round(entry + 1.0 * atr, 2)
+        target = round(entry - 2.0 * atr, 2)
+
+    risk = abs(entry - sl)
+    reward = abs(target - entry)
+    rr_ratio = round(reward / risk, 2) if risk > 0 else 0.0
+
+    rsi_val = round(float(calculate_rsi(df["Close"]).iloc[-1]), 1)
+    vol_avg20 = df["Volume"].tail(20).mean()
+    rvol_raw = round(float(df["Volume"].iloc[-1] / vol_avg20), 2) if vol_avg20 > 0 else 0.0
+
+    ai_score = round(min(max(50 + (rvol_raw * 10) + (10 if is_up else -10) + (rsi_val - 50) * 0.3, 0), 100), 1)
+    confidence = round(min(95.0, max(35.0, 55 + min(rvol_raw, 3) * 8 + rr_ratio * 3)), 1)
+
+    stock_ticker = symbol.replace("NSE:", "").replace("-EQ", "")
+    now = datetime.now()
+    reason = (
+        f"{timeframe_label} CISD {'bullish' if is_up else 'bearish'} shift confirmed on candle close "
+        f"(RSI {rsi_val}, RVOL {_format_rvol_display(rvol_raw)})"
+    )
+
+    row = {
+        "Signal Date": now.strftime("%d-%b-%Y"),
+        "Signal Time": now.strftime("%H:%M:%S"),
+        "Timeframe": timeframe_label,
+        "Stock": stock_ticker,
+        "Signal": signal_label,
+        "Entry": entry,
+        "Stoploss": sl,
+        "Target": target,
+        "Confidence %": confidence,
+        "AI Score": ai_score,
+        "News": calculate_news(stock_ticker, 0.0, rvol_raw, "📈 Bullish" if is_up else "📉 Bearish"),
+        "Reason": reason,
+    }
+    return row, None
+
+
+def run_intraday_cisd_scan(fyers, symbols: List[str], resolution: str, timeframe_label: str):
+    """Threaded, rate-limited intraday CISD scan — mirrors run_scan()'s
+    batching pattern but calls _fetch_intraday_cisd_signal instead, so the
+    original run_scan()/_fetch_symbol() are untouched."""
+    results, errors = [], []
+    progress = st.progress(0.0, text=f"Scanning Intraday CISD 0 / {len(symbols)}")
+    done = 0
+    for i in range(0, len(symbols), BATCH_SIZE):
+        batch = symbols[i:i + BATCH_SIZE]
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            futures = {
+                executor.submit(_fetch_intraday_cisd_signal, fyers, s, resolution, timeframe_label): s
+                for s in batch
+            }
+            for future in as_completed(futures):
+                res, err = future.result()
+                if res:
+                    results.append(res)
+                if err:
+                    errors.append(err)
+                done += 1
+                progress.progress(done / len(symbols), text=f"Scanning Intraday CISD {done} / {len(symbols)}")
+        if i + BATCH_SIZE < len(symbols):
+            time.sleep(BATCH_PAUSE_SECONDS)
+    progress.empty()
+    return results, errors
+
+
+# ── 3. F&O CISD Scanner ──────────────────────────────────────────────────────
+def _fetch_fo_cisd_signal(fyers, symbol: str):
+    """Standalone daily-resolution CISD fetch+detect for the F&O universe.
+    Returns (row_dict_or_None, error_or_None); row is None (no error) when
+    there's no live CISD event on this symbol right now."""
+    try:
+        resp = fyers.history({
+            "symbol": symbol, "resolution": "D", "date_format": "1",
+            "range_from": DATE_FROM, "range_to": DATE_TO, "cont_flag": "1"
+        })
+    except Exception as e:
+        return None, f"{symbol}: exception {e}"
+
+    if not isinstance(resp, dict) or resp.get("s") != "ok":
+        return None, f"{symbol}: {resp.get('message', resp.get('s')) if isinstance(resp, dict) else 'no response'}"
+    candles = resp.get("candles")
+    if not candles or len(candles) < 30:
+        return None, f"{symbol}: insufficient history ({len(candles) if candles else 0} candles)"
+
+    df = pd.DataFrame(candles, columns=["Time", "Open", "High", "Low", "Close", "Volume"])
+    df["Time"] = pd.to_datetime(df["Time"], unit="s", utc=True).dt.tz_convert("Asia/Kolkata")
+
+    smc_structure, cisd_signal, _event_date = _calculate_smc_and_cisd(df)
+    if cisd_signal == "None":
+        return None, None
+
+    last_close = float(df["Close"].iloc[-1])
+    atr = float(calculate_atr(df).iloc[-1])
+    if pd.isna(atr) or atr <= 0:
+        atr = last_close * 0.01
+
+    is_bull = "Bullish" in cisd_signal
+    signal_label = "🟢 ▲ CISD BUY" if is_bull else "🔴 ▼ CISD SELL"
+
+    entry = round(last_close, 2)
+    if is_bull:
+        sl = round(entry - 1.5 * atr, 2)
+        target = round(entry + 3.0 * atr, 2)
+    else:
+        sl = round(entry + 1.5 * atr, 2)
+        target = round(entry - 3.0 * atr, 2)
+
+    risk = abs(entry - sl)
+    reward = abs(target - entry)
+    rr_ratio = round(reward / risk, 2) if risk > 0 else 0.0
+
+    supertrend_label, supertrend_bullish, _ = calculate_supertrend(df)
+    vol_avg20 = df["Volume"].tail(20).mean()
+    last_volume = float(df["Volume"].iloc[-1])
+    rvol_raw = round(last_volume / vol_avg20, 2) if vol_avg20 > 0 else 0.0
+
+    confidence = round(min(95.0, max(35.0,
+        50 + min(rvol_raw, 3) * 10 + rr_ratio * 3 + (10 if supertrend_bullish == is_bull else 0)
+    )), 1)
+
+    gap_pct = 0.0
+    if len(df) >= 2:
+        gap_pct = ((df["Open"].iloc[-1] - df["Close"].iloc[-2]) / df["Close"].iloc[-2]) * 100
+
+    stock_ticker = symbol.replace("NSE:", "").replace("-EQ", "")
+    now = datetime.now()
+
+    row = {
+        "Signal Date": now.strftime("%d-%b-%Y"),
+        "Signal Time": now.strftime("%H:%M:%S"),
+        "Symbol": stock_ticker,
+        "LTP": round(last_close, 2),
+        "Signal": signal_label,
+        "Entry": entry,
+        "SL": sl,
+        "Target": target,
+        "Confidence": confidence,
+        "Trend": supertrend_label,
+        "Volume": int(last_volume),
+        "RVOL": _format_rvol_display(rvol_raw),
+        "News": calculate_news(stock_ticker, gap_pct, rvol_raw, "📈 Bullish" if is_bull else "📉 Bearish"),
+    }
+    return row, None
+
+
+def run_fo_cisd_scan(fyers, symbols: List[str]):
+    """Threaded, rate-limited F&O CISD scan. Additive — does not touch
+    run_scan()/_fetch_symbol() used by the existing tabs."""
+    results, errors = [], []
+    progress = st.progress(0.0, text=f"Scanning F&O CISD 0 / {len(symbols)}")
+    done = 0
+    for i in range(0, len(symbols), BATCH_SIZE):
+        batch = symbols[i:i + BATCH_SIZE]
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            futures = {executor.submit(_fetch_fo_cisd_signal, fyers, s): s for s in batch}
+            for future in as_completed(futures):
+                res, err = future.result()
+                if res:
+                    results.append(res)
+                if err:
+                    errors.append(err)
+                done += 1
+                progress.progress(done / len(symbols), text=f"Scanning F&O CISD {done} / {len(symbols)}")
+        if i + BATCH_SIZE < len(symbols):
+            time.sleep(BATCH_PAUSE_SECONDS)
+    progress.empty()
+    return results, errors
+
+
+# ── 4. Swing Trading Scanner (Golden Cross / Death Cross) ───────────────────
+def _fetch_golden_death_cross_signal(fyers, symbol: str):
+    """Standalone daily-resolution EMA50/EMA200 cross detector. Returns
+    (row_dict_or_None, error_or_None); row is None (no error) when there's
+    no fresh cross on this symbol in the last few sessions."""
+    try:
+        resp = fyers.history({
+            "symbol": symbol, "resolution": "D", "date_format": "1",
+            "range_from": DATE_FROM, "range_to": DATE_TO, "cont_flag": "1"
+        })
+    except Exception as e:
+        return None, f"{symbol}: exception {e}"
+
+    if not isinstance(resp, dict) or resp.get("s") != "ok":
+        return None, f"{symbol}: {resp.get('message', resp.get('s')) if isinstance(resp, dict) else 'no response'}"
+    candles = resp.get("candles")
+    if not candles or len(candles) < 60:
+        return None, f"{symbol}: insufficient history for cross detection"
+
+    df = pd.DataFrame(candles, columns=["Time", "Open", "High", "Low", "Close", "Volume"])
+    df["Time"] = pd.to_datetime(df["Time"], unit="s", utc=True).dt.tz_convert("Asia/Kolkata")
+    close = df["Close"]
+
+    ema50 = close.ewm(span=50, adjust=False).mean()
+    ema200 = close.ewm(span=200, adjust=False).mean() if len(close) >= 200 else close.ewm(span=len(close), adjust=False).mean()
+
+    lookback = min(5, len(close) - 1)
+    diff_tail = (ema50 - ema200).tail(lookback + 1)
+    prev_sign = np.sign(diff_tail.iloc[0])
+    curr_sign = np.sign(diff_tail.iloc[-1])
+
+    if prev_sign <= 0 and curr_sign > 0:
+        cross_type = "Golden Cross"
+    elif prev_sign >= 0 and curr_sign < 0:
+        cross_type = "Death Cross"
+    else:
+        return None, None  # no fresh cross — nothing to show for this stock
+
+    last_close = float(close.iloc[-1])
+    atr = float(calculate_atr(df).iloc[-1])
+    if pd.isna(atr) or atr <= 0:
+        atr = last_close * 0.01
+
+    is_bull = cross_type == "Golden Cross"
+    signal_label = "🟢 Swing BUY" if is_bull else "🔴 Swing SELL"
+
+    entry = round(last_close, 2)
+    if is_bull:
+        sl = round(entry - 2.0 * atr, 2)
+        t1 = round(entry + 2.0 * atr, 2)
+        t2 = round(entry + 3.5 * atr, 2)
+        t3 = round(entry + 5.0 * atr, 2)
+    else:
+        sl = round(entry + 2.0 * atr, 2)
+        t1 = round(entry - 2.0 * atr, 2)
+        t2 = round(entry - 3.5 * atr, 2)
+        t3 = round(entry - 5.0 * atr, 2)
+
+    atr_pct = (atr / last_close * 100) if last_close else 0
+    if atr_pct >= 3:
+        holding_days, est_days = "3–7 Days", 5
+    elif atr_pct >= 1.5:
+        holding_days, est_days = "7–14 Days", 10
+    else:
+        holding_days, est_days = "14–25 Days", 18
+    exit_date = (datetime.now() + timedelta(days=est_days)).strftime("%d-%b-%Y")
+
+    ema200_last = float(ema200.iloc[-1])
+    ema_gap_pct = abs((float(ema50.iloc[-1]) - ema200_last) / ema200_last * 100) if ema200_last else 0
+    if ema_gap_pct >= 3:
+        trend_strength = "🟢 Strong"
+    elif ema_gap_pct >= 1:
+        trend_strength = "🟡 Moderate"
+    else:
+        trend_strength = "🔴 Weak"
+
+    rsi_val = round(float(calculate_rsi(close).iloc[-1]), 1)
+    vol_avg20 = df["Volume"].tail(20).mean()
+    rvol_raw = round(float(df["Volume"].iloc[-1] / vol_avg20), 2) if vol_avg20 > 0 else 0.0
+
+    ai_score = round(min(max(50 + (15 if is_bull else -15) + (rvol_raw * 8) + (rsi_val - 50) * 0.2, 0), 100), 1)
+    confidence = round(min(95.0, max(35.0, 55 + ema_gap_pct * 4 + min(rvol_raw, 3) * 5)), 1)
+
+    stock_ticker = symbol.replace("NSE:", "").replace("-EQ", "")
+    now = datetime.now()
+
+    row = {
+        "Signal Date": now.strftime("%d-%b-%Y"),
+        "Signal Time": now.strftime("%H:%M:%S"),
+        "Stock": stock_ticker,
+        "Cross Type": cross_type,
+        "Signal": signal_label,
+        "Entry": entry,
+        "Stoploss": sl,
+        "Target 1": t1,
+        "Target 2": t2,
+        "Target 3": t3,
+        "Holding Period (Days)": holding_days,
+        "Estimated Exit Date": exit_date,
+        "Trend Strength": trend_strength,
+        "Confidence %": confidence,
+        "AI Score": ai_score,
+        "News": calculate_news(stock_ticker, 0.0, rvol_raw, "📈 Bullish" if is_bull else "📉 Bearish"),
+    }
+    return row, None
+
+
+def run_golden_death_cross_scan(fyers, symbols: List[str]):
+    """Threaded, rate-limited Golden/Death Cross scan. Additive — does not
+    touch run_scan()/_fetch_symbol() used by the existing tabs."""
+    results, errors = [], []
+    progress = st.progress(0.0, text=f"Scanning Golden/Death Cross 0 / {len(symbols)}")
+    done = 0
+    for i in range(0, len(symbols), BATCH_SIZE):
+        batch = symbols[i:i + BATCH_SIZE]
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            futures = {executor.submit(_fetch_golden_death_cross_signal, fyers, s): s for s in batch}
+            for future in as_completed(futures):
+                res, err = future.result()
+                if res:
+                    results.append(res)
+                if err:
+                    errors.append(err)
+                done += 1
+                progress.progress(done / len(symbols), text=f"Scanning Golden/Death Cross {done} / {len(symbols)}")
+        if i + BATCH_SIZE < len(symbols):
+            time.sleep(BATCH_PAUSE_SECONDS)
+    progress.empty()
+    return results, errors
+
+
+# ── 5. Pre-Market Scanner ────────────────────────────────────────────────────
+# IMPORTANT CAVEAT: Fyers' history endpoint only exposes OHLCV daily candles —
+# it does NOT provide true buy/sell order-flow volume splits, a pre-open
+# auction feed, or NSE delivery percentage. "Buy Volume" / "Sell Volume" /
+# "Buy-Sell Ratio" below are a technical PROXY built from up-day vs down-day
+# volume over the trailing 10 sessions, not real order-flow data, and "Gap %"
+# uses the most recently completed session's gap as a pre-market reference
+# point (today's own gap can't be known until the pre-open session prints).
+# This is disclosed in the UI caption too — nothing here is presented as a
+# verified live feed.
+def _fetch_premarket_signal(fyers, symbol: str):
+    try:
+        resp = fyers.history({
+            "symbol": symbol, "resolution": "D", "date_format": "1",
+            "range_from": DATE_FROM, "range_to": DATE_TO, "cont_flag": "1"
+        })
+    except Exception as e:
+        return None, f"{symbol}: exception {e}"
+
+    if not isinstance(resp, dict) or resp.get("s") != "ok":
+        return None, f"{symbol}: {resp.get('message', resp.get('s')) if isinstance(resp, dict) else 'no response'}"
+    candles = resp.get("candles")
+    if not candles or len(candles) < 30:
+        return None, f"{symbol}: insufficient history ({len(candles) if candles else 0} candles)"
+
+    df = pd.DataFrame(candles, columns=["Time", "Open", "High", "Low", "Close", "Volume"])
+    df["Time"] = pd.to_datetime(df["Time"], unit="s", utc=True).dt.tz_convert("Asia/Kolkata")
+
+    recent = df.tail(10)
+    buy_volume = float(recent.loc[recent["Close"] > recent["Open"], "Volume"].sum())
+    sell_volume = float(recent.loc[recent["Close"] <= recent["Open"], "Volume"].sum())
+    buy_sell_ratio = round(buy_volume / sell_volume, 2) if sell_volume > 0 else round(buy_volume, 2) if buy_volume > 0 else 0.0
+
+    gap_pct = 0.0
+    if len(df) >= 2:
+        gap_pct = ((df["Close"].iloc[-1] - df["Close"].iloc[-2]) / df["Close"].iloc[-2]) * 100
+
+    vol_avg20 = df["Volume"].tail(20).mean()
+    rvol_raw = round(float(df["Volume"].iloc[-1] / vol_avg20), 2) if vol_avg20 > 0 else 0.0
+
+    rsi_val = round(float(calculate_rsi(df["Close"]).iloc[-1]), 1)
+    ai_score = round(min(max(
+        50 + (buy_sell_ratio - 1) * 8 + (rvol_raw * 6) + max(gap_pct, 0) * 2 + (rsi_val - 50) * 0.2,
+        0), 100), 1)
+
+    bullish_votes = sum([buy_sell_ratio > 1.2, gap_pct > 0.3, rvol_raw >= 1.5, rsi_val > 50])
+    bearish_votes = sum([buy_sell_ratio < 0.8, gap_pct < -0.3, rvol_raw >= 1.5, rsi_val < 50])
+    if bullish_votes >= 3:
+        expected_trend = "🟢 Bullish Opening Likely"
+    elif bearish_votes >= 3:
+        expected_trend = "🔴 Bearish Opening Likely"
+    else:
+        expected_trend = "🟡 Flat/Uncertain"
+
+    stock_ticker = symbol.replace("NSE:", "").replace("-EQ", "")
+    now = datetime.now()
+
+    row = {
+        "Signal Date": now.strftime("%d-%b-%Y"),
+        "Signal Time": now.strftime("%H:%M:%S"),
+        "Stock": stock_ticker,
+        "Buy Volume": int(buy_volume),
+        "Sell Volume": int(sell_volume),
+        "Buy/Sell Ratio": buy_sell_ratio,
+        "Gap %": f"{gap_pct:.2f}%",
+        "RVOL": _format_rvol_display(rvol_raw),
+        "AI Score": ai_score,
+        "Expected Opening Trend": expected_trend,
+        "News": calculate_news(stock_ticker, gap_pct, rvol_raw, "📈 Bullish" if bullish_votes >= 3 else ("📉 Bearish" if bearish_votes >= 3 else "NO")),
+    }
+    return row, None
+
+
+def run_premarket_scan(fyers, symbols: List[str]):
+    """Threaded, rate-limited Pre-Market scan. Additive — does not touch
+    run_scan()/_fetch_symbol() used by the existing tabs."""
+    results, errors = [], []
+    progress = st.progress(0.0, text=f"Scanning Pre-Market 0 / {len(symbols)}")
+    done = 0
+    for i in range(0, len(symbols), BATCH_SIZE):
+        batch = symbols[i:i + BATCH_SIZE]
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            futures = {executor.submit(_fetch_premarket_signal, fyers, s): s for s in batch}
+            for future in as_completed(futures):
+                res, err = future.result()
+                if res:
+                    results.append(res)
+                if err:
+                    errors.append(err)
+                done += 1
+                progress.progress(done / len(symbols), text=f"Scanning Pre-Market {done} / {len(symbols)}")
+        if i + BATCH_SIZE < len(symbols):
+            time.sleep(BATCH_PAUSE_SECONDS)
+    progress.empty()
+    return results, errors
+
+
 # ── Main Application ──────────────────────────────────────────────────────────
 def show_scanner(fyers):
     st.title("🚀 NSE AI PRO V13 — Institutional Scanner")
@@ -1391,8 +1866,11 @@ def show_scanner(fyers):
         if errors:
             st.warning(f"{len(errors)} of {len(scan_universe)} symbols failed or were skipped.")
 
-    tab_scanner, tab_intraday, tab_swing, tab_fo = st.tabs(
-        ["📊 Full Scanner", "⚡ Intraday Scanner", "📈 Swing Trade Scanner", "🏛️ F&O Stocks Scanner"]
+    tab_scanner, tab_intraday, tab_swing, tab_fo, \
+        tab_intraday_cisd, tab_fo_cisd, tab_golden_death, tab_premarket = st.tabs(
+        ["📊 Full Scanner", "⚡ Intraday Scanner", "📈 Swing Trade Scanner", "🏛️ F&O Stocks Scanner",
+         "🕐 Intraday CISD Signals", "🎯 F&O CISD Scanner", "✝️ Swing Trading (Golden/Death Cross)",
+         "🌅 Pre-Market Scanner"]
     )
 
     # ── Full Scanner tab (existing dashboard/columns, unchanged) ───────────
@@ -1536,6 +2014,207 @@ def show_scanner(fyers):
             if st.session_state.get("fo_scan_errors"):
                 with st.expander(f"⚠️ F&O errors / skipped symbols ({len(st.session_state['fo_scan_errors'])})"):
                     st.text("\n".join(st.session_state["fo_scan_errors"][:200]))
+
+    # ══════════════════════════════════════════════════════════════════════
+    # ── Intraday CISD Signals tab (new — 5 Min / 15 Min) ────────────────────
+    # ══════════════════════════════════════════════════════════════════════
+    with tab_intraday_cisd:
+        st.caption(
+            "Live CISD (Change In State of Delivery) shifts detected directly on 5-minute or "
+            "15-minute candles — a genuine intraday feed via a dedicated resolution='5'/'15' "
+            "Fyers history call, separate from the daily-candle pipeline used elsewhere."
+        )
+        icisd_col1, icisd_col2, icisd_col3 = st.columns([1, 1, 1])
+        with icisd_col1:
+            icisd_timeframe = st.selectbox(
+                "Timeframe", options=list(_INTRADAY_RESOLUTION_MAP.keys()), key="icisd_timeframe",
+            )
+        with icisd_col2:
+            icisd_limit = st.number_input(
+                "Limit symbols (0 = all)", min_value=0, max_value=len(symbols),
+                value=min(200, len(symbols)), step=50, key="icisd_limit",
+            )
+        with icisd_col3:
+            st.caption("Only stocks with a live CISD event right now are shown — most scans return a short list.")
+
+        icisd_universe = symbols if icisd_limit == 0 else symbols[:icisd_limit]
+
+        if st.button(f"🕐 Run Intraday CISD Scan ({len(icisd_universe)} symbols, {icisd_timeframe})", key="icisd_run"):
+            with st.spinner(f"Scanning {icisd_timeframe} candles for CISD shifts…"):
+                icisd_results, icisd_errors = run_intraday_cisd_scan(
+                    fyers, icisd_universe, _INTRADAY_RESOLUTION_MAP[icisd_timeframe], icisd_timeframe
+                )
+                icisd_df = pd.DataFrame(icisd_results)
+
+            st.session_state["intraday_cisd_df"] = icisd_df
+            st.session_state["intraday_cisd_errors"] = icisd_errors
+
+            if icisd_errors:
+                st.warning(f"{len(icisd_errors)} of {len(icisd_universe)} symbols failed or were skipped.")
+
+        icisd_df = st.session_state.get("intraday_cisd_df")
+        if icisd_df is not None and not icisd_df.empty:
+            icisd_sorted = icisd_df.sort_values("Confidence %", ascending=False)
+            st.dataframe(_style_dataframe(icisd_sorted), use_container_width=True, height=500)
+            st.download_button(
+                "📥 Download Intraday CISD Signals as Excel",
+                data=to_excel_bytes(icisd_sorted, "Intraday CISD"),
+                file_name=f"nse_intraday_cisd_{datetime.today().strftime('%Y%m%d_%H%M')}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="dl_icisd",
+            )
+        else:
+            st.info("Run an Intraday CISD scan above to see live signals here.")
+
+        if st.session_state.get("intraday_cisd_errors"):
+            with st.expander(f"⚠️ Intraday CISD errors ({len(st.session_state['intraday_cisd_errors'])})"):
+                st.text("\n".join(st.session_state["intraday_cisd_errors"][:200]))
+
+    # ══════════════════════════════════════════════════════════════════════
+    # ── F&O CISD Scanner tab (new) ───────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════════════
+    with tab_fo_cisd:
+        st.caption("Daily-candle CISD BUY/SELL events across the full F&O-permitted stock universe.")
+        fo_cisd_symbols = load_nse_fo_stock_symbols()
+
+        if not fo_cisd_symbols:
+            st.warning("No F&O stock symbols loaded — check network access to public.fyers.in.")
+        else:
+            fo_cisd_limit = st.number_input(
+                "Limit F&O symbols (0 = all)", min_value=0, max_value=len(fo_cisd_symbols),
+                value=len(fo_cisd_symbols), step=25, key="fo_cisd_limit",
+            )
+            fo_cisd_universe = fo_cisd_symbols if fo_cisd_limit == 0 else fo_cisd_symbols[:fo_cisd_limit]
+
+            if st.button(f"🎯 Run F&O CISD Scan ({len(fo_cisd_universe)} symbols)", key="fo_cisd_run"):
+                with st.spinner("Scanning F&O stocks for CISD BUY/SELL events…"):
+                    fo_cisd_results, fo_cisd_errors = run_fo_cisd_scan(fyers, fo_cisd_universe)
+                    fo_cisd_df = pd.DataFrame(fo_cisd_results)
+
+                st.session_state["fo_cisd_df"] = fo_cisd_df
+                st.session_state["fo_cisd_errors"] = fo_cisd_errors
+
+                if fo_cisd_errors:
+                    st.warning(f"{len(fo_cisd_errors)} of {len(fo_cisd_universe)} symbols failed or were skipped.")
+
+            fo_cisd_df = st.session_state.get("fo_cisd_df")
+            if fo_cisd_df is not None and not fo_cisd_df.empty:
+                fo_cisd_sorted = fo_cisd_df.sort_values("Confidence", ascending=False)
+                st.dataframe(_style_dataframe(fo_cisd_sorted), use_container_width=True, height=500)
+                st.download_button(
+                    "📥 Download F&O CISD Signals as Excel",
+                    data=to_excel_bytes(fo_cisd_sorted, "F&O CISD"),
+                    file_name=f"nse_fo_cisd_{datetime.today().strftime('%Y%m%d_%H%M')}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key="dl_fo_cisd",
+                )
+            else:
+                st.info("Run an F&O CISD scan above to see live signals here.")
+
+            if st.session_state.get("fo_cisd_errors"):
+                with st.expander(f"⚠️ F&O CISD errors ({len(st.session_state['fo_cisd_errors'])})"):
+                    st.text("\n".join(st.session_state["fo_cisd_errors"][:200]))
+
+    # ══════════════════════════════════════════════════════════════════════
+    # ── Swing Trading tab (new — Golden Cross / Death Cross) ────────────────
+    # ══════════════════════════════════════════════════════════════════════
+    with tab_golden_death:
+        st.caption("EMA50 / EMA200 Golden Cross (bullish) and Death Cross (bearish) detection on daily candles.")
+        gd_limit = st.number_input(
+            "Limit symbols (0 = all)", min_value=0, max_value=len(symbols),
+            value=min(300, len(symbols)), step=50, key="gd_limit",
+        )
+        gd_universe = symbols if gd_limit == 0 else symbols[:gd_limit]
+
+        if st.button(f"✝️ Run Golden/Death Cross Scan ({len(gd_universe)} symbols)", key="gd_run"):
+            with st.spinner("Scanning for Golden Cross / Death Cross events…"):
+                gd_results, gd_errors = run_golden_death_cross_scan(fyers, gd_universe)
+                gd_df = pd.DataFrame(gd_results)
+
+            st.session_state["golden_death_df"] = gd_df
+            st.session_state["golden_death_errors"] = gd_errors
+
+            if gd_errors:
+                st.warning(f"{len(gd_errors)} of {len(gd_universe)} symbols failed or were skipped.")
+
+        gd_df = st.session_state.get("golden_death_df")
+        if gd_df is not None and not gd_df.empty:
+            gd_sorted = gd_df.sort_values("Confidence %", ascending=False)
+            st.dataframe(_style_dataframe(gd_sorted), use_container_width=True, height=500)
+            st.download_button(
+                "📥 Download Golden/Death Cross Signals as Excel",
+                data=to_excel_bytes(gd_sorted, "Swing Golden-Death"),
+                file_name=f"nse_golden_death_cross_{datetime.today().strftime('%Y%m%d_%H%M')}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="dl_gd",
+            )
+        else:
+            st.info("Run a Golden/Death Cross scan above to see results here.")
+
+        if st.session_state.get("golden_death_errors"):
+            with st.expander(f"⚠️ Golden/Death Cross errors ({len(st.session_state['golden_death_errors'])})"):
+                st.text("\n".join(st.session_state["golden_death_errors"][:200]))
+
+    # ══════════════════════════════════════════════════════════════════════
+    # ── Pre-Market Scanner tab (new) ─────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════════════
+    with tab_premarket:
+        st.caption(
+            "⚠️ Fyers' history feed doesn't expose true order-flow buy/sell volume or NSE delivery %, "
+            "or a live pre-open auction. 'Buy Volume'/'Sell Volume'/'Buy-Sell Ratio' are a technical "
+            "PROXY from the last 10 sessions' up-day vs down-day volume, and 'Gap %' is the most "
+            "recently completed session's gap — useful pre-market context, not live tick data."
+        )
+        pm_limit = st.number_input(
+            "Limit symbols (0 = all)", min_value=0, max_value=len(symbols),
+            value=min(300, len(symbols)), step=50, key="pm_limit",
+        )
+        pm_universe = symbols if pm_limit == 0 else symbols[:pm_limit]
+
+        if st.button(f"🌅 Run Pre-Market Scan ({len(pm_universe)} symbols)", key="pm_run"):
+            with st.spinner("Scanning pre-market candidates…"):
+                pm_results, pm_errors = run_premarket_scan(fyers, pm_universe)
+                pm_df = pd.DataFrame(pm_results)
+
+            st.session_state["premarket_df"] = pm_df
+            st.session_state["premarket_errors"] = pm_errors
+
+            if pm_errors:
+                st.warning(f"{len(pm_errors)} of {len(pm_universe)} symbols failed or were skipped.")
+
+        pm_df = st.session_state.get("premarket_df")
+        if pm_df is not None and not pm_df.empty:
+            pm_filter = st.selectbox(
+                "Filter", options=["All", "Bullish Candidates", "Bearish Candidates", "High RVOL",
+                                    "Gap Up", "Gap Down"], key="pm_filter",
+            )
+            pm_view = pm_df.copy()
+            if pm_filter == "Bullish Candidates":
+                pm_view = pm_view[pm_view["Expected Opening Trend"].str.contains("Bullish", na=False)]
+            elif pm_filter == "Bearish Candidates":
+                pm_view = pm_view[pm_view["Expected Opening Trend"].str.contains("Bearish", na=False)]
+            elif pm_filter == "High RVOL":
+                pm_view = pm_view[pm_view["RVOL"].str.contains("❤️|🔥", na=False, regex=True)]
+            elif pm_filter == "Gap Up":
+                pm_view = pm_view[pm_view["Gap %"].str.replace("%", "", regex=False).astype(float) > 0]
+            elif pm_filter == "Gap Down":
+                pm_view = pm_view[pm_view["Gap %"].str.replace("%", "", regex=False).astype(float) < 0]
+
+            pm_sorted = pm_view.sort_values("AI Score", ascending=False)
+            st.dataframe(_style_dataframe(pm_sorted), use_container_width=True, height=500)
+            st.download_button(
+                "📥 Download Pre-Market Scan as Excel",
+                data=to_excel_bytes(pm_sorted, "Pre-Market"),
+                file_name=f"nse_premarket_{datetime.today().strftime('%Y%m%d_%H%M')}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="dl_pm",
+            )
+        else:
+            st.info("Run a Pre-Market scan above to see results here.")
+
+        if st.session_state.get("premarket_errors"):
+            with st.expander(f"⚠️ Pre-Market errors ({len(st.session_state['premarket_errors'])})"):
+                st.text("\n".join(st.session_state["premarket_errors"][:200]))
 
     if st.session_state.get("scan_errors"):
         with st.expander(f"⚠️ Errors / skipped symbols ({len(st.session_state['scan_errors'])})"):
