@@ -633,12 +633,22 @@ def _format_rvol_display(rvol_raw: float) -> str:
     return display
 
 
+# ── FIX (Neutral confidence direction) ───────────────────────────────────────
+# calculate_ai_trend previously computed Neutral confidence as
+# `100 - abs(ai_score - 50) * 2`, which is HIGHEST exactly at ai_score=50
+# (the most ambiguous possible score) and falls as the score approaches the
+# Bullish/Bearish thresholds — the opposite of what "confidence" should mean,
+# and discontinuous at the 65/40 boundaries (e.g. score=64 -> conf=72 while
+# score=65 -> conf=65). The corrected formula below is continuous with the
+# Bullish/Bearish branches and gives the lowest confidence at score=50
+# (maximum uncertainty), rising toward the boundaries — matching the
+# Bullish/Bearish branches exactly at ai_score=65 and ai_score=40.
 def calculate_ai_trend(ai_score: float) -> Tuple[str, float]:
     if ai_score >= 65:
         return "📈 Bullish", round(ai_score, 1)
     if ai_score <= 40:
         return "📉 Bearish", round(100 - ai_score, 1)
-    return "➖ Neutral", round(100 - abs(ai_score - 50) * 2, 1)
+    return "➖ Neutral", round(50 + abs(ai_score - 50), 1)
 
 
 # ── News column ────────────────────────────────────────────────────────────
