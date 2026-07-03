@@ -2177,6 +2177,172 @@ def run_premarket_scan(fyers, symbols: List[str]):
     return results, errors, stats
 
 
+# ══════════════════════════════════════════════════════════════════════════
+# ── 6. NSE F&O 15-Minute CISD Scanner (new, additive) ────────────────────
+# Dedicated 15-minute CISD scanner restricted to the F&O stock universe
+# (index symbols excluded via load_nse_fo_stock_symbols(), which already
+# filters out NIFTY/BANKNIFTY/etc.). A signal is only generated from a
+# 15-minute candle that has FULLY CLOSED — the currently-forming candle is
+# always dropped before CISD detection, so Signal Date/Signal Time never
+# drift on re-render/re-scan and only ever update when a genuinely NEW
+# confirming candle closes.
+# ══════════════════════════════════════════════════════════════════════════
+
+FO_15M_CISD_RESOLUTION = "15"
+FO_15M_CISD_RESOLUTION_MINUTES = 15
+FO_15M_CISD_LOOKBACK_DAYS = 5
+
+
+def _is_intraday_candle_closed(candle_time_ist, resolution_minutes: int) -> bool:
+    """True only if the intraday candle starting at candle_time_ist (IST) has
+    fully closed as of right now. Guarantees CISD signals are only ever
+    generated off completed candles, never a still-forming one."""
+    candle_close = candle_time_ist + timedelta(minutes=resolution_minutes)
+    return _now_ist() >= candle_close
+
+
+def _fetch_fo_15min_cisd_signal(fyers, symbol: str):
+    """Returns (row_dict_or_None, error_or_None). row is None (no error) when
+    there's simply no live, fully-closed 15-min CISD signal on this F&O stock
+    right now — that's normal, not a failure."""
+    if not isinstance(symbol, str) or not _VALID_EQ_SYMBOL_RE.match(symbol):
+        return None, f"{symbol}: invalid symbol format — skipped"
+
+    date_from = (datetime.today() - timedelta(days=FO_15M_CISD_LOOKBACK_DAYS)).strftime("%Y-%m-%d")
+    date_to = datetime.today().strftime("%Y-%m-%d")
+
+    resp, err = _safe_history(fyers, {
+        "symbol": symbol, "resolution": FO_15M_CISD_RESOLUTION, "date_format": "1",
+        "range_from": date_from, "range_to": date_to, "cont_flag": "1"
+    })
+    if err:
+        return None, f"{symbol}: {err}"
+
+    candles = resp.get("candles") if resp else None
+    if not candles or len(candles) < 31:
+        return None, None  # too little 15-min history yet — not an error
+
+    try:
+        df = pd.DataFrame(candles, columns=["Time", "Open", "High", "Low", "Close", "Volume"])
+        df["Time"] = pd.to_datetime(df["Time"], unit="s", utc=True).dt.tz_convert("Asia/Kolkata")
+        df[["Open", "High", "Low", "Close", "Volume"]] = df[["Open", "High", "Low", "Close", "Volume"]].apply(
+            pd.to_numeric, errors="coerce"
+        )
+        df = df.dropna(subset=["Open", "High", "Low", "Close"]).sort_values("Time").reset_index(drop=True)
+
+        # Drop the currently-forming candle (if any) — a signal must only
+        # ever be generated from a candle that has COMPLETELY closed.
+        if len(df) > 0 and not _is_intraday_candle_closed(df["Time"].iloc[-1], FO_15M_CISD_RESOLUTION_MINUTES):
+            df = df.iloc[:-1].reset_index(drop=True)
+
+        if len(df) < 30:
+            return None, None
+
+        smc_structure, cisd_signal, event_ts = _calculate_smc_and_cisd(df)
+        if cisd_signal == "None" or event_ts is None:
+            return None, None
+
+        # Belt-and-braces: the confirming candle itself must be closed too
+        # (guaranteed by the trim above, kept explicit for future-proofing).
+        if not _is_intraday_candle_closed(event_ts, FO_15M_CISD_RESOLUTION_MINUTES):
+            return None, None
+
+        last_close = float(df["Close"].iloc[-1])
+        atr = float(calculate_atr(df).iloc[-1])
+        if pd.isna(atr) or atr <= 0:
+            atr = last_close * 0.005
+
+        is_up = "Bullish" in cisd_signal
+        signal_label = "🟢 ▲ CISD BUY" if is_up else "🔴 ▼ CISD SELL"
+
+        entry = round(last_close, 2)
+        if is_up:
+            sl = round(entry - 1.0 * atr, 2)
+            t1 = round(entry + 1.0 * atr, 2)
+            t2 = round(entry + 1.8 * atr, 2)
+            t3 = round(entry + 2.6 * atr, 2)
+        else:
+            sl = round(entry + 1.0 * atr, 2)
+            t1 = round(entry - 1.0 * atr, 2)
+            t2 = round(entry - 1.8 * atr, 2)
+            t3 = round(entry - 2.6 * atr, 2)
+
+        risk = abs(entry - sl)
+        reward = abs(t1 - entry)
+        rr_ratio = round(reward / risk, 2) if risk > 0 else 0.0
+
+        rsi_val = round(float(calculate_rsi(df["Close"]).iloc[-1]), 1)
+        vol_avg20 = df["Volume"].tail(20).mean()
+        rvol_raw = round(float(df["Volume"].iloc[-1] / vol_avg20), 2) if vol_avg20 > 0 else 0.0
+
+        ai_score = round(min(max(50 + (rvol_raw * 10) + (10 if is_up else -10) + (rsi_val - 50) * 0.3, 0), 100), 1)
+        confidence = round(min(95.0, max(35.0, 55 + min(rvol_raw, 3) * 8 + rr_ratio * 3)), 1)
+
+        stock_ticker = symbol.replace("NSE:", "").replace("-EQ", "")
+
+        # Signal Date/Time = timestamp of the actual 15-min candle whose
+        # CLOSE confirmed this CISD shift (event_ts from
+        # _calculate_smc_and_cisd) — never scan/system time. Real intraday
+        # candle → used as-is (is_daily=False), e.g. 09:30:00 IST. This
+        # value stays fixed until a NEW confirming candle fires a new signal.
+        signal_date_str, signal_time_str = _format_signal_timestamp(event_ts, is_daily=False)
+
+        reason = (
+            f"15-Min CISD {'bullish' if is_up else 'bearish'} shift confirmed on completed candle close "
+            f"(RSI {rsi_val}, RVOL {_format_rvol_display(rvol_raw)})"
+        )
+
+        row = {
+            "Signal Date": signal_date_str,
+            "Signal Time": signal_time_str,
+            "Stock": stock_ticker,
+            "LTP": round(last_close, 2),
+            "CISD Signal": signal_label,
+            "Entry": entry,
+            "Stop Loss": sl,
+            "Target 1": t1,
+            "Target 2": t2,
+            "Target 3": t3,
+            "Confidence %": confidence,
+            "AI Score": ai_score,
+            "Reason": reason,
+        }
+        return row, None
+    except (KeyError, IndexError, TypeError, ValueError, ZeroDivisionError, AttributeError) as e:
+        return None, f"{symbol}: analysis error ({type(e).__name__})"
+
+
+def run_fo_15min_cisd_scan(fyers, symbols: List[str]):
+    """Threaded, rate-limited 15-min CISD scan restricted to F&O stocks
+    (pass the F&O-filtered universe from load_nse_fo_stock_symbols() —
+    index symbols are already excluded there)."""
+    symbols = _validate_symbols(symbols)
+    results, errors = [], []
+    stats = ScanStats(total=len(symbols))
+    progress = st.progress(0.0, text=f"Scanning F&O 15-Min CISD 0 / {len(symbols)}")
+    done = 0
+    for i in range(0, len(symbols), BATCH_SIZE):
+        batch = symbols[i:i + BATCH_SIZE]
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            futures = {executor.submit(_fetch_fo_15min_cisd_signal, fyers, s): s for s in batch}
+            for future in as_completed(futures):
+                try:
+                    res, err = future.result()
+                except Exception as e:
+                    res, err = None, f"{futures[future]}: worker error ({type(e).__name__})"
+                if res:
+                    results.append(res)
+                if err:
+                    errors.append(err)
+                stats.record(has_result=bool(res), has_error=bool(err))
+                done += 1
+                progress.progress(done / len(symbols), text=f"Scanning F&O 15-Min CISD {done} / {len(symbols)}")
+        if i + BATCH_SIZE < len(symbols):
+            time.sleep(BATCH_PAUSE_SECONDS)
+    progress.empty()
+    return results, errors, stats
+
+
 # ── Main Application ──────────────────────────────────────────────────────────
 def show_scanner(fyers):
     st.title("🚀 NSE AI PRO V13 — Institutional Scanner")
@@ -2252,10 +2418,10 @@ def show_scanner(fyers):
         _display_scan_summary(st.session_state["scan_stats"])
 
     tab_scanner, tab_intraday, tab_swing, tab_fo, \
-        tab_intraday_cisd, tab_fo_cisd, tab_golden_death, tab_premarket = st.tabs(
+        tab_intraday_cisd, tab_fo_cisd, tab_golden_death, tab_premarket, tab_fo_15m_cisd = st.tabs(
         ["📊 Full Scanner", "⚡ Intraday Scanner", "📈 Swing Trade Scanner", "🏛️ F&O Stocks Scanner",
          "🕐 Intraday CISD Signals", "🎯 F&O CISD Scanner", "✝️ Swing Trading (Golden/Death Cross)",
-         "🌅 Pre-Market Scanner"]
+         "🌅 Pre-Market Scanner", "🎯 NSE F&O 15-Min CISD Scanner"]
     )
 
     # ── Full Scanner tab ─────────────────────────────────────────────────
@@ -2618,6 +2784,57 @@ def show_scanner(fyers):
             with st.expander(f"⚠️ Skipped/failed symbols ({len(st.session_state['premarket_errors'])})"):
                 st.caption("Showing up to 20 — most stocks are simply skipped for missing/invalid data, not app errors.")
                 st.text("\n".join(st.session_state["premarket_errors"][:20]))
+
+    # ── NSE F&O 15-Minute CISD Scanner tab (new) ─────────────────────────
+    with tab_fo_15m_cisd:
+        st.caption(
+            "Dedicated 15-minute CISD scanner — F&O stocks only (index symbols excluded). "
+            "A signal is generated ONLY after a 15-minute candle has fully closed; the "
+            "currently-forming candle is always dropped before detection. Signal Date/Time "
+            "stay fixed until a new confirming candle produces a new signal."
+        )
+        fo15_symbols = load_nse_fo_stock_symbols()
+        st.caption(f"Loaded {len(fo15_symbols)} F&O-permitted NSE stocks (indices excluded).")
+
+        if not fo15_symbols:
+            st.warning("No F&O stock symbols loaded — check network access to public.fyers.in.")
+        else:
+            fo15_limit = st.number_input(
+                "Limit F&O symbols (0 = all)", min_value=0, max_value=len(fo15_symbols),
+                value=len(fo15_symbols), step=25, key="fo15_limit",
+            )
+            fo15_universe = fo15_symbols if fo15_limit == 0 else fo15_symbols[:fo15_limit]
+
+            if st.button(f"🎯 Run F&O 15-Min CISD Scan ({len(fo15_universe)} symbols)", key="fo15_run"):
+                with st.spinner("Scanning F&O stocks for fully-closed 15-min CISD signals…"):
+                    fo15_results, fo15_errors, fo15_stats = run_fo_15min_cisd_scan(fyers, fo15_universe)
+                    fo15_df = pd.DataFrame(fo15_results)
+
+                st.session_state["fo15_cisd_df"] = fo15_df
+                st.session_state["fo15_cisd_errors"] = fo15_errors
+                st.session_state["fo15_cisd_stats"] = fo15_stats
+
+            if "fo15_cisd_stats" in st.session_state:
+                _display_scan_summary(st.session_state["fo15_cisd_stats"])
+
+            fo15_df = st.session_state.get("fo15_cisd_df")
+            if fo15_df is not None and not fo15_df.empty:
+                fo15_sorted = fo15_df.sort_values("Confidence %", ascending=False)
+                st.dataframe(_style_dataframe(fo15_sorted), use_container_width=True, height=500)
+                st.download_button(
+                    "📥 Download F&O 15-Min CISD Signals as Excel",
+                    data=to_excel_bytes(fo15_sorted, "F&O 15-Min CISD"),
+                    file_name=f"nse_fo_15min_cisd_{_now_ist().strftime('%Y%m%d_%H%M')}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key="dl_fo15",
+                )
+            else:
+                st.info("Run an F&O 15-Min CISD scan above to see live signals here.")
+
+            if st.session_state.get("fo15_cisd_errors"):
+                with st.expander(f"⚠️ Skipped/failed symbols ({len(st.session_state['fo15_cisd_errors'])})"):
+                    st.caption("Showing up to 20 — most stocks are simply skipped for missing/invalid data, not app errors.")
+                    st.text("\n".join(st.session_state["fo15_cisd_errors"][:20]))
 
     if st.session_state.get("scan_errors"):
         with st.expander(f"⚠️ Skipped/failed symbols ({len(st.session_state['scan_errors'])})"):
