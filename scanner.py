@@ -1070,6 +1070,93 @@ def _calculate_smc_and_cisd(df: pd.DataFrame):
     return smc_structure, cisd_signal, event_ts
 
 
+# ══════════════════════════════════════════════════════════════════════════
+# ── ORDER BLOCK DETECTION (Smart Money Concepts) — NEW, purely additive ────
+# Detects Bullish / Bearish Order Blocks from daily candles. Does not read
+# or modify anything computed by _calculate_smc_and_cisd — it only reuses
+# its `smc_structure` output (BOS/CHOCH label) as a confirmation input.
+#
+# Bullish OB: last bearish candle before an impulsive bullish BOS move,
+#   with above-average volume on that candle, where price has since
+#   revisited the candle's High-Low zone.
+# Bearish OB: mirror image (last bullish candle before an impulsive
+#   bearish BOS move, above-average volume, zone revisited).
+# ══════════════════════════════════════════════════════════════════════════
+
+_OB_LOOKBACK = 20
+_OB_MIN_MOVE_PCT = 1.5          # minimum impulsive move after the OB candle
+_OB_VOL_MULTIPLIER = 1.2        # min candle volume vs 20-period avg to qualify
+
+
+def _detect_order_blocks(df: pd.DataFrame, smc_structure: str) -> Tuple[str, str, str, str]:
+    """Returns (Bullish Order Block, Bearish Order Block, Order Block Zone,
+    Order Block Strength). Either side shows 'No' when no valid Order Block
+    is found; Zone/Strength show '—' when neither side has a valid OB."""
+    if len(df) < 15:
+        return "No", "No", "—", "—"
+
+    d = df.reset_index(drop=True)
+    lookback = min(_OB_LOOKBACK, len(d) - 3)
+    recent = d.tail(lookback + 2).reset_index(drop=True)
+
+    vol_avg = d["Volume"].tail(20).mean()
+    last_close = float(d["Close"].iloc[-1])
+
+    bullish_label, bearish_label = "No", "No"
+    ob_zone, ob_strength = "—", "—"
+
+    is_bos_bullish = smc_structure in ("BOS 📈", "CHOCH 🐂")
+    is_bos_bearish = smc_structure in ("BOS 📉", "CHOCH 🐻")
+
+    def _strength(move_pct: float, candle_vol: float) -> str:
+        if move_pct >= 4 and vol_avg > 0 and candle_vol >= vol_avg * 2:
+            return "Strong"
+        if move_pct >= 2.5 or (vol_avg > 0 and candle_vol >= vol_avg * 1.5):
+            return "Medium"
+        return "Weak"
+
+    try:
+        if is_bos_bullish:
+            for i in range(len(recent) - 2, 0, -1):
+                candle = recent.iloc[i]
+                if not (candle["Close"] < candle["Open"]):
+                    continue
+                if i + 1 >= len(recent):
+                    continue
+                move_after = recent["Close"].iloc[i + 1:].max()
+                move_pct = ((move_after - candle["Close"]) / candle["Close"] * 100) if candle["Close"] else 0
+                vol_ok = vol_avg > 0 and candle["Volume"] >= vol_avg * _OB_VOL_MULTIPLIER
+                if move_pct >= _OB_MIN_MOVE_PCT and vol_ok:
+                    zone_low, zone_high = round(float(candle["Low"]), 2), round(float(candle["High"]), 2)
+                    if zone_low <= last_close <= zone_high * 1.02:  # price revisited the zone
+                        bullish_label = "🟢 Bullish OB"
+                        ob_zone = f"{zone_low}–{zone_high}"
+                        ob_strength = _strength(move_pct, float(candle["Volume"]))
+                    break
+
+        if is_bos_bearish and bullish_label == "No":
+            for i in range(len(recent) - 2, 0, -1):
+                candle = recent.iloc[i]
+                if not (candle["Close"] > candle["Open"]):
+                    continue
+                if i + 1 >= len(recent):
+                    continue
+                move_after = recent["Close"].iloc[i + 1:].min()
+                move_pct = ((candle["Close"] - move_after) / candle["Close"] * 100) if candle["Close"] else 0
+                vol_ok = vol_avg > 0 and candle["Volume"] >= vol_avg * _OB_VOL_MULTIPLIER
+                if move_pct >= _OB_MIN_MOVE_PCT and vol_ok:
+                    zone_low, zone_high = round(float(candle["Low"]), 2), round(float(candle["High"]), 2)
+                    if zone_low * 0.98 <= last_close <= zone_high:  # price revisited the zone
+                        bearish_label = "🔴 Bearish OB"
+                        ob_zone = f"{zone_low}–{zone_high}"
+                        ob_strength = _strength(move_pct, float(candle["Volume"]))
+                    break
+    except (KeyError, IndexError, TypeError, ValueError, ZeroDivisionError, AttributeError):
+        return "No", "No", "—", "—"
+
+    return bullish_label, bearish_label, ob_zone, ob_strength
+
+
 # ── Analysis core ─────────────────────────────────────────────────────────────
 def _analyse(symbol: str, df: pd.DataFrame, nifty_close: Optional[pd.Series], enable_xgboost: bool) -> dict:
     close, volume = df["Close"], df["Volume"]
@@ -1097,6 +1184,10 @@ def _analyse(symbol: str, df: pd.DataFrame, nifty_close: Optional[pd.Series], en
         gap_str += " 🔴"
 
     smc_structure, cisd_signal, _signal_event_ts = _calculate_smc_and_cisd(df)
+
+    # NEW: Order Block detection — purely additive, reuses smc_structure
+    # already computed above as its BOS/CHOCH confirmation input.
+    bullish_ob, bearish_ob, ob_zone, ob_strength = _detect_order_blocks(df, smc_structure)
 
     h52w = df["High"].max()
     l52w = df["Low"].min()
@@ -1193,6 +1284,10 @@ def _analyse(symbol: str, df: pd.DataFrame, nifty_close: Optional[pd.Series], en
         "Stoploss": stoploss,
         "SMC Structure": smc_structure,
         "CISD": cisd_signal,
+        "Bullish Order Block": bullish_ob,
+        "Bearish Order Block": bearish_ob,
+        "Order Block Zone": ob_zone,
+        "Order Block Strength": ob_strength,
         "XGBoost Trend": xgb_trend,
         "XGBoost Confidence (%)": xgb_confidence,
         "News": news,
@@ -1323,6 +1418,10 @@ def calculate_intraday_signal(row: dict) -> dict:
             "Risk Reward Ratio": rr_ratio,
             "Confidence %": confidence,
             "AI Score": ai_score,
+            "Bullish Order Block": row.get("Bullish Order Block", "No"),
+            "Bearish Order Block": row.get("Bearish Order Block", "No"),
+            "Order Block Zone": row.get("Order Block Zone", "—"),
+            "Order Block Strength": row.get("Order Block Strength", "—"),
             "Expected Holding Time": holding_time,
             "Exit Condition": exit_condition,
             "Reason": reason_str,
@@ -1339,6 +1438,10 @@ def calculate_intraday_signal(row: dict) -> dict:
             "Stop Loss": None, "Target 1": None, "Target 2": None, "Target 3": None,
             "Risk Reward Ratio": 0.0, "Confidence %": 0.0,
             "AI Score": row.get("AI Score", 0),
+            "Bullish Order Block": row.get("Bullish Order Block", "No"),
+            "Bearish Order Block": row.get("Bearish Order Block", "No"),
+            "Order Block Zone": row.get("Order Block Zone", "—"),
+            "Order Block Strength": row.get("Order Block Strength", "—"),
             "Expected Holding Time": "N/A",
             "Exit Condition": "Insufficient data for this stock",
             "Reason": "Insufficient data",
@@ -1446,6 +1549,10 @@ def calculate_swing_signal(row: dict) -> dict:
             "Confidence %": confidence,
             "AI Score": ai_score,
             "Risk Reward Ratio": rr_ratio,
+            "Bullish Order Block": row.get("Bullish Order Block", "No"),
+            "Bearish Order Block": row.get("Bearish Order Block", "No"),
+            "Order Block Zone": row.get("Order Block Zone", "—"),
+            "Order Block Strength": row.get("Order Block Strength", "—"),
             "Reason": reason_str,
         }
     except (KeyError, IndexError, TypeError, ValueError, ZeroDivisionError, AttributeError):
@@ -1460,6 +1567,10 @@ def calculate_swing_signal(row: dict) -> dict:
             "Exit Condition": "Insufficient data for this stock",
             "Trend Strength": "🔴 Weak", "Confidence %": 0.0,
             "AI Score": row.get("AI Score", 0), "Risk Reward Ratio": 0.0,
+            "Bullish Order Block": row.get("Bullish Order Block", "No"),
+            "Bearish Order Block": row.get("Bearish Order Block", "No"),
+            "Order Block Zone": row.get("Order Block Zone", "—"),
+            "Order Block Strength": row.get("Order Block Strength", "—"),
             "Reason": "Insufficient data",
         }
 
