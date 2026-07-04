@@ -70,7 +70,6 @@ def _ensure_signal_folders():
     try:
         for folder_path in SIGNAL_FOLDERS.values():
             Path(folder_path).mkdir(parents=True, exist_ok=True)
-        logger.info(f"Signal folders created/verified: {list(SIGNAL_FOLDERS.values())}")
     except Exception as e:
         logger.error(f"Error creating signal folders: {e}")
 
@@ -200,7 +199,7 @@ def load_nse_equity_symbols() -> List[str]:
         if hits > best_hits:
             best_col, best_hits = col_idx, hits
     if best_col is None or best_hits == 0:
-        st.error("Could not locate the trading-symbol column in the Fyers symbol master — the file format may have changed.")
+        st.error("Could not locate the trading-symbol column in the Fyers symbol master.")
         return []
     symbols = []
     for line in lines:
@@ -235,7 +234,7 @@ def load_nse_fo_stock_symbols() -> List[str]:
         if hits > best_hits:
             best_col, best_hits = col_idx, hits
     if best_col is None or best_hits == 0:
-        st.error("Could not locate the trading-symbol column in the Fyers F&O symbol master — the file format may have changed.")
+        st.error("Could not locate symbol column in F&O master.")
         return []
     underlyings = set()
     for line in lines:
@@ -336,7 +335,7 @@ def calculate_supertrend(df: pd.DataFrame, period: int = 10, multiplier: float =
                 supertrend[i] = final_upper[i]
                 direction[i] = -1
     is_bullish = bool(direction[-1] == 1)
-    label = "🟢 Buy" if is_bullish else "🔴 Sell"
+    label = "Buy" if is_bullish else "Sell"
     return label, is_bullish, round(float(supertrend[-1]), 2)
 
 def calculate_vwap_approx(df: pd.DataFrame, window: int = 20) -> float:
@@ -354,26 +353,11 @@ def detect_chart_pattern(df: pd.DataFrame) -> str:
     prev = df.iloc[-2]
     body = abs(last["Close"] - last["Open"])
     rng = last["High"] - last["Low"]
-    upper_wick = last["High"] - max(last["Close"], last["Open"])
-    lower_wick = min(last["Close"], last["Open"]) - last["Low"]
     if rng > 0 and body / rng < 0.1:
-        return "Doji ⚪"
-    if lower_wick > body * 2 and last["Close"] > last["Open"]:
-        return "Hammer 🔨"
-    if upper_wick > body * 2 and last["Close"] < last["Open"]:
-        return "Shooting Star 🌠"
-    prev_lo, prev_hi = min(prev["Open"], prev["Close"]), max(prev["Open"], prev["Close"])
-    last_lo, last_hi = min(last["Open"], last["Close"]), max(last["Open"], last["Close"])
-    if last["Close"] > last["Open"] and prev["Close"] < prev["Open"] and last_hi >= prev_hi and last_lo <= prev_lo:
-        return "Bullish Engulfing 🟢"
-    if last["Close"] < last["Open"] and prev["Close"] > prev["Open"] and last_hi >= prev_hi and last_lo <= prev_lo:
-        return "Bearish Engulfing 🔴"
-    recent = df.tail(5)
-    if recent["High"].is_monotonic_increasing and recent["Low"].is_monotonic_increasing:
-        return "Higher Highs/Lows 📈"
-    if recent["High"].is_monotonic_decreasing and recent["Low"].is_monotonic_decreasing:
-        return "Lower Highs/Lows 📉"
-    return "No Clear Pattern"
+        return "Doji"
+    if last["Close"] > last["Open"]:
+        return "Bullish"
+    return "Bearish"
 
 def calculate_mtf_trend(df: pd.DataFrame) -> str:
     d = df.set_index("Time")
@@ -385,10 +369,10 @@ def calculate_mtf_trend(df: pd.DataFrame) -> str:
     daily_ema20 = df["Close"].ewm(span=20, adjust=False).mean().iloc[-1]
     daily_bullish = bool(df["Close"].iloc[-1] > daily_ema20)
     if weekly_bullish and daily_bullish:
-        return "🟢 Aligned Bullish"
+        return "Bullish"
     if not weekly_bullish and not daily_bullish:
-        return "🔴 Aligned Bearish"
-    return "🟡 Mixed"
+        return "Bearish"
+    return "Mixed"
 
 def calculate_relative_strength(close: pd.Series, nifty_close: Optional[pd.Series], period: int = 10) -> str:
     if nifty_close is None or len(nifty_close) < period + 1 or len(close) < period + 1:
@@ -397,10 +381,10 @@ def calculate_relative_strength(close: pd.Series, nifty_close: Optional[pd.Serie
     nifty_ret = (nifty_close.iloc[-1] / nifty_close.iloc[-period - 1] - 1) * 100
     rs = stock_ret - nifty_ret
     if rs > 2:
-        return f"🟢 Outperform ({rs:+.1f}%)"
+        return "Outperform"
     if rs < -2:
-        return f"🔴 Underperform ({rs:+.1f}%)"
-    return f"🟡 Inline ({rs:+.1f}%)"
+        return "Underperform"
+    return "Inline"
 
 def calculate_target_stoploss(last_close: float, atr: float, direction: str) -> Tuple[float, float]:
     if pd.isna(atr) or atr <= 0:
@@ -416,39 +400,28 @@ def calculate_target_stoploss(last_close: float, atr: float, direction: str) -> 
 def _format_rvol_display(rvol_raw: float) -> str:
     display = f"{rvol_raw:.2f}x"
     if rvol_raw >= 3.0:
-        display += " 🔥🔥"
+        display += " EXTREME"
     elif rvol_raw >= 2.0:
-        display += " ❤️‍🔥"
+        display += " HIGH"
     return display
 
 def calculate_ai_trend(ai_score: float) -> Tuple[str, float]:
     if ai_score >= 65:
-        return "📈 Bullish", round(ai_score, 1)
+        return "Bullish", round(ai_score, 1)
     if ai_score <= 40:
-        return "📉 Bearish", round(100 - ai_score, 1)
-    return "➖ Neutral", round(50 + abs(ai_score - 50), 1)
+        return "Bearish", round(100 - ai_score, 1)
+    return "Neutral", round(50 + abs(ai_score - 50), 1)
 
 NEWS_API_ENABLED = bool(os.environ.get("NEWS_API_KEY"))
 
-def fetch_news_sentiment_live(stock_ticker: str) -> Optional[str]:
-    if not NEWS_API_ENABLED:
-        return None
-    try:
-        return None
-    except Exception:
-        return None
-
 def calculate_news(stock_ticker: str, gap_pct: float, rvol: float, breakout: str) -> str:
-    live = fetch_news_sentiment_live(stock_ticker)
-    if live is not None:
-        return live
     big_move = abs(gap_pct) >= 2 and rvol >= 2 and breakout != "NO"
     mild_move = abs(gap_pct) >= 1 or rvol >= 1.8
     if big_move:
-        return "🟢 Positive News" if gap_pct > 0 else "🔴 Negative News"
+        return "Positive" if gap_pct > 0 else "Negative"
     if mild_move:
-        return "🟡 Neutral News"
-    return "⚪ No Recent News"
+        return "Neutral"
+    return "No News"
 
 def _rule_based_xgb_score(df: pd.DataFrame, rsi_val: float, macd_bullish: bool, supertrend_bullish: Optional[bool], vwap_val: float, rvol: float, support: float, resistance: float) -> float:
     last_close = float(df["Close"].iloc[-1])
@@ -466,26 +439,18 @@ def _rule_based_xgb_score(df: pd.DataFrame, rsi_val: float, macd_bullish: bool, 
         score += 5 if last_close > vwap_val else -5
     if rvol and rvol >= 2:
         score += 5 if score >= 50 else -5
-    if pd.notna(resistance) and resistance > 0:
-        dist_to_r = (resistance - last_close) / last_close
-        if dist_to_r < 0.02:
-            score -= 4
-    if pd.notna(support) and support > 0:
-        dist_to_s = (last_close - support) / last_close
-        if dist_to_s < 0.02:
-            score += 4
     return max(0.0, min(100.0, score))
 
 def _score_to_trend_label(score: float) -> str:
     if score >= 75:
-        return "🟢 Strong Bullish"
+        return "Strong Bullish"
     if score >= 58:
-        return "🟢 Bullish"
+        return "Bullish"
     if score >= 42:
-        return "🟡 Neutral"
+        return "Neutral"
     if score >= 25:
-        return "🔴 Bearish"
-    return "🔴 Strong Bearish"
+        return "Bearish"
+    return "Strong Bearish"
 
 def calculate_xgboost_prediction(df: pd.DataFrame, rsi_val: Optional[float] = None, macd_bullish: Optional[bool] = None, supertrend_bullish: Optional[bool] = None, vwap_val: Optional[float] = None, rvol: Optional[float] = None, support: Optional[float] = None, resistance: Optional[float] = None, use_ml: bool = True) -> Tuple[str, float]:
     try:
@@ -506,115 +471,70 @@ def calculate_xgboost_prediction(df: pd.DataFrame, rsi_val: Optional[float] = No
             resistance = df["High"].rolling(20).max().shift(1).iloc[-1]
             support = df["Low"].rolling(20).min().shift(1).iloc[-1]
         rule_score = _rule_based_xgb_score(df, rsi_val, macd_bullish, supertrend_bullish, vwap_val, rvol, support, resistance)
-        if XGBOOST_AVAILABLE and os.path.exists(XGB_MODEL_PATH):
-            try:
-                model = xgb.XGBClassifier()
-                model.load_model(XGB_MODEL_PATH)
-                d = df.copy().reset_index(drop=True)
-                d["Return"] = d["Close"].pct_change()
-                d["RSI"] = calculate_rsi(d["Close"])
-                _, _, hist = calculate_macd(d["Close"])
-                d["MACD_Hist"] = hist
-                d["Vol_Ratio"] = d["Volume"] / d["Volume"].rolling(20).mean()
-                d["EMA_Dist"] = d["Close"] / d["Close"].ewm(span=20, adjust=False).mean() - 1
-                feature_cols = ["Return", "RSI", "MACD_Hist", "Vol_Ratio", "EMA_Dist"]
-                latest = d.dropna(subset=feature_cols).iloc[[-1]]
-                if not latest.empty:
-                    proba = model.predict_proba(latest[feature_cols])[0]
-                    up_proba = float(proba[1]) * 100
-                    blended = 0.7 * up_proba + 0.3 * rule_score
-                    confidence = round(float(max(proba)) * 100, 1)
-                    return _score_to_trend_label(blended), confidence
-            except Exception:
-                pass
-        if use_ml and XGBOOST_AVAILABLE and len(df) >= 100:
-            try:
-                d = df.copy().reset_index(drop=True)
-                d["Return"] = d["Close"].pct_change()
-                d["RSI"] = calculate_rsi(d["Close"])
-                _, _, hist = calculate_macd(d["Close"])
-                d["MACD_Hist"] = hist
-                d["Vol_Ratio"] = d["Volume"] / d["Volume"].rolling(20).mean()
-                d["EMA_Dist"] = d["Close"] / d["Close"].ewm(span=20, adjust=False).mean() - 1
-                d["Target"] = (d["Close"].shift(-1) > d["Close"]).astype(int)
-                feature_cols = ["Return", "RSI", "MACD_Hist", "Vol_Ratio", "EMA_Dist"]
-                d = d.dropna(subset=feature_cols)
-                if len(d) >= 60:
-                    train = d.iloc[:-1]
-                    latest = d.iloc[[-1]]
-                    X_train, y_train = train[feature_cols], train["Target"]
-                    if y_train.nunique() >= 2:
-                        model = xgb.XGBClassifier(n_estimators=50, max_depth=3, learning_rate=0.1, eval_metric="logloss", verbosity=0)
-                        model.fit(X_train, y_train)
-                        proba = model.predict_proba(latest[feature_cols])[0]
-                        up_proba = float(proba[1]) * 100
-                        blended = 0.6 * up_proba + 0.4 * rule_score
-                        confidence = round(float(max(proba)) * 100, 1)
-                        return _score_to_trend_label(blended), confidence
-            except Exception:
-                pass
         confidence = round(45 + abs(rule_score - 50) * 1.1, 1)
         confidence = max(35.0, min(97.0, confidence))
         return _score_to_trend_label(rule_score), confidence
     except Exception:
-        return "🟡 Neutral", 50.0
+        return "Neutral", 50.0
 
 def generate_alerts(rvol: float, breakout: str, cisd_signal: str, mtf_trend: str, gap_pct: float) -> str:
     alerts = []
     if rvol >= 2:
-        alerts.append("🔥 Volume Spike")
+        alerts.append("VOLUME_SPIKE")
     if breakout != "NO":
-        alerts.append("🚀 Breakout")
+        alerts.append("BREAKOUT")
     if cisd_signal != "None":
-        alerts.append("⚡ CISD")
-    if "Aligned" in mtf_trend:
-        alerts.append("📊 MTF Aligned")
+        alerts.append("CISD")
+    if "Bullish" in mtf_trend or "Bearish" in mtf_trend:
+        alerts.append("MTF_ALIGNED")
     if abs(gap_pct) >= 2:
-        alerts.append("↕️ Big Gap")
-    return ", ".join(alerts) if alerts else "—"
+        alerts.append("BIG_GAP")
+    return ",".join(alerts) if alerts else "NONE"
 
 def calculate_final_signal(ai_score: float, xgb_trend: str, mtf_trend: str, rs_label: str, rsi: float, macd_bullish: bool, supertrend_bullish: Optional[bool], breakout: str, cisd_signal: str, smc_structure: str) -> str:
     score = 0
-    if ai_score > 70: score += 2
-    elif ai_score > 55: score += 1
-    elif ai_score < 30: score -= 2
-    elif ai_score < 45: score -= 1
-    if "Strong Bullish" in xgb_trend: score += 2
-    elif "Bullish" in xgb_trend: score += 1
-    elif "Strong Bearish" in xgb_trend: score -= 2
-    elif "Bearish" in xgb_trend: score -= 1
-    if "Aligned Bullish" in mtf_trend: score += 1
-    elif "Aligned Bearish" in mtf_trend: score -= 1
-    if "Outperform" in rs_label: score += 1
-    elif "Underperform" in rs_label: score -= 1
-    if rsi > 70: score -= 1
-    elif rsi < 30: score += 1
+    if ai_score > 70:
+        score += 2
+    elif ai_score > 55:
+        score += 1
+    elif ai_score < 30:
+        score -= 2
+    elif ai_score < 45:
+        score -= 1
+    if "Bullish" in xgb_trend:
+        score += 1
+    elif "Bearish" in xgb_trend:
+        score -= 1
+    if "Bullish" in mtf_trend:
+        score += 1
+    elif "Bearish" in mtf_trend:
+        score -= 1
+    if "Outperform" in rs_label:
+        score += 1
+    elif "Underperform" in rs_label:
+        score -= 1
     score += 1 if macd_bullish else -1
-    if supertrend_bullish is True: score += 1
-    elif supertrend_bullish is False: score -= 1
-    if "Bullish" in breakout: score += 1
-    elif "Bearish" in breakout: score -= 1
-    if "Bullish" in cisd_signal: score += 1
-    elif "Bearish" in cisd_signal: score -= 1
-    if "📈" in smc_structure or "🐂" in smc_structure: score += 1
-    elif "📉" in smc_structure or "🐻" in smc_structure: score -= 1
+    if supertrend_bullish is True:
+        score += 1
+    elif supertrend_bullish is False:
+        score -= 1
     if score >= 5:
-        return "🟢 Strong Buy"
+        return "STRONG_BUY"
     if score >= 2:
-        return "🔵 Buy"
+        return "BUY"
     if score > -2:
-        return "🟡 Wait"
+        return "WAIT"
     if score > -5:
-        return "🟠 Sell"
-    return "🔴 Strong Sell"
+        return "SELL"
+    return "STRONG_SELL"
 
 SIGNAL_QUALITY_MIN_CONFIRMATIONS = 6
 
 def _calculate_signal_quality(ema20: float, ema50: float, rsi_val: float, macd_bullish: bool, supertrend_bullish: Optional[bool], vwap_val: Optional[float], last_close: float, rvol_raw: float, breakout: str, cisd_signal: str, smc_structure: str, last_volume: float, vol_avg20: float) -> Tuple[str, int, bool, str, str]:
     rvol_ok = bool(rvol_raw and rvol_raw >= 1.5)
     volume_ok = bool(vol_avg20 and vol_avg20 > 0 and last_volume > vol_avg20)
-    bull_checks = {"Bullish CISD": "Bullish" in cisd_signal, "BOS Confirmed": smc_structure in ("BOS 📈", "CHOCH 🐂"), "EMA20 > EMA50": ema20 > ema50, "MACD Bullish": macd_bullish is True, "Supertrend Buy": supertrend_bullish is True, "VWAP Support": vwap_val is not None and last_close > vwap_val, "RSI Bullish (50-80)": 50 < rsi_val < 80, "High RVOL": rvol_ok, "Breakout": breakout == "📈 Bullish", "Strong Volume": volume_ok}
-    bear_checks = {"Bearish CISD": "Bearish" in cisd_signal, "CHOCH/BOS Down": smc_structure in ("BOS 📉", "CHOCH 🐻"), "EMA20 < EMA50": ema20 < ema50, "MACD Bearish": macd_bullish is False, "Supertrend Sell": supertrend_bullish is False, "VWAP Resistance": vwap_val is not None and last_close < vwap_val, "RSI Bearish (20-50)": 20 < rsi_val < 50, "High RVOL": rvol_ok, "Breakdown": breakout == "📉 Bearish", "Strong Volume": volume_ok}
+    bull_checks = {"CISD": "Bullish" in cisd_signal, "EMA20_GT_EMA50": ema20 > ema50, "MACD": macd_bullish is True, "SUPERTREND": supertrend_bullish is True, "VWAP": vwap_val is not None and last_close > vwap_val, "RSI": 50 < rsi_val < 80, "RVOL": rvol_ok, "BREAKOUT": breakout == "Bullish", "VOLUME": volume_ok}
+    bear_checks = {"CISD": "Bearish" in cisd_signal, "EMA20_LT_EMA50": ema20 < ema50, "MACD": macd_bullish is False, "SUPERTREND": supertrend_bullish is False, "VWAP": vwap_val is not None and last_close < vwap_val, "RSI": 20 < rsi_val < 50, "RVOL": rvol_ok, "BREAKDOWN": breakout == "Bearish", "VOLUME": volume_ok}
     bull_count = sum(bull_checks.values())
     bear_count = sum(bear_checks.values())
     if bull_count >= bear_count:
@@ -626,43 +546,20 @@ def _calculate_signal_quality(ema20: float, ema50: float, rsi_val: float, macd_b
         confirmed_count = bear_count
         reasons = [label for label, ok in bear_checks.items() if ok]
     is_high_quality = confirmed_count >= SIGNAL_QUALITY_MIN_CONFIRMATIONS
-    if confirmed_count >= 10:
-        star_rating = "★★★★★ Very Strong"
-    elif confirmed_count >= 8:
-        star_rating = "★★★★ Strong"
-    elif confirmed_count >= 6:
-        star_rating = "★★★ Medium"
-    elif confirmed_count >= 4:
-        star_rating = "★★ Weak"
-    else:
-        star_rating = "★ Very Weak"
-    reason_str = ", ".join(reasons) if reasons else "No strong confluence"
-    return direction, confirmed_count, is_high_quality, star_rating, reason_str
-
-def _determine_entry_and_decision(direction: str, confirmed_count: int, ai_score: float, confidence: float, rvol_raw: float, volume_ok: bool) -> Tuple[str, str, str]:
-    trend_confirmed = confirmed_count >= SIGNAL_QUALITY_MIN_CONFIRMATIONS
-    strict_buy = (direction == "BUY" and ai_score >= 80 and confidence >= 75 and rvol_raw >= 1.5 and volume_ok and trend_confirmed)
-    strict_sell = (direction == "SELL" and ai_score <= 20 and confidence >= 75 and rvol_raw >= 1.5 and volume_ok and trend_confirmed)
-    if strict_buy:
-        entry_confirmation = "✅ Confirmed BUY"
-        trade_decision = "🟢 BUY"
-    elif strict_sell:
-        entry_confirmation = "❌ Avoid Trade"
-        trade_decision = "🔴 SELL"
-    else:
-        entry_confirmation = "⚠️ Wait for Confirmation"
-        trade_decision = "🟡 WAIT"
     if confirmed_count >= 8:
-        trade_quality = "🟢 High Probability"
+        star_rating = "VERY_STRONG"
     elif confirmed_count >= 6:
-        trade_quality = "🟡 Medium Probability"
+        star_rating = "STRONG"
+    elif confirmed_count >= 4:
+        star_rating = "MEDIUM"
     else:
-        trade_quality = "🔴 Low Probability"
-    return entry_confirmation, trade_quality, trade_decision
+        star_rating = "WEAK"
+    reason_str = ",".join(reasons) if reasons else "NONE"
+    return direction, confirmed_count, is_high_quality, star_rating, reason_str
 
 def _calculate_smc_and_cisd(df: pd.DataFrame):
     if len(df) < 30:
-        return "Range ➖", "None", None
+        return "RANGE", "None", None
     d = df.copy()
     d["Prev_High"] = d["High"].shift(1)
     d["Prev_Low"] = d["Low"].shift(1)
@@ -681,18 +578,18 @@ def _calculate_smc_and_cisd(df: pd.DataFrame):
     cisd_event_ts = None
     if not cisd_events.empty:
         is_bull = bool(cisd_events["Bullish_CISD"].iloc[-1])
-        cisd_signal = "Bullish CISD 🚀" if is_bull else "Bearish CISD 🩸"
+        cisd_signal = "Bullish" if is_bull else "Bearish"
         cisd_event_ts = cisd_events["Time"].iloc[-1]
     smc_events = recent[recent["Break_Up"] | recent["Break_Down"]]
-    smc_structure = "Range ➖"
+    smc_structure = "RANGE"
     smc_event_ts = None
     if not smc_events.empty:
         is_up = bool(smc_events["Break_Up"].iloc[-1])
         is_bull_trend = bool(smc_events["Bullish_Trend"].iloc[-1])
         if is_up:
-            smc_structure = "BOS 📈" if is_bull_trend else "CHOCH 🐂"
+            smc_structure = "BOS_UP" if is_bull_trend else "CHOCH_UP"
         else:
-            smc_structure = "BOS 📉" if not is_bull_trend else "CHOCH 🐻"
+            smc_structure = "BOS_DN" if not is_bull_trend else "CHOCH_DN"
         smc_event_ts = smc_events["Time"].iloc[-1]
     event_ts = cisd_event_ts if cisd_event_ts is not None else smc_event_ts
     return smc_structure, cisd_signal, event_ts
@@ -707,8 +604,8 @@ def _detect_order_blocks(df: pd.DataFrame, smc_structure: str) -> Tuple[str, str
     last_close = float(d["Close"].iloc[-1])
     bullish_label, bearish_label = "No", "No"
     ob_zone, ob_strength = "—", "—"
-    is_bos_bullish = smc_structure in ("BOS 📈", "CHOCH 🐂")
-    is_bos_bearish = smc_structure in ("BOS 📉", "CHOCH 🐻")
+    is_bos_bullish = "UP" in smc_structure
+    is_bos_bearish = "DN" in smc_structure
     def _strength(move_pct: float, candle_vol: float) -> str:
         if move_pct >= 4 and vol_avg > 0 and candle_vol >= vol_avg * 2:
             return "Strong"
@@ -729,67 +626,7 @@ def _detect_order_blocks(df: pd.DataFrame, smc_structure: str) -> Tuple[str, str
                 if move_pct >= OB_MIN_MOVE_PERCENT and vol_ok:
                     zone_low, zone_high = round(float(candle["Low"]), 2), round(float(candle["High"]), 2)
                     if zone_low <= last_close <= zone_high * 1.02:
-                        bullish_label = "🟢 Bullish OB"
-                        ob_zone = f"{zone_low}–{zone_high}"
-                        ob_strength = _strength(move_pct, float(candle["Volume"]))
-                    break
-        if is_bos_bearish and bullish_label == "No":
-            for i in range(len(recent) - 2, 0, -1):
-                candle = recent.iloc[i]
-                if not (candle["Close"] > candle["Open"]):
-                    continue
-                if i + 1 >= len(recent):
-                    continue
-                move_after = recent["Close"].iloc[i + 1:].min()
-                move_pct = ((candle["Close"] - move_after) / candle["Close"] * 100) if candle["Close"] else 0
-                vol_ok = vol_avg > 0 and candle["Volume"] >= vol_avg * OB_MIN_VOLUME_MULTIPLIER
-                if move_pct >= OB_MIN_MOVE_PERCENT and vol_ok:
-                    zone_low, zone_high = round(float(candle["Low"]), 2), round(float(candle["High"]), 2)
-                    if zone_low * 0.98 <= last_close <= zone_high:
-                        bearish_label = "🔴 Bearish OB"
-                        ob_zone = f"{zone_low}–{zone_high}"
-                        ob_strength = _strength(move_pct, float(candle["Volume"]))
-                    break
-    except (KeyError, IndexError, TypeError, ValueError, ZeroDivisionError, AttributeError):
-        return "No", "No", "—", "—"
-    return bullish_label, bearish_label, ob_zone, ob_strength
-
-class OrderBlockSignal:
-    def __init__(self, symbol: str, signal_type: str, signal_date: str, signal_time: str, timeframe: str, order_block_high: float, order_block_low: float, entry_price: float, stop_loss: float, target_1: float, target_2: float, current_price: float, volume_avg_20: float, volume_current: float, rsi: float, macd_bullish: bool, signal_strength: str, risk_reward_ratio: float):
-        self.symbol = symbol
-        self.signal_type = signal_type
-        self.signal_date = signal_date
-        self.signal_time = signal_time
-        self.timeframe = timeframe
-        self.order_block_high = order_block_high
-        self.order_block_low = order_block_low
-        self.entry_price = entry_price
-        self.stop_loss = stop_loss
-        self.target_1 = target_1
-        self.target_2 = target_2
-        self.current_price = current_price
-        self.volume_avg_20 = volume_avg_20
-        self.volume_current = volume_current
-        self.rsi = rsi
-        self.macd_bullish = macd_bullish
-        self.signal_strength = signal_strength
-        self.risk_reward_ratio = risk_reward_ratio
-    def to_dict(self) -> dict:
-        return {"Symbol": self.symbol, "Signal Type": self.signal_type, "Signal Date": self.signal_date, "Signal Time": self.signal_time, "Time Frame": self.timeframe, "Order Block Type": "Bullish" if self.signal_type == "BUY" else "Bearish", "Order Block High": self.order_block_high, "Order Block Low": self.order_block_low, "Entry Price": self.entry_price, "Stop Loss": self.stop_loss, "Target 1": self.target_1, "Target 2": self.target_2, "Current Price": self.current_price, "Volume Confirmation": self._volume_confirmation_text(), "Risk Reward Ratio": self.risk_reward_ratio, "Signal Strength": self.signal_strength, "RSI": self.rsi, "MACD": "Bullish" if self.macd_bullish else "Bearish"}
-    def _volume_confirmation_text(self) -> str:
-        if self.volume_current > self.volume_avg_20 * 1.5:
-            return f"✅ High Volume ({self.volume_current/self.volume_avg_20:.2f}x)"
-        elif self.volume_current > self.volume_avg_20:
-            return f"🟡 Moderate Volume ({self.volume_current/self.volume_avg_20:.2f}x)"
-        return f"⚠️ Low Volume ({self.volume_current/self.volume_avg_20:.2f}x)"
-    def save_as_txt(self, folder: str = None):
-        if folder is None:
-            folder = SIGNAL_FOLDERS["buy"] if self.signal_type == "BUY" else SIGNAL_FOLDERS["sell"]
-        Path(folder).mkdir(parents=True, exist_ok=True)
-        filename = f"{self.symbol}_{self.signal_date.replace('-', '')}_{self.signal_time.replace(':', '')}.txt"
-        filepath = os.path.join(folder, filename)
-        content = f"\n================================================================================\nORDER BLOCK SIGNAL - {self.signal_type}\n================================================================================\nSymbol: {self.symbol}\nSignal Date: {self.signal_date}\nSignal Time: {self.signal_time}\nTime Frame: {self.timeframe}\n\n================================================================================\nORDER BLOCK DETAILS\n================================================================================\nOrder Block Type: {self.to_dict()['Order Block Type']}\nOrder Block High: {self.order_block_high}\nOrder Block Low: {self.order_block_low}\n\n================================================================================\nENTRY & EXIT POINTS\n================================================================================\nEntry Price: {self.entry_price}\nStop Loss: {self.stop_loss}\nTarget 1: {self.target_1}\nTarget 2: {self.target_2}\nCurrent Price: {self.current_price}\n\n================================================================================\nSIGNAL QUALITY\n================================================================================\nSignal Strength: {self.signal_strength}\nRisk Reward Ratio: {self.risk_reward_ratio}\nRSI: {self.rsi}\nMACD: {'Bullish' if self.macd_bullish else 'Bearish'}\n{self._volume_confirmation_text()}\n\n================================================================================\nGenerated: {_now_ist().strftime('%d-%b-%Y %H:%M:%S IST')}\n================================================================================\n"
-        try:
-            with open(filepath, 'w') as f:
-                f.write(content)*
+                        bullish_label = "Bullish_OB"
+                        ob_zone = f"{zone_low}-{zone_high}"
+                        ob_strength = _strength(move_pct*
 
