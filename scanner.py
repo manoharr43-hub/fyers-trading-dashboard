@@ -860,3 +860,179 @@ def show_scanner(fyers):
                 )
 
                 st.success(f"{len(df)} Signals Found")
+# ==========================================================
+# PART 5
+# PROFESSIONAL DASHBOARD
+# ==========================================================
+
+from openpyxl import Workbook
+from openpyxl.styles import PatternFill, Font
+
+# ----------------------------------------------------------
+# AI RANK
+# ----------------------------------------------------------
+
+def ai_rank(score):
+
+    if score >= 90:
+        return "★★★★★"
+
+    elif score >= 80:
+        return "★★★★"
+
+    elif score >= 70:
+        return "★★★"
+
+    elif score >= 60:
+        return "★★"
+
+    return "★"
+
+# ----------------------------------------------------------
+# PRE MARKET
+# ----------------------------------------------------------
+
+def premarket_status(df):
+
+    prev_close = df["Close"].iloc[-2]
+
+    today_open = df["Open"].iloc[-1]
+
+    gap = ((today_open-prev_close)/prev_close)*100
+
+    if gap > 1:
+
+        return "Gap Up"
+
+    elif gap < -1:
+
+        return "Gap Down"
+
+    return "Flat"
+
+# ----------------------------------------------------------
+# AFTER MARKET
+# ----------------------------------------------------------
+
+def closing_strength(df):
+
+    close = df["Close"].iloc[-1]
+
+    high = df["High"].iloc[-1]
+
+    low = df["Low"].iloc[-1]
+
+    pos = (close-low)/(high-low+0.01)
+
+    if pos > 0.75:
+
+        return "Strong Close"
+
+    elif pos < 0.30:
+
+        return "Weak Close"
+
+    return "Neutral"
+
+# ----------------------------------------------------------
+# F&O
+# ----------------------------------------------------------
+
+def is_fno(symbol):
+
+    FNO = [
+
+        "NSE:RELIANCE-EQ",
+
+        "NSE:TCS-EQ",
+
+        "NSE:INFY-EQ",
+
+        "NSE:HDFCBANK-EQ",
+
+        "NSE:ICICIBANK-EQ"
+
+    ]
+
+    return symbol in FNO
+
+# ----------------------------------------------------------
+# NEWS PLACEHOLDER
+# ----------------------------------------------------------
+
+def latest_news(symbol):
+
+    return "No News"
+
+# ----------------------------------------------------------
+# EXCEL EXPORT
+# ----------------------------------------------------------
+
+def export_excel(df):
+
+    wb = Workbook()
+
+    ws = wb.active
+
+    ws.title = "Scanner"
+
+    header_fill = PatternFill(
+        fill_type="solid",
+        start_color="1F4E78"
+    )
+
+    buy_fill = PatternFill(
+        fill_type="solid",
+        start_color="00AA00"
+    )
+
+    sell_fill = PatternFill(
+        fill_type="solid",
+        start_color="FF0000"
+    )
+
+    watch_fill = PatternFill(
+        fill_type="solid",
+        start_color="FFD966"
+    )
+
+    for col, name in enumerate(df.columns,1):
+
+        c = ws.cell(row=1,column=col)
+
+        c.value = name
+
+        c.fill = header_fill
+
+        c.font = Font(
+            bold=True,
+            color="FFFFFF"
+        )
+
+    for r in df.itertuples(index=False):
+
+        ws.append(list(r))
+
+    decision_col = list(df.columns).index("Trade Decision")+1
+
+    for row in range(2,ws.max_row+1):
+
+        cell = ws.cell(row=row,column=decision_col)
+
+        if "BUY" in str(cell.value):
+
+            cell.fill = buy_fill
+
+        elif "SELL" in str(cell.value):
+
+            cell.fill = sell_fill
+
+        else:
+
+            cell.fill = watch_fill
+
+    filename = "exports/NSE_AI_PRO.xlsx"
+
+    wb.save(filename)
+
+    return filename
