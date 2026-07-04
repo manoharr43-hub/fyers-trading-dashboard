@@ -674,3 +674,189 @@ def scanner_dataframe(results):
     ]
 
     return pd.DataFrame(results)[cols]
+# ==========================================================
+# PART 4
+# FYERS HISTORY API + AUTO SCANNER
+# ==========================================================
+
+import pandas as pd
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
+
+# ==========================================================
+# TIMEFRAME MAP
+# ==========================================================
+
+FYERS_INTERVAL = {
+    "5 Minute": "5",
+    "15 Minute": "15",
+    "1 Hour": "60",
+    "Daily": "D"
+}
+
+# ==========================================================
+# GET HISTORY
+# ==========================================================
+
+def get_history(fyers, symbol, timeframe="15 Minute", candles=200):
+
+    try:
+
+        data = {
+            "symbol": symbol,
+            "resolution": FYERS_INTERVAL[timeframe],
+            "date_format": "1",
+            "range_from": "2025-01-01",
+            "range_to": datetime.now().strftime("%Y-%m-%d"),
+            "cont_flag": "1"
+        }
+
+        response = fyers.history(data)
+
+        if response.get("s") != "ok":
+            return None
+
+        df = pd.DataFrame(
+            response["candles"],
+            columns=[
+                "Timestamp",
+                "Open",
+                "High",
+                "Low",
+                "Close",
+                "Volume"
+            ]
+        )
+
+        df["Timestamp"] = pd.to_datetime(
+            df["Timestamp"],
+            unit="s"
+        )
+
+        return df.tail(candles)
+
+    except Exception:
+        return None
+
+# ==========================================================
+# DEFAULT NSE UNIVERSE
+# ==========================================================
+
+DEFAULT_STOCKS = [
+    "NSE:RELIANCE-EQ",
+    "NSE:TCS-EQ",
+    "NSE:INFY-EQ",
+    "NSE:HDFCBANK-EQ",
+    "NSE:ICICIBANK-EQ",
+    "NSE:SBIN-EQ",
+    "NSE:LT-EQ",
+    "NSE:AXISBANK-EQ",
+    "NSE:ITC-EQ",
+    "NSE:BHARTIARTL-EQ"
+]
+
+# ==========================================================
+# SCAN ONE SYMBOL
+# ==========================================================
+
+def scan_symbol(fyers, symbol):
+
+    df = get_history(fyers, symbol, "15 Minute")
+
+    if df is None or len(df) < 50:
+        return None
+
+    signal = intraday_15m_ai(df, symbol)
+
+    return signal
+
+# ==========================================================
+# MULTI THREAD SCANNER
+# ==========================================================
+
+def run_scanner(fyers, symbols):
+
+    results = []
+
+    progress = st.progress(0)
+
+    total = len(symbols)
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+
+        futures = {
+            executor.submit(scan_symbol, fyers, s): s
+            for s in symbols
+        }
+
+        completed = 0
+
+        for future in as_completed(futures):
+
+            completed += 1
+
+            progress.progress(completed / total)
+
+            try:
+                signal = future.result()
+
+                if signal:
+                    results.append(signal)
+
+            except Exception:
+                pass
+
+    return results
+
+# ==========================================================
+# STREAMLIT PAGE
+# ==========================================================
+
+def show_scanner(fyers):
+
+    st.title("📈 NSE AI PRO V13 Scanner")
+
+    scanner_type = st.selectbox(
+        "Scanner",
+        [
+            "15 Minute AI Scanner"
+        ]
+    )
+
+    universe = st.multiselect(
+        "Stocks",
+        DEFAULT_STOCKS,
+        default=DEFAULT_STOCKS
+    )
+
+    if st.button("🚀 Start Scan"):
+
+        with st.spinner("Scanning..."):
+
+            results = run_scanner(
+                fyers,
+                universe
+            )
+
+            if len(results) == 0:
+
+                st.warning("No Signals Found")
+
+            else:
+
+                df = scanner_dataframe(results)
+
+                st.dataframe(
+                    df,
+                    use_container_width=True,
+                    height=600
+                )
+
+                st.download_button(
+                    "📥 Download CSV",
+                    df.to_csv(index=False),
+                    file_name="scanner_results.csv",
+                    mime="text/csv"
+                )
+
+                st.success(f"{len(df)} Signals Found")
