@@ -476,3 +476,201 @@ def build_ai_signal(df, symbol):
     signal["AI Score"] = calculate_ai_score(signal)
 
     return signal
+# ==========================================================
+# PART 3
+# INTRADAY 15 MINUTE AI SCANNER
+# ==========================================================
+
+import pandas as pd
+import numpy as np
+
+# ==========================================================
+# RSI
+# ==========================================================
+
+def calculate_rsi(close, period=14):
+
+    delta = close.diff()
+
+    gain = delta.clip(lower=0)
+
+    loss = -delta.clip(upper=0)
+
+    avg_gain = gain.rolling(period).mean()
+
+    avg_loss = loss.rolling(period).mean()
+
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+
+    return 100 - (100 / (1 + rs))
+
+# ==========================================================
+# EMA
+# ==========================================================
+
+def ema(close, period):
+    return close.ewm(span=period, adjust=False).mean()
+
+# ==========================================================
+# MACD
+# ==========================================================
+
+def calculate_macd(close):
+
+    ema12 = ema(close,12)
+
+    ema26 = ema(close,26)
+
+    macd = ema12-ema26
+
+    signal = macd.ewm(span=9,adjust=False).mean()
+
+    return macd.iloc[-1],signal.iloc[-1]
+
+# ==========================================================
+# VWAP
+# ==========================================================
+
+def calculate_vwap(df):
+
+    tp = (df["High"]+df["Low"]+df["Close"])/3
+
+    return ((tp*df["Volume"]).cumsum()/df["Volume"].cumsum()).iloc[-1]
+
+# ==========================================================
+# SUPERTREND
+# ==========================================================
+
+def supertrend_signal(df):
+
+    ema20 = ema(df["Close"],20)
+
+    return "Bullish" if df["Close"].iloc[-1]>ema20.iloc[-1] else "Bearish"
+
+# ==========================================================
+# AI DECISION
+# ==========================================================
+
+def ai_trade_decision(signal):
+
+    score = signal["AI Score"]
+
+    if score >= 90:
+        return "🟢 STRONG BUY"
+
+    elif score >= 75:
+        return "🟢 BUY"
+
+    elif score >= 60:
+        return "🟡 WATCH"
+
+    elif score >= 40:
+        return "🟠 WEAK"
+
+    return "🔴 SELL"
+
+# ==========================================================
+# 15 MIN AI SCANNER
+# ==========================================================
+
+def intraday_15m_ai(df,symbol):
+
+    signal = build_ai_signal(df,symbol)
+
+    signal["RSI"] = round(
+        calculate_rsi(df["Close"]).iloc[-1],2
+    )
+
+    macd,macd_signal = calculate_macd(df["Close"])
+
+    signal["MACD Signal"] = "Bullish" if macd>macd_signal else "Bearish"
+
+    signal["VWAP"] = round(
+        calculate_vwap(df),2
+    )
+
+    signal["Supertrend"] = supertrend_signal(df)
+
+    signal["Trade Decision"] = ai_trade_decision(signal)
+
+    signal["AI Confidence (%)"] = signal["AI Score"]
+
+    if signal["Trade Decision"]=="🟢 STRONG BUY":
+
+        signal["Signal Strength"]="★★★★★"
+
+    elif signal["Trade Decision"]=="🟢 BUY":
+
+        signal["Signal Strength"]="★★★★"
+
+    elif signal["Trade Decision"]=="🟡 WATCH":
+
+        signal["Signal Strength"]="★★★"
+
+    else:
+
+        signal["Signal Strength"]="★"
+
+    return signal
+
+# ==========================================================
+# RESULT TABLE
+# ==========================================================
+
+def scanner_dataframe(results):
+
+    if len(results)==0:
+
+        return pd.DataFrame()
+
+    cols=[
+
+        "Signal Date",
+
+        "Signal Time",
+
+        "Stock",
+
+        "LTP",
+
+        "Trade Decision",
+
+        "AI Score",
+
+        "AI Confidence (%)",
+
+        "Signal Strength",
+
+        "RSI",
+
+        "MACD Signal",
+
+        "VWAP",
+
+        "Supertrend",
+
+        "Bullish Order Block",
+
+        "Bearish Order Block",
+
+        "BOS",
+
+        "CHOCH",
+
+        "CISD",
+
+        "Liquidity Sweep",
+
+        "FVG",
+
+        "Order Block Entry",
+
+        "Order Block SL",
+
+        "Order Block Target1",
+
+        "Order Block Target2"
+
+    ]
+
+    return pd.DataFrame(results)[cols]
