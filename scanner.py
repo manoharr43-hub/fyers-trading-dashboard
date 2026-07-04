@@ -67,6 +67,8 @@ SIGNAL_FOLDERS = {
     "exports": "exports"
 }
 
+NIFTY_50_STOCKS = ["NSE:RELIANCE-EQ", "NSE:TCS-EQ", "NSE:HDFC-EQ", "NSE:INFY-EQ", "NSE:KOTAKBANK-EQ", "NSE:ICICIBANK-EQ", "NSE:HDFCBANK-EQ", "NSE:ITC-EQ", "NSE:SBIN-EQ", "NSE:LT-EQ", "NSE:MARUTI-EQ", "NSE:BAJAJFINSV-EQ", "NSE:WIPRO-EQ", "NSE:AXISBANK-EQ", "NSE:SUNPHARMA-EQ", "NSE:DMART-EQ", "NSE:JSWSTEEL-EQ", "NSE:ULTRACEMCO-EQ", "NSE:ASIANPAINT-EQ", "NSE:NESTLEIND-EQ", "NSE:TECHM-EQ", "NSE:HEROMOTOCORP-EQ", "NSE:TITAN-EQ", "NSE:BAJAJFINSV-EQ", "NSE:HINDUNILVR-EQ", "NSE:INDIGO-EQ", "NSE:CIPLA-EQ", "NSE:GRASIM-EQ", "NSE:LUPIN-EQ", "NSE:POWERGRID-EQ", "NSE:BHARTIARTL-EQ", "NSE:DIVISLAB-EQ", "NSE:DRREDDY-EQ", "NSE:BPCL-EQ", "NSE:PETRONET-EQ", "NSE:APOLLOHOSP-EQ", "NSE:ONGC-EQ", "NSE:ADANIPORTS-EQ", "NSE:M&M-EQ", "NSE:NTPC-EQ", "NSE:SBILIFE-EQ", "NSE:BIOCON-EQ", "NSE:HCLTECH-EQ", "NSE:SHREECEM-EQ", "NSE:AUTHORITYO-EQ", "NSE:INDUSIND-EQ", "NSE:TORRENTPHAR-EQ", "NSE:GAIL-EQ", "NSE:HINDALCO-EQ"]
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -169,6 +171,13 @@ class ScanStats:
     @property
     def elapsed_seconds(self) -> float:
         return time.time() - self._start
+    
+    @property
+    def estimated_remaining(self) -> float:
+        if self.scanned == 0:
+            return 0
+        avg_time = self.elapsed_seconds / self.scanned
+        return avg_time * (self.total - self.scanned)
 
 def _display_scan_summary(stats: ScanStats):
     c1, c2, c3, c4, c5, c6 = st.columns(6)
@@ -185,7 +194,7 @@ def load_nse_equity_symbols() -> List[str]:
         resp = requests.get(FYERS_NSE_CM_SYMBOL_MASTER, timeout=20)
         resp.raise_for_status()
     except Exception as e:
-        st.error(f"Error: {e}")
+        logger.error(f"Error loading symbols: {e}")
         return []
     
     lines = [ln for ln in resp.text.strip().split("\n") if ln.strip()]
@@ -302,7 +311,7 @@ def calculate_supertrend(df: pd.DataFrame, period: int = 10, multiplier: float =
                 direction[i] = -1
     
     is_bullish = bool(direction[-1] == 1)
-    label = "Buy" if is_bullish else "Sell"
+    label = "BUY" if is_bullish else "SELL"
     return label, is_bullish, round(float(supertrend[-1]), 2)
 
 def calculate_vwap_approx(df: pd.DataFrame, window: int = 20) -> float:
@@ -355,9 +364,9 @@ def calculate_relative_strength(close: pd.Series, nifty_close: Optional[pd.Serie
 def calculate_target_stoploss(last_close: float, atr: float, direction: str) -> Tuple[float, float]:
     if pd.isna(atr) or atr <= 0:
         atr = last_close * 0.01
-    if direction == "Bullish":
+    if direction == "BUY":
         target, stoploss = last_close + 2 * atr, last_close - 1 * atr
-    elif direction == "Bearish":
+    elif direction == "SELL":
         target, stoploss = last_close - 2 * atr, last_close + 1 * atr
     else:
         target, stoploss = last_close + 1.5 * atr, last_close - 1.5 * atr
@@ -365,17 +374,17 @@ def calculate_target_stoploss(last_close: float, atr: float, direction: str) -> 
 
 def _format_rvol_display(rvol_raw: float) -> str:
     if rvol_raw >= 3.0:
-        return f"{rvol_raw:.2f}x EXTREME"
+        return f"{rvol_raw:.2f}x"
     elif rvol_raw >= 2.0:
-        return f"{rvol_raw:.2f}x HIGH"
+        return f"{rvol_raw:.2f}x"
     return f"{rvol_raw:.2f}x"
 
 def calculate_ai_trend(ai_score: float) -> Tuple[str, float]:
     if ai_score >= 65:
-        return "Bullish", round(ai_score, 1)
+        return "BULLISH", round(ai_score, 1)
     if ai_score <= 40:
-        return "Bearish", round(100 - ai_score, 1)
-    return "Neutral", round(50 + abs(ai_score - 50), 1)
+        return "BEARISH", round(100 - ai_score, 1)
+    return "NEUTRAL", round(50 + abs(ai_score - 50), 1)
 
 def calculate_news(stock_ticker: str, gap_pct: float, rvol: float, breakout: str) -> str:
     big_move = abs(gap_pct) >= 2 and rvol >= 2 and breakout != "NO"
@@ -406,14 +415,14 @@ def _rule_based_xgb_score(df: pd.DataFrame, rsi_val: float, macd_bullish: bool, 
 
 def _score_to_trend_label(score: float) -> str:
     if score >= 75:
-        return "Strong Bullish"
+        return "STRONG_BUY"
     if score >= 58:
-        return "Bullish"
+        return "BUY"
     if score >= 42:
-        return "Neutral"
+        return "NEUTRAL"
     if score >= 25:
-        return "Bearish"
-    return "Strong Bearish"
+        return "SELL"
+    return "STRONG_SELL"
 
 def calculate_xgboost_prediction(df: pd.DataFrame, rsi_val: Optional[float] = None, macd_bullish: Optional[bool] = None, supertrend_bullish: Optional[bool] = None, vwap_val: Optional[float] = None, rvol: Optional[float] = None, support: Optional[float] = None, resistance: Optional[float] = None, use_ml: bool = True) -> Tuple[str, float]:
     try:
@@ -439,7 +448,7 @@ def calculate_xgboost_prediction(df: pd.DataFrame, rsi_val: Optional[float] = No
         confidence = max(35.0, min(97.0, confidence))
         return _score_to_trend_label(rule_score), confidence
     except Exception:
-        return "Neutral", 50.0
+        return "NEUTRAL", 50.0
 
 def generate_alerts(rvol: float, breakout: str, cisd_signal: str, mtf_trend: str, gap_pct: float) -> str:
     alerts = []
@@ -543,10 +552,11 @@ def _detect_order_blocks(df: pd.DataFrame, smc_structure: str) -> Tuple[str, str
         return "No", "No", "N/A", "N/A"
     return bullish_label, bearish_label, ob_zone, ob_strength
 
-def _fetch_symbol(fyers, symbol: str, nifty_close: Optional[pd.Series], enable_xgboost: bool):
+def _fetch_symbol(fyers, symbol: str, nifty_close: Optional[pd.Series], enable_xgboost: bool, timeframe: str = "D"):
     if not isinstance(symbol, str) or not _VALID_EQ_SYMBOL_RE.match(symbol):
         return None, f"{symbol}: invalid"
-    resp, err = _safe_history(fyers, {"symbol": symbol, "resolution": "D", "date_format": "1", "range_from": DATE_FROM, "range_to": DATE_TO, "cont_flag": "1"})
+    
+    resp, err = _safe_history(fyers, {"symbol": symbol, "resolution": timeframe, "date_format": "1", "range_from": DATE_FROM, "range_to": DATE_TO, "cont_flag": "1"})
     if err:
         return None, f"{symbol}: {err}"
     candles = resp.get("candles") if resp else None
@@ -558,7 +568,7 @@ def _fetch_symbol(fyers, symbol: str, nifty_close: Optional[pd.Series], enable_x
         df[["Open", "High", "Low", "Close", "Volume"]] = df[["Open", "High", "Low", "Close", "Volume"]].apply(pd.to_numeric, errors="coerce")
         df = df.dropna(subset=["Open", "High", "Low", "Close"])
         if len(df) < 30:
-            return None, f"{symbol}: cleaned data too small"
+            return None, f"{symbol}: cleaned data"
     except Exception:
         return None, f"{symbol}: parse error"
     
@@ -605,7 +615,7 @@ def _fetch_symbol(fyers, symbol: str, nifty_close: Optional[pd.Series], enable_x
         rs_label = calculate_relative_strength(close, nifty_close)
         
         atr14 = calculate_atr(df).iloc[-1]
-        direction = "Bullish" if breakout == "Bullish" or macd_bullish else ("Bearish" if breakout == "Bearish" or not macd_bullish else "Neutral")
+        direction = "BUY" if breakout == "Bullish" or macd_bullish else ("SELL" if breakout == "Bearish" or not macd_bullish else "NEUTRAL")
         target, stoploss = calculate_target_stoploss(last_close, atr14, direction)
         
         ai_trend, ai_confidence = calculate_ai_trend(ai_score)
@@ -620,153 +630,48 @@ def _fetch_symbol(fyers, symbol: str, nifty_close: Optional[pd.Series], enable_x
         
         signal_date_str, signal_time_str = _candle_signal_timestamp(df, is_daily=True)
         
+        risk = abs(target - stoploss)
+        reward = abs(target - last_close)
+        rr_ratio = round(reward / risk, 2) if risk > 0 else 0.0
+        
+        signal_strength_map = {"STRONG_BUY": 5, "BUY": 4, "NEUTRAL": 3, "SELL": 2, "STRONG_SELL": 1}
+        signal_strength_val = signal_strength_map.get(xgb_trend, 3)
+        
         return {
-            "Stock": stock_ticker,
+            "Symbol": stock_ticker,
             "LTP": round(last_close, 2),
-            "Gap": f"{gap_pct:.2f}%",
-            "Target": target,
-            "SL": stoploss,
-            "RSI": rsi_val,
-            "MACD": "Bullish" if macd_bullish else "Bearish",
-            "Supertrend": supertrend_label,
-            "VWAP": vwap_val,
-            "Pattern": chart_pattern,
-            "RVOL": rvol_display,
-            "MTF": mtf_trend,
-            "RS": rs_label,
-            "Breakout": breakout,
-            "AI_Score": ai_score,
-            "AI_Trend": ai_trend,
-            "XGB_Trend": xgb_trend,
-            "XGB_Conf": xgb_confidence,
-            "News": news,
-            "Signal_Date": signal_date_str,
+            "Signal": xgb_trend,
             "Signal_Time": signal_time_str,
-            "OB_Bull": bullish_ob,
-            "OB_Bear": bearish_ob,
-            "OB_Zone": ob_zone,
-            "OB_Strength": ob_strength
-        }, None
-    except Exception as e:
-        return None, f"{symbol}: {str(e)}"
-
-def run_scan(fyers, symbols: List[str], nifty_close: Optional[pd.Series], enable_xgboost: bool):
-    symbols = _validate_symbols(symbols)
-    results, errors = [], []
-    stats = ScanStats(total=len(symbols))
-    progress = st.progress(0.0, text=f"Scanning 0 / {len(symbols)}")
-    done = 0
-    
-    for i in range(0, len(symbols), BATCH_SIZE):
-        batch = symbols[i:i + BATCH_SIZE]
-        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            futures = {executor.submit(_fetch_symbol, fyers, s, nifty_close, enable_xgboost): s for s in batch}
-            for future in as_completed(futures):
-                try:
-                    res, err = future.result()
-                except Exception as e:
-                    res, err = None, "worker error"
-                
-                if res:
-                    results.append(res)
-                if err:
-                    errors.append(err)
-                stats.record(has_result=bool(res), has_error=bool(err))
-                done += 1
-                progress.progress(done / len(symbols), text=f"Scanning {done} / {len(symbols)}")
-        
-        if i + BATCH_SIZE < len(symbols):
-            time.sleep(BATCH_PAUSE_SECONDS)
-    
-    progress.empty()
-    return results, errors, stats
-
-def _fetch_4h_signal(fyers, symbol: str):
-    if not isinstance(symbol, str) or not _VALID_EQ_SYMBOL_RE.match(symbol):
-        return None, f"{symbol}: invalid"
-    resp, err = _safe_history(fyers, {"symbol": symbol, "resolution": SIGNAL_4H_RESOLUTION, "date_format": "1", "range_from": (datetime.today() - timedelta(days=SIGNAL_4H_LOOKBACK_DAYS)).strftime("%Y-%m-%d"), "range_to": DATE_TO, "cont_flag": "1"})
-    if err:
-        return None, f"{symbol}: {err}"
-    candles = resp.get("candles") if resp else None
-    if not candles or len(candles) < 30:
-        return None, f"{symbol}: insufficient"
-    try:
-        df = pd.DataFrame(candles, columns=["Time", "Open", "High", "Low", "Close", "Volume"])
-        df["Time"] = pd.to_datetime(df["Time"], unit="s", utc=True).dt.tz_convert("Asia/Kolkata")
-        df[["Open", "High", "Low", "Close", "Volume"]] = df[["Open", "High", "Low", "Close", "Volume"]].apply(pd.to_numeric, errors="coerce")
-        df = df.dropna(subset=["Open", "High", "Low", "Close"])
-        if len(df) < 30:
-            return None, f"{symbol}: cleaned data"
-    except Exception:
-        return None, f"{symbol}: parse error"
-    
-    try:
-        close, volume = df["Close"], df["Volume"]
-        last_close = close.iloc[-1]
-        vol_avg20 = volume.tail(20).mean()
-        rvol = (volume.iloc[-1] / vol_avg20) if vol_avg20 > 0 else 0
-        
-        rsi_val = round(float(calculate_rsi(close).iloc[-1]), 1)
-        macd_line, signal_line, _ = calculate_macd(close)
-        macd_bullish = bool(macd_line.iloc[-1] > signal_line.iloc[-1])
-        
-        supertrend_label, supertrend_bullish, _ = calculate_supertrend(df)
-        
-        adx_val = calculate_adx(df)
-        
-        vwap_val = calculate_vwap_approx(df)
-        
-        smc_structure, cisd_signal, _ = _calculate_smc_and_cisd(df)
-        bullish_ob, bearish_ob, ob_zone, ob_strength = _detect_order_blocks(df, smc_structure)
-        
-        resistance = df["High"].rolling(20).max().shift(1).iloc[-1]
-        support = df["Low"].rolling(20).min().shift(1).iloc[-1]
-        
-        if pd.notna(resistance) and last_close > resistance:
-            breakout = "Bullish"
-        elif pd.notna(support) and last_close < support:
-            breakout = "Bearish"
-        else:
-            breakout = "NO"
-        
-        atr14 = calculate_atr(df).iloc[-1]
-        
-        stock_ticker = symbol.replace("NSE:", "").replace("-EQ", "")
-        signal_date_str, signal_time_str = _candle_signal_timestamp(df, is_daily=False)
-        
-        return {
-            "Stock": stock_ticker,
-            "LTP": round(last_close, 2),
+            "TimeFrame": timeframe,
             "RSI": rsi_val,
             "MACD": "Bullish" if macd_bullish else "Bearish",
-            "ADX": adx_val,
-            "Supertrend": supertrend_label,
-            "VWAP": vwap_val,
-            "Breakout": breakout,
-            "RVOL": _format_rvol_display(rvol),
-            "OB_Bull": bullish_ob,
-            "OB_Bear": bearish_ob,
-            "OB_Zone": ob_zone,
-            "OB_Strength": ob_strength,
+            "RVOL": rvol_raw,
+            "Volume": int(volume.iloc[-1]),
+            "Entry": round(last_close, 2),
+            "StopLoss": stoploss,
+            "Target1": target,
+            "Target2": round(target + atr14, 2) if pd.notna(atr14) else target,
+            "RiskReward": rr_ratio,
+            "SignalStrength": signal_strength_val,
             "Support": round(float(support), 2) if pd.notna(support) else None,
-            "Resistance": round(float(resistance), 2) if pd.notna(resistance) else None,
-            "Signal_Date": signal_date_str,
-            "Signal_Time": signal_time_str
+            "Resistance": round(float(resistance), 2) if pd.notna(resistance) else None
         }, None
     except Exception as e:
         return None, f"{symbol}: {str(e)}"
 
-def run_4h_scan(fyers, symbols: List[str]):
+def run_scan(fyers, symbols: List[str], nifty_close: Optional[pd.Series], enable_xgboost: bool, timeframe: str = "D"):
     symbols = _validate_symbols(symbols)
     results, errors = [], []
     stats = ScanStats(total=len(symbols))
-    progress = st.progress(0.0, text=f"4H Scanning 0 / {len(symbols)}")
+    progress_bar = st.progress(0.0)
+    status_text = st.empty()
     done = 0
+    start_time = time.time()
     
     for i in range(0, len(symbols), BATCH_SIZE):
         batch = symbols[i:i + BATCH_SIZE]
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            futures = {executor.submit(_fetch_4h_signal, fyers, s): s for s in batch}
+            futures = {executor.submit(_fetch_symbol, fyers, s, nifty_close, enable_xgboost, timeframe): s for s in batch}
             for future in as_completed(futures):
                 try:
                     res, err = future.result()
@@ -779,157 +684,136 @@ def run_4h_scan(fyers, symbols: List[str]):
                     errors.append(err)
                 stats.record(has_result=bool(res), has_error=bool(err))
                 done += 1
-                progress.progress(done / len(symbols), text=f"4H Scanning {done} / {len(symbols)}")
+                
+                elapsed = time.time() - start_time
+                estimated_remaining = stats.estimated_remaining
+                progress = done / len(symbols)
+                progress_bar.progress(progress)
+                status_text.text(f"Scanned: {done}/{len(symbols)} | Elapsed: {elapsed:.1f}s | Remaining: {estimated_remaining:.1f}s")
         
         if i + BATCH_SIZE < len(symbols):
             time.sleep(BATCH_PAUSE_SECONDS)
     
-    progress.empty()
+    progress_bar.empty()
+    status_text.empty()
     return results, errors, stats
+
+def _get_universe_symbols(universe: str) -> List[str]:
+    all_symbols = load_nse_equity_symbols()
+    
+    if universe == "NIFTY 50":
+        return NIFTY_50_STOCKS
+    elif universe == "NIFTY 100":
+        return all_symbols[:100]
+    elif universe == "NIFTY 200":
+        return all_symbols[:200]
+    elif universe == "NIFTY 500":
+        return all_symbols[:500]
+    elif universe == "All NSE Stocks":
+        return all_symbols
+    else:
+        return NIFTY_50_STOCKS
+
+def _filter_results(df: pd.DataFrame, filters: Dict) -> pd.DataFrame:
+    if filters["signal_type"] == "BUY_ONLY":
+        df = df[df["Signal"].str.contains("BUY", case=False)]
+    elif filters["signal_type"] == "SELL_ONLY":
+        df = df[df["Signal"].str.contains("SELL", case=False)]
+    
+    if filters["strong_signals"]:
+        df = df[df["SignalStrength"] >= 4]
+    
+    if filters["high_volume"]:
+        vol_threshold = df["Volume"].quantile(0.75)
+        df = df[df["Volume"] >= vol_threshold]
+    
+    df = df.sort_values("SignalStrength", ascending=False)
+    return df
+
+def _export_to_excel(df: pd.DataFrame) -> bytes:
+    buffer = io.BytesIO()
+    with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
+        df.to_excel(writer, index=False, sheet_name='Results')
+    buffer.seek(0)
+    return buffer.getvalue()
+
+def _export_to_csv(df: pd.DataFrame) -> bytes:
+    return df.to_csv(index=False).encode()
 
 def show_scanner(fyers):
     st.set_page_config(page_title="NSE Multi-Scanner", layout="wide")
     st.title("NSE Multi-Timeframe Trading Scanner")
     
-    tabs = st.tabs(["Daily Scan", "Swing", "Fuel", "5-Min", "15-Min", "Golden Cross", "4-Hour"])
+    tabs = st.tabs(["Daily", "Swing", "Fuel", "5-Min", "15-Min", "Golden Cross", "4-Hour"])
     
-    with tabs[0]:
-        st.subheader("Daily Scanner")
-        col1, col2 = st.columns([3, 1])
-        with col1:
-            symbols_input = st.text_area("Enter NSE Symbols (one per line)", height=150, key="daily_scan")
-        with col2:
-            st.write("")
-            st.write("")
-            scan_button = st.button("START DAILY SCAN", key="daily_btn")
-        
-        if scan_button and symbols_input:
-            symbols = [s.strip().upper() for s in symbols_input.split('\n') if s.strip()]
-            nifty_close = fetch_nifty_benchmark(fyers)
-            results, errors, stats = run_scan(fyers, symbols, nifty_close, True)
+    def create_scanner_ui(tab, timeframe, tab_name):
+        with tab:
+            st.subheader(f"{tab_name} Scanner")
             
-            st.success(f"Daily Scan Complete!")
-            _display_scan_summary(stats)
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                universe = st.selectbox(f"Select Universe ({tab_name})", ["NIFTY 50", "NIFTY 100", "NIFTY 200", "NIFTY 500", "All NSE Stocks"], key=f"universe_{tab_name}")
+            with col2:
+                st.write("")
+                st.write("")
+                scan_button = st.button(f"START {tab_name.upper()} SCAN", key=f"scan_{tab_name}")
+            with col3:
+                st.write("")
+                st.write("")
+                fresh_signals = st.checkbox("Fresh Signals Only", key=f"fresh_{tab_name}")
             
-            if results:
-                df_results = pd.DataFrame(results)
-                st.dataframe(df_results, use_container_width=True)
-            
-            if errors:
-                st.warning(f"{len(errors)} errors")
+            if scan_button:
+                symbols = _get_universe_symbols(universe)
+                st.info(f"Scanning {len(symbols)} stocks from {universe}...")
+                
+                nifty_close = fetch_nifty_benchmark(fyers)
+                results, errors, stats = run_scan(fyers, symbols, nifty_close, True, timeframe)
+                
+                st.success(f"{tab_name} Scan Complete!")
+                _display_scan_summary(stats)
+                
+                if results:
+                    df_results = pd.DataFrame(results)
+                    
+                    st.subheader("Filters")
+                    col1, col2, col3, col4 = st.columns(4)
+                    with col1:
+                        signal_filter = st.radio("Signal Type", ["ALL", "BUY_ONLY", "SELL_ONLY"], key=f"sig_filt_{tab_name}")
+                    with col2:
+                        strong_only = st.checkbox("Strong Signals", key=f"strong_{tab_name}")
+                    with col3:
+                        high_vol = st.checkbox("High Volume", key=f"hvol_{tab_name}")
+                    with col4:
+                        st.write("")
+                    
+                    filters = {
+                        "signal_type": signal_filter,
+                        "strong_signals": strong_only,
+                        "high_volume": high_vol
+                    }
+                    
+                    df_filtered = _filter_results(df_results, filters)
+                    
+                    st.subheader(f"Results ({len(df_filtered)} signals)")
+                    st.dataframe(df_filtered[["Symbol", "LTP", "Signal", "Signal_Time", "RSI", "MACD", "RVOL", "Volume", "Entry", "StopLoss", "Target1", "Target2", "RiskReward", "SignalStrength"]], use_container_width=True)
+                    
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        excel_data = _export_to_excel(df_filtered)
+                        st.download_button("Download Excel", excel_data, f"{tab_name}_scan.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key=f"excel_{tab_name}")
+                    with col2:
+                        csv_data = _export_to_csv(df_filtered)
+                        st.download_button("Download CSV", csv_data, f"{tab_name}_scan.csv", "text/csv", key=f"csv_{tab_name}")
+                
+                if errors:
+                    with st.expander(f"View Errors ({len(errors)})"):
+                        for error in errors[:20]:
+                            st.write(error)
     
-    with tabs[1]:
-        st.subheader("Swing Scanner")
-        col1, col2 = st.columns([3, 1])
-        with col1:
-            symbols_input = st.text_area("Enter NSE Symbols", height=150, key="swing_scan")
-        with col2:
-            st.write("")
-            st.write("")
-            scan_button = st.button("START SWING SCAN", key="swing_btn")
-        
-        if scan_button and symbols_input:
-            symbols = [s.strip().upper() for s in symbols_input.split('\n') if s.strip()]
-            nifty_close = fetch_nifty_benchmark(fyers)
-            results, errors, stats = run_scan(fyers, symbols, nifty_close, True)
-            
-            st.success(f"Swing Scan Complete!")
-            _display_scan_summary(stats)
-            
-            if results:
-                df_results = pd.DataFrame(results)
-                st.dataframe(df_results, use_container_width=True)
-    
-    with tabs[2]:
-        st.subheader("Fuel Scanner")
-        col1, col2 = st.columns([3, 1])
-        with col1:
-            symbols_input = st.text_area("Enter NSE Symbols", height=150, key="fuel_scan")
-        with col2:
-            st.write("")
-            st.write("")
-            scan_button = st.button("START FUEL SCAN", key="fuel_btn")
-        
-        if scan_button and symbols_input:
-            symbols = [s.strip().upper() for s in symbols_input.split('\n') if s.strip()]
-            nifty_close = fetch_nifty_benchmark(fyers)
-            results, errors, stats = run_scan(fyers, symbols, nifty_close, True)
-            
-            st.success(f"Fuel Scan Complete!")
-            _display_scan_summary(stats)
-            
-            if results:
-                df_results = pd.DataFrame(results)
-                st.dataframe(df_results, use_container_width=True)
-    
-    with tabs[3]:
-        st.subheader("5-Minute Intraday Scanner")
-        col1, col2 = st.columns([3, 1])
-        with col1:
-            symbols_input = st.text_area("Enter NSE Symbols", height=150, key="5min_scan")
-        with col2:
-            st.write("")
-            st.write("")
-            scan_button = st.button("START 5-MIN SCAN", key="5min_btn")
-        
-        if scan_button and symbols_input:
-            st.info("5-Minute scanner would fetch intraday data. Configure as needed.")
-    
-    with tabs[4]:
-        st.subheader("15-Minute Order Block Scanner")
-        col1, col2 = st.columns([3, 1])
-        with col1:
-            symbols_input = st.text_area("Enter NSE Symbols", height=150, key="15min_scan")
-        with col2:
-            st.write("")
-            st.write("")
-            scan_button = st.button("START 15-MIN SCAN", key="15min_btn")
-        
-        if scan_button and symbols_input:
-            st.info("15-Minute Order Block scanner with all detection features.")
-    
-    with tabs[5]:
-        st.subheader("Golden Cross / Death Cross Swing Scanner")
-        col1, col2 = st.columns([3, 1])
-        with col1:
-            symbols_input = st.text_area("Enter NSE Symbols", height=150, key="gc_scan")
-        with col2:
-            st.write("")
-            st.write("")
-            scan_button = st.button("START GOLDEN CROSS SCAN", key="gc_btn")
-        
-        if scan_button and symbols_input:
-            symbols = [s.strip().upper() for s in symbols_input.split('\n') if s.strip()]
-            nifty_close = fetch_nifty_benchmark(fyers)
-            results, errors, stats = run_scan(fyers, symbols, nifty_close, True)
-            
-            st.success(f"Golden Cross Scan Complete!")
-            _display_scan_summary(stats)
-            
-            if results:
-                df_results = pd.DataFrame(results)
-                st.dataframe(df_results, use_container_width=True)
-    
-    with tabs[6]:
-        st.subheader("4-Hour Scanner with Order Blocks")
-        col1, col2 = st.columns([3, 1])
-        with col1:
-            symbols_input = st.text_area("Enter NSE Symbols", height=150, key="4h_scan")
-        with col2:
-            st.write("")
-            st.write("")
-            scan_button = st.button("START 4-HOUR SCAN", key="4h_btn")
-        
-        if scan_button and symbols_input:
-            symbols = [s.strip().upper() for s in symbols_input.split('\n') if s.strip()]
-            results, errors, stats = run_4h_scan(fyers, symbols)
-            
-            st.success(f"4-Hour Scan Complete!")
-            _display_scan_summary(stats)
-            
-            if results:
-                df_results = pd.DataFrame(results)
-                st.dataframe(df_results, use_container_width=True)
-            
-            if errors:
-                st.warning(f"{len(errors)} errors")
+    create_scanner_ui(tabs[0], "D", "Daily")
+    create_scanner_ui(tabs[1], "D", "Swing")
+    create_scanner_ui(tabs[2], "D", "Fuel")
+    create_scanner_ui(tabs[3], "5", "5-Min")
+    create_scanner_ui(tabs[4], "15", "15-Min")
+    create_scanner_ui(tabs[5], "D", "GoldenCross")
+    create_scanner_ui(tabs[6], "240", "4-Hour")
