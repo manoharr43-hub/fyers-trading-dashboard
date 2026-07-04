@@ -73,12 +73,7 @@ SIGNAL_FOLDERS = {
 # ── Logging Configuration ────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler(os.path.join(SIGNAL_FOLDERS["logs"], "signal_engine.log")) 
-        if os.path.exists(SIGNAL_FOLDERS["logs"]) or Path(SIGNAL_FOLDERS["logs"]).mkdir(parents=True, exist_ok=True) else logging.NullHandler(),
-        logging.StreamHandler()
-    ]
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
@@ -1035,7 +1030,7 @@ class OrderBlockSignal:
     def __init__(
         self,
         symbol: str,
-        signal_type: str,  # "BUY" or "SELL"
+        signal_type: str,
         signal_date: str,
         signal_time: str,
         timeframe: str,
@@ -1213,13 +1208,11 @@ Generated: {_now_ist().strftime('%d-%b-%Y %H:%M:%S IST')}
         try:
             fig, ax = plt.subplots(figsize=(14, 8))
             
-            # Plot candlesticks
             for idx, row in df.iterrows():
                 color = 'green' if row['Close'] >= row['Open'] else 'red'
                 ax.plot([idx, idx], [row['Low'], row['High']], color=color, linewidth=1)
                 ax.plot([idx, idx], [row['Open'], row['Close']], color=color, linewidth=3)
             
-            # Plot Order Block Zone
             ob_rect = patches.Rectangle(
                 (len(df) - 5, self.order_block_low),
                 5,
@@ -1232,7 +1225,6 @@ Generated: {_now_ist().strftime('%d-%b-%Y %H:%M:%S IST')}
             )
             ax.add_patch(ob_rect)
             
-            # Plot Entry, Stop Loss, Targets
             ax.axhline(y=self.entry_price, color='black', linestyle='--', linewidth=2, label=f"Entry: {self.entry_price}")
             ax.axhline(y=self.stop_loss, color='red', linestyle='--', linewidth=2, label=f"Stop Loss: {self.stop_loss}")
             ax.axhline(y=self.target_1, color='green', linestyle='--', linewidth=2, label=f"Target 1: {self.target_1}")
@@ -1257,7 +1249,6 @@ Generated: {_now_ist().strftime('%d-%b-%Y %H:%M:%S IST')}
             return None
 
 
-# ── Duplicate signal prevention ───────────────────────────────────────────
 class SignalDeduplicator:
     """Prevents duplicate signals for the same candle."""
     def __init__(self):
@@ -1324,7 +1315,6 @@ def _fetch_15min_order_block_signals(fyers, symbol: str) -> Tuple[List[OrderBloc
         )
         df = df.dropna(subset=["Open", "High", "Low", "Close"]).sort_values("Time").reset_index(drop=True)
 
-        # Drop currently-forming candle
         if len(df) > 0 and not _is_intraday_candle_closed(df["Time"].iloc[-1], 15):
             df = df.iloc[:-1].reset_index(drop=True)
 
@@ -1334,13 +1324,11 @@ def _fetch_15min_order_block_signals(fyers, symbol: str) -> Tuple[List[OrderBloc
         signals = []
         stock_ticker = symbol.replace("NSE:", "").replace("-EQ", "")
         
-        # Detect Order Blocks on 15M candles
         last_candle = df.iloc[-1]
         last_close = float(last_candle["Close"])
         last_volume = float(last_candle["Volume"])
         vol_avg20 = float(df["Volume"].tail(20).mean())
         
-        # Calculate technicals
         rsi = float(calculate_rsi(df["Close"]).iloc[-1])
         macd_line, signal_line, _ = calculate_macd(df["Close"])
         macd_bullish = bool(macd_line.iloc[-1] > signal_line.iloc[-1])
@@ -1349,13 +1337,11 @@ def _fetch_15min_order_block_signals(fyers, symbol: str) -> Tuple[List[OrderBloc
         if pd.isna(atr) or atr <= 0:
             atr = last_close * 0.005
         
-        # Detect Order Blocks using SMC structure
         smc_structure, _, _ = _calculate_smc_and_cisd(df)
         bullish_ob, bearish_ob, ob_zone, ob_strength = _detect_order_blocks(df, smc_structure)
         
         signal_date_str, signal_time_str = _candle_signal_timestamp(df, is_daily=False)
         
-        # Generate BUY signal (Bullish Order Block)
         if bullish_ob == "🟢 Bullish OB":
             if not signal_deduplicator.is_duplicate(symbol, signal_time_str):
                 ob_low, ob_high = map(float, ob_zone.split("–"))
@@ -1390,17 +1376,14 @@ def _fetch_15min_order_block_signals(fyers, symbol: str) -> Tuple[List[OrderBloc
                 signals.append(signal)
                 signal_deduplicator.record_signal(symbol, signal_time_str)
                 
-                # Save signal in all formats
                 signal.save_as_txt()
                 signal.save_as_csv()
                 signal.save_as_json()
                 if MATPLOTLIB_AVAILABLE:
                     signal.generate_chart(df)
                 
-                # Streamlit alert
                 st.success(f"🟢 BUY Signal: {stock_ticker} at {entry}")
         
-        # Generate SELL signal (Bearish Order Block)
         if bearish_ob == "🔴 Bearish OB":
             if not signal_deduplicator.is_duplicate(symbol, signal_time_str):
                 ob_low, ob_high = map(float, ob_zone.split("–"))
@@ -1435,14 +1418,12 @@ def _fetch_15min_order_block_signals(fyers, symbol: str) -> Tuple[List[OrderBloc
                 signals.append(signal)
                 signal_deduplicator.record_signal(symbol, signal_time_str)
                 
-                # Save signal in all formats
                 signal.save_as_txt()
                 signal.save_as_csv()
                 signal.save_as_json()
                 if MATPLOTLIB_AVAILABLE:
                     signal.generate_chart(df)
                 
-                # Streamlit alert
                 st.error(f"🔴 SELL Signal: {stock_ticker} at {entry}")
         
         return signals, None
@@ -1981,7 +1962,6 @@ def _style_dataframe(df: pd.DataFrame):
     return styler.applymap(_color_code)
 
 
-# ── Excel conditional-formatting rules ────────────────────────────────────
 _SIGNAL_FILL_RULES = [
     ("STRONG BUY", "006100", "FFFFFF", True),
     ("STRONG SELL", "9C0006", "FFFFFF", True),
@@ -2097,10 +2077,9 @@ def to_excel_bytes_multi(sheets: dict) -> bytes:
 
 
 # ════════════════════════════════════════════════════════════════
-# ── ADDITIVE MODULES ───────────────────────────────────────────
+# ── ADDITIVE MODULES PART 2 ────────────────────────────────────
 # ════════════════════════════════════════════════════════════════
 
-# ── Intraday CISD Signals (5-Minute / 15-Minute) ──────────────────────────
 _INTRADAY_RESOLUTION_MAP = {"5 Minutes": "5", "15 Minutes": "15"}
 
 
@@ -2224,7 +2203,6 @@ def run_intraday_cisd_scan(fyers, symbols: List[str], resolution: str, timeframe
     return results, errors, stats
 
 
-# ── F&O CISD Scanner ──────────────────────────────────────────────────────
 def _fetch_fo_cisd_signal(fyers, symbol: str):
     if not isinstance(symbol, str) or not _VALID_EQ_SYMBOL_RE.match(symbol):
         return None, f"{symbol}: invalid symbol format — skipped"
@@ -2341,7 +2319,6 @@ def run_fo_cisd_scan(fyers, symbols: List[str]):
     return results, errors, stats
 
 
-# ── Swing Trading Scanner (Golden Cross / Death Cross) ───────────────────
 def _fetch_golden_death_cross_signal(fyers, symbol: str):
     if not isinstance(symbol, str) or not _VALID_EQ_SYMBOL_RE.match(symbol):
         return None, f"{symbol}: invalid symbol format — skipped"
@@ -2397,4 +2374,23 @@ def _fetch_golden_death_cross_signal(fyers, symbol: str):
             sl = round(entry - 2.0 * atr, 2)
             t1 = round(entry + 2.0 * atr, 2)
             t2 = round(entry + 3.5 * atr, 2)
-            t3 = round(entry + 5.0 * atr,
+            t3 = round(entry + 5.0 * atr, 2)
+        else:
+            sl = round(entry + 2.0 * atr, 2)
+            t1 = round(entry - 2.0 * atr, 2)
+            t2 = round(entry - 3.5 * atr, 2)
+            t3 = round(entry - 5.0 * atr, 2)
+
+        atr_pct = (atr / last_close * 100) if last_close else 0
+        if atr_pct >= 3:
+            holding_days, est_days = "3–7 Days", 5
+        elif atr_pct >= 1.5:
+            holding_days, est_days = "7–14 Days", 10
+        else:
+            holding_days, est_days = "14–25 Days", 18
+        exit_date = (_now_ist() + timedelta(days=est_days)).strftime("%d-%b-%Y")
+
+        ema200_last = float(ema200.iloc[-1])
+        ema_gap_pct = abs((float(ema50.iloc[-1]) - ema200_last) / ema200_last * 100) if ema200_last else 0
+        if ema_gap_pct >= 3:
+            trend_strength = "🟢 Strong"
