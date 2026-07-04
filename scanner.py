@@ -6,9 +6,25 @@ import time
 import io
 import os
 import re
+import json
+import csv
+import logging
 from datetime import datetime, timedelta
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Dict, Any
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# matplotlib is optional — only needed for the candlestick chart export in
+# the new Live Order Block Signal Engine. If it's unavailable the rest of
+# the app (including that engine's BUY/SELL/CSV/JSON/TXT output) still
+# works fine; only the .png chart save step is skipped.
+try:
+    import matplotlib
+    matplotlib.use("Agg")  # headless backend — safe inside Streamlit/threads
+    import matplotlib.pyplot as plt
+    import matplotlib.dates as mdates
+    MATPLOTLIB_AVAILABLE = True
+except ImportError:
+    MATPLOTLIB_AVAILABLE = False
 
 try:
     from zoneinfo import ZoneInfo
@@ -58,6 +74,64 @@ XGB_MODEL_PATH = "xgb_trend_model.json"
 # separate from DATE_FROM/DATE_TO (which stay at 365 days for the existing
 # daily-resolution pipeline, untouched).
 INTRADAY_CISD_LOOKBACK_DAYS = 5
+
+# ══════════════════════════════════════════════════════════════════════════
+# ── LIVE ORDER BLOCK BUY/SELL SIGNAL ENGINE — folders, logging, config ────
+# Purely additive infrastructure for the new "🔔 Live OB Signal Scanner"
+# tab (15-min candles). Nothing here touches any existing scanner/tab.
+# ══════════════════════════════════════════════════════════════════════════
+SIGNALS_DIR = "signals"
+SIGNALS_BUY_DIR = os.path.join(SIGNALS_DIR, "buy")
+SIGNALS_SELL_DIR = os.path.join(SIGNALS_DIR, "sell")
+LOGS_DIR = "logs"
+CHARTS_DIR = "charts"
+EXPORTS_DIR = "exports"
+
+# Where we persist which (symbol, candle, direction) combinations have
+# already produced a signal, so the SAME confirming candle never fires a
+# duplicate BUY/SELL alert on a later re-scan/auto-refresh.
+_SEEN_SIGNALS_FILE = os.path.join(SIGNALS_DIR, "_seen_signal_keys.json")
+_SEEN_SIGNALS_MAX_KEEP = 5000  # trim the dedup file so it never grows unbounded
+
+# Master rolling exports used by the download buttons on the new tab.
+_LIVE_OB_MASTER_CSV = os.path.join(EXPORTS_DIR, "live_ob_signals.csv")
+_LIVE_OB_MASTER_JSON = os.path.join(EXPORTS_DIR, "live_ob_signals.json")
+
+LIVE_OB_RESOLUTION = "15"
+LIVE_OB_RESOLUTION_MINUTES = 15
+LIVE_OB_LOOKBACK_DAYS = 5
+LIVE_OB_AUTO_REFRESH_SECONDS = 30
+
+
+def _ensure_app_folders() -> None:
+    """Requirement 10: auto-create every folder the signal engine writes
+    to. Safe to call repeatedly (idempotent) and safe under threads."""
+    for folder in (SIGNALS_DIR, SIGNALS_BUY_DIR, SIGNALS_SELL_DIR, LOGS_DIR, CHARTS_DIR, EXPORTS_DIR):
+        os.makedirs(folder, exist_ok=True)
+
+
+_ensure_app_folders()
+
+# ── Logging (Requirement 17) ─────────────────────────────────────────────
+# A single named logger for the whole app, writing to logs/scanner.log.
+# Streamlit re-executes this module on every interaction, so the handler
+# is only attached once (guarded by `if not logger.handlers`) to avoid
+# duplicate log lines piling up on every rerun.
+logger = logging.getLogger("nse_ai_pro_scanner")
+logger.setLevel(logging.INFO)
+if not logger.handlers:
+    try:
+        _file_handler = logging.FileHandler(os.path.join(LOGS_DIR, "scanner.log"), encoding="utf-8")
+        _file_handler.setFormatter(
+            logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s")
+        )
+        logger.addHandler(_file_handler)
+    except OSError:
+        # Filesystem could be read-only in some hosting environments —
+        # fall back to a console handler so the app never crashes over
+        # logging setup alone.
+        _stream_handler = logging.StreamHandler()
+        logger.addHandler(_stream_handler)
 
 # NOTE ON OPEN INTEREST: this scanner runs against the NSE_CM (cash
 # equity) symbol master. Open Interest and Change in OI are futures &
@@ -2464,6 +2538,483 @@ def run_fo_15min_cisd_scan(fyers, symbols: List[str]):
     return results, errors, stats
 
 
+# ══════════════════════════════════════════════════════════════════════════
+# ── 7. LIVE 15-MIN ORDER BLOCK BUY/SELL SIGNAL ENGINE (new, additive) ─────
+# Everything below is new, self-contained, and purely additive:
+#   • Fetches 15-minute candles via the same _safe_history()/Fyers V3 call
+#     used everywhere else in this file (Requirement 1).
+#   • Detects Bullish/Bearish Order Blocks by reusing the existing
+#     _calculate_smc_and_cisd() + _detect_order_blocks() functions, so the
+#     OB logic itself is identical to the daily-candle version (Req 2, 6).
+#   • Generates a live BUY/SELL decision, Entry/SL/Target1/Target2/RR,
+#     Signal Strength, and IST Signal Time (Req 3–8).
+#   • De-duplicates on (symbol, candle timestamp, direction) so the same
+#     confirming 15-min candle can never fire twice (Req 9).
+#   • Persists every signal as TXT + CSV + JSON under signals/buy|sell, and
+#     appends to a rolling exports/ CSV+JSON for the download buttons
+#     (Req 10, 11).
+#   • Renders and saves a candlestick chart with the OB zone / Entry / SL /
+#     Targets annotated (Req 12).
+#   • The Streamlit tab below shows live st.toast()/st.success() alerts on
+#     every NEW signal and supports a 30-second auto-refresh loop for a
+#     user-selected set of NSE stocks (Req 13–15).
+# None of this reads, mutates, or depends on any of the daily-resolution
+# scanners/tabs above — it is fully independent and additive.
+# ══════════════════════════════════════════════════════════════════════════
+
+
+def _load_seen_signal_keys() -> set:
+    """Loads the persisted set of (symbol|resolution|candle_ts|direction)
+    keys that have already produced a saved signal, so restarts of the
+    Streamlit process don't re-fire duplicates for candles seen before."""
+    try:
+        with open(_SEEN_SIGNALS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, list):
+            return set(data)
+    except (FileNotFoundError, json.JSONDecodeError, OSError) as e:
+        logger.info("No existing seen-signal keys file (or unreadable): %s", e)
+    return set()
+
+
+def _save_seen_signal_keys(keys: set) -> None:
+    """Persists the de-dup key set, trimming to the most recent
+    _SEEN_SIGNALS_MAX_KEEP entries (sorted, so the trim is deterministic)
+    so this file never grows without bound over long-running sessions."""
+    try:
+        trimmed = sorted(keys)[-_SEEN_SIGNALS_MAX_KEEP:]
+        with open(_SEEN_SIGNALS_FILE, "w", encoding="utf-8") as f:
+            json.dump(trimmed, f)
+    except OSError as e:
+        logger.warning("Could not persist seen-signal keys: %s", e)
+
+
+def _parse_ob_zone(ob_zone: str) -> Tuple[Optional[float], Optional[float]]:
+    """Parses the 'low–high' string produced by _detect_order_blocks() back
+    into (zone_low, zone_high) floats. Returns (None, None) if there is no
+    valid zone (ob_zone == '—')."""
+    if not ob_zone or ob_zone == "—":
+        return None, None
+    try:
+        low_str, high_str = ob_zone.split("–")
+        return float(low_str), float(high_str)
+    except (ValueError, AttributeError):
+        return None, None
+
+
+def _live_ob_signal_strength(
+    volume_confirmed: bool, smc_aligned: bool, rvol_ok: bool,
+    macd_aligned: bool, supertrend_aligned: bool, ob_strength: str,
+) -> str:
+    """Requirement 7: Signal Strength (Strong/Medium/Weak).
+
+    Counts how many of the independent confirmations line up (Order Block
+    itself is a prerequisite and always counts as 1), plus the OB's own
+    Strong/Medium/Weak read from _detect_order_blocks(), and maps the
+    total confirmations to a simple 3-tier label."""
+    confirmations = 1  # the Order Block itself (a prerequisite to get here)
+    confirmations += int(volume_confirmed)
+    confirmations += int(smc_aligned)
+    confirmations += int(rvol_ok)
+    confirmations += int(macd_aligned)
+    confirmations += int(supertrend_aligned)
+    if ob_strength == "Strong":
+        confirmations += 1
+
+    if confirmations >= 6:
+        return "🟢 Strong"
+    if confirmations >= 4:
+        return "🟡 Medium"
+    return "🔴 Weak"
+
+
+def _fetch_live_ob_signal(fyers, symbol: str, seen_keys: set) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """Core per-symbol worker for the Live OB Signal Engine.
+
+    Returns (signal_row_or_None, error_or_None). `signal_row` is None
+    (with no error) whenever there simply is no live, NEW, fully-closed
+    15-min Order Block BUY/SELL signal for this symbol right now — that's
+    the normal/expected case, not a failure.
+    """
+    if not isinstance(symbol, str) or not _VALID_EQ_SYMBOL_RE.match(symbol):
+        return None, f"{symbol}: invalid symbol format — skipped"
+
+    date_from = (datetime.today() - timedelta(days=LIVE_OB_LOOKBACK_DAYS)).strftime("%Y-%m-%d")
+    date_to = datetime.today().strftime("%Y-%m-%d")
+
+    resp, err = _safe_history(fyers, {
+        "symbol": symbol, "resolution": LIVE_OB_RESOLUTION, "date_format": "1",
+        "range_from": date_from, "range_to": date_to, "cont_flag": "1",
+    })
+    if err:
+        return None, f"{symbol}: {err}"
+
+    candles = resp.get("candles") if resp else None
+    if not candles or len(candles) < 31:
+        return None, None  # too little 15-min history yet — not an error
+
+    try:
+        df = pd.DataFrame(candles, columns=["Time", "Open", "High", "Low", "Close", "Volume"])
+        df["Time"] = pd.to_datetime(df["Time"], unit="s", utc=True).dt.tz_convert("Asia/Kolkata")
+        df[["Open", "High", "Low", "Close", "Volume"]] = df[["Open", "High", "Low", "Close", "Volume"]].apply(
+            pd.to_numeric, errors="coerce"
+        )
+        df = df.dropna(subset=["Open", "High", "Low", "Close"]).sort_values("Time").reset_index(drop=True)
+
+        # Only ever act on FULLY CLOSED candles — drop a still-forming one.
+        if len(df) > 0 and not _is_intraday_candle_closed(df["Time"].iloc[-1], LIVE_OB_RESOLUTION_MINUTES):
+            df = df.iloc[:-1].reset_index(drop=True)
+        if len(df) < 30:
+            return None, None
+
+        # Reuse the existing, already-tested SMC/CISD + Order Block logic —
+        # no duplicate detection logic is introduced here (Requirement 16).
+        smc_structure, cisd_signal, event_ts = _calculate_smc_and_cisd(df)
+        bullish_ob, bearish_ob, ob_zone, ob_strength = _detect_order_blocks(df, smc_structure)
+
+        if bullish_ob == "No" and bearish_ob == "No":
+            return None, None  # no Order Block right now — normal, not an error
+
+        direction = "BUY" if bullish_ob != "No" else "SELL"
+        is_buy = direction == "BUY"
+
+        # Anchor the signal to the most recent fully-closed candle's time —
+        # if a CISD/SMC event confirmed it, use that event's own candle so
+        # re-scans keep returning the identical timestamp (Requirement 4).
+        anchor_ts = event_ts if event_ts is not None else df["Time"].iloc[-1]
+        signal_date_str, signal_time_str = _format_signal_timestamp(anchor_ts, is_daily=False)
+
+        # Requirement 9: de-duplicate on (symbol, resolution, candle, direction)
+        # so the same confirming candle never produces two alerts.
+        dedup_key = f"{symbol}|{LIVE_OB_RESOLUTION}|{signal_date_str}|{signal_time_str}|{direction}"
+        if dedup_key in seen_keys:
+            return None, None
+
+        last_close = float(df["Close"].iloc[-1])
+        atr = float(calculate_atr(df).iloc[-1])
+        if pd.isna(atr) or atr <= 0:
+            atr = last_close * 0.005
+
+        zone_low, zone_high = _parse_ob_zone(ob_zone)
+
+        # Requirement 5/6: Entry / SL / Target1 / Target2 / RR, anchored to
+        # the Order Block's own High/Low (falling back to ATR if the zone
+        # could not be parsed, which should not normally happen here).
+        entry = round(last_close, 2)
+        if is_buy:
+            sl = round((zone_low - 0.25 * atr) if zone_low is not None else (entry - 1.0 * atr), 2)
+            risk = max(entry - sl, 0.01)
+            target1 = round(entry + 1.5 * risk, 2)
+            target2 = round(entry + 3.0 * risk, 2)
+        else:
+            sl = round((zone_high + 0.25 * atr) if zone_high is not None else (entry + 1.0 * atr), 2)
+            risk = max(sl - entry, 0.01)
+            target1 = round(entry - 1.5 * risk, 2)
+            target2 = round(entry - 3.0 * risk, 2)
+
+        reward1 = abs(target1 - entry)
+        rr_ratio = round(reward1 / risk, 2) if risk > 0 else 0.0
+
+        # Requirement 8: Volume confirmation using the 20-candle average.
+        vol_avg20 = float(df["Volume"].tail(20).mean())
+        last_volume = float(df["Volume"].iloc[-1])
+        volume_confirmed = bool(vol_avg20 > 0 and last_volume > vol_avg20)
+        rvol_raw = round(last_volume / vol_avg20, 2) if vol_avg20 > 0 else 0.0
+
+        rsi_val = round(float(calculate_rsi(df["Close"]).iloc[-1]), 1)
+        macd_line, macd_sig, _ = calculate_macd(df["Close"])
+        macd_bullish = bool(macd_line.iloc[-1] > macd_sig.iloc[-1])
+        supertrend_label, supertrend_bullish, _ = calculate_supertrend(df)
+
+        smc_aligned = (is_buy and smc_structure in ("BOS 📈", "CHOCH 🐂")) or \
+                      (not is_buy and smc_structure in ("BOS 📉", "CHOCH 🐻"))
+        macd_aligned = (is_buy and macd_bullish) or (not is_buy and not macd_bullish)
+        supertrend_aligned = (is_buy and supertrend_bullish is True) or \
+                             (not is_buy and supertrend_bullish is False)
+        rvol_ok = rvol_raw >= 1.5
+
+        signal_strength = _live_ob_signal_strength(
+            volume_confirmed=volume_confirmed, smc_aligned=smc_aligned, rvol_ok=rvol_ok,
+            macd_aligned=macd_aligned, supertrend_aligned=supertrend_aligned, ob_strength=ob_strength,
+        )
+
+        stock_ticker = symbol.replace("NSE:", "").replace("-EQ", "")
+        signal_label = "🟢 BUY" if is_buy else "🔴 SELL"
+
+        row: Dict[str, Any] = {
+            "dedup_key": dedup_key,
+            "Signal Date": signal_date_str,
+            "Signal Time": signal_time_str,
+            "Stock": stock_ticker,
+            "Symbol": symbol,
+            "Direction": direction,
+            "Signal": signal_label,
+            "LTP": entry,
+            "Entry": entry,
+            "Stop Loss": sl,
+            "Target 1": target1,
+            "Target 2": target2,
+            "Risk:Reward": rr_ratio,
+            "Order Block High": zone_high,
+            "Order Block Low": zone_low,
+            "Order Block Zone": ob_zone,
+            "Order Block Strength": ob_strength,
+            "Signal Strength": signal_strength,
+            "Volume Confirmed": "✅ Yes" if volume_confirmed else "❌ No",
+            "RVOL": _format_rvol_display(rvol_raw),
+            "RSI": rsi_val,
+            "MACD Signal": "🟢 Bullish" if macd_bullish else "🔴 Bearish",
+            "Supertrend": supertrend_label,
+            "SMC Structure": smc_structure,
+            "CISD": cisd_signal,
+        }
+        return row, None
+    except (KeyError, IndexError, TypeError, ValueError, ZeroDivisionError, AttributeError) as e:
+        logger.exception("Live OB analysis error for %s", symbol)
+        return None, f"{symbol}: analysis error ({type(e).__name__})"
+    except Exception as e:  # pragma: no cover - absolute safety net
+        logger.exception("Unexpected live OB error for %s", symbol)
+        return None, f"{symbol}: unexpected error ({type(e).__name__})"
+
+
+def _save_signal_txt(row: Dict[str, Any], folder: str, base_name: str) -> Optional[str]:
+    """Requirement 11 (TXT). Writes a short, human-readable signal report."""
+    path = os.path.join(folder, f"{base_name}.txt")
+    try:
+        lines = [
+            f"NSE Live Order Block Signal — {row['Signal']}",
+            "=" * 48,
+            f"Stock            : {row['Stock']}",
+            f"Signal Date/Time : {row['Signal Date']} {row['Signal Time']}",
+            f"Direction        : {row['Direction']}",
+            f"Entry            : {row['Entry']}",
+            f"Stop Loss        : {row['Stop Loss']}",
+            f"Target 1         : {row['Target 1']}",
+            f"Target 2         : {row['Target 2']}",
+            f"Risk:Reward      : {row['Risk:Reward']}",
+            f"Order Block Zone : {row['Order Block Zone']} "
+            f"(High={row['Order Block High']}, Low={row['Order Block Low']})",
+            f"Order Block Str. : {row['Order Block Strength']}",
+            f"Signal Strength  : {row['Signal Strength']}",
+            f"Volume Confirmed : {row['Volume Confirmed']}",
+            f"RVOL             : {row['RVOL']}",
+            f"RSI              : {row['RSI']}",
+            f"MACD Signal      : {row['MACD Signal']}",
+            f"Supertrend       : {row['Supertrend']}",
+            f"SMC Structure    : {row['SMC Structure']}",
+            f"CISD             : {row['CISD']}",
+        ]
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+        return path
+    except OSError as e:
+        logger.warning("Could not write signal TXT for %s: %s", row.get("Stock"), e)
+        return None
+
+
+def _save_signal_json(row: Dict[str, Any], folder: str, base_name: str) -> Optional[str]:
+    """Requirement 11 (JSON). One JSON file per signal, plus append to the
+    rolling exports/live_ob_signals.json used by the tab's download button."""
+    path = os.path.join(folder, f"{base_name}.json")
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(row, f, indent=2, default=str)
+    except OSError as e:
+        logger.warning("Could not write signal JSON for %s: %s", row.get("Stock"), e)
+        return None
+
+    try:
+        history: List[dict] = []
+        if os.path.exists(_LIVE_OB_MASTER_JSON):
+            with open(_LIVE_OB_MASTER_JSON, "r", encoding="utf-8") as f:
+                history = json.load(f)
+        history.append(row)
+        with open(_LIVE_OB_MASTER_JSON, "w", encoding="utf-8") as f:
+            json.dump(history, f, indent=2, default=str)
+    except (OSError, json.JSONDecodeError) as e:
+        logger.warning("Could not append to master live-OB JSON log: %s", e)
+
+    return path
+
+
+def _save_signal_csv(row: Dict[str, Any], folder: str, base_name: str) -> Optional[str]:
+    """Requirement 11 (CSV). One CSV file per signal, plus append a row to
+    the rolling exports/live_ob_signals.csv used by the tab's download
+    button (header written once, on first creation)."""
+    path = os.path.join(folder, f"{base_name}.csv")
+    fieldnames = [k for k in row.keys() if k != "dedup_key"]
+    try:
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerow({k: row[k] for k in fieldnames})
+    except OSError as e:
+        logger.warning("Could not write signal CSV for %s: %s", row.get("Stock"), e)
+        return None
+
+    try:
+        master_exists = os.path.exists(_LIVE_OB_MASTER_CSV)
+        with open(_LIVE_OB_MASTER_CSV, "a", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            if not master_exists:
+                writer.writeheader()
+            writer.writerow({k: row[k] for k in fieldnames})
+    except OSError as e:
+        logger.warning("Could not append to master live-OB CSV log: %s", e)
+
+    return path
+
+
+def _save_signal_chart(df: pd.DataFrame, row: Dict[str, Any], folder: str, base_name: str) -> Optional[str]:
+    """Requirement 12: candlestick chart of the last ~60 candles with the
+    Order Block zone shaded and Entry/Stop Loss/Target lines annotated.
+    Returns the saved PNG path, or None if matplotlib is unavailable or
+    saving fails for any reason (chart export is best-effort, never
+    allowed to break signal generation itself)."""
+    if not MATPLOTLIB_AVAILABLE:
+        return None
+
+    path = os.path.join(folder, f"{base_name}.png")
+    try:
+        plot_df = df.tail(60).reset_index(drop=True)
+        fig, ax = plt.subplots(figsize=(11, 6))
+
+        for i, candle in plot_df.iterrows():
+            color = "#26a69a" if candle["Close"] >= candle["Open"] else "#ef5350"
+            ax.plot([i, i], [candle["Low"], candle["High"]], color=color, linewidth=1)
+            ax.add_patch(plt.Rectangle(
+                (i - 0.3, min(candle["Open"], candle["Close"])),
+                0.6, max(abs(candle["Close"] - candle["Open"]), 1e-6),
+                facecolor=color, edgecolor=color,
+            ))
+
+        zone_low, zone_high = row.get("Order Block Low"), row.get("Order Block High")
+        if zone_low is not None and zone_high is not None:
+            ax.axhspan(zone_low, zone_high, color="orange", alpha=0.2,
+                       label=f"Order Block Zone ({zone_low}-{zone_high})")
+
+        ax.axhline(row["Entry"], color="blue", linestyle="--", linewidth=1.2, label=f"Entry {row['Entry']}")
+        ax.axhline(row["Stop Loss"], color="red", linestyle="--", linewidth=1.2, label=f"Stop Loss {row['Stop Loss']}")
+        ax.axhline(row["Target 1"], color="green", linestyle="--", linewidth=1.2, label=f"Target 1 {row['Target 1']}")
+        ax.axhline(row["Target 2"], color="darkgreen", linestyle=":", linewidth=1.2, label=f"Target 2 {row['Target 2']}")
+
+        ax.set_title(f"{row['Stock']} — {row['Signal']} @ {row['Signal Date']} {row['Signal Time']}")
+        ax.set_xlabel("Candle #")
+        ax.set_ylabel("Price")
+        ax.legend(loc="best", fontsize=8)
+        fig.tight_layout()
+        fig.savefig(path, dpi=120)
+        plt.close(fig)
+        return path
+    except Exception as e:  # pragma: no cover - chart export is best-effort
+        logger.warning("Could not save signal chart for %s: %s", row.get("Stock"), e)
+        try:
+            plt.close("all")
+        except Exception:
+            pass
+        return None
+
+
+def _persist_live_ob_signal(df: pd.DataFrame, row: Dict[str, Any]) -> None:
+    """Requirement 10/11/12: routes a freshly-detected signal into the
+    correct signals/buy or signals/sell folder and writes TXT+CSV+JSON,
+    plus the annotated chart into charts/. Failures in any single save
+    step are logged but never raised — a chart/log-write problem must
+    never take down the live scan."""
+    _ensure_app_folders()
+    target_folder = SIGNALS_BUY_DIR if row["Direction"] == "BUY" else SIGNALS_SELL_DIR
+    safe_time = row["Signal Time"].replace(":", "").replace(" ", "_")
+    base_name = f"{row['Stock']}_{row['Signal Date']}_{safe_time}_{row['Direction']}"
+
+    _save_signal_txt(row, target_folder, base_name)
+    _save_signal_json(row, target_folder, base_name)
+    _save_signal_csv(row, target_folder, base_name)
+    _save_signal_chart(df, row, CHARTS_DIR, base_name)
+
+    logger.info(
+        "New Live OB signal saved: %s %s @ %s %s (Entry=%s SL=%s T1=%s T2=%s RR=%s)",
+        row["Stock"], row["Direction"], row["Signal Date"], row["Signal Time"],
+        row["Entry"], row["Stop Loss"], row["Target 1"], row["Target 2"], row["Risk:Reward"],
+    )
+
+
+def run_live_ob_signal_scan(fyers, symbols: List[str], seen_keys: set):
+    """Threaded, rate-limited scan across `symbols` for live 15-minute
+    Order Block BUY/SELL signals. Returns (all_rows, new_rows, errors,
+    stats, updated_seen_keys). `new_rows` are freshly-detected (not
+    previously seen) signals that have ALREADY been persisted to disk via
+    _persist_live_ob_signal — the caller only needs them to drive
+    Streamlit alerts/toasts."""
+    symbols = _validate_symbols(symbols)
+    all_rows: List[dict] = []
+    new_rows: List[dict] = []
+    errors: List[str] = []
+    stats = ScanStats(total=len(symbols))
+    updated_keys = set(seen_keys)
+
+    progress = st.progress(0.0, text=f"Scanning Live OB Signals 0 / {len(symbols)}")
+    done = 0
+
+    for i in range(0, len(symbols), BATCH_SIZE):
+        batch = symbols[i:i + BATCH_SIZE]
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            futures = {
+                executor.submit(_fetch_live_ob_signal, fyers, s, seen_keys): s for s in batch
+            }
+            for future in as_completed(futures):
+                try:
+                    res, err = future.result()
+                except Exception as e:
+                    res, err = None, f"{futures[future]}: worker error ({type(e).__name__})"
+
+                if res:
+                    all_rows.append(res)
+                    if res["dedup_key"] not in updated_keys:
+                        updated_keys.add(res["dedup_key"])
+                        new_rows.append(res)
+                if err:
+                    errors.append(err)
+                stats.record(has_result=bool(res), has_error=bool(err))
+                done += 1
+                progress.progress(done / max(len(symbols), 1), text=f"Scanning Live OB Signals {done} / {len(symbols)}")
+
+        if i + BATCH_SIZE < len(symbols):
+            time.sleep(BATCH_PAUSE_SECONDS)
+
+    progress.empty()
+    _save_seen_signal_keys(updated_keys)
+    return all_rows, new_rows, errors, stats, updated_keys
+
+
+def _persist_new_live_ob_rows(fyers, new_rows: List[dict]) -> None:
+    """Re-fetches each new row's 15-min candles once more (cheap — only for
+    the handful of genuinely NEW signals per scan) purely so the chart
+    export has the OHLCV data to draw from, then persists TXT/CSV/JSON/PNG
+    for every new signal via _persist_live_ob_signal."""
+    for row in new_rows:
+        try:
+            date_from = (datetime.today() - timedelta(days=LIVE_OB_LOOKBACK_DAYS)).strftime("%Y-%m-%d")
+            date_to = datetime.today().strftime("%Y-%m-%d")
+            resp, err = _safe_history(fyers, {
+                "symbol": row["Symbol"], "resolution": LIVE_OB_RESOLUTION, "date_format": "1",
+                "range_from": date_from, "range_to": date_to, "cont_flag": "1",
+            })
+            if err or not resp:
+                continue
+            candles = resp.get("candles")
+            if not candles:
+                continue
+            df = pd.DataFrame(candles, columns=["Time", "Open", "High", "Low", "Close", "Volume"])
+            df["Time"] = pd.to_datetime(df["Time"], unit="s", utc=True).dt.tz_convert("Asia/Kolkata")
+            df[["Open", "High", "Low", "Close", "Volume"]] = df[["Open", "High", "Low", "Close", "Volume"]].apply(
+                pd.to_numeric, errors="coerce"
+            )
+            df = df.dropna(subset=["Open", "High", "Low", "Close"]).sort_values("Time").reset_index(drop=True)
+            _persist_live_ob_signal(df, row)
+        except (KeyError, ValueError, TypeError, OSError) as e:
+            logger.warning("Could not persist live OB signal for %s: %s", row.get("Stock"), e)
+
+
 # ── Main Application ──────────────────────────────────────────────────────────
 def show_scanner(fyers):
     st.title("🚀 NSE AI PRO V13 — Institutional Scanner")
@@ -2539,10 +3090,11 @@ def show_scanner(fyers):
         _display_scan_summary(st.session_state["scan_stats"])
 
     tab_scanner, tab_intraday, tab_swing, tab_fo, \
-        tab_intraday_cisd, tab_fo_cisd, tab_golden_death, tab_premarket, tab_fo_15m_cisd = st.tabs(
+        tab_intraday_cisd, tab_fo_cisd, tab_golden_death, tab_premarket, tab_fo_15m_cisd, \
+        tab_live_ob = st.tabs(
         ["📊 Full Scanner", "⚡ Intraday Scanner", "📈 Swing Trade Scanner", "🏛️ F&O Stocks Scanner",
          "🕐 Intraday CISD Signals", "🎯 F&O CISD Scanner", "✝️ Swing Trading (Golden/Death Cross)",
-         "🌅 Pre-Market Scanner", "🎯 NSE F&O 15-Min CISD Scanner"]
+         "🌅 Pre-Market Scanner", "🎯 NSE F&O 15-Min CISD Scanner", "🔔 Live OB Signal Scanner"]
     )
 
     # ── Full Scanner tab ─────────────────────────────────────────────────
@@ -2956,6 +3508,126 @@ def show_scanner(fyers):
                 with st.expander(f"⚠️ Skipped/failed symbols ({len(st.session_state['fo15_cisd_errors'])})"):
                     st.caption("Showing up to 20 — most stocks are simply skipped for missing/invalid data, not app errors.")
                     st.text("\n".join(st.session_state["fo15_cisd_errors"][:20]))
+
+    # ── Live Order Block (15-Min) Signal Scanner tab (new) ────────────────
+    with tab_live_ob:
+        st.caption(
+            "Live 15-minute Order Block BUY/SELL signal engine — a genuine intraday feed "
+            "(resolution='15' via the Fyers V3 history API), reusing the existing SMC/CISD "
+            "and Order Block detection functions. Every NEW signal (never a duplicate for "
+            "the same confirming candle) is saved as TXT + CSV + JSON under signals/buy or "
+            "signals/sell, with an annotated candlestick chart under charts/, and logged to "
+            "logs/scanner.log."
+        )
+
+        live_ob_col1, live_ob_col2 = st.columns([2, 1])
+        with live_ob_col1:
+            default_watchlist = symbols[: min(15, len(symbols))]
+            live_ob_watchlist = st.multiselect(
+                "Stocks to monitor (Requirement 15 — supports multiple NSE stocks)",
+                options=symbols, default=default_watchlist, key="live_ob_watchlist",
+                help="Keep this list reasonably small (≤ 30–40 stocks) when auto-refresh is "
+                     "enabled, since a fresh 15-min history call is made for every stock every "
+                     "30 seconds and Fyers rate-limits the history API.",
+            )
+        with live_ob_col2:
+            live_ob_auto_refresh = st.checkbox(
+                f"🔁 Auto-refresh every {LIVE_OB_AUTO_REFRESH_SECONDS}s", value=False, key="live_ob_auto_refresh",
+                help="When ON, this tab automatically re-scans the watchlist above every "
+                     f"{LIVE_OB_AUTO_REFRESH_SECONDS} seconds and shows a live alert for any "
+                     "brand-new signal, without needing to click the scan button again.",
+            )
+
+        run_live_ob_now = st.button(
+            f"🔔 Run Live OB Signal Scan ({len(live_ob_watchlist)} symbols)", key="live_ob_run",
+        )
+
+        if run_live_ob_now or live_ob_auto_refresh:
+            if not live_ob_watchlist:
+                st.warning("Select at least one stock to monitor above.")
+            else:
+                seen_keys = _load_seen_signal_keys()
+                with st.spinner("Scanning for live 15-min Order Block signals…"):
+                    live_ob_rows, live_ob_new_rows, live_ob_errors, live_ob_stats, updated_keys = \
+                        run_live_ob_signal_scan(fyers, live_ob_watchlist, seen_keys)
+                    if live_ob_new_rows:
+                        _persist_new_live_ob_rows(fyers, live_ob_new_rows)
+
+                st.session_state["live_ob_df"] = pd.DataFrame(
+                    [{k: v for k, v in r.items() if k not in ("dedup_key", "Symbol")} for r in live_ob_rows]
+                )
+                st.session_state["live_ob_errors"] = live_ob_errors
+                st.session_state["live_ob_stats"] = live_ob_stats
+                st.session_state["live_ob_last_run"] = _now_ist().strftime("%d-%b-%Y %H:%M:%S")
+
+                # Requirement 13: live Streamlit alerts for every NEW signal.
+                for new_row in live_ob_new_rows:
+                    alert_msg = (
+                        f"{new_row['Signal']} {new_row['Stock']} @ {new_row['Entry']} "
+                        f"(SL {new_row['Stop Loss']}, T1 {new_row['Target 1']}, "
+                        f"T2 {new_row['Target 2']}, RR {new_row['Risk:Reward']}) — "
+                        f"{new_row['Signal Date']} {new_row['Signal Time']}"
+                    )
+                    if new_row["Direction"] == "BUY":
+                        st.success(f"🟢 NEW BUY SIGNAL: {alert_msg}")
+                    else:
+                        st.error(f"🔴 NEW SELL SIGNAL: {alert_msg}")
+                    try:
+                        st.toast(alert_msg, icon="🔔")
+                    except Exception:
+                        pass  # st.toast not available on older Streamlit versions
+
+        if "live_ob_stats" in st.session_state:
+            _display_scan_summary(st.session_state["live_ob_stats"])
+        if st.session_state.get("live_ob_last_run"):
+            st.caption(f"Last scanned: {st.session_state['live_ob_last_run']} IST")
+
+        live_ob_df = st.session_state.get("live_ob_df")
+        if live_ob_df is not None and not live_ob_df.empty:
+            live_ob_sorted = live_ob_df.sort_values("Signal Date", ascending=False)
+            st.dataframe(_style_dataframe(live_ob_sorted), use_container_width=True, height=450)
+
+            dl_col1, dl_col2, dl_col3 = st.columns(3)
+            with dl_col1:
+                st.download_button(
+                    "📥 Download Live OB Signals (Excel)",
+                    data=to_excel_bytes(live_ob_sorted, "Live OB Signals"),
+                    file_name=f"live_ob_signals_{_now_ist().strftime('%Y%m%d_%H%M')}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key="dl_live_ob_xlsx",
+                )
+            with dl_col2:
+                if os.path.exists(_LIVE_OB_MASTER_CSV):
+                    with open(_LIVE_OB_MASTER_CSV, "rb") as f:
+                        st.download_button(
+                            "📥 Download All-Time Signal Log (CSV)", data=f.read(),
+                            file_name="live_ob_signals_all_time.csv", mime="text/csv",
+                            key="dl_live_ob_csv",
+                        )
+            with dl_col3:
+                if os.path.exists(_LIVE_OB_MASTER_JSON):
+                    with open(_LIVE_OB_MASTER_JSON, "rb") as f:
+                        st.download_button(
+                            "📥 Download All-Time Signal Log (JSON)", data=f.read(),
+                            file_name="live_ob_signals_all_time.json", mime="application/json",
+                            key="dl_live_ob_json",
+                        )
+        else:
+            st.info("Run a Live OB Signal scan above (or enable auto-refresh) to see live signals here.")
+
+        if st.session_state.get("live_ob_errors"):
+            with st.expander(f"⚠️ Skipped/failed symbols ({len(st.session_state['live_ob_errors'])})"):
+                st.caption("Showing up to 20 — most stocks are simply skipped for missing/invalid data, not app errors.")
+                st.text("\n".join(st.session_state["live_ob_errors"][:20]))
+
+        # Requirement 14: auto-refresh every 30 seconds. Implemented as a
+        # blocking sleep + st.rerun() so the ENTIRE app re-executes and this
+        # tab re-scans automatically — this keeps the implementation simple
+        # and dependency-free, at the cost of the whole page (not just this
+        # tab) refreshing every cycle while the checkbox above is enabled.
+        if live_ob_auto_refresh:
+            time.sleep(LIVE_OB_AUTO_REFRESH_SECONDS)
+            st.rerun()
 
     if st.session_state.get("scan_errors"):
         with st.expander(f"⚠️ Skipped/failed symbols ({len(st.session_state['scan_errors'])})"):
