@@ -1,11 +1,12 @@
 streamlit
 fyers-apiv3
-pandas
+pandas>=2.1.0
+numpy
 requests
 yfinance
-numpy
 plotly
 matplotlib
-pandas>=2.1.0
 xgboost
 openpyxl
+feedparser
+streamlit-autorefresh
