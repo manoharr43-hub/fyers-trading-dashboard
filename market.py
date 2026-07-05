@@ -75,4 +75,8 @@ def market_summary(fyers):
         st.error("🔴 AI VIEW : Market Bearish")
 
     else:
-        st.warning("🟡 AI VIEW : Sideways / Neutral")
+        st.warning("🟡 AI VIEW : Sideways / Neutral")def show_market(fyers):
+    """
+    Compatibility wrapper for app.py
+    """
+    show_ai_market_intelligence(fyers)
