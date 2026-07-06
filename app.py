@@ -1,10 +1,18 @@
 import streamlit as st
 from fyers_apiv3 import fyersModel
 
-# 1. Page Config
-st.set_page_config(page_title="NSE AI PRO V12", page_icon="📈", layout="wide")
+# ==========================================
+# PAGE CONFIG
+# ==========================================
+st.set_page_config(
+    page_title="NSE AI PRO V12",
+    page_icon="📈",
+    layout="wide"
+)
 
-# 2. Imports & Error Handling
+# ==========================================
+# IMPORT MODULES
+# ==========================================
 try:
     from dashboard import show_dashboard
     from market import show_market
@@ -16,66 +24,172 @@ try:
     from trading import show_trading
     from profile import show_profile
     from settings import show_settings
+
+    # NEW MODULE
+    from ai_market_intelligence import show_ai_market_intelligence
+
 except ImportError as e:
-    st.error(f"Module Import Error: {e}")
-    st.info("గమనిక: అన్ని ఫైల్స్ (.py) ఒకే ఫోల్డర్‌లో ఉన్నాయని నిర్ధారించుకోండి.")
+    st.error(f"Module Import Error : {e}")
+    st.info("All .py files must be inside the same folder.")
     st.stop()
 
-# 3. FYERS Configuration
+# ==========================================
+# FYERS CONFIG
+# ==========================================
 CLIENT_ID = st.secrets["FYERS_CLIENT_ID"]
 SECRET_KEY = st.secrets["FYERS_SECRET_KEY"]
 REDIRECT_URI = st.secrets["FYERS_REDIRECT_URI"]
 
-# 4. Session Management
-if "access_token" not in st.session_state: st.session_state["access_token"] = None
-if "logged_in" not in st.session_state: st.session_state["logged_in"] = False
+# ==========================================
+# SESSION
+# ==========================================
+if "access_token" not in st.session_state:
+    st.session_state.access_token = None
 
-# 5. Login System
-session = fyersModel.SessionModel(client_id=CLIENT_ID, secret_key=SECRET_KEY, redirect_uri=REDIRECT_URI, response_type="code", grant_type="authorization_code")
+if "logged_in" not in st.session_state:
+    st.session_state.logged_in = False
 
-if not st.session_state["logged_in"]:
+# ==========================================
+# LOGIN
+# ==========================================
+session = fyersModel.SessionModel(
+    client_id=CLIENT_ID,
+    secret_key=SECRET_KEY,
+    redirect_uri=REDIRECT_URI,
+    response_type="code",
+    grant_type="authorization_code"
+)
+
+if not st.session_state.logged_in:
+
     st.title("📈 NSE AI PRO V12")
+
     login_url = session.generate_authcode()
-    st.link_button("🔑 Login with FYERS", login_url, use_container_width=True)
-    
+
+    st.link_button(
+        "🔑 Login With FYERS",
+        login_url,
+        use_container_width=True
+    )
+
     params = st.query_params
+
     if "auth_code" in params:
+
         try:
+
             session.set_token(params["auth_code"])
+
             response = session.generate_token()
-            if response.get("s") == "ok":
-                st.session_state["access_token"] = response["access_token"]
-                st.session_state["logged_in"] = True
+
+            if response["s"] == "ok":
+
+                st.session_state.access_token = response["access_token"]
+                st.session_state.logged_in = True
+
                 st.rerun()
-        except Exception as e: st.error(f"Login Error: {e}")
+
+            else:
+                st.error(response)
+
+        except Exception as e:
+            st.error(e)
+
     st.stop()
 
-# 6. Fyers Connection
-fyers = fyersModel.FyersModel(client_id=CLIENT_ID, token=st.session_state["access_token"], is_async=False)
+# ==========================================
+# CONNECT FYERS
+# ==========================================
+fyers = fyersModel.FyersModel(
+    client_id=CLIENT_ID,
+    token=st.session_state.access_token,
+    is_async=False
+)
 
-# 7. Navigation Sidebar
-menu = st.sidebar.radio("Navigation", [
-    "🏠 Dashboard", "📈 Market", "💼 Portfolio", "📋 Orders", 
-    "⚙️ Option Chain", "🤖 Scanner", "📊 Charts", "💹 Trading", 
-    "👤 Profile", "⚙️ Settings"
-])
+# ==========================================
+# SIDEBAR
+# ==========================================
+menu = st.sidebar.radio(
 
-# 8. Page Routing Map
+    "Navigation",
+
+    [
+
+        "🏠 Dashboard",
+
+        "📈 Market",
+
+        "🧠 AI Market Intelligence",
+
+        "💼 Portfolio",
+
+        "📋 Orders",
+
+        "⚙️ Option Chain",
+
+        "🤖 Scanner",
+
+        "📊 Charts",
+
+        "💹 Trading",
+
+        "👤 Profile",
+
+        "⚙️ Settings"
+
+    ]
+
+)
+
+# ==========================================
+# PAGE ROUTING
+# ==========================================
 pages = {
-    "🏠 Dashboard": show_dashboard, "📈 Market": show_market,
-    "💼 Portfolio": show_portfolio, "📋 Orders": show_orders,
-    "⚙️ Option Chain": show_option_chain, "🤖 Scanner": show_scanner,
-    "📊 Charts": show_charts, "💹 Trading": show_trading,
-    "👤 Profile": show_profile, "⚙️ Settings": show_settings
+
+    "🏠 Dashboard": show_dashboard,
+
+    "📈 Market": show_market,
+
+    "🧠 AI Market Intelligence": show_ai_market_intelligence,
+
+    "💼 Portfolio": show_portfolio,
+
+    "📋 Orders": show_orders,
+
+    "⚙️ Option Chain": show_option_chain,
+
+    "🤖 Scanner": show_scanner,
+
+    "📊 Charts": show_charts,
+
+    "💹 Trading": show_trading,
+
+    "👤 Profile": show_profile,
+
+    "⚙️ Settings": show_settings,
+
 }
 
-# 9. Execution
+# ==========================================
+# LOAD PAGE
+# ==========================================
 try:
-    pages[menu](fyers)
-except Exception as e:
-    st.error(f"Error loading {menu}: {e}")
 
+    pages[menu](fyers)
+
+except Exception as e:
+
+    st.error(f"Error Loading {menu}")
+
+    st.exception(e)
+
+# ==========================================
+# LOGOUT
+# ==========================================
 st.sidebar.divider()
+
 if st.sidebar.button("🚪 Logout"):
+
     st.session_state.clear()
+
     st.rerun()
