@@ -24,10 +24,15 @@ Streamlit + FYERS API v3 dashboard with:
     Table / Big Move Ready / AI Trade Signals sheets.
   • All original features preserved: PCR, Max Pain, IV chart, OI chart,
     Chain table, Big Move Alerts, Support/Resistance, Strike Signal.
+  • Gamma Build-up Analyzer: real-time (session-tracked) per-strike
+    Gamma monitoring with Gamma Change / Change % / Trend / Signal /
+    Strength / Trade Action / AI Rating, blinking Buy/Sell rows, smart
+    alerts, optional audio ping, and a live summary panel.
 """
 
 import io
 import math
+import time
 from collections import defaultdict
 from datetime import datetime
 
@@ -94,6 +99,35 @@ hr { border-color: #30363d; }
 .rating-hold       { background:#3a2f05; color:#d29922; border:1px solid #9e6a03; padding:3px 10px; border-radius:6px; font-size:12px; font-weight:700; }
 .rating-avoid      { background:#3a2405; color:#e8823a; border:1px solid #b5650a; padding:3px 10px; border-radius:6px; font-size:12px; font-weight:700; }
 .rating-ignore     { background:#3b0d1a; color:#f85149; border:1px solid #da3633; padding:3px 10px; border-radius:6px; font-size:12px; font-weight:700; }
+
+/* ── Gamma Build-up Analyzer: blink animations ────────────────────────── */
+@keyframes gammaBlinkGreen {
+    0%   { background-color: #0d3b2e; }
+    50%  { background-color: #1d5c3f; }
+    100% { background-color: #0d3b2e; }
+}
+@keyframes gammaBlinkRed {
+    0%   { background-color: #3b0d1a; }
+    50%  { background-color: #5c1d2c; }
+    100% { background-color: #3b0d1a; }
+}
+.gamma-table { width: 100%; border-collapse: collapse; font-family: 'Courier New', monospace; font-size: 12.5px; }
+.gamma-table th {
+    background: #1F4E78; color: #ffffff; padding: 8px 10px; text-align: center;
+    position: sticky; top: 0; font-size: 11px; text-transform: uppercase; letter-spacing: .04em;
+}
+.gamma-table td { padding: 7px 10px; text-align: center; border-bottom: 1px solid #21262d; color: #e6edf3; }
+.gamma-row-strongbuy { background-color: #0d3b2e; }
+.gamma-row-buy       { background-color: #123524; }
+.gamma-row-hold      { background-color: #1c2128; }
+.gamma-row-sell      { background-color: #2b1a05; }
+.gamma-row-strongsell{ background-color: #3b0d1a; }
+.gamma-row-blink-green { animation: gammaBlinkGreen 1.1s infinite; }
+.gamma-row-blink-red   { animation: gammaBlinkRed 1.1s infinite; }
+.gamma-live-badge {
+    background: #238636; color: #fff; padding: 3px 10px; border-radius: 12px;
+    font-size: 11px; font-weight: 700; letter-spacing: .05em; animation: gammaBlinkGreen 1.4s infinite;
+}
 </style>
 """, unsafe_allow_html=True)
 
@@ -1429,6 +1463,427 @@ def build_excel_report(df: pd.DataFrame, spot_price: float, atm_strike: float, p
 
 
 # ══════════════════════════════════════════════════════════════════════════
+# 5C. GAMMA BUILD-UP ANALYZER  (real-time, session-tracked per-strike Gamma
+#     monitoring — Gamma Change / Change % / Trend / Signal / Strength /
+#     Trade Action / AI Rating, blinking BUY/SELL rows, smart alerts,
+#     optional audio ping, live summary panel, no-duplicate-signal guard)
+# ══════════════════════════════════════════════════════════════════════════
+
+GAMMA_HISTORY_KEY = "oc_gamma_history"
+GAMMA_ALERTED_KEY = "oc_gamma_alerted_thresholds"
+GAMMA_LAST_SIGNAL_KEY = "oc_gamma_last_signal"
+GAMMA_AUDIO_FIRED_KEY = "oc_gamma_audio_fired"
+
+# A tiny base64 WAV "ping" so an audio alert can be played without any
+# external asset — used only when the user opts in via the sidebar.
+_GAMMA_PING_WAV_B64 = (
+    "UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQAAAAA="
+)
+
+
+def _bs_gamma(spot: float, strike: float, t: float, r: float, sigma: float) -> float:
+    """Standard Black-Scholes Gamma — identical for calls and puts at the
+    same strike/vol/tenor. Returns 0 for degenerate inputs."""
+    if t <= 0 or sigma <= 0 or spot <= 0 or strike <= 0:
+        return 0.0
+    d1 = (math.log(spot / strike) + (r + 0.5 * sigma ** 2) * t) / (sigma * math.sqrt(t))
+    return math.exp(-0.5 * d1 ** 2) / (spot * sigma * math.sqrt(2 * math.pi * t))
+
+
+def add_gamma_columns(df: pd.DataFrame, spot: float, expiry_label: str, r: float = 0.07) -> pd.DataFrame:
+    """Adds ce_gamma / pe_gamma / gamma (chain-level, avg of CE & PE) using
+    the CE/PE IV already present on the dataframe (from add_iv_columns).
+    Gamma is expressed per 1-point move in the underlying, same convention
+    used across the rest of this file's Black-Scholes helpers."""
+    d = df.copy()
+    if d.empty or not spot:
+        d["ce_gamma"] = 0.0
+        d["pe_gamma"] = 0.0
+        d["gamma"] = 0.0
+        return d
+
+    days_to_expiry = parse_days_to_expiry(expiry_label)
+    t = max(days_to_expiry, 0.5) / 365.0
+    ce_iv = d.get("ce_iv", pd.Series(0, index=d.index))
+    pe_iv = d.get("pe_iv", pd.Series(0, index=d.index))
+
+    def _row_gamma(strike, iv_pct):
+        sigma = max(float(iv_pct), 0.0) / 100.0
+        if sigma <= 0:
+            sigma = 0.30  # fallback vol so gamma still renders on thin payloads
+        return _bs_gamma(spot, strike, t, r, sigma)
+
+    d["ce_gamma"] = d.apply(lambda row: _row_gamma(row["strike_price"], row.get("ce_iv", 0)), axis=1)
+    d["pe_gamma"] = d.apply(lambda row: _row_gamma(row["strike_price"], row.get("pe_iv", 0)), axis=1)
+    d["gamma"] = ((d["ce_gamma"] + d["pe_gamma"]) / 2).round(6)
+    return d
+
+
+def _gamma_trend_label(change_pct: float) -> str:
+    if change_pct >= 30:
+        return "🚀 Explosive Increase"
+    if change_pct >= 10:
+        return "🟢 Increasing"
+    if change_pct > -10:
+        return "🟡 Stable"
+    if change_pct > -30:
+        return "🔴 Decreasing"
+    return "⚫ Flat"
+
+
+def _gamma_strength(change_pct: float) -> tuple:
+    """Returns (label, css_key). css_key maps to a row color band."""
+    a = abs(change_pct)
+    if a >= 30:
+        return "Very Strong", "strongbuy"
+    if a >= 20:
+        return "Strong", "buy"
+    if a >= 10:
+        return "Medium", "hold"
+    if a >= 3:
+        return "Weak", "sell"
+    return "Very Weak", "strongsell"
+
+
+def _gamma_signal(gamma_up: bool, oi_up: bool, volume_up: bool, ltp_up: bool, ltp_down: bool) -> str:
+    if gamma_up and oi_up and volume_up and ltp_up:
+        return "🟢 BUY"
+    if (not gamma_up) and oi_up and ltp_down:
+        return "🔴 SELL"
+    return "🟡 WAIT"
+
+
+def _gamma_trade_action(signal: str, strength_key: str, trend: str) -> str:
+    if signal == "🟢 BUY":
+        if "Explosive" in trend or strength_key == "strongbuy":
+            return "BUY NOW"
+        return "BUY ON DIP"
+    if signal == "🔴 SELL":
+        if strength_key in ("strongsell", "sell"):
+            return "EXIT"
+        return "SELL"
+    if strength_key in ("strongbuy", "buy"):
+        return "HOLD"
+    return "BOOK PROFIT" if strength_key in ("sell", "strongsell") else "HOLD"
+
+
+def _gamma_ai_rating(signal: str, strength_key: str) -> str:
+    if signal == "🟢 BUY" and strength_key == "strongbuy":
+        return "⭐⭐⭐⭐⭐"
+    if signal == "🟢 BUY" and strength_key in ("buy", "hold"):
+        return "⭐⭐⭐⭐"
+    if signal == "🟡 WAIT" and strength_key == "hold":
+        return "⭐⭐⭐"
+    if signal == "🔴 SELL" and strength_key in ("sell", "hold"):
+        return "⭐⭐"
+    return "⭐"
+
+
+def compute_gamma_analysis(df: pd.DataFrame, symbol: str, expiry_label: str) -> pd.DataFrame:
+    """
+    Compares this refresh's per-strike Gamma/OI/Volume/LTP against the
+    previous refresh (stored in st.session_state, keyed by symbol+expiry+
+    strike) and derives Gamma Change, Gamma Change %, Gamma Trend, Gamma
+    Signal, Gamma Strength, Trade Action and AI Rating.
+
+    On the very first fetch for a given symbol/expiry there is no prior
+    snapshot yet, so every strike starts at a neutral 0.0% / Stable / WAIT
+    baseline — this is expected and resolves itself from the second
+    refresh onward.
+    """
+    if df.empty:
+        return df
+
+    d = df.copy()
+    history = st.session_state.setdefault(GAMMA_HISTORY_KEY, {})
+    last_signal_map = st.session_state.setdefault(GAMMA_LAST_SIGNAL_KEY, {})
+    hist_key = f"{symbol}|{expiry_label}"
+    prev_strikes = history.get(hist_key, {})
+    new_strikes = {}
+
+    total_oi = (d.get("ce_oi", 0) + d.get("pe_oi", 0))
+    total_vol = (d.get("ce_volume", 0) + d.get("pe_volume", 0))
+    total_ltp = (d.get("ce_ltp", 0) + d.get("pe_ltp", 0))
+
+    gamma_change_list, gamma_pct_list, trend_list = [], [], []
+    signal_list, signal_key_list, strength_list, strength_key_list = [], [], [], []
+    action_list, rating_list = [], []
+    is_new_signal_list = []
+
+    for idx, row in d.iterrows():
+        strike = row["strike_price"]
+        cur_gamma = float(row.get("gamma", 0.0))
+        cur_oi = float(total_oi.loc[idx])
+        cur_vol = float(total_vol.loc[idx])
+        cur_ltp = float(total_ltp.loc[idx])
+
+        prev = prev_strikes.get(str(strike), {})
+        prev_gamma = prev.get("gamma", cur_gamma)
+        prev_oi = prev.get("oi", cur_oi)
+        prev_vol = prev.get("volume", cur_vol)
+        prev_ltp = prev.get("ltp", cur_ltp)
+
+        gamma_diff = cur_gamma - prev_gamma
+        gamma_pct = ((cur_gamma - prev_gamma) / prev_gamma * 100) if prev_gamma else 0.0
+        gamma_pct = float(np.clip(gamma_pct, -999, 999))
+
+        trend = _gamma_trend_label(gamma_pct)
+        gamma_up = gamma_diff > 0
+        oi_up = cur_oi > prev_oi
+        vol_up = cur_vol > prev_vol
+        ltp_up = cur_ltp > prev_ltp
+        ltp_down = cur_ltp < prev_ltp
+
+        signal = _gamma_signal(gamma_up, oi_up, vol_up, ltp_up, ltp_down)
+        strength_label, strength_key = _gamma_strength(gamma_pct)
+        action = _gamma_trade_action(signal, strength_key, trend)
+        rating = _gamma_ai_rating(signal, strength_key)
+
+        # ── no duplicate signal: only "fresh" once per direction change ──
+        prior_signal = last_signal_map.get(f"{hist_key}|{strike}")
+        is_new_signal = signal != "🟡 WAIT" and signal != prior_signal
+        if signal != "🟡 WAIT":
+            last_signal_map[f"{hist_key}|{strike}"] = signal
+        elif prior_signal is not None and prior_signal != "🟡 WAIT":
+            # gamma direction reverted to neutral — clear so next real
+            # signal in either direction counts as fresh again
+            last_signal_map[f"{hist_key}|{strike}"] = "🟡 WAIT"
+
+        gamma_change_list.append(gamma_diff)
+        gamma_pct_list.append(gamma_pct)
+        trend_list.append(trend)
+        signal_list.append(signal)
+        signal_key_list.append("buy" if signal == "🟢 BUY" else ("sell" if signal == "🔴 SELL" else "wait"))
+        strength_list.append(strength_label)
+        strength_key_list.append(strength_key)
+        action_list.append(action)
+        rating_list.append(rating)
+        is_new_signal_list.append(is_new_signal)
+
+        new_strikes[str(strike)] = {"gamma": cur_gamma, "oi": cur_oi, "volume": cur_vol, "ltp": cur_ltp}
+
+    d["Gamma Change"] = gamma_change_list
+    d["Gamma Change %"] = gamma_pct_list
+    d["Gamma Trend"] = trend_list
+    d["Gamma Signal"] = signal_list
+    d["Gamma Signal Key"] = signal_key_list
+    d["Gamma Strength"] = strength_list
+    d["Gamma Strength Key"] = strength_key_list
+    d["Trade Action"] = action_list
+    d["AI Rating"] = rating_list
+    d["_gamma_is_new_signal"] = is_new_signal_list
+
+    # ── Strong Buy / Strong Sell overrides (proxy conditions — no Greeks
+    # beyond Gamma are available in this chain payload, so Delta/Theta/
+    # VWAP conditions are approximated via ΔOI, Volume and LTP direction
+    # already computed above) ────────────────────────────────────────────
+    def _final_band(row):
+        strong_buy = (
+            row["Gamma Signal"] == "🟢 BUY"
+            and row["Gamma Strength Key"] in ("strongbuy", "buy")
+            and row.get("ce_chng_oi", 0) + row.get("pe_chng_oi", 0) > 0
+        )
+        strong_sell = (
+            row["Gamma Signal"] == "🔴 SELL"
+            and row["Gamma Strength Key"] in ("strongsell", "sell")
+        )
+        if strong_buy:
+            return "strongbuy"
+        if strong_sell:
+            return "strongsell"
+        if row["Gamma Signal"] == "🟢 BUY":
+            return "buy"
+        if row["Gamma Signal"] == "🔴 SELL":
+            return "sell"
+        return "hold"
+
+    d["Gamma Row Band"] = d.apply(_final_band, axis=1)
+
+    # persist this refresh as "previous" for the next one
+    history[hist_key] = new_strikes
+    st.session_state[GAMMA_HISTORY_KEY] = history
+    st.session_state[GAMMA_LAST_SIGNAL_KEY] = last_signal_map
+
+    # Sort so the strongest Gamma increase sits at the top, per spec.
+    d = d.sort_values("Gamma Change %", ascending=False).reset_index(drop=True)
+    return d
+
+
+GAMMA_ROW_CSS = {
+    "strongbuy": "gamma-row-strongbuy",
+    "buy": "gamma-row-buy",
+    "hold": "gamma-row-hold",
+    "sell": "gamma-row-sell",
+    "strongsell": "gamma-row-strongsell",
+}
+
+
+def render_gamma_html_table(df: pd.DataFrame, top_n: int = 40) -> str:
+    """Builds a raw HTML table (not st.dataframe) so CSS keyframe blinking
+    can actually animate — st.dataframe renders through a static grid
+    component that does not support live CSS animation."""
+    cols = [
+        ("strike_price", "Strike", "{:,.0f}"),
+        ("gamma", "Gamma", "{:.5f}"),
+        ("Gamma Change", "Gamma Chg", "{:+.5f}"),
+        ("Gamma Change %", "Gamma Chg %", "{:+.1f}%"),
+        ("Gamma Trend", "Trend", None),
+        ("Gamma Signal", "Signal", None),
+        ("Gamma Strength", "Strength", None),
+        ("Trade Action", "Action", None),
+        ("AI Rating", "AI Rating", None),
+    ]
+    view = df.head(top_n)
+    rows_html = []
+    for _, row in view.iterrows():
+        band = row.get("Gamma Row Band", "hold")
+        css = GAMMA_ROW_CSS.get(band, "gamma-row-hold")
+        blink = ""
+        if band in ("strongbuy", "buy") and row.get("Gamma Change %", 0) > 0:
+            blink = " gamma-row-blink-green"
+        elif band in ("strongsell", "sell") and row.get("Gamma Change %", 0) < -15:
+            blink = " gamma-row-blink-red"
+        cells = []
+        for key, _, fmt in cols:
+            val = row.get(key, "")
+            cells.append(f"<td>{fmt.format(val) if fmt else val}</td>")
+        rows_html.append(f'<tr class="{css}{blink}">{"".join(cells)}</tr>')
+
+    header_html = "".join(f"<th>{label}</th>" for _, label, _ in cols)
+    return f"""
+    <div style="max-height:560px; overflow-y:auto; border:1px solid #30363d; border-radius:8px;">
+    <table class="gamma-table">
+        <thead><tr>{header_html}</tr></thead>
+        <tbody>{''.join(rows_html)}</tbody>
+    </table>
+    </div>
+    """
+
+
+def fire_gamma_smart_alerts(df: pd.DataFrame, symbol: str, expiry_label: str) -> list:
+    """Popup-style st.toast alerts when the strongest Gamma Change % on the
+    board crosses 10% / 20% / 30% thresholds — fired once per threshold
+    per symbol/expiry until Gamma direction resets below it."""
+    if df.empty or "Gamma Change %" not in df.columns:
+        return []
+    alerted = st.session_state.setdefault(GAMMA_ALERTED_KEY, {})
+    key = f"{symbol}|{expiry_label}"
+    state = alerted.setdefault(key, {"10": False, "20": False, "30": False})
+
+    max_pct = float(df["Gamma Change %"].max())
+    messages = []
+    thresholds = [(30, "30", "🔥 Explosive Gamma Build-up"),
+                  (20, "20", "🚀🚀 Strong Institutional Buying"),
+                  (10, "10", "🚀 Gamma Build-up Detected")]
+    for value, tkey, msg in thresholds:
+        if max_pct >= value and not state[tkey]:
+            messages.append(msg)
+            state[tkey] = True
+        elif max_pct < value:
+            state[tkey] = False
+    alerted[key] = state
+    st.session_state[GAMMA_ALERTED_KEY] = alerted
+    return messages
+
+
+def render_gamma_tab(df: pd.DataFrame, symbol: str, expiry_label: str, spot_price: float,
+                      live_mode: bool, audio_alert: bool):
+    """Renders the full Gamma Build-up Analyzer tab: live status badge,
+    summary panel, smart alerts, optional audio ping, and the blinking
+    color-coded Gamma table. Does not touch or recompute anything from
+    the rest of the dashboard."""
+    st.markdown("##### ⚡ Advanced Gamma Build-up Analyzer")
+
+    gdf = add_gamma_columns(df, spot_price, expiry_label)
+    gdf = compute_gamma_analysis(gdf, symbol, expiry_label)
+
+    # ── Live status badge ────────────────────────────────────────────────
+    badge_col, time_col, prev_col = st.columns([1, 1, 1])
+    with badge_col:
+        if live_mode:
+            st.markdown('<span class="gamma-live-badge">🔴 LIVE</span>', unsafe_allow_html=True)
+        else:
+            st.markdown('<span class="intel-label">⏸ Manual refresh</span>', unsafe_allow_html=True)
+    with time_col:
+        st.markdown(f"<span class='intel-label'>Updated</span><br>"
+                    f"<span class='intel-value' style='font-size:14px;'>{datetime.now().strftime('%H:%M:%S')}</span>",
+                    unsafe_allow_html=True)
+    with prev_col:
+        avg_gamma = gdf["gamma"].mean() if "gamma" in gdf.columns and len(gdf) else 0
+        st.markdown(f"<span class='intel-label'>Avg Gamma (this refresh)</span><br>"
+                    f"<span class='intel-value' style='font-size:14px;'>{avg_gamma:.5f}</span>",
+                    unsafe_allow_html=True)
+
+    # ── Smart alerts (popups) ────────────────────────────────────────────
+    alert_msgs = fire_gamma_smart_alerts(gdf, symbol, expiry_label)
+    for msg in alert_msgs:
+        try:
+            st.toast(msg, icon="⚡")
+        except Exception:
+            st.info(msg)
+
+    # ── Audio alert (only once per fresh, non-duplicate signal) ─────────
+    if audio_alert and gdf.get("_gamma_is_new_signal", pd.Series(dtype=bool)).any():
+        fired = st.session_state.setdefault(GAMMA_AUDIO_FIRED_KEY, {})
+        fire_key = f"{symbol}|{expiry_label}|{datetime.now().strftime('%H:%M:%S')}"
+        if fired.get(f"{symbol}|{expiry_label}") != fire_key:
+            fired[f"{symbol}|{expiry_label}"] = fire_key
+            st.session_state[GAMMA_AUDIO_FIRED_KEY] = fired
+            st.audio(io.BytesIO(__import__("base64").b64decode(_GAMMA_PING_WAV_B64)), format="audio/wav")
+
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    # ── Summary panel (above the Gamma table) ────────────────────────────
+    st.markdown('<div class="block-title">📋 Gamma Summary Panel</div>', unsafe_allow_html=True)
+    strong_buy_n = int((gdf["Gamma Row Band"] == "strongbuy").sum()) if "Gamma Row Band" in gdf.columns else 0
+    buy_n = int((gdf["Gamma Row Band"] == "buy").sum()) if "Gamma Row Band" in gdf.columns else 0
+    sell_n = int(gdf["Gamma Row Band"].isin(["sell", "strongsell"]).sum()) if "Gamma Row Band" in gdf.columns else 0
+
+    top_gamma_row = gdf.loc[gdf["gamma"].idxmax()] if len(gdf) and "gamma" in gdf.columns else None
+    top_gamma_pct_row = gdf.loc[gdf["Gamma Change %"].idxmax()] if len(gdf) and "Gamma Change %" in gdf.columns else None
+    top_oi_row = gdf.loc[(gdf.get("ce_oi", 0) + gdf.get("pe_oi", 0)).idxmax()] if len(gdf) else None
+    top_vol_row = gdf.loc[(gdf.get("ce_volume", 0) + gdf.get("pe_volume", 0)).idxmax()] if len(gdf) else None
+    top_rating_row = gdf.iloc[gdf["AI Rating"].apply(len).values.argmax()] if len(gdf) and "AI Rating" in gdf.columns else None
+
+    def _strike_of(row):
+        try:
+            return f"{row['strike_price']:,.0f}"
+        except Exception:
+            return "—"
+
+    g1, g2, g3, g4 = st.columns(4)
+    g1.metric("Total Strong Buy Strikes", strong_buy_n)
+    g2.metric("Total Buy Strikes", buy_n)
+    g3.metric("Total Sell Strikes", sell_n)
+    g4.metric("Highest Gamma Strike", _strike_of(top_gamma_row) if top_gamma_row is not None else "—")
+
+    g5, g6, g7, g8 = st.columns(4)
+    g5.metric("Highest Gamma %", f"{top_gamma_pct_row['Gamma Change %']:+.1f}%" if top_gamma_pct_row is not None else "—")
+    g6.metric("Highest OI Strike", _strike_of(top_oi_row) if top_oi_row is not None else "—")
+    g7.metric("Highest Volume Strike", _strike_of(top_vol_row) if top_vol_row is not None else "—")
+    g8.metric("Highest AI Rating", top_rating_row["AI Rating"] if top_rating_row is not None else "—")
+
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    # ── Gamma table (custom HTML — enables CSS blink animation) ─────────
+    st.markdown(render_gamma_html_table(gdf), unsafe_allow_html=True)
+    st.caption(
+        "Gamma is derived per strike via Black-Scholes from the chain's own IV (or a 30% fallback vol "
+        "on thin payloads) and compared against the previous refresh stored for this session. Rows "
+        "blink green while Gamma is rising alongside a BUY signal, and blink red while Gamma is "
+        "falling sharply (≤ −15%) alongside a SELL signal; blinking stops automatically once Gamma "
+        "stabilizes, while the last BUY/SELL signal stays visible. Strongest Gamma increase is sorted "
+        "to the top. This is a heuristic read from a single point-in-time + previous-refresh "
+        "comparison, not real tick-by-tick market data — always confirm with live price action."
+    )
+
+    # ── Auto-refresh every 5 seconds when Live mode is enabled ──────────
+    if live_mode:
+        time.sleep(5)
+        st.rerun()
+
+
+# ══════════════════════════════════════════════════════════════════════════
 # 9. MAIN DASHBOARD
 # ══════════════════════════════════════════════════════════════════════════
 
@@ -1525,6 +1980,15 @@ def show_option_chain(fyers):
         debug_mode = st.checkbox("Show raw API response (debug)", value=False)
         st.divider()
         fetch_btn = st.button("🔄 Fetch Live Data", use_container_width=True, type="primary")
+
+        st.divider()
+        st.markdown("### ⚡ Gamma Build-up Analyzer")
+        gamma_live_mode = st.checkbox(
+            "Enable Live Gamma Auto-Refresh (5s)", value=False, key="oc_gamma_live_mode",
+            help="When enabled, the Gamma Build-up tab re-runs every 5 seconds so Gamma Change / "
+                 "Trend / Signal are compared against the previous refresh.",
+        )
+        gamma_audio_alert = st.checkbox("🔔 Audio ping on new Gamma signal", value=False, key="oc_gamma_audio")
 
     # ── Fetch & Process ─────────────────────────────────────────────────
     if fetch_btn:
@@ -1791,8 +2255,9 @@ def show_option_chain(fyers):
 
     st.divider()
 
-    tab1, tab2, tab3, tab4, tab5 = st.tabs(
-        ["📋 Chain Table", "📊 OI Analysis", "📈 IV Skew", "🔥 Big Move Ready", "🤖 AI Trade Signals"]
+    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
+        ["📋 Chain Table", "📊 OI Analysis", "📈 IV Skew", "🔥 Big Move Ready",
+         "🤖 AI Trade Signals", "⚡ Gamma Build-up"]
     )
 
     with tab1:
@@ -1935,6 +2400,9 @@ def show_option_chain(fyers):
             "based. This is a positioning read, not financial advice — always confirm with price action "
             "and manage your own risk."
         )
+
+    with tab6:
+        render_gamma_tab(df, symbol, expiry_label, spot_price, gamma_live_mode, gamma_audio_alert)
 
     # ── Excel Download ───────────────────────────────────────────────────
     st.divider()
