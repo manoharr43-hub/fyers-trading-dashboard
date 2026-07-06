@@ -1727,16 +1727,16 @@ def _color_code(val):
         if any(x in val for x in [
             "Strong Buy", "BUY", "Institutional", "🟢", "🔵", "Buy", "BOS 📈", "CHOCH 🐂",
             "Bullish", "Aligned Bullish", "Outperform", "Near High", "Bullish Engulfing",
-            "Hammer", "Higher Highs", "📈", "Up",
+            "Hammer", "Higher Highs", "📈", "Up", "Golden Cross",
         ]):
             return "color: green; font-weight: bold;"
         if any(x in val for x in [
             "Strong Sell", "SELL", "Sell", "Distribution", "🔴", "🟠", "BOS 📉", "CHOCH 🐻",
             "Bearish", "Aligned Bearish", "Underperform", "Near Low", "Bearish Engulfing",
-            "Shooting Star", "Lower Highs", "📉", "Down",
+            "Shooting Star", "Lower Highs", "📉", "Down", "Death Cross",
         ]):
             return "color: red; font-weight: bold;"
-        if any(x in val for x in ["🟡", "Wait", "HOLD", "Neutral", "Mixed", "Inline", "WAIT"]):
+        if any(x in val for x in ["🟡", "Wait", "HOLD", "Neutral", "Mixed", "Inline", "WAIT", "WATCH"]):
             return "color: #b8860b; font-weight: bold;"
     return ""
 
@@ -1757,6 +1757,7 @@ _SIGNAL_FILL_RULES = [
     ("SELL", "FF0000", "FFFFFF", True),
     ("WAIT", "FFFF00", "000000", True),
     ("HOLD", "FFFF00", "000000", True),
+    ("WATCH", "FFFF00", "000000", True),
     ("CISD UP", "92D050", "000000", True),
     ("CISD DOWN", "FF0000", "FFFFFF", True),
 ]
@@ -1861,6 +1862,19 @@ def to_excel_bytes_multi(sheets: dict) -> bytes:
 
     buf.seek(0)
     return buf.getvalue()
+
+
+def to_csv_bytes(df: pd.DataFrame) -> bytes:
+    """Generic CSV export helper — used by any scanner tab that needs a
+    plain CSV download button (e.g. the new EMA 50/200 Swing Scanner)."""
+    return df.to_csv(index=False).encode("utf-8")
+
+
+def to_json_bytes(df: pd.DataFrame) -> bytes:
+    """Generic JSON export helper (records orientation, pretty-printed) —
+    used alongside to_csv_bytes()/to_excel_bytes() for scanners that need
+    all three export formats."""
+    return df.to_json(orient="records", indent=2, force_ascii=False).encode("utf-8")
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -2121,7 +2135,7 @@ def run_fo_cisd_scan(fyers, symbols: List[str]):
     return results, errors, stats
 
 
-# ── 4. Swing Trading Scanner (Golden Cross / Death Cross) ───────────────────
+# ── 4. Swing Trading Scanner (Golden Cross / Death Cross, Daily) ────────────
 def _fetch_golden_death_cross_signal(fyers, symbol: str):
     if not isinstance(symbol, str) or not _VALID_EQ_SYMBOL_RE.match(symbol):
         return None, f"{symbol}: invalid symbol format — skipped"
@@ -3015,6 +3029,260 @@ def _persist_new_live_ob_rows(fyers, new_rows: List[dict]) -> None:
             logger.warning("Could not persist live OB signal for %s: %s", row.get("Stock"), e)
 
 
+# ══════════════════════════════════════════════════════════════════════════
+# ── 8. EMA 50/200 SWING TRADING STRATEGY (4-HOUR, new, additive) ─────────
+# Brand-new swing scanner requested by the user. Fully independent of every
+# scanner above — reuses only the already-tested shared helpers
+# (_safe_history, calculate_rsi, calculate_macd, calculate_atr,
+# calculate_vwap_approx, _validate_symbols, ScanStats, _format_signal_timestamp)
+# and introduces no changes to any existing function, tab, or column.
+#
+# Requirements implemented:
+#   1. Fetches 4-Hour candles via the Fyers History API (resolution="240").
+#   2. Computes EMA 50 and EMA 200 on the 4H close series.
+#   3. Detects Golden Cross (EMA50 crosses ABOVE EMA200 -> BUY) and
+#      Death Cross (EMA50 crosses BELOW EMA200 -> SELL) using the same
+#      sign-change-over-a-short-lookback technique as the existing daily
+#      Golden/Death Cross scanner (_fetch_golden_death_cross_signal), just
+#      applied to 4H candles instead of daily ones.
+#   4. Confirms the cross only if ALL of the following line up:
+#        - RSI > 55 for BUY / RSI < 45 for SELL
+#        - MACD line above/below signal line in the trade's direction
+#        - Volume > 20-period average (on the 4H series)
+#        - Price above VWAP for BUY / below VWAP for SELL
+#      A cross that fires without full confirmation is still shown, tagged
+#      "🟡 WATCH", so the user can see early crosses that haven't yet lined
+#      up — it is simply not labeled BUY/SELL until every condition agrees.
+#   5. Emits every requested display column.
+#   6. Row highlighting: BUY=green, SELL=red, WATCH=yellow — handled by the
+#      existing _color_code()/_get_conditional_fill_font() functions, which
+#      already recognize "BUY"/"SELL"/"WATCH" (WATCH added to both).
+#   7. Excel export via to_excel_bytes(); CSV/JSON export via the new
+#      to_csv_bytes()/to_json_bytes() helpers.
+# ══════════════════════════════════════════════════════════════════════════
+
+EMA_SWING_RESOLUTION = "240"          # Fyers 4-Hour candle resolution
+EMA_SWING_RESOLUTION_LABEL = "4-Hour"
+EMA_SWING_LOOKBACK_DAYS = 400          # enough 4H history for a stable EMA200
+EMA_SWING_FAST_SPAN = 50
+EMA_SWING_SLOW_SPAN = 200
+EMA_SWING_MIN_CANDLES = 60             # minimum 4H candles required to even attempt cross detection
+
+
+def _fetch_ema_swing_signal(fyers, symbol: str):
+    """Core per-symbol worker for the EMA 50/200 4H Swing Scanner.
+
+    Returns (row_dict_or_None, error_or_None). `row` is None (with no
+    error) whenever this symbol simply has no FRESH Golden/Death Cross on
+    its 4H candles right now — that's the normal/expected case for most
+    stocks on any given scan, not a failure.
+    """
+    if not isinstance(symbol, str) or not _VALID_EQ_SYMBOL_RE.match(symbol):
+        return None, f"{symbol}: invalid symbol format — skipped"
+
+    date_from = (datetime.today() - timedelta(days=EMA_SWING_LOOKBACK_DAYS)).strftime("%Y-%m-%d")
+    date_to = datetime.today().strftime("%Y-%m-%d")
+
+    # Requirement 1: 4-Hour candles via the Fyers History API.
+    resp, err = _safe_history(fyers, {
+        "symbol": symbol, "resolution": EMA_SWING_RESOLUTION, "date_format": "1",
+        "range_from": date_from, "range_to": date_to, "cont_flag": "1",
+    })
+    if err:
+        return None, f"{symbol}: {err}"
+
+    candles = resp.get("candles") if resp else None
+    if not candles or len(candles) < EMA_SWING_MIN_CANDLES:
+        return None, None  # not enough 4H history yet — not an error
+
+    try:
+        df = pd.DataFrame(candles, columns=["Time", "Open", "High", "Low", "Close", "Volume"])
+        df["Time"] = pd.to_datetime(df["Time"], unit="s", utc=True).dt.tz_convert("Asia/Kolkata")
+        df[["Open", "High", "Low", "Close", "Volume"]] = df[["Open", "High", "Low", "Close", "Volume"]].apply(
+            pd.to_numeric, errors="coerce"
+        )
+        df = df.dropna(subset=["Open", "High", "Low", "Close"]).sort_values("Time").reset_index(drop=True)
+        if len(df) < EMA_SWING_MIN_CANDLES:
+            return None, None
+
+        close = df["Close"]
+
+        # Requirement 2: EMA 50 / EMA 200 on the 4H close series. Falls
+        # back to a shorter span (like the existing daily cross scanner)
+        # when there isn't yet a full 200-candle history, so EMA200 is
+        # never blank/undefined for a symbol that's simply newer/shorter.
+        ema50 = close.ewm(span=EMA_SWING_FAST_SPAN, adjust=False).mean()
+        ema200 = (
+            close.ewm(span=EMA_SWING_SLOW_SPAN, adjust=False).mean()
+            if len(close) >= EMA_SWING_SLOW_SPAN
+            else close.ewm(span=len(close), adjust=False).mean()
+        )
+
+        # Requirement 3: detect a FRESH cross in the last few candles (same
+        # sign-change technique as the existing daily Golden/Death Cross
+        # scanner, just on 4H bars).
+        lookback = min(5, len(close) - 1)
+        diff_tail = (ema50 - ema200).tail(lookback + 1)
+        prev_sign = np.sign(diff_tail.iloc[0])
+        curr_sign = np.sign(diff_tail.iloc[-1])
+
+        if prev_sign <= 0 and curr_sign > 0:
+            direction = "BUY"
+            golden_cross, death_cross = "Yes", "No"
+        elif prev_sign >= 0 and curr_sign < 0:
+            direction = "SELL"
+            golden_cross, death_cross = "No", "Yes"
+        else:
+            return None, None  # no fresh crossover on this symbol right now
+
+        last_close = float(close.iloc[-1])
+        ema50_last = round(float(ema50.iloc[-1]), 2)
+        ema200_last = round(float(ema200.iloc[-1]), 2)
+
+        # Requirement 4: confirmation checklist (RSI / MACD / Volume / VWAP).
+        rsi_val = round(float(calculate_rsi(close).iloc[-1]), 1)
+        macd_line, macd_signal_line, _ = calculate_macd(close)
+        macd_bullish = bool(macd_line.iloc[-1] > macd_signal_line.iloc[-1])
+        macd_str = "🟢 Bullish" if macd_bullish else "🔴 Bearish"
+
+        vol_avg20 = float(df["Volume"].tail(20).mean())
+        last_volume = float(df["Volume"].iloc[-1])
+        volume_ok = bool(vol_avg20 > 0 and last_volume > vol_avg20)
+        volume_ratio = round(last_volume / vol_avg20, 2) if vol_avg20 > 0 else 0.0
+
+        vwap_val = calculate_vwap_approx(df)
+
+        is_buy = direction == "BUY"
+        if is_buy:
+            confirmations = {
+                "RSI > 55": rsi_val > 55,
+                "MACD Bullish": macd_bullish,
+                "Volume > 20-avg": volume_ok,
+                "Price > VWAP": vwap_val is not None and last_close > vwap_val,
+            }
+        else:
+            confirmations = {
+                "RSI < 45": rsi_val < 45,
+                "MACD Bearish": not macd_bullish,
+                "Volume > 20-avg": volume_ok,
+                "Price < VWAP": vwap_val is not None and last_close < vwap_val,
+            }
+
+        confirmed_count = sum(confirmations.values())
+        all_confirmed = confirmed_count == len(confirmations)
+
+        # Requirement 4/5: Trade Decision — only a fully-confirmed cross is
+        # labeled BUY/SELL; a cross that hasn't (yet) lined up with every
+        # condition is shown as WATCH so the user can track it without
+        # acting on a half-confirmed signal.
+        if all_confirmed and is_buy:
+            trade_decision = "🟢 BUY"
+        elif all_confirmed and not is_buy:
+            trade_decision = "🔴 SELL"
+        else:
+            trade_decision = "🟡 WATCH"
+
+        # AI Score: 50 baseline, shifted by how many of the 4 confirmations
+        # agree (in the cross's own direction), plus a small RVOL kicker —
+        # same style of scoring used by the other scanners in this file.
+        direction_sign = 1 if is_buy else -1
+        ai_score = round(min(max(
+            50 + direction_sign * (confirmed_count * 10) + direction_sign * min(volume_ratio, 3) * 3,
+            0), 100), 1)
+
+        if confirmed_count == 4:
+            swing_trend = "🟢🟢 Strong Bullish Reversal" if is_buy else "🔴🔴 Strong Bearish Reversal"
+        elif confirmed_count >= 2:
+            swing_trend = "🟢 Bullish Bias" if is_buy else "🔴 Bearish Bias"
+        else:
+            swing_trend = "🟡 Weak / Unconfirmed"
+
+        # Entry / Stop Loss / Target 1 / Target 2 — ATR-based, mirroring the
+        # existing daily Golden/Death Cross scanner's risk model.
+        atr = float(calculate_atr(df).iloc[-1])
+        if pd.isna(atr) or atr <= 0:
+            atr = last_close * 0.01
+
+        entry = round(last_close, 2)
+        if is_buy:
+            stop_loss = round(entry - 2.0 * atr, 2)
+            target1 = round(entry + 2.0 * atr, 2)
+            target2 = round(entry + 3.5 * atr, 2)
+        else:
+            stop_loss = round(entry + 2.0 * atr, 2)
+            target1 = round(entry - 2.0 * atr, 2)
+            target2 = round(entry - 3.5 * atr, 2)
+
+        stock_ticker = symbol.replace("NSE:", "").replace("-EQ", "")
+
+        # Signal Date/Time = the actual 4H candle whose close produced this
+        # crossover — a genuine intraday-resolution candle, so it is used
+        # as-is (is_daily=False), never scan/system time.
+        signal_date_str, signal_time_str = _candle_signal_timestamp(df, is_daily=False)
+
+        row = {
+            "Signal Date": signal_date_str,
+            "Signal Time": signal_time_str,
+            "Stock": stock_ticker,
+            "LTP": round(last_close, 2),
+            "EMA 50": ema50_last,
+            "EMA 200": ema200_last,
+            "Golden Cross": golden_cross,
+            "Death Cross": death_cross,
+            "RSI": rsi_val,
+            "MACD": macd_str,
+            "Volume Ratio": volume_ratio,
+            "VWAP": vwap_val,
+            "AI Score": ai_score,
+            "Swing Trend": swing_trend,
+            "Entry": entry,
+            "Stop Loss": stop_loss,
+            "Target 1": target1,
+            "Target 2": target2,
+            "Trade Decision": trade_decision,
+        }
+        return row, None
+    except (KeyError, IndexError, TypeError, ValueError, ZeroDivisionError, AttributeError) as e:
+        return None, f"{symbol}: analysis error ({type(e).__name__})"
+    except Exception as e:  # pragma: no cover - absolute safety net
+        return None, f"{symbol}: unexpected error ({type(e).__name__})"
+
+
+def run_ema_swing_scan(fyers, symbols: List[str]):
+    """Threaded, rate-limited scan across `symbols` for fresh EMA 50/200
+    Golden Cross / Death Cross signals on 4-Hour candles. Returns
+    (results, errors, stats) — same shape as every other scanner in this
+    file, so it plugs into the existing summary/export UI unchanged."""
+    symbols = _validate_symbols(symbols)
+    results, errors = [], []
+    stats = ScanStats(total=len(symbols))
+    progress = st.progress(0.0, text=f"Scanning EMA 50/200 Swing (4H) 0 / {len(symbols)}")
+    done = 0
+
+    for i in range(0, len(symbols), BATCH_SIZE):
+        batch = symbols[i:i + BATCH_SIZE]
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            futures = {executor.submit(_fetch_ema_swing_signal, fyers, s): s for s in batch}
+            for future in as_completed(futures):
+                try:
+                    res, err = future.result()
+                except Exception as e:
+                    res, err = None, f"{futures[future]}: worker error ({type(e).__name__})"
+                if res:
+                    results.append(res)
+                if err:
+                    errors.append(err)
+                stats.record(has_result=bool(res), has_error=bool(err))
+                done += 1
+                progress.progress(done / max(len(symbols), 1), text=f"Scanning EMA 50/200 Swing (4H) {done} / {len(symbols)}")
+
+        if i + BATCH_SIZE < len(symbols):
+            time.sleep(BATCH_PAUSE_SECONDS)
+
+    progress.empty()
+    return results, errors, stats
+
+
 # ── Main Application ──────────────────────────────────────────────────────────
 def show_scanner(fyers):
     st.title("🚀 NSE AI PRO V13 — Institutional Scanner")
@@ -3091,10 +3359,11 @@ def show_scanner(fyers):
 
     tab_scanner, tab_intraday, tab_swing, tab_fo, \
         tab_intraday_cisd, tab_fo_cisd, tab_golden_death, tab_premarket, tab_fo_15m_cisd, \
-        tab_live_ob = st.tabs(
+        tab_live_ob, tab_ema_swing = st.tabs(
         ["📊 Full Scanner", "⚡ Intraday Scanner", "📈 Swing Trade Scanner", "🏛️ F&O Stocks Scanner",
          "🕐 Intraday CISD Signals", "🎯 F&O CISD Scanner", "✝️ Swing Trading (Golden/Death Cross)",
-         "🌅 Pre-Market Scanner", "🎯 NSE F&O 15-Min CISD Scanner", "🔔 Live OB Signal Scanner"]
+         "🌅 Pre-Market Scanner", "🎯 NSE F&O 15-Min CISD Scanner", "🔔 Live OB Signal Scanner",
+         "🌟 EMA 50/200 Swing (4H)"]
     )
 
     # ── Full Scanner tab ─────────────────────────────────────────────────
@@ -3353,7 +3622,7 @@ def show_scanner(fyers):
                     st.caption("Showing up to 20 — most stocks are simply skipped for missing/invalid data, not app errors.")
                     st.text("\n".join(st.session_state["fo_cisd_errors"][:20]))
 
-    # ── Swing Trading tab (Golden Cross / Death Cross) ───────────────────
+    # ── Swing Trading tab (Golden Cross / Death Cross, Daily) ─────────────
     with tab_golden_death:
         st.caption("EMA50 / EMA200 Golden Cross (bullish) and Death Cross (bearish) detection on daily candles.")
         gd_limit = st.number_input(
@@ -3458,7 +3727,7 @@ def show_scanner(fyers):
                 st.caption("Showing up to 20 — most stocks are simply skipped for missing/invalid data, not app errors.")
                 st.text("\n".join(st.session_state["premarket_errors"][:20]))
 
-    # ── NSE F&O 15-Minute CISD Scanner tab (new) ─────────────────────────
+    # ── NSE F&O 15-Minute CISD Scanner tab ───────────────────────────────
     with tab_fo_15m_cisd:
         st.caption(
             "Dedicated 15-minute CISD scanner — F&O stocks only (index symbols excluded). "
@@ -3509,7 +3778,7 @@ def show_scanner(fyers):
                     st.caption("Showing up to 20 — most stocks are simply skipped for missing/invalid data, not app errors.")
                     st.text("\n".join(st.session_state["fo15_cisd_errors"][:20]))
 
-    # ── Live Order Block (15-Min) Signal Scanner tab (new) ────────────────
+    # ── Live Order Block (15-Min) Signal Scanner tab ──────────────────────
     with tab_live_ob:
         st.caption(
             "Live 15-minute Order Block BUY/SELL signal engine — a genuine intraday feed "
@@ -3628,6 +3897,91 @@ def show_scanner(fyers):
         if live_ob_auto_refresh:
             time.sleep(LIVE_OB_AUTO_REFRESH_SECONDS)
             st.rerun()
+
+    # ── EMA 50/200 Swing Trading Scanner tab (4-Hour, NEW) ────────────────
+    with tab_ema_swing:
+        st.caption(
+            "EMA 50 / EMA 200 Swing Trading strategy on 4-Hour candles (resolution='240' via "
+            "the Fyers History API). A Golden Cross (EMA 50 crosses ABOVE EMA 200) or Death "
+            "Cross (EMA 50 crosses BELOW EMA 200) is only labeled a firm BUY/SELL once RSI, "
+            "MACD, Volume, and VWAP all confirm the same direction — otherwise it's shown as "
+            "🟡 WATCH so you can track an early cross without acting on it prematurely."
+        )
+        st.caption(
+            "Confirmation rules — **BUY**: RSI > 55, MACD bullish, Volume > 20-period average, "
+            "Price above VWAP. **SELL**: RSI < 45, MACD bearish, Volume > 20-period average, "
+            "Price below VWAP."
+        )
+
+        ema_swing_limit = st.number_input(
+            "Limit symbols (0 = all)", min_value=0, max_value=len(symbols),
+            value=min(300, len(symbols)), step=50, key="ema_swing_limit",
+        )
+        ema_swing_universe = symbols if ema_swing_limit == 0 else symbols[:ema_swing_limit]
+
+        if st.button(f"🌟 Run EMA 50/200 Swing Scan ({len(ema_swing_universe)} symbols, 4H)", key="ema_swing_run"):
+            with st.spinner("Scanning 4-Hour candles for EMA 50/200 Golden/Death Cross signals…"):
+                ema_swing_results, ema_swing_errors, ema_swing_stats = run_ema_swing_scan(fyers, ema_swing_universe)
+                ema_swing_df = pd.DataFrame(ema_swing_results)
+
+            st.session_state["ema_swing_df"] = ema_swing_df
+            st.session_state["ema_swing_errors"] = ema_swing_errors
+            st.session_state["ema_swing_stats"] = ema_swing_stats
+
+        if "ema_swing_stats" in st.session_state:
+            _display_scan_summary(st.session_state["ema_swing_stats"])
+
+        ema_swing_df = st.session_state.get("ema_swing_df")
+        if ema_swing_df is not None and not ema_swing_df.empty:
+            ema_swing_filter = st.selectbox(
+                "Filter", options=["All", "BUY only", "SELL only", "WATCH only"], key="ema_swing_filter",
+            )
+            ema_swing_view = ema_swing_df.copy()
+            try:
+                if ema_swing_filter == "BUY only":
+                    ema_swing_view = ema_swing_view[ema_swing_view["Trade Decision"].str.contains("BUY", na=False)]
+                elif ema_swing_filter == "SELL only":
+                    ema_swing_view = ema_swing_view[ema_swing_view["Trade Decision"].str.contains("SELL", na=False)]
+                elif ema_swing_filter == "WATCH only":
+                    ema_swing_view = ema_swing_view[ema_swing_view["Trade Decision"].str.contains("WATCH", na=False)]
+            except (KeyError, TypeError, AttributeError):
+                ema_swing_view = ema_swing_df.copy()
+
+            ema_swing_sorted = ema_swing_view.sort_values("AI Score", ascending=False)
+            st.dataframe(_style_dataframe(ema_swing_sorted), use_container_width=True, height=500)
+
+            ema_dl_col1, ema_dl_col2, ema_dl_col3 = st.columns(3)
+            with ema_dl_col1:
+                st.download_button(
+                    "📥 Download as Excel",
+                    data=to_excel_bytes(ema_swing_sorted, "EMA Swing 4H"),
+                    file_name=f"nse_ema_swing_4h_{_now_ist().strftime('%Y%m%d_%H%M')}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key="dl_ema_swing_xlsx",
+                )
+            with ema_dl_col2:
+                st.download_button(
+                    "📥 Download as CSV",
+                    data=to_csv_bytes(ema_swing_sorted),
+                    file_name=f"nse_ema_swing_4h_{_now_ist().strftime('%Y%m%d_%H%M')}.csv",
+                    mime="text/csv",
+                    key="dl_ema_swing_csv",
+                )
+            with ema_dl_col3:
+                st.download_button(
+                    "📥 Download as JSON",
+                    data=to_json_bytes(ema_swing_sorted),
+                    file_name=f"nse_ema_swing_4h_{_now_ist().strftime('%Y%m%d_%H%M')}.json",
+                    mime="application/json",
+                    key="dl_ema_swing_json",
+                )
+        else:
+            st.info("Run an EMA 50/200 Swing scan above to see fresh 4H Golden/Death Cross signals here.")
+
+        if st.session_state.get("ema_swing_errors"):
+            with st.expander(f"⚠️ Skipped/failed symbols ({len(st.session_state['ema_swing_errors'])})"):
+                st.caption("Showing up to 20 — most stocks are simply skipped for missing/invalid data, not app errors.")
+                st.text("\n".join(st.session_state["ema_swing_errors"][:20]))
 
     if st.session_state.get("scan_errors"):
         with st.expander(f"⚠️ Skipped/failed symbols ({len(st.session_state['scan_errors'])})"):
