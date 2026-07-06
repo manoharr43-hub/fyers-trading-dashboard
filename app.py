@@ -1,54 +1,81 @@
 import streamlit as st
-import pandas as pd
+from fyers_apiv3 import fyersModel
 
+# 1. Page Config
+st.set_page_config(page_title="NSE AI PRO V12", page_icon="📈", layout="wide")
 
-def show_ai_market_intelligence(fyers):
-    """
-    AI Market Intelligence page.
-    Replace the placeholder logic below with your actual analysis
-    (sentiment scoring, breakout detection, ML predictions, etc.)
-    """
-    st.title("🧠 AI Market Intelligence")
-    st.caption("Automated insights and signals generated from live market data.")
+# 2. Imports & Error Handling
+try:
+    from dashboard import show_dashboard
+    from market import show_market
+    from portfolio import show_portfolio
+    from orders import show_orders
+    from option_chain import show_option_chain
+    from scanner import show_scanner
+    from charts import show_charts
+    from trading import show_trading
+    from profile import show_profile
+    from settings import show_settings
+except ImportError as e:
+    st.error(f"Module Import Error: {e}")
+    st.info("గమనిక: అన్ని ఫైల్స్ (.py) ఒకే ఫోల్డర్‌లో ఉన్నాయని నిర్ధారించుకోండి.")
+    st.stop()
 
-    symbol = st.text_input("Symbol (e.g. NSE:RELIANCE-EQ)", "NSE:RELIANCE-EQ")
+# 3. FYERS Configuration
+CLIENT_ID = st.secrets["FYERS_CLIENT_ID"]
+SECRET_KEY = st.secrets["FYERS_SECRET_KEY"]
+REDIRECT_URI = st.secrets["FYERS_REDIRECT_URI"]
 
-    col1, col2 = st.columns(2)
-    with col1:
-        run = st.button("🔍 Analyze", use_container_width=True)
-    with col2:
-        st.write("")
+# 4. Session Management
+if "access_token" not in st.session_state: st.session_state["access_token"] = None
+if "logged_in" not in st.session_state: st.session_state["logged_in"] = False
 
-    if run:
+# 5. Login System
+session = fyersModel.SessionModel(client_id=CLIENT_ID, secret_key=SECRET_KEY, redirect_uri=REDIRECT_URI, response_type="code", grant_type="authorization_code")
+
+if not st.session_state["logged_in"]:
+    st.title("📈 NSE AI PRO V12")
+    login_url = session.generate_authcode()
+    st.link_button("🔑 Login with FYERS", login_url, use_container_width=True)
+    
+    params = st.query_params
+    if "auth_code" in params:
         try:
-            data = {
-                "symbol": symbol,
-                "ohlcv_flag": 1
-            }
-            quote = fyers.quotes({"symbols": symbol})
+            session.set_token(params["auth_code"])
+            response = session.generate_token()
+            if response.get("s") == "ok":
+                st.session_state["access_token"] = response["access_token"]
+                st.session_state["logged_in"] = True
+                st.rerun()
+        except Exception as e: st.error(f"Login Error: {e}")
+    st.stop()
 
-            if quote.get("s") == "ok":
-                d = quote["d"][0]["v"]
-                st.subheader("Snapshot")
-                st.metric("LTP", d.get("lp"))
-                st.metric("Change %", d.get("chp"))
+# 6. Fyers Connection
+fyers = fyersModel.FyersModel(client_id=CLIENT_ID, token=st.session_state["access_token"], is_async=False)
 
-                # --- Placeholder "AI" signal logic ---
-                chp = d.get("chp", 0)
-                if chp > 1:
-                    signal, color = "BULLISH 📈", "green"
-                elif chp < -1:
-                    signal, color = "BEARISH 📉", "red"
-                else:
-                    signal, color = "NEUTRAL ⏸️", "orange"
+# 7. Navigation Sidebar
+menu = st.sidebar.radio("Navigation", [
+    "🏠 Dashboard", "📈 Market", "💼 Portfolio", "📋 Orders", 
+    "⚙️ Option Chain", "🤖 Scanner", "📊 Charts", "💹 Trading", 
+    "👤 Profile", "⚙️ Settings"
+])
 
-                st.markdown(f"### Signal: :{color}[{signal}]")
-                st.info("This is a placeholder rule-based signal. Plug in your own model "
-                        "(technical indicators, sentiment, ML predictions) here.")
-            else:
-                st.error(f"Could not fetch data: {quote}")
+# 8. Page Routing Map
+pages = {
+    "🏠 Dashboard": show_dashboard, "📈 Market": show_market,
+    "💼 Portfolio": show_portfolio, "📋 Orders": show_orders,
+    "⚙️ Option Chain": show_option_chain, "🤖 Scanner": show_scanner,
+    "📊 Charts": show_charts, "💹 Trading": show_trading,
+    "👤 Profile": show_profile, "⚙️ Settings": show_settings
+}
 
-        except Exception as e:
-            st.error(f"Error analyzing {symbol}: {e}")
-    else:
-        st.info("Enter a symbol and click Analyze to generate an AI-driven market view.")
+# 9. Execution
+try:
+    pages[menu](fyers)
+except Exception as e:
+    st.error(f"Error loading {menu}: {e}")
+
+st.sidebar.divider()
+if st.sidebar.button("🚪 Logout"):
+    st.session_state.clear()
+    st.rerun()
