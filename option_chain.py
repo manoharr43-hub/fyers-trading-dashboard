@@ -1,3 +1,4 @@
+
 """
 FYERS Options Chain Dashboard — Pro Edition (AI Upgrade)
 =========================================================
@@ -128,31 +129,6 @@ hr { border-color: #30363d; }
     background: #238636; color: #fff; padding: 3px 10px; border-radius: 12px;
     font-size: 11px; font-weight: 700; letter-spacing: .05em; animation: gammaBlinkGreen 1.4s infinite;
 }
-
-/* ── AI Scalping Engine ───────────────────────────────────────────────── */
-.scalp-direction-buy {
-    background: linear-gradient(135deg, #0d3b2e, #123524); color: #3fb950;
-    border: 1px solid #238636; padding: 14px 20px; border-radius: 10px;
-    font-size: 26px; font-weight: 800; text-align: center; letter-spacing: .05em;
-}
-.scalp-direction-sell {
-    background: linear-gradient(135deg, #3b0d1a, #2b0d14); color: #f85149;
-    border: 1px solid #da3633; padding: 14px 20px; border-radius: 10px;
-    font-size: 26px; font-weight: 800; text-align: center; letter-spacing: .05em;
-}
-.scalp-direction-wait {
-    background: #1c2128; color: #d29922; border: 1px solid #9e6a03;
-    padding: 14px 20px; border-radius: 10px; font-size: 22px; font-weight: 800;
-    text-align: center; letter-spacing: .04em;
-}
-.scalp-reason-yes { color: #3fb950; font-family: 'Courier New', monospace; font-size: 13px; }
-.scalp-reason-no  { color: #6e7681; font-family: 'Courier New', monospace; font-size: 13px; }
-.scalp-warning {
-    background: #3a2405; color: #e8823a; border: 1px solid #b5650a;
-    padding: 8px 14px; border-radius: 6px; font-size: 13px; margin-bottom: 6px; display: block;
-}
-.scalp-condition-met { color:#3fb950; }
-.scalp-condition-unmet { color:#f85149; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -474,29 +450,6 @@ def _bs_price(spot, strike, t, r, sigma, is_call: bool) -> float:
     return strike * math.exp(-r * t) * _norm_cdf(-d2) - spot * _norm_cdf(-d1)
 
 
-def _bs_greeks(spot, strike, t, r, sigma, is_call: bool) -> dict:
-    """Standard Black-Scholes Delta/Gamma/Theta/Vega — used by the AI
-    engine's option-Greeks factors (section 5B) and the scalping engine
-    (section 5D). Theta is expressed per-calendar-day, Vega per 1% IV."""
-    if t <= 0 or sigma <= 0 or spot <= 0 or strike <= 0:
-        return {"delta": 0.0, "gamma": 0.0, "theta": 0.0, "vega": 0.0}
-    d1 = (math.log(spot / strike) + (r + 0.5 * sigma ** 2) * t) / (sigma * math.sqrt(t))
-    d2 = d1 - sigma * math.sqrt(t)
-    pdf_d1 = math.exp(-0.5 * d1 ** 2) / math.sqrt(2 * math.pi)
-    gamma = pdf_d1 / (spot * sigma * math.sqrt(t))
-    vega = spot * pdf_d1 * math.sqrt(t) / 100.0
-    if is_call:
-        delta = _norm_cdf(d1)
-        theta = (-(spot * pdf_d1 * sigma) / (2 * math.sqrt(t))
-                 - r * strike * math.exp(-r * t) * _norm_cdf(d2)) / 365.0
-    else:
-        delta = _norm_cdf(d1) - 1.0
-        theta = (-(spot * pdf_d1 * sigma) / (2 * math.sqrt(t))
-                 + r * strike * math.exp(-r * t) * _norm_cdf(-d2)) / 365.0
-    return {"delta": round(delta, 4), "gamma": round(gamma, 6),
-            "theta": round(theta, 4), "vega": round(vega, 4)}
-
-
 def implied_volatility(price, spot, strike, t, is_call: bool, r: float = 0.07) -> float:
     """Newton-Raphson IV solver — FYERS' optionchain endpoint commonly omits
     ce_iv/pe_iv, so IV is derived from premium via Black-Scholes instead."""
@@ -543,38 +496,6 @@ def add_iv_columns(df: pd.DataFrame, spot: float, expiry_label: str) -> pd.DataF
     df["pe_iv"] = df.apply(
         lambda row: implied_volatility(row.get("pe_ltp", 0), spot, row["strike_price"], t, False), axis=1)
     return df
-
-
-def add_greeks_columns(df: pd.DataFrame, spot: float, expiry_label: str, r: float = 0.07) -> pd.DataFrame:
-    """Adds ce_delta/pe_delta/ce_gamma_bs/pe_gamma_bs/ce_theta/pe_theta/
-    ce_vega/pe_vega using the chain's own IV. Independent of the existing
-    Gamma Build-up Analyzer's ce_gamma/pe_gamma (section 5C), which stays
-    untouched — this feeds the new Master AI Confidence engine instead."""
-    d = df.copy()
-    if d.empty or not spot:
-        for c in ("ce_delta", "pe_delta", "ce_gamma_bs", "pe_gamma_bs", "ce_theta", "pe_theta", "ce_vega", "pe_vega"):
-            d[c] = 0.0
-        return d
-    days_to_expiry = parse_days_to_expiry(expiry_label)
-    t = max(days_to_expiry, 0.5) / 365.0
-
-    def _row(strike, iv_pct, is_call):
-        sigma = max(float(iv_pct), 0.0) / 100.0
-        if sigma <= 0:
-            sigma = 0.30
-        return _bs_greeks(spot, strike, t, r, sigma, is_call)
-
-    ce_greeks = d.apply(lambda row: _row(row["strike_price"], row.get("ce_iv", 0), True), axis=1)
-    pe_greeks = d.apply(lambda row: _row(row["strike_price"], row.get("pe_iv", 0), False), axis=1)
-    d["ce_delta"] = ce_greeks.apply(lambda g: g["delta"])
-    d["ce_gamma_bs"] = ce_greeks.apply(lambda g: g["gamma"])
-    d["ce_theta"] = ce_greeks.apply(lambda g: g["theta"])
-    d["ce_vega"] = ce_greeks.apply(lambda g: g["vega"])
-    d["pe_delta"] = pe_greeks.apply(lambda g: g["delta"])
-    d["pe_gamma_bs"] = pe_greeks.apply(lambda g: g["gamma"])
-    d["pe_theta"] = pe_greeks.apply(lambda g: g["theta"])
-    d["pe_vega"] = pe_greeks.apply(lambda g: g["vega"])
-    return d
 
 
 def compute_strike_bias(df: pd.DataFrame) -> pd.DataFrame:
@@ -1964,834 +1885,540 @@ def render_gamma_tab(df: pd.DataFrame, symbol: str, expiry_label: str, spot_pric
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# 5D. FUTURES DATA  (OI + price trend — used by the Master AI Confidence
-#     engine and the Scalping Engine; independent of the options chain)
+# 9. MAIN DASHBOARD
 # ══════════════════════════════════════════════════════════════════════════
 
-FUTURES_NAME_MAP = {
-    "NIFTY": ("NSE", "NIFTY"), "BANKNIFTY": ("NSE", "BANKNIFTY"),
-    "FINNIFTY": ("NSE", "FINNIFTY"), "MIDCPNIFTY": ("NSE", "MIDCPNIFTY"),
-    "NIFTYNEXT50": ("NSE", "NIFTYNEXT50"), "SENSEX": ("BSE", "SENSEX"),
-    "BANKEX": ("BSE", "BANKEX"),
-}
+def show_option_chain(fyers):
+    st.markdown("## 📊 Master Options Chain Dashboard")
 
-FUTURES_HISTORY_KEY = "oc_futures_history"
+    # ── Sidebar ──────────────────────────────────────────────────────────
+    with st.sidebar:
+        st.markdown("### ⚙️ Configuration")
+        option_type = st.radio("Instrument Type", ["Indices", "F&O Stocks"], key="instr_type_radio")
+        is_stock = option_type == "F&O Stocks"
 
+        if not is_stock:
+            selected_key = st.selectbox("Index", list(INDEX_SYMBOL_CANDIDATES.keys()))
+            symbol_candidates = INDEX_SYMBOL_CANDIDATES[selected_key]
+            symbol_key = selected_key
+        else:
+            stock = st.text_input("Stock Symbol (e.g. RELIANCE, TCS, INFY, SBIN, ICICIBANK, HDFCBANK)", "RELIANCE")
+            symbol_candidates = get_stock_symbol_candidates(stock)
+            symbol_key = symbol_candidates[0]
 
-def get_futures_symbol_candidates(index_key: str, base_symbol: str = None) -> list:
-    """Builds ordered NSE/BSE futures symbol candidates for the current and
-    next-month contract (FYERS format, e.g. NSE:NIFTY25JULFUT). Since the
-    exact FYERS futures naming convention can vary, both the current and
-    next calendar month are tried, same fallback style used throughout
-    this file for index/stock symbols."""
-    now = datetime.now()
-    candidates = []
-    if index_key in FUTURES_NAME_MAP:
-        exch, name = FUTURES_NAME_MAP[index_key]
-    elif base_symbol:
-        exch, name = "NSE", base_symbol.strip().upper()
-    else:
-        return []
-    for month_offset in (0, 1):
-        total_month = now.month - 1 + month_offset
-        year = now.year + total_month // 12
-        month = total_month % 12 + 1
-        yy = str(year)[-2:]
-        mon = datetime(year, month, 1).strftime("%b").upper()
-        candidates.append(f"{exch}:{name}{yy}{mon}FUT")
-    return candidates
+        # Auto-reload expiry list whenever the chosen instrument changes —
+        # no manual timestamp editing required. We fetch the RAW expiry
+        # payload here too, and store it untouched for on-screen inspection
+        # — no assumption is made about which instruments are weekly vs
+        # monthly-only; whatever the API returns is what gets shown.
+        if st.session_state.get("oc_current_symbol_key") != symbol_key:
+            st.session_state["oc_current_symbol_key"] = symbol_key
+            st.session_state["oc_expiry_list"] = []
+            st.session_state["oc_raw_expiry_payload"] = []
+            st.session_state.pop("oc_df", None)
+            with st.spinner("Loading expiry dates …"):
+                expiry_list, _used, raw_payload = fetch_expiry_list(fyers, symbol_candidates)
+            st.session_state["oc_expiry_list"] = expiry_list
+            st.session_state["oc_raw_expiry_payload"] = raw_payload
 
+        max_strikes = 20 if is_stock else 30
+        strike_count = st.slider("Strikes Around ATM", 5, max_strikes, min(20, max_strikes), step=5)
 
-def fetch_futures_snapshot(fyers, symbol_candidates: list) -> dict:
-    """Best-effort futures LTP + Open Interest fetch via fyers.quotes(),
-    trying each candidate symbol in turn. Returns {} if none resolve —
-    the rest of the AI engine degrades gracefully (futures factors are
-    simply skipped) rather than failing outright."""
-    for sym in symbol_candidates:
-        try:
-            resp = fyers.quotes(data={"symbols": sym})
-        except Exception:
-            continue
-        if not isinstance(resp, dict) or resp.get("s") != "ok":
-            continue
-        d_list = resp.get("d", [])
-        if not d_list:
-            continue
-        v = d_list[0].get("v", {}) if isinstance(d_list[0], dict) else {}
-        if not v:
-            continue
-        ltp = float(v.get("lp", 0) or 0)
-        if ltp <= 0:
-            continue
-        return {
-            "symbol": sym,
-            "ltp": ltp,
-            "oi": float(v.get("oi", 0) or v.get("open_interest", 0) or 0),
-            "prev_close": float(v.get("prev_close_price", 0) or v.get("cp", 0) or 0),
-            "change_pct": float(v.get("chp", 0) or 0),
-            "volume": float(v.get("volume", 0) or v.get("vol_traded_today", 0) or 0),
-        }
-    return {}
+        expiry_options = st.session_state.get("oc_expiry_list", [])
+        raw_expiry_payload = st.session_state.get("oc_raw_expiry_payload", [])
 
+        # ── Raw API expiry inspection (always shown, never filtered) ────
+        with st.expander("🔍 Raw FYERS Expiry Response (debug/inspection)", expanded=False):
+            st.markdown(f"**Number of expiries returned by API:** {len(raw_expiry_payload)}")
+            if len(raw_expiry_payload) == 1:
+                st.warning("Only one expiry is available from FYERS API.")
+            elif len(raw_expiry_payload) == 0:
+                st.caption("No expiry data returned yet — select an instrument or click Retry below.")
+            st.markdown("**Raw `expiryData` payload (exactly as received):**")
+            st.json(raw_expiry_payload if raw_expiry_payload else {})
+            st.markdown("**Parsed expiry list (label, timestamp) — every expiry above, unfiltered:**")
+            st.write(expiry_options if expiry_options else "—")
 
-def analyze_futures_buildup(snapshot: dict) -> dict:
-    """Compares this refresh's Futures OI/LTP against the previous refresh
-    (session-tracked) to classify Long Build-up / Short Build-up / Long
-    Unwinding / Short Covering, and the raw price trend direction."""
-    if not snapshot:
-        return {}
-    history = st.session_state.setdefault(FUTURES_HISTORY_KEY, {})
-    key = snapshot.get("symbol", "futures")
-    prev = history.get(key, {})
-    cur_oi, cur_ltp = snapshot["oi"], snapshot["ltp"]
-    prev_oi = prev.get("oi", cur_oi)
-    prev_ltp = prev.get("ltp", cur_ltp)
+        if expiry_options:
+            tagged = classify_expiries(expiry_options)  # (label, ts, tag) — every expiry preserved, nearest-first
+            display_labels = [f"{label}  ·  {tag}" for label, ts, tag in tagged]
+            label_to_ts = {f"{label}  ·  {tag}": ts for label, ts, tag in tagged}
+            label_to_plain = {f"{label}  ·  {tag}": label for label, ts, tag in tagged}
+            selected_display = st.selectbox(
+                "Expiry (Weekly / Monthly — nearest selected by default)", display_labels, index=0
+            )
+            expiry_timestamp = label_to_ts.get(selected_display, "")
+            selected_expiry_label = label_to_plain.get(selected_display, "")
 
-    oi_up = cur_oi > prev_oi
-    price_up = cur_ltp > prev_ltp
-    price_down = cur_ltp < prev_ltp
+            if len(expiry_options) == 1:
+                st.info("Only one expiry is available from FYERS API.")
 
-    if oi_up and price_up:
-        buildup = "Long Build-up"
-    elif oi_up and price_down:
-        buildup = "Short Build-up"
-    elif not oi_up and price_down:
-        buildup = "Long Unwinding"
-    elif not oi_up and price_up:
-        buildup = "Short Covering"
-    else:
-        buildup = "Flat"
+            # Data-driven check against what THIS fetch actually returned —
+            # not a hard-coded per-index assumption. If none of the
+            # expiries the API returned classify as "Weekly" (classify_
+            # expiries logic is unmodified), the FYERS API is not currently
+            # listing a weekly contract for this instrument.
+            has_weekly = any(tag == "Weekly" for _, _, tag in tagged)
+            if not has_weekly:
+                st.warning("Weekly expiries are not available from the FYERS API for this instrument.")
 
-    history[key] = {"oi": cur_oi, "ltp": cur_ltp}
-    st.session_state[FUTURES_HISTORY_KEY] = history
+            st.caption(
+                f"Selected expiry: **{selected_expiry_label}**  |  "
+                f"API request expiry (timestamp sent to FYERS): **{expiry_timestamp or '—'}**"
+            )
+        else:
+            st.caption("⏳ Fetching available expiry dates for this instrument …")
+            expiry_timestamp = ""
+            selected_expiry_label = ""
+            if st.button("🔁 Retry Loading Expiry List"):
+                with st.spinner("Loading expiry dates …"):
+                    expiry_list, _used, raw_payload = fetch_expiry_list(fyers, symbol_candidates)
+                st.session_state["oc_expiry_list"] = expiry_list
+                st.session_state["oc_raw_expiry_payload"] = raw_payload
+                st.rerun()
 
-    return {
-        **snapshot,
-        "buildup": buildup,
-        "long_buildup": buildup == "Long Build-up",
-        "short_buildup": buildup == "Short Build-up",
-        "long_unwinding": buildup == "Long Unwinding",
-        "short_covering": buildup == "Short Covering",
-        "price_trend": "up" if price_up else ("down" if price_down else "flat"),
-    }
+        ai_min_conf = st.slider("AI Min Confidence % (Trade Signals)", 50, 95, 80, step=5)
+        debug_mode = st.checkbox("Show raw API response (debug)", value=False)
+        st.divider()
+        fetch_btn = st.button("🔄 Fetch Live Data", use_container_width=True, type="primary")
 
+        st.divider()
+        st.markdown("### ⚡ Gamma Build-up Analyzer")
+        gamma_live_mode = st.checkbox(
+            "Enable Live Gamma Auto-Refresh (5s)", value=False, key="oc_gamma_live_mode",
+            help="When enabled, the Gamma Build-up tab re-runs every 5 seconds so Gamma Change / "
+                 "Trend / Signal are compared against the previous refresh.",
+        )
+        gamma_audio_alert = st.checkbox("🔔 Audio ping on new Gamma signal", value=False, key="oc_gamma_audio")
 
-# ══════════════════════════════════════════════════════════════════════════
-# 5E. TECHNICAL INDICATORS  (candle-based: VWAP, EMA 9/20/50, RSI, MACD,
-#     Supertrend, ADX — feed the Master AI Confidence engine and the
-#     Scalping Engine. Computed from FYERS intraday history candles.)
-# ══════════════════════════════════════════════════════════════════════════
+    # ── Fetch & Process ─────────────────────────────────────────────────
+    if fetch_btn:
+        with st.spinner("Connecting to Fyers API …"):
+            response, used_symbol, attempts = fetch_optionchain_with_fallback(
+                fyers, symbol_candidates, strike_count, expiry_timestamp
+            )
+            # If the selected expiry itself returns no usable data, walk
+            # forward through the remaining expiries automatically instead
+            # of failing outright. This never drops an expiry from the
+            # dropdown — it only changes which one is actively displayed
+            # if the chosen one comes back empty.
+            if (not response or response.get("s") != "ok") and expiry_options:
+                for _, ts in expiry_options:
+                    if ts == expiry_timestamp:
+                        continue
+                    response, used_symbol, attempts = fetch_optionchain_with_fallback(
+                        fyers, symbol_candidates, strike_count, ts
+                    )
+                    if response and response.get("s") == "ok":
+                        expiry_timestamp = ts
+                        selected_expiry_label = format_expiry_label(ts)
+                        st.info(f"Selected expiry had no data — automatically switched to {selected_expiry_label}.")
+                        break
 
-def fetch_candle_data(fyers, symbol: str, resolution: str = "5", lookback_days: int = 5) -> pd.DataFrame:
-    """Fetches recent OHLCV candles via the FYERS history API so intraday
-    technical indicators (VWAP/EMA/RSI/MACD/Supertrend/ADX) can be derived
-    — the option-chain endpoint itself carries no price-series data."""
-    try:
-        to_ts = int(time.time())
-        from_ts = to_ts - int(lookback_days) * 86400
-        resp = fyers.history(data={
-            "symbol": symbol, "resolution": str(resolution), "date_format": "0",
-            "range_from": str(from_ts), "range_to": str(to_ts), "cont_flag": "1",
-        })
-    except Exception:
-        return pd.DataFrame()
-    if not isinstance(resp, dict) or resp.get("s") != "ok":
-        return pd.DataFrame()
-    candles = resp.get("candles", [])
-    if not candles:
-        return pd.DataFrame()
-    df = pd.DataFrame(candles, columns=["timestamp", "open", "high", "low", "close", "volume"])
-    for c in ("open", "high", "low", "close", "volume"):
-        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
-    df["datetime"] = pd.to_datetime(df["timestamp"], unit="s")
-    df.sort_values("timestamp", inplace=True)
-    df.reset_index(drop=True, inplace=True)
-    return df
+        if debug_mode:
+            st.write("**Symbols tried:**", attempts)
+            st.json(response if response else {})
 
+        if not response:
+            st.error("API call failed for all symbol variants tried. Check your Fyers connection/token.")
+            return
 
-def compute_vwap(df: pd.DataFrame) -> pd.Series:
+        if response.get("s") != "ok":
+            err_code = response.get("code", "—")
+            err_msg = response.get("message", "No data returned")
+            st.error(
+                f"API Error (code {err_code}): {err_msg}\n\n"
+                f"Tried: {', '.join(s for s, _ in attempts)}. "
+                "If this is a stock, confirm it actually has active F&O contracts on NSE — "
+                "not every stock has listed options."
+            )
+            return
+
+        symbol = used_symbol
+
+        # Re-derive both the raw and parsed expiry lists straight from this
+        # fetch's response too, so the sidebar inspection panel always
+        # reflects the most recent API payload for the chosen instrument —
+        # every expiry present is kept, nothing is filtered out.
+        new_raw_payload = extract_raw_expiry_payload(response)
+        new_expiry_list = extract_expiry_list(response)
+        if new_expiry_list:
+            st.session_state["oc_expiry_list"] = new_expiry_list
+        if new_raw_payload:
+            st.session_state["oc_raw_expiry_payload"] = new_raw_payload
+
+        options_data, data = extract_options_data(response)
+        spot_price = extract_spot_price(response, data)
+
+        if not spot_price:
+            try:
+                quote_resp = fyers.quotes(data={"symbols": symbol})
+                q = quote_resp.get("d", [{}])[0].get("v", {}) if isinstance(quote_resp, dict) else {}
+                spot_price = float(q.get("lp", 0) or 0)
+            except Exception:
+                pass
+
+        if not options_data:
+            st.warning(
+                "⚠️ No options data returned for this symbol. This can mean: the market is closed, "
+                "the symbol/strike count combination is invalid, or the API response uses a different "
+                "field name than expected. Enable **'Show raw API response'** in the sidebar and "
+                "re-fetch to inspect the actual payload."
+            )
+            return
+
+        df = normalize_chain_shape(options_data)
+        df = ensure_numeric_columns(df)
+        df.sort_values("strike_price", inplace=True)
+        df.reset_index(drop=True, inplace=True)
+        df = compute_strike_bias(df)
+        df = add_iv_columns(df, spot_price, selected_expiry_label)
+
+        st.session_state["oc_df"] = df
+        st.session_state["oc_spot"] = spot_price
+        st.session_state["oc_symbol"] = symbol
+        st.session_state["oc_expiry_label"] = selected_expiry_label
+        st.session_state["oc_expiry_timestamp"] = expiry_timestamp
+        st.session_state["oc_ai_min_conf"] = ai_min_conf
+
+    # ── Render from session_state (persists across reruns/tab switches) ─
+    if "oc_df" not in st.session_state:
+        st.info("👈 Choose an instrument in the sidebar and click **Fetch Live Data**.")
+        return
+
+    df = st.session_state["oc_df"]
+    spot_price = st.session_state["oc_spot"]
+    symbol = st.session_state.get("oc_symbol", "")
+    expiry_label = st.session_state.get("oc_expiry_label", "")
+    request_expiry_ts = st.session_state.get("oc_expiry_timestamp", "")
+    ai_min_conf = st.session_state.get("oc_ai_min_conf", ai_min_conf)
+
     if df.empty:
-        return pd.Series(dtype=float)
-    typical = (df["high"] + df["low"] + df["close"]) / 3.0
-    cum_vol = df["volume"].cumsum().replace(0, np.nan)
-    return ((typical * df["volume"]).cumsum() / cum_vol).fillna(typical)
+        st.warning("No strikes available in the current chain snapshot.")
+        return
 
+    # ── Expiry inspection banner (always visible above the chain) ───────
+    exp_i1, exp_i2, exp_i3, exp_i4 = st.columns(4)
+    exp_i1.metric("Expiries Returned by API", len(st.session_state.get("oc_raw_expiry_payload", [])))
+    exp_i2.metric("Selected Expiry", expiry_label or "—")
+    exp_i3.metric("API Request Expiry (ts)", request_expiry_ts or "—")
+    exp_i4.metric("Symbol Used", symbol or "—")
+    if len(st.session_state.get("oc_raw_expiry_payload", [])) == 1:
+        st.info("Only one expiry is available from FYERS API.")
+    else:
+        _tagged_now = classify_expiries(st.session_state.get("oc_expiry_list", []))
+        if _tagged_now and not any(tag == "Weekly" for _, _, tag in _tagged_now):
+            st.warning("Weekly expiries are not available from the FYERS API for this instrument.")
 
-def compute_ema(series: pd.Series, span: int) -> pd.Series:
-    return series.ewm(span=span, adjust=False).mean()
+    total_ce = df["ce_oi"].sum()
+    total_pe = df["pe_oi"].sum()
+    pcr = total_pe / total_ce if total_ce > 0 else 0
+    max_pain = calculate_max_pain(df)
 
+    if spot_price:
+        atm_strike = df.iloc[(df["strike_price"] - spot_price).abs().argsort().iloc[:1]]["strike_price"].values[0]
+    else:
+        atm_strike = df["strike_price"].median()
 
-def compute_rsi(series: pd.Series, period: int = 14) -> pd.Series:
-    delta = series.diff()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
-    avg_gain = gain.ewm(alpha=1 / period, adjust=False).mean()
-    avg_loss = loss.ewm(alpha=1 / period, adjust=False).mean()
-    rs = avg_gain / avg_loss.replace(0, np.nan)
-    rsi = 100 - (100 / (1 + rs))
-    return rsi.fillna(50)
+    df = compute_big_move_scores(df, spot_price, max_pain, pcr, atm_strike)
+    intel = compute_market_intelligence(df, spot_price, max_pain, pcr)
+    df = compute_ai_engine(df, spot_price, atm_strike, max_pain, pcr)
+    signals = generate_trade_signals(df, pcr, intel.get("support"), intel.get("resistance"),
+                                      min_confidence=ai_min_conf, top_n=15)
 
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Spot Price", f"₹{spot_price:,.2f}" if spot_price else "—")
+    c2.metric("ATM Strike", f"₹{atm_strike:,.0f}")
+    c3.metric("Total CE OI", f"{total_ce/1e5:.1f}L")
+    c4.metric("Total PE OI", f"{total_pe/1e5:.1f}L")
+    c5.metric("Max Pain", f"₹{max_pain:,.0f}")
 
-def compute_macd(series: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9):
-    ema_fast = compute_ema(series, fast)
-    ema_slow = compute_ema(series, slow)
-    macd_line = ema_fast - ema_slow
-    signal_line = compute_ema(macd_line, signal)
-    hist = macd_line - signal_line
-    return macd_line, signal_line, hist
+    st.markdown("<br>", unsafe_allow_html=True)
 
+    # ── Big Move Alerts (existing feature, preserved) ───────────────────
+    big_moves = detect_big_moves(df)
+    if big_moves:
+        st.markdown("**⚡ Big Move Alerts — Unusual OI Activity**")
+        for alert in big_moves[:5]:
+            badge = "🟢 BUY" if alert["direction"] == "BUY" else "🔴 SELL"
+            box = st.success if alert["direction"] == "BUY" else st.error
+            box(f"{badge} · Strike **{alert['strike']:,.0f}** ({alert['side']}) · "
+                f"ΔOI {alert['oi_change']:+,.0f} — {alert['note']}")
+        st.caption(
+            "Based on unusual open-interest change (top percentile of ΔOI across strikes). "
+            "This is a positioning signal, not financial advice — confirm with price action before acting."
+        )
+    st.markdown("<br>", unsafe_allow_html=True)
 
-def compute_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
-    high, low, close = df["high"], df["low"], df["close"]
-    prev_close = close.shift(1)
-    tr = pd.concat([high - low, (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
-    return tr.ewm(alpha=1 / period, adjust=False).mean()
+    # ── OI Shift Detection ───────────────────────────────────────────────
+    shift_notes = detect_oi_shift(symbol, intel.get("support"), intel.get("resistance"))
+    if shift_notes:
+        for note in shift_notes:
+            st.info(note)
 
+    sig_col, gauge_col = st.columns([1, 1])
+    with sig_col:
+        st.markdown("**Market Sentiment**")
+        st.markdown(pcr_signal(pcr), unsafe_allow_html=True)
+        st.markdown(f"<br>PCR = **{pcr:.3f}**  |  Max Pain = **{max_pain:,.0f}**", unsafe_allow_html=True)
+        st.markdown(f"🛡️ Support (max PE OI): **{intel.get('support', 0):,.0f}**")
+        st.markdown(f"🧱 Resistance (max CE OI): **{intel.get('resistance', 0):,.0f}**")
+    with gauge_col:
+        st.plotly_chart(pcr_gauge(pcr), use_container_width=True, config={"displayModeBar": False})
 
-def compute_supertrend(df: pd.DataFrame, period: int = 10, multiplier: float = 3.0):
-    """Returns (supertrend_series, trend_series['up'|'down'])."""
-    if df.empty or len(df) < period + 1:
-        return pd.Series(dtype=float), pd.Series(dtype=object)
-    atr = compute_atr(df, period)
-    hl2 = (df["high"] + df["low"]) / 2.0
-    upperband = hl2 + multiplier * atr
-    lowerband = hl2 - multiplier * atr
-    close = df["close"]
-    final_upper = upperband.copy()
-    final_lower = lowerband.copy()
-    trend = pd.Series(index=df.index, dtype=object)
-    trend.iloc[0] = "up"
-    supertrend = pd.Series(index=df.index, dtype=float)
-    supertrend.iloc[0] = final_lower.iloc[0]
-    for i in range(1, len(df)):
-        if close.iloc[i - 1] > final_upper.iloc[i - 1]:
-            final_upper.iloc[i] = upperband.iloc[i]
-        else:
-            final_upper.iloc[i] = min(upperband.iloc[i], final_upper.iloc[i - 1])
-        if close.iloc[i - 1] < final_lower.iloc[i - 1]:
-            final_lower.iloc[i] = lowerband.iloc[i]
-        else:
-            final_lower.iloc[i] = max(lowerband.iloc[i], final_lower.iloc[i - 1])
-        if close.iloc[i] > final_upper.iloc[i - 1]:
-            trend.iloc[i] = "up"
-        elif close.iloc[i] < final_lower.iloc[i - 1]:
-            trend.iloc[i] = "down"
-        else:
-            trend.iloc[i] = trend.iloc[i - 1]
-        supertrend.iloc[i] = final_lower.iloc[i] if trend.iloc[i] == "up" else final_upper.iloc[i]
-    return supertrend, trend
+    st.divider()
 
+    # ── Market Intelligence ──────────────────────────────────────────────
+    st.markdown('<div class="block-title">📡 Market Intelligence</div>', unsafe_allow_html=True)
+    mi1, mi2 = st.columns([1, 1])
+    with mi1:
+        st.markdown(
+            f"""<div class="intel-card"><div class="intel-label">Market Trend</div>
+            <div class="intel-value">{intel.get('trend', '—')}</div></div>""",
+            unsafe_allow_html=True,
+        )
+        st.markdown(
+            f"""<div class="intel-card"><div class="intel-label">Institution Buying vs Selling</div>
+            <div class="intel-value">🟢 {intel.get('institution_buying', 0):,.0f}
+            &nbsp;/&nbsp; 🔴 {intel.get('institution_selling', 0):,.0f}</div></div>""",
+            unsafe_allow_html=True,
+        )
+        st.markdown(
+            f"""<div class="intel-card"><div class="intel-label">Option Writers vs Buyers Activity</div>
+            <div class="intel-value">Writers: {intel.get('call_writers_activity',0)+intel.get('put_writers_activity',0):,.0f}
+            &nbsp;|&nbsp; Buyers: {intel.get('call_buyers_activity',0)+intel.get('put_buyers_activity',0):,.0f}</div></div>""",
+            unsafe_allow_html=True,
+        )
+        st.markdown(
+            f"""<div class="intel-card"><div class="intel-label">Breakout / Breakdown Probability</div>
+            <div class="intel-value">🚀 {intel.get('breakout_probability',0):.0f}%
+            &nbsp;/&nbsp; 📉 {intel.get('breakdown_probability',0):.0f}%</div></div>""",
+            unsafe_allow_html=True,
+        )
+    with mi2:
+        st.plotly_chart(momentum_gauge(intel.get("momentum_score", 0)), use_container_width=True,
+                         config={"displayModeBar": False})
+        st.markdown(
+            f"""<div class="intel-card"><div class="intel-label">Highest Volume / OI / ΔOI Strike</div>
+            <div class="intel-value">Vol: {intel.get('highest_volume_strike', 0):,.0f} &nbsp;|&nbsp;
+            OI: {intel.get('highest_oi_strike', 0):,.0f} &nbsp;|&nbsp;
+            ΔOI: {intel.get('highest_delta_oi_strike', 0):,.0f}</div></div>""",
+            unsafe_allow_html=True,
+        )
+    st.caption(
+        "Momentum, institutional flow, and writers/buyers activity are derived from the current chain "
+        "snapshot (OI, ΔOI, volume, PCR, spot-vs-max-pain) — not from a historical time series, since "
+        "the option chain endpoint returns only a point-in-time view."
+    )
 
-def compute_adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
-    if df.empty or len(df) < period + 1:
-        return pd.Series(dtype=float)
-    high, low, close = df["high"], df["low"], df["close"]
-    up_move = high.diff()
-    down_move = -low.diff()
-    plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
-    minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
-    atr = compute_atr(df, period)
-    plus_di = 100 * pd.Series(plus_dm, index=df.index).ewm(alpha=1 / period, adjust=False).mean() / atr.replace(0, np.nan)
-    minus_di = 100 * pd.Series(minus_dm, index=df.index).ewm(alpha=1 / period, adjust=False).mean() / atr.replace(0, np.nan)
-    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
-    adx = dx.ewm(alpha=1 / period, adjust=False).mean()
-    return adx.fillna(0)
+    st.divider()
 
+    # ── Dashboard Summary ─────────────────────────────────────────────────
+    st.markdown('<div class="block-title">📈 Dashboard Summary</div>', unsafe_allow_html=True)
+    summary2 = compute_dashboard_summary(df, signals, intel)
 
-def compute_technical_snapshot(candle_df: pd.DataFrame, atm_row: pd.Series = None) -> dict:
-    """
-    Runs every technical indicator on the fetched candle series and returns
-    a flat dict of latest values + derived booleans consumed by both the
-    Master AI Confidence engine (5H) and the Scalping Engine (5I):
-      close, vwap, ema9/20/50, rsi, macd_line/signal/hist, adx, supertrend,
-      atr_pct, volume_spike, breakout_up/down, price_above/below_vwap,
-      ema_bullish/bearish, macd_bullish/bearish, ce_premium_up, pe_premium_up.
-    Returns a dict of zeros/False if candles are unavailable so downstream
-    code degrades gracefully instead of raising.
-    """
-    empty = {
-        "available": False, "close": 0.0, "vwap": 0.0, "ema9": 0.0, "ema20": 0.0, "ema50": 0.0,
-        "rsi": 50.0, "macd_line": 0.0, "macd_signal": 0.0, "macd_hist": 0.0, "adx": 0.0,
-        "supertrend": "flat", "atr_pct": 0.0, "volume_spike": False,
-        "breakout_up": False, "breakout_down": False,
-        "price_above_vwap": False, "price_below_vwap": False,
-        "ema_bullish": False, "ema_bearish": False,
-        "macd_bullish": False, "macd_bearish": False,
-        "ce_premium_up": False, "pe_premium_up": False,
-    }
-    if candle_df is None or candle_df.empty or len(candle_df) < 20:
-        return empty
-
-    df = candle_df.copy()
-    vwap = compute_vwap(df)
-    ema9 = compute_ema(df["close"], 9)
-    ema20 = compute_ema(df["close"], 20)
-    ema50 = compute_ema(df["close"], 50) if len(df) >= 50 else compute_ema(df["close"], max(len(df) - 1, 2))
-    rsi = compute_rsi(df["close"], 14)
-    macd_line, macd_signal, macd_hist = compute_macd(df["close"])
-    adx = compute_adx(df, 14)
-    supertrend, trend = compute_supertrend(df, 10, 3.0)
-    atr = compute_atr(df, 14)
-
-    close = float(df["close"].iloc[-1])
-    vwap_v = float(vwap.iloc[-1]) if len(vwap) else close
-    ema9_v = float(ema9.iloc[-1])
-    ema20_v = float(ema20.iloc[-1])
-    ema50_v = float(ema50.iloc[-1])
-    rsi_v = float(rsi.iloc[-1])
-    macd_v, macd_sig_v, macd_hist_v = float(macd_line.iloc[-1]), float(macd_signal.iloc[-1]), float(macd_hist.iloc[-1])
-    adx_v = float(adx.iloc[-1]) if len(adx) else 0.0
-    st_trend = str(trend.iloc[-1]) if len(trend) else "flat"
-    atr_v = float(atr.iloc[-1]) if len(atr) else 0.0
-    atr_pct = (atr_v / close * 100) if close else 0.0
-
-    # Volume spike: last candle's volume vs rolling 20-candle average
-    vol_avg = df["volume"].tail(20).mean()
-    volume_spike = bool(vol_avg > 0 and df["volume"].iloc[-1] >= vol_avg * 1.5)
-
-    # Breakout/breakdown: close breaches the prior 20-candle high/low
-    lookback = df.iloc[-21:-1] if len(df) >= 21 else df.iloc[:-1]
-    prior_high = lookback["high"].max() if len(lookback) else close
-    prior_low = lookback["low"].min() if len(lookback) else close
-    breakout_up = bool(close > prior_high)
-    breakout_down = bool(close < prior_low)
-
-    ema_bullish = ema9_v > ema20_v > ema50_v
-    ema_bearish = ema9_v < ema20_v < ema50_v
-
-    result = {
-        "available": True, "close": close, "vwap": vwap_v,
-        "ema9": ema9_v, "ema20": ema20_v, "ema50": ema50_v, "rsi": rsi_v,
-        "macd_line": macd_v, "macd_signal": macd_sig_v, "macd_hist": macd_hist_v,
-        "adx": adx_v, "supertrend": st_trend, "atr_pct": atr_pct,
-        "volume_spike": volume_spike, "breakout_up": breakout_up, "breakout_down": breakout_down,
-        "price_above_vwap": close > vwap_v, "price_below_vwap": close < vwap_v,
-        "ema_bullish": ema_bullish, "ema_bearish": ema_bearish,
-        "macd_bullish": macd_v > macd_sig_v and macd_hist_v > 0,
-        "macd_bearish": macd_v < macd_sig_v and macd_hist_v < 0,
-    }
-
-    # ATM CE/PE premium direction vs the previous refresh (session-tracked)
-    if atm_row is not None and len(atm_row):
+    def _fmt_strike_row(row):
+        if row is None:
+            return "—"
         try:
-            ce_ltp = float(atm_row.get("ce_ltp", 0))
-            pe_ltp = float(atm_row.get("pe_ltp", 0))
+            return f"{row['strike_price']:,.0f}"
+        except Exception:
+            return "—"
+
+    def _fmt_num(v):
+        try:
+            return f"{v:,.0f}"
         except (TypeError, ValueError):
-            ce_ltp, pe_ltp = 0.0, 0.0
-        prev_premiums = st.session_state.setdefault("oc_prev_atm_premium", {})
-        prev_ce = prev_premiums.get("ce_ltp")
-        prev_pe = prev_premiums.get("pe_ltp")
-        result["ce_premium_up"] = prev_ce is not None and ce_ltp > prev_ce
-        result["pe_premium_up"] = prev_pe is not None and pe_ltp > prev_pe
-        prev_premiums["ce_ltp"] = ce_ltp
-        prev_premiums["pe_ltp"] = pe_ltp
-        st.session_state["oc_prev_atm_premium"] = prev_premiums
+            return "—"
 
-    return result
+    def _fmt_trade(sig):
+        if not sig:
+            return "—"
+        return f"{sig['Strike']:,.0f} {sig['Side']} ({sig['Confidence']:.0f}%)"
 
+    d1, d2, d3, d4 = st.columns(4)
+    d1.metric("Top CE Buy", _fmt_strike_row(summary2.get("Top CE Buy")))
+    d2.metric("Top PE Buy", _fmt_strike_row(summary2.get("Top PE Buy")))
+    d3.metric("Best Breakout Strike", _fmt_strike_row(summary2.get("Best Breakout Strike")))
+    d4.metric("Best Breakdown Strike", _fmt_strike_row(summary2.get("Best Breakdown Strike")))
 
-# ══════════════════════════════════════════════════════════════════════════
-# 5F. MARKET-LEVEL OI SIGNAL DETECTION  (near-ATM aggregate — complements
-#     the existing per-strike CE/PE Bias columns from section 4)
-# ══════════════════════════════════════════════════════════════════════════
+    d5, d6, d7, d8 = st.columns(4)
+    d5.metric("Highest Institutional Buying", _fmt_num(summary2.get("Highest Institutional Buying")))
+    d6.metric("Highest Institutional Selling", _fmt_num(summary2.get("Highest Institutional Selling")))
+    d7.metric("Highest Smart Money", _fmt_strike_row(summary2.get("Highest Smart Money")))
+    d8.metric("Highest OI", _fmt_strike_row(summary2.get("Highest OI")))
 
-def detect_market_oi_signals(df: pd.DataFrame, atm_strike: float, band: int = 3) -> dict:
-    """
-    Aggregates strikes within `band` positions of ATM to detect market-wide
-    Call Writing / Put Writing / Call Unwinding / Put Unwinding and an
-    overall Bullish/Bearish OI Shift — a broader read than any single
-    strike's bias, used by the Master AI Confidence engine and the
-    Scalping Engine's strict OI conditions.
-    """
-    empty = {
-        "ce_chng_near_atm": 0.0, "pe_chng_near_atm": 0.0,
-        "call_writing": False, "put_writing": False,
-        "call_unwinding": False, "put_unwinding": False,
-        "bullish_oi_shift": False, "bearish_oi_shift": False,
-        "long_buildup": False, "short_buildup": False,
-    }
-    if df.empty:
-        return empty
-    strikes_sorted = sorted(df["strike_price"].unique())
-    if not strikes_sorted:
-        return empty
-    if atm_strike in strikes_sorted:
-        idx = strikes_sorted.index(atm_strike)
-    else:
-        idx = min(range(len(strikes_sorted)), key=lambda i: abs(strikes_sorted[i] - atm_strike))
-    near = strikes_sorted[max(0, idx - band): idx + band + 1]
-    sub = df[df["strike_price"].isin(near)]
+    d9, d10, d11, d12 = st.columns(4)
+    d9.metric("Highest Volume", _fmt_strike_row(summary2.get("Highest Volume")))
+    d10.metric("Highest Delta OI", _fmt_strike_row(summary2.get("Highest Delta OI")))
+    d11.metric("Best Risk/Reward Trade", _fmt_trade(summary2.get("Best Risk Reward Trade")))
+    d12.metric("Today's Best Trade", _fmt_trade(summary2.get("Today's Best Trade")))
 
-    ce_chng = float(sub["ce_chng_oi"].sum())
-    pe_chng = float(sub["pe_chng_oi"].sum())
+    st.divider()
 
-    return {
-        "ce_chng_near_atm": ce_chng, "pe_chng_near_atm": pe_chng,
-        "call_writing": ce_chng > 0, "put_writing": pe_chng > 0,
-        "call_unwinding": ce_chng < 0, "put_unwinding": pe_chng < 0,
-        "bullish_oi_shift": pe_chng > 0 and pe_chng > abs(ce_chng),
-        "bearish_oi_shift": ce_chng > 0 and ce_chng > abs(pe_chng),
-        # Long/Short Build-up read at the option-chain level: fresh Put
-        "long_buildup": pe_chng > 0 and pe_chng >= abs(ce_chng),
-        "short_buildup": ce_chng > 0 and ce_chng >= abs(pe_chng),
-    }
+    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
+        ["📋 Chain Table", "📊 OI Analysis", "📈 IV Skew", "🔥 Big Move Ready",
+         "🤖 AI Trade Signals", "⚡ Gamma Build-up"]
+    )
 
+    with tab1:
+        flagged = df[df["Big Move"] == "🚨 Big Move"] if "Big Move" in df.columns else pd.DataFrame()
+        if not flagged.empty:
+            buy_strikes = flagged[flagged["Strike Signal"] == "🟢 BUY"]["strike_price"].tolist()
+            sell_strikes = flagged[flagged["Strike Signal"] == "🔴 SELL"]["strike_price"].tolist()
+            parts = []
+            if buy_strikes:
+                parts.append(f"🟢 **Buy-side build-up:** {', '.join(f'{s:,.0f}' for s in buy_strikes)}")
+            if sell_strikes:
+                parts.append(f"🔴 **Sell-side build-up:** {', '.join(f'{s:,.0f}' for s in sell_strikes)}")
+            if parts:
+                st.markdown("🚨 **Big OI moves detected** — " + "  |  ".join(parts))
 
-# ══════════════════════════════════════════════════════════════════════════
-# 5G. MARKET CONDITION CLASSIFIER  (Trending / Sideways / Volatile /
-#     Breakout / Breakdown / Fake Breakout)
-# ══════════════════════════════════════════════════════════════════════════
+        display_df = style_chain_table(df)
+        numeric_cols = display_df.select_dtypes("number").columns
+        st.dataframe(
+            display_df.style
+                .background_gradient(subset=[c for c in ["CE OI", "PE OI"] if c in display_df.columns],
+                                      cmap="RdYlGn", vmin=0)
+                .format({c: "{:,.0f}" for c in numeric_cols}),
+            use_container_width=True, height=520,
+        )
 
-def classify_market_condition(tech: dict) -> str:
-    """
-    Classifies the current intraday condition from the technical snapshot:
-      • Breakout   — closed above the recent range on a volume spike
-      • Breakdown  — closed below the recent range on a volume spike
-      • Fake Breakout — range was breached WITHOUT volume confirmation
-        (a classic trap — price pokes through but doesn't hold)
-      • Trending   — strong directional ADX with aligned EMA stack
-      • Volatile   — ATR% is elevated without a clear directional stack
-      • Sideways   — none of the above (default, low-ADX/low-ATR chop)
-    """
-    if not tech.get("available"):
-        return "🟡 Sideways / Insufficient Data"
+    with tab2:
+        st.markdown("##### Open Interest — Calls vs Puts")
+        st.plotly_chart(oi_bar_chart(df, max_pain), use_container_width=True, config={"displayModeBar": False})
 
-    adx = tech.get("adx", 0)
-    atr_pct = tech.get("atr_pct", 0)
-    breakout_up = tech.get("breakout_up", False)
-    breakout_down = tech.get("breakout_down", False)
-    vol_spike = tech.get("volume_spike", False)
-    ema_bull = tech.get("ema_bullish", False)
-    ema_bear = tech.get("ema_bearish", False)
+        col_a, col_b = st.columns(2)
+        with col_a:
+            st.markdown("**Top 5 CE OI Strikes**")
+            top5_ce = df.nlargest(5, "ce_oi")[["strike_price", "ce_oi", "ce_ltp"]].reset_index(drop=True)
+            st.dataframe(top5_ce.style.format({"ce_oi": "{:,.0f}", "ce_ltp": "{:.2f}"}),
+                         use_container_width=True, height=215)
+        with col_b:
+            st.markdown("**Top 5 PE OI Strikes**")
+            top5_pe = df.nlargest(5, "pe_oi")[["strike_price", "pe_oi", "pe_ltp"]].reset_index(drop=True)
+            st.dataframe(top5_pe.style.format({"pe_oi": "{:,.0f}", "pe_ltp": "{:.2f}"}),
+                         use_container_width=True, height=215)
 
-    if (breakout_up or breakout_down) and not vol_spike:
-        return "⚠️ Fake Breakout"
-    if breakout_up and vol_spike:
-        return "🚀 Breakout"
-    if breakout_down and vol_spike:
-        return "📉 Breakdown"
-    if adx >= 25 and (ema_bull or ema_bear):
-        return "📈 Trending"
-    if atr_pct >= 0.35:
-        return "🌪️ Volatile"
-    return "🟡 Sideways"
+        st.markdown("**OI Build-up Classification**")
+        buildup_view = df[["strike_price", "CE Build-up", "PE Build-up"]].rename(
+            columns={"strike_price": "Strike"})
+        st.dataframe(buildup_view, use_container_width=True, height=260)
+        st.caption(
+            "Long Build-up = fresh Put writing (bullish) · Short Build-up = fresh Call writing (bearish) · "
+            "Short Covering = Call OI unwinding · Long Unwinding = Put OI unwinding."
+        )
 
+    with tab3:
+        st.markdown("##### Implied Volatility Skew")
+        st.plotly_chart(iv_chart(df), use_container_width=True, config={"displayModeBar": False})
 
-# ══════════════════════════════════════════════════════════════════════════
-# 5H. MASTER AI CONFIDENCE ENGINE  (0-100% confidence, BUY/SELL/SIDEWAYS —
-#     combines Option-Chain data + Futures data + Technical indicators.
-#     No single factor, including PCR, can dominate: every factor is a
-#     capped, bounded weight out of a fixed total.)
-# ══════════════════════════════════════════════════════════════════════════
+    with tab4:
+        st.markdown("##### 🔥 Big Move Ready Strike Engine")
+        s1, s2, s3, s4 = st.columns(4)
+        top_ce_row = _safe_top(df, "CE Score")
+        top_pe_row = _safe_top(df, "PE Score")
+        s1.metric("Top CE Score Strike", _fmt_strike_row(top_ce_row))
+        s2.metric("Top PE Score Strike", _fmt_strike_row(top_pe_row))
+        s3.metric("Best Breakout Strike", _fmt_strike_row(summary2.get("Best Breakout Strike")))
+        s4.metric("Best Breakdown Strike", _fmt_strike_row(summary2.get("Best Breakdown Strike")))
 
-# Each tuple: (label, weight). Weights sum to 100 so the final confidence
-# is naturally expressed as a percentage of "how many of these factors
-# agree, weighted by how much each one matters." PCR is deliberately just
-# ONE line among ~25 — never a standalone driver of direction.
-AI_FACTOR_WEIGHTS = {
-    "total_oi_skew": 5, "delta_oi_near_atm": 7, "call_put_writing": 6,
-    "call_put_unwinding": 4, "bullish_bearish_oi_shift": 5, "max_pain_pull": 4,
-    "pcr": 4, "atm_premium_direction": 4, "iv_skew": 3,
-    "price_vs_vwap": 6, "ema_stack": 7, "rsi": 4, "macd": 5,
-    "supertrend": 6, "adx_trend": 4, "volume_spike": 4,
-    "futures_buildup": 6, "futures_price_trend": 4, "support_resistance": 5,
-    "delta_greek": 3, "gamma_greek": 3, "theta_decay": 2, "vega_iv_sensitivity": 2,
-    "breakout_probability": 3, "smart_money": 4,
-}
+        st.markdown("<br>", unsafe_allow_html=True)
+        st.markdown("**Full CE / PE Analysis** — independent AI Score, BUY/SELL Probability, "
+                     "Entry/SL/Targets, Institutional flow and Smart Money Activity for both sides "
+                     "of every strike (color-coded by Final Recommendation)")
+        ce_pe_table = style_ce_pe_analysis_table(df)
+        numeric_ce_pe_cols = [c for c in ce_pe_table.select_dtypes("number").columns if c != "Strike ⚡"]
+        st.dataframe(
+            ce_pe_table.style.apply(_bigmove_row_style, axis=1)
+                .format({c: "{:,.1f}" for c in numeric_ce_pe_cols})
+                .format({"Strike ⚡": "{:,.0f}"}),
+            use_container_width=True, height=560,
+        )
+        st.caption(
+            "CE AI Score / PE AI Score = independent 0-100 favourability for buying a CALL / PUT at "
+            "that strike, built from OI, ΔOI, Volume, PCR, Max Pain, Spot/ATM distance, IV, "
+            "Long/Short Build-up, Long/Short Unwinding, and Heavy Call/Put Writing. BUY Probability = "
+            "the side's own score; SELL Probability = 100 − that score. Entry/SL/Targets are "
+            "premium-percentage based (SL −15%, T1 +15%, T2 +30%, T3 +50%) for each side "
+            "independently. Institutional Buying/Selling and Smart Money Activity are OI-base + "
+            "ΔOI proxies for large-player positioning. Final Recommendation shows the stronger side "
+            "with its ★ rating: ★★★★★ 90-100 Strong Buy · ★★★★ 75-89 Buy · ★★★ 55-74 Hold · "
+            "★★ 35-54 Avoid · ★ below 35 Ignore."
+        )
 
+        with st.expander("Legacy combined Big Move Table (Overall Score view)"):
+            bm_table = style_big_move_table(df)
+            numeric_bm_cols = [c for c in bm_table.select_dtypes("number").columns if c != "Strike ⚡"]
+            st.dataframe(
+                bm_table.style.apply(_bigmove_row_style, axis=1)
+                    .format({c: "{:,.1f}" for c in numeric_bm_cols})
+                    .format({"Strike ⚡": "{:,.0f}"}),
+                use_container_width=True, height=420,
+            )
 
-def compute_ai_master_confidence(df: pd.DataFrame, spot_price: float, pcr: float, max_pain: float,
-                                  atm_strike: float, intel: dict, tech: dict, futures: dict,
-                                  market_oi: dict) -> dict:
-    """
-    Combines every requested factor (Option-Chain OI/ΔOI/build-ups/Max
-    Pain/PCR/ATM premium/IV/Greeks, Futures OI & price trend, and
-    technicals VWAP/EMA9-20-50/RSI/MACD/Supertrend/ADX/Volume/Support-
-    Resistance) into ONE weighted 0-100 confidence score and a
-    BUY / SELL / SIDEWAYS direction. Returns a dict with confidence,
-    direction, trend, strength, probability, and the individual factor
-    votes (for the Live Reasons checklist).
+    with tab5:
+        st.markdown("##### 🤖 AI Trade Signal Engine — High Confidence Only")
+        st.caption(f"Showing strikes with AI Confidence ≥ {ai_min_conf}% (adjust in the sidebar).")
 
-    This is a heuristic, weighted-evidence model derived from the current
-    option-chain + futures + technical snapshot together — never from any
-    single indicator (PCR included) — it is a positioning read, not a
-    guarantee, and should be confirmed with your own risk management.
-    """
-    votes = {}  # factor -> "bull" | "bear" | None
-    w = AI_FACTOR_WEIGHTS
-
-    total_ce_oi = float(df["ce_oi"].sum()) if not df.empty else 0.0
-    total_pe_oi = float(df["pe_oi"].sum()) if not df.empty else 0.0
-    votes["total_oi_skew"] = "bull" if total_pe_oi > total_ce_oi else ("bear" if total_ce_oi > total_pe_oi else None)
-
-    ce_n, pe_n = market_oi.get("ce_chng_near_atm", 0), market_oi.get("pe_chng_near_atm", 0)
-    votes["delta_oi_near_atm"] = "bull" if pe_n > ce_n else ("bear" if ce_n > pe_n else None)
-
-    if market_oi.get("put_writing") and not market_oi.get("call_writing"):
-        votes["call_put_writing"] = "bull"
-    elif market_oi.get("call_writing") and not market_oi.get("put_writing"):
-        votes["call_put_writing"] = "bear"
-    else:
-        votes["call_put_writing"] = None
-
-    if market_oi.get("call_unwinding") and not market_oi.get("put_unwinding"):
-        votes["call_put_unwinding"] = "bull"
-    elif market_oi.get("put_unwinding") and not market_oi.get("call_unwinding"):
-        votes["call_put_unwinding"] = "bear"
-    else:
-        votes["call_put_unwinding"] = None
-
-    if market_oi.get("bullish_oi_shift"):
-        votes["bullish_bearish_oi_shift"] = "bull"
-    elif market_oi.get("bearish_oi_shift"):
-        votes["bullish_bearish_oi_shift"] = "bear"
-    else:
-        votes["bullish_bearish_oi_shift"] = None
-
-    if max_pain and spot_price:
-        votes["max_pain_pull"] = "bull" if spot_price < max_pain else ("bear" if spot_price > max_pain else None)
-    else:
-        votes["max_pain_pull"] = None
-
-    # PCR — capped weight, one vote among ~25, never a standalone driver
-    if pcr > 1.1:
-        votes["pcr"] = "bull"
-    elif pcr < 0.9:
-        votes["pcr"] = "bear"
-    else:
-        votes["pcr"] = None
-
-    atm_row = None
-    if not df.empty:
-        atm_sub = df.iloc[(df["strike_price"] - atm_strike).abs().argsort().iloc[:1]]
-        atm_row = atm_sub.iloc[0] if len(atm_sub) else None
-    if atm_row is not None:
-        ce_up, pe_up = tech.get("ce_premium_up", False), tech.get("pe_premium_up", False)
-        if ce_up and not pe_up:
-            votes["atm_premium_direction"] = "bull"
-        elif pe_up and not ce_up:
-            votes["atm_premium_direction"] = "bear"
+        if not signals:
+            st.info("No strikes currently meet the selected confidence threshold. Try lowering it in the sidebar.")
         else:
-            votes["atm_premium_direction"] = None
-    else:
-        votes["atm_premium_direction"] = None
+            for sig in signals:
+                css_class = RATING_CSS_CLASS.get(sig.get("Signal Key", "ignore"), "rating-ignore")
+                reasons_list = sig.get("Reasons") or [r.strip() for r in sig.get("Reason", "").split("·") if r.strip()]
+                reasons_html = "".join(f"<li>{r}</li>" for r in reasons_list)
 
-    if not df.empty and "ce_iv" in df.columns and "pe_iv" in df.columns:
-        avg_ce_iv, avg_pe_iv = df["ce_iv"].mean(), df["pe_iv"].mean()
-        votes["iv_skew"] = "bear" if avg_pe_iv > avg_ce_iv * 1.05 else ("bull" if avg_ce_iv > avg_pe_iv * 1.05 else None)
-    else:
-        votes["iv_skew"] = None
+                st.markdown(f"""
+                <div class="intel-card">
+                  <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;">
+                    <div><b style="color:#e6edf3;">{sig['Strike']:,.0f} {sig['Side']}</b>
+                      &nbsp; <span class="{css_class}">{sig['Signal']}</span></div>
+                    <div class="intel-label">Confidence
+                      <span style="color:#e6edf3;font-weight:700;font-size:15px;">{sig['Confidence']:.0f}%</span></div>
+                  </div>
+                  <div style="margin-top:10px;font-family:'Courier New',monospace;color:#e6edf3;font-size:14px;">
+                    Entry <b>{sig['Entry']}</b> &nbsp;|&nbsp; Stop Loss <b>{sig['SL']}</b> &nbsp;|&nbsp;
+                    Target 1 {sig['T1']} &nbsp; Target 2 {sig['T2']} &nbsp; Target 3 {sig['T3']}
+                    &nbsp;|&nbsp; RR {sig['Risk Reward']}
+                  </div>
+                  <div style="margin-top:8px;color:#8b949e;font-size:12px;">
+                    Reason:
+                    <ul style="margin:4px 0 0 18px;padding:0;">{reasons_html}</ul>
+                  </div>
+                </div>
+                """, unsafe_allow_html=True)
 
-    if tech.get("available"):
-        votes["price_vs_vwap"] = "bull" if tech.get("price_above_vwap") else ("bear" if tech.get("price_below_vwap") else None)
-        votes["ema_stack"] = "bull" if tech.get("ema_bullish") else ("bear" if tech.get("ema_bearish") else None)
-        rsi = tech.get("rsi", 50)
-        votes["rsi"] = "bull" if rsi >= 55 else ("bear" if rsi <= 45 else None)
-        votes["macd"] = "bull" if tech.get("macd_bullish") else ("bear" if tech.get("macd_bearish") else None)
-        votes["supertrend"] = "bull" if tech.get("supertrend") == "up" else ("bear" if tech.get("supertrend") == "down" else None)
-        if tech.get("adx", 0) > 25:
-            votes["adx_trend"] = "bull" if tech.get("ema_bullish") else ("bear" if tech.get("ema_bearish") else None)
-        else:
-            votes["adx_trend"] = None
-        if tech.get("volume_spike"):
-            votes["volume_spike"] = "bull" if tech.get("price_above_vwap") else ("bear" if tech.get("price_below_vwap") else None)
-        else:
-            votes["volume_spike"] = None
-    else:
-        for k in ("price_vs_vwap", "ema_stack", "rsi", "macd", "supertrend", "adx_trend", "volume_spike"):
-            votes[k] = None
+            st.markdown("<br>", unsafe_allow_html=True)
+            st.markdown("**All Qualifying Signals**")
+            sig_table = style_trade_signals_table(signals)
+            st.dataframe(sig_table, use_container_width=True, height=360)
 
-    if futures:
-        votes["futures_buildup"] = "bull" if futures.get("long_buildup") else ("bear" if futures.get("short_buildup") else None)
-        votes["futures_price_trend"] = "bull" if futures.get("price_trend") == "up" else ("bear" if futures.get("price_trend") == "down" else None)
-    else:
-        votes["futures_buildup"] = None
-        votes["futures_price_trend"] = None
+        st.caption(
+            "Heuristic engine built entirely from the current chain snapshot (OI, ΔOI, Volume, PCR, "
+            "Max Pain, IV, spot/ATM/max-pain distance, breakout/breakdown probability, institutional & "
+            "smart-money proxies). Entry/SL/Targets are premium-percentage based, not option-Greeks "
+            "based. This is a positioning read, not financial advice — always confirm with price action "
+            "and manage your own risk."
+        )
 
-    support, resistance = intel.get("support"), intel.get("resistance")
-    if spot_price and support and resistance:
-        dist_support = abs(spot_price - support)
-        dist_resistance = abs(spot_price - resistance)
-        votes["support_resistance"] = "bull" if dist_support < dist_resistance else ("bear" if dist_resistance < dist_support else None)
-    else:
-        votes["support_resistance"] = None
+    with tab6:
+        render_gamma_tab(df, symbol, expiry_label, spot_price, gamma_live_mode, gamma_audio_alert)
 
-    if atm_row is not None:
-        ce_delta = float(atm_row.get("ce_delta", 0)) if "ce_delta" in df.columns else 0.0
-        pe_delta = float(atm_row.get("pe_delta", 0)) if "pe_delta" in df.columns else 0.0
-        votes["delta_greek"] = "bull" if abs(ce_delta) > abs(pe_delta) else ("bear" if abs(pe_delta) > abs(ce_delta) else None)
-        ce_gamma_bs = float(atm_row.get("ce_gamma_bs", 0)) if "ce_gamma_bs" in df.columns else 0.0
-        votes["gamma_greek"] = "bull" if ce_gamma_bs > 0 and market_oi.get("bullish_oi_shift") else (
-            "bear" if ce_gamma_bs > 0 and market_oi.get("bearish_oi_shift") else None)
-        ce_theta = float(atm_row.get("ce_theta", 0)) if "ce_theta" in df.columns else 0.0
-        pe_theta = float(atm_row.get("pe_theta", 0)) if "pe_theta" in df.columns else 0.0
-        votes["theta_decay"] = "bear" if abs(ce_theta) > abs(pe_theta) else ("bull" if abs(pe_theta) > abs(ce_theta) else None)
-        ce_vega = float(atm_row.get("ce_vega", 0)) if "ce_vega" in df.columns else 0.0
-        pe_vega = float(atm_row.get("pe_vega", 0)) if "pe_vega" in df.columns else 0.0
-        votes["vega_iv_sensitivity"] = None if abs(ce_vega - pe_vega) < 1e-6 else (
-            "bull" if ce_vega > pe_vega and votes.get("iv_skew") == "bull" else
-            "bear" if pe_vega > ce_vega and votes.get("iv_skew") == "bear" else None)
-    else:
-        votes["delta_greek"] = votes["gamma_greek"] = votes["theta_decay"] = votes["vega_iv_sensitivity"] = None
-
-    if "Breakout Probability" in df.columns and "Breakdown Probability" in df.columns and not df.empty:
-        max_breakout = df["Breakout Probability"].max()
-        max_breakdown = df["Breakdown Probability"].max()
-        votes["breakout_probability"] = "bull" if max_breakout > max_breakdown else ("bear" if max_breakdown > max_breakout else None)
-    else:
-        votes["breakout_probability"] = None
-
-    inst_buy = intel.get("institution_buying", 0)
-    inst_sell = intel.get("institution_selling", 0)
-    votes["smart_money"] = "bull" if inst_buy > inst_sell else ("bear" if inst_sell > inst_buy else None)
-
-    bull_points, bear_points, max_points = 0.0, 0.0, 0.0
-    for factor, weight in w.items():
-        max_points += weight
-        vote = votes.get(factor)
-        if vote == "bull":
-            bull_points += weight
-        elif vote == "bear":
-            bear_points += weight
-
-    net = bull_points - bear_points
-    confidence = round((max(bull_points, bear_points) / max_points) * 100, 1) if max_points else 0.0
-
-    if max_points == 0 or abs(net) < max_points * 0.06:
-        direction = "SIDEWAYS"
-    else:
-        direction = "BUY" if net > 0 else "SELL"
-
-    if confidence >= 90:
-        strength, probability = "Strong", "Very High"
-    elif confidence >= 80:
-        strength, probability = "Strong", "High"
-    elif confidence >= 65:
-        strength, probability = "Medium", "Medium"
-    else:
-        strength, probability = "Weak", "Low"
-
-    trend_label = "Bullish" if net > 0 else ("Bearish" if net < 0 else "Neutral")
-
-    return {
-        "confidence": confidence, "direction": direction, "trend": trend_label,
-        "strength": strength, "probability": probability,
-        "bull_points": round(bull_points, 1), "bear_points": round(bear_points, 1),
-        "max_points": max_points, "votes": votes, "atm_row": atm_row,
-    }
-
-
-AI_FACTOR_LABELS = {
-    "total_oi_skew": ("Total OI favours Puts (support)", "Total OI favours Calls (resistance)"),
-    "delta_oi_near_atm": ("Rising Put ΔOI near ATM", "Rising Call ΔOI near ATM"),
-    "call_put_writing": ("Heavy Put Writing", "Heavy Call Writing"),
-    "call_put_unwinding": ("Call Unwinding (resistance fading)", "Put Unwinding (support fading)"),
-    "bullish_bearish_oi_shift": ("Bullish OI Shift", "Bearish OI Shift"),
-    "max_pain_pull": ("Spot below Max Pain (pull-up bias)", "Spot above Max Pain (pull-down bias)"),
-    "pcr": ("Bullish PCR", "Bearish PCR"),
-    "atm_premium_direction": ("ATM CE Premium Increasing", "ATM PE Premium Increasing"),
-    "iv_skew": ("Call IV richer (bullish skew)", "Put IV richer (bearish skew)"),
-    "price_vs_vwap": ("Price Above VWAP", "Price Below VWAP"),
-    "ema_stack": ("EMA Bullish Stack (9>20>50)", "EMA Bearish Stack (9<20<50)"),
-    "rsi": ("RSI Bullish Zone", "RSI Bearish Zone"),
-    "macd": ("MACD Positive/Bullish", "MACD Negative/Bearish"),
-    "supertrend": ("Supertrend Buy", "Supertrend Sell"),
-    "adx_trend": ("Strong Trending Move (ADX>25, Bullish)", "Strong Trending Move (ADX>25, Bearish)"),
-    "volume_spike": ("Volume Breakout (Bullish)", "Volume Breakout (Bearish)"),
-    "futures_buildup": ("Futures Long Build-up", "Futures Short Build-up"),
-    "futures_price_trend": ("Futures Price Trending Up", "Futures Price Trending Down"),
-    "support_resistance": ("Price Closer to Support", "Price Closer to Resistance"),
-    "delta_greek": ("Call Delta Dominance", "Put Delta Dominance"),
-    "gamma_greek": ("Gamma Build-up Bullish", "Gamma Build-up Bearish"),
-    "theta_decay": ("Put Theta Decay Favours Calls", "Call Theta Decay Favours Puts"),
-    "vega_iv_sensitivity": ("Call Vega + Rising IV", "Put Vega + Rising IV"),
-    "breakout_probability": ("Breakout Probability > Breakdown", "Breakdown Probability > Breakout"),
-    "smart_money": ("Strong Institutional Buying", "Strong Institutional Selling"),
-}
-
-
-def build_live_reasons(votes: dict, direction: str) -> list:
-    """Turns the factor votes into a plain-English checklist of reasons
-    supporting the current AI direction (used for the '✓ Heavy Put
-    Writing / ✓ EMA Bullish / ...' Live Reasons display)."""
-    if direction not in ("BUY", "SELL"):
-        return []
-    wanted = "bull" if direction == "BUY" else "bear"
-    reasons = []
-    for factor, vote in votes.items():
-        if vote == wanted and factor in AI_FACTOR_LABELS:
-            bull_label, bear_label = AI_FACTOR_LABELS[factor]
-            reasons.append(bull_label if wanted == "bull" else bear_label)
-    return reasons
-
-
-def build_warning_messages(tech: dict, market_condition: str, expiry_label: str,
-                            df: pd.DataFrame) -> list:
-    """Detects and surfaces Possible Trap / Bull Trap / Bear Trap / Low
-    Volume / Expiry / Volatility warnings from the data already computed
-    elsewhere in this file — no new external data source required."""
-    warnings = []
-
-    if "Fake Breakout" in market_condition:
-        if tech.get("breakout_up"):
-            warnings.append("⚠️ Bull Trap Risk — breakout up without volume confirmation")
-        elif tech.get("breakout_down"):
-            warnings.append("⚠️ Bear Trap Risk — breakdown without volume confirmation")
-        else:
-            warnings.append("⚠️ Possible Trap — range breached without confirming volume")
-
-    if tech.get("available") and not tech.get("volume_spike") and tech.get("adx", 0) < 20:
-        warnings.append("🔈 Low Volume — conviction behind the current move is weak")
-
-    if expiry_label:
-        try:
-            days_left = parse_days_to_expiry(expiry_label)
-            if days_left <= 1:
-                warnings.append("📅 Expiry Day — expect sharp Theta decay & whipsaw moves")
-        except Exception:
-            pass
-
-    if "Volatile" in market_condition or tech.get("atr_pct", 0) >= 0.5:
-        warnings.append("🌪️ Elevated Volatility — widen stop-loss expectations")
-
-    if not df.empty and "ce_iv" in df.columns and "pe_iv" in df.columns:
-        avg_iv = (df["ce_iv"].mean() + df["pe_iv"].mean()) / 2
-        if avg_iv >= 25:
-            warnings.append("📰 High IV — possible News/Event Impact priced in")
-
-    return warnings
-
-
-# ══════════════════════════════════════════════════════════════════════════
-# 5I. AI SCALPING ENGINE  (1min / 3min / 5min — signals fire ONLY when
-#     every strict condition matches; confidence must also be > 75%,
-#     otherwise the engine explicitly outputs "WAIT - No High Probability
-#     Trade". Refreshes every 5 seconds when Live mode is enabled.)
-# ══════════════════════════════════════════════════════════════════════════
-
-SCALP_MIN_CONFIDENCE = 75.0
-
-
-def evaluate_scalping_conditions(tech: dict, market_oi: dict, futures: dict) -> dict:
-    """
-    Evaluates the exact BUY / SELL scalping condition sets from the spec.
-    ALL conditions in a set must be true for that side to qualify — this
-    is intentionally strict (a scalping engine should stay quiet more
-    often than it fires).
-    """
-    rsi = tech.get("rsi", 50)
-    buy_conditions = {
-        "Price > VWAP": bool(tech.get("price_above_vwap")),
-        "EMA9 > EMA20 > EMA50": bool(tech.get("ema_bullish")),
-        "RSI 55–70": 55 <= rsi <= 70,
-        "MACD Bullish": bool(tech.get("macd_bullish")),
-        "Supertrend Buy": tech.get("supertrend") == "up",
-        "ADX > 25": tech.get("adx", 0) > 25,
-        "Put Writing Increasing": bool(market_oi.get("put_writing")),
-        "Call Unwinding Increasing": bool(market_oi.get("call_unwinding")),
-        "Futures Long Build-up": bool(futures.get("long_buildup")),
-        "Volume Spike": bool(tech.get("volume_spike")),
-        "ATM CE Premium Increasing": bool(tech.get("ce_premium_up")),
-    }
-    sell_conditions = {
-        "Price < VWAP": bool(tech.get("price_below_vwap")),
-        "EMA9 < EMA20 < EMA50": bool(tech.get("ema_bearish")),
-        "RSI 30–45": 30 <= rsi <= 45,
-        "MACD Bearish": bool(tech.get("macd_bearish")),
-        "Supertrend Sell": tech.get("supertrend") == "down",
-        "ADX > 25": tech.get("adx", 0) > 25,
-        "Call Writing Increasing": bool(market_oi.get("call_writing")),
-        "Put Unwinding Increasing": bool(market_oi.get("put_unwinding")),
-        "Futures Short Build-up": bool(futures.get("short_buildup")),
-        "Volume Spike": bool(tech.get("volume_spike")),
-        "ATM PE Premium Increasing": bool(tech.get("pe_premium_up")),
-    }
-    return {
-        "buy_conditions": buy_conditions, "sell_conditions": sell_conditions,
-        "buy_all_met": all(buy_conditions.values()),
-        "sell_all_met": all(sell_conditions.values()),
-    }
-
-
-def generate_scalping_levels(direction: str, atm_row, tech: dict) -> dict:
-    """Entry / SL / T1 / T2 / T3 / Risk-Reward for the ATM CE (BUY) or ATM
-    PE (SELL) premium, sized off the intraday ATR% so scalping stops are
-    tighter than the swing-style AI Trade Signals in section 5B."""
-    if atm_row is None or direction not in ("BUY", "SELL"):
-        return {}
-    side = "CE" if direction == "BUY" else "PE"
-    ltp = float(atm_row.get("ce_ltp" if side == "CE" else "pe_ltp", 0) or 0)
-    if ltp <= 0:
-        return {}
-    atr_pct = max(tech.get("atr_pct", 0.5), 0.3)
-    sl_pct = min(max(atr_pct * 1.5, 8), 20) / 100.0
-    entry = round(ltp, 2)
-    sl = round(ltp * (1 - sl_pct), 2)
-    t1 = round(ltp * (1 + sl_pct * 0.75), 2)
-    t2 = round(ltp * (1 + sl_pct * 1.5), 2)
-    t3 = round(ltp * (1 + sl_pct * 2.5), 2)
-    risk = max(entry - sl, 0.01)
-    reward = t2 - entry
-    rr = round(reward / risk, 2) if risk > 0 else 0
-    return {"side": side, "entry": entry, "sl": sl, "t1": t1, "t2": t2, "t3": t3,
-            "rr": f"1 : {rr}" if rr > 0 else "—"}
-
-
-def compute_scalping_signal(df: pd.DataFrame, spot_price: float, pcr: float, max_pain: float,
-                             atm_strike: float, intel: dict, tech: dict, futures: dict,
-                             market_oi: dict) -> dict:
-    """
-    Master entry point for the Scalping Engine. Combines the Master AI
-    Confidence score (5H) with the strict per-timeframe BUY/SELL condition
-    sets above. A BUY or SELL is only ever emitted when:
-      (a) confidence > 75%, AND
-      (b) every single condition in that side's strict set is met.
-    Otherwise the engine outputs WAIT, per spec — never a low-confidence
-    guess dressed up as a signal.
-    """
-    ai = compute_ai_master_confidence(df, spot_price, pcr, max_pain, atm_strike, intel, tech, futures, market_oi)
-    cond = evaluate_scalping_conditions(tech, market_oi, futures)
-    market_condition = classify_market_condition(tech)
-    warnings = build_warning_messages(tech, market_condition, intel.get("_expiry_label", ""), df)
-
-    confidence = ai["confidence"]
-    final_direction = "WAIT"
-    if confidence > SCALP_MIN_CONFIDENCE:
-        if ai["direction"] == "BUY" and cond["buy_all_met"]:
-            final_direction = "BUY"
-        elif ai["direction"] == "SELL" and cond["sell_all_met"]:
-            final_direction = "SELL"
-
-    reasons = build_live_reasons(ai["votes"], final_direction if final_direction != "WAIT" else ai["direction"])
-    atm_row = ai.get("atm_row")
-    levels = generate_scalping_levels(final_direction, atm_row, tech) if final_direction != "WAIT" else {}
-
-    return {
-        "direction": final_direction, "raw_ai_direction": ai["direction"],
-        "confidence": confidence, "trend": ai["trend"], "strength": ai["strength"],
-        "probability": ai["probability"], "market_condition": market_condition,
-        "reasons": reasons, "warnings": warnings, "levels": levels,
-        "buy_conditions": cond["buy_conditions"], "sell_conditions": cond["sell_conditions"],
-        "buy_all_met": cond["buy_all_met"], "sell_all_met": cond["sell_all_met"],
-        "atm_row": atm_row,
-    }
-
-
-def render_scalping_tab(fyers, df: pd.DataFrame, symbol: str, symbol_key: str, spot_price: float,
-                         pcr: float, max_pain: float, atm_strike: float, intel: dict,
-                         expiry_label: str, timeframe: str, live_mode: bool):
-    """Renders the full AI Scalping Engine tab: timeframe-based candle
-    fetch, futures snapshot, technical + OI + AI confidence computation,
-    the AI Output panel, Trading Levels, Live Reasons, Warnings, and the
-    strict condition checklists for both sides."""
-    st.markdown(f"##### 🎯 AI Scalping Engine — {timeframe} Chart")
-
-    resolution_map = {"1 min": "1", "3 min": "3", "5 min": "5"}
-    resolution = resolution_map.get(timeframe, "5")
-
-    with st.spinner("Fetching intraday candles, futures data & computing AI confidence..."):
-        candle_df = fetch_candle_data(fyers, symbol, resolution=resolution, lookback_days=5)
-        futures_candidates = get_futures_symbol_candidates(symbol_key)
-        futures_snapshot = fetch_futures_snapshot(fyers, futures_candidates) if futures_candidates else {}
-        futures = analyze_futures_buildup(futures_snapshot) i
-Preview truncated for large file
+    # ── Excel Download ───────────────────────────────────────────────────
+    st.divider()
+    st.markdown('<div class="block-title">📥 Export</div>', unsafe_allow_html=True)
+    try:
+        excel_buffer = build_excel_report(
+            df, spot_price, atm_strike, pcr, max_pain,
+            intel.get("support"), intel.get("resistance"), symbol, expiry_label, signals,
+        )
+        st.download_button(
+            "⬇️ Download Excel Report",
+            data=excel_buffer,
+            file_name=f"options_chain_{symbol.replace(':', '_')}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+        )
+    except Exception as e:  # noqa: BLE001
+        st.error(f"Could not build Excel report: {e}")
