@@ -1,4 +1,3 @@
-
 """
 FYERS Options Chain Dashboard — Pro Edition (AI Upgrade)
 =========================================================
@@ -35,7 +34,7 @@ import io
 import math
 import time
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import numpy as np
 import pandas as pd
@@ -1787,16 +1786,21 @@ def fire_gamma_smart_alerts(df: pd.DataFrame, symbol: str, expiry_label: str) ->
     return messages
 
 
-def render_gamma_tab(df: pd.DataFrame, symbol: str, expiry_label: str, spot_price: float,
+def render_gamma_tab(gdf: pd.DataFrame, symbol: str, expiry_label: str,
                       live_mode: bool, audio_alert: bool):
     """Renders the full Gamma Build-up Analyzer tab: live status badge,
     summary panel, smart alerts, optional audio ping, and the blinking
     color-coded Gamma table. Does not touch or recompute anything from
-    the rest of the dashboard."""
-    st.markdown("##### ⚡ Advanced Gamma Build-up Analyzer")
+    the rest of the dashboard.
 
-    gdf = add_gamma_columns(df, spot_price, expiry_label)
-    gdf = compute_gamma_analysis(gdf, symbol, expiry_label)
+    NOTE: `gdf` must already have add_gamma_columns() + compute_gamma_
+    analysis() applied to it (this is done once per refresh in
+    show_option_chain, then shared with the AI Scalping Engine tab too)
+    — compute_gamma_analysis() updates the session-tracked "previous
+    refresh" history as a side effect, so it must only run once per
+    Streamlit script run or the Gamma Change %/Trend comparisons would
+    be silently corrupted."""
+    st.markdown("##### ⚡ Advanced Gamma Build-up Analyzer")
 
     # ── Live status badge ────────────────────────────────────────────────
     badge_col, time_col, prev_col = st.columns([1, 1, 1])
@@ -1882,6 +1886,664 @@ def render_gamma_tab(df: pd.DataFrame, symbol: str, expiry_label: str, spot_pric
     if live_mode:
         time.sleep(5)
         st.rerun()
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 5D. AI SCALPING ENGINE  (multi-factor confirmation — EMA/VWAP/RSI/MACD/
+#     ADX/ATR/Supertrend/India VIX from FYERS historical candles, combined
+#     with the chain's own OI/Gamma/Build-up factors. Requires >= 8 of 13
+#     confirmations in the same direction before showing a BUY/SELL signal
+#     — otherwise stays at WAIT. This intentionally does NOT reuse or
+#     alter the existing CE/PE AI Engine, Big Move Engine, or Gamma
+#     Analyzer signal logic; it is a separate, additive engine.)
+# ══════════════════════════════════════════════════════════════════════════
+
+SCALP_BOS_HISTORY_KEY = "oc_scalp_last_bos_dir"
+SCALP_ALERT_KEY_PREFIX = "oc_scalp_last_fire"
+SCALP_MIN_CONFIRMATIONS = 8
+SCALP_TOTAL_CHECKS = 13
+
+
+def fetch_underlying_candles(fyers, symbol_candidates: list, resolution: str = "5",
+                              lookback_days: int = 5) -> pd.DataFrame:
+    """Fetches recent OHLCV candles for the underlying via the FYERS
+    history endpoint, trying each candidate symbol format until one
+    returns data (mirrors the same fallback pattern used for the option
+    chain itself). Returns a DataFrame [time, open, high, low, close,
+    volume] sorted chronologically, or an empty DataFrame if unavailable
+    — the Scalping Engine degrades to WAIT-only rather than raising when
+    historical candles can't be fetched (market closed, plan without
+    history access, symbol not resolvable, etc.)."""
+    end = datetime.now()
+    start = end - timedelta(days=lookback_days)
+    for sym in symbol_candidates:
+        req = {
+            "symbol": sym, "resolution": str(resolution), "date_format": "1",
+            "range_from": start.strftime("%Y-%m-%d"), "range_to": end.strftime("%Y-%m-%d"),
+            "cont_flag": "1",
+        }
+        try:
+            resp = fyers.history(data=req)
+        except Exception:  # noqa: BLE001 - external SDK, keep resilient
+            continue
+        if not isinstance(resp, dict) or resp.get("s") != "ok":
+            continue
+        candles = resp.get("candles", [])
+        if not candles:
+            continue
+        try:
+            cdf = pd.DataFrame(candles, columns=["time", "open", "high", "low", "close", "volume"])
+            cdf["time"] = pd.to_datetime(cdf["time"], unit="s")
+            cdf.sort_values("time", inplace=True)
+            cdf.reset_index(drop=True, inplace=True)
+            return cdf
+        except Exception:  # noqa: BLE001
+            continue
+    return pd.DataFrame()
+
+
+def fetch_india_vix(fyers):
+    """Returns the latest India VIX value, or None if unavailable — VIX
+    is informational context for the Scalping Engine, not a hard gate."""
+    for sym in ("NSE:INDIAVIX-INDEX", "NSE:INDIA_VIX-INDEX"):
+        try:
+            resp = fyers.quotes(data={"symbols": sym})
+            v = resp.get("d", [{}])[0].get("v", {}) if isinstance(resp, dict) else {}
+            val = float(v.get("lp", 0) or 0)
+            if val > 0:
+                return val
+        except Exception:  # noqa: BLE001
+            continue
+    return None
+
+
+# ── Technical indicators (manual implementations — no external TA-lib
+#    dependency, so this keeps working wherever the base dashboard runs) ──
+
+def _ema(series: pd.Series, n: int) -> pd.Series:
+    return series.ewm(span=n, adjust=False).mean()
+
+
+def _rsi(series: pd.Series, n: int = 14) -> pd.Series:
+    delta = series.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.ewm(alpha=1 / n, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1 / n, adjust=False).mean()
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    rsi = 100 - (100 / (1 + rs))
+    return rsi.fillna(50.0)
+
+
+def _macd(series: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9):
+    ema_fast, ema_slow = _ema(series, fast), _ema(series, slow)
+    macd_line = ema_fast - ema_slow
+    signal_line = _ema(macd_line, signal)
+    return macd_line, signal_line, macd_line - signal_line
+
+
+def _atr(df: pd.DataFrame, n: int = 14) -> pd.Series:
+    high, low, close = df["high"], df["low"], df["close"]
+    prev_close = close.shift(1)
+    tr = pd.concat([high - low, (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
+    return tr.ewm(alpha=1 / n, adjust=False).mean()
+
+
+def _adx(df: pd.DataFrame, n: int = 14):
+    high, low = df["high"], df["low"]
+    up_move, down_move = high.diff(), -low.diff()
+    plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
+    minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
+    atr = _atr(df, n)
+    plus_di = 100 * pd.Series(plus_dm, index=df.index).ewm(alpha=1 / n, adjust=False).mean() / atr.replace(0, np.nan)
+    minus_di = 100 * pd.Series(minus_dm, index=df.index).ewm(alpha=1 / n, adjust=False).mean() / atr.replace(0, np.nan)
+    dx = ((plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)) * 100
+    adx = dx.ewm(alpha=1 / n, adjust=False).mean()
+    return adx.fillna(0.0), plus_di.fillna(0.0), minus_di.fillna(0.0)
+
+
+def _supertrend(df: pd.DataFrame, period: int = 10, multiplier: float = 3.0):
+    atr = _atr(df, period)
+    hl2 = (df["high"] + df["low"]) / 2
+    upperband, lowerband = hl2 + multiplier * atr, hl2 - multiplier * atr
+    close = df["close"]
+    n = len(df)
+    final_upper, final_lower = upperband.copy(), lowerband.copy()
+    direction = pd.Series(1, index=df.index, dtype="int64")
+    trend = pd.Series(0.0, index=df.index, dtype="float64")
+    for i in range(n):
+        if i == 0:
+            trend.iloc[i] = final_lower.iloc[i]
+            continue
+        final_upper.iloc[i] = min(upperband.iloc[i], final_upper.iloc[i - 1]) \
+            if close.iloc[i - 1] <= final_upper.iloc[i - 1] else upperband.iloc[i]
+        final_lower.iloc[i] = max(lowerband.iloc[i], final_lower.iloc[i - 1]) \
+            if close.iloc[i - 1] >= final_lower.iloc[i - 1] else lowerband.iloc[i]
+        if close.iloc[i] > final_upper.iloc[i - 1]:
+            direction.iloc[i] = 1
+        elif close.iloc[i] < final_lower.iloc[i - 1]:
+            direction.iloc[i] = -1
+        else:
+            direction.iloc[i] = direction.iloc[i - 1]
+        trend.iloc[i] = final_lower.iloc[i] if direction.iloc[i] == 1 else final_upper.iloc[i]
+    return trend, direction
+
+
+def _vwap(df: pd.DataFrame) -> pd.Series:
+    typical = (df["high"] + df["low"] + df["close"]) / 3
+    cum_vol = df["volume"].cumsum().replace(0, np.nan)
+    return (typical * df["volume"]).cumsum() / cum_vol
+
+
+# ── Simplified price-action / SMC-style pattern detectors ────────────────
+# These are heuristic proxies for their named concepts, built only from
+# FYERS OHLCV candles (no order-book/depth data is available), and are
+# meant to add directional context — not to be a certified SMC engine.
+
+def _swing_points(df: pd.DataFrame, lookback: int = 3):
+    highs, lows = df["high"], df["low"]
+    window = lookback * 2 + 1
+    swing_high = highs == highs.rolling(window, center=True).max()
+    swing_low = lows == lows.rolling(window, center=True).min()
+    return swing_high.fillna(False), swing_low.fillna(False)
+
+
+def _detect_bos_choch(df: pd.DataFrame) -> dict:
+    """Break of Structure: latest close beyond the most recent confirmed
+    swing high/low. Change of Character: the break direction flips from
+    the last confirmed break (tracked in session_state across refreshes)."""
+    if len(df) < 10:
+        return {"bos_bull": False, "bos_bear": False, "bos_label": "None", "choch_label": "None"}
+    swing_high, swing_low = _swing_points(df)
+    last_swing_high_val = df.loc[swing_high, "high"].iloc[-1] if swing_high.any() else None
+    last_swing_low_val = df.loc[swing_low, "low"].iloc[-1] if swing_low.any() else None
+    last_close = df["close"].iloc[-1]
+
+    bos_bull = last_swing_high_val is not None and last_close > last_swing_high_val
+    bos_bear = last_swing_low_val is not None and last_close < last_swing_low_val
+
+    prev_dir = st.session_state.get(SCALP_BOS_HISTORY_KEY)
+    cur_dir = "bull" if bos_bull else ("bear" if bos_bear else prev_dir)
+    choch = prev_dir is not None and cur_dir is not None and cur_dir != prev_dir and (bos_bull or bos_bear)
+    if bos_bull or bos_bear:
+        st.session_state[SCALP_BOS_HISTORY_KEY] = cur_dir
+
+    bos_label = "Bullish BOS" if bos_bull else ("Bearish BOS" if bos_bear else "None")
+    choch_label = "None"
+    if choch:
+        choch_label = "Bullish CHOCH" if cur_dir == "bull" else "Bearish CHOCH"
+    return {"bos_bull": bos_bull, "bos_bear": bos_bear, "bos_label": bos_label, "choch_label": choch_label}
+
+
+def _detect_order_block(df: pd.DataFrame):
+    """Simplified Order Block: the last opposite-colour candle immediately
+    preceding a stronger same-direction impulse candle."""
+    if len(df) < 3:
+        return False, False, "None"
+    c = df.iloc[-3:]
+    bodies = c["close"] - c["open"]
+    bullish_ob = bool(bodies.iloc[0] < 0 and bodies.iloc[1] > 0 and bodies.iloc[2] > 0
+                      and abs(bodies.iloc[1]) > abs(bodies.iloc[0]))
+    bearish_ob = bool(bodies.iloc[0] > 0 and bodies.iloc[1] < 0 and bodies.iloc[2] < 0
+                      and abs(bodies.iloc[1]) > abs(bodies.iloc[0]))
+    label = "Bullish OB" if bullish_ob else ("Bearish OB" if bearish_ob else "None")
+    return bullish_ob, bearish_ob, label
+
+
+def _detect_fvg(df: pd.DataFrame) -> str:
+    """3-candle Fair Value Gap on the most recent completed window:
+    candle[-3].high < candle[-1].low (bullish gap) or
+    candle[-3].low > candle[-1].high (bearish gap)."""
+    if len(df) < 3:
+        return "None"
+    a, c = df.iloc[-3], df.iloc[-1]
+    if a["high"] < c["low"]:
+        return "Bullish FVG"
+    if a["low"] > c["high"]:
+        return "Bearish FVG"
+    return "None"
+
+
+def _detect_liquidity_sweep(df: pd.DataFrame, lookback: int = 10) -> str:
+    """Flags a liquidity sweep when the latest candle wicks beyond the
+    recent swing high/low but closes back inside the prior range."""
+    if len(df) < lookback + 1:
+        return "None"
+    window = df.iloc[-(lookback + 1):-1]
+    last = df.iloc[-1]
+    if last["high"] > window["high"].max() and last["close"] < window["high"].max():
+        return "Sell-side Sweep (Bearish)"
+    if last["low"] < window["low"].min() and last["close"] > window["low"].min():
+        return "Buy-side Sweep (Bullish)"
+    return "None"
+
+
+def _prev_day_high_low(df: pd.DataFrame):
+    if df.empty:
+        return None, None
+    d = df.copy()
+    d["date"] = d["time"].dt.date
+    days = sorted(d["date"].unique())
+    if len(days) < 2:
+        return None, None
+    prev_df = d[d["date"] == days[-2]]
+    return float(prev_df["high"].max()), float(prev_df["low"].min())
+
+
+def _support_resistance_from_candles(df: pd.DataFrame, lookback: int = 50):
+    if df.empty:
+        return None, None
+    recent = df.tail(lookback)
+    return float(recent["low"].min()), float(recent["high"].max())
+
+
+def compute_scalping_trend_engine(fyers, symbol_candidates: list, df: pd.DataFrame, gdf: pd.DataFrame) -> dict:
+    """
+    Builds the underlying-level multi-factor confirmation engine: EMA9/
+    20/50, VWAP, RSI (5m & 15m), MACD, ADX, ATR, Supertrend, India VIX,
+    previous-day high/low, support/resistance, Order Block, Liquidity
+    Sweep, FVG and BOS/CHOCH from FYERS historical candles — combined
+    with the option chain's own aggregate OI/Gamma/Build-up direction
+    (from `df`/`gdf`, already computed elsewhere in this file) into
+    exactly the 13 BUY and 13 SELL confirmation checks specified for
+    this engine.
+
+    Every confirmation fails safe toward "not counted" on missing data —
+    this can only push the result toward WAIT, never force a BUY/SELL.
+    Returns a dict; `available` is False if there isn't enough candle
+    history to compute the indicators at all.
+    """
+    result = {"available": False, "buy_confirmations": [], "sell_confirmations": [],
+              "buy_count": 0, "sell_count": 0}
+
+    c5 = fetch_underlying_candles(fyers, symbol_candidates, resolution="5", lookback_days=5)
+    if c5.empty or len(c5) < 30:
+        return result
+    c15 = fetch_underlying_candles(fyers, symbol_candidates, resolution="15", lookback_days=10)
+
+    close5 = c5["close"]
+    ema9, ema20, ema50 = _ema(close5, 9), _ema(close5, 20), _ema(close5, 50)
+    rsi5 = _rsi(close5, 14)
+    rsi15 = _rsi(c15["close"], 14) if not c15.empty and len(c15) >= 20 else pd.Series([50.0])
+    macd_line, macd_signal, _ = _macd(close5)
+    adx, _, _ = _adx(c5, 14)
+    atr = _atr(c5, 14)
+    supertrend, st_dir = _supertrend(c5, 10, 3.0)
+    vwap = _vwap(c5)
+    vix = fetch_india_vix(fyers)
+    prev_high, prev_low = _prev_day_high_low(c5)
+    support, resistance = _support_resistance_from_candles(c5)
+    bos_info = _detect_bos_choch(c5)
+    ob_bull, ob_bear, ob_label = _detect_order_block(c5)
+    fvg_label = _detect_fvg(c5)
+    sweep_label = _detect_liquidity_sweep(c5)
+
+    last_close = float(close5.iloc[-1])
+    last_vwap = float(vwap.iloc[-1]) if not vwap.empty and pd.notna(vwap.iloc[-1]) else last_close
+    last_ema9, last_ema20, last_ema50 = float(ema9.iloc[-1]), float(ema20.iloc[-1]), float(ema50.iloc[-1])
+    last_rsi5, last_rsi15 = float(rsi5.iloc[-1]), float(rsi15.iloc[-1])
+    last_macd, last_macd_sig = float(macd_line.iloc[-1]), float(macd_signal.iloc[-1])
+    last_adx, last_atr = float(adx.iloc[-1]), float(atr.iloc[-1])
+    last_st_dir = int(st_dir.iloc[-1]) if len(st_dir) else 0
+    volume_spike = bool(len(c5) >= 20 and c5["volume"].iloc[-1] > c5["volume"].tail(20).mean() * 1.5)
+
+    # ── Aggregate chain-side factors (from df / gdf, computed elsewhere) ─
+    total_ce_chng = float(df.get("ce_chng_oi", pd.Series(dtype=float)).sum())
+    total_pe_chng = float(df.get("pe_chng_oi", pd.Series(dtype=float)).sum())
+    avg_gamma_change = float(gdf["Gamma Change"].mean()) if "Gamma Change" in gdf.columns and len(gdf) else 0.0
+    ce_build = df.get("CE Build-up", pd.Series(dtype=object))
+    pe_build = df.get("PE Build-up", pd.Series(dtype=object))
+    pe_long_buildup_dominant = (pe_build == "Long Build-up (Put Writing)").sum() > (pe_build == "Long Unwinding").sum()
+    pe_long_unwinding_dominant = (pe_build == "Long Unwinding").sum() > (pe_build == "Long Build-up (Put Writing)").sum()
+    ce_short_covering_dominant = (ce_build == "Short Covering").sum() > (ce_build == "Short Build-up (Call Writing)").sum()
+    ce_short_buildup_dominant = (ce_build == "Short Build-up (Call Writing)").sum() > (ce_build == "Short Covering").sum()
+
+    # ── Exactly the 13 BUY / 13 SELL confirmations specified ─────────────
+    buy_checks = {
+        "Price above VWAP": last_close > last_vwap,
+        "EMA9 > EMA20 > EMA50": last_ema9 > last_ema20 > last_ema50,
+        "RSI(5m) > 60": last_rsi5 > 60,
+        "MACD Bullish": last_macd > last_macd_sig,
+        "ADX > 25": last_adx > 25,
+        "PE OI increasing": total_pe_chng > 0,
+        "CE OI decreasing": total_ce_chng < 0,
+        "Positive Gamma": avg_gamma_change > 0,
+        "Long Build-up": bool(pe_long_buildup_dominant),
+        "Short Covering": bool(ce_short_covering_dominant),
+        "Bullish Order Block": ob_bull,
+        "Bullish BOS": bos_info["bos_bull"],
+        "Volume Spike": volume_spike,
+    }
+    sell_checks = {
+        "Price below VWAP": last_close < last_vwap,
+        "EMA9 < EMA20 < EMA50": last_ema9 < last_ema20 < last_ema50,
+        "RSI(5m) < 40": last_rsi5 < 40,
+        "MACD Bearish": last_macd < last_macd_sig,
+        "ADX > 25": last_adx > 25,
+        "CE OI increasing": total_ce_chng > 0,
+        "PE OI decreasing": total_pe_chng < 0,
+        "Negative Gamma": avg_gamma_change < 0,
+        "Short Build-up": bool(ce_short_buildup_dominant),
+        "Long Unwinding": bool(pe_long_unwinding_dominant),
+        "Bearish Order Block": ob_bear,
+        "Bearish BOS": bos_info["bos_bear"],
+        "Volume Spike": volume_spike,
+    }
+
+    result.update({
+        "available": True,
+        "last_close": last_close, "vwap": last_vwap,
+        "ema9": last_ema9, "ema20": last_ema20, "ema50": last_ema50,
+        "rsi5": last_rsi5, "rsi15": last_rsi15,
+        "macd": last_macd, "macd_signal": last_macd_sig,
+        "adx": last_adx, "atr": last_atr, "supertrend_dir": last_st_dir,
+        "vix": vix, "prev_high": prev_high, "prev_low": prev_low,
+        "support": support, "resistance": resistance,
+        "bos_label": bos_info["bos_label"], "choch_label": bos_info["choch_label"],
+        "order_block_label": ob_label, "fvg_label": fvg_label, "sweep_label": sweep_label,
+        "buy_checks": buy_checks, "sell_checks": sell_checks,
+        "buy_confirmations": [k for k, v in buy_checks.items() if v],
+        "sell_confirmations": [k for k, v in sell_checks.items() if v],
+        "buy_count": int(sum(buy_checks.values())),
+        "sell_count": int(sum(sell_checks.values())),
+        "candle_time": c5["time"].iloc[-1],
+    })
+    return result
+
+
+def determine_scalping_signal(buy_count: int, sell_count: int,
+                               min_confirmations: int = SCALP_MIN_CONFIRMATIONS) -> str:
+    """Only returns a BUY/SELL signal once one side reaches the minimum
+    confirmation count AND leads the other side; otherwise WAIT."""
+    if buy_count >= min_confirmations and buy_count > sell_count:
+        return "🟢 STRONG SCALP BUY" if buy_count >= min_confirmations + 3 else "🟢 SCALP BUY"
+    if sell_count >= min_confirmations and sell_count > buy_count:
+        return "🔴 STRONG SCALP SELL" if sell_count >= min_confirmations + 3 else "🔴 SCALP SELL"
+    return "🟡 WAIT"
+
+
+def scalping_confidence_pct(buy_count: int, sell_count: int, total_checks: int = SCALP_TOTAL_CHECKS) -> float:
+    return round(min(max(buy_count, sell_count) / total_checks, 1.0) * 100, 1)
+
+
+def confidence_stars(pct: float) -> str:
+    if pct >= 90:
+        return "★★★★★"
+    if pct >= 80:
+        return "★★★★☆"
+    if pct >= 70:
+        return "★★★☆☆"
+    return "NO TRADE"
+
+
+def compute_scalping_table(df: pd.DataFrame, gdf: pd.DataFrame, trend_engine: dict,
+                            min_confirmations: int = SCALP_MIN_CONFIRMATIONS) -> pd.DataFrame:
+    """Builds the per-strike AI Scalping table: the overall multi-factor
+    Signal/Confidence apply chain-wide (the underlying trend doesn't
+    differ strike to strike), while Entry/SL/Targets/Gamma/Gamma Change/
+    Delta OI/Volume Strength/Build-up columns are per-strike, pulled from
+    `df` (chain snapshot) and `gdf` (gamma-analyzed chain, computed once
+    per refresh in show_option_chain)."""
+    d = df.copy()
+
+    if not trend_engine.get("available") or d.empty:
+        d["AI Scalping Signal"] = "🟡 WAIT"
+        d["Confidence %"] = 0.0
+        d["Confidence Stars"] = "NO TRADE"
+        for col in ("Entry Price", "Stop Loss", "Target 1", "Target 2"):
+            d[col] = 0.0
+        d["Risk Reward"] = "—"
+        d["Gamma"] = gdf["gamma"] if "gamma" in gdf.columns else 0.0
+        d["Gamma Change"] = gdf["Gamma Change"] if "Gamma Change" in gdf.columns else 0.0
+        d["Delta OI"] = d.get("ce_chng_oi", 0) - d.get("pe_chng_oi", 0)
+        d["Volume Strength"] = "—"
+        d["Long Build-up"] = d.get("PE Build-up", "—")
+        d["Short Build-up"] = d.get("CE Build-up", "—")
+        d["Order Block"] = trend_engine.get("order_block_label", "None")
+        d["BOS"] = trend_engine.get("bos_label", "None")
+        d["CHOCH"] = trend_engine.get("choch_label", "None")
+        d["Trend Strength"] = "—"
+        return d
+
+    buy_count, sell_count = trend_engine["buy_count"], trend_engine["sell_count"]
+    signal = determine_scalping_signal(buy_count, sell_count, min_confirmations)
+    confidence_pct = scalping_confidence_pct(buy_count, sell_count)
+    stars = confidence_stars(confidence_pct)
+
+    gamma_cols = gdf.set_index("strike_price")[["gamma", "Gamma Change"]] if "gamma" in gdf.columns else None
+    if gamma_cols is not None and not gamma_cols.index.duplicated().any():
+        d = d.merge(gamma_cols, on="strike_price", how="left")
+    else:
+        d["gamma"], d["Gamma Change"] = 0.0, 0.0
+    d["gamma"] = d["gamma"].fillna(0.0)
+    d["Gamma Change"] = d["Gamma Change"].fillna(0.0)
+
+    d["AI Scalping Signal"] = signal
+    d["Confidence %"] = confidence_pct
+    d["Confidence Stars"] = stars
+    d["Delta OI"] = d.get("ce_chng_oi", 0) - d.get("pe_chng_oi", 0)
+
+    total_vol = d.get("ce_volume", pd.Series(0, index=d.index)) + d.get("pe_volume", pd.Series(0, index=d.index))
+    vol_thresh_strong = total_vol.quantile(0.85) if len(total_vol) and total_vol.max() > 0 else 0
+    vol_thresh_med = total_vol.quantile(0.6) if len(total_vol) and total_vol.max() > 0 else 0
+
+    def _vol_strength(v):
+        if vol_thresh_strong > 0 and v >= vol_thresh_strong:
+            return "Strong"
+        if vol_thresh_med > 0 and v >= vol_thresh_med:
+            return "Medium"
+        return "Weak"
+
+    d["Volume Strength"] = total_vol.apply(_vol_strength)
+    d["Long Build-up"] = d.get("PE Build-up", "—")
+    d["Short Build-up"] = d.get("CE Build-up", "—")
+    d["Order Block"] = trend_engine.get("order_block_label", "None")
+    d["BOS"] = trend_engine.get("bos_label", "None")
+    d["CHOCH"] = trend_engine.get("choch_label", "None")
+    d["Trend Strength"] = "Strong" if trend_engine.get("adx", 0) > 25 else "Weak"
+
+    is_buy_type, is_sell_type = "BUY" in signal, "SELL" in signal
+
+    def _entry_row(row):
+        if is_buy_type:
+            return row.get("ce_ltp", 0)
+        if is_sell_type:
+            return row.get("pe_ltp", 0)
+        return 0.0
+
+    d["Entry Price"] = d.apply(_entry_row, axis=1).round(2)
+    d["Stop Loss"] = (d["Entry Price"] * 0.85).round(2)
+    d["Target 1"] = (d["Entry Price"] * 1.15).round(2)
+    d["Target 2"] = (d["Entry Price"] * 1.30).round(2)
+
+    def _rr(row):
+        entry, sl, t1 = row["Entry Price"], row["Stop Loss"], row["Target 1"]
+        if entry <= 0:
+            return "—"
+        risk = max(entry - sl, 0.01)
+        reward = t1 - entry
+        return f"1 : {round(reward / risk, 2)}" if risk > 0 else "—"
+
+    d["Risk Reward"] = d.apply(_rr, axis=1)
+    zero_entry_mask = d["Entry Price"] <= 0
+    d.loc[zero_entry_mask, ["Entry Price", "Stop Loss", "Target 1", "Target 2"]] = 0.0
+
+    # Sort so the most actionable strikes (closest to spot / highest
+    # gamma) surface first, without touching any existing sort elsewhere.
+    if "gamma" in d.columns:
+        d = d.sort_values("gamma", ascending=False).reset_index(drop=True)
+    return d
+
+
+SCALP_ROW_CSS = {
+    "strongbuy": "gamma-row-strongbuy", "buy": "gamma-row-buy", "hold": "gamma-row-hold",
+    "sell": "gamma-row-sell", "strongsell": "gamma-row-strongsell",
+}
+
+
+def _scalp_band(signal: str) -> str:
+    return {
+        "🟢 STRONG SCALP BUY": "strongbuy", "🟢 SCALP BUY": "buy",
+        "🔴 STRONG SCALP SELL": "strongsell", "🔴 SCALP SELL": "sell",
+    }.get(signal, "hold")
+
+
+def render_scalping_html_table(df: pd.DataFrame, top_n: int = 40) -> str:
+    """Custom HTML table (not st.dataframe) so the same CSS blink
+    keyframes used by the Gamma tab can animate Strong Buy/Sell rows."""
+    cols = [
+        ("strike_price", "Strike", "{:,.0f}"),
+        ("AI Scalping Signal", "Signal", None),
+        ("Confidence %", "Conf %", "{:.1f}%"),
+        ("Confidence Stars", "Rating", None),
+        ("Entry Price", "Entry", "{:.2f}"),
+        ("Stop Loss", "SL", "{:.2f}"),
+        ("Target 1", "T1", "{:.2f}"),
+        ("Target 2", "T2", "{:.2f}"),
+        ("Risk Reward", "RR", None),
+        ("Gamma", "Gamma", "{:.5f}"),
+        ("Gamma Change", "Gamma Chg", "{:+.5f}"),
+        ("Delta OI", "Delta OI", "{:+,.0f}"),
+        ("Volume Strength", "Vol Strength", None),
+        ("Long Build-up", "Long BU", None),
+        ("Short Build-up", "Short BU", None),
+        ("Order Block", "Order Block", None),
+        ("BOS", "BOS", None),
+        ("CHOCH", "CHOCH", None),
+        ("Trend Strength", "Trend", None),
+    ]
+    view = df.head(top_n)
+    rows_html = []
+    for _, row in view.iterrows():
+        band = _scalp_band(row.get("AI Scalping Signal", "🟡 WAIT"))
+        css = SCALP_ROW_CSS.get(band, "gamma-row-hold")
+        blink = ""
+        if band == "strongbuy":
+            blink = " gamma-row-blink-green"
+        elif band == "strongsell":
+            blink = " gamma-row-blink-red"
+        cells = []
+        for key, _, fmt in cols:
+            val = row.get(key, "")
+            cells.append(f"<td>{fmt.format(val) if fmt else val}</td>")
+        rows_html.append(f'<tr class="{css}{blink}">{"".join(cells)}</tr>')
+    header_html = "".join(f"<th>{label}</th>" for _, label, _ in cols)
+    return f"""
+    <div style="max-height:560px; overflow-y:auto; border:1px solid #30363d; border-radius:8px;">
+    <table class="gamma-table">
+        <thead><tr>{header_html}</tr></thead>
+        <tbody>{''.join(rows_html)}</tbody>
+    </table>
+    </div>
+    """
+
+
+def fire_scalping_alert(trend_engine: dict, symbol: str, signal: str, audio_alert: bool):
+    """Blinking banner is handled in render_scalping_tab; this fires the
+    popup + optional audio ping only when the Signal changes AND it's a
+    new candle — never repeats for the same candle even across reruns."""
+    candle_time = trend_engine.get("candle_time")
+    key = f"{SCALP_ALERT_KEY_PREFIX}|{symbol}"
+    last = st.session_state.get(key)
+    cur = (str(candle_time), signal) if candle_time is not None else None
+    if cur is None:
+        return
+    if last != cur:
+        st.session_state[key] = cur
+        if signal != "🟡 WAIT" and (last is None or last[0] == cur[0] or last[1] != signal):
+            try:
+                st.toast(f"AI Scalping: {signal}", icon="🎯")
+            except Exception:  # noqa: BLE001
+                st.info(f"AI Scalping: {signal}")
+            if audio_alert:
+                st.audio(io.BytesIO(__import__("base64").b64decode(_GAMMA_PING_WAV_B64)), format="audio/wav")
+
+
+def render_scalping_tab(scalp_df: pd.DataFrame, trend_engine: dict, symbol: str, audio_alert: bool):
+    """Renders the AI Scalping Engine tab: overall blinking signal banner,
+    the full indicator readout, the BUY/SELL confirmation checklist, and
+    the per-strike Scalping table."""
+    st.markdown("##### 🎯 AI Scalping Engine — Multi-Factor Confirmation")
+
+    if not trend_engine.get("available"):
+        st.warning(
+            "Historical candle data isn't available right now (market closed, a plan without "
+            "history access, or the FYERS history call failed for every symbol variant tried). "
+            "The Scalping Engine needs 5m/15m candles for EMA/RSI/MACD/ADX/Supertrend and stays "
+            "at 🟡 WAIT until that data is available — it will never force a BUY/SELL without it."
+        )
+        return
+
+    signal = scalp_df["AI Scalping Signal"].iloc[0] if len(scalp_df) else "🟡 WAIT"
+    band = _scalp_band(signal)
+    blink_class = "gamma-row-blink-green" if band == "strongbuy" else (
+        "gamma-row-blink-red" if band == "strongsell" else "")
+
+    fire_scalping_alert(trend_engine, symbol, signal, audio_alert)
+
+    st.markdown(
+        f"""<div class="intel-card {blink_class}" style="text-align:center;">
+        <div class="intel-label">Overall Scalping Signal</div>
+        <div class="intel-value" style="font-size:26px;">{signal}</div>
+        <div style="color:#8b949e;font-size:12px;margin-top:4px;">
+            Confidence {scalp_df['Confidence %'].iloc[0]:.1f}%  ·  {scalp_df['Confidence Stars'].iloc[0]}
+            &nbsp;|&nbsp; BUY confirmations {trend_engine['buy_count']}/{SCALP_TOTAL_CHECKS}
+            &nbsp;|&nbsp; SELL confirmations {trend_engine['sell_count']}/{SCALP_TOTAL_CHECKS}
+        </div>
+        </div>""",
+        unsafe_allow_html=True,
+    )
+
+    st.markdown("<br>", unsafe_allow_html=True)
+    i1, i2, i3, i4 = st.columns(4)
+    i1.metric("EMA 9 / 20 / 50", f"{trend_engine['ema9']:.1f} / {trend_engine['ema20']:.1f} / {trend_engine['ema50']:.1f}")
+    i2.metric("VWAP", f"{trend_engine['vwap']:.1f}")
+    i3.metric("RSI (5m / 15m)", f"{trend_engine['rsi5']:.1f} / {trend_engine['rsi15']:.1f}")
+    i4.metric("ADX", f"{trend_engine['adx']:.1f}")
+
+    i5, i6, i7, i8 = st.columns(4)
+    i5.metric("MACD / Signal", f"{trend_engine['macd']:.2f} / {trend_engine['macd_signal']:.2f}")
+    i6.metric("ATR", f"{trend_engine['atr']:.2f}")
+    i7.metric("Supertrend", "🟢 Bullish" if trend_engine["supertrend_dir"] == 1 else "🔴 Bearish")
+    i8.metric("India VIX", f"{trend_engine['vix']:.2f}" if trend_engine.get("vix") else "—")
+
+    i9, i10, i11, i12 = st.columns(4)
+    i9.metric("Prev Day High / Low",
+              f"{trend_engine['prev_high']:,.0f} / {trend_engine['prev_low']:,.0f}" if trend_engine.get("prev_high") else "—")
+    i10.metric("Support / Resistance",
+               f"{trend_engine['support']:,.0f} / {trend_engine['resistance']:,.0f}" if trend_engine.get("support") else "—")
+    i11.metric("Order Block / FVG", f"{trend_engine['order_block_label']} / {trend_engine['fvg_label']}")
+    i12.metric("BOS / CHOCH", f"{trend_engine['bos_label']} / {trend_engine['choch_label']}")
+
+    st.markdown("<br>", unsafe_allow_html=True)
+    conf_col1, conf_col2 = st.columns(2)
+    with conf_col1:
+        st.markdown("**🟢 BUY confirmations met**")
+        if trend_engine["buy_confirmations"]:
+            st.markdown("\n".join(f"- {c}" for c in trend_engine["buy_confirmations"]))
+        else:
+            st.caption("None currently met.")
+    with conf_col2:
+        st.markdown("**🔴 SELL confirmations met**")
+        if trend_engine["sell_confirmations"]:
+            st.markdown("\n".join(f"- {c}" for c in trend_engine["sell_confirmations"]))
+        else:
+            st.caption("None currently met.")
+
+    st.markdown("<br>", unsafe_allow_html=True)
+    st.markdown('<div class="block-title">📋 AI Scalping Table (per strike)</div>', unsafe_allow_html=True)
+    st.markdown(render_scalping_html_table(scalp_df), unsafe_allow_html=True)
+    st.caption(
+        f"A BUY/SELL Scalping Signal requires at least {SCALP_MIN_CONFIRMATIONS} of {SCALP_TOTAL_CHECKS} "
+        "confirmations in the same direction (VWAP, EMA alignment, RSI, MACD, ADX, CE/PE OI direction, "
+        "Gamma direction, Build-up/Covering/Unwinding, Order Block, BOS, Volume Spike); otherwise it "
+        "stays at 🟡 WAIT. Confidence % and the ★ rating are scored independently against the "
+        f"{SCALP_TOTAL_CHECKS}-point checklist and can sit below the signal's own confirmation bar — "
+        "treat a 'NO TRADE' star rating as a caution flag even when a Scalp signal is showing. Order "
+        "Block / FVG / Liquidity Sweep / BOS / CHOCH are simplified heuristic pattern proxies from "
+        "FYERS candle data, not a certified SMC engine. This is a positioning read, not financial "
+        "advice — always confirm with live price action and manage your own risk."
+    )
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -1990,6 +2652,15 @@ def show_option_chain(fyers):
                  "Trend / Signal are compared against the previous refresh.",
         )
         gamma_audio_alert = st.checkbox("🔔 Audio ping on new Gamma signal", value=False, key="oc_gamma_audio")
+
+        st.divider()
+        st.markdown("### 🎯 AI Scalping Engine")
+        scalping_enabled = st.checkbox(
+            "Enable AI Scalping Engine (fetches 5m/15m candles)", value=False, key="oc_scalping_enabled",
+            help="Multi-factor confirmation engine (EMA/VWAP/RSI/MACD/ADX/Supertrend + chain OI/Gamma). "
+                 "Off by default since it makes extra FYERS history/quote API calls.",
+        )
+        scalping_audio_alert = st.checkbox("🔔 Audio ping on new Scalping signal", value=False, key="oc_scalping_audio")
 
     # ── Fetch & Process ─────────────────────────────────────────────────
     if fetch_btn:
@@ -2126,6 +2797,12 @@ def show_option_chain(fyers):
     signals = generate_trade_signals(df, pcr, intel.get("support"), intel.get("resistance"),
                                       min_confidence=ai_min_conf, top_n=15)
 
+    # Gamma analysis is computed exactly once per refresh here (it updates
+    # session-tracked "previous refresh" history as a side effect) and is
+    # shared by both the Gamma tab and the AI Scalping Engine tab below.
+    gdf = add_gamma_columns(df, spot_price, expiry_label)
+    gdf = compute_gamma_analysis(gdf, symbol, expiry_label)
+
     c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Spot Price", f"₹{spot_price:,.2f}" if spot_price else "—")
     c2.metric("ATM Strike", f"₹{atm_strike:,.0f}")
@@ -2256,9 +2933,9 @@ def show_option_chain(fyers):
 
     st.divider()
 
-    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(
         ["📋 Chain Table", "📊 OI Analysis", "📈 IV Skew", "🔥 Big Move Ready",
-         "🤖 AI Trade Signals", "⚡ Gamma Build-up"]
+         "🤖 AI Trade Signals", "⚡ Gamma Build-up", "🎯 AI Scalping Engine"]
     )
 
     with tab1:
@@ -2403,7 +3080,21 @@ def show_option_chain(fyers):
         )
 
     with tab6:
-        render_gamma_tab(df, symbol, expiry_label, spot_price, gamma_live_mode, gamma_audio_alert)
+        render_gamma_tab(gdf, symbol, expiry_label, gamma_live_mode, gamma_audio_alert)
+
+    with tab7:
+        if scalping_enabled:
+            with st.spinner("Fetching 5m/15m candles & India VIX for the AI Scalping Engine …"):
+                trend_engine = compute_scalping_trend_engine(fyers, symbol_candidates, df, gdf)
+            scalp_df = compute_scalping_table(df, gdf, trend_engine)
+            render_scalping_tab(scalp_df, trend_engine, symbol, scalping_audio_alert)
+        else:
+            st.info(
+                "🎯 The AI Scalping Engine is off. Enable **'Enable AI Scalping Engine'** in the "
+                "sidebar to fetch 5m/15m candles and India VIX and compute the 13-point BUY/SELL "
+                "confirmation checklist (EMA/VWAP/RSI/MACD/ADX/Supertrend, CE/PE OI direction, "
+                "Gamma direction, Build-up/Covering/Unwinding, Order Block, BOS, Volume Spike)."
+            )
 
     # ── Excel Download ───────────────────────────────────────────────────
     st.divider()
