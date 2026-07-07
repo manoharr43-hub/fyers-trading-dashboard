@@ -1,15 +1,4 @@
-def show_scanner(fyers):
-    import streamlit as st
 
-    st.title("🤖 AI Scanner")
-
-    # మీ scanner UI మొత్తం ఇక్కడ
-    st.write("Scanner Loaded Successfully")
-
-    # ఉదాహరణ:
-    # show_order_block_scanner(fyers)
-    # show_ai_scanner(fyers)# ══════════════════════════════════════════════════════════════════════════
-# live_ob_ai_engine.py
 # ──────────────────────────────────────────────────────────────────────────
 # TRUE LIVE 15-MINUTE ORDER BLOCK AI SCANNER — additive module.
 #
@@ -37,7 +26,18 @@ def show_scanner(fyers):
 #   • Renders a live Streamlit dashboard tab with a 30-second auto-refresh,
 #     scan progress, and all requested columns.
 # ══════════════════════════════════════════════════════════════════════════
+def show_scanner(fyers):
+    import streamlit as st
 
+    st.title("🤖 AI Scanner")
+
+    # మీ scanner UI మొత్తం ఇక్కడ
+    st.write("Scanner Loaded Successfully")
+
+    # ఉదాహరణ:
+    # show_order_block_scanner(fyers)
+    # show_ai_scanner(fyers)# ══════════════════════════════════════════════════════════════════════════
+# live_ob_ai_engine.py
 import os
 import re
 import csv
