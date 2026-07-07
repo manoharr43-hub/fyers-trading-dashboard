@@ -28,6 +28,16 @@ Streamlit + FYERS API v3 dashboard with:
     Gamma monitoring with Gamma Change / Change % / Trend / Signal /
     Strength / Trade Action / AI Rating, blinking Buy/Sell rows, smart
     alerts, optional audio ping, and a live summary panel.
+
+FIX NOTE (this file):
+  render_scalping_html_table() previously looked up the column key
+  "Gamma" (capital G) while compute_scalping_table() actually creates
+  the column as lowercase "gamma". Because the lookup key didn't match
+  any column, row.get("Gamma", "") silently fell back to an empty
+  string, and then the numeric format spec "{:.5f}".format("") raised:
+      ValueError: Unknown format code 'f' for object of type 'str'
+  Fixed by changing the column key from "Gamma" to "gamma" in the
+  `cols` list inside render_scalping_html_table (see section 5D below).
 """
 
 import io
@@ -2283,7 +2293,14 @@ def compute_scalping_table(df: pd.DataFrame, gdf: pd.DataFrame, trend_engine: di
     differ strike to strike), while Entry/SL/Targets/Gamma/Gamma Change/
     Delta OI/Volume Strength/Build-up columns are per-strike, pulled from
     `df` (chain snapshot) and `gdf` (gamma-analyzed chain, computed once
-    per refresh in show_option_chain)."""
+    per refresh in show_option_chain).
+
+    NOTE: this function always creates the column named lowercase
+    "gamma" (matching gdf's own column name), never "Gamma" — the
+    corresponding renderer (render_scalping_html_table, section 5D
+    below) must look up "gamma" too, or the format-string call on a
+    missing/blank value raises ValueError: Unknown format code 'f' for
+    object of type 'str'."""
     d = df.copy()
 
     if not trend_engine.get("available") or d.empty:
@@ -2293,7 +2310,7 @@ def compute_scalping_table(df: pd.DataFrame, gdf: pd.DataFrame, trend_engine: di
         for col in ("Entry Price", "Stop Loss", "Target 1", "Target 2"):
             d[col] = 0.0
         d["Risk Reward"] = "—"
-        d["Gamma"] = gdf["gamma"] if "gamma" in gdf.columns else 0.0
+        d["gamma"] = gdf["gamma"] if "gamma" in gdf.columns else 0.0
         d["Gamma Change"] = gdf["Gamma Change"] if "Gamma Change" in gdf.columns else 0.0
         d["Delta OI"] = d.get("ce_chng_oi", 0) - d.get("pe_chng_oi", 0)
         d["Volume Strength"] = "—"
@@ -2390,7 +2407,15 @@ def _scalp_band(signal: str) -> str:
 
 def render_scalping_html_table(df: pd.DataFrame, top_n: int = 40) -> str:
     """Custom HTML table (not st.dataframe) so the same CSS blink
-    keyframes used by the Gamma tab can animate Strong Buy/Sell rows."""
+    keyframes used by the Gamma tab can animate Strong Buy/Sell rows.
+
+    FIX: the "Gamma" column key below is now lowercase "gamma" to match
+    the actual column name created in compute_scalping_table(). The
+    previous mismatched capital-G key caused row.get("Gamma", "") to
+    silently fall back to an empty string, and the subsequent
+    "{:.5f}".format("") call raised:
+        ValueError: Unknown format code 'f' for object of type 'str'
+    """
     cols = [
         ("strike_price", "Strike", "{:,.0f}"),
         ("AI Scalping Signal", "Signal", None),
@@ -2401,7 +2426,7 @@ def render_scalping_html_table(df: pd.DataFrame, top_n: int = 40) -> str:
         ("Target 1", "T1", "{:.2f}"),
         ("Target 2", "T2", "{:.2f}"),
         ("Risk Reward", "RR", None),
-        ("Gamma", "Gamma", "{:.5f}"),
+        ("gamma", "Gamma", "{:.5f}"),               # <-- FIXED: was ("Gamma", "Gamma", "{:.5f}")
         ("Gamma Change", "Gamma Chg", "{:+.5f}"),
         ("Delta OI", "Delta OI", "{:+,.0f}"),
         ("Volume Strength", "Vol Strength", None),
