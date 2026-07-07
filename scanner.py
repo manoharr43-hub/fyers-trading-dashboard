@@ -100,7 +100,7 @@ _LIVE_OB_MASTER_JSON = os.path.join(EXPORTS_DIR, "live_ob_signals.json")
 LIVE_OB_RESOLUTION = "15"
 LIVE_OB_RESOLUTION_MINUTES = 15
 LIVE_OB_LOOKBACK_DAYS = 5
-LIVE_OB_AUTO_REFRESH_SECONDS = 30
+LIVE_OB_AUTO_REFRESH_SECONDS = 180
 
 
 def _ensure_app_folders() -> None:
@@ -1912,7 +1912,17 @@ def _fetch_intraday_cisd_signal(fyers, symbol: str, resolution: str, timeframe_l
         df[["Open", "High", "Low", "Close", "Volume"]] = df[["Open", "High", "Low", "Close", "Volume"]].apply(
             pd.to_numeric, errors="coerce"
         )
-        df = df.dropna(subset=["Open", "High", "Low", "Close"])
+        df = df.dropna(subset=["Open", "High", "Low", "Close"]).sort_values("Time").reset_index(drop=True)
+        if len(df) < 30:
+            return None, None
+
+        # FIX: drop the currently-forming candle (if any) before detecting a
+        # signal. Without this, the last row's price/timestamp keeps
+        # changing intra-candle, so the same "signal" showed a different
+        # Signal Date/Time on every re-scan. A signal must only ever be
+        # generated from a candle that has COMPLETELY closed.
+        if len(df) > 0 and not _is_intraday_candle_closed(df["Time"].iloc[-1], int(resolution)):
+            df = df.iloc[:-1].reset_index(drop=True)
         if len(df) < 30:
             return None, None
 
@@ -2570,8 +2580,8 @@ def run_fo_15min_cisd_scan(fyers, symbols: List[str]):
 #   • Renders and saves a candlestick chart with the OB zone / Entry / SL /
 #     Targets annotated (Req 12).
 #   • The Streamlit tab below shows live st.toast()/st.success() alerts on
-#     every NEW signal and supports a 30-second auto-refresh loop for a
-#     user-selected set of NSE stocks (Req 13–15).
+#     every NEW signal and supports an auto-refresh loop across ALL NSE
+#     stocks (Req 13–15).
 # None of this reads, mutates, or depends on any of the daily-resolution
 # scanners/tabs above — it is fully independent and additive.
 # ══════════════════════════════════════════════════════════════════════════
@@ -3034,8 +3044,9 @@ def _persist_new_live_ob_rows(fyers, new_rows: List[dict]) -> None:
 # Brand-new swing scanner requested by the user. Fully independent of every
 # scanner above — reuses only the already-tested shared helpers
 # (_safe_history, calculate_rsi, calculate_macd, calculate_atr,
-# calculate_vwap_approx, _validate_symbols, ScanStats, _format_signal_timestamp)
-# and introduces no changes to any existing function, tab, or column.
+# calculate_vwap_approx, _validate_symbols, ScanStats, _format_signal_timestamp,
+# _is_intraday_candle_closed) and introduces no changes to any existing
+# function, tab, or column.
 #
 # Requirements implemented:
 #   1. Fetches 4-Hour candles via the Fyers History API (resolution="240").
@@ -3059,9 +3070,15 @@ def _persist_new_live_ob_rows(fyers, new_rows: List[dict]) -> None:
 #      already recognize "BUY"/"SELL"/"WATCH" (WATCH added to both).
 #   7. Excel export via to_excel_bytes(); CSV/JSON export via the new
 #      to_csv_bytes()/to_json_bytes() helpers.
+#
+# FIX: Signal Date/Time was drifting on re-scan because the currently-
+# forming 4H candle (whose price/timestamp keeps changing until it closes)
+# was being used directly. The still-forming candle is now dropped before
+# any EMA/cross calculation, exactly like the 15-min scanners above.
 # ══════════════════════════════════════════════════════════════════════════
 
 EMA_SWING_RESOLUTION = "240"          # Fyers 4-Hour candle resolution
+EMA_SWING_RESOLUTION_MINUTES = 240
 EMA_SWING_RESOLUTION_LABEL = "4-Hour"
 EMA_SWING_LOOKBACK_DAYS = 400          # enough 4H history for a stable EMA200
 EMA_SWING_FAST_SPAN = 50
@@ -3102,6 +3119,14 @@ def _fetch_ema_swing_signal(fyers, symbol: str):
             pd.to_numeric, errors="coerce"
         )
         df = df.dropna(subset=["Open", "High", "Low", "Close"]).sort_values("Time").reset_index(drop=True)
+
+        # FIX: drop the currently-forming 4H candle before computing EMAs /
+        # detecting a cross — otherwise Signal Date/Time (and even whether
+        # a cross fired at all) can flip on every re-scan while that candle
+        # is still open.
+        if len(df) > 0 and not _is_intraday_candle_closed(df["Time"].iloc[-1], EMA_SWING_RESOLUTION_MINUTES):
+            df = df.iloc[:-1].reset_index(drop=True)
+
         if len(df) < EMA_SWING_MIN_CANDLES:
             return None, None
 
@@ -3216,8 +3241,9 @@ def _fetch_ema_swing_signal(fyers, symbol: str):
         stock_ticker = symbol.replace("NSE:", "").replace("-EQ", "")
 
         # Signal Date/Time = the actual 4H candle whose close produced this
-        # crossover — a genuine intraday-resolution candle, so it is used
-        # as-is (is_daily=False), never scan/system time.
+        # crossover — a genuine intraday-resolution candle (now guaranteed
+        # closed, per the FIX above), so it is used as-is (is_daily=False),
+        # never scan/system time.
         signal_date_str, signal_time_str = _candle_signal_timestamp(df, is_daily=False)
 
         row = {
@@ -3527,7 +3553,9 @@ def show_scanner(fyers):
         st.caption(
             "Live CISD (Change In State of Delivery) shifts detected directly on 5-minute or "
             "15-minute candles — a genuine intraday feed via a dedicated resolution='5'/'15' "
-            "Fyers history call, separate from the daily-candle pipeline used elsewhere."
+            "Fyers history call, separate from the daily-candle pipeline used elsewhere. "
+            "Signals are only generated from FULLY CLOSED candles (the still-forming candle "
+            "is dropped first), so Signal Date/Time no longer drift between re-scans."
         )
         icisd_col1, icisd_col2, icisd_col3 = st.columns([1, 1, 1])
         with icisd_col1:
@@ -3789,20 +3817,25 @@ def show_scanner(fyers):
             "logs/scanner.log."
         )
 
+        # UPDATED: scans ALL NSE equity stocks automatically — no manual
+        # watchlist selection required. A "Limit symbols" box is still
+        # offered (defaulting to ALL) purely as a safety valve against
+        # Fyers' history API rate limits.
         live_ob_col1, live_ob_col2 = st.columns([2, 1])
         with live_ob_col1:
-            default_watchlist = symbols[: min(15, len(symbols))]
-            live_ob_watchlist = st.multiselect(
-                "Stocks to monitor (Requirement 15 — supports multiple NSE stocks)",
-                options=symbols, default=default_watchlist, key="live_ob_watchlist",
-                help="Keep this list reasonably small (≤ 30–40 stocks) when auto-refresh is "
-                     "enabled, since a fresh 15-min history call is made for every stock every "
-                     "30 seconds and Fyers rate-limits the history API.",
+            live_ob_limit = st.number_input(
+                "Limit symbols (0 = ALL NSE equity symbols)", min_value=0, max_value=len(symbols),
+                value=0, step=50, key="live_ob_limit",
+                help="Scanning ALL symbols every refresh cycle will make many Fyers history "
+                     "calls and can hit rate limits — lower this if you see repeated "
+                     "'rate limited' errors in the skipped/failed list below.",
             )
+            live_ob_watchlist = symbols if live_ob_limit == 0 else symbols[:live_ob_limit]
+            st.caption(f"Monitoring {len(live_ob_watchlist)} stock(s) automatically — no manual selection needed.")
         with live_ob_col2:
             live_ob_auto_refresh = st.checkbox(
                 f"🔁 Auto-refresh every {LIVE_OB_AUTO_REFRESH_SECONDS}s", value=False, key="live_ob_auto_refresh",
-                help="When ON, this tab automatically re-scans the watchlist above every "
+                help="When ON, this tab automatically re-scans the stocks above every "
                      f"{LIVE_OB_AUTO_REFRESH_SECONDS} seconds and shows a live alert for any "
                      "brand-new signal, without needing to click the scan button again.",
             )
@@ -3813,7 +3846,7 @@ def show_scanner(fyers):
 
         if run_live_ob_now or live_ob_auto_refresh:
             if not live_ob_watchlist:
-                st.warning("Select at least one stock to monitor above.")
+                st.warning("No symbols available to scan.")
             else:
                 seen_keys = _load_seen_signal_keys()
                 with st.spinner("Scanning for live 15-min Order Block signals…"):
@@ -3889,10 +3922,10 @@ def show_scanner(fyers):
                 st.caption("Showing up to 20 — most stocks are simply skipped for missing/invalid data, not app errors.")
                 st.text("\n".join(st.session_state["live_ob_errors"][:20]))
 
-        # Requirement 14: auto-refresh every 30 seconds. Implemented as a
-        # blocking sleep + st.rerun() so the ENTIRE app re-executes and this
-        # tab re-scans automatically — this keeps the implementation simple
-        # and dependency-free, at the cost of the whole page (not just this
+        # Auto-refresh every LIVE_OB_AUTO_REFRESH_SECONDS (now 3 minutes).
+        # Implemented as a blocking sleep + st.rerun() so the ENTIRE app
+        # re-executes and this tab re-scans automatically — simple and
+        # dependency-free, at the cost of the whole page (not just this
         # tab) refreshing every cycle while the checkbox above is enabled.
         if live_ob_auto_refresh:
             time.sleep(LIVE_OB_AUTO_REFRESH_SECONDS)
@@ -3905,7 +3938,8 @@ def show_scanner(fyers):
             "the Fyers History API). A Golden Cross (EMA 50 crosses ABOVE EMA 200) or Death "
             "Cross (EMA 50 crosses BELOW EMA 200) is only labeled a firm BUY/SELL once RSI, "
             "MACD, Volume, and VWAP all confirm the same direction — otherwise it's shown as "
-            "🟡 WATCH so you can track an early cross without acting on it prematurely."
+            "🟡 WATCH so you can track an early cross without acting on it prematurely. Signals "
+            "are only generated from a fully-closed 4H candle."
         )
         st.caption(
             "Confirmation rules — **BUY**: RSI > 55, MACD bullish, Volume > 20-period average, "
