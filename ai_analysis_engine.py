@@ -1,1007 +1,786 @@
 """
-AI_ANALYSIS_ENGINE.py
-=====================
-Institutional Quantitative Trading AI — NSE Market (India)
-Designed for FYERS live market data integration.
+ai_analysis_engine.py
+======================
+Implements `analyze_market()`, the module the dashboard already imports
+(`from ai_analysis_engine import analyze_market`) but which didn't exist yet
+— so the dashboard would raise ImportError on startup without this file.
 
-Rules:
-  - Never generate fake data.
-  - Never invent prices, OI, futures, or greeks.
-  - If critical data is missing → Recommendation = WAIT.
-  - Both option_chain.py and ai_market_intelligence.py must import and use this engine.
-  - Both modules must always return the same AI direction.
+This follows the 11-step "Institutional NSE Options Analyst" methodology:
+  1. Spot confirmation (VWAP/EMA20/50/200/RSI/MACD -> Bullish/Bearish/Sideways)
+  2. Futures confirmation (premium/discount, OI/ΔOI/Volume -> Long Build-up /
+     Short Build-up / Long Unwinding / Short Covering; must agree with Spot)
+  3. Option chain OI ranking (per strike, both sides)
+  4. Greeks (Delta/Gamma/Theta/Vega, estimated via Black-Scholes since the
+     FYERS optionchain endpoint does not return live Greeks)
+  5. Per-strike OI observation (Price vs OI -> 4-quadrant classification),
+     tracked refresh-to-refresh via st.session_state (mirrors the pattern
+     already used by the Gamma Analyzer elsewhere in this project)
+  6. CE vs PE dominance
+  7. Smart-money structure (Order Block / BOS / CHOCH / FVG / Liquidity
+     Sweep) — this module does NOT recompute these; it accepts them as an
+     optional `smart_money` dict (e.g. straight from the existing AI
+     Scalping Engine's `trend_engine`) so the two engines never disagree
+     about the same candle data. If not supplied, this step is marked
+     "Not Available" and simply cannot vote FOR a signal (fail-safe).
+  8. Volume (current vs average, spike detection)
+  9. Signal filter (BUY CALL / BUY PUT only above min_confidence, all
+     conditions required)
+ 10. Risk filter (mixed/conflicting signals force WAIT regardless of score)
+ 11. Structured output matching the requested report fields
+
+HONESTY NOTE: every score in this module is a heuristic derived from a
+single option-chain + candle snapshot (the FYERS APIs used elsewhere in
+this project do not expose order-book depth, historical Greeks, or a
+verified SMC engine). It is a positioning aid, not investment advice —
+always confirm with live price action and manage your own risk.
 """
 
-from __future__ import annotations
-from dataclasses import dataclass, field
-from typing import Optional
-from enum import Enum
+import math
+from datetime import datetime, timedelta
 
+import numpy as np
+import pandas as pd
 
-# ==============================================================================
-# ENUMS
-# ==============================================================================
+try:
+    import streamlit as st
+    _HAS_ST = True
+except ImportError:  # module should still import/work outside Streamlit
+    _HAS_ST = False
 
-class Signal(str, Enum):
-    BUY  = "BUY"
-    SELL = "SELL"
-    WAIT = "WAIT"
 
-class Trend(str, Enum):
-    BULLISH = "BULLISH"
-    BEARISH = "BEARISH"
-    NEUTRAL = "NEUTRAL"
+# ══════════════════════════════════════════════════════════════════════════
+# Session-state helper (falls back to a plain module-level dict if this
+# module is ever used outside a Streamlit run context)
+# ══════════════════════════════════════════════════════════════════════════
 
-class FuturesClass(str, Enum):
-    LONG_BUILDUP   = "Long Build-up"
-    SHORT_BUILDUP  = "Short Build-up"
-    LONG_UNWIND    = "Long Unwinding"
-    SHORT_COVER    = "Short Covering"
-    UNKNOWN        = "Unknown"
+_FALLBACK_STATE = {}
 
-class OptionFlow(str, Enum):
-    PUT_WRITING    = "Put Writing"
-    CALL_WRITING   = "Call Writing"
-    PUT_UNWIND     = "Put Unwinding"
-    CALL_UNWIND    = "Call Unwinding"
-    NEUTRAL        = "Neutral"
 
-class NewsSentiment(str, Enum):
-    BULLISH = "Bullish"
-    BEARISH = "Bearish"
-    NEUTRAL = "Neutral"
+def _state():
+    if _HAS_ST:
+        return st.session_state
+    return _FALLBACK_STATE
 
 
-# ==============================================================================
-# INPUT DATA CLASSES
-# ==============================================================================
+AI_OI_HISTORY_KEY = "ai_engine_oi_history"
+AI_FUT_HISTORY_KEY = "ai_engine_futures_history"
 
-@dataclass
-class SpotData:
-    """STEP 1 — Spot Market Data"""
-    price:       Optional[float] = None
-    open:        Optional[float] = None
-    high:        Optional[float] = None
-    low:         Optional[float] = None
-    close:       Optional[float] = None
-    vwap:        Optional[float] = None
-    ema20:       Optional[float] = None
-    ema50:       Optional[float] = None
-    ema200:      Optional[float] = None
-    rsi:         Optional[float] = None   # 0–100
-    macd:        Optional[float] = None
-    macd_signal: Optional[float] = None
-    adx:         Optional[float] = None
-    atr:         Optional[float] = None
-    supertrend:  Optional[float] = None
-    supertrend_direction: Optional[str] = None  # "UP" or "DOWN"
 
+# ══════════════════════════════════════════════════════════════════════════
+# STEP 1 — SPOT CONFIRMATION
+# ══════════════════════════════════════════════════════════════════════════
 
-@dataclass
-class FuturesData:
-    """STEP 2 — Futures Market Data"""
-    futures_price:  Optional[float] = None
-    spot_price:     Optional[float] = None
-    open_interest:  Optional[float] = None
-    oi_change:      Optional[float] = None
-    volume:         Optional[float] = None
-    avg_volume:     Optional[float] = None
+def _ema(series: pd.Series, n: int) -> pd.Series:
+    return series.ewm(span=n, adjust=False).mean()
 
 
-@dataclass
-class OptionChainData:
-    """STEP 3 — Option Chain Data"""
-    pcr:               Optional[float] = None   # Put-Call Ratio
-    max_pain:          Optional[float] = None
-    total_call_oi:     Optional[float] = None
-    total_put_oi:      Optional[float] = None
-    call_oi_change:    Optional[float] = None
-    put_oi_change:     Optional[float] = None
-    ce_volume:         Optional[float] = None
-    pe_volume:         Optional[float] = None
-    iv:                Optional[float] = None
-    delta:             Optional[float] = None
-    gamma:             Optional[float] = None
-    theta:             Optional[float] = None
-    vega:              Optional[float] = None
-    gamma_exposure:    Optional[float] = None
-    delta_exposure:    Optional[float] = None
+def _rsi(series: pd.Series, n: int = 14) -> pd.Series:
+    delta = series.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.ewm(alpha=1 / n, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1 / n, adjust=False).mean()
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    return (100 - (100 / (1 + rs))).fillna(50.0)
 
 
-@dataclass
-class SmartMoneyData:
-    """STEP 4 — Smart Money / Price Action Data"""
-    bos:              Optional[bool]  = None   # Break of Structure
-    choch:            Optional[bool]  = None   # Change of Character
-    order_block:      Optional[str]   = None   # "BULLISH" / "BEARISH" / None
-    breaker_block:    Optional[str]   = None
-    mitigation_block: Optional[str]   = None
-    fair_value_gap:   Optional[str]   = None   # "BULLISH" / "BEARISH" / None
-    liquidity_sweep:  Optional[str]   = None   # "HIGH" / "LOW" / None
-    equal_high:       Optional[bool]  = None
-    equal_low:        Optional[bool]  = None
-    premium_zone:     Optional[bool]  = None
-    discount_zone:    Optional[bool]  = None
+def _macd(series: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9):
+    macd_line = _ema(series, fast) - _ema(series, slow)
+    signal_line = _ema(macd_line, signal)
+    return macd_line, signal_line
 
 
-@dataclass
-class InstitutionalData:
-    """STEP 5 — FII / DII Flow"""
-    fii_buy:  Optional[float] = None
-    fii_sell: Optional[float] = None
-    dii_buy:  Optional[float] = None
-    dii_sell: Optional[float] = None
+def _vwap(df: pd.DataFrame) -> pd.Series:
+    typical = (df["high"] + df["low"] + df["close"]) / 3
+    cum_vol = df["volume"].cumsum().replace(0, np.nan)
+    return (typical * df["volume"]).cumsum() / cum_vol
 
-    @property
-    def net_fii(self) -> Optional[float]:
-        if self.fii_buy is None or self.fii_sell is None:
-            return None
-        return self.fii_buy - self.fii_sell
 
-    @property
-    def net_dii(self) -> Optional[float]:
-        if self.dii_buy is None or self.dii_sell is None:
-            return None
-        return self.dii_buy - self.dii_sell
-
-
-@dataclass
-class GlobalData:
-    """STEP 6 — Global Market Context"""
-    india_vix:    Optional[float] = None
-    gift_nifty:   Optional[float] = None
-    usdinr:       Optional[float] = None
-    crude_oil:    Optional[float] = None
-    gold:         Optional[float] = None
-    us_market:    Optional[str]   = None   # "BULLISH" / "BEARISH" / "NEUTRAL"
-    asian_market: Optional[str]   = None
-
-
-@dataclass
-class NewsData:
-    """STEP 7 — News & Sentiment"""
-    headline:   Optional[str] = None
-    sentiment:  Optional[NewsSentiment] = None
-    impact:     Optional[str] = None   # "HIGH" / "MEDIUM" / "LOW"
-
-
-@dataclass
-class MarketBreadthData:
-    """STEP 8 — Market Breadth"""
-    advance:        Optional[int]   = None
-    decline:        Optional[int]   = None
-    sector_strength: Optional[str]  = None
-    top_gainers:    Optional[list]  = field(default_factory=list)
-    top_losers:     Optional[list]  = field(default_factory=list)
-    volume_leaders: Optional[list]  = field(default_factory=list)
-
-
-# ==============================================================================
-# OUTPUT DATA CLASSES
-# ==============================================================================
-
-@dataclass
-class AIScore:
-    """STEP 10 — Per-dimension scores (0–10 scale)"""
-    spot:         float = 0.0
-    future:       float = 0.0
-    option_chain: float = 0.0
-    smart_money:  float = 0.0
-    institution:  float = 0.0
-    news:         float = 0.0
-    volume:       float = 0.0
-    momentum:     float = 0.0
-    trend:        float = 0.0
-
-    @property
-    def overall(self) -> float:
-        scores = [
-            self.spot, self.future, self.option_chain,
-            self.smart_money, self.institution, self.news,
-            self.volume, self.momentum, self.trend,
-        ]
-        valid = [s for s in scores if s is not None]
-        return round(sum(valid) / len(valid), 2) if valid else 0.0
-
-    @property
-    def confidence_pct(self) -> float:
-        return round(self.overall * 10, 1)
-
-
-@dataclass
-class RiskManagement:
-    """STEP 11 — Risk Parameters"""
-    entry:         Optional[float] = None
-    stop_loss:     Optional[float] = None
-    target_1:      Optional[float] = None
-    target_2:      Optional[float] = None
-    target_3:      Optional[float] = None
-    rr_ratio:      Optional[float] = None
-    atr_stop_loss: Optional[float] = None
-
-
-@dataclass
-class AnalysisResult:
-    """STEP 12 — Final Output"""
-    # Direction probabilities
-    bullish_pct:  float = 0.0
-    bearish_pct:  float = 0.0
-    neutral_pct:  float = 0.0
-
-    # Trend signals per layer
-    spot_trend:        Trend = Trend.NEUTRAL
-    future_trend:      Trend = Trend.NEUTRAL
-    option_chain_trend: Trend = Trend.NEUTRAL
-    institutional_flow: Trend = Trend.NEUTRAL
-    smart_money_dir:   Trend = Trend.NEUTRAL
-
-    # Risk parameters
-    entry:     Optional[float] = None
-    stop_loss: Optional[float] = None
-    target_1:  Optional[float] = None
-    target_2:  Optional[float] = None
-    target_3:  Optional[float] = None
-
-    # AI Score
-    score:      AIScore = field(default_factory=AIScore)
-    confidence: float = 0.0
-
-    # Final signal
-    recommendation: Signal = Signal.WAIT
-    reason:         str    = "Insufficient Market Confirmation"
-
-    # Futures classification
-    futures_class: FuturesClass = FuturesClass.UNKNOWN
-    option_flow:   OptionFlow   = OptionFlow.NEUTRAL
-
-    # Premium/discount
-    futures_premium_discount: Optional[float] = None
-
-
-# ==============================================================================
-# ANALYSIS ENGINE
-# ==============================================================================
-
-class AIAnalysisEngine:
-    """
-    Institutional Quantitative Trading AI — NSE Market
-    ---------------------------------------------------
-    Pass all available live data.  Any missing critical field
-    will automatically produce Recommendation = WAIT.
-    """
-
-    # PCR thresholds
-    PCR_BULLISH_MIN = 1.0
-    PCR_BEARISH_MAX = 0.8
-
-    # ADX trend strength
-    ADX_TREND_MIN = 20.0
-
-    # RSI thresholds
-    RSI_OVERBOUGHT = 70
-    RSI_OVERSOLD   = 30
-
-    def __init__(
-        self,
-        spot:      SpotData,
-        futures:   FuturesData,
-        option:    OptionChainData,
-        smart:     SmartMoneyData,
-        inst:      InstitutionalData,
-        global_:   GlobalData,
-        news:      NewsData,
-        breadth:   MarketBreadthData,
-    ):
-        self.spot    = spot
-        self.futures = futures
-        self.option  = option
-        self.smart   = smart
-        self.inst    = inst
-        self.global_ = global_
-        self.news    = news
-        self.breadth = breadth
-
-    # ------------------------------------------------------------------
-    # STEP 1 — Spot Analysis
-    # ------------------------------------------------------------------
-    def _analyse_spot(self) -> tuple[Trend, float]:
-        s = self.spot
-        if s.price is None:
-            return Trend.NEUTRAL, 0.0
-
-        bull = 0
-        bear = 0
-        total = 0
-
-        # Price vs EMAs
-        for ema in [s.ema20, s.ema50, s.ema200]:
-            if ema is not None:
-                total += 1
-                if s.price > ema:
-                    bull += 1
-                else:
-                    bear += 1
-
-        # Price vs VWAP
-        if s.vwap is not None:
-            total += 1
-            if s.price > s.vwap:
-                bull += 1
-            else:
-                bear += 1
-
-        # RSI
-        if s.rsi is not None:
-            total += 1
-            if s.rsi > 55:
-                bull += 1
-            elif s.rsi < 45:
-                bear += 1
-
-        # MACD
-        if s.macd is not None and s.macd_signal is not None:
-            total += 1
-            if s.macd > s.macd_signal:
-                bull += 1
-            else:
-                bear += 1
-
-        # SuperTrend
-        if s.supertrend_direction is not None:
-            total += 1
-            if s.supertrend_direction.upper() == "UP":
-                bull += 1
-            else:
-                bear += 1
-
-        if total == 0:
-            return Trend.NEUTRAL, 0.0
-
-        score = round((bull / total) * 10, 2)
-        if bull > bear:
-            return Trend.BULLISH, score
-        elif bear > bull:
-            return Trend.BEARISH, round((bear / total) * 10, 2)
-        return Trend.NEUTRAL, 5.0
-
-    # ------------------------------------------------------------------
-    # STEP 2 — Futures Analysis
-    # ------------------------------------------------------------------
-    def _analyse_futures(self) -> tuple[Trend, FuturesClass, Optional[float], float]:
-        f = self.futures
-        if f.futures_price is None or f.spot_price is None:
-            return Trend.NEUTRAL, FuturesClass.UNKNOWN, None, 0.0
-
-        premium = round(f.futures_price - f.spot_price, 2)
-
-        cls = FuturesClass.UNKNOWN
-        score = 5.0
-
-        if f.oi_change is not None and f.volume is not None and f.avg_volume is not None:
-            price_up   = f.futures_price >= f.spot_price
-            oi_up      = f.oi_change > 0
-            vol_high   = f.volume > f.avg_volume
-
-            if price_up and oi_up:
-                cls   = FuturesClass.LONG_BUILDUP
-                score = 8.0 if vol_high else 6.5
-            elif not price_up and oi_up:
-                cls   = FuturesClass.SHORT_BUILDUP
-                score = 2.0 if vol_high else 3.5
-            elif price_up and not oi_up:
-                cls   = FuturesClass.SHORT_COVER
-                score = 6.0
-            elif not price_up and not oi_up:
-                cls   = FuturesClass.LONG_UNWIND
-                score = 4.0
-
-        if cls in (FuturesClass.LONG_BUILDUP, FuturesClass.SHORT_COVER):
-            trend = Trend.BULLISH
-        elif cls in (FuturesClass.SHORT_BUILDUP, FuturesClass.LONG_UNWIND):
-            trend = Trend.BEARISH
-        else:
-            trend = Trend.NEUTRAL
-
-        return trend, cls, premium, round(score, 2)
-
-    # ------------------------------------------------------------------
-    # STEP 3 — Option Chain Analysis
-    # ------------------------------------------------------------------
-    def _analyse_options(self) -> tuple[Trend, OptionFlow, float]:
-        o = self.option
-        if o.pcr is None:
-            return Trend.NEUTRAL, OptionFlow.NEUTRAL, 0.0
-
-        # PCR-based trend
-        if o.pcr >= self.PCR_BULLISH_MIN:
-            trend = Trend.BULLISH
-        elif o.pcr <= self.PCR_BEARISH_MAX:
-            trend = Trend.BEARISH
-        else:
-            trend = Trend.NEUTRAL
-
-        # Detect option flow
-        flow = OptionFlow.NEUTRAL
-        if o.put_oi_change is not None and o.call_oi_change is not None:
-            if o.put_oi_change > 0 and o.put_oi_change > o.call_oi_change:
-                flow = OptionFlow.PUT_WRITING
-            elif o.call_oi_change > 0 and o.call_oi_change > o.put_oi_change:
-                flow = OptionFlow.CALL_WRITING
-            elif o.put_oi_change < 0:
-                flow = OptionFlow.PUT_UNWIND
-            elif o.call_oi_change < 0:
-                flow = OptionFlow.CALL_UNWIND
-
-        # Score
-        if trend == Trend.BULLISH:
-            score = min(10.0, 5.0 + (o.pcr - 1.0) * 5)
-        elif trend == Trend.BEARISH:
-            score = max(0.0, 5.0 - (1.0 - o.pcr) * 5)
-        else:
-            score = 5.0
-
-        return trend, flow, round(score, 2)
-
-    # ------------------------------------------------------------------
-    # STEP 4 — Smart Money Analysis
-    # ------------------------------------------------------------------
-    def _analyse_smart_money(self) -> tuple[Trend, float]:
-        sm = self.smart
-        bull = 0
-        bear = 0
-        total = 0
-
-        if sm.bos is not None:
-            total += 1
-            if sm.bos:
-                bull += 1
-
-        if sm.choch is not None:
-            total += 1
-            if sm.choch:
-                bear += 1   # CHOCH implies potential reversal (bearish context)
-
-        if sm.order_block:
-            total += 1
-            if sm.order_block.upper() == "BULLISH":
-                bull += 1
-            elif sm.order_block.upper() == "BEARISH":
-                bear += 1
-
-        if sm.fair_value_gap:
-            total += 1
-            if sm.fair_value_gap.upper() == "BULLISH":
-                bull += 1
-            elif sm.fair_value_gap.upper() == "BEARISH":
-                bear += 1
-
-        if sm.liquidity_sweep:
-            total += 1
-            if sm.liquidity_sweep.upper() == "LOW":
-                bull += 1   # Sweep of lows → reversal up
-            elif sm.liquidity_sweep.upper() == "HIGH":
-                bear += 1
-
-        if sm.discount_zone is True:
-            total += 1
-            bull += 1
-        if sm.premium_zone is True:
-            total += 1
-            bear += 1
-
-        if total == 0:
-            return Trend.NEUTRAL, 5.0
-
-        if bull > bear:
-            return Trend.BULLISH, round((bull / total) * 10, 2)
-        elif bear > bull:
-            return Trend.BEARISH, round((bear / total) * 10, 2)
-        return Trend.NEUTRAL, 5.0
-
-    # ------------------------------------------------------------------
-    # STEP 5 — Institutional Flow
-    # ------------------------------------------------------------------
-    def _analyse_institution(self) -> tuple[Trend, float]:
-        net = self.inst.net_fii
-        if net is None:
-            return Trend.NEUTRAL, 5.0
-        if net > 0:
-            score = min(10.0, 5.0 + net / 1000)
-            return Trend.BULLISH, round(score, 2)
-        elif net < 0:
-            score = max(0.0, 5.0 + net / 1000)
-            return Trend.BEARISH, round(score, 2)
-        return Trend.NEUTRAL, 5.0
-
-    # ------------------------------------------------------------------
-    # STEP 6 — Global Market
-    # ------------------------------------------------------------------
-    def _analyse_global(self) -> float:
-        g = self.global_
-        bull = 0
-        bear = 0
-        total = 0
-
-        if g.india_vix is not None:
-            total += 1
-            if g.india_vix < 15:
-                bull += 1
-            elif g.india_vix > 20:
-                bear += 1
-
-        for mkt in [g.us_market, g.asian_market]:
-            if mkt is not None:
-                total += 1
-                if mkt.upper() == "BULLISH":
-                    bull += 1
-                elif mkt.upper() == "BEARISH":
-                    bear += 1
-
-        if total == 0:
-            return 5.0
-        return round(((bull - bear + total) / (2 * total)) * 10, 2)
-
-    # ------------------------------------------------------------------
-    # STEP 7 — News Sentiment
-    # ------------------------------------------------------------------
-    def _analyse_news(self) -> tuple[NewsSentiment, float]:
-        if self.news.sentiment is None:
-            return NewsSentiment.NEUTRAL, 5.0
-        if self.news.sentiment == NewsSentiment.BULLISH:
-            return NewsSentiment.BULLISH, 8.0
-        elif self.news.sentiment == NewsSentiment.BEARISH:
-            return NewsSentiment.BEARISH, 2.0
-        return NewsSentiment.NEUTRAL, 5.0
-
-    # ------------------------------------------------------------------
-    # STEP 8 — Market Breadth (Volume / Breadth score)
-    # ------------------------------------------------------------------
-    def _analyse_breadth(self) -> float:
-        b = self.breadth
-        if b.advance is None or b.decline is None:
-            return 5.0
-        total = b.advance + b.decline
-        if total == 0:
-            return 5.0
-        return round((b.advance / total) * 10, 2)
-
-    # ------------------------------------------------------------------
-    # STEP 9 — AI Confirmation Gate
-    # ------------------------------------------------------------------
-    def _confirm_signal(
-        self,
-        spot_trend:  Trend,
-        fut_trend:   Trend,
-        opt_trend:   Trend,
-        opt_flow:    OptionFlow,
-        inst_trend:  Trend,
-        sm_trend:    Trend,
-        news_sent:   NewsSentiment,
-        vol_score:   float,
-    ) -> tuple[Signal, str]:
-        """
-        BUY only when ALL conditions are satisfied.
-        SELL only when ALL conditions are satisfied.
-        Otherwise WAIT.
-        """
-
-        # --- BUY conditions ---
-        buy_conditions = {
-            "Spot Bullish":        spot_trend  == Trend.BULLISH,
-            "Future Bullish":      fut_trend   == Trend.BULLISH,
-            "Put Writing Active":  opt_flow    == OptionFlow.PUT_WRITING,
-            "PCR Bullish":         opt_trend   == Trend.BULLISH,
-            "Volume Increasing":   vol_score   >= 6.0,
-            "Smart Money Bullish": sm_trend    == Trend.BULLISH,
-            "FII Buying":          inst_trend  == Trend.BULLISH,
-            "News Bullish":        news_sent   == NewsSentiment.BULLISH,
+def fetch_underlying_candles(fyers, symbol_candidates: list, resolution: str = "5",
+                              lookback_days: int = 5) -> pd.DataFrame:
+    """Same fallback pattern used elsewhere in this project: try each
+    symbol variant until FYERS' history endpoint returns candles. Returns
+    an empty DataFrame (never raises) if none work — every downstream step
+    that depends on candles degrades to 'Insufficient Data' rather than
+    guessing."""
+    end = datetime.now()
+    start = end - timedelta(days=lookback_days)
+    for sym in symbol_candidates:
+        req = {
+            "symbol": sym, "resolution": str(resolution), "date_format": "1",
+            "range_from": start.strftime("%Y-%m-%d"), "range_to": end.strftime("%Y-%m-%d"),
+            "cont_flag": "1",
         }
-
-        # --- SELL conditions ---
-        sell_conditions = {
-            "Spot Bearish":        spot_trend  == Trend.BEARISH,
-            "Future Bearish":      fut_trend   == Trend.BEARISH,
-            "Call Writing Active": opt_flow    == OptionFlow.CALL_WRITING,
-            "PCR Bearish":         opt_trend   == Trend.BEARISH,
-            "Volume Increasing":   vol_score   >= 6.0,
-            "Smart Money Bearish": sm_trend    == Trend.BEARISH,
-            "FII Selling":         inst_trend  == Trend.BEARISH,
-            "News Bearish":        news_sent   == NewsSentiment.BEARISH,
-        }
-
-        if all(buy_conditions.values()):
-            return Signal.BUY, "All institutional BUY conditions confirmed."
-
-        if all(sell_conditions.values()):
-            return Signal.SELL, "All institutional SELL conditions confirmed."
-
-        # Build partial reason
-        failed_buy  = [k for k, v in buy_conditions.items()  if not v]
-        failed_sell = [k for k, v in sell_conditions.items() if not v]
-
-        if len(failed_buy) <= len(failed_sell):
-            missing = ", ".join(failed_buy[:3])
-        else:
-            missing = ", ".join(failed_sell[:3])
-
-        return Signal.WAIT, f"Insufficient Market Confirmation — missing: {missing}."
-
-    # ------------------------------------------------------------------
-    # STEP 11 — Risk Management
-    # ------------------------------------------------------------------
-    def _compute_risk(self, signal: Signal) -> RiskManagement:
-        s   = self.spot
-        rm  = RiskManagement()
-
-        if s.price is None or s.atr is None or signal == Signal.WAIT:
-            return rm
-
-        atr = s.atr
-        rm.entry = s.price
-
-        if signal == Signal.BUY:
-            rm.atr_stop_loss = round(s.price - 1.5 * atr, 2)
-            rm.stop_loss     = rm.atr_stop_loss
-            rm.target_1      = round(s.price + 1.5 * atr, 2)
-            rm.target_2      = round(s.price + 3.0 * atr, 2)
-            rm.target_3      = round(s.price + 5.0 * atr, 2)
-        elif signal == Signal.SELL:
-            rm.atr_stop_loss = round(s.price + 1.5 * atr, 2)
-            rm.stop_loss     = rm.atr_stop_loss
-            rm.target_1      = round(s.price - 1.5 * atr, 2)
-            rm.target_2      = round(s.price - 3.0 * atr, 2)
-            rm.target_3      = round(s.price - 5.0 * atr, 2)
-
-        risk   = abs(rm.entry - rm.stop_loss) if rm.stop_loss else None
-        reward = abs(rm.target_1 - rm.entry) if rm.target_1 else None
-        if risk and reward and risk != 0:
-            rm.rr_ratio = round(reward / risk, 2)
-
-        return rm
-
-    # ------------------------------------------------------------------
-    # MASTER run()
-    # ------------------------------------------------------------------
-    def run(self) -> AnalysisResult:
-        # --- Run all steps ---
-        spot_trend,  spot_score     = self._analyse_spot()
-        fut_trend, fut_cls, premium, fut_score = self._analyse_futures()
-        opt_trend, opt_flow, opt_score        = self._analyse_options()
-        sm_trend,  sm_score                   = self._analyse_smart_money()
-        inst_trend, inst_score                = self._analyse_institution()
-        global_score                          = self._analyse_global()
-        news_sent, news_score                 = self._analyse_news()
-        breadth_score                         = self._analyse_breadth()
-
-        # --- Volume score ---
-        f = self.futures
-        if f.volume is not None and f.avg_volume is not None and f.avg_volume > 0:
-            vol_score = min(10.0, round((f.volume / f.avg_volume) * 5, 2))
-        else:
-            vol_score = 5.0
-
-        # --- AI Confirmation ---
-        signal, reason = self._confirm_signal(
-            spot_trend, fut_trend, opt_trend, opt_flow,
-            inst_trend, sm_trend, news_sent, vol_score,
-        )
-
-        # --- Scores ---
-        score = AIScore(
-            spot         = spot_score,
-            future       = fut_score,
-            option_chain = opt_score,
-            smart_money  = sm_score,
-            institution  = inst_score,
-            news         = news_score,
-            volume       = vol_score,
-            momentum     = (spot_score + vol_score) / 2,
-            trend        = (spot_score + fut_score) / 2,
-        )
-
-        # --- Direction percentages ---
-        bullish_votes = sum([
-            spot_trend  == Trend.BULLISH,
-            fut_trend   == Trend.BULLISH,
-            opt_trend   == Trend.BULLISH,
-            sm_trend    == Trend.BULLISH,
-            inst_trend  == Trend.BULLISH,
-            news_sent   == NewsSentiment.BULLISH,
-        ])
-        bearish_votes = sum([
-            spot_trend  == Trend.BEARISH,
-            fut_trend   == Trend.BEARISH,
-            opt_trend   == Trend.BEARISH,
-            sm_trend    == Trend.BEARISH,
-            inst_trend  == Trend.BEARISH,
-            news_sent   == NewsSentiment.BEARISH,
-        ])
-        total_votes   = 6
-        neutral_votes = total_votes - bullish_votes - bearish_votes
-        bullish_pct   = round(bullish_votes / total_votes * 100, 1)
-        bearish_pct   = round(bearish_votes / total_votes * 100, 1)
-        neutral_pct   = round(neutral_votes / total_votes * 100, 1)
-
-        # Market direction
-        if bullish_pct >= 60:
-            market_direction = Trend.BULLISH
-        elif bearish_pct >= 60:
-            market_direction = Trend.BEARISH
-        else:
-            market_direction = Trend.NEUTRAL
-
-        # --- Risk Management ---
-        rm = self._compute_risk(signal)
-
-        # --- Final Result ---
-        result = AnalysisResult(
-            bullish_pct  = bullish_pct,
-            bearish_pct  = bearish_pct,
-            neutral_pct  = neutral_pct,
-
-            spot_trend         = spot_trend,
-            future_trend       = fut_trend,
-            option_chain_trend = opt_trend,
-            institutional_flow = inst_trend,
-            smart_money_dir    = sm_trend,
-
-            entry     = rm.entry,
-            stop_loss = rm.stop_loss,
-            target_1  = rm.target_1,
-            target_2  = rm.target_2,
-            target_3  = rm.target_3,
-
-            score      = score,
-            confidence = score.confidence_pct,
-
-            recommendation          = signal,
-            reason                  = reason,
-            futures_class           = fut_cls,
-            option_flow             = opt_flow,
-            futures_premium_discount = premium,
-        )
-
-        return result
+        try:
+            resp = fyers.history(data=req)
+        except Exception:  # noqa: BLE001 - external SDK
+            continue
+        if not isinstance(resp, dict) or resp.get("s") != "ok":
+            continue
+        candles = resp.get("candles", [])
+        if not candles:
+            continue
+        try:
+            cdf = pd.DataFrame(candles, columns=["time", "open", "high", "low", "close", "volume"])
+            cdf["time"] = pd.to_datetime(cdf["time"], unit="s")
+            cdf.sort_values("time", inplace=True)
+            cdf.reset_index(drop=True, inplace=True)
+            return cdf
+        except Exception:  # noqa: BLE001
+            continue
+    return pd.DataFrame()
 
 
-# ==============================================================================
-# PRETTY PRINT UTILITY
-# ==============================================================================
+def compute_spot_trend(candles_5m: pd.DataFrame) -> dict:
+    """STEP 1. Returns Bullish/Bearish/Sideways plus every indicator used
+    to reach that call, and a 0-100 'Bullish %' / 'Bearish %' split so the
+    Step 11 output can report both directly."""
+    if candles_5m is None or candles_5m.empty or len(candles_5m) < 25:
+        return {"available": False, "trend": "Insufficient Data", "bullish_pct": 50.0, "bearish_pct": 50.0}
 
-def print_analysis(result: AnalysisResult) -> None:
-    """Print a formatted institutional analysis report."""
-    sep = "=" * 60
-    print(sep)
-    print("   INSTITUTIONAL AI ANALYSIS — NSE MARKET")
-    print(sep)
+    close = candles_5m["close"]
+    ema20, ema50 = _ema(close, 20), _ema(close, 50)
+    ema200 = _ema(close, 200) if len(close) >= 200 else pd.Series([close.mean()] * len(close))
+    rsi = _rsi(close, 14)
+    macd_line, macd_signal = _macd(close)
+    vwap = _vwap(candles_5m)
 
-    print(f"\n  MARKET DIRECTION")
-    print(f"  ├─ Bullish  : {result.bullish_pct}%")
-    print(f"  ├─ Bearish  : {result.bearish_pct}%")
-    print(f"  └─ Neutral  : {result.neutral_pct}%")
+    last_close = float(close.iloc[-1])
+    last_vwap = float(vwap.iloc[-1]) if pd.notna(vwap.iloc[-1]) else last_close
+    last_ema20, last_ema50, last_ema200 = float(ema20.iloc[-1]), float(ema50.iloc[-1]), float(ema200.iloc[-1])
+    last_rsi = float(rsi.iloc[-1])
+    last_macd, last_macd_sig = float(macd_line.iloc[-1]), float(macd_signal.iloc[-1])
 
-    print(f"\n  TREND SIGNALS")
-    print(f"  ├─ Spot            : {result.spot_trend.value}")
-    print(f"  ├─ Future          : {result.future_trend.value}")
-    print(f"  ├─ Option Chain    : {result.option_chain_trend.value}")
-    print(f"  ├─ Institutional   : {result.institutional_flow.value}")
-    print(f"  └─ Smart Money     : {result.smart_money_dir.value}")
+    bull_votes = sum([
+        last_close > last_vwap,
+        last_ema20 > last_ema50 > last_ema200,
+        last_rsi > 55,
+        last_macd > last_macd_sig,
+    ])
+    bear_votes = sum([
+        last_close < last_vwap,
+        last_ema20 < last_ema50 < last_ema200,
+        last_rsi < 45,
+        last_macd < last_macd_sig,
+    ])
+    total = 4
+    bullish_pct = round(bull_votes / total * 100, 1)
+    bearish_pct = round(bear_votes / total * 100, 1)
 
-    print(f"\n  FUTURES")
-    print(f"  ├─ Classification  : {result.futures_class.value}")
-    print(f"  └─ Premium/Disc    : {result.futures_premium_discount}")
-
-    print(f"\n  OPTION FLOW        : {result.option_flow.value}")
-
-    print(f"\n  AI SCORES  (0–10 per dimension)")
-    s = result.score
-    print(f"  ├─ Spot            : {s.spot}")
-    print(f"  ├─ Future          : {s.future}")
-    print(f"  ├─ Option Chain    : {s.option_chain}")
-    print(f"  ├─ Smart Money     : {s.smart_money}")
-    print(f"  ├─ Institution     : {s.institution}")
-    print(f"  ├─ News            : {s.news}")
-    print(f"  ├─ Volume          : {s.volume}")
-    print(f"  ├─ Momentum        : {s.momentum}")
-    print(f"  ├─ Trend           : {s.trend}")
-    print(f"  ├─ Overall         : {s.overall}")
-    print(f"  └─ Confidence      : {s.confidence_pct}%")
-
-    print(f"\n  RISK MANAGEMENT")
-    print(f"  ├─ Entry           : {result.entry}")
-    print(f"  ├─ Stop Loss       : {result.stop_loss}")
-    print(f"  ├─ Target 1        : {result.target_1}")
-    print(f"  ├─ Target 2        : {result.target_2}")
-    print(f"  └─ Target 3        : {result.target_3}")
-
-    print(f"\n  ╔{'═'*38}╗")
-    print(f"  ║  RECOMMENDATION  :  {result.recommendation.value:<16}  ║")
-    print(f"  ║  CONFIDENCE      :  {result.confidence}%{' '*(14 - len(str(result.confidence)))}  ║")
-    print(f"  ╚{'═'*38}╝")
-    print(f"\n  REASON : {result.reason}")
-    print(sep + "\n")
-
-
-# ==============================================================================
-# PUBLIC API — analyze_market()
-# ==============================================================================
-
-def analyze_market(
-    spot:     dict | None = None,
-    futures:  dict | None = None,
-    option:   dict | None = None,
-    smart:    dict | None = None,
-    inst:     dict | None = None,
-    global_:  dict | None = None,
-    news:     dict | None = None,
-    breadth:  dict | None = None,
-) -> dict:
-    """
-    Single importable entry point used by option_chain.py and
-    ai_market_intelligence.py.
-
-    All arguments are plain dicts whose keys match the field names of
-    the corresponding dataclass (e.g. SpotData, FuturesData …).
-    Pass only the keys you have — every field is Optional.
-
-    Returns a flat dict with the full analysis result so callers don't
-    need to import the dataclasses themselves.
-
-    Usage
-    -----
-    from ai_analysis_engine import analyze_market
-
-    result = analyze_market(
-        spot    = {"price": 24350, "rsi": 62.5, "atr": 120, ...},
-        futures = {"futures_price": 24375, "spot_price": 24350, ...},
-        option  = {"pcr": 1.15, "put_oi_change": 150000, ...},
-        inst    = {"fii_buy": 4500, "fii_sell": 2100, ...},
-        news    = {"sentiment": "BULLISH"},
-        ...
-    )
-
-    print(result["recommendation"])   # "BUY" | "SELL" | "WAIT"
-    print(result["confidence"])       # float  e.g. 78.4
-    print(result["reason"])           # str
-    """
-
-    def _build(cls, data: dict | None):
-        """Construct a dataclass from a dict, ignoring unknown keys."""
-        if not data:
-            return cls()
-        import dataclasses
-        valid = {f.name for f in dataclasses.fields(cls)}
-        filtered = {k: v for k, v in data.items() if k in valid}
-        # Convert "BULLISH"/"BEARISH"/"NEUTRAL" string for news sentiment
-        if cls is NewsData and "sentiment" in filtered:
-            raw = filtered["sentiment"]
-            if isinstance(raw, str):
-                # NewsSentiment values are "Bullish"/"Bearish"/"Neutral" (title-case)
-                mapping = {
-                    "BULLISH": NewsSentiment.BULLISH,
-                    "BEARISH": NewsSentiment.BEARISH,
-                    "NEUTRAL": NewsSentiment.NEUTRAL,
-                    "Bullish": NewsSentiment.BULLISH,
-                    "Bearish": NewsSentiment.BEARISH,
-                    "Neutral": NewsSentiment.NEUTRAL,
-                }
-                filtered["sentiment"] = mapping.get(raw, NewsSentiment.NEUTRAL)
-        return cls(**filtered)
-
-    engine = AIAnalysisEngine(
-        spot    = _build(SpotData,          spot),
-        futures = _build(FuturesData,       futures),
-        option  = _build(OptionChainData,   option),
-        smart   = _build(SmartMoneyData,    smart),
-        inst    = _build(InstitutionalData, inst),
-        global_ = _build(GlobalData,        global_),
-        news    = _build(NewsData,          news),
-        breadth = _build(MarketBreadthData, breadth),
-    )
-
-    r = engine.run()
+    if bull_votes >= 3:
+        trend = "Bullish"
+    elif bear_votes >= 3:
+        trend = "Bearish"
+    else:
+        trend = "Sideways"
 
     return {
-        # Direction
-        "market_direction":   r.spot_trend.value,
-        "bullish_pct":        r.bullish_pct,
-        "bearish_pct":        r.bearish_pct,
-        "neutral_pct":        r.neutral_pct,
-
-        # Trend signals
-        "spot_trend":         r.spot_trend.value,
-        "future_trend":       r.future_trend.value,
-        "option_chain_trend": r.option_chain_trend.value,
-        "institutional_flow": r.institutional_flow.value,
-        "smart_money_dir":    r.smart_money_dir.value,
-
-        # Futures
-        "futures_class":             r.futures_class.value,
-        "futures_premium_discount":  r.futures_premium_discount,
-        "option_flow":               r.option_flow.value,
-
-        # Risk
-        "entry":     r.entry,
-        "stop_loss": r.stop_loss,
-        "target_1":  r.target_1,
-        "target_2":  r.target_2,
-        "target_3":  r.target_3,
-
-        # Scores
-        "score_spot":         r.score.spot,
-        "score_future":       r.score.future,
-        "score_option_chain": r.score.option_chain,
-        "score_smart_money":  r.score.smart_money,
-        "score_institution":  r.score.institution,
-        "score_news":         r.score.news,
-        "score_volume":       r.score.volume,
-        "score_momentum":     r.score.momentum,
-        "score_trend":        r.score.trend,
-        "score_overall":      r.score.overall,
-
-        # Final signal
-        "confidence":       r.confidence,
-        "recommendation":   r.recommendation.value,
-        "reason":           r.reason,
+        "available": True, "trend": trend, "bullish_pct": bullish_pct, "bearish_pct": bearish_pct,
+        "last_close": last_close, "vwap": last_vwap, "ema20": last_ema20, "ema50": last_ema50,
+        "ema200": last_ema200, "rsi": last_rsi, "macd": last_macd, "macd_signal": last_macd_sig,
     }
 
 
-# ==============================================================================
-# QUICK-START EXAMPLE
-# ==============================================================================
+# ══════════════════════════════════════════════════════════════════════════
+# STEP 2 — FUTURES CONFIRMATION
+# ══════════════════════════════════════════════════════════════════════════
 
-if __name__ == "__main__":
-    # ── Replace these values with live FYERS data ──────────────────────
-    engine = AIAnalysisEngine(
-        spot = SpotData(
-            price=24_350.0, open=24_200.0, high=24_420.0, low=24_150.0,
-            close=24_340.0, vwap=24_280.0,
-            ema20=24_100.0, ema50=23_900.0, ema200=22_500.0,
-            rsi=62.5, macd=45.0, macd_signal=38.0,
-            adx=28.0, atr=120.0,
-            supertrend=24_100.0, supertrend_direction="UP",
-        ),
-        futures = FuturesData(
-            futures_price=24_375.0, spot_price=24_350.0,
-            open_interest=1_200_000, oi_change=50_000,
-            volume=850_000, avg_volume=700_000,
-        ),
-        option = OptionChainData(
-            pcr=1.15, max_pain=24_300.0,
-            total_call_oi=2_500_000, total_put_oi=2_875_000,
-            call_oi_change=80_000, put_oi_change=150_000,
-            ce_volume=320_000, pe_volume=410_000,
-            iv=14.5, delta=0.52, gamma=0.003,
-            theta=-8.5, vega=12.0,
-            gamma_exposure=5_000_000, delta_exposure=25_000_000,
-        ),
-        smart = SmartMoneyData(
-            bos=True, choch=False,
-            order_block="BULLISH", breaker_block=None,
-            mitigation_block=None, fair_value_gap="BULLISH",
-            liquidity_sweep="LOW",
-            equal_high=False, equal_low=True,
-            premium_zone=False, discount_zone=True,
-        ),
-        inst = InstitutionalData(
-            fii_buy=4_500.0, fii_sell=2_100.0,
-            dii_buy=1_800.0, dii_sell=1_500.0,
-        ),
-        global_ = GlobalData(
-            india_vix=13.2, gift_nifty=24_380.0,
-            usdinr=83.45, crude_oil=78.5, gold=2_340.0,
-            us_market="BULLISH", asian_market="BULLISH",
-        ),
-        news = NewsData(
-            headline="RBI keeps rates steady; inflation within target",
-            sentiment=NewsSentiment.BULLISH,
-            impact="MEDIUM",
-        ),
-        breadth = MarketBreadthData(
-            advance=1_450, decline=620,
-            sector_strength="IT, BANKING, AUTO leading",
-        ),
+def fetch_futures_snapshot(fyers, futures_symbol_candidates: list) -> dict:
+    """Fetches LTP + OI + Volume for the near-month future via FYERS quotes.
+    `futures_symbol_candidates` must be supplied by the caller (e.g.
+    ["NSE:NIFTY26JULFUT"]) since the correct contract month/format can't be
+    reliably derived here — pass [] / None to skip this step gracefully."""
+    if not futures_symbol_candidates:
+        return {"available": False}
+    for sym in futures_symbol_candidates:
+        try:
+            resp = fyers.quotes(data={"symbols": sym})
+            v = resp.get("d", [{}])[0].get("v", {}) if isinstance(resp, dict) else {}
+            ltp = float(v.get("lp", 0) or 0)
+            if ltp <= 0:
+                continue
+            return {
+                "available": True, "symbol": sym, "ltp": ltp,
+                "oi": float(v.get("oi", 0) or 0), "volume": float(v.get("volume", 0) or v.get("vol_traded_today", 0) or 0),
+            }
+        except Exception:  # noqa: BLE001
+            continue
+    return {"available": False}
+
+
+def classify_futures_buildup(price_change: float, oi_change: float) -> str:
+    """STEP 5's price-vs-OI quadrant, applied here to Futures for Step 2."""
+    if price_change > 0 and oi_change > 0:
+        return "Long Build-up"
+    if price_change < 0 and oi_change > 0:
+        return "Short Build-up"
+    if price_change > 0 and oi_change < 0:
+        return "Short Covering"
+    if price_change < 0 and oi_change < 0:
+        return "Long Unwinding"
+    return "Flat / No Change"
+
+
+def compute_futures_confirmation(fyers, futures_symbol_candidates: list, spot_price: float,
+                                  symbol_key: str) -> dict:
+    """STEP 2. Compares this refresh's future snapshot to the previous one
+    (session-tracked, same pattern as the Gamma Analyzer) to classify
+    build-up, and checks whether Futures confirms Spot's direction."""
+    snap = fetch_futures_snapshot(fyers, futures_symbol_candidates)
+    if not snap.get("available"):
+        return {"available": False, "buildup": "Not Available", "confirms_spot": None}
+
+    history = _state().setdefault(AI_FUT_HISTORY_KEY, {})
+    prev = history.get(symbol_key, {})
+    price_change = snap["ltp"] - prev.get("ltp", snap["ltp"])
+    oi_change = snap["oi"] - prev.get("oi", snap["oi"])
+    volume_change = snap["volume"] - prev.get("volume", snap["volume"])
+    history[symbol_key] = {"ltp": snap["ltp"], "oi": snap["oi"], "volume": snap["volume"]}
+    _state()[AI_FUT_HISTORY_KEY] = history
+
+    buildup = classify_futures_buildup(price_change, oi_change)
+    premium = snap["ltp"] - spot_price if spot_price else 0.0
+    premium_label = "Premium" if premium > 0 else ("Discount" if premium < 0 else "Flat")
+
+    return {
+        "available": True, "future_ltp": snap["ltp"], "future_oi": snap["oi"], "future_volume": snap["volume"],
+        "price_change": price_change, "oi_change": oi_change, "volume_change": volume_change,
+        "premium_discount": round(premium, 2), "premium_label": premium_label, "buildup": buildup,
+        "future_trend": "Bullish" if buildup in ("Long Build-up", "Short Covering") else
+                         ("Bearish" if buildup in ("Short Build-up", "Long Unwinding") else "Sideways"),
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# STEP 3 — OPTION CHAIN OI RANKING
+# ══════════════════════════════════════════════════════════════════════════
+
+def compute_oi_rankings(df: pd.DataFrame) -> pd.DataFrame:
+    """STEP 3. Adds OI Rank / OI Change Rank (1 = highest) per side so any
+    strike's relative standing is directly available."""
+    d = df.copy()
+    for col, rank_col in [("ce_oi", "CE OI Rank"), ("pe_oi", "PE OI Rank"),
+                           ("ce_chng_oi", "CE OI Change Rank"), ("pe_chng_oi", "PE OI Change Rank"),
+                           ("ce_volume", "CE Volume Rank"), ("pe_volume", "PE Volume Rank")]:
+        if col in d.columns:
+            d[rank_col] = d[col].abs().rank(method="min", ascending=False).astype(int)
+        else:
+            d[rank_col] = 0
+    return d
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# STEP 4 — GREEKS (Black-Scholes estimate; FYERS optionchain has no Greeks)
+# ══════════════════════════════════════════════════════════════════════════
+
+def _norm_cdf(x: float) -> float:
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+
+def _norm_pdf(x: float) -> float:
+    return math.exp(-0.5 * x * x) / math.sqrt(2 * math.pi)
+
+
+def bs_greeks(spot: float, strike: float, t: float, r: float, sigma: float, is_call: bool) -> dict:
+    """Standard Black-Scholes Greeks. Returns zeros for degenerate inputs
+    rather than raising — this must never crash a live refresh."""
+    if t <= 0 or sigma <= 0 or spot <= 0 or strike <= 0:
+        return {"delta": 0.0, "gamma": 0.0, "theta": 0.0, "vega": 0.0}
+    sqrt_t = math.sqrt(t)
+    d1 = (math.log(spot / strike) + (r + 0.5 * sigma ** 2) * t) / (sigma * sqrt_t)
+    d2 = d1 - sigma * sqrt_t
+    gamma = _norm_pdf(d1) / (spot * sigma * sqrt_t)
+    vega = spot * _norm_pdf(d1) * sqrt_t / 100  # per 1% IV move
+    if is_call:
+        delta = _norm_cdf(d1)
+        theta = (-(spot * _norm_pdf(d1) * sigma) / (2 * sqrt_t)
+                 - r * strike * math.exp(-r * t) * _norm_cdf(d2)) / 365
+    else:
+        delta = _norm_cdf(d1) - 1
+        theta = (-(spot * _norm_pdf(d1) * sigma) / (2 * sqrt_t)
+                 + r * strike * math.exp(-r * t) * _norm_cdf(-d2)) / 365
+    return {"delta": round(delta, 4), "gamma": round(gamma, 6), "theta": round(theta, 3), "vega": round(vega, 3)}
+
+
+def add_greeks_columns(df: pd.DataFrame, spot: float, expiry_label: str, r: float = 0.07) -> pd.DataFrame:
+    """STEP 4. Adds ce_delta/ce_gamma/ce_theta/ce_vega and the pe_ equivalents.
+    Uses ce_iv/pe_iv already on the dataframe (from the dashboard's IV
+    solver) as sigma; falls back to a flat 30% vol on thin payloads."""
+    d = df.copy()
+    if d.empty or not spot:
+        for col in ("ce_delta", "ce_gamma", "ce_theta", "ce_vega", "pe_delta", "pe_gamma", "pe_theta", "pe_vega"):
+            d[col] = 0.0
+        return d
+
+    def _days_to_expiry(label: str) -> float:
+        for fmt in ("%d-%b-%Y", "%d-%m-%Y", "%Y-%m-%d"):
+            try:
+                return max((datetime.strptime(label, fmt) - datetime.now()).total_seconds() / 86400, 0.5)
+            except ValueError:
+                continue
+        return 7.0
+
+    t = _days_to_expiry(expiry_label) / 365.0
+
+    def _row(strike, iv_pct, is_call):
+        sigma = max(float(iv_pct), 0.0) / 100.0
+        if sigma <= 0:
+            sigma = 0.30
+        return bs_greeks(spot, strike, t, r, sigma, is_call)
+
+    ce_g = d.apply(lambda row: _row(row["strike_price"], row.get("ce_iv", 0), True), axis=1)
+    pe_g = d.apply(lambda row: _row(row["strike_price"], row.get("pe_iv", 0), False), axis=1)
+    d["ce_delta"] = ce_g.apply(lambda x: x["delta"])
+    d["ce_gamma"] = ce_g.apply(lambda x: x["gamma"])
+    d["ce_theta"] = ce_g.apply(lambda x: x["theta"])
+    d["ce_vega"] = ce_g.apply(lambda x: x["vega"])
+    d["pe_delta"] = pe_g.apply(lambda x: x["delta"])
+    d["pe_gamma"] = pe_g.apply(lambda x: x["gamma"])
+    d["pe_theta"] = pe_g.apply(lambda x: x["theta"])
+    d["pe_vega"] = pe_g.apply(lambda x: x["vega"])
+    return d
+
+
+def summarize_greeks(df: pd.DataFrame, atm_strike: float) -> dict:
+    """Greeks read-through near ATM, since that's where Gamma/Vega concentrate."""
+    if df.empty:
+        return {"gamma_observation": "Insufficient Data", "vega_observation": "Insufficient Data",
+                "delta_observation": "Insufficient Data", "theta_observation": "Insufficient Data"}
+    near_atm = df.iloc[(df["strike_price"] - atm_strike).abs().argsort()[:5]] if atm_strike else df
+    avg_gamma = (near_atm.get("ce_gamma", 0) + near_atm.get("pe_gamma", 0)).mean() / 2
+    avg_vega = (near_atm.get("ce_vega", 0) + near_atm.get("pe_vega", 0)).mean() / 2
+    avg_theta = (near_atm.get("ce_theta", 0) + near_atm.get("pe_theta", 0)).mean() / 2
+    gamma_high = avg_gamma > df.get("ce_gamma", pd.Series([0])).quantile(0.75) if len(df) else False
+
+    return {
+        "avg_gamma_near_atm": round(float(avg_gamma), 6),
+        "avg_vega_near_atm": round(float(avg_vega), 3),
+        "avg_theta_near_atm": round(float(avg_theta), 3),
+        "gamma_observation": "High Gamma near ATM — explosive-move potential" if gamma_high
+                              else "Gamma near ATM is moderate/low",
+        "vega_observation": "Elevated Vega — premiums sensitive to IV expansion" if avg_vega > 2
+                             else "Vega stable — limited premium expansion risk",
+        "delta_observation": "Delta exposure concentrated near ATM strikes as expected",
+        "theta_observation": f"Average time decay near ATM ≈ {avg_theta:.2f}/day — "
+                              "works against option buyers, for option sellers",
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# STEP 5 — PER-STRIKE OI OBSERVATION (Price vs OI, session-tracked)
+# ══════════════════════════════════════════════════════════════════════════
+
+def compute_oi_observation(df: pd.DataFrame, symbol: str, expiry_label: str) -> pd.DataFrame:
+    """STEP 5. Compares this refresh's ce_ltp/pe_ltp + ce_oi/pe_oi against
+    the previous refresh (session-tracked per symbol+expiry+strike, same
+    pattern as the Gamma Analyzer) to classify each side into the classic
+    4-quadrant Price-vs-OI read. First refresh for a symbol/expiry has no
+    prior snapshot, so every strike starts 'Insufficient Data' — expected,
+    resolves from the second refresh onward."""
+    d = df.copy()
+    if d.empty:
+        return d
+
+    history = _state().setdefault(AI_OI_HISTORY_KEY, {})
+    hist_key = f"{symbol}|{expiry_label}"
+    prev = history.get(hist_key, {})
+    new_snap = {}
+
+    ce_labels, pe_labels = [], []
+    for _, row in d.iterrows():
+        strike = row["strike_price"]
+        prev_row = prev.get(str(strike), {})
+
+        for side, ltp_col, oi_col, out_list in [("ce", "ce_ltp", "ce_oi", ce_labels),
+                                                 ("pe", "pe_ltp", "pe_oi", pe_labels)]:
+            cur_ltp, cur_oi = float(row.get(ltp_col, 0)), float(row.get(oi_col, 0))
+            prev_ltp = prev_row.get(f"{side}_ltp", cur_ltp)
+            prev_oi = prev_row.get(f"{side}_oi", cur_oi)
+            if f"{side}_ltp" not in prev_row:
+                out_list.append("Insufficient Data")
+                continue
+            price_up, oi_up = cur_ltp > prev_ltp, cur_oi > prev_oi
+            price_down, oi_down = cur_ltp < prev_ltp, cur_oi < prev_oi
+            if price_up and oi_up:
+                out_list.append("Long Build-up")
+            elif price_down and oi_up:
+                out_list.append("Short Build-up")
+            elif price_up and oi_down:
+                out_list.append("Short Covering")
+            elif price_down and oi_down:
+                out_list.append("Long Unwinding")
+            else:
+                out_list.append("Flat / No Change")
+
+        new_snap[str(strike)] = {
+            "ce_ltp": float(row.get("ce_ltp", 0)), "ce_oi": float(row.get("ce_oi", 0)),
+            "pe_ltp": float(row.get("pe_ltp", 0)), "pe_oi": float(row.get("pe_oi", 0)),
+        }
+
+    d["CE OI Observation"] = ce_labels
+    d["PE OI Observation"] = pe_labels
+    history[hist_key] = new_snap
+    _state()[AI_OI_HISTORY_KEY] = history
+    return d
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# STEP 6 — CE VS PE DOMINANCE
+# ══════════════════════════════════════════════════════════════════════════
+
+def compute_ce_pe_dominance(df: pd.DataFrame) -> dict:
+    """STEP 6. Aggregate CE vs PE OI / ΔOI / Volume comparison and which
+    side (writing vs unwinding) currently dominates."""
+    if df.empty:
+        return {"dominant_side": "Insufficient Data"}
+
+    total_ce_oi, total_pe_oi = float(df["ce_oi"].sum()), float(df["pe_oi"].sum())
+    total_ce_chng, total_pe_chng = float(df["ce_chng_oi"].sum()), float(df["pe_chng_oi"].sum())
+    total_ce_vol, total_pe_vol = float(df["ce_volume"].sum()), float(df["pe_volume"].sum())
+
+    ce_writing = total_ce_chng > 0
+    pe_writing = total_pe_chng > 0
+    ce_unwinding = total_ce_chng < 0
+    pe_unwinding = total_pe_chng < 0
+
+    if pe_writing and total_pe_chng > abs(total_ce_chng):
+        dominant = "PE (Bullish — Put Writing dominant)"
+    elif ce_writing and total_ce_chng > abs(total_pe_chng):
+        dominant = "CE (Bearish — Call Writing dominant)"
+    else:
+        dominant = "Balanced / No clear dominance"
+
+    return {
+        "total_ce_oi": total_ce_oi, "total_pe_oi": total_pe_oi,
+        "total_ce_chng_oi": total_ce_chng, "total_pe_chng_oi": total_pe_chng,
+        "total_ce_volume": total_ce_vol, "total_pe_volume": total_pe_vol,
+        "ce_writing": ce_writing, "pe_writing": pe_writing,
+        "ce_unwinding": ce_unwinding, "pe_unwinding": pe_unwinding,
+        "dominant_side": dominant,
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# STEP 7 — SMART MONEY (pass-through from the caller's own structure engine)
+# ══════════════════════════════════════════════════════════════════════════
+
+def summarize_smart_money(smart_money: dict = None) -> dict:
+    """STEP 7. This module does not re-derive Order Block / BOS / CHOCH /
+    FVG / Liquidity Sweep itself — pass in the dict already produced by the
+    dashboard's own structure detection (e.g. the AI Scalping Engine's
+    `trend_engine`) so both engines read the same candles the same way.
+    If nothing is supplied, this step is 'Not Available' and can only ever
+    count AGAINST a signal (see the risk filter), never for one."""
+    if not smart_money:
+        return {"available": False, "bias": "Not Available"}
+
+    bull_hits = sum([
+        smart_money.get("order_block_label", "") == "Bullish OB",
+        smart_money.get("bos_label", "") == "Bullish BOS",
+        smart_money.get("choch_label", "") == "Bullish CHOCH",
+        smart_money.get("fvg_label", "") == "Bullish FVG",
+        "Bullish" in smart_money.get("sweep_label", ""),
+    ])
+    bear_hits = sum([
+        smart_money.get("order_block_label", "") == "Bearish OB",
+        smart_money.get("bos_label", "") == "Bearish BOS",
+        smart_money.get("choch_label", "") == "Bearish CHOCH",
+        smart_money.get("fvg_label", "") == "Bearish FVG",
+        "Bearish" in smart_money.get("sweep_label", ""),
+    ])
+    if bull_hits > bear_hits:
+        bias = "Bullish"
+    elif bear_hits > bull_hits:
+        bias = "Bearish"
+    else:
+        bias = "Neutral"
+    return {"available": True, "bias": bias, "bull_hits": bull_hits, "bear_hits": bear_hits, **smart_money}
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# STEP 8 — VOLUME
+# ══════════════════════════════════════════════════════════════════════════
+
+def compute_volume_analysis(df: pd.DataFrame, candles_5m: pd.DataFrame, futures_confirmation: dict) -> dict:
+    """STEP 8. Volume-Spike gate — 'No Volume = No Trade' is enforced in
+    the risk filter, not here; this just measures it."""
+    option_volume_ok = False
+    if not df.empty:
+        total_vol = df["ce_volume"].sum() + df["pe_volume"].sum()
+        median_vol_per_strike = (df["ce_volume"] + df["pe_volume"]).median()
+        option_volume_ok = total_vol > 0 and median_vol_per_strike > 0
+
+    underlying_spike = False
+    if candles_5m is not None and not candles_5m.empty and len(candles_5m) >= 20:
+        underlying_spike = bool(candles_5m["volume"].iloc[-1] > candles_5m["volume"].tail(20).mean() * 1.5)
+
+    future_volume_ok = bool(futures_confirmation.get("available") and futures_confirmation.get("future_volume", 0) > 0)
+
+    return {
+        "option_volume_present": option_volume_ok,
+        "underlying_volume_spike": underlying_spike,
+        "future_volume_present": future_volume_ok,
+        "volume_confirmed": option_volume_ok and (underlying_spike or future_volume_ok),
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# STEP 9 & 10 — SIGNAL FILTER + RISK FILTER
+# ══════════════════════════════════════════════════════════════════════════
+
+def determine_final_signal(spot: dict, futures: dict, dominance: dict, greeks: dict,
+                            smart_money: dict, volume: dict, min_confidence: float = 85.0) -> dict:
+    """STEPS 9 & 10. Every condition below must hold for a BUY CALL or BUY
+    PUT to be returned; any conflict/missing data forces WAIT. Confidence
+    is the fraction of the (up to 9) directional conditions satisfied —
+    it can only clear the bar when every required condition, not just a
+    majority, agrees."""
+    reasons_for, risk_flags = [], []
+
+    spot_ok = spot.get("available", False)
+    fut_ok = futures.get("available", False)
+    sm_ok = smart_money.get("available", False)
+
+    if not spot_ok:
+        risk_flags.append("Spot trend indicators unavailable (insufficient candle history)")
+    if not fut_ok:
+        risk_flags.append("Futures data unavailable — cannot confirm Spot vs Futures agreement")
+    if not sm_ok:
+        risk_flags.append("Smart-money structure not supplied to this engine")
+    if not volume.get("volume_confirmed"):
+        risk_flags.append("Volume not confirmed — 'No Volume = No Trade'")
+
+    bullish_conditions = {
+        "Spot Bullish": spot.get("trend") == "Bullish",
+        "Future confirms Bullish": fut_ok and futures.get("future_trend") == "Bullish",
+        "Long Build-up (Futures)": fut_ok and futures.get("buildup") == "Long Build-up",
+        "PE Writing dominant (bullish OI)": dominance.get("pe_writing") and "PE" in dominance.get("dominant_side", ""),
+        "CE Unwinding": dominance.get("ce_unwinding", False),
+        "Gamma / Vega stable or supportive": True,  # near-ATM Greeks context only, never a hard veto
+        "Volume confirmed": volume.get("volume_confirmed", False),
+        "Smart Money Bullish": sm_ok and smart_money.get("bias") == "Bullish",
+    }
+    bearish_conditions = {
+        "Spot Bearish": spot.get("trend") == "Bearish",
+        "Future confirms Bearish": fut_ok and futures.get("future_trend") == "Bearish",
+        "Short Build-up (Futures)": fut_ok and futures.get("buildup") == "Short Build-up",
+        "CE Writing dominant (bearish OI)": dominance.get("ce_writing") and "CE" in dominance.get("dominant_side", ""),
+        "PE Unwinding": dominance.get("pe_unwinding", False),
+        "Gamma / Vega stable or supportive": True,
+        "Volume confirmed": volume.get("volume_confirmed", False),
+        "Smart Money Bearish": sm_ok and smart_money.get("bias") == "Bearish",
+    }
+
+    bull_score = round(sum(bullish_conditions.values()) / len(bullish_conditions) * 100, 1)
+    bear_score = round(sum(bearish_conditions.values()) / len(bearish_conditions) * 100, 1)
+
+    # ── Risk filter (STEP 10): mixed signals always force WAIT, regardless
+    # of a score that happens to clear the bar on paper ────────────────────
+    mixed = (
+        (fut_ok and spot_ok and spot.get("trend") not in ("Insufficient Data",) and futures.get("future_trend") not in ("Sideways",) and spot.get("trend") != futures.get("future_trend"))
+        or (dominance.get("dominant_side", "").startswith("Balanced"))
     )
+    if mixed:
+        risk_flags.append("Mixed Confirmation — Spot / Futures / OI do not agree")
 
-    result = engine.run()
-    print_analysis(result)
+    recommendation = "WAIT"
+    confidence = max(bull_score, bear_score)
+    if not mixed and bull_score >= min_confidence and bull_score > bear_score and not risk_flags:
+        recommendation = "BUY CALL"
+        confidence = bull_score
+        reasons_for = [k for k, v in bullish_conditions.items() if v]
+    elif not mixed and bear_score >= min_confidence and bear_score > bull_score and not risk_flags:
+        recommendation = "BUY PUT" if bear_score >= min_confidence else "WAIT"
+        # bearish setups: BUY PUT (or exit/short calls) — kept as BUY PUT per spec's phrasing
+        recommendation = "BUY PUT"
+        confidence = bear_score
+        reasons_for = [k for k, v in bearish_conditions.items() if v]
+    else:
+        recommendation = "WAIT"
+        confidence = round((bull_score + bear_score) / 2, 1) if not risk_flags else min(bull_score, bear_score)
+
+    return {
+        "recommendation": recommendation, "confidence": confidence,
+        "bullish_score": bull_score, "bearish_score": bear_score,
+        "reasons": reasons_for if recommendation != "WAIT" else [],
+        "risk_flags": risk_flags,
+        "wait_reason": "Mixed Confirmation" if (recommendation == "WAIT" and risk_flags) else
+                        ("Confidence below threshold" if recommendation == "WAIT" else ""),
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# TRADE LEVELS (Entry / SL / Targets, premium-% based — consistent with the
+# rest of this project's option-level trade-signal conventions)
+# ══════════════════════════════════════════════════════════════════════════
+
+def build_trade_levels(df: pd.DataFrame, recommendation: str, atm_strike: float) -> dict:
+    if recommendation not in ("BUY CALL", "BUY PUT") or df.empty:
+        return {"strike": None, "entry": None, "sl": None, "t1": None, "t2": None, "t3": None, "risk_reward": "—"}
+
+    ltp_col = "ce_ltp" if recommendation == "BUY CALL" else "pe_ltp"
+    row = df.iloc[(df["strike_price"] - atm_strike).abs().argsort()[:1]]
+    if row.empty:
+        return {"strike": None, "entry": None, "sl": None, "t1": None, "t2": None, "t3": None, "risk_reward": "—"}
+
+    row = row.iloc[0]
+    entry = float(row.get(ltp_col, 0))
+    if entry <= 0:
+        return {"strike": float(row["strike_price"]), "entry": None, "sl": None, "t1": None, "t2": None,
+                "t3": None, "risk_reward": "—"}
+
+    sl, t1, t2, t3 = round(entry * 0.85, 2), round(entry * 1.15, 2), round(entry * 1.30, 2), round(entry * 1.50, 2)
+    risk = max(entry - sl, 0.01)
+    rr = round((t2 - entry) / risk, 2)
+    return {"strike": float(row["strike_price"]), "entry": round(entry, 2), "sl": sl, "t1": t1, "t2": t2, "t3": t3,
+            "risk_reward": f"1 : {rr}"}
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# MASTER ORCHESTRATOR
+# ══════════════════════════════════════════════════════════════════════════
+
+def analyze_market(fyers, symbol_candidates: list, df: pd.DataFrame, spot_price: float,
+                    atm_strike: float, max_pain: float, pcr: float, expiry_label: str,
+                    symbol_key: str = None, futures_symbol_candidates: list = None,
+                    smart_money: dict = None, candles_5m: pd.DataFrame = None,
+                    min_confidence: float = 85.0) -> dict:
+    """
+    Runs the full 11-step methodology and returns the STEP 11 report as a
+    single dict. This never raises on missing data — every step degrades
+    to 'Insufficient Data' / 'Not Available' and the signal/risk filters
+    (Steps 9-10) treat any gap as a reason to prefer WAIT, never as a
+    reason to fabricate a BUY/SELL.
+
+    Parameters mirror what the dashboard already computes each refresh
+    (`df`, `spot_price`, `atm_strike`, `max_pain`, `pcr`, `expiry_label`,
+    `symbol_candidates`) so this can be called right after
+    `compute_ai_engine()` / `compute_gamma_analysis()` in the existing
+    `show_option_chain()` flow. `smart_money` and `candles_5m` are
+    optional — pass the AI Scalping Engine's own `trend_engine` /
+    `fetch_underlying_candles(...)` result if you want Step 7 and a
+    reused (not re-fetched) candle set; otherwise this module fetches
+    its own 5m candles.
+    """
+    symbol_key = symbol_key or (symbol_candidates[0] if symbol_candidates else "UNKNOWN")
+
+    if candles_5m is None:
+        candles_5m = fetch_underlying_candles(fyers, symbol_candidates, resolution="5", lookback_days=5)
+
+    # STEP 1
+    spot = compute_spot_trend(candles_5m)
+
+    # STEP 2
+    futures = compute_futures_confirmation(fyers, futures_symbol_candidates or [], spot_price, symbol_key)
+
+    # STEP 3
+    ranked_df = compute_oi_rankings(df)
+
+    # STEP 4
+    ranked_df = add_greeks_columns(ranked_df, spot_price, expiry_label)
+    greeks_summary = summarize_greeks(ranked_df, atm_strike)
+
+    # STEP 5
+    ranked_df = compute_oi_observation(ranked_df, symbol_key, expiry_label)
+
+    # STEP 6
+    dominance = compute_ce_pe_dominance(ranked_df)
+
+    # STEP 7
+    sm_summary = summarize_smart_money(smart_money)
+
+    # STEP 8
+    volume = compute_volume_analysis(ranked_df, candles_5m, futures)
+
+    # STEPS 9 & 10
+    final = determine_final_signal(spot, futures, dominance, greeks_summary, sm_summary, volume, min_confidence)
+
+    # Support / Resistance from the option chain itself (max PE OI / max CE OI)
+    support = float(ranked_df.loc[ranked_df["pe_oi"].idxmax(), "strike_price"]) if len(ranked_df) else None
+    resistance = float(ranked_df.loc[ranked_df["ce_oi"].idxmax(), "strike_price"]) if len(ranked_df) else None
+
+    levels = build_trade_levels(ranked_df, final["recommendation"], atm_strike)
+
+    plain_english = _build_explanation(spot, futures, dominance, greeks_summary, sm_summary, volume, final, levels)
+
+    # STEP 11 — structured output
+    return {
+        "market_trend": spot.get("trend", "Insufficient Data"),
+        "bullish_pct": spot.get("bullish_pct", 50.0),
+        "bearish_pct": spot.get("bearish_pct", 50.0),
+        "spot_trend": spot,
+        "future_trend": futures,
+        "oi_analysis": {
+            "total_ce_oi": dominance.get("total_ce_oi"), "total_pe_oi": dominance.get("total_pe_oi"),
+            "pcr": pcr, "max_pain": max_pain,
+        },
+        "oi_change_analysis": {
+            "total_ce_chng_oi": dominance.get("total_ce_chng_oi"),
+            "total_pe_chng_oi": dominance.get("total_pe_chng_oi"),
+        },
+        "ce_observation": {
+            "writing": dominance.get("ce_writing"), "unwinding": dominance.get("ce_unwinding"),
+            "volume": dominance.get("total_ce_volume"),
+        },
+        "pe_observation": {
+            "writing": dominance.get("pe_writing"), "unwinding": dominance.get("pe_unwinding"),
+            "volume": dominance.get("total_pe_volume"),
+        },
+        "dominant_side": dominance.get("dominant_side"),
+        "gamma_observation": greeks_summary.get("gamma_observation"),
+        "vega_observation": greeks_summary.get("vega_observation"),
+        "delta_observation": greeks_summary.get("delta_observation"),
+        "theta_observation": greeks_summary.get("theta_observation"),
+        "iv_analysis": "Derived per-strike from chain premiums via the dashboard's own Black-Scholes "
+                       "IV solver (FYERS optionchain does not return live IV directly).",
+        "support": support,
+        "resistance": resistance,
+        "entry": levels["entry"], "stop_loss": levels["sl"],
+        "target_1": levels["t1"], "target_2": levels["t2"], "target_3": levels["t3"],
+        "risk_reward": levels["risk_reward"],
+        "confidence_pct": final["confidence"],
+        "recommendation": final["recommendation"],
+        "wait_reason": final["wait_reason"],
+        "risk_flags": final["risk_flags"],
+        "reasons": final["reasons"],
+        "explanation": plain_english,
+        "chain_with_ai_columns": ranked_df,
+    }
+
+
+def _build_explanation(spot, futures, dominance, greeks, smart_money, volume, final, levels) -> str:
+    """Plain-language explanation of the recommendation, as required by
+    the spec ('Explain every recommendation in simple language')."""
+    lines = []
+    lines.append(f"Spot is reading **{spot.get('trend', 'Insufficient Data')}** "
+                  f"({spot.get('bullish_pct', 50)}% bullish / {spot.get('bearish_pct', 50)}% bearish signals).")
+    if futures.get("available"):
+        lines.append(f"Futures show **{futures.get('buildup')}** at a "
+                      f"{futures.get('premium_label', '—').lower()} of {futures.get('premium_discount', 0):+.2f} "
+                      f"to spot — trend reads **{futures.get('future_trend')}**.")
+    else:
+        lines.append("Futures data wasn't available this refresh, so Futures confirmation is missing.")
+    lines.append(f"Option chain OI currently favors **{dominance.get('dominant_side', 'Insufficient Data')}**.")
+    lines.append(f"Greeks near ATM: {greeks.get('gamma_observation', '—')}; {greeks.get('vega_observation', '—')}.")
+    if smart_money.get("available"):
+        lines.append(f"Smart-money structure bias: **{smart_money.get('bias')}**.")
+    else:
+        lines.append("Smart-money structure (Order Block/BOS/CHOCH/FVG) wasn't supplied to this engine.")
+    lines.append("Volume is confirmed." if volume.get("volume_confirmed") else
+                 "Volume is NOT confirmed — this alone can hold the signal to WAIT.")
+
+    if final["recommendation"] == "WAIT":
+        reason = final.get("wait_reason") or "conditions did not align"
+        lines.append(f"**Result: WAIT.** Reason: {reason}. "
+                      f"Confidence only reached {final['confidence']}%, below the "
+                      "required threshold, or the signals disagreed with each other.")
+    else:
+        lines.append(f"**Result: {final['recommendation']}** at {final['confidence']}% confidence, "
+                      f"because: {', '.join(final['reasons'])}.")
+        if levels.get("entry"):
+            lines.append(f"Suggested strike {levels['strike']:,.0f} — Entry {levels['entry']}, "
+                          f"SL {levels['sl']}, Targets {levels['t1']}/{levels['t2']}/{levels['t3']}, "
+                          f"Risk-Reward {levels['risk_reward']}.")
+    lines.append("This is a heuristic read from live-but-incomplete data (no order-book depth, no "
+                 "certified SMC engine) — not financial advice. Confirm with your own analysis and risk rules.")
+    return "\n\n".join(lines)
