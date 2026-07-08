@@ -3196,9 +3196,4 @@ def show_option_chain(fyers):
 #     show_option_chain(fyers)
 #
 # Run this file with:  streamlit run fyers_options_chain_dashboard.py
-try:
-    # Fetch from FYERS
-    option_chain = get_fyers_option_chain()
-except Exception:
-    # Fetch from NSE
-    option_chain = get_nse_option_chain()
+
