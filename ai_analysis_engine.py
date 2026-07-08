@@ -823,6 +823,130 @@ def print_analysis(result: AnalysisResult) -> None:
 
 
 # ==============================================================================
+# PUBLIC API — analyze_market()
+# ==============================================================================
+
+def analyze_market(
+    spot:     dict | None = None,
+    futures:  dict | None = None,
+    option:   dict | None = None,
+    smart:    dict | None = None,
+    inst:     dict | None = None,
+    global_:  dict | None = None,
+    news:     dict | None = None,
+    breadth:  dict | None = None,
+) -> dict:
+    """
+    Single importable entry point used by option_chain.py and
+    ai_market_intelligence.py.
+
+    All arguments are plain dicts whose keys match the field names of
+    the corresponding dataclass (e.g. SpotData, FuturesData …).
+    Pass only the keys you have — every field is Optional.
+
+    Returns a flat dict with the full analysis result so callers don't
+    need to import the dataclasses themselves.
+
+    Usage
+    -----
+    from ai_analysis_engine import analyze_market
+
+    result = analyze_market(
+        spot    = {"price": 24350, "rsi": 62.5, "atr": 120, ...},
+        futures = {"futures_price": 24375, "spot_price": 24350, ...},
+        option  = {"pcr": 1.15, "put_oi_change": 150000, ...},
+        inst    = {"fii_buy": 4500, "fii_sell": 2100, ...},
+        news    = {"sentiment": "BULLISH"},
+        ...
+    )
+
+    print(result["recommendation"])   # "BUY" | "SELL" | "WAIT"
+    print(result["confidence"])       # float  e.g. 78.4
+    print(result["reason"])           # str
+    """
+
+    def _build(cls, data: dict | None):
+        """Construct a dataclass from a dict, ignoring unknown keys."""
+        if not data:
+            return cls()
+        import dataclasses
+        valid = {f.name for f in dataclasses.fields(cls)}
+        filtered = {k: v for k, v in data.items() if k in valid}
+        # Convert "BULLISH"/"BEARISH"/"NEUTRAL" string for news sentiment
+        if cls is NewsData and "sentiment" in filtered:
+            raw = filtered["sentiment"]
+            if isinstance(raw, str):
+                # NewsSentiment values are "Bullish"/"Bearish"/"Neutral" (title-case)
+                mapping = {
+                    "BULLISH": NewsSentiment.BULLISH,
+                    "BEARISH": NewsSentiment.BEARISH,
+                    "NEUTRAL": NewsSentiment.NEUTRAL,
+                    "Bullish": NewsSentiment.BULLISH,
+                    "Bearish": NewsSentiment.BEARISH,
+                    "Neutral": NewsSentiment.NEUTRAL,
+                }
+                filtered["sentiment"] = mapping.get(raw, NewsSentiment.NEUTRAL)
+        return cls(**filtered)
+
+    engine = AIAnalysisEngine(
+        spot    = _build(SpotData,          spot),
+        futures = _build(FuturesData,       futures),
+        option  = _build(OptionChainData,   option),
+        smart   = _build(SmartMoneyData,    smart),
+        inst    = _build(InstitutionalData, inst),
+        global_ = _build(GlobalData,        global_),
+        news    = _build(NewsData,          news),
+        breadth = _build(MarketBreadthData, breadth),
+    )
+
+    r = engine.run()
+
+    return {
+        # Direction
+        "market_direction":   r.spot_trend.value,
+        "bullish_pct":        r.bullish_pct,
+        "bearish_pct":        r.bearish_pct,
+        "neutral_pct":        r.neutral_pct,
+
+        # Trend signals
+        "spot_trend":         r.spot_trend.value,
+        "future_trend":       r.future_trend.value,
+        "option_chain_trend": r.option_chain_trend.value,
+        "institutional_flow": r.institutional_flow.value,
+        "smart_money_dir":    r.smart_money_dir.value,
+
+        # Futures
+        "futures_class":             r.futures_class.value,
+        "futures_premium_discount":  r.futures_premium_discount,
+        "option_flow":               r.option_flow.value,
+
+        # Risk
+        "entry":     r.entry,
+        "stop_loss": r.stop_loss,
+        "target_1":  r.target_1,
+        "target_2":  r.target_2,
+        "target_3":  r.target_3,
+
+        # Scores
+        "score_spot":         r.score.spot,
+        "score_future":       r.score.future,
+        "score_option_chain": r.score.option_chain,
+        "score_smart_money":  r.score.smart_money,
+        "score_institution":  r.score.institution,
+        "score_news":         r.score.news,
+        "score_volume":       r.score.volume,
+        "score_momentum":     r.score.momentum,
+        "score_trend":        r.score.trend,
+        "score_overall":      r.score.overall,
+
+        # Final signal
+        "confidence":       r.confidence,
+        "recommendation":   r.recommendation.value,
+        "reason":           r.reason,
+    }
+
+
+# ==============================================================================
 # QUICK-START EXAMPLE
 # ==============================================================================
 
