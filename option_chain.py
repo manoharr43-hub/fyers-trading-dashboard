@@ -3175,3 +3175,23 @@ def show_option_chain(fyers):
         )
     except Exception as e:  # noqa: BLE001
         st.error(f"Could not build Excel report: {e}")
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 10. ENTRY POINT
+# ══════════════════════════════════════════════════════════════════════════
+#
+# This module exposes show_option_chain(fyers) as its main entry point.
+# `fyers` must be an already-authenticated FYERS API v3 client instance
+# (from the `fyers-apiv3` package), e.g.:
+#
+#     from fyers_apiv3 import fyersModel
+#     fyers = fyersModel.FyersModel(
+#         client_id="YOUR-APP-ID",
+#         token="YOUR-ACCESS-TOKEN",
+#         is_async=False,
+#         log_path="",
+#     )
+#     show_option_chain(fyers)
+#
+# Run this file with:  streamlit run fyers_options_chain_dashboard.py
