@@ -12,6 +12,10 @@ import logging
 from datetime import datetime, timedelta
 from typing import List, Optional, Tuple, Dict, Any
 from concurrent.futures import ThreadPoolExecutor, as_completed
+# ===============================
+# AI ENGINE
+# ===============================
+from ai_analysis_engine import analyze_market
 
 # matplotlib is optional — only needed for the candlestick chart export in
 # the new Live Order Block Signal Engine. If it's unavailable the rest of
