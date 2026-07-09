@@ -1,786 +1,733 @@
 """
 ai_analysis_engine.py
 ======================
-Implements `analyze_market()`, the module the dashboard already imports
-(`from ai_analysis_engine import analyze_market`) but which didn't exist yet
-— so the dashboard would raise ImportError on startup without this file.
+Implements analyze_market(), the module the dashboard imports as:
 
-This follows the 11-step "Institutional NSE Options Analyst" methodology:
-  1. Spot confirmation (VWAP/EMA20/50/200/RSI/MACD -> Bullish/Bearish/Sideways)
-  2. Futures confirmation (premium/discount, OI/ΔOI/Volume -> Long Build-up /
-     Short Build-up / Long Unwinding / Short Covering; must agree with Spot)
-  3. Option chain OI ranking (per strike, both sides)
-  4. Greeks (Delta/Gamma/Theta/Vega, estimated via Black-Scholes since the
-     FYERS optionchain endpoint does not return live Greeks)
-  5. Per-strike OI observation (Price vs OI -> 4-quadrant classification),
-     tracked refresh-to-refresh via st.session_state (mirrors the pattern
-     already used by the Gamma Analyzer elsewhere in this project)
-  6. CE vs PE dominance
-  7. Smart-money structure (Order Block / BOS / CHOCH / FVG / Liquidity
-     Sweep) — this module does NOT recompute these; it accepts them as an
-     optional `smart_money` dict (e.g. straight from the existing AI
-     Scalping Engine's `trend_engine`) so the two engines never disagree
-     about the same candle data. If not supplied, this step is marked
-     "Not Available" and simply cannot vote FOR a signal (fail-safe).
-  8. Volume (current vs average, spike detection)
-  9. Signal filter (BUY CALL / BUY PUT only above min_confidence, all
-     conditions required)
- 10. Risk filter (mixed/conflicting signals force WAIT regardless of score)
- 11. Structured output matching the requested report fields
+    from ai_analysis_engine import analyze_market
 
-HONESTY NOTE: every score in this module is a heuristic derived from a
-single option-chain + candle snapshot (the FYERS APIs used elsewhere in
-this project do not expose order-book depth, historical Greeks, or a
-verified SMC engine). It is a positioning aid, not investment advice —
-always confirm with live price action and manage your own risk.
+This module exists to satisfy the "THINK LIKE AN OPTION SELLER & OPTION
+BUYER" decision framework: before any BUY/SELL signal is produced, it
+walks through Seller Bias -> Buyer Bias -> Market Maker Bias -> Smart
+Money Bias -> strict ALL-conditions-true CE BUY / PE BUY / CE SELL /
+PE SELL checks -> and only then returns a signal. Missing / unavailable
+confirmations fail safe toward WAIT — this engine can only ever be
+pushed toward caution by missing data, never forced into a BUY/SELL.
+
+INPUT CONTRACT
+--------------
+analyze_market() is designed to run AFTER the dashboard's own pipeline
+has already computed its per-strike columns, i.e. after:
+
+    df = compute_big_move_scores(df, spot_price, max_pain, pcr, atm_strike)
+    df = compute_ai_engine(df, spot_price, atm_strike, max_pain, pcr)
+
+so it can reuse CE Score / PE Score / Breakout Probability / Breakdown
+Probability / Institutional Score / Smart Money Score / CE Build-up /
+PE Build-up rather than recomputing them. Gamma columns ("gamma",
+"Gamma Change") are optional — if absent, the Gamma confirmation simply
+does not count toward either side.
+
+An optional `trend_engine` dict — in the shape produced by this
+dashboard's compute_scalping_trend_engine() (VWAP, EMA9/20/50, RSI,
+ADX, Supertrend direction, Order Block, BOS, volume spike, etc.) — can
+be passed in to unlock the underlying-price-action confirmations
+(VWAP/EMA/Structure/Volume Expansion) required by STEP 5 and STEP 6
+below. Without it, those checks fail safe to False (not True) — per
+STEP 9, that alone is enough to keep the result at WAIT, since CE BUY /
+PE BUY require ALL listed conditions, not a majority.
+
+This is a heuristic, snapshot-based read-through of the option chain
+and (optionally) recent underlying candles. It is not financial advice,
+it does not have access to real order-flow/dealer-position data, and
+several "Smart Money" / "Dealer" concepts below are necessarily proxied
+from OI/Volume/ΔOI/Gamma rather than measured directly. Always confirm
+with live price action and manage your own risk.
 """
 
+from __future__ import annotations
+
 import math
-from datetime import datetime, timedelta
+from dataclasses import dataclass, field
+from typing import Optional
 
 import numpy as np
 import pandas as pd
 
-try:
-    import streamlit as st
-    _HAS_ST = True
-except ImportError:  # module should still import/work outside Streamlit
-    _HAS_ST = False
+# ══════════════════════════════════════════════════════════════════════════
+# Tunable thresholds
+# ══════════════════════════════════════════════════════════════════════════
+
+MIN_PROBABILITY = 85.0
+MIN_CONFIDENCE = 85.0
+
+# Percentile-based "heavy" thresholds — relative to the current chain
+# snapshot, since only a single point-in-time payload is available.
+HEAVY_OI_PCT = 0.80
+HEAVY_CHNG_OI_PCT = 0.80
+HIGH_VOLUME_PCT = 0.75
+IV_HIGH_PCT = 0.75
+IV_LOW_PCT = 0.25
+
+RISK_LEVELS = ["Low", "Moderate", "Elevated", "High"]
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# Session-state helper (falls back to a plain module-level dict if this
-# module is ever used outside a Streamlit run context)
+# Small helpers
 # ══════════════════════════════════════════════════════════════════════════
 
-_FALLBACK_STATE = {}
+def _safe_quantile(series: pd.Series, q: float) -> float:
+    s = pd.to_numeric(series, errors="coerce").dropna()
+    if s.empty:
+        return 0.0
+    return float(s.quantile(q))
 
 
-def _state():
-    if _HAS_ST:
-        return st.session_state
-    return _FALLBACK_STATE
+def _pct_rank(value: float, series: pd.Series) -> float:
+    """0-1 percentile rank of `value` within `series`."""
+    s = pd.to_numeric(series, errors="coerce").dropna()
+    if s.empty or s.max() == s.min():
+        return 0.5
+    return float((s < value).mean())
 
 
-AI_OI_HISTORY_KEY = "ai_engine_oi_history"
-AI_FUT_HISTORY_KEY = "ai_engine_futures_history"
-
-
-# ══════════════════════════════════════════════════════════════════════════
-# STEP 1 — SPOT CONFIRMATION
-# ══════════════════════════════════════════════════════════════════════════
-
-def _ema(series: pd.Series, n: int) -> pd.Series:
-    return series.ewm(span=n, adjust=False).mean()
-
-
-def _rsi(series: pd.Series, n: int = 14) -> pd.Series:
-    delta = series.diff()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
-    avg_gain = gain.ewm(alpha=1 / n, adjust=False).mean()
-    avg_loss = loss.ewm(alpha=1 / n, adjust=False).mean()
-    rs = avg_gain / avg_loss.replace(0, np.nan)
-    return (100 - (100 / (1 + rs))).fillna(50.0)
-
-
-def _macd(series: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9):
-    macd_line = _ema(series, fast) - _ema(series, slow)
-    signal_line = _ema(macd_line, signal)
-    return macd_line, signal_line
-
-
-def _vwap(df: pd.DataFrame) -> pd.Series:
-    typical = (df["high"] + df["low"] + df["close"]) / 3
-    cum_vol = df["volume"].cumsum().replace(0, np.nan)
-    return (typical * df["volume"]).cumsum() / cum_vol
-
-
-def fetch_underlying_candles(fyers, symbol_candidates: list, resolution: str = "5",
-                              lookback_days: int = 5) -> pd.DataFrame:
-    """Same fallback pattern used elsewhere in this project: try each
-    symbol variant until FYERS' history endpoint returns candles. Returns
-    an empty DataFrame (never raises) if none work — every downstream step
-    that depends on candles degrades to 'Insufficient Data' rather than
-    guessing."""
-    end = datetime.now()
-    start = end - timedelta(days=lookback_days)
-    for sym in symbol_candidates:
-        req = {
-            "symbol": sym, "resolution": str(resolution), "date_format": "1",
-            "range_from": start.strftime("%Y-%m-%d"), "range_to": end.strftime("%Y-%m-%d"),
-            "cont_flag": "1",
-        }
-        try:
-            resp = fyers.history(data=req)
-        except Exception:  # noqa: BLE001 - external SDK
-            continue
-        if not isinstance(resp, dict) or resp.get("s") != "ok":
-            continue
-        candles = resp.get("candles", [])
-        if not candles:
-            continue
-        try:
-            cdf = pd.DataFrame(candles, columns=["time", "open", "high", "low", "close", "volume"])
-            cdf["time"] = pd.to_datetime(cdf["time"], unit="s")
-            cdf.sort_values("time", inplace=True)
-            cdf.reset_index(drop=True, inplace=True)
-            return cdf
-        except Exception:  # noqa: BLE001
-            continue
-    return pd.DataFrame()
-
-
-def compute_spot_trend(candles_5m: pd.DataFrame) -> dict:
-    """STEP 1. Returns Bullish/Bearish/Sideways plus every indicator used
-    to reach that call, and a 0-100 'Bullish %' / 'Bearish %' split so the
-    Step 11 output can report both directly."""
-    if candles_5m is None or candles_5m.empty or len(candles_5m) < 25:
-        return {"available": False, "trend": "Insufficient Data", "bullish_pct": 50.0, "bearish_pct": 50.0}
-
-    close = candles_5m["close"]
-    ema20, ema50 = _ema(close, 20), _ema(close, 50)
-    ema200 = _ema(close, 200) if len(close) >= 200 else pd.Series([close.mean()] * len(close))
-    rsi = _rsi(close, 14)
-    macd_line, macd_signal = _macd(close)
-    vwap = _vwap(candles_5m)
-
-    last_close = float(close.iloc[-1])
-    last_vwap = float(vwap.iloc[-1]) if pd.notna(vwap.iloc[-1]) else last_close
-    last_ema20, last_ema50, last_ema200 = float(ema20.iloc[-1]), float(ema50.iloc[-1]), float(ema200.iloc[-1])
-    last_rsi = float(rsi.iloc[-1])
-    last_macd, last_macd_sig = float(macd_line.iloc[-1]), float(macd_signal.iloc[-1])
-
-    bull_votes = sum([
-        last_close > last_vwap,
-        last_ema20 > last_ema50 > last_ema200,
-        last_rsi > 55,
-        last_macd > last_macd_sig,
-    ])
-    bear_votes = sum([
-        last_close < last_vwap,
-        last_ema20 < last_ema50 < last_ema200,
-        last_rsi < 45,
-        last_macd < last_macd_sig,
-    ])
-    total = 4
-    bullish_pct = round(bull_votes / total * 100, 1)
-    bearish_pct = round(bear_votes / total * 100, 1)
-
-    if bull_votes >= 3:
-        trend = "Bullish"
-    elif bear_votes >= 3:
-        trend = "Bearish"
-    else:
-        trend = "Sideways"
-
-    return {
-        "available": True, "trend": trend, "bullish_pct": bullish_pct, "bearish_pct": bearish_pct,
-        "last_close": last_close, "vwap": last_vwap, "ema20": last_ema20, "ema50": last_ema50,
-        "ema200": last_ema200, "rsi": last_rsi, "macd": last_macd, "macd_signal": last_macd_sig,
-    }
+def _clip01(x: float) -> float:
+    return max(0.0, min(1.0, x))
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# STEP 2 — FUTURES CONFIRMATION
+# Bias primitives (STEP 1-4, "Final Output Format" bias fields)
 # ══════════════════════════════════════════════════════════════════════════
 
-def fetch_futures_snapshot(fyers, futures_symbol_candidates: list) -> dict:
-    """Fetches LTP + OI + Volume for the near-month future via FYERS quotes.
-    `futures_symbol_candidates` must be supplied by the caller (e.g.
-    ["NSE:NIFTY26JULFUT"]) since the correct contract month/format can't be
-    reliably derived here — pass [] / None to skip this step gracefully."""
-    if not futures_symbol_candidates:
-        return {"available": False}
-    for sym in futures_symbol_candidates:
-        try:
-            resp = fyers.quotes(data={"symbols": sym})
-            v = resp.get("d", [{}])[0].get("v", {}) if isinstance(resp, dict) else {}
-            ltp = float(v.get("lp", 0) or 0)
-            if ltp <= 0:
-                continue
-            return {
-                "available": True, "symbol": sym, "ltp": ltp,
-                "oi": float(v.get("oi", 0) or 0), "volume": float(v.get("volume", 0) or v.get("vol_traded_today", 0) or 0),
-            }
-        except Exception:  # noqa: BLE001
-            continue
-    return {"available": False}
+@dataclass
+class MarketContext:
+    """Chain-wide context computed once per analyze_market() call and
+    shared by every per-strike evaluation, so every strike is judged
+    against the same seller/buyer/dealer/smart-money read."""
+
+    spot_price: float
+    atm_strike: float
+    max_pain: float
+    pcr: float
+    support: Optional[float]
+    resistance: Optional[float]
+    expiry_label: str = ""
+
+    # Chain-wide thresholds, filled in by build_market_context()
+    heavy_ce_oi_thresh: float = 0.0
+    heavy_pe_oi_thresh: float = 0.0
+    heavy_ce_chng_thresh: float = 0.0
+    heavy_pe_chng_thresh: float = 0.0
+    high_ce_vol_thresh: float = 0.0
+    high_pe_vol_thresh: float = 0.0
+    ce_iv_high_thresh: float = 0.0
+    ce_iv_low_thresh: float = 0.0
+    pe_iv_high_thresh: float = 0.0
+    pe_iv_low_thresh: float = 0.0
+    avg_ce_iv: float = 0.0
+    avg_pe_iv: float = 0.0
+
+    # Trend-engine derived (may all be None if trend_engine unavailable)
+    price_above_vwap: Optional[bool] = None
+    price_below_vwap: Optional[bool] = None
+    above_ema20: Optional[bool] = None
+    above_ema50: Optional[bool] = None
+    below_ema20: Optional[bool] = None
+    below_ema50: Optional[bool] = None
+    bullish_structure: Optional[bool] = None
+    bearish_structure: Optional[bool] = None
+    volume_expansion: Optional[bool] = None
+    adx_strong: Optional[bool] = None
+    supertrend_dir: Optional[int] = None  # 1 bullish, -1 bearish
+
+    # Bias summary (STEP 1-4 / final output)
+    market_bias: str = "🟡 Neutral"
+    smart_money_bias: str = "🟡 Neutral"
+    seller_bias: str = "🟡 Balanced"
+    buyer_bias: str = "🟡 Weak"
+    institutional_bias: str = "🟡 Neutral"
+    dealer_bias: str = "🟡 Neutral"
+    pcr_bias: str = "🟡 Neutral"
+    oi_bias: str = "🟡 Neutral"
+    gamma_bias: str = "🟡 Neutral"
+    iv_bias: str = "🟡 Neutral"
+    expected_direction: str = "🟡 Range-bound"
+
+    has_trend_engine: bool = False
+    has_gamma: bool = False
 
 
-def classify_futures_buildup(price_change: float, oi_change: float) -> str:
-    """STEP 5's price-vs-OI quadrant, applied here to Futures for Step 2."""
-    if price_change > 0 and oi_change > 0:
-        return "Long Build-up"
-    if price_change < 0 and oi_change > 0:
-        return "Short Build-up"
-    if price_change > 0 and oi_change < 0:
-        return "Short Covering"
-    if price_change < 0 and oi_change < 0:
-        return "Long Unwinding"
-    return "Flat / No Change"
-
-
-def compute_futures_confirmation(fyers, futures_symbol_candidates: list, spot_price: float,
-                                  symbol_key: str) -> dict:
-    """STEP 2. Compares this refresh's future snapshot to the previous one
-    (session-tracked, same pattern as the Gamma Analyzer) to classify
-    build-up, and checks whether Futures confirms Spot's direction."""
-    snap = fetch_futures_snapshot(fyers, futures_symbol_candidates)
-    if not snap.get("available"):
-        return {"available": False, "buildup": "Not Available", "confirms_spot": None}
-
-    history = _state().setdefault(AI_FUT_HISTORY_KEY, {})
-    prev = history.get(symbol_key, {})
-    price_change = snap["ltp"] - prev.get("ltp", snap["ltp"])
-    oi_change = snap["oi"] - prev.get("oi", snap["oi"])
-    volume_change = snap["volume"] - prev.get("volume", snap["volume"])
-    history[symbol_key] = {"ltp": snap["ltp"], "oi": snap["oi"], "volume": snap["volume"]}
-    _state()[AI_FUT_HISTORY_KEY] = history
-
-    buildup = classify_futures_buildup(price_change, oi_change)
-    premium = snap["ltp"] - spot_price if spot_price else 0.0
-    premium_label = "Premium" if premium > 0 else ("Discount" if premium < 0 else "Flat")
-
-    return {
-        "available": True, "future_ltp": snap["ltp"], "future_oi": snap["oi"], "future_volume": snap["volume"],
-        "price_change": price_change, "oi_change": oi_change, "volume_change": volume_change,
-        "premium_discount": round(premium, 2), "premium_label": premium_label, "buildup": buildup,
-        "future_trend": "Bullish" if buildup in ("Long Build-up", "Short Covering") else
-                         ("Bearish" if buildup in ("Short Build-up", "Long Unwinding") else "Sideways"),
-    }
-
-
-# ══════════════════════════════════════════════════════════════════════════
-# STEP 3 — OPTION CHAIN OI RANKING
-# ══════════════════════════════════════════════════════════════════════════
-
-def compute_oi_rankings(df: pd.DataFrame) -> pd.DataFrame:
-    """STEP 3. Adds OI Rank / OI Change Rank (1 = highest) per side so any
-    strike's relative standing is directly available."""
-    d = df.copy()
-    for col, rank_col in [("ce_oi", "CE OI Rank"), ("pe_oi", "PE OI Rank"),
-                           ("ce_chng_oi", "CE OI Change Rank"), ("pe_chng_oi", "PE OI Change Rank"),
-                           ("ce_volume", "CE Volume Rank"), ("pe_volume", "PE Volume Rank")]:
-        if col in d.columns:
-            d[rank_col] = d[col].abs().rank(method="min", ascending=False).astype(int)
-        else:
-            d[rank_col] = 0
-    return d
-
-
-# ══════════════════════════════════════════════════════════════════════════
-# STEP 4 — GREEKS (Black-Scholes estimate; FYERS optionchain has no Greeks)
-# ══════════════════════════════════════════════════════════════════════════
-
-def _norm_cdf(x: float) -> float:
-    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
-
-
-def _norm_pdf(x: float) -> float:
-    return math.exp(-0.5 * x * x) / math.sqrt(2 * math.pi)
-
-
-def bs_greeks(spot: float, strike: float, t: float, r: float, sigma: float, is_call: bool) -> dict:
-    """Standard Black-Scholes Greeks. Returns zeros for degenerate inputs
-    rather than raising — this must never crash a live refresh."""
-    if t <= 0 or sigma <= 0 or spot <= 0 or strike <= 0:
-        return {"delta": 0.0, "gamma": 0.0, "theta": 0.0, "vega": 0.0}
-    sqrt_t = math.sqrt(t)
-    d1 = (math.log(spot / strike) + (r + 0.5 * sigma ** 2) * t) / (sigma * sqrt_t)
-    d2 = d1 - sigma * sqrt_t
-    gamma = _norm_pdf(d1) / (spot * sigma * sqrt_t)
-    vega = spot * _norm_pdf(d1) * sqrt_t / 100  # per 1% IV move
-    if is_call:
-        delta = _norm_cdf(d1)
-        theta = (-(spot * _norm_pdf(d1) * sigma) / (2 * sqrt_t)
-                 - r * strike * math.exp(-r * t) * _norm_cdf(d2)) / 365
-    else:
-        delta = _norm_cdf(d1) - 1
-        theta = (-(spot * _norm_pdf(d1) * sigma) / (2 * sqrt_t)
-                 + r * strike * math.exp(-r * t) * _norm_cdf(-d2)) / 365
-    return {"delta": round(delta, 4), "gamma": round(gamma, 6), "theta": round(theta, 3), "vega": round(vega, 3)}
-
-
-def add_greeks_columns(df: pd.DataFrame, spot: float, expiry_label: str, r: float = 0.07) -> pd.DataFrame:
-    """STEP 4. Adds ce_delta/ce_gamma/ce_theta/ce_vega and the pe_ equivalents.
-    Uses ce_iv/pe_iv already on the dataframe (from the dashboard's IV
-    solver) as sigma; falls back to a flat 30% vol on thin payloads."""
-    d = df.copy()
-    if d.empty or not spot:
-        for col in ("ce_delta", "ce_gamma", "ce_theta", "ce_vega", "pe_delta", "pe_gamma", "pe_theta", "pe_vega"):
-            d[col] = 0.0
-        return d
-
-    def _days_to_expiry(label: str) -> float:
-        for fmt in ("%d-%b-%Y", "%d-%m-%Y", "%Y-%m-%d"):
-            try:
-                return max((datetime.strptime(label, fmt) - datetime.now()).total_seconds() / 86400, 0.5)
-            except ValueError:
-                continue
-        return 7.0
-
-    t = _days_to_expiry(expiry_label) / 365.0
-
-    def _row(strike, iv_pct, is_call):
-        sigma = max(float(iv_pct), 0.0) / 100.0
-        if sigma <= 0:
-            sigma = 0.30
-        return bs_greeks(spot, strike, t, r, sigma, is_call)
-
-    ce_g = d.apply(lambda row: _row(row["strike_price"], row.get("ce_iv", 0), True), axis=1)
-    pe_g = d.apply(lambda row: _row(row["strike_price"], row.get("pe_iv", 0), False), axis=1)
-    d["ce_delta"] = ce_g.apply(lambda x: x["delta"])
-    d["ce_gamma"] = ce_g.apply(lambda x: x["gamma"])
-    d["ce_theta"] = ce_g.apply(lambda x: x["theta"])
-    d["ce_vega"] = ce_g.apply(lambda x: x["vega"])
-    d["pe_delta"] = pe_g.apply(lambda x: x["delta"])
-    d["pe_gamma"] = pe_g.apply(lambda x: x["gamma"])
-    d["pe_theta"] = pe_g.apply(lambda x: x["theta"])
-    d["pe_vega"] = pe_g.apply(lambda x: x["vega"])
-    return d
-
-
-def summarize_greeks(df: pd.DataFrame, atm_strike: float) -> dict:
-    """Greeks read-through near ATM, since that's where Gamma/Vega concentrate."""
-    if df.empty:
-        return {"gamma_observation": "Insufficient Data", "vega_observation": "Insufficient Data",
-                "delta_observation": "Insufficient Data", "theta_observation": "Insufficient Data"}
-    near_atm = df.iloc[(df["strike_price"] - atm_strike).abs().argsort()[:5]] if atm_strike else df
-    avg_gamma = (near_atm.get("ce_gamma", 0) + near_atm.get("pe_gamma", 0)).mean() / 2
-    avg_vega = (near_atm.get("ce_vega", 0) + near_atm.get("pe_vega", 0)).mean() / 2
-    avg_theta = (near_atm.get("ce_theta", 0) + near_atm.get("pe_theta", 0)).mean() / 2
-    gamma_high = avg_gamma > df.get("ce_gamma", pd.Series([0])).quantile(0.75) if len(df) else False
-
-    return {
-        "avg_gamma_near_atm": round(float(avg_gamma), 6),
-        "avg_vega_near_atm": round(float(avg_vega), 3),
-        "avg_theta_near_atm": round(float(avg_theta), 3),
-        "gamma_observation": "High Gamma near ATM — explosive-move potential" if gamma_high
-                              else "Gamma near ATM is moderate/low",
-        "vega_observation": "Elevated Vega — premiums sensitive to IV expansion" if avg_vega > 2
-                             else "Vega stable — limited premium expansion risk",
-        "delta_observation": "Delta exposure concentrated near ATM strikes as expected",
-        "theta_observation": f"Average time decay near ATM ≈ {avg_theta:.2f}/day — "
-                              "works against option buyers, for option sellers",
-    }
-
-
-# ══════════════════════════════════════════════════════════════════════════
-# STEP 5 — PER-STRIKE OI OBSERVATION (Price vs OI, session-tracked)
-# ══════════════════════════════════════════════════════════════════════════
-
-def compute_oi_observation(df: pd.DataFrame, symbol: str, expiry_label: str) -> pd.DataFrame:
-    """STEP 5. Compares this refresh's ce_ltp/pe_ltp + ce_oi/pe_oi against
-    the previous refresh (session-tracked per symbol+expiry+strike, same
-    pattern as the Gamma Analyzer) to classify each side into the classic
-    4-quadrant Price-vs-OI read. First refresh for a symbol/expiry has no
-    prior snapshot, so every strike starts 'Insufficient Data' — expected,
-    resolves from the second refresh onward."""
-    d = df.copy()
-    if d.empty:
-        return d
-
-    history = _state().setdefault(AI_OI_HISTORY_KEY, {})
-    hist_key = f"{symbol}|{expiry_label}"
-    prev = history.get(hist_key, {})
-    new_snap = {}
-
-    ce_labels, pe_labels = [], []
-    for _, row in d.iterrows():
-        strike = row["strike_price"]
-        prev_row = prev.get(str(strike), {})
-
-        for side, ltp_col, oi_col, out_list in [("ce", "ce_ltp", "ce_oi", ce_labels),
-                                                 ("pe", "pe_ltp", "pe_oi", pe_labels)]:
-            cur_ltp, cur_oi = float(row.get(ltp_col, 0)), float(row.get(oi_col, 0))
-            prev_ltp = prev_row.get(f"{side}_ltp", cur_ltp)
-            prev_oi = prev_row.get(f"{side}_oi", cur_oi)
-            if f"{side}_ltp" not in prev_row:
-                out_list.append("Insufficient Data")
-                continue
-            price_up, oi_up = cur_ltp > prev_ltp, cur_oi > prev_oi
-            price_down, oi_down = cur_ltp < prev_ltp, cur_oi < prev_oi
-            if price_up and oi_up:
-                out_list.append("Long Build-up")
-            elif price_down and oi_up:
-                out_list.append("Short Build-up")
-            elif price_up and oi_down:
-                out_list.append("Short Covering")
-            elif price_down and oi_down:
-                out_list.append("Long Unwinding")
-            else:
-                out_list.append("Flat / No Change")
-
-        new_snap[str(strike)] = {
-            "ce_ltp": float(row.get("ce_ltp", 0)), "ce_oi": float(row.get("ce_oi", 0)),
-            "pe_ltp": float(row.get("pe_ltp", 0)), "pe_oi": float(row.get("pe_oi", 0)),
-        }
-
-    d["CE OI Observation"] = ce_labels
-    d["PE OI Observation"] = pe_labels
-    history[hist_key] = new_snap
-    _state()[AI_OI_HISTORY_KEY] = history
-    return d
-
-
-# ══════════════════════════════════════════════════════════════════════════
-# STEP 6 — CE VS PE DOMINANCE
-# ══════════════════════════════════════════════════════════════════════════
-
-def compute_ce_pe_dominance(df: pd.DataFrame) -> dict:
-    """STEP 6. Aggregate CE vs PE OI / ΔOI / Volume comparison and which
-    side (writing vs unwinding) currently dominates."""
-    if df.empty:
-        return {"dominant_side": "Insufficient Data"}
-
-    total_ce_oi, total_pe_oi = float(df["ce_oi"].sum()), float(df["pe_oi"].sum())
-    total_ce_chng, total_pe_chng = float(df["ce_chng_oi"].sum()), float(df["pe_chng_oi"].sum())
-    total_ce_vol, total_pe_vol = float(df["ce_volume"].sum()), float(df["pe_volume"].sum())
-
-    ce_writing = total_ce_chng > 0
-    pe_writing = total_pe_chng > 0
-    ce_unwinding = total_ce_chng < 0
-    pe_unwinding = total_pe_chng < 0
-
-    if pe_writing and total_pe_chng > abs(total_ce_chng):
-        dominant = "PE (Bullish — Put Writing dominant)"
-    elif ce_writing and total_ce_chng > abs(total_pe_chng):
-        dominant = "CE (Bearish — Call Writing dominant)"
-    else:
-        dominant = "Balanced / No clear dominance"
-
-    return {
-        "total_ce_oi": total_ce_oi, "total_pe_oi": total_pe_oi,
-        "total_ce_chng_oi": total_ce_chng, "total_pe_chng_oi": total_pe_chng,
-        "total_ce_volume": total_ce_vol, "total_pe_volume": total_pe_vol,
-        "ce_writing": ce_writing, "pe_writing": pe_writing,
-        "ce_unwinding": ce_unwinding, "pe_unwinding": pe_unwinding,
-        "dominant_side": dominant,
-    }
-
-
-# ══════════════════════════════════════════════════════════════════════════
-# STEP 7 — SMART MONEY (pass-through from the caller's own structure engine)
-# ══════════════════════════════════════════════════════════════════════════
-
-def summarize_smart_money(smart_money: dict = None) -> dict:
-    """STEP 7. This module does not re-derive Order Block / BOS / CHOCH /
-    FVG / Liquidity Sweep itself — pass in the dict already produced by the
-    dashboard's own structure detection (e.g. the AI Scalping Engine's
-    `trend_engine`) so both engines read the same candles the same way.
-    If nothing is supplied, this step is 'Not Available' and can only ever
-    count AGAINST a signal (see the risk filter), never for one."""
-    if not smart_money:
-        return {"available": False, "bias": "Not Available"}
-
-    bull_hits = sum([
-        smart_money.get("order_block_label", "") == "Bullish OB",
-        smart_money.get("bos_label", "") == "Bullish BOS",
-        smart_money.get("choch_label", "") == "Bullish CHOCH",
-        smart_money.get("fvg_label", "") == "Bullish FVG",
-        "Bullish" in smart_money.get("sweep_label", ""),
-    ])
-    bear_hits = sum([
-        smart_money.get("order_block_label", "") == "Bearish OB",
-        smart_money.get("bos_label", "") == "Bearish BOS",
-        smart_money.get("choch_label", "") == "Bearish CHOCH",
-        smart_money.get("fvg_label", "") == "Bearish FVG",
-        "Bearish" in smart_money.get("sweep_label", ""),
-    ])
-    if bull_hits > bear_hits:
-        bias = "Bullish"
-    elif bear_hits > bull_hits:
-        bias = "Bearish"
-    else:
-        bias = "Neutral"
-    return {"available": True, "bias": bias, "bull_hits": bull_hits, "bear_hits": bear_hits, **smart_money}
-
-
-# ══════════════════════════════════════════════════════════════════════════
-# STEP 8 — VOLUME
-# ══════════════════════════════════════════════════════════════════════════
-
-def compute_volume_analysis(df: pd.DataFrame, candles_5m: pd.DataFrame, futures_confirmation: dict) -> dict:
-    """STEP 8. Volume-Spike gate — 'No Volume = No Trade' is enforced in
-    the risk filter, not here; this just measures it."""
-    option_volume_ok = False
-    if not df.empty:
-        total_vol = df["ce_volume"].sum() + df["pe_volume"].sum()
-        median_vol_per_strike = (df["ce_volume"] + df["pe_volume"]).median()
-        option_volume_ok = total_vol > 0 and median_vol_per_strike > 0
-
-    underlying_spike = False
-    if candles_5m is not None and not candles_5m.empty and len(candles_5m) >= 20:
-        underlying_spike = bool(candles_5m["volume"].iloc[-1] > candles_5m["volume"].tail(20).mean() * 1.5)
-
-    future_volume_ok = bool(futures_confirmation.get("available") and futures_confirmation.get("future_volume", 0) > 0)
-
-    return {
-        "option_volume_present": option_volume_ok,
-        "underlying_volume_spike": underlying_spike,
-        "future_volume_present": future_volume_ok,
-        "volume_confirmed": option_volume_ok and (underlying_spike or future_volume_ok),
-    }
-
-
-# ══════════════════════════════════════════════════════════════════════════
-# STEP 9 & 10 — SIGNAL FILTER + RISK FILTER
-# ══════════════════════════════════════════════════════════════════════════
-
-def determine_final_signal(spot: dict, futures: dict, dominance: dict, greeks: dict,
-                            smart_money: dict, volume: dict, min_confidence: float = 85.0) -> dict:
-    """STEPS 9 & 10. Every condition below must hold for a BUY CALL or BUY
-    PUT to be returned; any conflict/missing data forces WAIT. Confidence
-    is the fraction of the (up to 9) directional conditions satisfied —
-    it can only clear the bar when every required condition, not just a
-    majority, agrees."""
-    reasons_for, risk_flags = [], []
-
-    spot_ok = spot.get("available", False)
-    fut_ok = futures.get("available", False)
-    sm_ok = smart_money.get("available", False)
-
-    if not spot_ok:
-        risk_flags.append("Spot trend indicators unavailable (insufficient candle history)")
-    if not fut_ok:
-        risk_flags.append("Futures data unavailable — cannot confirm Spot vs Futures agreement")
-    if not sm_ok:
-        risk_flags.append("Smart-money structure not supplied to this engine")
-    if not volume.get("volume_confirmed"):
-        risk_flags.append("Volume not confirmed — 'No Volume = No Trade'")
-
-    bullish_conditions = {
-        "Spot Bullish": spot.get("trend") == "Bullish",
-        "Future confirms Bullish": fut_ok and futures.get("future_trend") == "Bullish",
-        "Long Build-up (Futures)": fut_ok and futures.get("buildup") == "Long Build-up",
-        "PE Writing dominant (bullish OI)": dominance.get("pe_writing") and "PE" in dominance.get("dominant_side", ""),
-        "CE Unwinding": dominance.get("ce_unwinding", False),
-        "Gamma / Vega stable or supportive": True,  # near-ATM Greeks context only, never a hard veto
-        "Volume confirmed": volume.get("volume_confirmed", False),
-        "Smart Money Bullish": sm_ok and smart_money.get("bias") == "Bullish",
-    }
-    bearish_conditions = {
-        "Spot Bearish": spot.get("trend") == "Bearish",
-        "Future confirms Bearish": fut_ok and futures.get("future_trend") == "Bearish",
-        "Short Build-up (Futures)": fut_ok and futures.get("buildup") == "Short Build-up",
-        "CE Writing dominant (bearish OI)": dominance.get("ce_writing") and "CE" in dominance.get("dominant_side", ""),
-        "PE Unwinding": dominance.get("pe_unwinding", False),
-        "Gamma / Vega stable or supportive": True,
-        "Volume confirmed": volume.get("volume_confirmed", False),
-        "Smart Money Bearish": sm_ok and smart_money.get("bias") == "Bearish",
-    }
-
-    bull_score = round(sum(bullish_conditions.values()) / len(bullish_conditions) * 100, 1)
-    bear_score = round(sum(bearish_conditions.values()) / len(bearish_conditions) * 100, 1)
-
-    # ── Risk filter (STEP 10): mixed signals always force WAIT, regardless
-    # of a score that happens to clear the bar on paper ────────────────────
-    mixed = (
-        (fut_ok and spot_ok and spot.get("trend") not in ("Insufficient Data",) and futures.get("future_trend") not in ("Sideways",) and spot.get("trend") != futures.get("future_trend"))
-        or (dominance.get("dominant_side", "").startswith("Balanced"))
+def build_market_context(df: pd.DataFrame, spot_price: float, atm_strike: float,
+                          max_pain: float, pcr: float, support: Optional[float],
+                          resistance: Optional[float], trend_engine: Optional[dict] = None,
+                          expiry_label: str = "") -> MarketContext:
+    """STEP 1-4: derive every chain-wide bias BEFORE any per-strike
+    BUY/SELL condition is evaluated. Nothing here looks at a single
+    strike in isolation — it is deliberately the full market context."""
+    ctx = MarketContext(
+        spot_price=spot_price, atm_strike=atm_strike, max_pain=max_pain, pcr=pcr,
+        support=support, resistance=resistance, expiry_label=expiry_label,
     )
-    if mixed:
-        risk_flags.append("Mixed Confirmation — Spot / Futures / OI do not agree")
+    if df is None or df.empty:
+        return ctx
 
-    recommendation = "WAIT"
-    confidence = max(bull_score, bear_score)
-    if not mixed and bull_score >= min_confidence and bull_score > bear_score and not risk_flags:
-        recommendation = "BUY CALL"
-        confidence = bull_score
-        reasons_for = [k for k, v in bullish_conditions.items() if v]
-    elif not mixed and bear_score >= min_confidence and bear_score > bull_score and not risk_flags:
-        recommendation = "BUY PUT" if bear_score >= min_confidence else "WAIT"
-        # bearish setups: BUY PUT (or exit/short calls) — kept as BUY PUT per spec's phrasing
-        recommendation = "BUY PUT"
-        confidence = bear_score
-        reasons_for = [k for k, v in bearish_conditions.items() if v]
+    ce_oi = df.get("ce_oi", pd.Series(dtype=float))
+    pe_oi = df.get("pe_oi", pd.Series(dtype=float))
+    ce_chng = df.get("ce_chng_oi", pd.Series(dtype=float))
+    pe_chng = df.get("pe_chng_oi", pd.Series(dtype=float))
+    ce_vol = df.get("ce_volume", pd.Series(dtype=float))
+    pe_vol = df.get("pe_volume", pd.Series(dtype=float))
+    ce_iv = df.get("ce_iv", pd.Series(dtype=float))
+    pe_iv = df.get("pe_iv", pd.Series(dtype=float))
+
+    ctx.heavy_ce_oi_thresh = _safe_quantile(ce_oi, HEAVY_OI_PCT)
+    ctx.heavy_pe_oi_thresh = _safe_quantile(pe_oi, HEAVY_OI_PCT)
+    ctx.heavy_ce_chng_thresh = _safe_quantile(ce_chng.clip(lower=0), HEAVY_CHNG_OI_PCT)
+    ctx.heavy_pe_chng_thresh = _safe_quantile(pe_chng.clip(lower=0), HEAVY_CHNG_OI_PCT)
+    ctx.high_ce_vol_thresh = _safe_quantile(ce_vol, HIGH_VOLUME_PCT)
+    ctx.high_pe_vol_thresh = _safe_quantile(pe_vol, HIGH_VOLUME_PCT)
+    ctx.ce_iv_high_thresh = _safe_quantile(ce_iv, IV_HIGH_PCT)
+    ctx.ce_iv_low_thresh = _safe_quantile(ce_iv, IV_LOW_PCT)
+    ctx.pe_iv_high_thresh = _safe_quantile(pe_iv, IV_HIGH_PCT)
+    ctx.pe_iv_low_thresh = _safe_quantile(pe_iv, IV_LOW_PCT)
+    ctx.avg_ce_iv = float(ce_iv[ce_iv > 0].mean()) if (ce_iv > 0).any() else 0.0
+    ctx.avg_pe_iv = float(pe_iv[pe_iv > 0].mean()) if (pe_iv > 0).any() else 0.0
+    ctx.has_gamma = "gamma" in df.columns
+
+    # ── PCR Bias ──────────────────────────────────────────────────────
+    if pcr > 1.3:
+        ctx.pcr_bias = "🟢 Bullish"
+    elif pcr < 0.7:
+        ctx.pcr_bias = "🔴 Bearish"
     else:
-        recommendation = "WAIT"
-        confidence = round((bull_score + bear_score) / 2, 1) if not risk_flags else min(bull_score, bear_score)
+        ctx.pcr_bias = "🟡 Neutral"
 
-    return {
-        "recommendation": recommendation, "confidence": confidence,
-        "bullish_score": bull_score, "bearish_score": bear_score,
-        "reasons": reasons_for if recommendation != "WAIT" else [],
-        "risk_flags": risk_flags,
-        "wait_reason": "Mixed Confirmation" if (recommendation == "WAIT" and risk_flags) else
-                        ("Confidence below threshold" if recommendation == "WAIT" else ""),
+    # ── OI Bias (which side is building more aggressively overall) ──────
+    total_ce_chng_up = float(ce_chng.clip(lower=0).sum())
+    total_pe_chng_up = float(pe_chng.clip(lower=0).sum())
+    if total_pe_chng_up > total_ce_chng_up * 1.15:
+        ctx.oi_bias = "🟢 Put Writers in Control (Bullish)"
+    elif total_ce_chng_up > total_pe_chng_up * 1.15:
+        ctx.oi_bias = "🔴 Call Writers in Control (Bearish)"
+    else:
+        ctx.oi_bias = "🟡 Balanced OI Build-up"
+
+    # ── Seller Bias (STEP 1) — sellers are assumed in control unless
+    # buyers are clearly overwhelming them with fresh volume + ΔOI ─────
+    seller_dominant_ce = total_ce_chng_up >= ctx.heavy_ce_chng_thresh > 0
+    seller_dominant_pe = total_pe_chng_up >= ctx.heavy_pe_chng_thresh > 0
+    if seller_dominant_ce and not seller_dominant_pe:
+        ctx.seller_bias = "🔴 Call Sellers Defending (Resistance)"
+    elif seller_dominant_pe and not seller_dominant_ce:
+        ctx.seller_bias = "🟢 Put Sellers Defending (Support)"
+    elif seller_dominant_ce and seller_dominant_pe:
+        ctx.seller_bias = "🟡 Sellers Active Both Sides (Range)"
+    else:
+        ctx.seller_bias = "🟡 Sellers Passive"
+
+    # ── IV Bias ───────────────────────────────────────────────────────
+    avg_iv = (ctx.avg_ce_iv + ctx.avg_pe_iv) / 2
+    if avg_iv >= max(ctx.ce_iv_high_thresh, ctx.pe_iv_high_thresh) and avg_iv > 0:
+        ctx.iv_bias = "🔴 Elevated IV (favor sellers / caution on buying)"
+    elif 0 < avg_iv <= min(ctx.ce_iv_low_thresh or avg_iv, ctx.pe_iv_low_thresh or avg_iv):
+        ctx.iv_bias = "🟢 Low/Compressed IV"
+    else:
+        ctx.iv_bias = "🟡 Neutral IV"
+
+    # ── Gamma Bias ────────────────────────────────────────────────────
+    if ctx.has_gamma and "Gamma Change" in df.columns:
+        avg_gc = float(df["Gamma Change"].mean())
+        if avg_gc > 0:
+            ctx.gamma_bias = "🟢 Gamma Building (accelerating moves)"
+        elif avg_gc < 0:
+            ctx.gamma_bias = "🔴 Gamma Fading (favor sellers / pinning)"
+        else:
+            ctx.gamma_bias = "🟡 Gamma Flat"
+    else:
+        ctx.gamma_bias = "⚪ Gamma data unavailable"
+
+    # ── Institutional / Smart Money / Dealer Bias (OI+ΔOI proxies) ──────
+    high_oi_pe = df.loc[pe_oi >= ctx.heavy_pe_oi_thresh, "pe_chng_oi"].clip(lower=0).sum() if "pe_chng_oi" in df.columns else 0
+    high_oi_ce = df.loc[ce_oi >= ctx.heavy_ce_oi_thresh, "ce_chng_oi"].clip(lower=0).sum() if "ce_chng_oi" in df.columns else 0
+    if high_oi_pe > high_oi_ce * 1.15:
+        ctx.institutional_bias = "🟢 Institutional Buying (Put support)"
+        ctx.smart_money_bias = "🟢 Accumulation"
+    elif high_oi_ce > high_oi_pe * 1.15:
+        ctx.institutional_bias = "🔴 Institutional Selling (Call resistance)"
+        ctx.smart_money_bias = "🔴 Distribution"
+    else:
+        ctx.institutional_bias = "🟡 Neutral"
+        ctx.smart_money_bias = "🟡 Neutral"
+
+    # Dealer bias proxy: high total OI concentrated near ATM (pin risk) vs
+    # spread out (directional room) — a rough Max-Pain-vs-Spot read.
+    if max_pain and spot_price:
+        dist_pct = abs(spot_price - max_pain) / max_pain * 100
+        if dist_pct < 0.3:
+            ctx.dealer_bias = "🟡 Pin Risk Near Max Pain"
+        elif spot_price > max_pain:
+            ctx.dealer_bias = "🟢 Spot Above Max Pain (dealers may hedge higher)"
+        else:
+            ctx.dealer_bias = "🔴 Spot Below Max Pain (dealers may hedge lower)"
+
+    # ── Trend-engine derived checks (VWAP/EMA/Structure/Volume) ─────────
+    if trend_engine and trend_engine.get("available"):
+        ctx.has_trend_engine = True
+        last_close = trend_engine.get("last_close")
+        vwap = trend_engine.get("vwap")
+        ema20, ema50 = trend_engine.get("ema20"), trend_engine.get("ema50")
+        adx = trend_engine.get("adx", 0)
+        buy_checks = trend_engine.get("buy_checks", {})
+        sell_checks = trend_engine.get("sell_checks", {})
+
+        if last_close is not None and vwap is not None:
+            ctx.price_above_vwap = last_close > vwap
+            ctx.price_below_vwap = last_close < vwap
+        if last_close is not None and ema20 is not None:
+            ctx.above_ema20 = last_close > ema20
+            ctx.below_ema20 = last_close < ema20
+        if last_close is not None and ema50 is not None:
+            ctx.above_ema50 = last_close > ema50
+            ctx.below_ema50 = last_close < ema50
+
+        ctx.bullish_structure = bool(buy_checks.get("Bullish BOS")) or bool(buy_checks.get("Bullish Order Block"))
+        ctx.bearish_structure = bool(sell_checks.get("Bearish BOS")) or bool(sell_checks.get("Bearish Order Block"))
+        ctx.volume_expansion = bool(buy_checks.get("Volume Spike") or sell_checks.get("Volume Spike"))
+        ctx.adx_strong = adx > 25
+        ctx.supertrend_dir = trend_engine.get("supertrend_dir")
+
+    # ── Buyer Bias (STEP 2) — requires trend engine for real momentum
+    # confirmation; without it, buyer bias stays "Unconfirmed" (weak),
+    # per STEP 9's fail-safe-to-WAIT rule ────────────────────────────────
+    if ctx.has_trend_engine:
+        bull_votes = sum(bool(v) for v in [ctx.price_above_vwap, ctx.above_ema20, ctx.above_ema50,
+                                            ctx.bullish_structure, ctx.volume_expansion, ctx.adx_strong])
+        bear_votes = sum(bool(v) for v in [ctx.price_below_vwap, ctx.below_ema20, ctx.below_ema50,
+                                            ctx.bearish_structure, ctx.volume_expansion, ctx.adx_strong])
+        if bull_votes >= 5:
+            ctx.buyer_bias = "🟢 Strong Bullish Momentum"
+        elif bear_votes >= 5:
+            ctx.buyer_bias = "🔴 Strong Bearish Momentum"
+        else:
+            ctx.buyer_bias = "🟡 Momentum Unconfirmed"
+    else:
+        ctx.buyer_bias = "⚪ Momentum Unconfirmed (no candle data)"
+
+    # ── Overall Market Bias / Expected Direction (rollup) ────────────────
+    bull_signals = sum([
+        ctx.pcr_bias.startswith("🟢"), ctx.oi_bias.startswith("🟢"),
+        ctx.institutional_bias.startswith("🟢"), ctx.gamma_bias.startswith("🟢"),
+        ctx.buyer_bias.startswith("🟢"),
+    ])
+    bear_signals = sum([
+        ctx.pcr_bias.startswith("🔴"), ctx.oi_bias.startswith("🔴"),
+        ctx.institutional_bias.startswith("🔴"), ctx.gamma_bias.startswith("🔴"),
+        ctx.buyer_bias.startswith("🔴"),
+    ])
+    if bull_signals >= 3 and bull_signals > bear_signals:
+        ctx.market_bias = "🟢 Bullish"
+        ctx.expected_direction = "🟢 Up-move favored"
+    elif bear_signals >= 3 and bear_signals > bull_signals:
+        ctx.market_bias = "🔴 Bearish"
+        ctx.expected_direction = "🔴 Down-move favored"
+    else:
+        ctx.market_bias = "🟡 Neutral / Range-bound"
+        ctx.expected_direction = "🟡 Range-bound / Unclear"
+
+    return ctx
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Per-strike condition checklists (STEP 5, STEP 6, STEP 7)
+# ══════════════════════════════════════════════════════════════════════════
+
+def _ce_buy_conditions(row: pd.Series, ctx: MarketContext) -> dict:
+    """STEP 5 — every condition must be True for a CE BUY signal."""
+    ce_iv = float(row.get("ce_iv", 0) or 0)
+    conds = {
+        "Price above VWAP": bool(ctx.price_above_vwap),
+        "Above 20 EMA": bool(ctx.above_ema20),
+        "Above 50 EMA": bool(ctx.above_ema50),
+        "Bullish structure (BOS/Order Block)": bool(ctx.bullish_structure),
+        "Strong Put Writing at/near strike": float(row.get("pe_chng_oi", 0) or 0) >= ctx.heavy_pe_chng_thresh > 0,
+        "Call OI unwinding": float(row.get("ce_chng_oi", 0) or 0) < 0,
+        "Increasing volume": float(row.get("ce_volume", 0) or 0) >= ctx.high_ce_vol_thresh > 0,
+        "Positive Gamma trend": (float(row.get("Gamma Change", 0) or 0) > 0) if ctx.has_gamma else False,
+        "PCR supportive (> 1.0)": ctx.pcr > 1.0,
+        "IV acceptable (not elevated)": 0 < ce_iv <= (ctx.ce_iv_high_thresh or ce_iv),
+        "No nearby resistance": (ctx.resistance is None) or (row["strike_price"] < ctx.resistance) or \
+            (ctx.resistance and abs(row["strike_price"] - ctx.resistance) / max(ctx.resistance, 1) > 0.01),
     }
+    return conds
+
+
+def _pe_buy_conditions(row: pd.Series, ctx: MarketContext) -> dict:
+    """STEP 6 — every condition must be True for a PE BUY signal."""
+    pe_iv = float(row.get("pe_iv", 0) or 0)
+    conds = {
+        "Price below VWAP": bool(ctx.price_below_vwap),
+        "Below 20 EMA": bool(ctx.below_ema20),
+        "Below 50 EMA": bool(ctx.below_ema50),
+        "Bearish structure (BOS/Order Block)": bool(ctx.bearish_structure),
+        "Strong Call Writing at/near strike": float(row.get("ce_chng_oi", 0) or 0) >= ctx.heavy_ce_chng_thresh > 0,
+        "Put OI unwinding": float(row.get("pe_chng_oi", 0) or 0) < 0,
+        "High volume": float(row.get("pe_volume", 0) or 0) >= ctx.high_pe_vol_thresh > 0,
+        "Gamma supportive": (float(row.get("Gamma Change", 0) or 0) >= 0) if ctx.has_gamma else False,
+        "PCR bearish (< 1.0)": ctx.pcr < 1.0,
+        "No nearby support": (ctx.support is None) or (row["strike_price"] > ctx.support) or \
+            (ctx.support and abs(row["strike_price"] - ctx.support) / max(ctx.support, 1) > 0.01),
+        "IV acceptable (not elevated)": 0 < pe_iv <= (ctx.pe_iv_high_thresh or pe_iv),
+    }
+    return conds
+
+
+def _ce_sell_conditions(row: pd.Series, ctx: MarketContext) -> dict:
+    """STEP 7 — Call SELL: strong resistance + overpriced premium + weak
+    momentum + time-decay edge."""
+    ce_iv = float(row.get("ce_iv", 0) or 0)
+    momentum_weak = not bool(ctx.bullish_structure) if ctx.has_trend_engine else True
+    conds = {
+        "Strong resistance at strike": ctx.resistance is not None and abs(row["strike_price"] - ctx.resistance) < 1e-6
+            or float(row.get("ce_oi", 0) or 0) >= ctx.heavy_ce_oi_thresh > 0,
+        "Heavy Call Writing": float(row.get("ce_chng_oi", 0) or 0) >= ctx.heavy_ce_chng_thresh > 0,
+        "Premium/IV elevated": ce_iv > 0 and ce_iv >= (ctx.ce_iv_high_thresh or ce_iv),
+        "Momentum weak / stalling": momentum_weak,
+        "Time decay favors seller (theta edge)": True,  # structural — premium decays every session, always true for a seller once the above hold
+    }
+    return conds
+
+
+def _pe_sell_conditions(row: pd.Series, ctx: MarketContext) -> dict:
+    """STEP 7 — Put SELL: strong support + overpriced premium + weak
+    momentum + time-decay edge."""
+    pe_iv = float(row.get("pe_iv", 0) or 0)
+    momentum_weak = not bool(ctx.bearish_structure) if ctx.has_trend_engine else True
+    conds = {
+        "Strong support at strike": ctx.support is not None and abs(row["strike_price"] - ctx.support) < 1e-6
+            or float(row.get("pe_oi", 0) or 0) >= ctx.heavy_pe_oi_thresh > 0,
+        "Heavy Put Writing": float(row.get("pe_chng_oi", 0) or 0) >= ctx.heavy_pe_chng_thresh > 0,
+        "Premium/IV elevated": pe_iv > 0 and pe_iv >= (ctx.pe_iv_high_thresh or pe_iv),
+        "Momentum weak / stalling": momentum_weak,
+        "Time decay favors seller (theta edge)": True,
+    }
+    return conds
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# TRADE LEVELS (Entry / SL / Targets, premium-% based — consistent with the
-# rest of this project's option-level trade-signal conventions)
+# Probability / Confidence / Risk scoring
 # ══════════════════════════════════════════════════════════════════════════
 
-def build_trade_levels(df: pd.DataFrame, recommendation: str, atm_strike: float) -> dict:
-    if recommendation not in ("BUY CALL", "BUY PUT") or df.empty:
-        return {"strike": None, "entry": None, "sl": None, "t1": None, "t2": None, "t3": None, "risk_reward": "—"}
+def _probability_from_conditions(conds: dict, base_score: float) -> float:
+    """Probability blends the strike's own model score (CE/PE Score,
+    already 0-100 from the dashboard's AI Engine) with the fraction of
+    the strict checklist that passed — so a strike only reaches the
+    required >85% probability bar when BOTH the quantitative score and
+    the qualitative condition list agree."""
+    if not conds:
+        return 0.0
+    passed_frac = sum(1 for v in conds.values() if v) / len(conds)
+    return round(_clip01(0.5 * (base_score / 100.0) + 0.5 * passed_frac) * 100, 1)
 
-    ltp_col = "ce_ltp" if recommendation == "BUY CALL" else "pe_ltp"
-    row = df.iloc[(df["strike_price"] - atm_strike).abs().argsort()[:1]]
-    if row.empty:
-        return {"strike": None, "entry": None, "sl": None, "t1": None, "t2": None, "t3": None, "risk_reward": "—"}
 
-    row = row.iloc[0]
-    entry = float(row.get(ltp_col, 0))
+def _risk_level(probability: float, confidence: float, iv_bias: str) -> str:
+    score = (probability + confidence) / 2
+    if iv_bias.startswith("🔴"):
+        score -= 10  # elevated IV = elevated risk even with a good setup
+    if score >= 90:
+        return "Low"
+    if score >= 80:
+        return "Moderate"
+    if score >= 70:
+        return "Elevated"
+    return "High"
+
+
+def _levels(entry: float):
     if entry <= 0:
-        return {"strike": float(row["strike_price"]), "entry": None, "sl": None, "t1": None, "t2": None,
-                "t3": None, "risk_reward": "—"}
-
-    sl, t1, t2, t3 = round(entry * 0.85, 2), round(entry * 1.15, 2), round(entry * 1.30, 2), round(entry * 1.50, 2)
-    risk = max(entry - sl, 0.01)
-    rr = round((t2 - entry) / risk, 2)
-    return {"strike": float(row["strike_price"]), "entry": round(entry, 2), "sl": sl, "t1": t1, "t2": t2, "t3": t3,
-            "risk_reward": f"1 : {rr}"}
+        return 0.0, 0.0, 0.0, 0.0
+    sl = round(entry * 0.85, 2)
+    t1 = round(entry * 1.15, 2)
+    t2 = round(entry * 1.30, 2)
+    t3 = round(entry * 1.50, 2)
+    return sl, t1, t2, t3
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# MASTER ORCHESTRATOR
+# Per-strike evaluation (STEP 8 traps + STEP 9 final decision engine)
 # ══════════════════════════════════════════════════════════════════════════
 
-def analyze_market(fyers, symbol_candidates: list, df: pd.DataFrame, spot_price: float,
-                    atm_strike: float, max_pain: float, pcr: float, expiry_label: str,
-                    symbol_key: str = None, futures_symbol_candidates: list = None,
-                    smart_money: dict = None, candles_5m: pd.DataFrame = None,
-                    min_confidence: float = 85.0) -> dict:
-    """
-    Runs the full 11-step methodology and returns the STEP 11 report as a
-    single dict. This never raises on missing data — every step degrades
-    to 'Insufficient Data' / 'Not Available' and the signal/risk filters
-    (Steps 9-10) treat any gap as a reason to prefer WAIT, never as a
-    reason to fabricate a BUY/SELL.
+def _evaluate_strike(row: pd.Series, ctx: MarketContext,
+                      min_probability: float, min_confidence: float) -> dict:
+    strike = float(row["strike_price"])
+    ce_score = float(row.get("CE Score", 0) or 0)
+    pe_score = float(row.get("PE Score", 0) or 0)
 
-    Parameters mirror what the dashboard already computes each refresh
-    (`df`, `spot_price`, `atm_strike`, `max_pain`, `pcr`, `expiry_label`,
-    `symbol_candidates`) so this can be called right after
-    `compute_ai_engine()` / `compute_gamma_analysis()` in the existing
-    `show_option_chain()` flow. `smart_money` and `candles_5m` are
-    optional — pass the AI Scalping Engine's own `trend_engine` /
-    `fetch_underlying_candles(...)` result if you want Step 7 and a
-    reused (not re-fetched) candle set; otherwise this module fetches
-    its own 5m candles.
-    """
-    symbol_key = symbol_key or (symbol_candidates[0] if symbol_candidates else "UNKNOWN")
+    ce_buy_conds = _ce_buy_conditions(row, ctx)
+    pe_buy_conds = _pe_buy_conditions(row, ctx)
+    ce_sell_conds = _ce_sell_conditions(row, ctx)
+    pe_sell_conds = _pe_sell_conditions(row, ctx)
 
-    if candles_5m is None:
-        candles_5m = fetch_underlying_candles(fyers, symbol_candidates, resolution="5", lookback_days=5)
+    ce_buy_all = ctx.has_trend_engine and all(ce_buy_conds.values())
+    pe_buy_all = ctx.has_trend_engine and all(pe_buy_conds.values())
+    ce_sell_all = all(ce_sell_conds.values())
+    pe_sell_all = all(pe_sell_conds.values())
 
-    # STEP 1
-    spot = compute_spot_trend(candles_5m)
+    ce_buy_prob = _probability_from_conditions(ce_buy_conds, ce_score)
+    pe_buy_prob = _probability_from_conditions(pe_buy_conds, pe_score)
+    ce_sell_prob = _probability_from_conditions(ce_sell_conds, 100 - ce_score)
+    pe_sell_prob = _probability_from_conditions(pe_sell_conds, 100 - pe_score)
 
-    # STEP 2
-    futures = compute_futures_confirmation(fyers, futures_symbol_candidates or [], spot_price, symbol_key)
+    ce_buy_conf = round((ce_score + ce_buy_prob) / 2, 1)
+    pe_buy_conf = round((pe_score + pe_buy_prob) / 2, 1)
+    ce_sell_conf = round(((100 - ce_score) + ce_sell_prob) / 2, 1)
+    pe_sell_conf = round(((100 - pe_score) + pe_sell_prob) / 2, 1)
 
-    # STEP 3
-    ranked_df = compute_oi_rankings(df)
+    # STEP 8 — avoid-trap gate: never allow a BUY through if it fights
+    # the market-wide institutional/smart-money bias, even if the local
+    # strike checklist happened to pass.
+    if ce_buy_all and ctx.institutional_bias.startswith("🔴") and ctx.smart_money_bias.startswith("🔴"):
+        ce_buy_all = False
+    if pe_buy_all and ctx.institutional_bias.startswith("🟢") and ctx.smart_money_bias.startswith("🟢"):
+        pe_buy_all = False
 
-    # STEP 4
-    ranked_df = add_greeks_columns(ranked_df, spot_price, expiry_label)
-    greeks_summary = summarize_greeks(ranked_df, atm_strike)
+    candidates = []
+    if ce_buy_all and ce_buy_prob >= min_probability and ce_buy_conf >= min_confidence:
+        candidates.append(("CE BUY", ce_buy_prob, ce_buy_conf, ce_buy_conds, row.get("ce_ltp", 0)))
+    if pe_buy_all and pe_buy_prob >= min_probability and pe_buy_conf >= min_confidence:
+        candidates.append(("PE BUY", pe_buy_prob, pe_buy_conf, pe_buy_conds, row.get("pe_ltp", 0)))
+    if ce_sell_all and ce_sell_prob >= min_probability:
+        candidates.append(("CE SELL", ce_sell_prob, ce_sell_conf, ce_sell_conds, row.get("ce_ltp", 0)))
+    if pe_sell_all and pe_sell_prob >= min_probability:
+        candidates.append(("PE SELL", pe_sell_prob, pe_sell_conf, pe_sell_conds, row.get("pe_ltp", 0)))
 
-    # STEP 5
-    ranked_df = compute_oi_observation(ranked_df, symbol_key, expiry_label)
+    if not candidates:
+        return {
+            "Strike": strike, "Recommended Action": "WAIT",
+            "Probability %": max(ce_buy_prob, pe_buy_prob, ce_sell_prob, pe_sell_prob),
+            "Confidence %": max(ce_buy_conf, pe_buy_conf, ce_sell_conf, pe_sell_conf),
+            "Risk Level": "—", "Entry": 0.0, "Stop Loss": 0.0,
+            "Target 1": 0.0, "Target 2": 0.0, "Target 3": 0.0,
+            "Reason for Trade": "—",
+            "Reason to Avoid Trade": _missing_reasons(ce_buy_conds, pe_buy_conds, ctx),
+            "Invalidation Level": "—",
+            "_ce_buy_conditions": ce_buy_conds, "_pe_buy_conditions": pe_buy_conds,
+            "_ce_sell_conditions": ce_sell_conds, "_pe_sell_conditions": pe_sell_conds,
+        }
 
-    # STEP 6
-    dominance = compute_ce_pe_dominance(ranked_df)
+    action, prob, conf, conds, ltp = max(candidates, key=lambda c: (c[1] + c[2]))
+    ltp = float(ltp or 0)
+    is_sell = action.endswith("SELL")
 
-    # STEP 7
-    sm_summary = summarize_smart_money(smart_money)
+    if is_sell:
+        # Premium SELL: SL/targets are inverted vs a BUY (credit position).
+        entry = ltp
+        sl = round(entry * 1.20, 2)   # premium expanding 20% against the seller
+        t1 = round(entry * 0.85, 2)
+        t2 = round(entry * 0.70, 2)
+        t3 = round(entry * 0.50, 2)
+    else:
+        entry = ltp
+        sl, t1, t2, t3 = _levels(entry)
 
-    # STEP 8
-    volume = compute_volume_analysis(ranked_df, candles_5m, futures)
+    invalidation = None
+    if action == "CE BUY":
+        invalidation = ctx.resistance if ctx.resistance else strike
+    elif action == "PE BUY":
+        invalidation = ctx.support if ctx.support else strike
+    elif action == "CE SELL":
+        invalidation = ctx.resistance
+    elif action == "PE SELL":
+        invalidation = ctx.support
 
-    # STEPS 9 & 10
-    final = determine_final_signal(spot, futures, dominance, greeks_summary, sm_summary, volume, min_confidence)
-
-    # Support / Resistance from the option chain itself (max PE OI / max CE OI)
-    support = float(ranked_df.loc[ranked_df["pe_oi"].idxmax(), "strike_price"]) if len(ranked_df) else None
-    resistance = float(ranked_df.loc[ranked_df["ce_oi"].idxmax(), "strike_price"]) if len(ranked_df) else None
-
-    levels = build_trade_levels(ranked_df, final["recommendation"], atm_strike)
-
-    plain_english = _build_explanation(spot, futures, dominance, greeks_summary, sm_summary, volume, final, levels)
-
-    # STEP 11 — structured output
     return {
-        "market_trend": spot.get("trend", "Insufficient Data"),
-        "bullish_pct": spot.get("bullish_pct", 50.0),
-        "bearish_pct": spot.get("bearish_pct", 50.0),
-        "spot_trend": spot,
-        "future_trend": futures,
-        "oi_analysis": {
-            "total_ce_oi": dominance.get("total_ce_oi"), "total_pe_oi": dominance.get("total_pe_oi"),
-            "pcr": pcr, "max_pain": max_pain,
-        },
-        "oi_change_analysis": {
-            "total_ce_chng_oi": dominance.get("total_ce_chng_oi"),
-            "total_pe_chng_oi": dominance.get("total_pe_chng_oi"),
-        },
-        "ce_observation": {
-            "writing": dominance.get("ce_writing"), "unwinding": dominance.get("ce_unwinding"),
-            "volume": dominance.get("total_ce_volume"),
-        },
-        "pe_observation": {
-            "writing": dominance.get("pe_writing"), "unwinding": dominance.get("pe_unwinding"),
-            "volume": dominance.get("total_pe_volume"),
-        },
-        "dominant_side": dominance.get("dominant_side"),
-        "gamma_observation": greeks_summary.get("gamma_observation"),
-        "vega_observation": greeks_summary.get("vega_observation"),
-        "delta_observation": greeks_summary.get("delta_observation"),
-        "theta_observation": greeks_summary.get("theta_observation"),
-        "iv_analysis": "Derived per-strike from chain premiums via the dashboard's own Black-Scholes "
-                       "IV solver (FYERS optionchain does not return live IV directly).",
-        "support": support,
-        "resistance": resistance,
-        "entry": levels["entry"], "stop_loss": levels["sl"],
-        "target_1": levels["t1"], "target_2": levels["t2"], "target_3": levels["t3"],
-        "risk_reward": levels["risk_reward"],
-        "confidence_pct": final["confidence"],
-        "recommendation": final["recommendation"],
-        "wait_reason": final["wait_reason"],
-        "risk_flags": final["risk_flags"],
-        "reasons": final["reasons"],
-        "explanation": plain_english,
-        "chain_with_ai_columns": ranked_df,
+        "Strike": strike, "Recommended Action": action,
+        "Probability %": prob, "Confidence %": conf,
+        "Risk Level": _risk_level(prob, conf, ctx.iv_bias),
+        "Entry": entry, "Stop Loss": sl,
+        "Target 1": t1, "Target 2": t2, "Target 3": t3,
+        "Reason for Trade": " · ".join(k for k, v in conds.items() if v),
+        "Reason to Avoid Trade": _missing_reasons(
+            _ce_buy_conditions(row, ctx) if action != "CE BUY" else {},
+            _pe_buy_conditions(row, ctx) if action != "PE BUY" else {}, ctx),
+        "Invalidation Level": f"{invalidation:,.0f}" if invalidation else "—",
+        "_ce_buy_conditions": ce_buy_conds, "_pe_buy_conditions": pe_buy_conds,
+        "_ce_sell_conditions": ce_sell_conds, "_pe_sell_conditions": pe_sell_conds,
     }
 
 
-def _build_explanation(spot, futures, dominance, greeks, smart_money, volume, final, levels) -> str:
-    """Plain-language explanation of the recommendation, as required by
-    the spec ('Explain every recommendation in simple language')."""
-    lines = []
-    lines.append(f"Spot is reading **{spot.get('trend', 'Insufficient Data')}** "
-                  f"({spot.get('bullish_pct', 50)}% bullish / {spot.get('bearish_pct', 50)}% bearish signals).")
-    if futures.get("available"):
-        lines.append(f"Futures show **{futures.get('buildup')}** at a "
-                      f"{futures.get('premium_label', '—').lower()} of {futures.get('premium_discount', 0):+.2f} "
-                      f"to spot — trend reads **{futures.get('future_trend')}**.")
-    else:
-        lines.append("Futures data wasn't available this refresh, so Futures confirmation is missing.")
-    lines.append(f"Option chain OI currently favors **{dominance.get('dominant_side', 'Insufficient Data')}**.")
-    lines.append(f"Greeks near ATM: {greeks.get('gamma_observation', '—')}; {greeks.get('vega_observation', '—')}.")
-    if smart_money.get("available"):
-        lines.append(f"Smart-money structure bias: **{smart_money.get('bias')}**.")
-    else:
-        lines.append("Smart-money structure (Order Block/BOS/CHOCH/FVG) wasn't supplied to this engine.")
-    lines.append("Volume is confirmed." if volume.get("volume_confirmed") else
-                 "Volume is NOT confirmed — this alone can hold the signal to WAIT.")
+def _missing_reasons(ce_buy_conds: dict, pe_buy_conds: dict, ctx: MarketContext) -> str:
+    missing = []
+    if not ctx.has_trend_engine:
+        missing.append("No underlying candle data (VWAP/EMA/Structure unconfirmed)")
+    missing += [f"CE: {k}" for k, v in ce_buy_conds.items() if not v]
+    missing += [f"PE: {k}" for k, v in pe_buy_conds.items() if not v]
+    if not missing:
+        return "—"
+    return " · ".join(missing[:6]) + (" · …" if len(missing) > 6 else "")
 
-    if final["recommendation"] == "WAIT":
-        reason = final.get("wait_reason") or "conditions did not align"
-        lines.append(f"**Result: WAIT.** Reason: {reason}. "
-                      f"Confidence only reached {final['confidence']}%, below the "
-                      "required threshold, or the signals disagreed with each other.")
-    else:
-        lines.append(f"**Result: {final['recommendation']}** at {final['confidence']}% confidence, "
-                      f"because: {', '.join(final['reasons'])}.")
-        if levels.get("entry"):
-            lines.append(f"Suggested strike {levels['strike']:,.0f} — Entry {levels['entry']}, "
-                          f"SL {levels['sl']}, Targets {levels['t1']}/{levels['t2']}/{levels['t3']}, "
-                          f"Risk-Reward {levels['risk_reward']}.")
-    lines.append("This is a heuristic read from live-but-incomplete data (no order-book depth, no "
-                 "certified SMC engine) — not financial advice. Confirm with your own analysis and risk rules.")
-    return "\n\n".join(lines)
+
+# ══════════════════════════════════════════════════════════════════════════
+# PUBLIC ENTRY POINT
+# ══════════════════════════════════════════════════════════════════════════
+
+def analyze_market(df: pd.DataFrame, spot_price: float, atm_strike: float,
+                    max_pain: float, pcr: float, support: Optional[float] = None,
+                    resistance: Optional[float] = None, trend_engine: Optional[dict] = None,
+                    expiry_label: str = "", min_probability: float = MIN_PROBABILITY,
+                    min_confidence: float = MIN_CONFIDENCE, top_n: int = 10) -> dict:
+    """
+    Main entry point. Runs the full seller -> buyer -> market-maker ->
+    smart-money -> strict-condition decision framework and returns a
+    dict matching the "FINAL OUTPUT FORMAT" section of the framework:
+
+        {
+          "market_bias", "smart_money_bias", "seller_bias", "buyer_bias",
+          "institutional_bias", "dealer_bias", "pcr_bias", "oi_bias",
+          "gamma_bias", "iv_bias", "expected_direction",
+          "best_trade": {...} | None,
+          "top_trades": [ {...}, ... ],   # up to top_n qualifying trades
+          "all_strikes": [ {...}, ... ],  # every strike, mostly WAIT
+          "data_quality": {...},
+        }
+
+    `df` must already carry the dashboard's own CE Score / PE Score
+    columns (i.e. call this AFTER compute_ai_engine()). If those columns
+    are missing, this degrades gracefully — every strike simply scores
+    lower on the probability blend and is far less likely to clear the
+    minimum bar, which is the correct fail-safe direction (STEP 9).
+    """
+    if df is None or df.empty:
+        return _empty_result(reason="Empty option chain — nothing to analyze.")
+
+    ctx = build_market_context(df, spot_price, atm_strike, max_pain, pcr, support,
+                                resistance, trend_engine=trend_engine, expiry_label=expiry_label)
+
+    results = []
+    for _, row in df.iterrows():
+        try:
+            results.append(_evaluate_strike(row, ctx, min_probability, min_confidence))
+        except Exception:  # noqa: BLE001 - never let one malformed row kill the whole read
+            continue
+
+    qualifying = [r for r in results if r["Recommended Action"] != "WAIT"]
+    qualifying.sort(key=lambda r: (r["Probability %"] + r["Confidence %"]), reverse=True)
+    best_trade = qualifying[0] if qualifying else None
+
+    for r in results:
+        r.pop("_ce_buy_conditions", None)
+        r.pop("_pe_buy_conditions", None)
+        r.pop("_ce_sell_conditions", None)
+        r.pop("_pe_sell_conditions", None)
+
+    return {
+        "market_bias": ctx.market_bias,
+        "smart_money_bias": ctx.smart_money_bias,
+        "seller_bias": ctx.seller_bias,
+        "buyer_bias": ctx.buyer_bias,
+        "institutional_bias": ctx.institutional_bias,
+        "dealer_bias": ctx.dealer_bias,
+        "pcr_bias": ctx.pcr_bias,
+        "oi_bias": ctx.oi_bias,
+        "gamma_bias": ctx.gamma_bias,
+        "iv_bias": ctx.iv_bias,
+        "expected_direction": ctx.expected_direction,
+        "best_trade": best_trade,
+        "top_trades": qualifying[:top_n],
+        "all_strikes": results,
+        "data_quality": {
+            "has_trend_engine": ctx.has_trend_engine,
+            "has_gamma": ctx.has_gamma,
+            "strikes_evaluated": len(results),
+            "strikes_qualifying": len(qualifying),
+            "note": (
+                "Buyer-side (CE BUY / PE BUY) signals require underlying VWAP/EMA/structure "
+                "confirmation from a trend_engine (e.g. this dashboard's compute_scalping_trend_engine "
+                "output). Without it, buyer-side signals correctly stay at WAIT per the framework's "
+                "'missing confirmation -> WAIT' rule; seller-side (CE SELL / PE SELL) reads can still "
+                "surface from the option-chain snapshot alone."
+            ),
+        },
+    }
+
+
+def _empty_result(reason: str) -> dict:
+    return {
+        "market_bias": "🟡 Neutral", "smart_money_bias": "🟡 Neutral",
+        "seller_bias": "🟡 Balanced", "buyer_bias": "🟡 Weak",
+        "institutional_bias": "🟡 Neutral", "dealer_bias": "🟡 Neutral",
+        "pcr_bias": "🟡 Neutral", "oi_bias": "🟡 Neutral",
+        "gamma_bias": "⚪ Unavailable", "iv_bias": "🟡 Neutral",
+        "expected_direction": "🟡 Range-bound", "best_trade": None,
+        "top_trades": [], "all_strikes": [],
+        "data_quality": {"has_trend_engine": False, "has_gamma": False,
+                          "strikes_evaluated": 0, "strikes_qualifying": 0, "note": reason},
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Optional Streamlit rendering helper (mirrors this dashboard's card style)
+# ══════════════════════════════════════════════════════════════════════════
+
+def render_ai_analysis_block(result: dict, st_module=None) -> None:
+    """Renders the analyze_market() result using the same intel-card /
+    rating-* CSS classes already defined in the dashboard's <style> block,
+    so it drops into show_option_chain() without adding new CSS. Pass the
+    imported `streamlit` module in as `st_module` (kept as a parameter,
+    not a hard import, so this file has no Streamlit dependency at
+    import time and can be unit-tested headlessly)."""
+    if st_module is None:
+        import streamlit as st_module  # local import keeps module import light
+
+    st_module.markdown('<div class="block-title">🧠 AI Market Analysis (Seller → Buyer → Dealer → Smart Money)</div>',
+                        unsafe_allow_html=True)
+
+    bias_fields = [
+        ("Market Bias", result["market_bias"]), ("Expected Direction", result["expected_direction"]),
+        ("Seller Bias", result["seller_bias"]), ("Buyer Bias", result["buyer_bias"]),
+        ("Smart Money Bias", result["smart_money_bias"]), ("Institutional Bias", result["institutional_bias"]),
+        ("Dealer Bias", result["dealer_bias"]), ("PCR Bias", result["pcr_bias"]),
+        ("OI Bias", result["oi_bias"]), ("Gamma Bias", result["gamma_bias"]), ("IV Bias", result["iv_bias"]),
+    ]
+    cols = st_module.columns(4)
+    for i, (label, value) in enumerate(bias_fields):
+        with cols[i % 4]:
+            st_module.markdown(
+                f"""<div class="intel-card"><div class="intel-label">{label}</div>
+                <div class="intel-value" style="font-size:14px;">{value}</div></div>""",
+                unsafe_allow_html=True,
+            )
+
+    st_module.markdown("<br>", unsafe_allow_html=True)
+    best = result.get("best_trade")
+    if not best:
+        st_module.info(
+            "🟡 WAIT — no strike currently satisfies every condition in the Seller/Buyer/Dealer/"
+            "Smart-Money checklist at the required probability/confidence bar. " +
+            result.get("data_quality", {}).get("note", "")
+        )
+        return
+
+    action = best["Recommended Action"]
+    css = "rating-strongbuy" if "BUY" in action else "rating-avoid"
+    st_module.markdown(f"""
+    <div class="intel-card">
+      <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;">
+        <div><b style="color:#e6edf3;">{best['Strike']:,.0f}</b>
+          &nbsp; <span class="{css}">{action}</span></div>
+        <div class="intel-label">Probability <span style="color:#e6edf3;font-weight:700;">{best['Probability %']:.1f}%</span>
+          &nbsp;|&nbsp; Confidence <span style="color:#e6edf3;font-weight:700;">{best['Confidence %']:.1f}%</span></div>
+      </div>
+      <div style="margin-top:10px;font-family:'Courier New',monospace;color:#e6edf3;font-size:14px;">
+        Entry <b>{best['Entry']}</b> &nbsp;|&nbsp; Stop Loss <b>{best['Stop Loss']}</b> &nbsp;|&nbsp;
+        T1 {best['Target 1']} &nbsp; T2 {best['Target 2']} &nbsp; T3 {best['Target 3']}
+        &nbsp;|&nbsp; Risk {best['Risk Level']} &nbsp;|&nbsp; Invalidation {best['Invalidation Level']}
+      </div>
+      <div style="margin-top:8px;color:#8b949e;font-size:12px;">Reason: {best['Reason for Trade']}</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    if result.get("top_trades"):
+        st_module.markdown("<br>**Other qualifying strikes**", unsafe_allow_html=True)
+        st_module.dataframe(
+            pd.DataFrame(result["top_trades"]).drop(columns=["Reason to Avoid Trade"], errors="ignore"),
+            use_container_width=True, height=280,
+        )
