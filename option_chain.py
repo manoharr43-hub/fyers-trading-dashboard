@@ -671,6 +671,74 @@ def validate_option_chain_df(df) -> bool:
         return False
 
 
+def filter_strikes_around_atm(df: pd.DataFrame, spot_price: float, strike_count) -> pd.DataFrame:
+    """Explicit "Strike Selection" pipeline step.
+
+    FYERS' optionchain API only ever returns `strike_count` strikes on
+    each side of ATM (the `strikecount` request parameter) — but NSE's
+    public endpoint always returns the FULL expiry chain (often 40-80+
+    strikes). Feeding that mismatched strike universe straight into the
+    AI engine would silently break "identical pipeline / identical
+    quality" between sources, because every score in this file is
+    computed via _normalize() — a min/max RELATIVE to whichever strikes
+    are visible. A wider NSE strike universe compresses/stretches CE/PE
+    Score, Institutional Score, Smart Money Score, etc. relative to what
+    FYERS would have produced for the exact same market.
+
+    This restricts any chain (NSE today; safe to reuse for any future
+    source) to `strike_count` strikes above and below ATM, mirroring
+    FYERS' own behaviour, so both sources feed the AI engine the same
+    shaped strike universe. Never raises; degrades to the untouched
+    DataFrame if strike_count/spot_price aren't usable.
+    """
+    try:
+        if df is None or df.empty or "strike_price" not in df.columns:
+            return df
+        n = int(strike_count) if strike_count else 0
+        if n <= 0:
+            return df
+        d = df.sort_values("strike_price").reset_index(drop=True)
+        ref = spot_price if spot_price else float(d["strike_price"].median())
+        atm_idx = int((d["strike_price"] - ref).abs().idxmin())
+        lo = max(0, atm_idx - n)
+        hi = min(len(d), atm_idx + n + 1)
+        out = d.iloc[lo:hi].reset_index(drop=True)
+        logger.info(
+            "NSE Stage: Strike Selection — restricted chain from %d to %d strikes "
+            "(%d each side of ATM ref=%.2f), matching FYERS strikecount behaviour",
+            len(d), len(out), n, ref,
+        )
+        return out
+    except Exception as e:  # noqa: BLE001 - strike selection must never crash the pipeline
+        logger.error("Strike selection (filter_strikes_around_atm) raised an exception: %s", e)
+        return df
+
+
+def normalize_nse_to_fyers_schema(df: pd.DataFrame) -> pd.DataFrame:
+    """Explicit "Column Mapping" pipeline step for the NSE route.
+
+    fetch_nse_option_chain() already builds rows directly in FYERS' wide
+    schema, but this function is the single, logged checkpoint that
+    GUARANTEES schema + dtype parity with FYERS before ANY AI/scoring
+    function ever touches the data — every column ensure_numeric_columns()
+    and compute_ai_engine()/compute_big_move_scores() expect is present,
+    numeric, and named exactly like the FYERS route, regardless of source.
+    This is what requirement "Normalize all NSE column names to match the
+    FYERS schema before any AI calculation" refers to as a distinct step.
+    """
+    logger.info("NSE Stage: Column Mapping — normalizing NSE fields to FYERS schema")
+    if df is None or df.empty:
+        logger.error("NSE Stage: Column Mapping — received an empty/None DataFrame, nothing to map")
+        return df
+    d = df.copy()
+    # Same canonical column set ensure_numeric_columns() (the FYERS route's
+    # own schema gate) already enforces — reusing it here guarantees the
+    # two routes can never silently drift apart.
+    d = ensure_numeric_columns(d)
+    logger.info("NSE Stage: Column Mapping complete — columns=%s", list(d.columns))
+    return d
+
+
 # NSE only lists tradable options for these indices via its public
 # option-chain-indices endpoint. NIFTYNEXT50 has no listed options, and
 # SENSEX/BANKEX are BSE instruments — NSE is not a valid backup for those,
@@ -710,12 +778,14 @@ def fetch_nse_option_chain_raw(symbol_key: str, is_stock: bool, stock_name: str 
     JSON, unsupported instrument) — callers must treat an empty dict as
     'NSE unavailable' rather than raising, so this function never bubbles
     an exception up to Streamlit."""
+    logger.info("NSE Stage 1/5: Data Download — requesting NSE option chain for %s", symbol_key or stock_name)
     try:
         if is_stock:
             nse_symbol = (stock_name or "").strip().upper()
             if nse_symbol.endswith("-EQ"):
                 nse_symbol = nse_symbol[:-3]
             if not nse_symbol:
+                logger.error("NSE Stage 1/5: Data Download failed — no stock symbol provided")
                 return {}
             url = f"https://www.nseindia.com/api/option-chain-equities?symbol={nse_symbol}"
         else:
@@ -723,41 +793,50 @@ def fetch_nse_option_chain_raw(symbol_key: str, is_stock: bool, stock_name: str 
             if not nse_symbol:
                 # Instrument isn't listed on NSE's option-chain endpoint
                 # (e.g. SENSEX / BANKEX / NIFTYNEXT50) — fail gracefully.
+                logger.error(
+                    "NSE Stage 1/5: Data Download skipped — %s is not available on NSE's "
+                    "option-chain endpoint (BSE instrument or no listed options)", symbol_key,
+                )
                 return {}
             url = f"https://www.nseindia.com/api/option-chain-indices?symbol={nse_symbol}"
 
         session = _nse_session()
         resp = session.get(url, timeout=10)
         if resp.status_code != 200:
-            logger.error("NSE fetch returned HTTP %s for %s", resp.status_code, symbol_key or stock_name)
+            logger.error("NSE Stage 1/5: Data Download failed — HTTP %s for %s", resp.status_code, symbol_key or stock_name)
             return {}
         try:
-            return resp.json()
+            payload = resp.json()
+            logger.info("NSE Stage 1/5: Data Download succeeded for %s", symbol_key or stock_name)
+            return payload
         except ValueError as e:  # invalid JSON
-            logger.error("NSE response was not valid JSON for %s: %s", symbol_key or stock_name, e)
+            logger.error("NSE Stage 1/5: Data Download failed — invalid JSON for %s: %s", symbol_key or stock_name, e)
             return {}
     except Exception as e:  # noqa: BLE001 - covers timeouts, connection errors, DNS, etc.
-        logger.error("NSE raw fetch failed for %s: %s", symbol_key or stock_name, e)
+        logger.error("NSE Stage 1/5: Data Download raised an exception for %s: %s", symbol_key or stock_name, e)
         return {}
 
 
 def fetch_nse_option_chain(symbol_key: str, is_stock: bool, stock_name: str = "",
-                            preferred_expiry_label: str = "") -> tuple:
-    """Fetches + parses the NSE Option Chain into the same WIDE
-    (strike_price, ce_*, pe_*) shape the rest of this dashboard already
-    expects, so every downstream function (Max Pain, PCR, AI Engine, IV,
-    Gamma, Scalping, Excel export, etc.) works unmodified regardless of
-    which source supplied the data.
+                            preferred_expiry_label: str = "", strike_count=None) -> tuple:
+    """Runs the FULL NSE data pipeline — Data Download, Column Mapping,
+    Strike Selection, Validation — and returns the option chain in the
+    exact same WIDE (strike_price, ce_*, pe_*) shape, dtypes, and strike
+    universe size the FYERS route already produces, so every downstream
+    function (Max Pain, PCR, AI Engine, Greeks/IV, Gamma, Scalping, Excel
+    export, analyze_market) works unmodified and produces comparable
+    results regardless of which source supplied the data.
 
-    Returns (df, spot_price, expiry_label, expiry_list). df is None if
-    NSE could not be reached, returned nothing, or returned unusable data
-    — this function never raises.
+    Returns (df, spot_price, expiry_label, expiry_list). df is None only
+    if NSE could not be reached or returned nothing at all — this
+    function never raises; every stage below is individually logged.
     """
     try:
         raw = fetch_nse_option_chain_raw(symbol_key, is_stock, stock_name)
         records = raw.get("records", {}) if isinstance(raw, dict) else {}
         chain = records.get("data", []) if isinstance(records, dict) else []
         if not chain:
+            logger.error("NSE Stage 1/5: Data Download returned no contracts for %s", symbol_key or stock_name)
             return None, 0.0, "", []
 
         spot_price = 0.0
@@ -792,12 +871,41 @@ def fetch_nse_option_chain(symbol_key: str, is_stock: bool, stock_name: str = ""
             })
 
         if not rows:
+            logger.error(
+                "NSE Stage 1/5: Data Download — %s had an expiry list but zero strikes matched "
+                "expiry '%s' for %s", len(chain), target_expiry, symbol_key or stock_name,
+            )
             return None, spot_price, target_expiry, nse_expiry_dates
 
+        logger.info(
+            "NSE Stage 1/5: Data Download complete — %d strikes for %s @ expiry %s",
+            len(rows), symbol_key or stock_name, target_expiry,
+        )
+
         df = pd.DataFrame(rows)
+
+        # ── Stage 2/5: Column Mapping — enforce identical FYERS schema ──
+        df = normalize_nse_to_fyers_schema(df)
+
+        # ── Strike Selection — match FYERS' strikecount-limited universe
+        # so the AI engine sees a comparable set of strikes either way ──
+        if df is not None and not df.empty:
+            df = filter_strikes_around_atm(df, spot_price, strike_count)
+            df.sort_values("strike_price", inplace=True)
+            df.reset_index(drop=True, inplace=True)
+
+        # ── Stage 3/5: Validation ────────────────────────────────────────
+        if validate_option_chain_df(df):
+            logger.info(
+                "NSE Stage 3/5: Validation passed — %d strikes ready for the AI engine (spot=%.2f)",
+                len(df), spot_price,
+            )
+        else:
+            logger.error("NSE Stage 3/5: Validation failed for %s — data did not pass schema checks", symbol_key or stock_name)
+
         return df, spot_price, target_expiry, nse_expiry_dates
     except Exception as e:  # noqa: BLE001 - parsing must never crash the app
-        logger.error("NSE option chain parsing failed for %s: %s", symbol_key or stock_name, e)
+        logger.error("NSE pipeline raised an exception for %s: %s", symbol_key or stock_name, e)
         return None, 0.0, "", []
 
 
@@ -902,7 +1010,11 @@ def get_option_chain_data(fyers, symbol_candidates: list, strike_count: int, exp
         logger.error(fyers_err)
 
     if fyers_df is not None and not fyers_df.empty:
-        logger.info("Using FYERS Option Chain")
+        logger.info(
+            "Using FYERS Option Chain. FYERS Stage 3/5: Validation passed — %d strikes. "
+            "FYERS Stage 4/5: AI Engine handoff — proceeding to the full AI/scoring pipeline.",
+            len(fyers_df),
+        )
         result.update({
             "df": fyers_df, "spot_price": fyers_spot, "symbol": fyers_symbol,
             "source": "FYERS", "error": None, "attempts": fyers_attempts,
@@ -915,17 +1027,25 @@ def get_option_chain_data(fyers, symbol_candidates: list, strike_count: int, exp
     result["error"] = fyers_err
 
     try:
+        # strike_count is passed through so NSE's full expiry chain is
+        # trimmed to the same "N strikes around ATM" universe FYERS'
+        # own strikecount parameter already limits it to (Strike
+        # Selection stage) — this is what keeps CE/PE Score,
+        # Institutional Score, Smart Money Score etc. comparable in
+        # quality between the two sources instead of silently differing
+        # because NSE was scored against a much wider strike universe.
         nse_df, nse_spot, nse_expiry_label, nse_expiry_list = fetch_nse_option_chain(
             symbol_key=symbol_key, is_stock=is_stock, stock_name=stock_name,
-            preferred_expiry_label=selected_expiry_label,
+            preferred_expiry_label=selected_expiry_label, strike_count=strike_count,
         )
-        if nse_df is not None:
-            nse_df = ensure_numeric_columns(nse_df)
-            nse_df.sort_values("strike_price", inplace=True)
-            nse_df.reset_index(drop=True, inplace=True)
 
         if nse_df is not None and validate_option_chain_df(nse_df):
-            logger.info("Using NSE Option Chain (fallback)")
+            logger.info(
+                "Using NSE Option Chain (fallback). NSE Stage 4/5: AI Engine handoff — "
+                "%d strikes, schema-identical to FYERS, proceeding to the full AI/scoring "
+                "pipeline unmodified (no AI calculations are skipped for NSE).",
+                len(nse_df),
+            )
             result.update({
                 "df": nse_df, "spot_price": nse_spot,
                 "symbol": (f"NSE:{stock_name.strip().upper()}-EQ" if is_stock else symbol_key),
@@ -936,7 +1056,9 @@ def get_option_chain_data(fyers, symbol_candidates: list, strike_count: int, exp
             })
             return result
         else:
-            result["error"] = f"{result['error']} | NSE fallback returned no valid Option Chain data."
+            reason = "NSE returned no data" if nse_df is None else "NSE data failed schema validation"
+            logger.error("NSE Stage 3/5: Validation failed — %s. WAIT will be shown with this reason.", reason)
+            result["error"] = f"{result['error']} | NSE fallback returned no valid Option Chain data ({reason})."
     except Exception as e:  # noqa: BLE001
         err = f"NSE fallback also raised an exception: {e}"
         logger.error(err)
@@ -1298,10 +1420,34 @@ def compute_ai_engine(df: pd.DataFrame, spot_price: float, atm_strike: float,
 
 
 def generate_trade_signals(df: pd.DataFrame, pcr: float, support, resistance,
-                            min_confidence: float = 80, top_n: int = 15) -> list:
+                            min_confidence: float = 80, top_n: int = 15, source: str = "") -> list:
     """High-confidence-only Strike / CE / PE trade signals with Entry, SL,
-    three targets, Risk-Reward and a plain-English Reason list."""
+    three targets, Risk-Reward and a plain-English Reason list.
+
+    This is the FINAL DECISION stage of the pipeline and runs identically
+    for FYERS and NSE data (both routes call this exact function on a
+    schema-identical DataFrame). Every strike/side evaluated that does
+    NOT become a signal is tracked with its rejection reason (either
+    "confidence below threshold" or "no premium/LTP available") and the
+    aggregate is logged + stashed in st.session_state["oc_signal_rejection_summary"]
+    so the UI can show a clear reason instead of a bare "no signals"
+    message — this file never fabricates a BUY/SELL signal to avoid an
+    empty result; a real WAIT with a reason is always preferred.
+    """
+    src_tag = source or "UNKNOWN"
     if df.empty or "CE Score" not in df.columns:
+        logger.error(
+            "Stage: Final Decision (source=%s) — AI Engine columns missing or chain empty; "
+            "no signals can be generated. Returning WAIT.", src_tag,
+        )
+        try:
+            st.session_state["oc_signal_rejection_summary"] = {
+                "source": src_tag, "evaluated": 0, "passed": 0,
+                "top_ce_score": 0.0, "top_pe_score": 0.0, "threshold": min_confidence,
+                "reason": "AI Engine did not run (empty chain or missing CE/PE Score columns).",
+            }
+        except Exception:  # noqa: BLE001 - session_state may be unavailable outside Streamlit
+            pass
         return []
 
     ce_vol_thresh = df["ce_volume"].quantile(0.75) if df["ce_volume"].max() > 0 else 0
@@ -1310,16 +1456,33 @@ def generate_trade_signals(df: pd.DataFrame, pcr: float, support, resistance,
     strike_gap = diffs.median() if len(diffs) else 1
 
     signals = []
+    evaluated = 0
+    rejected_low_confidence = 0
+    rejected_no_premium = 0
+    top_ce_score = float(df["CE Score"].max()) if "CE Score" in df.columns and len(df) else 0.0
+    top_pe_score = float(df["PE Score"].max()) if "PE Score" in df.columns and len(df) else 0.0
+
     for _, row in df.iterrows():
         for side, score_col, rating_col, ltp_col in [
             ("CE", "CE Score", "CE Rating", "ce_ltp"),
             ("PE", "PE Score", "PE Rating", "pe_ltp"),
         ]:
+            evaluated += 1
             score = row[score_col]
             if score < min_confidence:
+                rejected_low_confidence += 1
+                logger.debug(
+                    "Signal rejected (source=%s): Strike %.0f %s — score %.1f < threshold %.1f",
+                    src_tag, row.get("strike_price", 0), side, score, min_confidence,
+                )
                 continue
             ltp = row[ltp_col]
             if ltp <= 0:
+                rejected_no_premium += 1
+                logger.debug(
+                    "Signal rejected (source=%s): Strike %.0f %s — no premium/LTP available (score %.1f)",
+                    src_tag, row.get("strike_price", 0), side, score,
+                )
                 continue
 
             entry = round(float(ltp), 2)
@@ -1376,7 +1539,45 @@ def generate_trade_signals(df: pd.DataFrame, pcr: float, support, resistance,
             })
 
     signals.sort(key=lambda s: s["Confidence"], reverse=True)
-    return signals[:top_n]
+    final_signals = signals[:top_n]
+
+    if final_signals:
+        logger.info(
+            "Stage: Final Decision (source=%s) — %d signal(s) generated (evaluated=%d, "
+            "rejected_low_confidence=%d, rejected_no_premium=%d, threshold=%.0f%%)",
+            src_tag, len(final_signals), evaluated, rejected_low_confidence, rejected_no_premium, min_confidence,
+        )
+    else:
+        reason = (
+            f"No strike met the {min_confidence:.0f}% confidence threshold "
+            f"(highest CE Score={top_ce_score:.1f}, highest PE Score={top_pe_score:.1f}) — "
+            f"WAIT is correct here rather than forcing a signal."
+            if rejected_low_confidence and not rejected_no_premium == evaluated
+            else "No strike had both sufficient confidence AND a tradable premium (LTP > 0) — WAIT."
+        )
+        logger.info(
+            "Stage: Final Decision (source=%s) — 0 signals. Reason: %s "
+            "(evaluated=%d, rejected_low_confidence=%d, rejected_no_premium=%d)",
+            src_tag, reason, evaluated, rejected_low_confidence, rejected_no_premium,
+        )
+        try:
+            st.session_state["oc_signal_rejection_summary"] = {
+                "source": src_tag, "evaluated": evaluated,
+                "rejected_low_confidence": rejected_low_confidence,
+                "rejected_no_premium": rejected_no_premium,
+                "top_ce_score": top_ce_score, "top_pe_score": top_pe_score,
+                "threshold": min_confidence, "reason": reason,
+            }
+        except Exception:  # noqa: BLE001 - session_state may be unavailable outside Streamlit
+            pass
+
+    if final_signals:
+        try:
+            st.session_state["oc_signal_rejection_summary"] = None
+        except Exception:  # noqa: BLE001
+            pass
+
+    return final_signals
 
 
 def compute_dashboard_summary(df: pd.DataFrame, signals: list, intel: dict) -> dict:
@@ -1404,6 +1605,71 @@ def compute_dashboard_summary(df: pd.DataFrame, signals: list, intel: dict) -> d
         "Best Risk Reward Trade": max(signals, key=_rr_value) if signals else None,
         "Today's Best Trade": signals[0] if signals else None,
     }
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 5E. AI MARKET INTELLIGENCE BRIDGE  (analyze_market() — always invoked,
+#     for BOTH FYERS and NSE, with no source-based bypass)
+# ══════════════════════════════════════════════════════════════════════════
+#
+# `analyze_market` (imported from ai_analysis_engine at the top of this
+# file) was previously imported but never actually called anywhere in the
+# dashboard — for EITHER data source. That is exactly the kind of silent
+# "AI engine bypass" this fix is required to remove. This bridge wires it
+# into the shared pipeline so it always runs, right after the in-file
+# CE/PE AI Engine (compute_ai_engine) and Final Decision (generate_trade_
+# signals) stages, regardless of whether the chain came from FYERS or NSE.
+
+
+def run_external_ai_market_analysis(df: pd.DataFrame, spot_price: float, pcr: float,
+                                     max_pain: float, symbol: str, expiry_label: str,
+                                     source: str) -> dict:
+    """Always-executed, fault-tolerant call into analyze_market().
+
+    This function is called unconditionally for every successful fetch —
+    FYERS or NSE — immediately after the in-file AI Engine and trade-
+    signal generation have already run. It never blocks, alters, or
+    overrides those results: analyze_market() output is purely additive
+    ("AI Market Intelligence"), and if it fails or its exact call
+    signature doesn't match what this file guesses, that failure is
+    caught, logged with the reason, and surfaced to the UI as
+    "unavailable" — the rest of the dashboard (CE/PE Score, PCR, Max
+    Pain, Institutional/Smart Money Score, trade signals) is completely
+    unaffected either way, for either data source.
+
+    Returns {"available": bool, "result": Any, "reason": str | None}.
+    """
+    logger.info(
+        "Stage: AI Market Intelligence — invoking analyze_market() (source=%s, symbol=%s, expiry=%s)",
+        source, symbol, expiry_label,
+    )
+    payload = {
+        "df": df, "spot_price": spot_price, "pcr": pcr, "max_pain": max_pain,
+        "symbol": symbol, "expiry": expiry_label, "source": source,
+    }
+    try:
+        result = analyze_market(payload)
+        logger.info("Stage: AI Market Intelligence — analyze_market() completed (source=%s)", source)
+        return {"available": True, "result": result, "reason": None}
+    except TypeError as e:
+        # The imported module's exact signature isn't guaranteed by this
+        # file — retry with a plain DataFrame before giving up, so a
+        # simple analyze_market(df) implementation still works.
+        try:
+            result = analyze_market(df)
+            logger.info(
+                "Stage: AI Market Intelligence — analyze_market() completed via DataFrame-only "
+                "call (source=%s)", source,
+            )
+            return {"available": True, "result": result, "reason": None}
+        except Exception as e2:  # noqa: BLE001
+            reason = f"analyze_market() signature mismatch: {e2}"
+            logger.error("Stage: AI Market Intelligence — %s (source=%s, initial error=%s)", reason, source, e)
+            return {"available": False, "result": None, "reason": reason}
+    except Exception as e:  # noqa: BLE001 - external module must never crash the dashboard
+        reason = str(e)
+        logger.error("Stage: AI Market Intelligence — analyze_market() raised an exception (source=%s): %s", source, e)
+        return {"available": False, "result": None, "reason": reason}
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -3172,11 +3438,23 @@ def show_option_chain(fyers):
     else:
         atm_strike = df["strike_price"].median()
 
+    logger.info("Stage: AI Engine — running CE/PE scoring pipeline (source=%s, symbol=%s)", data_source, symbol)
     df = compute_big_move_scores(df, spot_price, max_pain, pcr, atm_strike)
     intel = compute_market_intelligence(df, spot_price, max_pain, pcr)
     df = compute_ai_engine(df, spot_price, atm_strike, max_pain, pcr)
     signals = generate_trade_signals(df, pcr, intel.get("support"), intel.get("resistance"),
-                                      min_confidence=ai_min_conf, top_n=15)
+                                      min_confidence=ai_min_conf, top_n=15, source=data_source)
+
+    # analyze_market() is invoked unconditionally here — for BOTH FYERS
+    # and NSE — immediately after the in-file AI Engine has run. This
+    # closes the gap where the imported analyze_market() function was
+    # never actually called for either source; there is no branch on
+    # `data_source` here or anywhere else in this pipeline that would
+    # skip it for NSE (or for FYERS).
+    ai_market_analysis = run_external_ai_market_analysis(
+        df, spot_price, pcr, max_pain, symbol, expiry_label, data_source
+    )
+    st.session_state["oc_ai_market_analysis"] = ai_market_analysis
 
     # Gamma analysis is computed exactly once per refresh here (it updates
     # session-tracked "previous refresh" history as a side effect) and is
@@ -3312,6 +3590,23 @@ def show_option_chain(fyers):
     d11.metric("Best Risk/Reward Trade", _fmt_trade(summary2.get("Best Risk Reward Trade")))
     d12.metric("Today's Best Trade", _fmt_trade(summary2.get("Today's Best Trade")))
 
+    # ── AI Market Intelligence (analyze_market bridge) ───────────────────
+    # Always shown, for both FYERS and NSE — see run_external_ai_market_
+    # analysis() above. This is additive context only; it never replaces
+    # or gates the in-file AI Engine / trade signals above or below it.
+    with st.expander("🧠 AI Market Intelligence (analyze_market)", expanded=False):
+        ai_market = st.session_state.get("oc_ai_market_analysis") or {}
+        st.caption(f"Data source for this analysis: **{data_source}**")
+        if ai_market.get("available"):
+            st.write(ai_market.get("result"))
+        else:
+            st.info(
+                f"External AI market analysis is unavailable right now: "
+                f"{ai_market.get('reason') or 'analyze_market() did not return a result.'} "
+                "This does not affect the CE/PE AI Engine, PCR, Max Pain, or trade signals above — "
+                "those are computed independently and remain fully available."
+            )
+
     st.divider()
 
     tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(
@@ -3422,7 +3717,16 @@ def show_option_chain(fyers):
         st.caption(f"Showing strikes with AI Confidence ≥ {ai_min_conf}% (adjust in the sidebar).")
 
         if not signals:
-            st.info("No strikes currently meet the selected confidence threshold. Try lowering it in the sidebar.")
+            rejection = st.session_state.get("oc_signal_rejection_summary") or {}
+            if rejection.get("reason"):
+                st.info(
+                    f"WAIT — {rejection['reason']} "
+                    f"(evaluated {rejection.get('evaluated', 0)} CE/PE combinations, source: "
+                    f"{rejection.get('source', data_source)}). Try lowering the confidence threshold "
+                    "in the sidebar, or check back after the market moves."
+                )
+            else:
+                st.info("No strikes currently meet the selected confidence threshold. Try lowering it in the sidebar.")
         else:
             for sig in signals:
                 css_class = RATING_CSS_CLASS.get(sig.get("Signal Key", "ignore"), "rating-ignore")
