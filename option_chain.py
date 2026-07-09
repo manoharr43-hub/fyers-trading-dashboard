@@ -51,9 +51,16 @@ FIX NOTE 2 (this file):
   Fixed by using strict `>` comparisons on both sides and only breaking
   a genuine tie using the strike's own Breakout vs Breakdown Probability
   instead of hardcoding a CE win (see section 5B below).
+
+FIX NOTE 3 (this file):
+  Added a robust, automatic FYERS -> NSE fallback data-source layer
+  (sections 1B / 1C below) so a FYERS outage, auth failure, timeout,
+  malformed JSON, or an incomplete Option Chain payload no longer takes
+  the whole dashboard down. See get_option_chain_data() for details.
 """
 
 import io
+import logging
 import math
 import time
 from collections import defaultdict
@@ -63,12 +70,21 @@ import numpy as np
 from ai_analysis_engine import analyze_market
 import pandas as pd
 import plotly.graph_objects as go
+import requests
 import streamlit as st
 from plotly.subplots import make_subplots
 
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
+
+# ─── Logging (used by the FYERS -> NSE automatic fallback layer) ──────────
+logger = logging.getLogger("options_chain_dashboard")
+if not logger.handlers:
+    _log_handler = logging.StreamHandler()
+    _log_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
+    logger.addHandler(_log_handler)
+logger.setLevel(logging.INFO)
 
 # ─── Page Config ────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -615,6 +631,320 @@ def detect_big_moves(df: pd.DataFrame, top_n: int = 3) -> list:
 
     alerts.sort(key=lambda a: abs(a["oi_change"]), reverse=True)
     return alerts
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 4B. DATA SOURCE FALLBACK LAYER  (FYERS primary -> automatic NSE backup)
+# ══════════════════════════════════════════════════════════════════════════
+#
+# This section adds a transparent, automatic fallback so a FYERS outage,
+# auth failure, timeout, malformed JSON, or incomplete Option Chain payload
+# never crashes the app or blanks the dashboard. FYERS remains the primary
+# source; NSE is used ONLY when FYERS fails or returns data that doesn't
+# pass validation. The unified entry point is get_option_chain_data() —
+# it always returns data in the exact same wide (strike_price, ce_*, pe_*)
+# DataFrame shape the rest of this file already expects, so every existing
+# module (PCR, Max Pain, AI Engine, Greeks/IV, Gamma, Scalping, charts,
+# Excel export) keeps working unmodified regardless of which source
+# actually supplied the data.
+
+REQUIRED_OPTION_CHAIN_COLUMNS = ["strike_price", "ce_ltp", "ce_oi", "pe_ltp", "pe_oi"]
+
+
+def validate_option_chain_df(df) -> bool:
+    """Guards every downstream module against a broken, empty, or partial
+    payload from either source. Returns True only if:
+      • df is not None and is a DataFrame
+      • df is not empty
+      • every column the rest of the dashboard depends on is present
+      • at least one strike has a real (non-null, > 0) strike_price
+    """
+    try:
+        if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+            return False
+        if not all(col in df.columns for col in REQUIRED_OPTION_CHAIN_COLUMNS):
+            return False
+        valid_strikes = pd.to_numeric(df["strike_price"], errors="coerce").dropna()
+        return bool((valid_strikes > 0).sum() > 0)
+    except Exception as e:  # noqa: BLE001 - validation itself must never raise
+        logger.error("Option chain validation raised an exception: %s", e)
+        return False
+
+
+# NSE only lists tradable options for these indices via its public
+# option-chain-indices endpoint. NIFTYNEXT50 has no listed options, and
+# SENSEX/BANKEX are BSE instruments — NSE is not a valid backup for those,
+# so they are intentionally left out of this map (handled gracefully by
+# validate_option_chain_df / get_option_chain_data returning "NONE").
+NSE_INDEX_SYMBOL_MAP = {
+    "NIFTY": "NIFTY",
+    "BANKNIFTY": "BANKNIFTY",
+    "FINNIFTY": "FINNIFTY",
+    "MIDCPNIFTY": "MIDCPNIFTY",
+}
+
+_NSE_SESSION_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/122.0 Safari/537.36",
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": "https://www.nseindia.com/option-chain",
+}
+
+
+def _nse_session():
+    """Creates an NSE session with the cookie handshake NSE's public API
+    requires before it will serve JSON from /api/* endpoints. Any failure
+    here (network, timeout, blocked) propagates up to the caller's own
+    try/except so it degrades to 'NSE unavailable' instead of crashing."""
+    s = requests.Session()
+    s.headers.update(_NSE_SESSION_HEADERS)
+    s.get("https://www.nseindia.com", timeout=8)
+    s.get("https://www.nseindia.com/option-chain", timeout=8)
+    return s
+
+
+def fetch_nse_option_chain_raw(symbol_key: str, is_stock: bool, stock_name: str = "") -> dict:
+    """Fetches the raw NSE Option Chain JSON for an index or an F&O stock.
+    Returns {} on ANY failure (network error, timeout, non-200, invalid
+    JSON, unsupported instrument) — callers must treat an empty dict as
+    'NSE unavailable' rather than raising, so this function never bubbles
+    an exception up to Streamlit."""
+    try:
+        if is_stock:
+            nse_symbol = (stock_name or "").strip().upper()
+            if nse_symbol.endswith("-EQ"):
+                nse_symbol = nse_symbol[:-3]
+            if not nse_symbol:
+                return {}
+            url = f"https://www.nseindia.com/api/option-chain-equities?symbol={nse_symbol}"
+        else:
+            nse_symbol = NSE_INDEX_SYMBOL_MAP.get(symbol_key)
+            if not nse_symbol:
+                # Instrument isn't listed on NSE's option-chain endpoint
+                # (e.g. SENSEX / BANKEX / NIFTYNEXT50) — fail gracefully.
+                return {}
+            url = f"https://www.nseindia.com/api/option-chain-indices?symbol={nse_symbol}"
+
+        session = _nse_session()
+        resp = session.get(url, timeout=10)
+        if resp.status_code != 200:
+            logger.error("NSE fetch returned HTTP %s for %s", resp.status_code, symbol_key or stock_name)
+            return {}
+        try:
+            return resp.json()
+        except ValueError as e:  # invalid JSON
+            logger.error("NSE response was not valid JSON for %s: %s", symbol_key or stock_name, e)
+            return {}
+    except Exception as e:  # noqa: BLE001 - covers timeouts, connection errors, DNS, etc.
+        logger.error("NSE raw fetch failed for %s: %s", symbol_key or stock_name, e)
+        return {}
+
+
+def fetch_nse_option_chain(symbol_key: str, is_stock: bool, stock_name: str = "",
+                            preferred_expiry_label: str = "") -> tuple:
+    """Fetches + parses the NSE Option Chain into the same WIDE
+    (strike_price, ce_*, pe_*) shape the rest of this dashboard already
+    expects, so every downstream function (Max Pain, PCR, AI Engine, IV,
+    Gamma, Scalping, Excel export, etc.) works unmodified regardless of
+    which source supplied the data.
+
+    Returns (df, spot_price, expiry_label, expiry_list). df is None if
+    NSE could not be reached, returned nothing, or returned unusable data
+    — this function never raises.
+    """
+    try:
+        raw = fetch_nse_option_chain_raw(symbol_key, is_stock, stock_name)
+        records = raw.get("records", {}) if isinstance(raw, dict) else {}
+        chain = records.get("data", []) if isinstance(records, dict) else []
+        if not chain:
+            return None, 0.0, "", []
+
+        spot_price = 0.0
+        try:
+            spot_price = float(records.get("underlyingValue", 0) or 0)
+        except (TypeError, ValueError):
+            pass
+
+        nse_expiry_dates = records.get("expiryDates", []) or []
+        target_expiry = preferred_expiry_label if preferred_expiry_label in nse_expiry_dates else (
+            nse_expiry_dates[0] if nse_expiry_dates else ""
+        )
+
+        rows = []
+        for item in chain:
+            if not isinstance(item, dict):
+                continue
+            if target_expiry and item.get("expiryDate") != target_expiry:
+                continue
+            strike = item.get("strikePrice")
+            if strike is None:
+                continue
+            ce, pe = item.get("CE", {}) or {}, item.get("PE", {}) or {}
+            rows.append({
+                "strike_price": strike,
+                "ce_oi": ce.get("openInterest", 0), "ce_chng_oi": ce.get("changeinOpenInterest", 0),
+                "ce_volume": ce.get("totalTradedVolume", 0), "ce_ltp": ce.get("lastPrice", 0),
+                "ce_iv": ce.get("impliedVolatility", 0),
+                "pe_oi": pe.get("openInterest", 0), "pe_chng_oi": pe.get("changeinOpenInterest", 0),
+                "pe_volume": pe.get("totalTradedVolume", 0), "pe_ltp": pe.get("lastPrice", 0),
+                "pe_iv": pe.get("impliedVolatility", 0),
+            })
+
+        if not rows:
+            return None, spot_price, target_expiry, nse_expiry_dates
+
+        df = pd.DataFrame(rows)
+        return df, spot_price, target_expiry, nse_expiry_dates
+    except Exception as e:  # noqa: BLE001 - parsing must never crash the app
+        logger.error("NSE option chain parsing failed for %s: %s", symbol_key or stock_name, e)
+        return None, 0.0, "", []
+
+
+def get_option_chain_data(fyers, symbol_candidates: list, strike_count: int, expiry_timestamp: str,
+                           expiry_options: list, symbol_key: str, is_stock: bool, stock_name: str,
+                           selected_expiry_label: str, debug_mode: bool = False) -> dict:
+    """
+    Unified, fault-tolerant Option Chain fetch: tries FYERS first, then
+    automatically and transparently falls back to NSE if FYERS raises an
+    exception, times out, returns None/empty/invalid JSON, an auth error,
+    or an incomplete payload that fails validate_option_chain_df().
+
+    Always returns a dict with the same keys, regardless of source, so
+    the caller (and every downstream analytics module) never needs to
+    branch on where the data came from:
+
+        {
+          "df": DataFrame (wide ce_/pe_ shape, numeric) or empty DataFrame,
+          "spot_price": float,
+          "symbol": str,
+          "expiry_label": str,
+          "expiry_timestamp": str,
+          "source": "FYERS" | "NSE" | "NONE",
+          "error": str | None,
+          "attempts": list,
+          "raw_expiry_payload": list,
+          "expiry_list": list,
+        }
+
+    This function never raises — every FYERS call and every NSE call is
+    individually wrapped in its own try/except. If BOTH sources fail, it
+    returns source="NONE" with an empty DataFrame so the caller can show
+    a friendly warning instead of an unhandled exception.
+    """
+    result = {
+        "df": pd.DataFrame(), "spot_price": 0.0,
+        "symbol": symbol_candidates[0] if symbol_candidates else "",
+        "expiry_label": selected_expiry_label, "expiry_timestamp": expiry_timestamp,
+        "source": "NONE", "error": None, "attempts": [],
+        "raw_expiry_payload": [], "expiry_list": [],
+    }
+
+    # ── 1. Try FYERS first (primary source) ─────────────────────────────
+    fyers_df, fyers_spot, fyers_symbol, fyers_attempts, fyers_err = None, 0.0, "", [], None
+    try:
+        response, used_symbol, attempts = fetch_optionchain_with_fallback(
+            fyers, symbol_candidates, strike_count, expiry_timestamp
+        )
+        fyers_attempts = attempts
+
+        # Auto-walk to the next expiry if the selected one comes back
+        # empty — mirrors the dashboard's existing fallback behaviour.
+        if (not response or response.get("s") != "ok") and expiry_options:
+            for _, ts in expiry_options:
+                if ts == expiry_timestamp:
+                    continue
+                try:
+                    response, used_symbol, attempts = fetch_optionchain_with_fallback(
+                        fyers, symbol_candidates, strike_count, ts
+                    )
+                except Exception as e:  # noqa: BLE001
+                    logger.error("FYERS fallback-expiry attempt raised: %s", e)
+                    continue
+                fyers_attempts = attempts
+                if response and isinstance(response, dict) and response.get("s") == "ok":
+                    expiry_timestamp = ts
+                    selected_expiry_label = format_expiry_label(ts)
+                    result["expiry_timestamp"] = expiry_timestamp
+                    result["expiry_label"] = selected_expiry_label
+                    break
+
+        if response and isinstance(response, dict) and response.get("s") == "ok":
+            options_data, data = extract_options_data(response)
+            spot = extract_spot_price(response, data)
+            if not spot:
+                try:
+                    quote_resp = fyers.quotes(data={"symbols": used_symbol})
+                    q = quote_resp.get("d", [{}])[0].get("v", {}) if isinstance(quote_resp, dict) else {}
+                    spot = float(q.get("lp", 0) or 0)
+                except Exception as e:  # noqa: BLE001
+                    logger.error("FYERS quotes() fallback for spot price raised: %s", e)
+
+            if options_data:
+                df = normalize_chain_shape(options_data)
+                df = ensure_numeric_columns(df)
+                df.sort_values("strike_price", inplace=True)
+                df.reset_index(drop=True, inplace=True)
+                if validate_option_chain_df(df):
+                    fyers_df, fyers_spot, fyers_symbol = df, spot, used_symbol
+                    result["raw_expiry_payload"] = extract_raw_expiry_payload(response)
+                    result["expiry_list"] = extract_expiry_list(response)
+                else:
+                    fyers_err = "FYERS response failed validation (missing/empty required option-chain fields)."
+            else:
+                fyers_err = "FYERS returned no options data."
+        elif response and isinstance(response, dict):
+            fyers_err = f"FYERS API error (code {response.get('code', '—')}): {response.get('message', 'No data returned')}"
+        else:
+            fyers_err = "FYERS returned no response / invalid response for all symbol variants tried."
+    except Exception as e:  # noqa: BLE001 - never let a fetch error crash the app
+        fyers_err = f"FYERS raised an exception: {e}"
+        logger.error(fyers_err)
+
+    if fyers_df is not None and not fyers_df.empty:
+        logger.info("Using FYERS Option Chain")
+        result.update({
+            "df": fyers_df, "spot_price": fyers_spot, "symbol": fyers_symbol,
+            "source": "FYERS", "error": None, "attempts": fyers_attempts,
+        })
+        return result
+
+    # ── 2. FYERS failed / invalid — automatically fall back to NSE ──────
+    logger.error("FYERS failed. Switching to NSE Option Chain. Reason: %s", fyers_err)
+    result["attempts"] = fyers_attempts
+    result["error"] = fyers_err
+
+    try:
+        nse_df, nse_spot, nse_expiry_label, nse_expiry_list = fetch_nse_option_chain(
+            symbol_key=symbol_key, is_stock=is_stock, stock_name=stock_name,
+            preferred_expiry_label=selected_expiry_label,
+        )
+        if nse_df is not None:
+            nse_df = ensure_numeric_columns(nse_df)
+            nse_df.sort_values("strike_price", inplace=True)
+            nse_df.reset_index(drop=True, inplace=True)
+
+        if nse_df is not None and validate_option_chain_df(nse_df):
+            logger.info("Using NSE Option Chain (fallback)")
+            result.update({
+                "df": nse_df, "spot_price": nse_spot,
+                "symbol": (f"NSE:{stock_name.strip().upper()}-EQ" if is_stock else symbol_key),
+                "expiry_label": nse_expiry_label or selected_expiry_label,
+                "expiry_timestamp": "",  # NSE doesn't use FYERS-style epoch timestamps
+                "source": "NSE", "error": None,
+                "expiry_list": nse_expiry_list or result["expiry_list"],
+            })
+            return result
+        else:
+            result["error"] = f"{result['error']} | NSE fallback returned no valid Option Chain data."
+    except Exception as e:  # noqa: BLE001
+        err = f"NSE fallback also raised an exception: {e}"
+        logger.error(err)
+        result["error"] = f"{result['error']} | {err}"
+
+    # ── 3. Both sources failed — return empty, never raise ──────────────
+    result["source"] = "NONE"
+    return result
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -1509,10 +1839,10 @@ def build_excel_report(df: pd.DataFrame, spot_price: float, atm_strike: float, p
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# 5C. GAMMA BUILD-UP ANALYZER  (real-time, session-tracked per-strike Gamma
+# 5C. GAMMA BUILD-UP ANALYZER  (real-time (session-tracked) per-strike Gamma
 #     monitoring — Gamma Change / Change % / Trend / Signal / Strength /
-#     Trade Action / AI Rating, blinking BUY/SELL rows, smart alerts,
-#     optional audio ping, live summary panel, no-duplicate-signal guard)
+#     Trade Action / AI Rating, blinking Buy/Sell rows, smart alerts,
+#     optional audio ping, and a live summary panel, no-duplicate-signal guard)
 # ══════════════════════════════════════════════════════════════════════════
 
 GAMMA_HISTORY_KEY = "oc_gamma_history"
@@ -2723,95 +3053,80 @@ def show_option_chain(fyers):
         )
         scalping_audio_alert = st.checkbox("🔔 Audio ping on new Scalping signal", value=False, key="oc_scalping_audio")
 
+        st.divider()
+        st.markdown("### 🛰️ Data Source")
+        st.caption(
+            "FYERS is always tried first. If FYERS is unreachable, times out, fails auth, or returns "
+            "an incomplete/invalid Option Chain, the dashboard automatically switches to the **NSE** "
+            "public Option Chain as a backup — transparently, with no action needed from you."
+        )
+
     # ── Fetch & Process ─────────────────────────────────────────────────
     if fetch_btn:
-        with st.spinner("Connecting to Fyers API …"):
-            response, used_symbol, attempts = fetch_optionchain_with_fallback(
-                fyers, symbol_candidates, strike_count, expiry_timestamp
+        with st.spinner("Fetching Option Chain (FYERS primary, NSE automatic fallback) …"):
+            fetch_result = get_option_chain_data(
+                fyers=fyers, symbol_candidates=symbol_candidates, strike_count=strike_count,
+                expiry_timestamp=expiry_timestamp, expiry_options=expiry_options,
+                symbol_key=symbol_key, is_stock=is_stock,
+                stock_name=(stock if is_stock else ""), selected_expiry_label=selected_expiry_label,
+                debug_mode=debug_mode,
             )
-            # If the selected expiry itself returns no usable data, walk
-            # forward through the remaining expiries automatically instead
-            # of failing outright. This never drops an expiry from the
-            # dropdown — it only changes which one is actively displayed
-            # if the chosen one comes back empty.
-            if (not response or response.get("s") != "ok") and expiry_options:
-                for _, ts in expiry_options:
-                    if ts == expiry_timestamp:
-                        continue
-                    response, used_symbol, attempts = fetch_optionchain_with_fallback(
-                        fyers, symbol_candidates, strike_count, ts
-                    )
-                    if response and response.get("s") == "ok":
-                        expiry_timestamp = ts
-                        selected_expiry_label = format_expiry_label(ts)
-                        st.info(f"Selected expiry had no data — automatically switched to {selected_expiry_label}.")
-                        break
 
         if debug_mode:
-            st.write("**Symbols tried:**", attempts)
-            st.json(response if response else {})
+            st.write("**Symbols tried (FYERS):**", fetch_result.get("attempts", []))
+            st.write("**Data source used:**", fetch_result.get("source"))
+            if fetch_result.get("error"):
+                st.write("**Fallback / error detail:**", fetch_result["error"])
 
-        if not response:
-            st.error("API call failed for all symbol variants tried. Check your Fyers connection/token.")
-            return
+        source = fetch_result.get("source")
+        fetched_df = fetch_result.get("df")
 
-        if response.get("s") != "ok":
-            err_code = response.get("code", "—")
-            err_msg = response.get("message", "No data returned")
+        # Both FYERS and NSE failed (or returned nothing usable) — show a
+        # friendly warning instead of letting anything downstream crash.
+        if source == "NONE" or fetched_df is None or fetched_df.empty:
             st.error(
-                f"API Error (code {err_code}): {err_msg}\n\n"
-                f"Tried: {', '.join(s for s, _ in attempts)}. "
-                "If this is a stock, confirm it actually has active F&O contracts on NSE — "
-                "not every stock has listed options."
+                "⚠️ Could not fetch Option Chain data from either FYERS or NSE. "
+                f"{fetch_result.get('error') or 'Both sources failed or returned no usable data.'} "
+                "Please check your FYERS connection/token, your network access to NSE, or try again "
+                "in a moment."
             )
             return
 
-        symbol = used_symbol
-
-        # Re-derive both the raw and parsed expiry lists straight from this
-        # fetch's response too, so the sidebar inspection panel always
-        # reflects the most recent API payload for the chosen instrument —
-        # every expiry present is kept, nothing is filtered out.
-        new_raw_payload = extract_raw_expiry_payload(response)
-        new_expiry_list = extract_expiry_list(response)
-        if new_expiry_list:
-            st.session_state["oc_expiry_list"] = new_expiry_list
-        if new_raw_payload:
-            st.session_state["oc_raw_expiry_payload"] = new_raw_payload
-
-        options_data, data = extract_options_data(response)
-        spot_price = extract_spot_price(response, data)
-
-        if not spot_price:
-            try:
-                quote_resp = fyers.quotes(data={"symbols": symbol})
-                q = quote_resp.get("d", [{}])[0].get("v", {}) if isinstance(quote_resp, dict) else {}
-                spot_price = float(q.get("lp", 0) or 0)
-            except Exception:
-                pass
-
-        if not options_data:
+        if source == "NSE":
             st.warning(
-                "⚠️ No options data returned for this symbol. This can mean: the market is closed, "
-                "the symbol/strike count combination is invalid, or the API response uses a different "
-                "field name than expected. Enable **'Show raw API response'** in the sidebar and "
-                "re-fetch to inspect the actual payload."
+                "⚠️ FYERS Option Chain was unavailable — automatically switched to the **NSE Option "
+                "Chain** as a backup data source. Every calculation below (PCR, Max Pain, AI Engine, "
+                "Gamma, Scalping, Excel export, etc.) runs exactly as usual on NSE data."
             )
-            return
 
-        df = normalize_chain_shape(options_data)
-        df = ensure_numeric_columns(df)
-        df.sort_values("strike_price", inplace=True)
-        df.reset_index(drop=True, inplace=True)
-        df = compute_strike_bias(df)
+        used_symbol = fetch_result.get("symbol", "")
+        spot_price = fetch_result.get("spot_price", 0.0)
+        selected_expiry_label = fetch_result.get("expiry_label", selected_expiry_label)
+        expiry_timestamp = fetch_result.get("expiry_timestamp", expiry_timestamp)
+
+        # Only refresh the sidebar's FYERS-timestamp-based expiry dropdown
+        # state when FYERS itself supplied it — NSE's own expiry list uses
+        # plain date-label strings instead of FYERS epoch timestamps, so it
+        # is not pushed into the FYERS-shaped dropdown state, avoiding any
+        # mismatch there.
+        new_raw_payload = fetch_result.get("raw_expiry_payload") or []
+        new_expiry_list = fetch_result.get("expiry_list") or []
+        if source == "FYERS":
+            if new_expiry_list:
+                st.session_state["oc_expiry_list"] = new_expiry_list
+            if new_raw_payload:
+                st.session_state["oc_raw_expiry_payload"] = new_raw_payload
+
+        df = compute_strike_bias(fetched_df)
         df = add_iv_columns(df, spot_price, selected_expiry_label)
 
         st.session_state["oc_df"] = df
         st.session_state["oc_spot"] = spot_price
-        st.session_state["oc_symbol"] = symbol
+        st.session_state["oc_symbol"] = used_symbol
         st.session_state["oc_expiry_label"] = selected_expiry_label
         st.session_state["oc_expiry_timestamp"] = expiry_timestamp
         st.session_state["oc_ai_min_conf"] = ai_min_conf
+        st.session_state["oc_data_source"] = source
 
     # ── Render from session_state (persists across reruns/tab switches) ─
     if "oc_df" not in st.session_state:
@@ -2824,6 +3139,7 @@ def show_option_chain(fyers):
     expiry_label = st.session_state.get("oc_expiry_label", "")
     request_expiry_ts = st.session_state.get("oc_expiry_timestamp", "")
     ai_min_conf = st.session_state.get("oc_ai_min_conf", ai_min_conf)
+    data_source = st.session_state.get("oc_data_source", "FYERS")
 
     if df.empty:
         st.warning("No strikes available in the current chain snapshot.")
@@ -2835,6 +3151,10 @@ def show_option_chain(fyers):
     exp_i2.metric("Selected Expiry", expiry_label or "—")
     exp_i3.metric("API Request Expiry (ts)", request_expiry_ts or "—")
     exp_i4.metric("Symbol Used", symbol or "—")
+
+    source_badge = "🟢 FYERS (Primary)" if data_source == "FYERS" else "🟡 NSE (Automatic Fallback)"
+    st.caption(f"📡 **Data Source:** {source_badge}")
+
     if len(st.session_state.get("oc_raw_expiry_payload", [])) == 1:
         st.info("Only one expiry is available from FYERS API.")
     else:
@@ -3196,4 +3516,3 @@ def show_option_chain(fyers):
 #     show_option_chain(fyers)
 #
 # Run this file with:  streamlit run fyers_options_chain_dashboard.py
-
