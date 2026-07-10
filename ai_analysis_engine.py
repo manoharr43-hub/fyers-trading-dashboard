@@ -84,20 +84,44 @@ IV_HIGH_PCT = 0.75
 IV_LOW_PCT = 0.25
 PREMIUM_VOLUME_SPIKE_MULT = 2.0
 
+# A strike's ΔOI must be at least this fraction of the chain's "heavy"
+# ΔOI threshold to count as *fresh* positioning at all. Below this, the
+# strike is treated as noise — abs(ΔOI) ≈ 0 — no matter how large its
+# historical/absolute OI is. This is what stops big legacy OI strikes
+# from masquerading as fresh institutional activity.
+FRESH_OI_SIGNIFICANCE_RATIO = 0.5
+
 RISK_LEVELS = ["Low", "Moderate", "Elevated", "High"]
 
-# Weighted-probability category weights (STEP-9 scoring — sums to 1.0)
+# ══════════════════════════════════════════════════════════════════════════
+# FRESH-POSITIONING SCORING MODEL
+# ══════════════════════════════════════════════════════════════════════════
+# OI Change (ΔOI) is the primary institutional-positioning signal in this
+# engine. Historical/absolute OI is demoted to a 5% *confirmation-only*
+# weight and can never by itself produce a BUY/SELL — large absolute OI
+# with ΔOI ≈ 0 is stale positioning, not fresh conviction.
+#
+#   OI Change (ΔOI)  = 40%   <- primary institutional-positioning signal
+#   Volume            = 20%
+#   Price Action      = 15%
+#   PCR                = 10%
+#   IV                 = 10%
+#   Absolute OI        =  5%   <- confirmation only, never a decision driver
+#
+# Trend / Greeks / Dealer / Smart-Money / Institutional-flow logic is not
+# removed — those biases still compute, still gate/veto trades (STEP 8
+# disagreement gate, traps, gamma flips, etc.) and still appear in the
+# output — they are simply no longer separate weighted-probability
+# buckets, since the institutional read now flows primarily through
+# ΔOI (folded into "oi_change") and price/structure (folded into
+# "price_action").
 CATEGORY_WEIGHTS = {
-    "trend": 0.20,
-    "oi": 0.20,
+    "oi_change": 0.40,
+    "volume": 0.20,
     "price_action": 0.15,
-    "volume": 0.10,
-    "greeks": 0.10,
-    "pcr": 0.05,
-    "iv": 0.05,
-    "dealer": 0.05,
-    "institutional": 0.05,
-    "smart_money": 0.05,
+    "pcr": 0.10,
+    "iv": 0.10,
+    "absolute_oi": 0.05,
 }
 assert abs(sum(CATEGORY_WEIGHTS.values()) - 1.0) < 1e-9
 
@@ -171,6 +195,80 @@ def _snapshot_delta(history: Optional[dict], key: str, current: float) -> Option
         return (current - prev) / abs(prev) * 100.0
     except ZeroDivisionError:
         return None
+
+
+def _select_fresh_level(df: pd.DataFrame, chng_col: str, vol_col: str,
+                         heavy_chng_thresh: float) -> tuple[Optional[float], Optional[float]]:
+    """Selects a Fresh Support/Resistance strike using ONLY positive OI
+    Change, with volume as a confirmation tie-breaker (Price Acceptance /
+    Price Rejection proxy). Strikes with ΔOI below
+    FRESH_OI_SIGNIFICANCE_RATIO * heavy_chng_thresh are excluded — a
+    strike is never selected purely because its historical/absolute OI
+    is the largest in the chain. Returns (strike, chng_oi) or
+    (None, None) if no strike has meaningful fresh ΔOI."""
+    if df is None or df.empty or chng_col not in df.columns:
+        return None, None
+    chng = pd.to_numeric(df[chng_col], errors="coerce")
+    candidates = df.loc[chng > 0].copy()
+    if heavy_chng_thresh and heavy_chng_thresh > 0:
+        candidates = candidates.loc[pd.to_numeric(candidates[chng_col], errors="coerce")
+                                     >= heavy_chng_thresh * FRESH_OI_SIGNIFICANCE_RATIO]
+    if candidates.empty:
+        return None, None
+    if vol_col in candidates.columns:
+        chng_rank = pd.to_numeric(candidates[chng_col], errors="coerce").rank(pct=True)
+        vol_rank = pd.to_numeric(candidates[vol_col], errors="coerce").fillna(0).rank(pct=True)
+        fresh_score = chng_rank.fillna(0) * 0.7 + vol_rank.fillna(0) * 0.3
+        best_idx = fresh_score.idxmax()
+    else:
+        best_idx = pd.to_numeric(candidates[chng_col], errors="coerce").idxmax()
+    best = candidates.loc[best_idx]
+    return float(best["strike_price"]), float(best[chng_col])
+
+
+def _classify_call_flow(chng_oi: Optional[float], ltp, ltp_prev) -> str:
+    """CALL side ΔOI + premium-price interpretation (fresh positioning
+    only — never derived from absolute OI):
+        +ΔOI + Price Falling -> Fresh Call Writing   (Bearish / Resistance)
+        +ΔOI + Price Rising  -> Call Buying           (Bullish)
+        -ΔOI + Price Rising  -> Short Covering (Call) (Bullish)
+        -ΔOI + Price Falling -> Long Unwinding (Call) (Weak Bearish)
+    Requires the prior-snapshot premium (ce_ltp_prev); without it the
+    price-direction leg is unavailable and this fails safe rather than
+    guessing a direction."""
+    if chng_oi is None or ltp_prev is None or ltp is None:
+        return "Unavailable"
+    price_chg = _safe_float(ltp) - _safe_float(ltp_prev)
+    if abs(chng_oi) < 1e-9:
+        return "Unavailable"
+    if chng_oi > 0 and price_chg < 0:
+        return "Fresh Call Writing"
+    if chng_oi > 0 and price_chg >= 0:
+        return "Call Buying"
+    if chng_oi < 0 and price_chg >= 0:
+        return "Short Covering (Call)"
+    return "Long Unwinding (Call)"
+
+
+def _classify_put_flow(chng_oi: Optional[float], ltp, ltp_prev) -> str:
+    """PUT side ΔOI + premium-price interpretation (fresh positioning
+    only — never derived from absolute OI):
+        +ΔOI + Price Falling -> Put Buying             (Bearish)
+        +ΔOI + Price Rising  -> Put Writing             (Bullish / Support)
+        -ΔOI + Price Rising  -> Long Unwinding (Put)    (Weak Bullish)
+        -ΔOI + Price Falling -> Short Covering (Put)    (Bearish Exit)"""
+    if chng_oi is None or ltp_prev is None or ltp is None:
+        return "Unavailable"
+    price_chg = _safe_float(ltp) - _safe_float(ltp_prev)
+    if abs(chng_oi) < 1e-9:
+        return "Unavailable"
+    if chng_oi > 0 and price_chg < 0:
+        return "Put Buying"
+    if chng_oi > 0 and price_chg >= 0:
+        return "Put Writing"
+    if chng_oi < 0 and price_chg >= 0:
+        return "Long Unwinding (Put)"
+    return "Short Covering (Put)"
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -250,7 +348,21 @@ class MarketContext:
     zero_gamma_strike: Optional[float] = None
     call_wall: Optional[float] = None
     put_wall: Optional[float] = None
+    call_wall_source: str = "unavailable"   # "fresh_oi_change" | "historical_oi_fallback" | "unavailable"
+    put_wall_source: str = "unavailable"
     pin_risk: bool = False
+
+    # ── Fresh-positioning layer (ΔOI-driven S/R + flow, primary metric) ──
+    fresh_support: Optional[float] = None
+    fresh_support_pe_chng_oi: Optional[float] = None
+    fresh_resistance: Optional[float] = None
+    fresh_resistance_ce_chng_oi: Optional[float] = None
+    strongest_writing_strike: Optional[dict] = None
+    strongest_buying_strike: Optional[dict] = None
+    institutional_flow_counts: dict = field(default_factory=dict)
+    pcr_prev: Optional[float] = None
+    pcr_improving: Optional[bool] = None
+    pcr_falling: Optional[bool] = None
 
     # IV regime layer
     iv_rank_ce: Optional[float] = None
@@ -501,10 +613,25 @@ def build_market_context(df: pd.DataFrame, spot_price: float, atm_strike: float,
 
     # ── Dealer Positioning layer (STEP 8): Call Wall / Put Wall / Zero
     # Gamma / Pin Risk / Max Pain ──────────────────────────────────────
-    if "ce_oi" in df.columns and not df["ce_oi"].dropna().empty:
+    # Call Wall / Put Wall now mean "maximum FRESH writing" (max positive
+    # ΔOI) first — historical/absolute OI is only a fallback when no
+    # strike shows meaningful fresh ΔOI at all.
+    if "ce_chng_oi" in df.columns and (df["ce_chng_oi"].clip(lower=0) > 0).any() and ctx.heavy_ce_chng_thresh > 0 \
+            and float(df["ce_chng_oi"].max()) >= ctx.heavy_ce_chng_thresh * FRESH_OI_SIGNIFICANCE_RATIO:
+        ctx.call_wall = float(df.loc[df["ce_chng_oi"].idxmax(), "strike_price"])
+        ctx.call_wall_source = "fresh_oi_change"
+    elif "ce_oi" in df.columns and not df["ce_oi"].dropna().empty:
         ctx.call_wall = float(df.loc[df["ce_oi"].idxmax(), "strike_price"])
-    if "pe_oi" in df.columns and not df["pe_oi"].dropna().empty:
+        ctx.call_wall_source = "historical_oi_fallback"
+
+    if "pe_chng_oi" in df.columns and (df["pe_chng_oi"].clip(lower=0) > 0).any() and ctx.heavy_pe_chng_thresh > 0 \
+            and float(df["pe_chng_oi"].max()) >= ctx.heavy_pe_chng_thresh * FRESH_OI_SIGNIFICANCE_RATIO:
+        ctx.put_wall = float(df.loc[df["pe_chng_oi"].idxmax(), "strike_price"])
+        ctx.put_wall_source = "fresh_oi_change"
+    elif "pe_oi" in df.columns and not df["pe_oi"].dropna().empty:
         ctx.put_wall = float(df.loc[df["pe_oi"].idxmax(), "strike_price"])
+        ctx.put_wall_source = "historical_oi_fallback"
+
     if ctx.has_gamma:
         net_gamma = df.sort_values("strike_price")[["strike_price", "gamma"]].dropna()
         sign_changes = net_gamma["gamma"].apply(lambda g: 1 if g >= 0 else -1).diff().fillna(0)
@@ -513,6 +640,67 @@ def build_market_context(df: pd.DataFrame, spot_price: float, atm_strike: float,
             ctx.zero_gamma_strike = float(flips.iloc[(flips - spot_price).abs().argsort().iloc[0]])
     if max_pain and spot_price:
         ctx.pin_risk = abs(spot_price - max_pain) / max_pain * 100 < 0.3
+
+    # ── Fresh Support / Fresh Resistance (STEP: Supply/Demand) ──────────
+    # Selected ONLY from strikes with meaningful *positive* ΔOI (Put
+    # writing for support, Call writing for resistance), ranked by a
+    # blend of ΔOI magnitude and volume confirmation. Strikes where
+    # ΔOI ≈ 0 are excluded outright even if their total OI is the
+    # largest in the chain — this never overrides the caller-supplied
+    # `support`/`resistance` (which stay backward compatible for every
+    # existing condition/check); it is reported as an additional,
+    # additive read of where *fresh* money is actually building.
+    ctx.fresh_support, ctx.fresh_support_pe_chng_oi = _select_fresh_level(
+        df, chng_col="pe_chng_oi", vol_col="pe_volume", heavy_chng_thresh=ctx.heavy_pe_chng_thresh)
+    ctx.fresh_resistance, ctx.fresh_resistance_ce_chng_oi = _select_fresh_level(
+        df, chng_col="ce_chng_oi", vol_col="ce_volume", heavy_chng_thresh=ctx.heavy_ce_chng_thresh)
+
+    # ── Strongest Writing Strike / Strongest Buying Strike / Institutional
+    # Flow — classified per strike using ΔOI + premium-price direction
+    # ONLY (never absolute OI). Requires optional prior-snapshot premiums
+    # (ce_ltp_prev / pe_ltp_prev); without them, flow per strike reports
+    # "Unavailable" rather than guessing. ─────────────────────────────────
+    strongest_writing = None
+    strongest_buying = None
+    flow_counts = {
+        "Fresh Call Writing": 0, "Call Buying": 0, "Short Covering (Call)": 0, "Long Unwinding (Call)": 0,
+        "Put Writing": 0, "Put Buying": 0, "Long Unwinding (Put)": 0, "Short Covering (Put)": 0,
+        "Unavailable": 0,
+    }
+    for _, r in df.iterrows():
+        ce_chng = _safe_float(r.get("ce_chng_oi"))
+        pe_chng = _safe_float(r.get("pe_chng_oi"))
+        ce_ltp_prev, pe_ltp_prev = r.get("ce_ltp_prev"), r.get("pe_ltp_prev")
+        ce_flow = _classify_call_flow(ce_chng, r.get("ce_ltp"), ce_ltp_prev)
+        pe_flow = _classify_put_flow(pe_chng, r.get("pe_ltp"), pe_ltp_prev)
+        flow_counts[ce_flow] = flow_counts.get(ce_flow, 0) + 1
+        flow_counts[pe_flow] = flow_counts.get(pe_flow, 0) + 1
+
+        if ce_flow == "Fresh Call Writing" and ce_chng > 0:
+            if strongest_writing is None or ce_chng > strongest_writing["chng_oi"]:
+                strongest_writing = {"strike": float(r["strike_price"]), "side": "CE", "chng_oi": ce_chng, "flow": ce_flow}
+        if pe_flow == "Put Writing" and pe_chng > 0:
+            if strongest_writing is None or pe_chng > strongest_writing["chng_oi"]:
+                strongest_writing = {"strike": float(r["strike_price"]), "side": "PE", "chng_oi": pe_chng, "flow": pe_flow}
+        if ce_flow == "Call Buying" and ce_chng > 0:
+            if strongest_buying is None or ce_chng > strongest_buying["chng_oi"]:
+                strongest_buying = {"strike": float(r["strike_price"]), "side": "CE", "chng_oi": ce_chng, "flow": ce_flow}
+        if pe_flow == "Put Buying" and pe_chng > 0:
+            if strongest_buying is None or pe_chng > strongest_buying["chng_oi"]:
+                strongest_buying = {"strike": float(r["strike_price"]), "side": "PE", "chng_oi": pe_chng, "flow": pe_flow}
+
+    ctx.strongest_writing_strike = strongest_writing
+    ctx.strongest_buying_strike = strongest_buying
+    ctx.institutional_flow_counts = flow_counts
+
+    # ── PCR trend (improving/falling) — additive, from oi_history only;
+    # unavailable -> neutral (never blocks a trade that would otherwise
+    # qualify, consistent with the rest of the fail-safe framework) ─────
+    if oi_history:
+        ctx.pcr_prev = oi_history.get("prev_pcr")
+        if ctx.pcr_prev not in (None, 0):
+            ctx.pcr_improving = pcr > ctx.pcr_prev
+            ctx.pcr_falling = pcr < ctx.pcr_prev
 
     # ── Seller Bias (STEP 1 legacy naming, now the "Option Sellers"
     # layer #9) — sellers are assumed in control unless buyers are
@@ -549,15 +737,23 @@ def build_market_context(df: pd.DataFrame, spot_price: float, atm_strike: float,
     else:
         ctx.gamma_bias = "⚪ Gamma data unavailable"
 
-    # ── Institutional / Smart Money / Dealer Bias (OI+ΔOI proxies,
-    # layer #7 Smart Money + layer #8 Dealer Positioning) ────────────────
-    high_oi_pe = df.loc[pe_oi >= ctx.heavy_pe_oi_thresh, "pe_chng_oi"].clip(lower=0).sum() if "pe_chng_oi" in df.columns else 0
-    high_oi_ce = df.loc[ce_oi >= ctx.heavy_ce_oi_thresh, "ce_chng_oi"].clip(lower=0).sum() if "ce_chng_oi" in df.columns else 0
-    if high_oi_pe > high_oi_ce * 1.15:
-        ctx.institutional_bias = "🟢 Institutional Buying (Put support)"
+    # ── Institutional / Smart Money / Dealer Bias (layer #7 Smart Money +
+    # layer #8 Dealer Positioning) — driven ONLY by ΔOI (primary) and
+    # Volume (secondary confirmation), never gated by absolute/historical
+    # OI membership. A strike with huge historical OI but ΔOI ≈ 0
+    # contributes nothing here. ───────────────────────────────────────────
+    ce_vol_sum = float(pd.to_numeric(ce_vol, errors="coerce").fillna(0).sum())
+    pe_vol_sum = float(pd.to_numeric(pe_vol, errors="coerce").fillna(0).sum())
+    total_vol = ce_vol_sum + pe_vol_sum
+    ce_vol_weight = 1.0 + (ce_vol_sum / total_vol if total_vol > 0 else 0.5)
+    pe_vol_weight = 1.0 + (pe_vol_sum / total_vol if total_vol > 0 else 0.5)
+    inst_ce_score = total_ce_chng_up * ce_vol_weight
+    inst_pe_score = total_pe_chng_up * pe_vol_weight
+    if inst_pe_score > inst_ce_score * 1.15:
+        ctx.institutional_bias = "🟢 Institutional Buying (fresh Put writing, volume-confirmed)"
         ctx.smart_money_bias = "🟢 Accumulation"
-    elif high_oi_ce > high_oi_pe * 1.15:
-        ctx.institutional_bias = "🔴 Institutional Selling (Call resistance)"
+    elif inst_ce_score > inst_pe_score * 1.15:
+        ctx.institutional_bias = "🔴 Institutional Selling (fresh Call writing, volume-confirmed)"
         ctx.smart_money_bias = "🔴 Distribution"
     else:
         ctx.institutional_bias = "🟡 Neutral"
@@ -727,6 +923,8 @@ def _ce_buy_conditions(row: pd.Series, ctx: MarketContext) -> dict:
         "Strong Put Writing at/near strike": float(row.get("pe_chng_oi", 0) or 0) >= ctx.heavy_pe_chng_thresh > 0,
         "Call OI unwinding": float(row.get("ce_chng_oi", 0) or 0) < 0,
         "Increasing volume": float(row.get("ce_volume", 0) or 0) >= ctx.high_ce_vol_thresh > 0,
+        "Strong Put Volume confirms writing": float(row.get("pe_volume", 0) or 0) >= ctx.high_pe_vol_thresh > 0,
+        "PCR improving (or unavailable)": ctx.pcr_improving in (None, True),
         "Positive Gamma trend": (float(row.get("Gamma Change", 0) or 0) > 0) if ctx.has_gamma else False,
         "PCR supportive (> 1.0)": ctx.pcr > 1.0,
         "IV acceptable (not elevated)": 0 < ce_iv <= (ctx.ce_iv_high_thresh or ce_iv),
@@ -762,6 +960,8 @@ def _pe_buy_conditions(row: pd.Series, ctx: MarketContext) -> dict:
         "Strong Call Writing at/near strike": float(row.get("ce_chng_oi", 0) or 0) >= ctx.heavy_ce_chng_thresh > 0,
         "Put OI unwinding": float(row.get("pe_chng_oi", 0) or 0) < 0,
         "High volume": float(row.get("pe_volume", 0) or 0) >= ctx.high_pe_vol_thresh > 0,
+        "Strong Call Volume confirms writing": float(row.get("ce_volume", 0) or 0) >= ctx.high_ce_vol_thresh > 0,
+        "PCR falling (or unavailable)": ctx.pcr_falling in (None, True),
         "Gamma supportive": (float(row.get("Gamma Change", 0) or 0) >= 0) if ctx.has_gamma else False,
         "PCR bearish (< 1.0)": ctx.pcr < 1.0,
         "No nearby support": (ctx.support is None) or (row["strike_price"] > ctx.support) or
@@ -844,69 +1044,107 @@ def _frac(conds: dict, keys: list) -> float:
     return sum(1 for k in present if conds[k]) / len(present)
 
 
-def _category_scores(conds: dict, ctx: MarketContext, base_score: float, direction: str) -> dict:
-    """Buckets the checklist + context into the ten weighted scoring
-    categories used for the final probability (Trend 20%, OI 20%,
-    Price Action 15%, Volume 10%, Greeks 10%, PCR 5%, IV 5%,
-    Dealer 5%, Institutional 5%, Smart Money 5%)."""
+def _oi_change_category_score(row: pd.Series, ctx: MarketContext, is_ce: bool, is_buy: bool) -> float:
+    """Continuous 0-1 score for the 40%-weighted 'oi_change' bucket —
+    the PRIMARY institutional-positioning signal in this engine. Driven
+    purely by ΔOI magnitude relative to the chain's heavy-ΔOI threshold;
+    a strike with ΔOI ≈ 0 scores ~0 here regardless of how large its
+    historical/absolute OI is (that only ever enters via the separate
+    5%-weighted 'absolute_oi' bucket)."""
+    ce_chng = _safe_float(row.get("ce_chng_oi"))
+    pe_chng = _safe_float(row.get("pe_chng_oi"))
+    if is_buy and is_ce:  # CE BUY: driven by fresh Put writing (support) + Call unwinding
+        strength = _clip01(pe_chng / ctx.heavy_pe_chng_thresh) if ctx.heavy_pe_chng_thresh > 0 else 0.0
+        return _clip01(strength + (0.15 if ce_chng < 0 else 0.0))
+    if is_buy and not is_ce:  # PE BUY: driven by fresh Call writing (resistance) + Put unwinding
+        strength = _clip01(ce_chng / ctx.heavy_ce_chng_thresh) if ctx.heavy_ce_chng_thresh > 0 else 0.0
+        return _clip01(strength + (0.15 if pe_chng < 0 else 0.0))
+    if not is_buy and is_ce:  # CE SELL: driven by fresh Call writing dominance at this strike
+        return _clip01(ce_chng / ctx.heavy_ce_chng_thresh) if ctx.heavy_ce_chng_thresh > 0 else 0.0
+    # PE SELL: driven by fresh Put writing dominance at this strike
+    return _clip01(pe_chng / ctx.heavy_pe_chng_thresh) if ctx.heavy_pe_chng_thresh > 0 else 0.0
+
+
+def _absolute_oi_category_score(row: pd.Series, ctx: MarketContext, is_ce: bool) -> float:
+    """Continuous 0-1 score for the 5%-weighted 'absolute_oi' bucket —
+    CONFIRMATION ONLY. Historical OI alone can never move the needle
+    more than its 5% allotment, and this is never a required/gating
+    condition — only ever a minor tilt on top of the ΔOI-driven read."""
+    if is_ce:
+        oi_val, thresh = _safe_float(row.get("ce_oi")), ctx.heavy_ce_oi_thresh
+    else:
+        oi_val, thresh = _safe_float(row.get("pe_oi")), ctx.heavy_pe_oi_thresh
+    if thresh <= 0:
+        return 0.5
+    return _clip01(oi_val / thresh)
+
+
+def _category_scores(conds: dict, ctx: MarketContext, base_score: float, direction: str,
+                      row: pd.Series) -> dict:
+    """Buckets the checklist + context into the FRESH-POSITIONING scoring
+    categories used for the final probability:
+        OI Change 40% | Volume 20% | Price Action 15% | PCR 10% | IV 10%
+        | Absolute OI 5% (confirmation only, never dominant).
+    Trend/Structure conditions are folded into Price Action; Greeks/
+    Dealer/Institutional/Smart-Money remain as gating/veto logic
+    elsewhere (STEP 8 disagreement gate, traps, gamma flips) rather than
+    separate weighted buckets, since fresh ΔOI now carries the primary
+    institutional-positioning signal."""
     is_ce = direction.startswith("CE")
-    trend_keys = (["Price above VWAP", "Above 20 EMA", "Above 50 EMA",
-                   "Bullish structure (BOS/Order Block)", "Index Trend bullish (EMA20>50>200 + ADX)"]
-                  if is_ce else
-                  ["Price below VWAP", "Below 20 EMA", "Below 50 EMA",
-                   "Bearish structure (BOS/Order Block)", "Index Trend bearish (EMA20<50<200 + ADX)"])
-    oi_keys = (["Strong Put Writing at/near strike", "Call OI unwinding",
-                "Fresh buying / Long Build-up (index OI)"] if is_ce and "BUY" in direction else
-               ["Strong Call Writing at/near strike", "Put OI unwinding",
-                "Fresh selling / Short Build-up (index OI)"] if not is_ce and "BUY" in direction else
-               ["Heavy Call Writing"] if direction == "CE SELL" else ["Heavy Put Writing"])
-    price_action_keys = ["No Buyer Trap / Fake Breakout detected", "No Stop-Hunt sweep against the move",
+    is_buy = "BUY" in direction
+
+    volume_keys = ["Increasing volume", "High volume", "Premium breakout / volume spike",
+                   "Strong Put Volume confirms writing", "Strong Call Volume confirms writing"]
+    price_action_keys = ["Price above VWAP", "Above 20 EMA", "Above 50 EMA",
+                          "Bullish structure (BOS/Order Block)", "Index Trend bullish (EMA20>50>200 + ADX)",
+                          "Price below VWAP", "Below 20 EMA", "Below 50 EMA",
+                          "Bearish structure (BOS/Order Block)", "Index Trend bearish (EMA20<50<200 + ADX)",
+                          "No Buyer Trap / Fake Breakout detected", "No Stop-Hunt sweep against the move",
                           "CHoCH not bearish", "No nearby resistance",
                           "No Seller Trap / Fake Breakdown detected", "CHoCH not bullish", "No nearby support",
-                          "Strong resistance / Call Wall at strike", "Strong support / Put Wall at strike"]
-    volume_keys = ["Increasing volume", "High volume", "Premium breakout / volume spike"]
-    greeks_keys = ["Positive Gamma trend", "Gamma supportive", "No Gamma Flip bullish (gamma not accelerating buyers)",
-                   "No Gamma Flip bearish (gamma not accelerating sellers of premium)",
-                   "Gamma not flipping bearish", "Gamma not flipping bullish"]
-    pcr_keys = ["PCR supportive (> 1.0)", "PCR bearish (< 1.0)"]
-    iv_keys = ["IV acceptable (not elevated)", "IV advantage (elevated / high IV rank)"]
+                          "Strong resistance / Call Wall at strike", "Strong support / Put Wall at strike",
+                          "Momentum weak / stalling"]
+    pcr_keys = ["PCR supportive (> 1.0)", "PCR bearish (< 1.0)",
+                "PCR improving (or unavailable)", "PCR falling (or unavailable)"]
+    iv_keys = ["IV acceptable (not elevated)", "IV advantage (elevated / high IV rank)",
+               "India VIX not spiking against buyers"]
 
     scores = {
-        "trend": _frac(conds, trend_keys),
-        "oi": _frac(conds, oi_keys),
-        "price_action": _frac(conds, price_action_keys),
+        "oi_change": _oi_change_category_score(row, ctx, is_ce, is_buy),
         "volume": _frac(conds, volume_keys),
-        "greeks": _frac(conds, greeks_keys),
+        "price_action": _frac(conds, price_action_keys),
         "pcr": _frac(conds, pcr_keys),
         "iv": _frac(conds, iv_keys),
-        "dealer": 1.0 if (ctx.dealer_bias.startswith("🟢") and is_ce) or (ctx.dealer_bias.startswith("🔴") and not is_ce) else
-                  (0.5 if ctx.dealer_bias.startswith("🟡") else 0.0),
-        "institutional": 1.0 if (ctx.institutional_bias.startswith("🟢") and is_ce) or (ctx.institutional_bias.startswith("🔴") and not is_ce) else
-                         (0.5 if ctx.institutional_bias.startswith("🟡") else 0.0),
-        "smart_money": 1.0 if (ctx.smart_money_bias.startswith("🟢") and is_ce) or (ctx.smart_money_bias.startswith("🔴") and not is_ce) else
-                       (0.5 if ctx.smart_money_bias.startswith("🟡") else 0.0),
+        "absolute_oi": _absolute_oi_category_score(row, ctx, is_ce),
     }
     return scores
 
 
-def _weighted_probability(conds: dict, ctx: MarketContext, base_score: float, direction: str) -> tuple[float, dict]:
+def _weighted_probability(conds: dict, ctx: MarketContext, base_score: float, direction: str,
+                           row: pd.Series) -> tuple[float, dict]:
     """STEP 9 weighted scoring — blends the strike's own quantitative
-    model score (CE/PE Score, 0-100) into the 'trend'/'oi' buckets via
-    base_score, then combines every category with CATEGORY_WEIGHTS.
+    model score (CE/PE Score, 0-100) into the 'oi_change' bucket (the
+    dominant 40%-weight category) via base_score, then combines every
+    category with CATEGORY_WEIGHTS (OI Change 40% / Volume 20% /
+    Price Action 15% / PCR 10% / IV 10% / Absolute OI 5%).
     Returns (probability_0_100, category_scores) for transparency."""
-    cats = _category_scores(conds, ctx, base_score, direction)
-    # Blend each of the two heaviest categories with the model's own
-    # 0-100 score so a strong quantitative read still matters.
-    cats["trend"] = _clip01(0.7 * cats["trend"] + 0.3 * (base_score / 100.0))
-    cats["oi"] = _clip01(0.7 * cats["oi"] + 0.3 * (base_score / 100.0))
+    cats = _category_scores(conds, ctx, base_score, direction, row)
+    # Blend the ΔOI-dominance read with the model's own 0-100 score so a
+    # strong quantitative read still matters — but ΔOI stays the anchor
+    # (75% weight) since it is the primary institutional-positioning
+    # signal and must not be diluted by a secondary score.
+    cats["oi_change"] = _clip01(0.75 * cats["oi_change"] + 0.25 * (base_score / 100.0))
     probability = sum(cats[k] * w for k, w in CATEGORY_WEIGHTS.items())
     return round(_clip01(probability) * 100, 1), cats
 
 
 def _confidence_from_categories(cats: dict, base_score: float) -> float:
     """Confidence is the weighted-confirmation strength itself (not a
-    simple average with the raw score) — how many of the ten
-    weighted buckets are actually confirming, scaled 0-100."""
+    simple average with the raw score) — how many of the weighted
+    buckets are actually confirming, scaled 0-100. Because OI Change is
+    40% of the weight, confidence mainly comes from fresh ΔOI + Volume +
+    Price Action, exactly as intended — NOT from historical/absolute OI,
+    which caps out at 5%."""
     strength = sum(cats[k] * w for k, w in CATEGORY_WEIGHTS.items())
     return round(_clip01(0.6 * strength + 0.4 * (base_score / 100.0)) * 100, 1)
 
@@ -1010,10 +1248,10 @@ def _evaluate_strike(row: pd.Series, ctx: MarketContext,
     ce_sell_all = all(ce_sell_conds.values())
     pe_sell_all = all(pe_sell_conds.values())
 
-    ce_buy_prob, ce_buy_cats = _weighted_probability(ce_buy_conds, ctx, ce_score, "CE BUY")
-    pe_buy_prob, pe_buy_cats = _weighted_probability(pe_buy_conds, ctx, pe_score, "PE BUY")
-    ce_sell_prob, ce_sell_cats = _weighted_probability(ce_sell_conds, ctx, 100 - ce_score, "CE SELL")
-    pe_sell_prob, pe_sell_cats = _weighted_probability(pe_sell_conds, ctx, 100 - pe_score, "PE SELL")
+    ce_buy_prob, ce_buy_cats = _weighted_probability(ce_buy_conds, ctx, ce_score, "CE BUY", row)
+    pe_buy_prob, pe_buy_cats = _weighted_probability(pe_buy_conds, ctx, pe_score, "PE BUY", row)
+    ce_sell_prob, ce_sell_cats = _weighted_probability(ce_sell_conds, ctx, 100 - ce_score, "CE SELL", row)
+    pe_sell_prob, pe_sell_cats = _weighted_probability(pe_sell_conds, ctx, 100 - pe_score, "PE SELL", row)
 
     ce_buy_conf = _confidence_from_categories(ce_buy_cats, ce_score)
     pe_buy_conf = _confidence_from_categories(pe_buy_cats, pe_score)
@@ -1244,6 +1482,18 @@ def analyze_market(df: pd.DataFrame, spot_price: float, atm_strike: float,
             "max_pain_shift": ctx.max_pain_shift_bias,
             "call_wall": ctx.call_wall,
             "put_wall": ctx.put_wall,
+            "call_wall_source": ctx.call_wall_source,
+            "put_wall_source": ctx.put_wall_source,
+            "fresh_support": ctx.fresh_support,
+            "fresh_support_pe_chng_oi": ctx.fresh_support_pe_chng_oi,
+            "fresh_resistance": ctx.fresh_resistance,
+            "fresh_resistance_ce_chng_oi": ctx.fresh_resistance_ce_chng_oi,
+            "strongest_writing_strike": ctx.strongest_writing_strike,
+            "strongest_buying_strike": ctx.strongest_buying_strike,
+            "institutional_flow_counts": ctx.institutional_flow_counts,
+            "pcr_prev": ctx.pcr_prev,
+            "pcr_improving": ctx.pcr_improving,
+            "pcr_falling": ctx.pcr_falling,
             "zero_gamma_strike": ctx.zero_gamma_strike,
             "pin_risk": ctx.pin_risk,
             "iv_rank_ce": ctx.iv_rank_ce,
@@ -1267,6 +1517,15 @@ def analyze_market(df: pd.DataFrame, spot_price: float, atm_strike: float,
         },
         "signal_engine_meta": {
             "category_weights": CATEGORY_WEIGHTS,
+            "scoring_model": "fresh_positioning_v2",
+            "primary_metric": "oi_change",
+            "note": (
+                "OI Change (ΔOI) is the primary institutional-positioning metric (40% weight). "
+                "Absolute/historical OI is confirmation-only (5% weight) and never gates a "
+                "BUY/SELL by itself; strikes with ΔOI ≈ 0 are excluded from Fresh Support/"
+                "Resistance and Call/Put Wall selection even when their total OI is the "
+                "largest in the chain."
+            ),
             "min_risk_reward": MIN_RISK_REWARD,
             "min_probability_bar": min_probability,
             "min_confidence_bar": min_confidence,
