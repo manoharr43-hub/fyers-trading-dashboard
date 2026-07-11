@@ -104,7 +104,7 @@ if not logger.handlers:
 logger.setLevel(logging.INFO)
 
 # ─── Page Config ────────────────────────────────────────────────────────────
-
+st.set_page_config()
     page_title="Options Chain Dashboard",
     page_icon="📊",
     layout="wide",
