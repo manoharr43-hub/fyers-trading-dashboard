@@ -69,7 +69,7 @@ if not st.session_state.logged_in:
     st.link_button(
         "🔑 Login With FYERS",
         login_url,
-        use_container_width=True
+        width="stretch"   # ✅ FIXED: replaced use_container_width
     )
 
     params = st.query_params
@@ -77,18 +77,13 @@ if not st.session_state.logged_in:
     if "auth_code" in params:
 
         try:
-
             session.set_token(params["auth_code"])
-
             response = session.generate_token()
 
             if response["s"] == "ok":
-
                 st.session_state.access_token = response["access_token"]
                 st.session_state.logged_in = True
-
                 st.rerun()
-
             else:
                 st.error(response)
 
@@ -110,77 +105,46 @@ fyers = fyersModel.FyersModel(
 # SIDEBAR
 # ==========================================
 menu = st.sidebar.radio(
-
     "Navigation",
-
     [
-
         "🏠 Dashboard",
-
         "📈 Market",
-
         "🧠 AI Market Intelligence",
-
         "💼 Portfolio",
-
         "📋 Orders",
-
         "⚙️ Option Chain",
-
         "🤖 Scanner",
-
         "📊 Charts",
-
         "💹 Trading",
-
         "👤 Profile",
-
         "⚙️ Settings"
-
     ]
-
 )
 
 # ==========================================
 # PAGE ROUTING
 # ==========================================
 pages = {
-
     "🏠 Dashboard": show_dashboard,
-
     "📈 Market": show_market,
-
     "🧠 AI Market Intelligence": show_ai_market_intelligence,
-
     "💼 Portfolio": show_portfolio,
-
     "📋 Orders": show_orders,
-
     "⚙️ Option Chain": show_option_chain,
-
     "🤖 Scanner": show_scanner,
-
     "📊 Charts": show_charts,
-
     "💹 Trading": show_trading,
-
     "👤 Profile": show_profile,
-
     "⚙️ Settings": show_settings,
-
 }
 
 # ==========================================
 # LOAD PAGE
 # ==========================================
 try:
-
     pages[menu](fyers)
-
 except Exception as e:
-
     st.error(f"Error Loading {menu}")
-
     st.exception(e)
 
 # ==========================================
@@ -189,7 +153,5 @@ except Exception as e:
 st.sidebar.divider()
 
 if st.sidebar.button("🚪 Logout"):
-
     st.session_state.clear()
-
     st.rerun()
