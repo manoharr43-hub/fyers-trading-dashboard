@@ -104,12 +104,31 @@ if not logger.handlers:
 logger.setLevel(logging.INFO)
 
 # ─── Page Config ────────────────────────────────────────────────────────────
-st.set_page_config(
-    page_title="Options Chain Dashboard",
-    page_icon="📊",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
+# Guarded: set_page_config() must be Streamlit's first command and can only
+# run once per session. If this module is imported after app.py has already
+# executed any other Streamlit command (or if this module is re-imported),
+# Streamlit raises StreamlitAPIException here. That is a wiring/import-order
+# issue in the hosting app, not a bug in the dashboard's logic, so it is
+# caught and logged instead of crashing the whole app — the page title/icon/
+# layout simply won't be (re)applied in that case, but every other feature
+# below continues to work normally.
+try:
+    st.set_page_config(
+        page_title="Options Chain Dashboard",
+        page_icon="📊",
+        layout="wide",
+        initial_sidebar_state="expanded",
+    )
+except Exception as _page_config_err:  # noqa: BLE001 - st.errors.StreamlitAPIException etc.
+    logger.warning(
+        "st.set_page_config() was skipped: %s. This means it was not the first "
+        "Streamlit command executed this run (commonly because the hosting "
+        "app.py called a Streamlit command, or imported another module that "
+        "did, before importing option_chain). Move `from option_chain import "
+        "show_option_chain` to the very top of app.py, before any other `st.*` "
+        "call, to have this dashboard's page config apply.",
+        _page_config_err,
+    )
 
 # ─── Custom CSS ─────────────────────────────────────────────────────────────
 st.markdown("""
