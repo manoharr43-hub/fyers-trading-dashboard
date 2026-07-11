@@ -200,6 +200,63 @@ def _classify_call_flow(chng_oi, ltp, ltp_prev) -> str:
     return "Long Unwinding (Call)"
 
 
+def _infer_pcr(df) -> float:
+    """Fallback PCR (PE OI / CE OI) computed directly from the chain when
+    the caller didn't supply one. Mirrors the identical calculation
+    option_chain.py's own show_option_chain() already performs, so results
+    match whenever the caller omits pcr instead of passing it in."""
+    try:
+        total_ce = pd.to_numeric(df.get("ce_oi", pd.Series(dtype=float)), errors="coerce").fillna(0).sum()
+        total_pe = pd.to_numeric(df.get("pe_oi", pd.Series(dtype=float)), errors="coerce").fillna(0).sum()
+        return float(total_pe / total_ce) if total_ce > 0 else 1.0
+    except Exception:  # noqa: BLE001 - fallback must never raise
+        return 1.0
+
+
+def _infer_max_pain(df) -> float:
+    """Fallback Max Pain computed directly from the chain when the caller
+    didn't supply one. Same formula as option_chain.py's
+    calculate_max_pain()."""
+    try:
+        strikes = pd.to_numeric(df["strike_price"], errors="coerce").dropna().values
+        if len(strikes) == 0:
+            return 0.0
+        ce_oi = pd.to_numeric(df.get("ce_oi", pd.Series(dtype=float)), errors="coerce").fillna(0).values
+        pe_oi = pd.to_numeric(df.get("pe_oi", pd.Series(dtype=float)), errors="coerce").fillna(0).values
+        pain = [
+            np.sum(np.maximum(s - strikes, 0) * ce_oi) + np.sum(np.maximum(strikes - s, 0) * pe_oi)
+            for s in strikes
+        ]
+        return float(strikes[int(np.argmin(pain))]) if pain else 0.0
+    except Exception:  # noqa: BLE001 - fallback must never raise
+        return 0.0
+
+
+def _infer_spot_price(df) -> float:
+    """Fallback spot price when the caller didn't supply one. This module
+    has no live-quote access of its own, so the median strike in the
+    chain is the best obtainable proxy from a snapshot alone — this only
+    ever engages when spot_price genuinely wasn't passed in."""
+    try:
+        strikes = pd.to_numeric(df["strike_price"], errors="coerce").dropna()
+        return float(strikes.median()) if not strikes.empty else 0.0
+    except Exception:  # noqa: BLE001 - fallback must never raise
+        return 0.0
+
+
+def _infer_atm_strike(df, spot_price) -> float:
+    """Fallback ATM strike — nearest listed strike to spot_price (or to
+    the median strike if spot_price is also unavailable)."""
+    try:
+        strikes = pd.to_numeric(df["strike_price"], errors="coerce").dropna()
+        if strikes.empty:
+            return 0.0
+        ref = spot_price if spot_price else float(strikes.median())
+        return float(strikes.iloc[(strikes - ref).abs().argsort().iloc[0]])
+    except Exception:  # noqa: BLE001 - fallback must never raise
+        return 0.0
+
+
 def _classify_put_flow(chng_oi, ltp, ltp_prev) -> str:
     if chng_oi is None or ltp_prev is None or ltp is None:
         return "Unavailable"
@@ -931,16 +988,6 @@ def _category_scores(conds, ctx: MarketContext, base_score, direction, row) -> d
 
 
 def _volume_category_score(row, ctx: MarketContext, is_ce) -> float:
-    """Continuous 0-1 score for the 20%-weighted 'volume' bucket, computed
-    directly from the strike's own CE/PE volume vs. the chain's
-    high-volume threshold. Computed the same way _oi_change_category_score
-    / _absolute_oi_category_score are (directly from row/ctx) rather than
-    via `_frac` over the checklist dict, because the BUY and SELL
-    checklists don't share matching volume-condition key names — under
-    the old `_frac(conds, volume_keys)` approach every SELL signal's
-    volume bucket silently defaulted to a fixed neutral 0.5 regardless of
-    actual liquidity, since none of `volume_keys` exist in
-    `_ce_sell_conditions` / `_pe_sell_conditions`."""
     vol_val = _safe_float(row.get("ce_volume")) if is_ce else _safe_float(row.get("pe_volume"))
     thresh = ctx.high_ce_vol_thresh if is_ce else ctx.high_pe_vol_thresh
     if thresh <= 0:
@@ -949,12 +996,6 @@ def _volume_category_score(row, ctx: MarketContext, is_ce) -> float:
 
 
 def _pcr_category_score(ctx: MarketContext, is_ce, is_buy) -> float:
-    """Continuous 0-1 score for the 10%-weighted 'pcr' bucket, computed
-    directly from ctx.pcr for every direction. Same rationale as
-    `_volume_category_score`: the SELL checklists carry no
-    "PCR ..." named condition at all, so under the old `_frac`
-    approach the pcr bucket was frozen at neutral 0.5 for every CE
-    SELL / PE SELL evaluation no matter what PCR actually was."""
     bullish_trade = (is_ce and is_buy) or (not is_ce and not is_buy)
     if ctx.pcr <= 0:
         return 0.5
@@ -1164,12 +1205,63 @@ def _missing_reasons(ce_buy_conds, pe_buy_conds, ctx: MarketContext, candidates,
     return " · ".join(missing[:6]) + (" · …" if len(missing) > 6 else "")
 
 
-def analyze_market(df, spot_price, atm_strike, max_pain, pcr, support=None,
-                    resistance=None, trend_engine=None, expiry_label="",
+def analyze_market(df, spot_price=None, atm_strike=None, max_pain=None, pcr=None,
+                    support=None, resistance=None, trend_engine=None, expiry_label="",
                     min_probability=MIN_PROBABILITY, min_confidence=MIN_CONFIDENCE, top_n=10,
-                    oi_history=None, macro_context=None) -> dict:
+                    oi_history=None, macro_context=None, **kwargs) -> dict:
+    """
+    BACKWARD-COMPATIBILITY FIX for:
+        TypeError: analyze_market() missing 4 required positional arguments:
+        'spot_price', 'atm_strike', 'max_pain', 'pcr'
+
+    `spot_price`, `atm_strike`, `max_pain`, `pcr` are now OPTIONAL, additively:
+      • Any existing call already passing all five (positionally or by
+        keyword) behaves exactly as before — unchanged.
+      • `df` may also be the legacy dict-payload shape option_chain.py's
+        AI Market Intelligence bridge has always used for its primary call
+        (analyze_market(payload)) — unpacked here instead of erroring.
+      • If `df` is a real DataFrame and spot_price/atm_strike/max_pain/pcr
+        are left None (e.g. the bridge's fallback call analyze_market(df)),
+        each is derived internally from the chain snapshot using the same
+        formulas option_chain.py already uses, instead of raising.
+    The return dict's keys/shape are unchanged in every case.
+    """
+    # Backward-compat: unpack the legacy single dict-payload calling style
+    # (analyze_market(payload)) used by run_external_ai_market_analysis().
+    if isinstance(df, dict):
+        payload = df
+        df = payload.get("df")
+        spot_price = payload.get("spot_price", spot_price)
+        atm_strike = payload.get("atm_strike", atm_strike)
+        max_pain = payload.get("max_pain", max_pain)
+        pcr = payload.get("pcr", pcr)
+        support = payload.get("support", support)
+        resistance = payload.get("resistance", resistance)
+        trend_engine = payload.get("trend_engine", trend_engine)
+        expiry_label = payload.get("expiry", payload.get("expiry_label", expiry_label))
+        oi_history = payload.get("oi_history", oi_history)
+        macro_context = payload.get("macro_context", macro_context)
+
     if df is None or df.empty:
         return _empty_result(reason="Empty option chain — nothing to analyze.")
+
+    # Never raise TypeError for missing context — derive anything the
+    # caller didn't supply directly from the chain snapshot itself. Values
+    # that WERE supplied by the caller are used as-is and never
+    # recalculated.
+    if spot_price is None:
+        spot_price = _infer_spot_price(df)
+    if atm_strike is None:
+        atm_strike = _infer_atm_strike(df, spot_price)
+    if max_pain is None:
+        max_pain = _infer_max_pain(df)
+    if pcr is None:
+        pcr = _infer_pcr(df)
+
+    spot_price = _safe_float(spot_price, 0.0)
+    atm_strike = _safe_float(atm_strike, 0.0)
+    max_pain = _safe_float(max_pain, 0.0)
+    pcr = _safe_float(pcr, 1.0)
 
     ctx = build_market_context(df, spot_price, atm_strike, max_pain, pcr, support,
                                 resistance, trend_engine=trend_engine, expiry_label=expiry_label,
