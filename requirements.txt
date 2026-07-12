@@ -6,7 +6,6 @@ requests==2.31.0
 yfinance==0.2.40
 plotly==5.22.0
 matplotlib==3.8.4
-
 openpyxl==3.1.2
 feedparser==6.0.10
 streamlit-autorefresh==1.0.1
