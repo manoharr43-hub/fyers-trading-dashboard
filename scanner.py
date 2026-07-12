@@ -2425,3 +2425,6 @@ def show_scanner(fyers):
 
 # Pass your Fyers object here:
 # show_scanner(fyers)
+        # మెమరీ క్లీనప్ - ఇది యాప్ క్రాష్ అవ్వకుండా ఆపుతుంది[span_1](start_span)[span_1](end_span)
+        del df
+        gc.collect() 
