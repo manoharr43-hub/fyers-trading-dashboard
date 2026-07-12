@@ -372,33 +372,12 @@ def extract_spot_price(response: dict, data) -> float:
 
 
 def normalize_chain_shape(options_data: list) -> pd.DataFrame:
-    """
-    FYERS/NSE option-chain payloads have been observed under multiple shapes
-    AND multiple field-name spellings for the same data — most critically
-    for OI Change, which is why "CE OI Change" / "PE OI Change" previously
-    displayed 0 for every strike regardless of the real value.
-
-    ROOT CAUSE (fixed here): the old field_map only recognised the exact,
-    case-sensitive source keys "chng_oi" / "change_oi" / "oi_change". Any
-    other real-world spelling — "changeinOpenInterest" (NSE-style),
-    "changeInOpenInterest", "oiChange", "changeOI", "oich", "chgoi", etc,
-    OR a wide-shaped payload whose ce_/pe_ columns use a different ΔOI
-    suffix entirely — was silently ignored, so ce_chng_oi/pe_chng_oi never
-    existed and ensure_numeric_columns() unconditionally back-filled them
-    with a hardcoded 0. This function now resolves ANY known OI-Change
-    spelling, case-insensitively, for both the long shape (below) and the
-    already-wide shape (see resolve_oi_change_aliases(), applied by the
-    caller after this function returns) — 0 is now only ever displayed
-    when the OI Change genuinely is zero.
-    """
     raw = pd.DataFrame(options_data)
     if raw.empty:
         return raw
 
     if any(c.startswith("ce_") or c.startswith("pe_") for c in raw.columns):
-        # Already wide-shaped. Still resolve OI-Change aliases in case the
-        # API used a suffix other than "chng_oi" (e.g. ce_oich, ce_oiChange).
-        return resolve_oi_change_aliases(raw)
+        return raw
 
     type_col = next(
         (c for c in ("option_type", "optionType", "type", "instrument_type") if c in raw.columns),
@@ -408,27 +387,14 @@ def normalize_chain_shape(options_data: list) -> pd.DataFrame:
         return raw
 
     raw[type_col] = raw[type_col].astype(str).str.upper()
-
-    # Case-insensitive alias resolution for the long-shape source columns.
-    # Every column in `raw` is matched (ignoring case/underscores) against
-    # every known spelling for oi / ltp / volume / OI-change / iv, and
-    # renamed to the single canonical name the rest of this file expects.
-    CANONICAL_FIELD_ALIASES = {
-        "oi": {"oi", "open_interest", "openinterest"},
-        "ltp": {"ltp", "last_price", "lastprice"},
-        "volume": {"volume", "vol", "totaltradedvolume", "traded_volume"},
-        "chng_oi": OI_CHANGE_FIELD_ALIASES,
-        "iv": {"iv", "implied_volatility", "impliedvolatility"},
+    field_map = {
+        "oi": "oi", "open_interest": "oi",
+        "ltp": "ltp", "last_price": "ltp",
+        "volume": "volume", "vol": "volume",
+        "chng_oi": "chng_oi", "change_oi": "chng_oi", "oi_change": "chng_oi",
+        "iv": "iv", "implied_volatility": "iv",
     }
-    normalized_lookup = {_normalize_field_name(c): c for c in raw.columns}
-    rename_map = {}
-    for canonical, aliases in CANONICAL_FIELD_ALIASES.items():
-        for alias in aliases:
-            actual_col = normalized_lookup.get(_normalize_field_name(alias))
-            if actual_col:
-                rename_map[actual_col] = canonical
-                break
-    raw_renamed = raw.rename(columns=rename_map)
+    raw_renamed = raw.rename(columns={k: v for k, v in field_map.items() if k in raw.columns})
     value_cols = [c for c in ("oi", "ltp", "volume", "chng_oi", "iv") if c in raw_renamed.columns]
 
     ce_df = raw_renamed[raw_renamed[type_col] == "CE"][["strike_price"] + value_cols].copy()
@@ -437,158 +403,6 @@ def normalize_chain_shape(options_data: list) -> pd.DataFrame:
     pe_df.rename(columns={c: f"pe_{c}" for c in value_cols}, inplace=True)
 
     return pd.merge(ce_df, pe_df, on="strike_price", how="outer")
-
-
-# Every OI-Change spelling observed across FYERS/NSE/third-party payloads,
-# matched case-insensitively with underscores stripped (see
-# _normalize_field_name). Add new spellings here if a future API variant
-# uses yet another name — nothing else in this file needs to change.
-OI_CHANGE_FIELD_ALIASES = {
-    "chng_oi", "change_oi", "oi_change", "changeinopeninterest",
-    "changeinopeninterest_", "changeopeninterest", "oichange", "oich",
-    "changeoi", "chgoi", "oi_chg", "deltaoi", "delta_oi", "oidelta",
-    "oi_delta", "netchangeoi", "net_change_oi",
-}
-
-
-def _normalize_field_name(name: str) -> str:
-    """Case/underscore/space-insensitive key for matching field-name
-    aliases, e.g. 'changeinOpenInterest' and 'change_in_open_interest'
-    and 'CHANGE_IN_OPEN_INTEREST' all normalize to the same string."""
-    return str(name).strip().lower().replace("_", "").replace(" ", "")
-
-
-def resolve_oi_change_aliases(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Catches the wide-shape case: the payload already has ce_/pe_ prefixed
-    columns, but the OI-Change field itself might be named ce_oich,
-    ce_changeInOpenInterest, ce_oiChange, etc. instead of ce_chng_oi. If
-    ce_chng_oi/pe_chng_oi are missing OR are present but entirely zero
-    while an alias column with real (non-zero) data exists, this copies
-    the alias's values in — never overwrites a column that already has
-    genuine non-zero data.
-    """
-    if df is None or df.empty:
-        return df
-    d = df.copy()
-    normalized_lookup = {_normalize_field_name(c): c for c in d.columns}
-    for side in ("ce", "pe"):
-        target = f"{side}_chng_oi"
-        target_has_signal = target in d.columns and pd.to_numeric(
-            d[target], errors="coerce"
-        ).fillna(0).abs().sum() > 0
-        if target_has_signal:
-            continue
-        for alias in OI_CHANGE_FIELD_ALIASES:
-            candidate_key = _normalize_field_name(f"{side}_{alias}")
-            actual_col = normalized_lookup.get(candidate_key)
-            if actual_col and actual_col != target:
-                candidate_vals = pd.to_numeric(d[actual_col], errors="coerce").fillna(0)
-                if candidate_vals.abs().sum() > 0:
-                    d[target] = candidate_vals
-                    logger.info(
-                        "OI Change alias resolved: %s -> %s (found real non-zero data)",
-                        actual_col, target,
-                    )
-                    break
-    return d
-
-
-OI_CHANGE_SNAPSHOT_KEY = "oc_oi_change_prev_snapshot"
-
-
-def _strike_snapshot_key(strike_price) -> str:
-    """Single, dtype-independent formatting for strike-price snapshot keys.
-    Without this, a DataFrame row visited via iterrows() can silently
-    upcast strike_price from int to float partway through a function (as
-    soon as any OTHER column in the same row becomes float64, pandas
-    unifies the whole row's dtype for that iteration) — producing '100'
-    at one point and '100.0' at another for the exact same strike, which
-    would otherwise cause the previous-snapshot lookup to silently miss."""
-    return f"{float(strike_price):.4f}"
-
-
-def apply_oi_change_snapshot_fallback(df: pd.DataFrame, symbol: str, expiry_label: str) -> pd.DataFrame:
-    """
-    Final fallback layer for OI Change, run every refresh regardless of
-    source: if ce_chng_oi/pe_chng_oi are still all-zero across every
-    strike after alias resolution above (meaning neither FYERS nor NSE
-    supplied a usable ΔOI field this time), OI Change is computed directly
-    as Current OI - Previous OI, using this session's own last snapshot
-    for the same symbol+expiry+strike (stored in st.session_state, the
-    same pattern the Gamma Analyzer already uses). On the very first fetch
-    for a symbol+expiry there is no prior snapshot yet, so OI Change is
-    legitimately 0 that one time — this is an inherent property of a
-    single point-in-time API, not a bug, and resolves itself from the next
-    refresh onward. Never overwrites a column that already has real data.
-    """
-    if df is None or df.empty:
-        return df
-    d = df.copy()
-    history = st.session_state.setdefault(OI_CHANGE_SNAPSHOT_KEY, {})
-    hist_key = f"{symbol}|{expiry_label}"
-    prev_strikes = history.get(hist_key, {})
-
-    for side in ("ce", "pe"):
-        oi_col, chng_col = f"{side}_oi", f"{side}_chng_oi"
-        if oi_col not in d.columns:
-            continue
-        if chng_col not in d.columns:
-            d[chng_col] = 0.0
-        has_real_signal = pd.to_numeric(d[chng_col], errors="coerce").fillna(0).abs().sum() > 0
-        if has_real_signal:
-            continue  # API/alias already supplied genuine (non-zero) data
-        recomputed = []
-        for _, row in d.iterrows():
-            strike_key = _strike_snapshot_key(row.get("strike_price"))
-            cur_oi = float(pd.to_numeric(row.get(oi_col), errors="coerce") or 0)
-            prev_oi = prev_strikes.get(f"{side}|{strike_key}")
-            recomputed.append(cur_oi - prev_oi if prev_oi is not None else 0.0)
-        d[chng_col] = recomputed
-        logger.info(
-            "OI Change (%s) recomputed from session snapshot (Current OI - Previous OI) "
-            "for %s — no non-zero ΔOI field was found in the API response.",
-            side.upper(), hist_key,
-        )
-
-    new_snapshot = {}
-    for side in ("ce", "pe"):
-        oi_col = f"{side}_oi"
-        if oi_col not in d.columns:
-            continue
-        for _, row in d.iterrows():
-            strike_key = _strike_snapshot_key(row.get("strike_price"))
-            new_snapshot[f"{side}|{strike_key}"] = float(pd.to_numeric(row.get(oi_col), errors="coerce") or 0)
-    history[hist_key] = new_snapshot
-    st.session_state[OI_CHANGE_SNAPSHOT_KEY] = history
-    return d
-
-
-def audit_oi_change(df: pd.DataFrame, symbol: str, expiry_label: str) -> pd.DataFrame:
-    """
-    Builds the "OI Change Audit" table shown in debug mode: Current OI,
-    Previous OI (from this session's snapshot, if any), and the final
-    displayed OI Change, per strike/side — so a mismatch between what the
-    API sent and what's on screen can be verified directly instead of
-    just trusted.
-    """
-    if df is None or df.empty:
-        return pd.DataFrame()
-    history = st.session_state.get(OI_CHANGE_SNAPSHOT_KEY, {})
-    hist_key = f"{symbol}|{expiry_label}"
-    prev_strikes = history.get(hist_key, {})
-    rows = []
-    for _, row in df.iterrows():
-        strike = row.get("strike_price")
-        rec = {"Strike": strike}
-        for side in ("ce", "pe"):
-            cur_oi = row.get(f"{side}_oi", 0)
-            prev_oi = prev_strikes.get(f"{side}|{_strike_snapshot_key(strike)}")
-            rec[f"{side.upper()} Current OI"] = cur_oi
-            rec[f"{side.upper()} Previous OI"] = prev_oi if prev_oi is not None else "—"
-            rec[f"{side.upper()} Displayed ΔOI"] = row.get(f"{side}_chng_oi", 0)
-        rows.append(rec)
-    return pd.DataFrame(rows)
 
 
 def ensure_numeric_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -955,14 +769,6 @@ def fetch_nse_option_chain(symbol_key: str, is_stock: bool, stock_name: str = ""
 
         if df is not None and not df.empty:
             df = filter_strikes_around_atm(df, spot_price, strike_count)
-            # Defense-in-depth: NSE's own "changeinOpenInterest" field is
-            # already mapped correctly above, but if NSE itself ever
-            # returns it empty/zero for every row, fall back to a
-            # session-tracked Current OI - Previous OI recompute rather
-            # than silently displaying 0.
-            df = apply_oi_change_snapshot_fallback(
-                df, symbol=(symbol_key or stock_name), expiry_label=target_expiry
-            )
             df.sort_values("strike_price", inplace=True)
             df.reset_index(drop=True, inplace=True)
 
@@ -1031,14 +837,6 @@ def get_option_chain_data(fyers, symbol_candidates: list, strike_count: int, exp
             if options_data:
                 df = normalize_chain_shape(options_data)
                 df = ensure_numeric_columns(df)
-                # OI-Change fix (final layer): alias resolution already ran
-                # inside normalize_chain_shape(); this session-snapshot
-                # fallback only engages if ce_chng_oi/pe_chng_oi are STILL
-                # all-zero after that — i.e. FYERS genuinely didn't supply
-                # a usable ΔOI field this call. Never overwrites real data.
-                df = apply_oi_change_snapshot_fallback(
-                    df, symbol=used_symbol, expiry_label=selected_expiry_label
-                )
                 df.sort_values("strike_price", inplace=True)
                 df.reset_index(drop=True, inplace=True)
                 if validate_option_chain_df(df):
@@ -1690,303 +1488,6 @@ def run_external_ai_market_analysis(df: pd.DataFrame, spot_price: float, atm_str
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# 5F. CE/PE INSTITUTIONAL BUY & SELL SIGNAL ENGINE  (additive — new columns
-#     BUY CE / SELL CE / BUY PE / SELL PE, Confidence %, Reason, Stars,
-#     Risk Level, Stop Loss, Target, Probability. Does not remove, rename,
-#     or recompute any existing column; purely appends alongside CE Score/
-#     PE Score/Final Signal etc.)
-# ══════════════════════════════════════════════════════════════════════════
-#
-# DESIGN NOTE — "No False Signals" (spec section 12):
-#   Buyer-side signals (BUY CE / BUY PE) require genuine underlying trend
-#   confirmation (VWAP/EMA/structure/RSI/MACD from `trend_engine` — the
-#   same dict compute_scalping_trend_engine() already produces elsewhere
-#   in this file when the AI Scalping Engine has fetched candles this
-#   session). Without a trend_engine, this file has NO way to confirm
-#   price action, momentum, or structure — so BUY CE / BUY PE always
-#   report NO TRADE rather than fabricate a signal from OI alone, exactly
-#   as requested. Seller-side signals (SELL CE / SELL PE) CAN surface from
-#   the option-chain snapshot alone (heavy OI/writing + IV + resistance/
-#   support proximity), mirroring the identical business rule already
-#   documented and enforced in ai_analysis_engine.py's analyze_market().
-#
-# HONEST FACTOR COVERAGE — a few of the requested inputs (Theta, FII/DII
-# Bias, true tick-level Delta/Gamma, a certified "Bullish Divergence"
-# detector) are not obtainable from a snapshot option-chain + OHLC-candle
-# pipeline; rather than fabricate numbers for them, they are either
-# proxied from the closest available signal (documented inline below) or
-# simply omitted from the checklist so the Confidence % this file reports
-# is never inflated by a value that was invented.
-
-CE_PE_SIGNAL_MIN_CONFIDENCE = 60.0   # below this -> NO TRADE regardless of anything else
-CE_PE_SIGNAL_MIN_TRUE_FRACTION = 0.55  # at least this fraction of applicable checks must hold
-
-
-def _ce_pe_signal_stars(confidence_pct: float) -> str:
-    if confidence_pct >= 90:
-        return "★★★★★"
-    if confidence_pct >= 75:
-        return "★★★★☆"
-    if confidence_pct >= 60:
-        return "★★★☆☆"
-    if confidence_pct >= 45:
-        return "★★☆☆☆"
-    return "★☆☆☆☆"
-
-
-def _ce_pe_levels(entry: float, is_sell: bool):
-    """Reuses the exact same premium-percentage convention already used
-    throughout this file (compute_ai_engine's CE/PE Entry/SL/Targets, and
-    the AI Scalping Engine's sell-side levels) rather than inventing a new
-    one, for consistency."""
-    if entry <= 0:
-        return 0.0, 0.0, 0.0
-    if is_sell:
-        sl = round(entry * 1.20, 2)
-        target = round(entry * 0.70, 2)
-    else:
-        sl = round(entry * 0.85, 2)
-        target = round(entry * 1.30, 2)
-    risk = abs(entry - sl)
-    reward = abs(target - entry)
-    rr = round(reward / risk, 2) if risk > 0 else 0.0
-    return sl, target, rr
-
-
-def compute_ce_pe_trade_signals(df: pd.DataFrame, spot_price: float, max_pain: float, pcr: float,
-                                 atm_strike: float, support, resistance,
-                                 trend_engine: dict = None, gdf: pd.DataFrame = None) -> pd.DataFrame:
-    """
-    Adds BUY CE / SELL CE / BUY PE / SELL PE (+ Confidence/Reason/Stars/
-    Risk Level/Stop Loss/Target/Probability) to `df`, per-strike, without
-    touching any existing column. Always returns a DataFrame with every
-    input column intact plus the new ones appended.
-    """
-    if df.empty:
-        return df
-    d = df.copy()
-
-    has_trend = bool(trend_engine and trend_engine.get("available"))
-    if has_trend:
-        last_close, vwap = trend_engine.get("last_close"), trend_engine.get("vwap")
-        ema9, ema20, ema50 = trend_engine.get("ema9"), trend_engine.get("ema20"), trend_engine.get("ema50")
-        rsi5 = trend_engine.get("rsi5", 50.0)
-        macd_val, macd_sig = trend_engine.get("macd", 0.0), trend_engine.get("macd_signal", 0.0)
-        bos_label = trend_engine.get("bos_label", "None")
-        volume_spike = ("Volume Spike" in trend_engine.get("buy_confirmations", [])
-                         or "Volume Spike" in trend_engine.get("sell_confirmations", []))
-        price_above_vwap = last_close is not None and vwap is not None and last_close > vwap
-        price_below_vwap = last_close is not None and vwap is not None and last_close < vwap
-        above_ema20_50 = (last_close is not None and ema20 is not None and ema50 is not None
-                          and last_close > ema20 and last_close > ema50)
-        below_ema20_50 = (last_close is not None and ema20 is not None and ema50 is not None
-                          and last_close < ema20 and last_close < ema50)
-        bullish_structure = bos_label == "Bullish BOS"
-        bearish_structure = bos_label == "Bearish BOS"
-        bullish_candle_proxy = macd_val > macd_sig   # proxy — no raw OHLC candle body available here
-        bearish_candle_proxy = macd_val < macd_sig
-        rsi_overbought = rsi5 > 70
-        rsi_oversold = rsi5 < 30
-    else:
-        price_above_vwap = price_below_vwap = None
-        above_ema20_50 = below_ema20_50 = None
-        bullish_structure = bearish_structure = None
-        bullish_candle_proxy = bearish_candle_proxy = None
-        rsi_overbought = rsi_oversold = None
-        volume_spike = None
-
-    gamma_map = None
-    if gdf is not None and not gdf.empty and "Gamma Change" in gdf.columns:
-        gamma_map = gdf.set_index("strike_price")["Gamma Change"].to_dict()
-
-    heavy_ce_oi = df["ce_oi"].quantile(0.80) if df["ce_oi"].max() > 0 else 0
-    heavy_pe_oi = df["pe_oi"].quantile(0.80) if df["pe_oi"].max() > 0 else 0
-    heavy_ce_chng = df["ce_chng_oi"].clip(lower=0).quantile(0.80) if (df["ce_chng_oi"] > 0).any() else 0
-    heavy_pe_chng = df["pe_chng_oi"].clip(lower=0).quantile(0.80) if (df["pe_chng_oi"] > 0).any() else 0
-    high_ce_vol = df["ce_volume"].quantile(0.75) if df["ce_volume"].max() > 0 else 0
-    high_pe_vol = df["pe_volume"].quantile(0.75) if df["pe_volume"].max() > 0 else 0
-    avg_ce_iv = df.loc[df["ce_iv"] > 0, "ce_iv"].mean() if (df["ce_iv"] > 0).any() else 0
-    avg_pe_iv = df.loc[df["pe_iv"] > 0, "pe_iv"].mean() if (df["pe_iv"] > 0).any() else 0
-
-    ref = spot_price if spot_price else (atm_strike if atm_strike else float(df["strike_price"].median()))
-    strike_gap = df["strike_price"].sort_values().diff().dropna().median() if len(df) > 1 else 1.0
-
-    buy_ce_col, sell_ce_col, buy_pe_col, sell_pe_col = [], [], [], []
-    ce_conf_col, pe_conf_col = [], []
-    ce_reason_col, pe_reason_col = [], []
-    ce_stars_col, pe_stars_col = [], []
-    ce_risk_col, pe_risk_col = [], []
-    ce_sl_col, ce_target_col, ce_rr_col, ce_prob_col = [], [], [], []
-    pe_sl_col, pe_target_col, pe_rr_col, pe_prob_col = [], [], [], []
-
-    for _, row in d.iterrows():
-        strike = row["strike_price"]
-        ce_oi, pe_oi = row.get("ce_oi", 0), row.get("pe_oi", 0)
-        ce_chng, pe_chng = row.get("ce_chng_oi", 0), row.get("pe_chng_oi", 0)
-        ce_vol, pe_vol = row.get("ce_volume", 0), row.get("pe_volume", 0)
-        ce_iv, pe_iv = row.get("ce_iv", 0), row.get("pe_iv", 0)
-        ce_ltp, pe_ltp = row.get("ce_ltp", 0), row.get("pe_ltp", 0)
-        inst_buying = row.get("Institutional Buying", 0)
-        inst_selling = row.get("Institutional Selling", 0)
-        gamma_chg = gamma_map.get(strike, 0.0) if gamma_map else None
-
-        near_resistance = resistance is not None and abs(strike - resistance) <= strike_gap
-        near_support = support is not None and abs(strike - support) <= strike_gap
-        no_nearby_resistance = resistance is None or strike < resistance - strike_gap
-        no_nearby_support_break = support is None or strike > support - strike_gap
-
-        # ── BUY CE (spec section 5) — requires trend confirmation ───────
-        buy_ce_conds = {
-            "PE Writing": pe_chng > 0 and heavy_pe_chng > 0 and pe_chng >= heavy_pe_chng * 0.5,
-            "CE Unwinding": ce_chng < 0,
-            "PCR Rising (>1.0)": pcr > 1.0,
-            "Price above VWAP": bool(price_above_vwap) if has_trend else False,
-            "Above EMA20 & EMA50": bool(above_ema20_50) if has_trend else False,
-            "Bullish Market Structure": bool(bullish_structure) if has_trend else False,
-            "Bullish Candle (MACD proxy)": bool(bullish_candle_proxy) if has_trend else False,
-            "Volume Expansion": bool(volume_spike) if has_trend else (ce_vol >= high_ce_vol > 0),
-            "Positive Gamma (Delta proxy)": (gamma_chg is not None and gamma_chg > 0),
-            "Stable IV": avg_ce_iv > 0 and 0 < ce_iv <= avg_ce_iv * 1.1,
-            "Max Pain below Spot": bool(max_pain and spot_price and spot_price > max_pain),
-            "Support Holding": (support is None) or (spot_price is not None and spot_price >= support),
-            "No nearby Resistance": no_nearby_resistance,
-            "Smart Money Buying": inst_buying >= 60,
-        }
-        # ── SELL CE (spec section 6) — snapshot-only, seller-side ───────
-        sell_ce_conds = {
-            "CE Long Build-up (Call Writing)": heavy_ce_chng > 0 and ce_chng >= heavy_ce_chng,
-            "Resistance Rejection": near_resistance or (heavy_ce_oi > 0 and ce_oi >= heavy_ce_oi),
-            "Bearish Structure": bool(bearish_structure) if has_trend else True,
-            "RSI Overbought": bool(rsi_overbought) if has_trend else True,
-            "MACD Bearish": bool(bearish_candle_proxy) if has_trend else True,
-            "Volume Selling": ce_vol >= high_ce_vol > 0,
-            "IV Expansion": avg_ce_iv > 0 and ce_iv >= avg_ce_iv * 1.1,
-            "OI Resistance": heavy_ce_oi > 0 and ce_oi >= heavy_ce_oi,
-            "Institutional Exit": inst_selling >= 60,
-        }
-        # ── BUY PE (spec section 7) — requires trend confirmation ───────
-        buy_pe_conds = {
-            "CE Writing": ce_chng > 0 and heavy_ce_chng > 0 and ce_chng >= heavy_ce_chng * 0.5,
-            "PE Unwinding": pe_chng < 0,
-            "Price below VWAP": bool(price_below_vwap) if has_trend else False,
-            "EMA Breakdown": bool(below_ema20_50) if has_trend else False,
-            "Bearish Candle (MACD proxy)": bool(bearish_candle_proxy) if has_trend else False,
-            "Breakdown Confirmed (Structure)": bool(bearish_structure) if has_trend else False,
-            "Volume Expansion": bool(volume_spike) if has_trend else (pe_vol >= high_pe_vol > 0),
-            "Negative Gamma (Delta proxy)": (gamma_chg is not None and gamma_chg < 0),
-            "Max Pain above Spot": bool(max_pain and spot_price and spot_price < max_pain),
-            "Institutional Selling": inst_selling >= 60,
-        }
-        # ── SELL PE (spec section 8) — snapshot-only, seller-side ───────
-        sell_pe_conds = {
-            "PE Long Build-up (Put Writing)": heavy_pe_chng > 0 and pe_chng >= heavy_pe_chng,
-            "Support Holding": near_support or (heavy_pe_oi > 0 and pe_oi >= heavy_pe_oi),
-            "Bullish Reversal (Structure)": bool(bullish_structure) if has_trend else True,
-            "RSI Oversold": bool(rsi_oversold) if has_trend else True,
-            "IV Crush": avg_pe_iv > 0 and 0 < pe_iv <= avg_pe_iv * 0.9,
-            "Institutional Buying": inst_buying >= 60,
-        }
-
-        def _score(conds: dict, require_all_available: bool) -> float:
-            if require_all_available and not has_trend:
-                return 0.0
-            vals = list(conds.values())
-            return (sum(1 for v in vals if v) / len(vals)) * 100 if vals else 0.0
-
-        ce_buy_conf = _score(buy_ce_conds, require_all_available=True)
-        ce_sell_conf = _score(sell_ce_conds, require_all_available=False)
-        pe_buy_conf = _score(buy_pe_conds, require_all_available=True)
-        pe_sell_conf = _score(sell_pe_conds, require_all_available=False)
-
-        def _passes(conds, conf, require_trend):
-            if require_trend and not has_trend:
-                return False
-            frac_true = sum(1 for v in conds.values() if v) / len(conds)
-            return conf >= CE_PE_SIGNAL_MIN_CONFIDENCE and frac_true >= CE_PE_SIGNAL_MIN_TRUE_FRACTION
-
-        ce_buy_ok = _passes(buy_ce_conds, ce_buy_conf, require_trend=True)
-        ce_sell_ok = _passes(sell_ce_conds, ce_sell_conf, require_trend=False)
-        pe_buy_ok = _passes(buy_pe_conds, pe_buy_conf, require_trend=True)
-        pe_sell_ok = _passes(sell_pe_conds, pe_sell_conf, require_trend=False)
-
-        # CE side: pick the stronger of BUY CE / SELL CE if both somehow
-        # pass (rare); never show both simultaneously for the same side.
-        ce_sl = ce_target = ce_rr = 0.0
-        if ce_buy_ok and (not ce_sell_ok or ce_buy_conf >= ce_sell_conf):
-            buy_ce, sell_ce = "✅ BUY CE", "—"
-            ce_conf, ce_reason_src = ce_buy_conf, buy_ce_conds
-            ce_sl, ce_target, ce_rr = _ce_pe_levels(float(ce_ltp or 0), is_sell=False)
-        elif ce_sell_ok:
-            buy_ce, sell_ce = "—", "🔻 SELL CE"
-            ce_conf, ce_reason_src = ce_sell_conf, sell_ce_conds
-            ce_sl, ce_target, ce_rr = _ce_pe_levels(float(ce_ltp or 0), is_sell=True)
-        else:
-            buy_ce, sell_ce = "NO TRADE", "NO TRADE"
-            ce_conf = max(ce_buy_conf, ce_sell_conf)
-            ce_reason_src = buy_ce_conds if ce_buy_conf >= ce_sell_conf else sell_ce_conds
-
-        pe_sl = pe_target = pe_rr = 0.0
-        if pe_buy_ok and (not pe_sell_ok or pe_buy_conf >= pe_sell_conf):
-            buy_pe, sell_pe = "✅ BUY PE", "—"
-            pe_conf, pe_reason_src = pe_buy_conf, buy_pe_conds
-            pe_sl, pe_target, pe_rr = _ce_pe_levels(float(pe_ltp or 0), is_sell=False)
-        elif pe_sell_ok:
-            buy_pe, sell_pe = "—", "🔻 SELL PE"
-            pe_conf, pe_reason_src = pe_sell_conf, sell_pe_conds
-            pe_sl, pe_target, pe_rr = _ce_pe_levels(float(pe_ltp or 0), is_sell=True)
-        else:
-            buy_pe, sell_pe = "NO TRADE", "NO TRADE"
-            pe_conf = max(pe_buy_conf, pe_sell_conf)
-            pe_reason_src = buy_pe_conds if pe_buy_conf >= pe_sell_conf else sell_pe_conds
-
-        # RR floor (capital-protection gate, spec section 15) — a
-        # BUY/SELL that fails 1:1.5 reward:risk downgrades to NO TRADE.
-        if buy_ce not in ("NO TRADE",) or sell_ce not in ("NO TRADE",):
-            if ce_rr < 1.5:
-                buy_ce, sell_ce, ce_conf = "NO TRADE", "NO TRADE", min(ce_conf, CE_PE_SIGNAL_MIN_CONFIDENCE - 1)
-        if buy_pe not in ("NO TRADE",) or sell_pe not in ("NO TRADE",):
-            if pe_rr < 1.5:
-                buy_pe, sell_pe, pe_conf = "NO TRADE", "NO TRADE", min(pe_conf, CE_PE_SIGNAL_MIN_CONFIDENCE - 1)
-
-        ce_reason = " · ".join(k for k, v in ce_reason_src.items() if v) or "No conditions met"
-        pe_reason = " · ".join(k for k, v in pe_reason_src.items() if v) or "No conditions met"
-        if not has_trend and (buy_ce == "NO TRADE" and buy_pe == "NO TRADE"):
-            note = "Enable the AI Scalping Engine (candle fetch) for trend-confirmed BUY signals"
-            ce_reason = f"{ce_reason} · {note}" if ce_reason != "No conditions met" else note
-            pe_reason = f"{pe_reason} · {note}" if pe_reason != "No conditions met" else note
-
-        buy_ce_col.append(buy_ce); sell_ce_col.append(sell_ce)
-        buy_pe_col.append(buy_pe); sell_pe_col.append(sell_pe)
-        ce_conf_col.append(round(ce_conf, 1)); pe_conf_col.append(round(pe_conf, 1))
-        ce_reason_col.append(ce_reason); pe_reason_col.append(pe_reason)
-        ce_stars_col.append(_ce_pe_signal_stars(ce_conf) if buy_ce != "NO TRADE" or sell_ce != "NO TRADE" else "—")
-        pe_stars_col.append(_ce_pe_signal_stars(pe_conf) if buy_pe != "NO TRADE" or sell_pe != "NO TRADE" else "—")
-        ce_risk_col.append(_risk_level_from_confidence(ce_conf))
-        pe_risk_col.append(_risk_level_from_confidence(pe_conf))
-        ce_sl_col.append(ce_sl); ce_target_col.append(ce_target); ce_rr_col.append(ce_rr); ce_prob_col.append(round(ce_conf, 1))
-        pe_sl_col.append(pe_sl); pe_target_col.append(pe_target); pe_rr_col.append(pe_rr); pe_prob_col.append(round(pe_conf, 1))
-
-    d["BUY CE"], d["SELL CE"], d["BUY PE"], d["SELL PE"] = buy_ce_col, sell_ce_col, buy_pe_col, sell_pe_col
-    d["CE Confidence"], d["PE Confidence"] = ce_conf_col, pe_conf_col
-    d["CE Reason"], d["PE Reason"] = ce_reason_col, pe_reason_col
-    d["CE Stars"], d["PE Stars"] = ce_stars_col, pe_stars_col
-    d["CE Risk Level"], d["PE Risk Level"] = ce_risk_col, pe_risk_col
-    d["CE Stop Loss"], d["CE Target"], d["CE Risk Reward"], d["CE Probability"] = ce_sl_col, ce_target_col, ce_rr_col, ce_prob_col
-    d["PE Stop Loss"], d["PE Target"], d["PE Risk Reward"], d["PE Probability"] = pe_sl_col, pe_target_col, pe_rr_col, pe_prob_col
-    return d
-
-
-def _risk_level_from_confidence(conf: float) -> str:
-    if conf >= 85:
-        return "Low"
-    if conf >= 70:
-        return "Moderate"
-    if conf >= 55:
-        return "Elevated"
-    return "High"
-
-
-# ══════════════════════════════════════════════════════════════════════════
 # 6. MARKET INTELLIGENCE
 # ══════════════════════════════════════════════════════════════════════════
 
@@ -2180,17 +1681,9 @@ def iv_chart(df: pd.DataFrame) -> go.Figure:
 
 
 def style_chain_table(df: pd.DataFrame) -> pd.DataFrame:
-    """Existing columns are kept exactly as before, in the same order.
-    The new institutional CE/PE BUY & SELL signal columns (spec section
-    14) are appended at the end — Signal/Confidence/Reason for each side —
-    nothing existing is removed, renamed, or reordered."""
     cols = ["ce_oi", "ce_chng_oi", "ce_volume", "ce_ltp", "CE Bias", "strike_price",
             "PE Bias", "pe_ltp", "pe_volume", "pe_chng_oi", "pe_oi", "Strike Signal", "Big Move"]
-    new_signal_cols = [
-        "BUY CE", "SELL CE", "CE Confidence", "CE Stars", "CE Reason",
-        "BUY PE", "SELL PE", "PE Confidence", "PE Stars", "PE Reason",
-    ]
-    available = [c for c in cols if c in df.columns] + [c for c in new_signal_cols if c in df.columns]
+    available = [c for c in cols if c in df.columns]
     out = df[available].copy()
     rename = {
         "ce_oi": "CE OI", "ce_chng_oi": "CE ΔOI", "ce_volume": "CE Vol", "ce_ltp": "CE LTP",
@@ -2199,58 +1692,6 @@ def style_chain_table(df: pd.DataFrame) -> pd.DataFrame:
     }
     out.rename(columns={k: v for k, v in rename.items() if k in out.columns}, inplace=True)
     return out
-
-
-# Big-move threshold used only for the "large build-up / large unwinding"
-# dark-green/dark-red distinction below — same 80th-percentile convention
-# already used everywhere else in this file for "heavy" ΔOI.
-def _oi_change_color(val, heavy_thresh: float) -> str:
-    """Spec section 3 color rules: positive -> green, negative -> red,
-    zero -> grey, a "large" build-up/unwinding (>= the chain's own 80th
-    percentile ΔOI) -> a darker shade of the same color."""
-    try:
-        v = float(val)
-    except (TypeError, ValueError):
-        return ""
-    if v == 0:
-        return "color:#8b949e;"  # grey
-    is_large = heavy_thresh > 0 and abs(v) >= heavy_thresh
-    if v > 0:
-        return "color:#0d3b2e;font-weight:700;background-color:#3fb950;" if is_large else "color:#3fb950;"
-    return "color:#3b0d1a;font-weight:700;background-color:#f85149;" if is_large else "color:#f85149;"
-
-
-def style_oi_change_columns(styler, df_for_thresholds: pd.DataFrame):
-    """Applies the color rules above to the 'CE ΔOI' / 'PE ΔOI' columns of
-    an already-built pandas Styler, using the source (unrenamed) dataframe
-    to compute the 80th-percentile 'heavy' threshold each side needs."""
-    heavy_ce = df_for_thresholds["ce_chng_oi"].abs().quantile(0.80) if "ce_chng_oi" in df_for_thresholds.columns and (df_for_thresholds["ce_chng_oi"] != 0).any() else 0
-    heavy_pe = df_for_thresholds["pe_chng_oi"].abs().quantile(0.80) if "pe_chng_oi" in df_for_thresholds.columns and (df_for_thresholds["pe_chng_oi"] != 0).any() else 0
-    if "CE ΔOI" in styler.data.columns:
-        styler = styler.applymap(lambda v: _oi_change_color(v, heavy_ce), subset=["CE ΔOI"])
-    if "PE ΔOI" in styler.data.columns:
-        styler = styler.applymap(lambda v: _oi_change_color(v, heavy_pe), subset=["PE ΔOI"])
-    return styler
-
-
-def _ce_pe_signal_cell_color(val: str) -> str:
-    """Color rule for the new BUY/SELL signal cells: green for BUY, red
-    for SELL, grey for NO TRADE / '—'."""
-    v = str(val)
-    if v.startswith("✅ BUY"):
-        return "color:#3fb950;font-weight:700;"
-    if v.startswith("🔻 SELL"):
-        return "color:#f85149;font-weight:700;"
-    return "color:#8b949e;"
-
-
-def style_ce_pe_signal_columns(styler):
-    """Applies the BUY/SELL color rule to whichever of the new signal
-    columns are present in the styled table."""
-    for col in ("BUY CE", "SELL CE", "BUY PE", "SELL PE"):
-        if col in styler.data.columns:
-            styler = styler.applymap(_ce_pe_signal_cell_color, subset=[col])
-    return styler
 
 
 def style_big_move_table(df: pd.DataFrame) -> pd.DataFrame:
@@ -3650,22 +3091,6 @@ def show_option_chain(fyers):
     gdf = add_gamma_columns(df, spot_price, expiry_label)
     gdf = compute_gamma_analysis(gdf, symbol, expiry_label)
 
-    # ── CE/PE Institutional BUY & SELL Signal Engine (additive, section 5F)
-    # Reuses the underlying trend_engine (VWAP/EMA/RSI/MACD/BOS) already
-    # computed by the AI Scalping Engine tab THIS SESSION, if the user has
-    # enabled it — cached in session_state since tab7's own candle-fetch
-    # only runs when that tab is actually reached in the script, which is
-    # after this point on the very first activation. Without a cached
-    # trend_engine yet, BUY CE/BUY PE correctly stay at NO TRADE (see the
-    # design note above compute_ce_pe_trade_signals) while SELL CE/SELL PE
-    # can still surface from the chain snapshot alone.
-    cached_trend_engine = st.session_state.get("oc_scalp_trend_engine")
-    df = compute_ce_pe_trade_signals(
-        df, spot_price=spot_price, max_pain=max_pain, pcr=pcr, atm_strike=atm_strike,
-        support=intel.get("support"), resistance=intel.get("resistance"),
-        trend_engine=cached_trend_engine, gdf=gdf,
-    )
-
     c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Spot Price", f"₹{spot_price:,.2f}" if spot_price else "—")
     c2.metric("ATM Strike", f"₹{atm_strike:,.0f}")
@@ -3826,44 +3251,12 @@ def show_option_chain(fyers):
         display_df = style_chain_table(df)
         numeric_cols = display_df.select_dtypes("number").columns
         st.dataframe(
-            style_ce_pe_signal_columns(
-                style_oi_change_columns(
-                    display_df.style
-                        .background_gradient(subset=[c for c in ["CE OI", "PE OI"] if c in display_df.columns],
-                                              cmap="RdYlGn", vmin=0)
-                        .format({c: "{:,.0f}" for c in numeric_cols}),
-                    df_for_thresholds=df,
-                )
-            ),
+            display_df.style
+                .background_gradient(subset=[c for c in ["CE OI", "PE OI"] if c in display_df.columns],
+                                      cmap="RdYlGn", vmin=0)
+                .format({c: "{:,.0f}" for c in numeric_cols}),
             use_container_width=True, height=520,
         )
-        st.caption(
-            "CE ΔOI / PE ΔOI: green = OI increasing, red = OI decreasing, grey = unchanged, filled "
-            "dark green/red = a 'large' build-up or unwinding (top 20% of today's ΔOI moves on that "
-            "side). BUY CE / SELL CE / BUY PE / SELL PE only ever show a real signal after passing "
-            "every institutional-confirmation check for that side (see the 🤖 AI Trade Signals tab's "
-            "caption and the 🧠 AI Market Intelligence panel above for the full methodology) — "
-            "otherwise the cell reads NO TRADE. BUY-side signals additionally require the AI Scalping "
-            "Engine to have fetched candle data this session (enable it in the sidebar) since this "
-            "file has no other way to confirm VWAP/EMA/structure; SELL-side signals can surface from "
-            "the option-chain snapshot (OI/IV/resistance/support) alone."
-        )
-
-        if debug_mode:
-            with st.expander("🔍 OI Change Audit (debug) — Current OI vs Previous OI vs Displayed ΔOI", expanded=False):
-                audit_df = audit_oi_change(df, symbol, expiry_label)
-                if not audit_df.empty:
-                    st.dataframe(audit_df, use_container_width=True, height=360)
-                    st.caption(
-                        "Previous OI comes from this session's own last refresh for the same "
-                        "symbol+expiry+strike (— means no prior refresh yet, so ΔOI is legitimately "
-                        "0 that one time). If Displayed ΔOI doesn't equal Current OI − Previous OI, "
-                        "it means the API itself supplied a non-zero ΔOI field this refresh (FYERS/NSE "
-                        "value takes priority over the session-computed fallback) — that is expected "
-                        "and correct, not a mismatch to fix."
-                    )
-                else:
-                    st.caption("No data available for the audit table yet.")
 
     with tab2:
         st.markdown("##### Open Interest — Calls vs Puts")
@@ -4001,7 +3394,6 @@ def show_option_chain(fyers):
         if scalping_enabled:
             with st.spinner("Fetching 5m/15m candles & India VIX for the AI Scalping Engine …"):
                 trend_engine = compute_scalping_trend_engine(fyers, symbol_candidates, df, gdf)
-                st.session_state["oc_scalp_trend_engine"] = trend_engine
             scalp_df = compute_scalping_table(df, gdf, trend_engine)
             render_scalping_tab(scalp_df, trend_engine, symbol, scalping_audio_alert)
         else:
