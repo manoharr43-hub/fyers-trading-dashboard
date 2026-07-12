@@ -1139,9 +1139,22 @@ def _color_code(val):
     return ""
 
 def _style_dataframe(df):
-    styler = df.style
-    if hasattr(styler, "map"): return styler.map(_color_code)
-    return styler.applymap(_color_code)
+    """Apply colour coding safely. Falls back to unstyled df on any error."""
+    try:
+        # Work only on string columns — numeric columns never need colour coding
+        # and passing them to _color_code causes applymap/map to break.
+        str_cols = [c for c in df.columns if df[c].dtype == object]
+        if not str_cols:
+            return df.style           # nothing to colour — return plain styler
+        styler = df.style
+        if hasattr(styler, "map"):
+            return styler.map(_color_code, subset=str_cols)
+        return styler.applymap(_color_code, subset=str_cols)
+    except Exception:
+        try:
+            return df.style           # plain unstyled styler
+        except Exception:
+            return df                 # raw DataFrame as last resort
 
 _SIGNAL_FILL_RULES = [
     ("STRONG BUY","006100","FFFFFF",True),("STRONG SELL","9C0006","FFFFFF",True),
@@ -2065,16 +2078,24 @@ def show_scanner(fyers):
         if st.button(f"🏆 Run Institutional Scan ({len(inst_universe)} symbols)", key="inst_run"):
             with st.spinner("Fetching NIFTY benchmark…"):
                 inst_nifty = fetch_nifty_benchmark(fyers)
-            with st.spinner(f"Running 20-point validation on {len(inst_universe)} symbols — confidence < 80% auto-rejected…"):
+            with st.spinner(f"Running 20-point validation on {len(inst_universe)} symbols…"):
                 inst_results, inst_errors, inst_stats = run_scan_enhanced(
                     fyers, inst_universe, inst_nifty, inst_xgb
                 )
                 inst_full_df = pd.DataFrame(inst_results)
-                if not inst_full_df.empty and "_Enhanced_Pass" in inst_full_df.columns:
-                    inst_full_df = inst_full_df[inst_full_df["_Enhanced_Pass"] == True]
+                # Keep ALL signals in session — UI toggle controls filtering below
+                # Remove only pure internal helper columns (prefixed _)
                 inst_dc = [c for c in inst_full_df.columns if not c.startswith("_")]
                 inst_scan_df = inst_full_df[inst_dc] if not inst_full_df.empty else inst_full_df
+                # Also store the strict-pass-only version separately
+                if not inst_full_df.empty and "_Enhanced_Pass" in inst_full_df.columns:
+                    inst_strict_df = inst_full_df[inst_full_df["_Enhanced_Pass"] == True]
+                    inst_strict_dc = [c for c in inst_strict_df.columns if not c.startswith("_")]
+                    inst_strict_df = inst_strict_df[inst_strict_dc]
+                else:
+                    inst_strict_df = inst_scan_df
             st.session_state["inst_scan_df"] = inst_scan_df
+            st.session_state["inst_strict_df"] = inst_strict_df
             st.session_state["inst_errors"] = inst_errors
             st.session_state["inst_stats"] = inst_stats
 
@@ -2085,21 +2106,63 @@ def show_scanner(fyers):
         # ── Results ───────────────────────────────────────────────────────────
         inst_df = st.session_state.get("inst_scan_df")
 
+        # ── Debug info: always show raw counts so user can see what the scan found ──
+        if inst_df is not None:
+            if inst_df.empty:
+                st.warning(
+                    "⚠️ Scan completed but **0 signals** passed the 80% confidence filter.  \n"
+                    "💡 Try: increase symbol limit, or use the **'Show All (including low confidence)'** toggle below."
+                )
+            else:
+                total_found = len(inst_df)
+                grade_counts = {}
+                if "Signal Grade" in inst_df.columns:
+                    grade_counts = inst_df["Signal Grade"].value_counts().to_dict()
+                grade_str = " · ".join(f"{g}: {c}" for g, c in sorted(grade_counts.items()))
+                st.success(f"✅ **{total_found} signals found** after validation  |  {grade_str if grade_str else 'Grade data unavailable'}")
+
+        # Toggle to bypass confidence filter (shows everything the scan produced)
+        inst_show_all = st.checkbox(
+            "🔓 Show ALL signals (bypass 80% confidence filter)",
+            value=True,
+            key="inst_show_all",
+            help="When ON: shows every signal the scan produced regardless of confidence. "
+                 "When OFF: only signals that passed the strict 80% threshold are shown."
+        )
+
         if inst_df is not None and not inst_df.empty:
-            # Apply grade filter
-            view_df = inst_df.copy()
+            # Choose base: all signals OR strict-pass-only
+            if inst_show_all:
+                view_df = inst_df.copy()
+            else:
+                strict_df = st.session_state.get("inst_strict_df", inst_df)
+                view_df = strict_df.copy() if strict_df is not None and not strict_df.empty else inst_df.copy()
+
+            # Apply grade filter on top
             try:
                 if inst_gf == "A+ only":
-                    view_df = view_df[view_df["Signal Grade"] == "A+"]
+                    filtered = view_df[view_df["Signal Grade"] == "A+"]
                 elif inst_gf == "A+ and A":
-                    view_df = view_df[view_df["Signal Grade"].isin(["A+", "A"])]
+                    filtered = view_df[view_df["Signal Grade"].isin(["A+", "A"])]
                 elif inst_gf == "A+ A B":
-                    view_df = view_df[view_df["Signal Grade"].isin(["A+", "A", "B"])]
+                    filtered = view_df[view_df["Signal Grade"].isin(["A+", "A", "B"])]
+                else:
+                    filtered = view_df
+                if not filtered.empty:
+                    view_df = filtered
+                else:
+                    st.warning(
+                        f"⚠️ Grade filter **'{inst_gf}'** returned 0 rows — showing all grades instead.  \n"
+                        "Change the Grade Filter dropdown to see specific grades."
+                    )
             except (KeyError, TypeError):
                 pass
 
             if view_df.empty:
-                st.warning("No signals match the selected grade filter — try a less strict grade or re-run the scan.")
+                st.warning(
+                    "⚠️ No signals to display.  \n"
+                    "💡 Enable **'Show ALL signals'** toggle above, or increase the symbol limit."
+                )
             else:
                 view_sorted = view_df.sort_values("AI Confidence %", ascending=False).reset_index(drop=True)
 
@@ -2133,12 +2196,13 @@ def show_scanner(fyers):
                 # ── Main data table ───────────────────────────────────────────
                 st.markdown("#### 📋 Signal Table")
 
-                # Preferred column order for the table view
+                # Preferred column order — AI Report excluded (shown in cards below)
                 priority_cols = [
                     "Signal Date", "Signal Time", "Stock", "LTP",
                     "Enhanced Decision", "Enhanced Signal", "Signal Grade", "AI Confidence %",
                     "Confirmations Passed", "Confirmations Failed",
-                    "Enhanced Entry", "Enhanced SL", "Enhanced Target 1", "Enhanced Target 2", "Enhanced Target 3", "Enhanced RR",
+                    "Enhanced Entry", "Enhanced SL",
+                    "Enhanced Target 1", "Enhanced Target 2", "Enhanced Target 3", "Enhanced RR",
                     "HTF Trend", "SMC Structure", "CISD",
                     "OB Type (Bullish)", "OB Type (Bearish)", "Order Block Zone", "Order Block Strength",
                     "FVG", "FVG Freshness", "FVG Filled %", "FVG Gap Size", "FVG Nearest Distance",
@@ -2148,15 +2212,30 @@ def show_scanner(fyers):
                     "XGBoost Trend", "XGBoost Confidence (%)",
                     "Signal Reason",
                 ]
-                existing_priority = [c for c in priority_cols if c in view_sorted.columns]
-                remaining = [c for c in view_sorted.columns if c not in existing_priority and c not in ("AI Report",)]
-                table_df = view_sorted[existing_priority + remaining]
+                # Build column list — exclude AI Report and internal cols
+                _exclude = {"AI Report", "Signal Reason"}
+                existing_priority = [c for c in priority_cols if c in view_sorted.columns and c not in _exclude]
+                remaining = [c for c in view_sorted.columns if c not in existing_priority and c not in _exclude]
+                table_cols = existing_priority + remaining
 
-                st.dataframe(
-                    _style_dataframe(table_df),
-                    use_container_width=True,
-                    height=480,
-                )
+                # Convert all values to strings to prevent Styler type errors
+                table_df = view_sorted[table_cols].copy()
+                for _col in table_df.columns:
+                    if table_df[_col].dtype == object:
+                        table_df[_col] = table_df[_col].fillna("—").astype(str)
+                    else:
+                        table_df[_col] = table_df[_col].fillna(0)
+
+                # Safe styled render with plain fallback
+                try:
+                    st.dataframe(
+                        _style_dataframe(table_df),
+                        use_container_width=True,
+                        height=500,
+                    )
+                except Exception:
+                    # Plain fallback — always works
+                    st.dataframe(table_df, use_container_width=True, height=500)
 
                 # ── Download buttons ──────────────────────────────────────────
                 st.markdown("#### 💾 Export")
@@ -2283,36 +2362,40 @@ def show_scanner(fyers):
                                     if f_item:
                                         st.markdown(f"- ❌ {f_item}")
 
-                        # Full AI Report (line-by-line parsed, not as raw code block)
+                        # Full AI Report — parsed line-by-line into a table
                         st.markdown("**📄 Full AI Analysis Report:**")
                         if ai_report and ai_report not in ("—", ""):
-                            report_lines = ai_report.split(" | ")
+                            report_lines = [ln.strip() for ln in ai_report.split(" | ") if ln.strip()]
                             rep_df_data = []
                             for line in report_lines:
                                 if ":" in line:
                                     key_part, val_part = line.split(":", 1)
+                                    val_clean = val_part.strip()
+                                    # Assign a simple status emoji for quick scan
+                                    if any(x in val_clean for x in ["✓", "Bullish", "High ✓", "Institutional", "Trending ✓", "Strong", "Above ✓", "Low"]):
+                                        status = "🟢"
+                                    elif any(x in val_clean for x in ["✗", "Bearish", "Low ✗", "Sideways", "Retail", "High Risk", "Below", "High ✗"]):
+                                        status = "🔴"
+                                    else:
+                                        status = "🟡"
                                     rep_df_data.append({
+                                        "": status,
                                         "Metric": key_part.strip(),
-                                        "Value": val_part.strip()
+                                        "Value": val_clean,
                                     })
                             if rep_df_data:
                                 rep_df = pd.DataFrame(rep_df_data)
+                                # Plain render — no styler so it never breaks
                                 st.dataframe(
-                                    rep_df.style.apply(
-                                        lambda col: [
-                                            "color: green; font-weight: bold;" if any(x in str(v) for x in ["✓", "Bullish", "High", "Institutional", "Low", "Trending", "Strong", "Above"])
-                                            else "color: red; font-weight: bold;" if any(x in str(v) for x in ["✗", "Bearish", "Low ✗", "High ✗", "Below", "Sideways", "Retail", "High Risk"])
-                                            else ""
-                                            for v in col
-                                        ],
-                                        axis=0,
-                                    ),
+                                    rep_df,
                                     use_container_width=True,
                                     hide_index=True,
-                                    height=min(35 * len(rep_df_data) + 38, 520),
+                                    height=min(38 * len(rep_df_data) + 40, 560),
                                 )
                             else:
-                                st.code(ai_report, language=None)
+                                # Fallback: show as formatted text
+                                for ln in report_lines:
+                                    st.markdown(f"- {ln}")
                         else:
                             st.info("AI Report not available for this signal.")
 
@@ -2320,12 +2403,17 @@ def show_scanner(fyers):
 
         elif "inst_scan_df" in st.session_state:
             st.info(
-                "No signals passed the 20-point institutional validation + 80% confidence bar on this scan.  \n"
-                "This is expected — accuracy over quantity is the design goal.  \n"
-                "Try increasing the symbol limit or waiting for more setups to develop."
+                "ℹ️ Scan ran but returned 0 signals after the institutional filter.  \n"
+                "**Enable the 'Show ALL signals' toggle above** — that lets you see every stock "
+                "the scan analysed, even those that didn't pass the 80% confidence bar.  \n"
+                "You can also increase the symbol limit to scan more stocks."
             )
         else:
-            st.info("Run an Institutional scan above to see high-grade signals here.")
+            st.info(
+                "👆 Click **'Run Institutional Scan'** above to start.  \n"
+                "The scanner runs the full 20-point institutional validation on every symbol "
+                "and shows each signal with a complete AI Report card below the table."
+            )
 
         if st.session_state.get("inst_errors"):
             with st.expander(f"⚠️ Skipped/failed symbols ({len(st.session_state['inst_errors'])})"):
