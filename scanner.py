@@ -2024,313 +2024,75 @@ def show_scanner(fyers):
         if st.session_state.get("ema_swing_errors"):
             with st.expander(f"⚠️ Skipped ({len(st.session_state['ema_swing_errors'])})"): st.text("\n".join(st.session_state["ema_swing_errors"][:20]))
 
-    # ── 🏆 Institutional Signal Scanner (NEW — fixed report rendering) ────────
+    # ── 🏆 Institutional Signal Scanner (NEW) ─────────────────────────────
     with tab_institutional:
-        st.markdown(
-            "### 🏆 Institutional-Quality Signal Engine\n"
-            "**20-Point Validation:** HTF Trend · BOS · CHOCH · CISD · OB Quality · "
-            "Fresh OB · Untested OB · Liquidity Sweep · FVG · Volume · Candle · ATR · "
-            "Momentum · VWAP · EMA · RSI · MACD · ADX · RR ≥ 1:2  \n"
-            "Signals with **AI Confidence < 80%** are automatically rejected.  \n"
-            "**Grades:** 🥇 A+ (20/20, ≥93%) · 🥈 A (≥17, ≥88%) · 🥉 B (≥14, ≥80%) · C (≥10, ≥70%) · ⬛ REJECT"
+        st.caption(
+            "**20-Point Institutional Validation:** HTF Trend · BOS · CHOCH · CISD · OB Quality · "
+            "Fresh OB · Untested OB · Liquidity Sweep · FVG · Volume · Candle · ATR · Momentum · "
+            "VWAP · EMA · RSI · MACD · ADX · RR ≥ 1:2. "
+            "Signals with AI Confidence < 80% are **automatically rejected**. "
+            "**Grades:** A+ (20/20, ≥93%) · A (≥17, ≥88%) · B (≥14, ≥80%) · C (≥10, ≥70%) · REJECT."
         )
-        st.divider()
-
-        # ── Controls ──────────────────────────────────────────────────────────
-        inst_c1, inst_c2, inst_c3, inst_c4 = st.columns([1, 1, 1, 2])
-        with inst_c1:
-            inst_lim = st.number_input(
-                "Limit symbols (0 = all)", min_value=0, max_value=len(symbols),
-                value=min(200, len(symbols)), step=50, key="inst_limit"
-            )
-        with inst_c2:
-            inst_xgb = st.checkbox(
-                "Enable XGBoost ML", value=False, key="inst_xgb",
-                disabled=not XGBOOST_AVAILABLE
-            )
-        with inst_c3:
-            inst_gf = st.selectbox(
-                "Grade Filter",
-                ["All (A+ to C)", "A+ only", "A+ and A", "A+ A B"],
-                key="inst_grade_filter"
-            )
-        with inst_c4:
-            inst_show_reports = st.checkbox(
-                "📋 Show per-signal AI Reports below table", value=True,
-                key="inst_show_reports"
-            )
-
-        inst_universe = symbols if inst_lim == 0 else symbols[:inst_lim]
+        inst_c1,inst_c2,inst_c3 = st.columns([1,1,2])
+        with inst_c1: inst_lim = st.number_input("Limit (0=all)", min_value=0, max_value=len(symbols), value=min(200,len(symbols)), step=50, key="inst_limit")
+        with inst_c2: inst_xgb = st.checkbox("Enable XGBoost ML", value=False, key="inst_xgb", disabled=not XGBOOST_AVAILABLE)
+        with inst_c3: inst_gf = st.selectbox("Minimum Grade", ["All (A+ to C)","A+ only","A+ and A","A+ A B"], key="inst_grade_filter")
+        inst_universe = symbols if inst_lim==0 else symbols[:inst_lim]
 
         if st.button(f"🏆 Run Institutional Scan ({len(inst_universe)} symbols)", key="inst_run"):
             with st.spinner("Fetching NIFTY benchmark…"):
                 inst_nifty = fetch_nifty_benchmark(fyers)
-            with st.spinner(f"Running 20-point validation on {len(inst_universe)} symbols — confidence < 80% auto-rejected…"):
-                inst_results, inst_errors, inst_stats = run_scan_enhanced(
-                    fyers, inst_universe, inst_nifty, inst_xgb
-                )
+            with st.spinner("Running 20-point institutional validation…"):
+                inst_results,inst_errors,inst_stats = run_scan_enhanced(fyers,inst_universe,inst_nifty,inst_xgb)
                 inst_full_df = pd.DataFrame(inst_results)
                 if not inst_full_df.empty and "_Enhanced_Pass" in inst_full_df.columns:
-                    inst_full_df = inst_full_df[inst_full_df["_Enhanced_Pass"] == True]
+                    inst_full_df = inst_full_df[inst_full_df["_Enhanced_Pass"]==True]
                 inst_dc = [c for c in inst_full_df.columns if not c.startswith("_")]
                 inst_scan_df = inst_full_df[inst_dc] if not inst_full_df.empty else inst_full_df
-            st.session_state["inst_scan_df"] = inst_scan_df
-            st.session_state["inst_errors"] = inst_errors
-            st.session_state["inst_stats"] = inst_stats
+            st.session_state["inst_scan_df"]=inst_scan_df; st.session_state["inst_errors"]=inst_errors; st.session_state["inst_stats"]=inst_stats
 
-        # ── Scan summary ──────────────────────────────────────────────────────
-        if "inst_stats" in st.session_state:
-            _display_scan_summary(st.session_state["inst_stats"])
+        if "inst_stats" in st.session_state: _display_scan_summary(st.session_state["inst_stats"])
 
-        # ── Results ───────────────────────────────────────────────────────────
         inst_df = st.session_state.get("inst_scan_df")
-
         if inst_df is not None and not inst_df.empty:
-            # Apply grade filter
             view_df = inst_df.copy()
             try:
-                if inst_gf == "A+ only":
-                    view_df = view_df[view_df["Signal Grade"] == "A+"]
-                elif inst_gf == "A+ and A":
-                    view_df = view_df[view_df["Signal Grade"].isin(["A+", "A"])]
-                elif inst_gf == "A+ A B":
-                    view_df = view_df[view_df["Signal Grade"].isin(["A+", "A", "B"])]
-            except (KeyError, TypeError):
-                pass
+                if inst_gf=="A+ only": view_df=view_df[view_df["Signal Grade"]=="A+"]
+                elif inst_gf=="A+ and A": view_df=view_df[view_df["Signal Grade"].isin(["A+","A"])]
+                elif inst_gf=="A+ A B": view_df=view_df[view_df["Signal Grade"].isin(["A+","A","B"])]
+            except (KeyError,TypeError): pass
 
             if view_df.empty:
-                st.warning("No signals match the selected grade filter — try a less strict grade or re-run the scan.")
+                st.info("No signals match the selected grade filter — try a less strict grade.")
             else:
-                view_sorted = view_df.sort_values("AI Confidence %", ascending=False).reset_index(drop=True)
-
-                # ── KPI metrics ───────────────────────────────────────────────
-                st.markdown("#### 📊 Scan Summary")
-                mk1, mk2, mk3, mk4, mk5, mk6 = st.columns(6)
-                mk1.metric("✅ Total Signals", len(view_sorted))
-                try:
-                    mk2.metric("🥇 A+ Grades", int((view_sorted["Signal Grade"] == "A+").sum()))
-                except Exception:
-                    mk2.metric("🥇 A+ Grades", "—")
-                try:
-                    mk3.metric("🟢 BUY Signals", int(view_sorted["Enhanced Signal"].str.contains("BUY", na=False).sum()))
-                except Exception:
-                    mk3.metric("🟢 BUY Signals", "—")
-                try:
-                    mk4.metric("🔴 SELL Signals", int(view_sorted["Enhanced Signal"].str.contains("SELL", na=False).sum()))
-                except Exception:
-                    mk4.metric("🔴 SELL Signals", "—")
-                try:
-                    mk5.metric("📈 Avg Confidence", f"{view_sorted['AI Confidence %'].mean():.1f}%")
-                except Exception:
-                    mk5.metric("📈 Avg Confidence", "—")
-                try:
-                    mk6.metric("🎯 Avg Confirmations", f"{view_sorted['Confirmations Passed'].mean():.1f}/20")
-                except Exception:
-                    mk6.metric("🎯 Avg Confirmations", "—")
-
-                st.divider()
-
-                # ── Main data table ───────────────────────────────────────────
-                st.markdown("#### 📋 Signal Table")
-
-                # Preferred column order for the table view
-                priority_cols = [
-                    "Signal Date", "Signal Time", "Stock", "LTP",
-                    "Enhanced Decision", "Enhanced Signal", "Signal Grade", "AI Confidence %",
-                    "Confirmations Passed", "Confirmations Failed",
-                    "Enhanced Entry", "Enhanced SL", "Enhanced Target 1", "Enhanced Target 2", "Enhanced Target 3", "Enhanced RR",
-                    "HTF Trend", "SMC Structure", "CISD",
-                    "OB Type (Bullish)", "OB Type (Bearish)", "Order Block Zone", "Order Block Strength",
-                    "FVG", "FVG Freshness", "FVG Filled %", "FVG Gap Size", "FVG Nearest Distance",
-                    "Liquidity Sweep", "ADX", "+DI", "-DI", "Momentum",
-                    "RSI", "MACD Signal", "Supertrend", "VWAP", "RVOL",
-                    "MTF Trend", "RS vs NIFTY", "AI Score",
-                    "XGBoost Trend", "XGBoost Confidence (%)",
-                    "Signal Reason",
-                ]
-                existing_priority = [c for c in priority_cols if c in view_sorted.columns]
-                remaining = [c for c in view_sorted.columns if c not in existing_priority and c not in ("AI Report",)]
-                table_df = view_sorted[existing_priority + remaining]
-
-                st.dataframe(
-                    _style_dataframe(table_df),
-                    use_container_width=True,
-                    height=480,
-                )
-
-                # ── Download buttons ──────────────────────────────────────────
-                st.markdown("#### 💾 Export")
-                idl1, idl2, idl3 = st.columns(3)
-                with idl1:
-                    st.download_button(
-                        "📥 Download as Excel",
-                        data=to_excel_bytes(view_sorted, "Institutional Signals"),
-                        file_name=f"nse_institutional_{_now_ist().strftime('%Y%m%d_%H%M')}.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        key="dl_inst_xlsx",
-                    )
-                with idl2:
-                    st.download_button(
-                        "📥 Download as CSV",
-                        data=to_csv_bytes(view_sorted),
-                        file_name=f"nse_institutional_{_now_ist().strftime('%Y%m%d_%H%M')}.csv",
-                        mime="text/csv",
-                        key="dl_inst_csv",
-                    )
-                with idl3:
-                    st.download_button(
-                        "📥 Download as JSON",
-                        data=to_json_bytes(view_sorted),
-                        file_name=f"nse_institutional_{_now_ist().strftime('%Y%m%d_%H%M')}.json",
-                        mime="application/json",
-                        key="dl_inst_json",
-                    )
-
-                # ── Per-signal AI Report cards (ALWAYS VISIBLE, not inside expander) ──
-                if inst_show_reports:
-                    st.divider()
-                    st.markdown(f"#### 🧠 AI Signal Reports — {len(view_sorted)} Signal(s)")
-                    st.caption("Each card shows the full institutional analysis for that signal.")
-
-                    for idx, row in view_sorted.iterrows():
-                        stock      = str(row.get("Stock", "?"))
-                        decision   = str(row.get("Enhanced Decision", "—"))
-                        grade      = str(row.get("Signal Grade", "?"))
-                        confidence = row.get("AI Confidence %", 0)
-                        passed     = row.get("Confirmations Passed", "?")
-                        failed_str = str(row.get("Confirmations Failed", "None"))
-                        ltp        = row.get("LTP", "—")
-                        entry      = row.get("Enhanced Entry", "—")
-                        sl         = row.get("Enhanced SL", "—")
-                        t1         = row.get("Enhanced Target 1", "—")
-                        t2         = row.get("Enhanced Target 2", "—")
-                        t3         = row.get("Enhanced Target 3", "—")
-                        rr         = row.get("Enhanced RR", "—")
-                        sig_date   = row.get("Signal Date", "—")
-                        sig_time   = row.get("Signal Time", "—")
-                        reason_raw = str(row.get("Signal Reason", "—"))
-                        ai_report  = str(row.get("AI Report", ""))
-                        htf        = str(row.get("HTF Trend", "—"))
-                        fvg_lbl    = str(row.get("FVG", "—"))
-                        liq        = str(row.get("Liquidity Sweep", "—"))
-                        ob_bull    = str(row.get("OB Type (Bullish)", "—"))
-                        ob_bear    = str(row.get("OB Type (Bearish)", "—"))
-                        adx_val    = row.get("ADX", "—")
-                        momentum   = str(row.get("Momentum", "—"))
-
-                        # Grade colour
-                        grade_color = {
-                            "A+": "#006100", "A": "#1a7a1a", "B": "#ff8c00",
-                            "C": "#cc6600", "REJECT": "#888888"
-                        }.get(grade, "#333333")
-
-                        is_buy = "BUY" in decision
-
-                        # Card header
-                        st.markdown(
-                            f"""
-<div style="border:2px solid {'#006100' if is_buy else '#9C0006'};border-radius:10px;padding:16px;margin-bottom:20px;background:{'#f0fff0' if is_buy else '#fff0f0'}">
-<h3 style="margin:0 0 4px 0;color:{'#006100' if is_buy else '#9C0006'}">
-{'🟢' if is_buy else '🔴'} {stock} &nbsp;|&nbsp; {decision}
-</h3>
-<span style="background:{grade_color};color:#fff;padding:3px 10px;border-radius:4px;font-weight:bold;font-size:14px">Grade: {grade}</span>
-&nbsp;&nbsp;
-<span style="background:#1a1a2e;color:#fff;padding:3px 10px;border-radius:4px;font-size:14px">Confidence: {confidence}%</span>
-&nbsp;&nbsp;
-<span style="color:#555;font-size:13px">✅ {passed}/20 confirmations &nbsp;|&nbsp; 📅 {sig_date} {sig_time}</span>
-</div>
-""",
-                            unsafe_allow_html=True,
-                        )
-
-                        # Trade levels
-                        col_a, col_b, col_c, col_d = st.columns(4)
-                        col_a.metric("LTP", f"₹{ltp}")
-                        col_a.metric("Entry", f"₹{entry}")
-                        col_b.metric("Stop Loss 🔴", f"₹{sl}")
-                        col_b.metric("R:R", f"1:{rr}")
-                        col_c.metric("Target 1 🎯", f"₹{t1}")
-                        col_c.metric("Target 2 🎯", f"₹{t2}")
-                        col_d.metric("Target 3 🚀", f"₹{t3}")
-                        col_d.metric("ADX", f"{adx_val}")
-
-                        # Context row
-                        ctx1, ctx2, ctx3, ctx4 = st.columns(4)
-                        ctx1.info(f"**HTF Trend**\n\n{htf}")
-                        ctx2.info(f"**FVG**\n\n{fvg_lbl}")
-                        ctx3.info(f"**Liquidity**\n\n{liq}")
-                        ctx4.info(f"**Momentum**\n\n{momentum}")
-
-                        ob1, ob2 = st.columns(2)
-                        ob1.success(f"**Bullish OB:** {ob_bull}") if "Fresh" in ob_bull or "Institutional" in ob_bull else ob1.warning(f"**Bullish OB:** {ob_bull}")
-                        ob2.error(f"**Bearish OB:** {ob_bear}") if "Fresh" in ob_bear or "Institutional" in ob_bear else ob2.warning(f"**Bearish OB:** {ob_bear}")
-
-                        # ✓ Reasons why this signal was generated
-                        st.markdown("**✅ Why this signal was generated:**")
-                        reasons = [r.strip() for r in reason_raw.split(" | ") if r.strip() and r.strip() != "—"]
-                        if reasons:
-                            reason_cols = st.columns(min(len(reasons), 3))
-                            for i, reason in enumerate(reasons):
-                                reason_cols[i % 3].success(f"✓ {reason}")
-                        else:
-                            st.caption("No specific reasons recorded.")
-
-                        # Failed confirmations
-                        if failed_str and failed_str.lower() not in ("none", "—", ""):
-                            with st.expander(f"❌ Failed confirmations ({failed_str.count(',') + 1 if ',' in failed_str else 1})"):
-                                for f_item in failed_str.split(","):
-                                    f_item = f_item.strip()
-                                    if f_item:
-                                        st.markdown(f"- ❌ {f_item}")
-
-                        # Full AI Report (line-by-line parsed, not as raw code block)
-                        st.markdown("**📄 Full AI Analysis Report:**")
-                        if ai_report and ai_report not in ("—", ""):
-                            report_lines = ai_report.split(" | ")
-                            rep_df_data = []
-                            for line in report_lines:
-                                if ":" in line:
-                                    key_part, val_part = line.split(":", 1)
-                                    rep_df_data.append({
-                                        "Metric": key_part.strip(),
-                                        "Value": val_part.strip()
-                                    })
-                            if rep_df_data:
-                                rep_df = pd.DataFrame(rep_df_data)
-                                st.dataframe(
-                                    rep_df.style.apply(
-                                        lambda col: [
-                                            "color: green; font-weight: bold;" if any(x in str(v) for x in ["✓", "Bullish", "High", "Institutional", "Low", "Trending", "Strong", "Above"])
-                                            else "color: red; font-weight: bold;" if any(x in str(v) for x in ["✗", "Bearish", "Low ✗", "High ✗", "Below", "Sideways", "Retail", "High Risk"])
-                                            else ""
-                                            for v in col
-                                        ],
-                                        axis=0,
-                                    ),
-                                    use_container_width=True,
-                                    hide_index=True,
-                                    height=min(35 * len(rep_df_data) + 38, 520),
-                                )
-                            else:
-                                st.code(ai_report, language=None)
-                        else:
-                            st.info("AI Report not available for this signal.")
-
-                        st.divider()
-
+                view_sorted = view_df.sort_values("AI Confidence %",ascending=False)
+                mc1,mc2,mc3,mc4,mc5 = st.columns(5)
+                mc1.metric("Total Signals", len(view_sorted))
+                mc2.metric("A+ Grades", int((view_sorted["Signal Grade"]=="A+").sum()) if "Signal Grade" in view_sorted else "—")
+                mc3.metric("BUY Signals", int(view_sorted["Enhanced Signal"].str.contains("BUY",na=False).sum()) if "Enhanced Signal" in view_sorted else "—")
+                mc4.metric("SELL Signals", int(view_sorted["Enhanced Signal"].str.contains("SELL",na=False).sum()) if "Enhanced Signal" in view_sorted else "—")
+                mc5.metric("Avg Confidence", f"{view_sorted['AI Confidence %'].mean():.1f}%" if "AI Confidence %" in view_sorted else "—")
+                st.dataframe(_style_dataframe(view_sorted), use_container_width=True, height=500)
+                idl1,idl2,idl3 = st.columns(3)
+                with idl1: st.download_button("📥 Excel", data=to_excel_bytes(view_sorted,"Institutional Signals"), file_name=f"nse_institutional_{_now_ist().strftime('%Y%m%d_%H%M')}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="dl_inst_xlsx")
+                with idl2: st.download_button("📥 CSV", data=to_csv_bytes(view_sorted), file_name=f"nse_institutional_{_now_ist().strftime('%Y%m%d_%H%M')}.csv", mime="text/csv", key="dl_inst_csv")
+                with idl3: st.download_button("📥 JSON", data=to_json_bytes(view_sorted), file_name=f"nse_institutional_{_now_ist().strftime('%Y%m%d_%H%M')}.json", mime="application/json", key="dl_inst_json")
+                if "AI Report" in view_sorted.columns:
+                    with st.expander("📋 Full AI Reports (top 10 signals)"):
+                        for _,row in view_sorted.head(10).iterrows():
+                            st.markdown(f"### {row.get('Stock','?')} — {row.get('Enhanced Decision','—')} | Grade: {row.get('Signal Grade','?')} | Confidence: {row.get('AI Confidence %','?')}%")
+                            st.markdown("**Why this signal?**")
+                            for reason in str(row.get("Signal Reason","—")).split(" | "):
+                                if reason and reason!="—": st.markdown(f"  ✓ {reason}")
+                            st.code(row.get("AI Report","—"), language=None)
+                            st.divider()
         elif "inst_scan_df" in st.session_state:
-            st.info(
-                "No signals passed the 20-point institutional validation + 80% confidence bar on this scan.  \n"
-                "This is expected — accuracy over quantity is the design goal.  \n"
-                "Try increasing the symbol limit or waiting for more setups to develop."
-            )
+            st.info("No signals passed the 20-point validation + 80% confidence bar. Accuracy over quantity is the design goal.")
         else:
             st.info("Run an Institutional scan above to see high-grade signals here.")
 
         if st.session_state.get("inst_errors"):
-            with st.expander(f"⚠️ Skipped/failed symbols ({len(st.session_state['inst_errors'])})"):
-                st.caption("Most stocks are skipped for missing/invalid data, not app errors.")
-                st.text("\n".join(st.session_state["inst_errors"][:20]))
+            with st.expander(f"⚠️ Skipped ({len(st.session_state['inst_errors'])})"): st.text("\n".join(st.session_state["inst_errors"][:20]))
 
     if st.session_state.get("scan_errors"):
         with st.expander(f"⚠️ Skipped/failed symbols ({len(st.session_state['scan_errors'])})"): st.text("\n".join(st.session_state["scan_errors"][:20]))
