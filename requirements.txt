@@ -1,4 +1,4 @@
-streamlit==1.39.0
+Streamlit==1.39.0
 fyers-apiv3==3.1.14
 pandas==2.2.2
 numpy==1.26.4
@@ -6,3 +6,4 @@ requests==2.31.0
 plotly==5.22.0
 openpyxl==3.1.2
 streamlit-autorefresh==1.0.1
+matplotlib==3.8.4
