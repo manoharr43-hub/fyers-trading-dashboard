@@ -2183,7 +2183,9 @@ def style_chain_table(df: pd.DataFrame) -> pd.DataFrame:
     """Existing columns are kept exactly as before, in the same order.
     The new institutional CE/PE BUY & SELL signal columns (spec section
     14) are appended at the end — Signal/Confidence/Reason for each side —
-    nothing existing is removed, renamed, or reordered."""
+    nothing existing is removed, renamed, or reordered. Still used as-is
+    for the Excel export sheet (build_excel_report / _write_dataframe
+    writes plain cell values, unaffected by the HTML rendering below)."""
     cols = ["ce_oi", "ce_chng_oi", "ce_volume", "ce_ltp", "CE Bias", "strike_price",
             "PE Bias", "pe_ltp", "pe_volume", "pe_chng_oi", "pe_oi", "Strike Signal", "Big Move"]
     new_signal_cols = [
@@ -2201,36 +2203,20 @@ def style_chain_table(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-# Big-move threshold used only for the "large build-up / large unwinding"
-# dark-green/dark-red distinction below — same 80th-percentile convention
-# already used everywhere else in this file for "heavy" ΔOI.
 def _oi_change_color(val, heavy_thresh: float) -> str:
     """Spec section 3 color rules: positive -> green, negative -> red,
     zero -> grey, a "large" build-up/unwinding (>= the chain's own 80th
-    percentile ΔOI) -> a darker shade of the same color."""
+    percentile ΔOI) -> a darker/filled shade of the same color."""
     try:
         v = float(val)
     except (TypeError, ValueError):
-        return ""
+        return "color:#e6edf3;"
     if v == 0:
         return "color:#8b949e;"  # grey
     is_large = heavy_thresh > 0 and abs(v) >= heavy_thresh
     if v > 0:
         return "color:#0d3b2e;font-weight:700;background-color:#3fb950;" if is_large else "color:#3fb950;"
     return "color:#3b0d1a;font-weight:700;background-color:#f85149;" if is_large else "color:#f85149;"
-
-
-def style_oi_change_columns(styler, df_for_thresholds: pd.DataFrame):
-    """Applies the color rules above to the 'CE ΔOI' / 'PE ΔOI' columns of
-    an already-built pandas Styler, using the source (unrenamed) dataframe
-    to compute the 80th-percentile 'heavy' threshold each side needs."""
-    heavy_ce = df_for_thresholds["ce_chng_oi"].abs().quantile(0.80) if "ce_chng_oi" in df_for_thresholds.columns and (df_for_thresholds["ce_chng_oi"] != 0).any() else 0
-    heavy_pe = df_for_thresholds["pe_chng_oi"].abs().quantile(0.80) if "pe_chng_oi" in df_for_thresholds.columns and (df_for_thresholds["pe_chng_oi"] != 0).any() else 0
-    if "CE ΔOI" in styler.data.columns:
-        styler = styler.applymap(lambda v: _oi_change_color(v, heavy_ce), subset=["CE ΔOI"])
-    if "PE ΔOI" in styler.data.columns:
-        styler = styler.applymap(lambda v: _oi_change_color(v, heavy_pe), subset=["PE ΔOI"])
-    return styler
 
 
 def _ce_pe_signal_cell_color(val: str) -> str:
@@ -2244,13 +2230,78 @@ def _ce_pe_signal_cell_color(val: str) -> str:
     return "color:#8b949e;"
 
 
-def style_ce_pe_signal_columns(styler):
-    """Applies the BUY/SELL color rule to whichever of the new signal
-    columns are present in the styled table."""
-    for col in ("BUY CE", "SELL CE", "BUY PE", "SELL PE"):
-        if col in styler.data.columns:
-            styler = styler.applymap(_ce_pe_signal_cell_color, subset=[col])
-    return styler
+def _oi_bar_pct(val, max_val) -> float:
+    """0-100 fill % used for the CE/PE OI background bar (a lightweight
+    stand-in for the old background_gradient, without pyarrow/Styler)."""
+    try:
+        v = float(val)
+    except (TypeError, ValueError):
+        return 0.0
+    return max(0.0, min(100.0, (v / max_val) * 100)) if max_val > 0 else 0.0
+
+
+def render_chain_table_html(df: pd.DataFrame, top_n: int = 500) -> str:
+    """
+    Renders the Chain Table (spec section 14 columns, plus every existing
+    column) as raw HTML instead of a pandas Styler passed to
+    st.dataframe(). This is a deliberate stability fix: on Streamlit
+    Cloud's pyarrow==25.0.0 / pandas==2.2.2 combination, chaining multiple
+    Styler.applymap() calls on the same object was intermittently
+    crashing the underlying Python process with a hard segmentation
+    fault (not a catchable Python exception — no try/except can prevent
+    a segfault, since it happens in native code during Arrow
+    serialization). The Gamma and Scalping tables elsewhere in this file
+    have used raw HTML via st.markdown(unsafe_allow_html=True) from the
+    start and have never exhibited this crash, so the Chain Table now
+    uses the same proven-stable approach. All the same columns, values,
+    and color rules are preserved — only the rendering mechanism changed.
+    """
+    display_df = style_chain_table(df)
+    view = display_df.head(top_n)
+
+    heavy_ce = df["ce_chng_oi"].abs().quantile(0.80) if "ce_chng_oi" in df.columns and (df["ce_chng_oi"] != 0).any() else 0
+    heavy_pe = df["pe_chng_oi"].abs().quantile(0.80) if "pe_chng_oi" in df.columns and (df["pe_chng_oi"] != 0).any() else 0
+    max_ce_oi = view["CE OI"].max() if "CE OI" in view.columns and len(view) else 0
+    max_pe_oi = view["PE OI"].max() if "PE OI" in view.columns and len(view) else 0
+
+    numeric_fmt = {
+        "CE OI": "{:,.0f}", "CE ΔOI": "{:+,.0f}", "CE Vol": "{:,.0f}", "CE LTP": "{:.2f}",
+        "Strike ⚡": "{:,.0f}", "PE LTP": "{:.2f}", "PE Vol": "{:,.0f}", "PE ΔOI": "{:+,.0f}",
+        "PE OI": "{:,.0f}", "CE Confidence": "{:.1f}%", "PE Confidence": "{:.1f}%",
+    }
+
+    header_html = "".join(f"<th>{col}</th>" for col in view.columns)
+    rows_html = []
+    for _, row in view.iterrows():
+        cells = []
+        for col in view.columns:
+            val = row[col]
+            fmt = numeric_fmt.get(col)
+            display_val = fmt.format(val) if fmt and pd.notna(val) else ("" if pd.isna(val) else val)
+            style = ""
+            if col == "CE ΔOI":
+                style = _oi_change_color(val, heavy_ce)
+            elif col == "PE ΔOI":
+                style = _oi_change_color(val, heavy_pe)
+            elif col in ("BUY CE", "SELL CE", "BUY PE", "SELL PE"):
+                style = _ce_pe_signal_cell_color(val)
+            elif col == "CE OI" and max_ce_oi > 0:
+                pct = _oi_bar_pct(val, max_ce_oi)
+                style = f"background:linear-gradient(90deg, rgba(63,185,80,{0.10 + pct/250:.2f}) {pct:.0f}%, transparent {pct:.0f}%);"
+            elif col == "PE OI" and max_pe_oi > 0:
+                pct = _oi_bar_pct(val, max_pe_oi)
+                style = f"background:linear-gradient(90deg, rgba(63,185,80,{0.10 + pct/250:.2f}) {pct:.0f}%, transparent {pct:.0f}%);"
+            cells.append(f'<td style="{style}">{display_val}</td>')
+        rows_html.append(f"<tr>{''.join(cells)}</tr>")
+
+    return f"""
+    <div style="max-height:560px; overflow-y:auto; border:1px solid #30363d; border-radius:8px;">
+    <table class="gamma-table">
+        <thead><tr>{header_html}</tr></thead>
+        <tbody>{''.join(rows_html)}</tbody>
+    </table>
+    </div>
+    """
 
 
 def style_big_move_table(df: pd.DataFrame) -> pd.DataFrame:
@@ -3823,20 +3874,7 @@ def show_option_chain(fyers):
             if parts:
                 st.markdown("🚨 **Big OI moves detected** — " + "  |  ".join(parts))
 
-        display_df = style_chain_table(df)
-        numeric_cols = display_df.select_dtypes("number").columns
-        st.dataframe(
-            style_ce_pe_signal_columns(
-                style_oi_change_columns(
-                    display_df.style
-                        .background_gradient(subset=[c for c in ["CE OI", "PE OI"] if c in display_df.columns],
-                                              cmap="RdYlGn", vmin=0)
-                        .format({c: "{:,.0f}" for c in numeric_cols}),
-                    df_for_thresholds=df,
-                )
-            ),
-            use_container_width=True, height=520,
-        )
+        st.markdown(render_chain_table_html(df), unsafe_allow_html=True)
         st.caption(
             "CE ΔOI / PE ΔOI: green = OI increasing, red = OI decreasing, grey = unchanged, filled "
             "dark green/red = a 'large' build-up or unwinding (top 20% of today's ΔOI moves on that "
@@ -4047,7 +4085,6 @@ def show_option_chain(fyers):
 #     )
 #     show_option_chain(fyers)
 #
-# Run this file with:  streamlit run fyers_options_chain_dashboard.py
-# మెమరీ క్లీనప్ - ఇది యాప్ క్రాష్ అవ్వకుండా ఆపుతుంది[span_1](start_span)[span_1](end_span)
+# Run this file with:  streamlit run fyers_options_chain_dashboard.py# మెమరీ క్లీనప్ - ఇది యాప్ క్రాష్ అవ్వకుండా ఆపుతుంది[span_1](start_span)[span_1](end_span)
         del df
         gc.collect()
