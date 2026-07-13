@@ -1764,6 +1764,986 @@ def run_ema_swing_scan(fyers, symbols):
         if i+BATCH_SIZE<len(symbols): time.sleep(BATCH_PAUSE_SECONDS)
     progress.empty(); return results, errors, stats
 
+# ══════════════════════════════════════════════════════════════════════════
+# ── F&O OI ANALYSIS MODULE (injected below — purely additive) ───────────
+# ══════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════
+# ── INSTITUTIONAL F&O OI ANALYSIS MODULE (purely additive) ───────────────
+# Adds a new "🔬 F&O OI Analysis" tab to the existing scanner.
+# Zero changes to any existing function, column, or tab.
+# ══════════════════════════════════════════════════════════════════════════
+
+import functools
+import hashlib
+
+# ── OI cache — keyed by (symbol, candle_epoch) so data is only re-fetched
+# when a new 15-minute candle completes, never on every Streamlit rerun. ──
+_OI_CACHE: dict = {}          # {cache_key: result_dict}
+_OI_CACHE_MAX = 500           # trim so memory never grows unbounded
+
+# NSE public option-chain endpoint (backup when Fyers OI unavailable)
+_NSE_OC_URL = "https://www.nseindia.com/api/option-chain-equities?symbol={}"
+_NSE_HEADERS = {
+    "User-Agent": "Mozilla/5.0",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Referer": "https://www.nseindia.com/",
+}
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────
+
+def _current_15m_epoch() -> int:
+    """Epoch second of the START of the most recently COMPLETED 15-min candle."""
+    now = int(_now_ist().timestamp())
+    slot = (now // 900) * 900          # floor to 15-min boundary
+    return slot - 900                  # previous completed candle
+
+
+def _nearest_atm(spot: float, strikes: list) -> float:
+    if not strikes:
+        return round(spot / 50) * 50
+    return min(strikes, key=lambda s: abs(s - spot))
+
+
+def _oi_cache_key(symbol: str) -> str:
+    epoch = _current_15m_epoch()
+    return f"{symbol}|{epoch}"
+
+
+# ── Fyers option-chain fetch ──────────────────────────────────────────────
+
+def _fetch_fyers_option_chain(fyers, symbol: str, spot: float) -> Optional[list]:
+    """
+    Fetches option chain via Fyers API.
+    Returns list of dicts with keys: strike, ce_oi, ce_oi_chg, pe_oi, pe_oi_chg,
+    ce_vol, pe_vol, ce_ltp, pe_ltp, ce_iv, pe_iv.
+    Returns None if Fyers OI is unavailable.
+    """
+    try:
+        # Fyers option chain symbol format: NSE:SYMBOL25JUNFUT equivalent
+        # The quotes endpoint accepts the index/equity underlying
+        ticker = symbol.replace("NSE:", "").replace("-EQ", "")
+        # Fyers option chain API (V3)
+        resp = fyers.optionchain({
+            "symbol": f"NSE:{ticker}",
+            "strikecount": 5,
+            "timestamp": ""
+        })
+        if not isinstance(resp, dict) or resp.get("s") != "ok":
+            return None
+        data = resp.get("data", {}).get("optionsChain", [])
+        if not data:
+            return None
+        rows = []
+        for item in data:
+            try:
+                rows.append({
+                    "strike":     float(item.get("strikePrice", 0)),
+                    "ce_oi":      int(item.get("CE", {}).get("openInterest", 0)),
+                    "ce_oi_chg":  int(item.get("CE", {}).get("changeinOpenInterest", 0)),
+                    "pe_oi":      int(item.get("PE", {}).get("openInterest", 0)),
+                    "pe_oi_chg":  int(item.get("PE", {}).get("changeinOpenInterest", 0)),
+                    "ce_vol":     int(item.get("CE", {}).get("totalTradedVolume", 0)),
+                    "pe_vol":     int(item.get("PE", {}).get("totalTradedVolume", 0)),
+                    "ce_ltp":     float(item.get("CE", {}).get("lastPrice", 0)),
+                    "pe_ltp":     float(item.get("PE", {}).get("lastPrice", 0)),
+                    "ce_iv":      float(item.get("CE", {}).get("impliedVolatility", 0)),
+                    "pe_iv":      float(item.get("PE", {}).get("impliedVolatility", 0)),
+                })
+            except (TypeError, ValueError, KeyError):
+                continue
+        return rows if rows else None
+    except Exception:
+        return None
+
+
+def _fetch_nse_option_chain(symbol: str, spot: float) -> Optional[list]:
+    """
+    Backup: fetches option chain from NSE public API.
+    Returns same schema as _fetch_fyers_option_chain.
+    """
+    try:
+        ticker = symbol.replace("NSE:", "").replace("-EQ", "")
+        session = requests.Session()
+        # Prime the session with a cookie first
+        session.get("https://www.nseindia.com", headers=_NSE_HEADERS, timeout=8)
+        resp = session.get(
+            _NSE_OC_URL.format(ticker),
+            headers=_NSE_HEADERS,
+            timeout=10,
+        )
+        if resp.status_code != 200:
+            return None
+        payload = resp.json()
+        records = payload.get("records", {}).get("data", [])
+        if not records:
+            return None
+        rows = []
+        for item in records:
+            try:
+                strike = float(item.get("strikePrice", 0))
+                ce = item.get("CE", {}) or {}
+                pe = item.get("PE", {}) or {}
+                rows.append({
+                    "strike":    strike,
+                    "ce_oi":     int(ce.get("openInterest", 0)),
+                    "ce_oi_chg": int(ce.get("changeinOpenInterest", 0)),
+                    "pe_oi":     int(pe.get("openInterest", 0)),
+                    "pe_oi_chg": int(pe.get("changeinOpenInterest", 0)),
+                    "ce_vol":    int(ce.get("totalTradedVolume", 0)),
+                    "pe_vol":    int(pe.get("totalTradedVolume", 0)),
+                    "ce_ltp":    float(ce.get("lastPrice", 0)),
+                    "pe_ltp":    float(pe.get("lastPrice", 0)),
+                    "ce_iv":     float(ce.get("impliedVolatility", 0)),
+                    "pe_iv":     float(pe.get("impliedVolatility", 0)),
+                })
+            except (TypeError, ValueError, KeyError):
+                continue
+        return rows if rows else None
+    except Exception:
+        return None
+
+
+def _select_strikes(rows: list, spot: float, n_itm: int = 2, n_otm: int = 2) -> list:
+    """Return ATM ± n_itm/n_otm strikes centred on spot."""
+    if not rows:
+        return []
+    strikes = sorted(set(r["strike"] for r in rows))
+    atm = _nearest_atm(spot, strikes)
+    idx = strikes.index(atm) if atm in strikes else 0
+    lo = max(0, idx - n_itm)
+    hi = min(len(strikes), idx + n_otm + 1)
+    selected = set(strikes[lo:hi])
+    return [r for r in rows if r["strike"] in selected]
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# ── STEP 2-4: OI metrics + Institutional Logic ────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════
+
+def _compute_oi_metrics(rows: list, prev_rows: Optional[list],
+                         spot: float, prev_spot: float,
+                         df_15m: pd.DataFrame) -> dict:
+    """
+    Given current + previous option chain rows and the 15-min OHLCV df,
+    returns the full OI metric dict that becomes new columns.
+    """
+    if not rows:
+        return _empty_oi_row()
+
+    # ── Aggregate totals ──────────────────────────────────────────────────
+    total_ce_oi     = sum(r["ce_oi"]     for r in rows)
+    total_pe_oi     = sum(r["pe_oi"]     for r in rows)
+    total_ce_chg    = sum(r["ce_oi_chg"] for r in rows)
+    total_pe_chg    = sum(r["pe_oi_chg"] for r in rows)
+    total_ce_vol    = sum(r["ce_vol"]    for r in rows)
+    total_pe_vol    = sum(r["pe_vol"]    for r in rows)
+
+    net_oi_chg = total_pe_chg - total_ce_chg
+    pcr        = round(total_pe_oi / total_ce_oi, 3) if total_ce_oi else 0.0
+    oi_ratio   = round(total_ce_oi / total_pe_oi, 3) if total_pe_oi else 0.0
+
+    # Max pain strike = strike where total OI pain for holders is max
+    try:
+        def pain(k):
+            return sum(
+                r["ce_oi"] * max(0, k - r["strike"]) +
+                r["pe_oi"] * max(0, r["strike"] - k)
+                for r in rows
+            )
+        all_strikes = [r["strike"] for r in rows]
+        max_pain_strike = min(all_strikes, key=pain) if all_strikes else spot
+    except Exception:
+        max_pain_strike = spot
+
+    # Max writing strikes
+    max_ce_row = max(rows, key=lambda r: r["ce_oi_chg"], default={})
+    max_pe_row = max(rows, key=lambda r: r["pe_oi_chg"], default={})
+    max_ce_writing_strike = max_ce_row.get("strike", 0)
+    max_pe_writing_strike = max_pe_row.get("strike", 0)
+
+    # ── CE/PE % change vs previous candle ────────────────────────────────
+    if prev_rows:
+        prev_ce = {r["strike"]: r["ce_oi"] for r in prev_rows}
+        prev_pe = {r["strike"]: r["pe_oi"] for r in prev_rows}
+        cur_ce_sum  = sum(r["ce_oi"] for r in rows)
+        cur_pe_sum  = sum(r["pe_oi"] for r in rows)
+        prv_ce_sum  = sum(prev_ce.get(r["strike"], r["ce_oi"]) for r in rows)
+        prv_pe_sum  = sum(prev_pe.get(r["strike"], r["pe_oi"]) for r in rows)
+        ce_oi_delta_pct = round((cur_ce_sum - prv_ce_sum) / prv_ce_sum * 100, 2) if prv_ce_sum else 0.0
+        pe_oi_delta_pct = round((cur_pe_sum - prv_pe_sum) / prv_pe_sum * 100, 2) if prv_pe_sum else 0.0
+    else:
+        ce_oi_delta_pct = 0.0
+        pe_oi_delta_pct = 0.0
+
+    # ── Price change % ────────────────────────────────────────────────────
+    price_chg_pct = round((spot - prev_spot) / prev_spot * 100, 3) if prev_spot else 0.0
+
+    # ── ATR % from 15m df ────────────────────────────────────────────────
+    try:
+        atr_val = float(calculate_atr(df_15m).iloc[-1])
+        atr_pct = round(atr_val / spot * 100, 3) if spot else 0.0
+    except Exception:
+        atr_val = spot * 0.005
+        atr_pct = 0.5
+
+    # ── Volume acceleration ───────────────────────────────────────────────
+    try:
+        vol_series = df_15m["Volume"]
+        vol_avg    = float(vol_series.tail(10).mean())
+        vol_last   = float(vol_series.iloc[-1])
+        vol_accel  = round((vol_last - vol_avg) / vol_avg * 100, 1) if vol_avg else 0.0
+    except Exception:
+        vol_accel = 0.0
+
+    # ── OI acceleration % ────────────────────────────────────────────────
+    oi_accel = round(abs(ce_oi_delta_pct) + abs(pe_oi_delta_pct), 2)
+
+    # ── Institutional Logic (Step 4) ──────────────────────────────────────
+    price_up   = price_chg_pct > 0.05
+    price_dn   = price_chg_pct < -0.05
+    ce_oi_up   = ce_oi_delta_pct > 1
+    ce_oi_dn   = ce_oi_delta_pct < -1
+    pe_oi_up   = pe_oi_delta_pct > 1
+    pe_oi_dn   = pe_oi_delta_pct < -1
+
+    if price_up and pe_oi_up and ce_oi_dn:
+        oi_build_up    = "Fresh Put Writing"
+        oi_bias        = "🟢 Very Bullish"
+        inst_activity  = "🏦 Institutional Long Build Up"
+        smart_money    = "Bullish"
+    elif price_up and ce_oi_dn and pe_oi_dn:
+        oi_build_up    = "Short Covering"
+        oi_bias        = "🟢 Bullish"
+        inst_activity  = "📈 Short Covering Detected"
+        smart_money    = "Bullish"
+    elif price_up and ce_oi_up and pe_oi_up:
+        oi_build_up    = "Long Build Up"
+        oi_bias        = "🟢 Bullish"
+        inst_activity  = "🏦 Long Build Up"
+        smart_money    = "Bullish"
+    elif price_dn and ce_oi_up and pe_oi_dn:
+        oi_build_up    = "Fresh Call Writing"
+        oi_bias        = "🔴 Bearish"
+        inst_activity  = "🐻 Institutional Short Build Up"
+        smart_money    = "Bearish"
+    elif price_dn and pe_oi_dn and ce_oi_dn:
+        oi_build_up    = "Long Unwinding"
+        oi_bias        = "🔴 Bearish"
+        inst_activity  = "📉 Long Unwinding"
+        smart_money    = "Bearish"
+    elif price_dn and ce_oi_up and pe_oi_up:
+        oi_build_up    = "Short Build Up"
+        oi_bias        = "🔴 Strong Bearish"
+        inst_activity  = "🔴 Strong Short Build Up"
+        smart_money    = "Bearish"
+    elif abs(price_chg_pct) <= 0.05 and pcr > 1.2:
+        oi_build_up    = "Range Bound - Bullish Bias"
+        oi_bias        = "🟡 Neutral-Bullish"
+        inst_activity  = "⚖️ Range Bound"
+        smart_money    = "Neutral"
+    elif abs(price_chg_pct) <= 0.05 and pcr < 0.8:
+        oi_build_up    = "Range Bound - Bearish Bias"
+        oi_bias        = "🟡 Neutral-Bearish"
+        inst_activity  = "⚖️ Range Bound"
+        smart_money    = "Neutral"
+    else:
+        oi_build_up    = "Neutral"
+        oi_bias        = "🟡 Neutral"
+        inst_activity  = "⚖️ No Clear Bias"
+        smart_money    = "Neutral"
+
+    # Fresh Call / Put writing signals
+    fresh_call_writing = ce_oi_up and price_dn
+    fresh_put_writing  = pe_oi_up and price_up
+
+    # ── Big Player Position ───────────────────────────────────────────────
+    if pcr > 1.5:
+        big_player = "🏦 Big Players Long"
+    elif pcr < 0.6:
+        big_player = "🐻 Big Players Short"
+    elif 0.8 <= pcr <= 1.2:
+        big_player = "⚖️ Balanced"
+    else:
+        big_player = "🟡 Neutral"
+
+    # ── Expected Move (Step 5) ────────────────────────────────────────────
+    # ATM IV-based expected move: Spot × IV/100 × √(T) where T=1/96 (1 candle of day)
+    atm_row  = min(rows, key=lambda r: abs(r["strike"] - spot), default=None)
+    atm_iv   = ((atm_row["ce_iv"] + atm_row["pe_iv"]) / 2) if atm_row else 20.0
+    if atm_iv <= 0:
+        atm_iv = 20.0
+    t_frac   = 1 / 96          # one 15-min candle as fraction of trading day
+    exp_move_pct    = round(atm_iv / 100 * (t_frac ** 0.5) * 100, 3)  # as %
+    exp_move_pts    = round(spot * exp_move_pct / 100, 2)
+    exp_range_low   = round(spot - exp_move_pts, 2)
+    exp_range_high  = round(spot + exp_move_pts, 2)
+
+    # ── Confidence & Probability (Step 5) ────────────────────────────────
+    # Score 0-100 from OI accel + vol accel + PCR extremity + ATR confirmation
+    oi_score    = min(oi_accel * 3, 30)
+    vol_score   = min(max(vol_accel / 5, 0), 20)
+    pcr_score   = min(abs(pcr - 1.0) * 20, 20)
+    atr_score   = min(atr_pct * 4, 15)
+    price_score = min(abs(price_chg_pct) * 10, 15)
+    confidence  = round(min(oi_score + vol_score + pcr_score + atr_score + price_score + 40, 97), 1)
+    probability = round(min(confidence * 0.95, 95), 1)
+
+    # Bullish % / Bearish %
+    if "Bullish" in oi_bias or "Bullish" in oi_build_up:
+        bullish_pct = round(min(50 + (pcr - 1) * 25 + abs(pe_oi_delta_pct) * 0.5, 95), 1)
+        bearish_pct = round(100 - bullish_pct, 1)
+    elif "Bearish" in oi_bias:
+        bearish_pct = round(min(50 + (1 - pcr) * 25 + abs(ce_oi_delta_pct) * 0.5, 95), 1)
+        bullish_pct = round(100 - bearish_pct, 1)
+    else:
+        bullish_pct = 50.0
+        bearish_pct = 50.0
+
+    # ── OI Momentum ──────────────────────────────────────────────────────
+    if oi_accel > 10:
+        oi_momentum = "🔥 High Acceleration"
+    elif oi_accel > 5:
+        oi_momentum = "⚡ Moderate"
+    else:
+        oi_momentum = "⚪ Low"
+
+    # ── Next Candle Prediction ────────────────────────────────────────────
+    if bullish_pct >= 70:
+        next_candle = "📈 Likely Up"
+        trade_dir   = "🟢 BUY"
+        exp_target  = round(spot + exp_move_pts, 2)
+        exp_sl      = round(spot - exp_move_pts * 0.6, 2)
+    elif bearish_pct >= 70:
+        next_candle = "📉 Likely Down"
+        trade_dir   = "🔴 SELL"
+        exp_target  = round(spot - exp_move_pts, 2)
+        exp_sl      = round(spot + exp_move_pts * 0.6, 2)
+    else:
+        next_candle = "🟡 Range Bound"
+        trade_dir   = "🟡 WAIT"
+        exp_target  = spot
+        exp_sl      = spot
+
+    risk   = abs(spot - exp_sl)
+    reward = abs(exp_target - spot)
+    rr     = round(reward / risk, 2) if risk > 0 else 0.0
+
+    # ── AI Summary (Step 9) ──────────────────────────────────────────────
+    ai_summary_parts = []
+    ai_summary_parts.append(
+        f"CE OI {'increased' if ce_oi_delta_pct > 0 else 'reduced'} by {abs(ce_oi_delta_pct):.1f}%."
+    )
+    ai_summary_parts.append(
+        f"PE OI {'increased' if pe_oi_delta_pct > 0 else 'reduced'} by {abs(pe_oi_delta_pct):.1f}%."
+    )
+    if fresh_put_writing:
+        ai_summary_parts.append("Fresh Put Writing observed.")
+    if fresh_call_writing:
+        ai_summary_parts.append("Fresh Call Writing observed.")
+    ai_summary_parts.append(f"{inst_activity} detected.")
+    direction_word = "upside" if bullish_pct > bearish_pct else "downside"
+    ai_summary_parts.append(
+        f"Expected {direction_word} move {exp_move_pct:.2f}%. Probability {probability}%."
+    )
+    ai_summary = " ".join(ai_summary_parts)
+
+    # ── Trap / False Breakout detection ──────────────────────────────────
+    if price_up and ce_oi_up and pe_oi_dn and oi_accel > 5:
+        prediction_text = "⚠️ Trap Probability — False Breakout Risk"
+    elif price_dn and pe_oi_up and ce_oi_dn and oi_accel > 5:
+        prediction_text = "⚠️ Trap Probability — False Breakdown Risk"
+    elif "Long Build Up" in oi_build_up and vol_accel > 10:
+        prediction_text = "🚀 High Probability Breakout"
+    elif "Short Build Up" in oi_build_up and vol_accel > 10:
+        prediction_text = "🔻 High Probability Breakdown"
+    elif fresh_call_writing and fresh_put_writing:
+        prediction_text = "📦 Range Bound"
+    elif fresh_put_writing:
+        prediction_text = "📈 Strong Put Writing"
+    elif fresh_call_writing:
+        prediction_text = "📉 Strong Call Writing"
+    elif "Short Covering" in oi_build_up:
+        prediction_text = "📈 Short Covering"
+    elif "Long Unwinding" in oi_build_up:
+        prediction_text = "📉 Long Unwinding"
+    elif "Institutional" in inst_activity and "Long" in inst_activity:
+        prediction_text = "🏦 Institutional Buying"
+    elif "Institutional" in inst_activity and "Short" in inst_activity:
+        prediction_text = "🏦 Institutional Selling"
+    else:
+        prediction_text = "🟡 Neutral / No Strong Signal"
+
+    return {
+        # Step 6 columns
+        "15m CE OI Δ":          total_ce_chg,
+        "15m PE OI Δ":          total_pe_chg,
+        "CE OI %":              ce_oi_delta_pct,
+        "PE OI %":              pe_oi_delta_pct,
+        "Net OI":               net_oi_chg,
+        "PCR":                  pcr,
+        "OI Ratio":             oi_ratio,
+        "Max Pain":             max_pain_strike,
+        "Max CE Writing":       max_ce_writing_strike,
+        "Max PE Writing":       max_pe_writing_strike,
+        "OI Bias":              oi_bias,
+        "OI Build Up":          oi_build_up,
+        "OI Momentum":          oi_momentum,
+        "OI Acceleration %":    oi_accel,
+        "Vol Acceleration %":   vol_accel,
+        "Price Change %":       price_chg_pct,
+        "ATR %":                atr_pct,
+        "Expected Move":        f"{exp_move_pct:.3f}%",
+        "Expected Points":      exp_move_pts,
+        "Expected Range":       f"{exp_range_low}–{exp_range_high}",
+        "Probability":          f"{probability}%",
+        "Confidence":           f"{confidence}%",
+        "Bullish %":            bullish_pct,
+        "Bearish %":            bearish_pct,
+        "Institutional Activity": inst_activity,
+        "Smart Money Bias":     smart_money,
+        "Big Player Position":  big_player,
+        "Prediction Text":      prediction_text,
+        "Next Candle Prediction": next_candle,
+        "Trade Direction":      trade_dir,
+        "Expected Target":      exp_target,
+        "Expected StopLoss":    exp_sl,
+        "Risk Reward":          rr,
+        "AI Summary":           ai_summary,
+        # Raw for display table
+        "_ce_oi_total":         total_ce_oi,
+        "_pe_oi_total":         total_pe_oi,
+        "_atm_iv":              atm_iv,
+    }
+
+
+def _empty_oi_row() -> dict:
+    """Returns a zero-filled OI row when data is unavailable."""
+    return {
+        "15m CE OI Δ": 0, "15m PE OI Δ": 0, "CE OI %": 0.0, "PE OI %": 0.0,
+        "Net OI": 0, "PCR": 0.0, "OI Ratio": 0.0, "Max Pain": 0,
+        "Max CE Writing": 0, "Max PE Writing": 0,
+        "OI Bias": "⚪ No Data", "OI Build Up": "No Data",
+        "OI Momentum": "⚪ No Data", "OI Acceleration %": 0.0,
+        "Vol Acceleration %": 0.0, "Price Change %": 0.0, "ATR %": 0.0,
+        "Expected Move": "—", "Expected Points": 0.0, "Expected Range": "—",
+        "Probability": "—", "Confidence": "—", "Bullish %": 0.0, "Bearish %": 0.0,
+        "Institutional Activity": "⚪ No OI Data",
+        "Smart Money Bias": "—", "Big Player Position": "—",
+        "Prediction Text": "⚪ OI data unavailable",
+        "Next Candle Prediction": "—", "Trade Direction": "—",
+        "Expected Target": 0.0, "Expected StopLoss": 0.0, "Risk Reward": 0.0,
+        "AI Summary": "OI data unavailable for this symbol.",
+        "_ce_oi_total": 0, "_pe_oi_total": 0, "_atm_iv": 0.0,
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# ── Per-symbol OI worker ──────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════
+
+def _fetch_fo_oi_signal(fyers, symbol: str) -> Tuple[Optional[dict], Optional[str]]:
+    """
+    Full pipeline for one F&O symbol:
+    1. Fetch 15-min candles (reuse _safe_history)
+    2. Fetch option chain (Fyers → NSE fallback)
+    3. Compute OI metrics
+    4. Return merged result dict
+    """
+    if not isinstance(symbol, str) or not _VALID_EQ_SYMBOL_RE.match(symbol):
+        return None, f"{symbol}: invalid format"
+
+    cache_key = _oi_cache_key(symbol)
+    if cache_key in _OI_CACHE:
+        return _OI_CACHE[cache_key], None
+
+    # ── Fetch 15-min candles ──────────────────────────────────────────────
+    date_from = (datetime.today() - timedelta(days=5)).strftime("%Y-%m-%d")
+    date_to   = datetime.today().strftime("%Y-%m-%d")
+    resp, err = _safe_history(fyers, {
+        "symbol": symbol, "resolution": "15", "date_format": "1",
+        "range_from": date_from, "range_to": date_to, "cont_flag": "1",
+    })
+    if err:
+        return None, f"{symbol}: {err}"
+
+    candles = resp.get("candles") if resp else None
+    if not candles or len(candles) < 5:
+        return None, f"{symbol}: insufficient 15m history"
+
+    try:
+        df = pd.DataFrame(candles, columns=["Time", "Open", "High", "Low", "Close", "Volume"])
+        df["Time"] = pd.to_datetime(df["Time"], unit="s", utc=True).dt.tz_convert("Asia/Kolkata")
+        df[["Open", "High", "Low", "Close", "Volume"]] = df[["Open", "High", "Low", "Close", "Volume"]].apply(
+            pd.to_numeric, errors="coerce"
+        )
+        df = df.dropna(subset=["Close"]).sort_values("Time").reset_index(drop=True)
+
+        # Drop still-forming candle
+        if len(df) > 0 and not _is_intraday_candle_closed(df["Time"].iloc[-1], 15):
+            df = df.iloc[:-1].reset_index(drop=True)
+        if len(df) < 3:
+            return None, f"{symbol}: insufficient completed candles"
+
+        spot      = float(df["Close"].iloc[-1])
+        prev_spot = float(df["Close"].iloc[-2])
+
+        # ── Fetch option chain ────────────────────────────────────────────
+        oc_rows = _fetch_fyers_option_chain(fyers, symbol, spot)
+        source  = "Fyers"
+        if not oc_rows:
+            oc_rows = _fetch_nse_option_chain(symbol, spot)
+            source  = "NSE"
+
+        selected = _select_strikes(oc_rows, spot) if oc_rows else []
+
+        # Previous candle option chain (cached one epoch earlier)
+        prev_cache_key = f"{symbol}|{_current_15m_epoch() - 900}"
+        prev_rows      = _OI_CACHE.get(prev_cache_key, {}).get("_oc_rows")
+
+        # ── Compute metrics ───────────────────────────────────────────────
+        metrics = _compute_oi_metrics(selected, prev_rows, spot, prev_spot, df)
+
+        stock_ticker = symbol.replace("NSE:", "").replace("-EQ", "")
+        rsi_val  = round(float(calculate_rsi(df["Close"]).iloc[-1]), 1)
+        atr_val  = round(float(calculate_atr(df).iloc[-1]), 2)
+        ema20    = round(float(df["Close"].ewm(span=20).mean().iloc[-1]), 2)
+        ema50    = round(float(df["Close"].ewm(span=50).mean().iloc[-1]), 2) if len(df) >= 50 else ema20
+        vwap_val = calculate_vwap_approx(df)
+        adx_val, _, _ = calculate_adx(df) if len(df) >= 15 else (0.0, 0.0, 0.0)
+
+        smc_structure, cisd_signal, _ = _calculate_smc_and_cisd(df)
+        signal_date, signal_time = _candle_signal_timestamp(df, is_daily=False)
+
+        result = {
+            "Signal Date":   signal_date,
+            "Signal Time":   signal_time,
+            "Stock":         stock_ticker,
+            "Spot":          spot,
+            "ATM Strike":    _nearest_atm(spot, [r["strike"] for r in selected]) if selected else round(spot / 50) * 50,
+            "OI Source":     source if selected else "No Data",
+            "RSI (15m)":     rsi_val,
+            "ATR (15m)":     atr_val,
+            "EMA20 (15m)":   ema20,
+            "EMA50 (15m)":   ema50,
+            "VWAP (15m)":    vwap_val,
+            "ADX (15m)":     adx_val,
+            "SMC Structure": smc_structure,
+            "CISD":          cisd_signal,
+            **metrics,
+            "_oc_rows":      selected,   # stored for next-candle prev_rows
+        }
+
+        # Trim and cache
+        if len(_OI_CACHE) >= _OI_CACHE_MAX:
+            oldest = sorted(_OI_CACHE.keys())[:100]
+            for k in oldest:
+                _OI_CACHE.pop(k, None)
+        _OI_CACHE[cache_key] = result
+        return result, None
+
+    except Exception as e:
+        return None, f"{symbol}: OI error ({type(e).__name__}: {e})"
+
+
+def run_fo_oi_scan(fyers, symbols: List[str]) -> Tuple[List[dict], List[str], "ScanStats"]:
+    """
+    Threaded F&O OI scan across `symbols` (should be F&O universe).
+    Returns (results, errors, stats) — same shape as every other scanner.
+    """
+    symbols = _validate_symbols(symbols)
+    results: List[dict] = []
+    errors:  List[str]  = []
+    stats = ScanStats(total=len(symbols))
+    progress = st.progress(0.0, text=f"F&O OI Scan 0 / {len(symbols)}")
+    done = 0
+
+    for i in range(0, len(symbols), BATCH_SIZE):
+        batch = symbols[i:i + BATCH_SIZE]
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            futures = {executor.submit(_fetch_fo_oi_signal, fyers, s): s for s in batch}
+            for future in as_completed(futures):
+                try:
+                    res, err = future.result()
+                except Exception as e:
+                    res, err = None, f"{futures[future]}: worker error ({type(e).__name__})"
+                if res:
+                    results.append(res)
+                if err:
+                    errors.append(err)
+                stats.record(has_result=bool(res), has_error=bool(err))
+                done += 1
+                progress.progress(
+                    done / max(len(symbols), 1),
+                    text=f"F&O OI Scan {done} / {len(symbols)}"
+                )
+        if i + BATCH_SIZE < len(symbols):
+            time.sleep(BATCH_PAUSE_SECONDS)
+
+    progress.empty()
+    return results, errors, stats
+
+
+# ── OI colour coder (Step 7) ──────────────────────────────────────────────
+def _oi_color_code(val) -> str:
+    if not isinstance(val, str):
+        return ""
+    v = val.upper()
+    if any(x in v for x in ["VERY BULLISH", "STRONG BULL", "INSTITUTIONAL BUYING",
+                              "LONG BUILD UP", "HIGH PROBABILITY BREAKOUT", "🟢🟢"]):
+        return "color: #006100; font-weight: bold; background-color: #e8f5e9;"
+    if any(x in v for x in ["BULLISH", "BUY", "PUT WRITING", "SHORT COVERING",
+                              "UPSIDE", "BREAKOUT", "🟢"]):
+        return "color: #1b5e20; font-weight: bold;"
+    if any(x in v for x in ["NEUTRAL", "RANGE", "BALANCED", "WAIT", "🟡", "⚖️"]):
+        return "color: #b8860b; font-weight: bold;"
+    if any(x in v for x in ["BEARISH", "SELL", "CALL WRITING", "UNWINDING",
+                              "BREAKDOWN", "INSTITUTIONAL SELLING", "🔴", "🟠"]):
+        return "color: #b71c1c; font-weight: bold;"
+    if any(x in v for x in ["STRONG BEAR", "STRONG SELL", "SHORT BUILD", "TRAP",
+                              "FALSE BREAK", "🔴🔴"]):
+        return "color: #7f0000; font-weight: bold; background-color: #ffebee;"
+    return ""
+
+
+def _style_oi_df(df: pd.DataFrame):
+    """Safe OI-aware styler — only applied to string columns."""
+    try:
+        str_cols = [c for c in df.columns if df[c].dtype == object]
+        if not str_cols:
+            return df.style
+        styler = df.style
+        if hasattr(styler, "map"):
+            return styler.map(_oi_color_code, subset=str_cols)
+        return styler.applymap(_oi_color_code, subset=str_cols)
+    except Exception:
+        try:
+            return df.style
+        except Exception:
+            return df
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# ── TAB UI: 🔬 F&O OI Analysis ───────────────────────────────────────────
+# Called from show_scanner() — purely additive, no existing code touched.
+# ══════════════════════════════════════════════════════════════════════════
+
+def _show_fo_oi_tab(fyers, fo_symbols: List[str]):
+    """Renders the complete 🔬 F&O OI Analysis tab."""
+
+    st.markdown(
+        "### 🔬 Institutional F&O OI Analysis — 15-Minute\n"
+        "Tracks CE/PE Open Interest changes on the latest **completed 15-minute candle** "
+        "for every F&O stock. Identifies Fresh Writing, Long/Short Build-Up, Institutional "
+        "activity, and estimates the probability of the next directional move."
+    )
+
+    # ── Info bar ─────────────────────────────────────────────────────────
+    next_candle_at = _current_15m_epoch() + 900
+    next_dt = datetime.fromtimestamp(next_candle_at, tz=IST).strftime("%H:%M:%S IST")
+    st.caption(
+        f"📡 OI Source: **Fyers** (NSE fallback) · "
+        f"Data refreshes after every completed 15-min candle · "
+        f"Next candle at **{next_dt}** · "
+        f"Cache entries: {len(_OI_CACHE)}"
+    )
+    st.divider()
+
+    # ── Controls ─────────────────────────────────────────────────────────
+    oi_c1, oi_c2, oi_c3, oi_c4 = st.columns([1, 1, 1, 1])
+    with oi_c1:
+        oi_limit = st.number_input(
+            "Limit F&O symbols (0 = all)", min_value=0,
+            max_value=len(fo_symbols), value=min(50, len(fo_symbols)),
+            step=25, key="oi_limit",
+            help="Start with 50 to test. OI API calls are rate-limited."
+        )
+    with oi_c2:
+        oi_bias_filter = st.selectbox(
+            "Filter by OI Bias",
+            ["All", "Bullish only", "Bearish only", "Neutral only",
+             "High Probability", "Institutional Activity"],
+            key="oi_bias_filter"
+        )
+    with oi_c3:
+        oi_min_prob = st.slider(
+            "Min Probability %", min_value=0, max_value=90, value=0, step=5,
+            key="oi_min_prob"
+        )
+    with oi_c4:
+        oi_clear_cache = st.button("🗑️ Clear OI Cache", key="oi_clear_cache")
+        if oi_clear_cache:
+            _OI_CACHE.clear()
+            st.success("OI cache cleared.")
+
+    oi_universe = fo_symbols if oi_limit == 0 else fo_symbols[:oi_limit]
+    st.caption(f"Scanning **{len(oi_universe)}** F&O stocks.")
+
+    if st.button(f"🔬 Run F&O OI Analysis ({len(oi_universe)} symbols)", key="oi_run"):
+        with st.spinner("Fetching OI data from Fyers / NSE…"):
+            oi_results, oi_errors, oi_stats = run_fo_oi_scan(fyers, oi_universe)
+
+        # Remove internal cache columns before storing
+        display_cols_exclude = {"_oc_rows", "_ce_oi_total", "_pe_oi_total", "_atm_iv"}
+        clean_results = [
+            {k: v for k, v in r.items() if k not in display_cols_exclude}
+            for r in oi_results
+        ]
+        st.session_state["oi_df"]     = pd.DataFrame(clean_results)
+        st.session_state["oi_errors"] = oi_errors
+        st.session_state["oi_stats"]  = oi_stats
+
+    # ── Summary metrics ───────────────────────────────────────────────────
+    if "oi_stats" in st.session_state:
+        _display_scan_summary(st.session_state["oi_stats"])
+
+    oi_df: Optional[pd.DataFrame] = st.session_state.get("oi_df")
+
+    if oi_df is not None and not oi_df.empty:
+
+        view = oi_df.copy()
+
+        # Apply filters
+        try:
+            if oi_bias_filter == "Bullish only":
+                view = view[view["OI Bias"].str.contains("Bullish", na=False)]
+            elif oi_bias_filter == "Bearish only":
+                view = view[view["OI Bias"].str.contains("Bearish", na=False)]
+            elif oi_bias_filter == "Neutral only":
+                view = view[view["OI Bias"].str.contains("Neutral", na=False)]
+            elif oi_bias_filter == "High Probability":
+                view = view[view["Prediction Text"].str.contains("High Probability", na=False)]
+            elif oi_bias_filter == "Institutional Activity":
+                view = view[view["Institutional Activity"].str.contains("Institutional|🏦", na=False, regex=True)]
+
+            if oi_min_prob > 0 and "Probability" in view.columns:
+                prob_nums = view["Probability"].str.replace("%", "", regex=False).apply(
+                    lambda x: float(x) if str(x).replace(".", "").isdigit() else 0
+                )
+                view = view[prob_nums >= oi_min_prob]
+        except Exception:
+            pass
+
+        if view.empty:
+            st.warning("⚠️ No results match the selected filters — try relaxing the filter settings.")
+        else:
+            view = view.sort_values("Probability", ascending=False, key=lambda s: s.str.replace("%","",regex=False).apply(lambda x: float(x) if str(x).replace(".","").isdigit() else 0)).reset_index(drop=True)
+
+            # ── KPI bar ───────────────────────────────────────────────────
+            st.markdown("#### 📊 OI Overview")
+            k1, k2, k3, k4, k5, k6 = st.columns(6)
+            k1.metric("Total Signals", len(view))
+            try:
+                k2.metric("🟢 Bullish", int(view["OI Bias"].str.contains("Bullish", na=False).sum()))
+                k3.metric("🔴 Bearish", int(view["OI Bias"].str.contains("Bearish", na=False).sum()))
+                k4.metric("🟡 Neutral", int(view["OI Bias"].str.contains("Neutral|No", na=False).sum()))
+            except Exception:
+                k2.metric("🟢 Bullish", "—"); k3.metric("🔴 Bearish", "—"); k4.metric("🟡 Neutral", "—")
+            try:
+                k5.metric("🏦 Institutional", int(view["Institutional Activity"].str.contains("🏦|Institutional", na=False, regex=True).sum()))
+            except Exception:
+                k5.metric("🏦 Institutional", "—")
+            try:
+                avg_prob = view["Probability"].str.replace("%","",regex=False).apply(lambda x: float(x) if str(x).replace(".","").isdigit() else 0).mean()
+                k6.metric("Avg Probability", f"{avg_prob:.1f}%")
+            except Exception:
+                k6.metric("Avg Probability", "—")
+
+            st.divider()
+
+            # ── Main table ────────────────────────────────────────────────
+            st.markdown("#### 📋 OI Signal Table")
+
+            # Priority column order
+            oi_priority = [
+                "Signal Date", "Signal Time", "Stock", "Spot", "ATM Strike",
+                "Trade Direction", "Next Candle Prediction", "Prediction Text",
+                "OI Bias", "OI Build Up", "Probability", "Confidence",
+                "Bullish %", "Bearish %",
+                "15m CE OI Δ", "15m PE OI Δ", "CE OI %", "PE OI %",
+                "Net OI", "PCR", "OI Ratio",
+                "Max CE Writing", "Max PE Writing", "Max Pain",
+                "OI Momentum", "OI Acceleration %", "Vol Acceleration %",
+                "Price Change %", "ATR %",
+                "Expected Move", "Expected Points", "Expected Range",
+                "Expected Target", "Expected StopLoss", "Risk Reward",
+                "Institutional Activity", "Smart Money Bias", "Big Player Position",
+                "RSI (15m)", "ATR (15m)", "EMA20 (15m)", "EMA50 (15m)",
+                "VWAP (15m)", "ADX (15m)", "SMC Structure", "CISD",
+                "OI Source", "AI Summary",
+            ]
+            existing = [c for c in oi_priority if c in view.columns]
+            rest     = [c for c in view.columns if c not in existing]
+            table_df = view[existing + rest].copy()
+
+            # Sanitise for display
+            for col in table_df.columns:
+                if table_df[col].dtype == object:
+                    table_df[col] = table_df[col].fillna("—").astype(str)
+
+            try:
+                st.dataframe(_style_oi_df(table_df), use_container_width=True, height=520)
+            except Exception:
+                st.dataframe(table_df, use_container_width=True, height=520)
+
+            # ── Downloads ─────────────────────────────────────────────────
+            st.markdown("#### 💾 Export")
+            dl1, dl2, dl3 = st.columns(3)
+            with dl1:
+                st.download_button(
+                    "📥 Download as Excel",
+                    data=to_excel_bytes(view, "F&O OI Analysis"),
+                    file_name=f"nse_fo_oi_{_now_ist().strftime('%Y%m%d_%H%M')}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key="dl_oi_xlsx",
+                )
+            with dl2:
+                st.download_button(
+                    "📥 Download as CSV",
+                    data=to_csv_bytes(view),
+                    file_name=f"nse_fo_oi_{_now_ist().strftime('%Y%m%d_%H%M')}.csv",
+                    mime="text/csv",
+                    key="dl_oi_csv",
+                )
+            with dl3:
+                st.download_button(
+                    "📥 Download as JSON",
+                    data=to_json_bytes(view),
+                    file_name=f"nse_fo_oi_{_now_ist().strftime('%Y%m%d_%H%M')}.json",
+                    mime="application/json",
+                    key="dl_oi_json",
+                )
+
+            st.divider()
+
+            # ── Per-stock AI Summary cards ────────────────────────────────
+            show_cards = st.checkbox(
+                "📋 Show per-stock AI Summary cards",
+                value=True, key="oi_show_cards"
+            )
+            if show_cards:
+                st.markdown(f"#### 🧠 AI OI Analysis Cards — {len(view)} stock(s)")
+                max_cards = st.slider("Max cards to show", 1, min(len(view), 30), min(10, len(view)), key="oi_max_cards")
+
+                for _, row in view.head(max_cards).iterrows():
+                    stock      = str(row.get("Stock", "?"))
+                    bias       = str(row.get("OI Bias", "—"))
+                    build_up   = str(row.get("OI Build Up", "—"))
+                    trade_dir  = str(row.get("Trade Direction", "—"))
+                    prob       = str(row.get("Probability", "—"))
+                    conf       = str(row.get("Confidence", "—"))
+                    pred_text  = str(row.get("Prediction Text", "—"))
+                    next_pred  = str(row.get("Next Candle Prediction", "—"))
+                    inst_act   = str(row.get("Institutional Activity", "—"))
+                    smart_m    = str(row.get("Smart Money Bias", "—"))
+                    big_p      = str(row.get("Big Player Position", "—"))
+                    pcr_val    = row.get("PCR", 0)
+                    ce_pct     = row.get("CE OI %", 0)
+                    pe_pct     = row.get("PE OI %", 0)
+                    net_oi     = row.get("Net OI", 0)
+                    exp_move   = str(row.get("Expected Move", "—"))
+                    exp_pts    = row.get("Expected Points", 0)
+                    exp_range  = str(row.get("Expected Range", "—"))
+                    exp_tgt    = row.get("Expected Target", 0)
+                    exp_sl     = row.get("Expected StopLoss", 0)
+                    rr_val     = row.get("Risk Reward", 0)
+                    bull_pct   = row.get("Bullish %", 50)
+                    bear_pct   = row.get("Bearish %", 50)
+                    max_pain   = row.get("Max Pain", 0)
+                    ai_sum     = str(row.get("AI Summary", "—"))
+                    spot_val   = row.get("Spot", 0)
+                    atm_s      = row.get("ATM Strike", 0)
+                    oi_source  = str(row.get("OI Source", "—"))
+                    sig_date   = str(row.get("Signal Date", "—"))
+                    sig_time   = str(row.get("Signal Time", "—"))
+
+                    is_bull = "Bullish" in bias or "BUY" in trade_dir
+                    is_bear = "Bearish" in bias or "SELL" in trade_dir
+                    card_color = ("#006100" if is_bull else "#9C0006" if is_bear else "#b8860b")
+                    card_bg    = ("#f0fff0" if is_bull else "#fff0f0" if is_bear else "#fffde7")
+
+                    st.markdown(
+                        f"""<div style="border:2px solid {card_color};border-radius:10px;
+                        padding:14px;margin-bottom:18px;background:{card_bg}">
+                        <h3 style="margin:0 0 4px 0;color:{card_color}">
+                        {'🟢' if is_bull else '🔴' if is_bear else '🟡'} {stock}
+                        &nbsp;|&nbsp; {bias} &nbsp;|&nbsp; {pred_text}
+                        </h3>
+                        <span style="font-size:13px;color:#555">
+                        📅 {sig_date} {sig_time} &nbsp;·&nbsp;
+                        Spot: ₹{spot_val} &nbsp;·&nbsp; ATM: {atm_s} &nbsp;·&nbsp;
+                        Source: {oi_source}
+                        </span></div>""",
+                        unsafe_allow_html=True,
+                    )
+
+                    # Row 1: Trade info
+                    rc1, rc2, rc3, rc4, rc5 = st.columns(5)
+                    rc1.metric("Direction",     trade_dir)
+                    rc2.metric("Probability",   prob)
+                    rc3.metric("Confidence",    conf)
+                    rc4.metric("Next Candle",   next_pred)
+                    rc5.metric("OI Build Up",   build_up)
+
+                    # Row 2: OI data
+                    oc1, oc2, oc3, oc4, oc5 = st.columns(5)
+                    oc1.metric("CE OI Δ%",  f"{ce_pct:+.2f}%",
+                               delta_color="inverse" if ce_pct > 0 and is_bear else "normal")
+                    oc2.metric("PE OI Δ%",  f"{pe_pct:+.2f}%",
+                               delta_color="normal" if pe_pct > 0 and is_bull else "inverse")
+                    oc3.metric("PCR",        f"{pcr_val:.3f}")
+                    oc4.metric("Net OI Δ",   f"{int(net_oi):,}")
+                    oc5.metric("Max Pain",   f"₹{max_pain}")
+
+                    # Row 3: Expected move
+                    em1, em2, em3, em4, em5 = st.columns(5)
+                    em1.metric("Expected Move",   exp_move)
+                    em2.metric("Exp. Points",     f"₹{exp_pts}")
+                    em3.metric("Exp. Target",     f"₹{exp_tgt}")
+                    em4.metric("Exp. Stop Loss",  f"₹{exp_sl}")
+                    em5.metric("Risk:Reward",     f"1:{rr_val}")
+
+                    # Row 4: Institutional
+                    ii1, ii2, ii3 = st.columns(3)
+                    ii1.info(f"**Institutional Activity**\n\n{inst_act}")
+                    ii2.info(f"**Smart Money Bias**\n\n{smart_m}")
+                    ii3.info(f"**Big Player Position**\n\n{big_p}")
+
+                    # Probability bar
+                    st.markdown(
+                        f"**Bullish {bull_pct:.0f}%** "
+                        f"{'🟩' * int(bull_pct // 10)}"
+                        f"{'🟥' * int(bear_pct // 10)}"
+                        f" **Bearish {bear_pct:.0f}%**"
+                    )
+
+                    # Expected range
+                    st.markdown(f"📐 **Expected Range:** `{exp_range}`")
+
+                    # AI Summary box
+                    st.markdown("**🤖 AI Summary:**")
+                    st.info(ai_sum)
+
+                    st.divider()
+
+    elif "oi_df" in st.session_state:
+        st.info("Scan completed but no OI data was available for the selected symbols. "
+                "Check that Fyers/NSE option chain API is accessible and symbols are "
+                "currently F&O active.")
+    else:
+        st.info(
+            "👆 Click **'Run F&O OI Analysis'** above to start.  \n"
+            "The scanner fetches live option chain data for each F&O stock, "
+            "computes CE/PE OI changes on the latest completed 15-min candle, "
+            "and generates institutional-grade directional signals."
+        )
+
+    if st.session_state.get("oi_errors"):
+        with st.expander(f"⚠️ Skipped/failed symbols ({len(st.session_state['oi_errors'])})"):
+            st.text("\n".join(st.session_state["oi_errors"][:30]))
+
+
 def show_scanner(fyers):
     st.title("🚀 NSE AI PRO V13 — Institutional Scanner")
     st.caption(f"🕒 Current Time (IST): {_now_ist().strftime('%d-%b-%Y %H:%M:%S')} IST")
@@ -1801,11 +2781,12 @@ def show_scanner(fyers):
         _display_scan_summary(st.session_state["scan_stats"])
 
     (tab_scanner,tab_intraday,tab_swing,tab_fo,tab_intraday_cisd,tab_fo_cisd,
-     tab_golden_death,tab_premarket,tab_fo_15m_cisd,tab_live_ob,tab_ema_swing,tab_institutional) = st.tabs([
+     tab_golden_death,tab_premarket,tab_fo_15m_cisd,tab_live_ob,tab_ema_swing,
+     tab_institutional,tab_fo_oi) = st.tabs([
         "📊 Full Scanner","⚡ Intraday Scanner","📈 Swing Trade Scanner","🏛️ F&O Stocks Scanner",
         "🕐 Intraday CISD Signals","🎯 F&O CISD Scanner","✝️ Swing Trading (Golden/Death Cross)",
         "🌅 Pre-Market Scanner","🎯 NSE F&O 15-Min CISD Scanner","🔔 Live OB Signal Scanner",
-        "🌟 EMA 50/200 Swing (4H)","🏆 Institutional Scanner",
+        "🌟 EMA 50/200 Swing (4H)","🏆 Institutional Scanner","🔬 F&O OI Analysis",
     ])
 
     with tab_scanner:
@@ -2420,11 +3401,15 @@ def show_scanner(fyers):
                 st.caption("Most stocks are skipped for missing/invalid data, not app errors.")
                 st.text("\n".join(st.session_state["inst_errors"][:20]))
 
+    # ── 🔬 F&O OI Analysis tab ───────────────────────────────────────────────
+    with tab_fo_oi:
+        _fo_oi_symbols = load_nse_fo_stock_symbols()
+        _show_fo_oi_tab(fyers, _fo_oi_symbols)
+
     if st.session_state.get("scan_errors"):
         with st.expander(f"⚠️ Skipped/failed symbols ({len(st.session_state['scan_errors'])})"): st.text("\n".join(st.session_state["scan_errors"][:20]))
 
 # Pass your Fyers object here:
-# show_scanner(fyers)
-        # మెమరీ క్లీనప్ - ఇది యాప్ క్రాష్ అవ్వకుండా ఆపుతుంది[span_1](start_span)[span_1](end_span)
+# show_scanner(fyers)  # మెమరీ క్లీనప్ - ఇది యాప్ క్రాష్ అవ్వకుండా ఆపుతుంది[span_1](start_span)[span_1](end_span)
         del df
         gc.collect() 
