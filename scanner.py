@@ -2626,104 +2626,181 @@ def _show_fo_oi_tab(fyers, fo_symbols: List[str]):
                 st.markdown(f"#### 🧠 AI OI Analysis Cards — {len(view)} stock(s)")
                 max_cards = st.slider("Max cards to show", 1, min(len(view), 30), min(10, len(view)), key="oi_max_cards")
 
-                for _, row in view.head(max_cards).iterrows():
-                    stock      = str(row.get("Stock", "?"))
-                    bias       = str(row.get("OI Bias", "—"))
-                    build_up   = str(row.get("OI Build Up", "—"))
-                    trade_dir  = str(row.get("Trade Direction", "—"))
-                    prob       = str(row.get("Probability", "—"))
-                    conf       = str(row.get("Confidence", "—"))
-                    pred_text  = str(row.get("Prediction Text", "—"))
-                    next_pred  = str(row.get("Next Candle Prediction", "—"))
-                    inst_act   = str(row.get("Institutional Activity", "—"))
-                    smart_m    = str(row.get("Smart Money Bias", "—"))
-                    big_p      = str(row.get("Big Player Position", "—"))
-                    pcr_val    = row.get("PCR", 0)
-                    ce_pct     = row.get("CE OI %", 0)
-                    pe_pct     = row.get("PE OI %", 0)
-                    net_oi     = row.get("Net OI", 0)
-                    exp_move   = str(row.get("Expected Move", "—"))
-                    exp_pts    = row.get("Expected Points", 0)
-                    exp_range  = str(row.get("Expected Range", "—"))
-                    exp_tgt    = row.get("Expected Target", 0)
-                    exp_sl     = row.get("Expected StopLoss", 0)
-                    rr_val     = row.get("Risk Reward", 0)
-                    bull_pct   = row.get("Bullish %", 50)
-                    bear_pct   = row.get("Bearish %", 50)
-                    max_pain   = row.get("Max Pain", 0)
-                    ai_sum     = str(row.get("AI Summary", "—"))
-                    spot_val   = row.get("Spot", 0)
-                    atm_s      = row.get("ATM Strike", 0)
-                    oi_source  = str(row.get("OI Source", "—"))
-                    sig_date   = str(row.get("Signal Date", "—"))
-                    sig_time   = str(row.get("Signal Time", "—"))
+                for card_idx, row in enumerate(view.head(max_cards).itertuples(index=False)):
+                    # ── Safe value extractors — handle both str and numeric
+                    # because the display table sanitises everything to str ─
+                    def _s(col, default="—"):
+                        """Safe string getter."""
+                        try:
+                            v = getattr(row, col.replace(" ","_").replace("%","").replace("(","").replace(")","").replace("/","").replace(":","").replace("Δ",""), None)
+                        except Exception:
+                            v = None
+                        if v is None:
+                            # fallback: search by column name in view
+                            try:
+                                v = view.iloc[card_idx][col]
+                            except Exception:
+                                return default
+                        return str(v) if v is not None else default
 
-                    is_bull = "Bullish" in bias or "BUY" in trade_dir
-                    is_bear = "Bearish" in bias or "SELL" in trade_dir
-                    card_color = ("#006100" if is_bull else "#9C0006" if is_bear else "#b8860b")
-                    card_bg    = ("#f0fff0" if is_bull else "#fff0f0" if is_bear else "#fffde7")
+                    def _f(col, default=0.0):
+                        """Safe float getter — strips % signs and commas."""
+                        raw = _s(col, str(default))
+                        try:
+                            return float(str(raw).replace("%","").replace(",","").strip())
+                        except (ValueError, TypeError):
+                            return float(default)
 
+                    def _i(col, default=0):
+                        return int(_f(col, default))
+
+                    # Pull all values using the original oi_df (unsanitised)
+                    orig_row = oi_df[oi_df["Stock"] == _s("Stock")].iloc[0] if len(oi_df[oi_df["Stock"] == _s("Stock")]) > 0 else None
+
+                    def _ov(col, default=None):
+                        """Get value from original unsanitised oi_df row."""
+                        if orig_row is not None:
+                            try:
+                                return orig_row[col]
+                            except (KeyError, TypeError):
+                                pass
+                        return default
+
+                    stock      = _s("Stock")
+                    bias       = _s("OI Bias")
+                    build_up   = _s("OI Build Up")
+                    trade_dir  = _s("Trade Direction")
+                    prob       = _s("Probability")
+                    conf       = _s("Confidence")
+                    pred_text  = _s("Prediction Text")
+                    next_pred  = _s("Next Candle Prediction")
+                    inst_act   = _s("Institutional Activity")
+                    smart_m    = _s("Smart Money Bias")
+                    big_p      = _s("Big Player Position")
+                    exp_move   = _s("Expected Move")
+                    exp_range  = _s("Expected Range")
+                    ai_sum     = _s("AI Summary")
+                    oi_source  = _s("OI Source")
+                    sig_date   = _s("Signal Date")
+                    sig_time   = _s("Signal Time")
+
+                    # Numeric values — try original df first, fall back to parsed str
+                    pcr_val  = _ov("PCR",            _f("PCR"))
+                    ce_pct   = _ov("CE OI %",        _f("CE OI %"))
+                    pe_pct   = _ov("PE OI %",        _f("PE OI %"))
+                    net_oi   = _ov("Net OI",         _f("Net OI"))
+                    exp_pts  = _ov("Expected Points",_f("Expected Points"))
+                    exp_tgt  = _ov("Expected Target",_f("Expected Target"))
+                    exp_sl   = _ov("Expected StopLoss",_f("Expected StopLoss"))
+                    rr_val   = _ov("Risk Reward",    _f("Risk Reward"))
+                    bull_pct = _ov("Bullish %",      _f("Bullish %", 50))
+                    bear_pct = _ov("Bearish %",      _f("Bearish %", 50))
+                    max_pain = _ov("Max Pain",       _f("Max Pain"))
+                    spot_val = _ov("Spot",           _f("Spot"))
+                    atm_s    = _ov("ATM Strike",     _f("ATM Strike"))
+
+                    # Safe numeric conversions
+                    try: pcr_val  = float(pcr_val)
+                    except: pcr_val = 0.0
+                    try: ce_pct   = float(ce_pct)
+                    except: ce_pct = 0.0
+                    try: pe_pct   = float(pe_pct)
+                    except: pe_pct = 0.0
+                    try: net_oi   = int(float(net_oi))
+                    except: net_oi = 0
+                    try: exp_pts  = float(exp_pts)
+                    except: exp_pts = 0.0
+                    try: exp_tgt  = float(exp_tgt)
+                    except: exp_tgt = 0.0
+                    try: exp_sl   = float(exp_sl)
+                    except: exp_sl = 0.0
+                    try: rr_val   = float(rr_val)
+                    except: rr_val = 0.0
+                    try: bull_pct = float(bull_pct)
+                    except: bull_pct = 50.0
+                    try: bear_pct = float(bear_pct)
+                    except: bear_pct = 50.0
+                    try: max_pain = float(max_pain)
+                    except: max_pain = 0.0
+                    try: spot_val = float(spot_val)
+                    except: spot_val = 0.0
+                    try: atm_s    = float(atm_s)
+                    except: atm_s = 0.0
+
+                    is_bull    = "Bullish" in bias or "BUY" in trade_dir
+                    is_bear    = "Bearish" in bias or "SELL" in trade_dir
+                    card_color = "#006100" if is_bull else "#9C0006" if is_bear else "#b8860b"
+                    card_bg    = "#f0fff0" if is_bull else "#fff0f0" if is_bear else "#fffde7"
+                    icon       = "🟢" if is_bull else "🔴" if is_bear else "🟡"
+
+                    # ── Card header ───────────────────────────────────────
                     st.markdown(
-                        f"""<div style="border:2px solid {card_color};border-radius:10px;
-                        padding:14px;margin-bottom:18px;background:{card_bg}">
-                        <h3 style="margin:0 0 4px 0;color:{card_color}">
-                        {'🟢' if is_bull else '🔴' if is_bear else '🟡'} {stock}
-                        &nbsp;|&nbsp; {bias} &nbsp;|&nbsp; {pred_text}
-                        </h3>
-                        <span style="font-size:13px;color:#555">
-                        📅 {sig_date} {sig_time} &nbsp;·&nbsp;
-                        Spot: ₹{spot_val} &nbsp;·&nbsp; ATM: {atm_s} &nbsp;·&nbsp;
-                        Source: {oi_source}
-                        </span></div>""",
+                        f'<div style="border:2px solid {card_color};border-radius:10px;'
+                        f'padding:14px;margin-bottom:6px;background:{card_bg}">'
+                        f'<h3 style="margin:0 0 4px 0;color:{card_color}">'
+                        f'{icon} {stock} &nbsp;|&nbsp; {bias} &nbsp;|&nbsp; {pred_text}'
+                        f'</h3>'
+                        f'<span style="font-size:13px;color:#555">'
+                        f'📅 {sig_date} {sig_time} &nbsp;·&nbsp; '
+                        f'Spot: ₹{spot_val:.2f} &nbsp;·&nbsp; ATM: {atm_s:.0f} &nbsp;·&nbsp; '
+                        f'Source: {oi_source}'
+                        f'</span></div>',
                         unsafe_allow_html=True,
                     )
 
-                    # Row 1: Trade info
+                    # ── Row 1: Trade metrics ──────────────────────────────
                     rc1, rc2, rc3, rc4, rc5 = st.columns(5)
-                    rc1.metric("Direction",     trade_dir)
-                    rc2.metric("Probability",   prob)
-                    rc3.metric("Confidence",    conf)
-                    rc4.metric("Next Candle",   next_pred)
-                    rc5.metric("OI Build Up",   build_up)
+                    rc1.metric("📍 Direction",    trade_dir)
+                    rc2.metric("🎯 Probability",  prob)
+                    rc3.metric("💡 Confidence",   conf)
+                    rc4.metric("🕯️ Next Candle",  next_pred)
+                    rc5.metric("📦 OI Build Up",  build_up)
 
-                    # Row 2: OI data
+                    # ── Row 2: OI data ────────────────────────────────────
                     oc1, oc2, oc3, oc4, oc5 = st.columns(5)
-                    oc1.metric("CE OI Δ%",  f"{ce_pct:+.2f}%",
-                               delta_color="inverse" if ce_pct > 0 and is_bear else "normal")
-                    oc2.metric("PE OI Δ%",  f"{pe_pct:+.2f}%",
-                               delta_color="normal" if pe_pct > 0 and is_bull else "inverse")
-                    oc3.metric("PCR",        f"{pcr_val:.3f}")
-                    oc4.metric("Net OI Δ",   f"{int(net_oi):,}")
-                    oc5.metric("Max Pain",   f"₹{max_pain}")
+                    oc1.metric("📞 CE OI Δ%",
+                               f"{ce_pct:+.2f}%",
+                               delta=f"{ce_pct:+.2f}",
+                               delta_color="inverse" if (ce_pct > 0 and is_bear) else "normal")
+                    oc2.metric("📤 PE OI Δ%",
+                               f"{pe_pct:+.2f}%",
+                               delta=f"{pe_pct:+.2f}",
+                               delta_color="normal" if (pe_pct > 0 and is_bull) else "inverse")
+                    oc3.metric("⚖️ PCR",       f"{pcr_val:.3f}")
+                    oc4.metric("🔢 Net OI Δ",  f"{net_oi:,}")
+                    oc5.metric("💊 Max Pain",  f"₹{max_pain:.0f}")
 
-                    # Row 3: Expected move
+                    # ── Row 3: Expected move ──────────────────────────────
                     em1, em2, em3, em4, em5 = st.columns(5)
-                    em1.metric("Expected Move",   exp_move)
-                    em2.metric("Exp. Points",     f"₹{exp_pts}")
-                    em3.metric("Exp. Target",     f"₹{exp_tgt}")
-                    em4.metric("Exp. Stop Loss",  f"₹{exp_sl}")
-                    em5.metric("Risk:Reward",     f"1:{rr_val}")
+                    em1.metric("📏 Exp. Move",    exp_move)
+                    em2.metric("📐 Exp. Points",  f"₹{exp_pts:.2f}")
+                    em3.metric("🎯 Exp. Target",  f"₹{exp_tgt:.2f}")
+                    em4.metric("🛑 Exp. SL",      f"₹{exp_sl:.2f}")
+                    em5.metric("⚖️ Risk:Reward",  f"1:{rr_val:.2f}")
 
-                    # Row 4: Institutional
+                    # ── Row 4: Institutional context ─────────────────────
                     ii1, ii2, ii3 = st.columns(3)
-                    ii1.info(f"**Institutional Activity**\n\n{inst_act}")
-                    ii2.info(f"**Smart Money Bias**\n\n{smart_m}")
-                    ii3.info(f"**Big Player Position**\n\n{big_p}")
+                    ii1.info(f"**🏦 Institutional Activity**\n\n{inst_act}")
+                    ii2.info(f"**🧠 Smart Money Bias**\n\n{smart_m}")
+                    ii3.info(f"**💼 Big Player Position**\n\n{big_p}")
 
-                    # Probability bar
-                    st.markdown(
-                        f"**Bullish {bull_pct:.0f}%** "
-                        f"{'🟩' * int(bull_pct // 10)}"
-                        f"{'🟥' * int(bear_pct // 10)}"
-                        f" **Bearish {bear_pct:.0f}%**"
+                    # ── Probability bar ───────────────────────────────────
+                    bull_blocks = min(int(bull_pct // 10), 10)
+                    bear_blocks = min(int(bear_pct // 10), 10)
+                    prob_bar = (
+                        f"**🟢 Bullish {bull_pct:.0f}%** "
+                        + "🟩" * bull_blocks
+                        + "🟥" * bear_blocks
+                        + f" **🔴 Bearish {bear_pct:.0f}%**"
                     )
+                    st.markdown(prob_bar)
 
-                    # Expected range
+                    # ── Expected range ────────────────────────────────────
                     st.markdown(f"📐 **Expected Range:** `{exp_range}`")
 
-                    # AI Summary box
+                    # ── AI Summary ────────────────────────────────────────
                     st.markdown("**🤖 AI Summary:**")
-                    st.info(ai_sum)
+                    st.success(ai_sum) if is_bull else (st.error(ai_sum) if is_bear else st.warning(ai_sum))
 
                     st.divider()
 
