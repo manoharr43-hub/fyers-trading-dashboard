@@ -2370,7 +2370,44 @@ def _bigmove_row_style(row):
         color = "background-color:#2b1a05;color:#e8823a;"
     else:
         color = "background-color:#161b22;color:#8b949e;"
-    return [color] * len(row)
+    return color
+
+
+def render_row_colored_table_html(df: pd.DataFrame, numeric_fmt: dict = None, top_n: int = 500) -> str:
+    """
+    Generic replacement for `<df>.style.apply(_bigmove_row_style, axis=1)
+    .format(...)` — same proven-stable raw-HTML rendering pattern as
+    render_chain_table_html()/render_gamma_html_table(). Row-wise
+    Styler.apply(axis=1) chained with multiple .format() calls is the
+    heaviest Styler operation pandas offers and was confirmed (via
+    Streamlit Cloud crash logs) to still segfault the process on this
+    stack's pyarrow==25.0.0/pandas==2.2.2 combination even after the
+    Chain Table's own Styler chain was removed — every remaining
+    Styler-based st.dataframe() call in this file is replaced with this
+    same HTML approach, since `with tabN:` blocks all execute on every
+    script rerun regardless of which tab is visible.
+    """
+    numeric_fmt = numeric_fmt or {}
+    view = df.head(top_n)
+    header_html = "".join(f"<th>{col}</th>" for col in view.columns)
+    rows_html = []
+    for _, row in view.iterrows():
+        row_style = _bigmove_row_style(row)
+        cells = []
+        for col in view.columns:
+            val = row[col]
+            fmt = numeric_fmt.get(col)
+            display_val = fmt.format(val) if fmt and pd.notna(val) else ("" if pd.isna(val) else val)
+            cells.append(f"<td>{display_val}</td>")
+        rows_html.append(f'<tr style="{row_style}">{"".join(cells)}</tr>')
+    return f"""
+    <div style="max-height:560px; overflow-y:auto; border:1px solid #30363d; border-radius:8px;">
+    <table class="gamma-table">
+        <thead><tr>{header_html}</tr></thead>
+        <tbody>{''.join(rows_html)}</tbody>
+    </table>
+    </div>
+    """
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -3911,13 +3948,15 @@ def show_option_chain(fyers):
         with col_a:
             st.markdown("**Top 5 CE OI Strikes**")
             top5_ce = df.nlargest(5, "ce_oi")[["strike_price", "ce_oi", "ce_ltp"]].reset_index(drop=True)
-            st.dataframe(top5_ce.style.format({"ce_oi": "{:,.0f}", "ce_ltp": "{:.2f}"}),
-                         use_container_width=True, height=215)
+            top5_ce["ce_oi"] = top5_ce["ce_oi"].map("{:,.0f}".format)
+            top5_ce["ce_ltp"] = top5_ce["ce_ltp"].map("{:.2f}".format)
+            st.dataframe(top5_ce, use_container_width=True, height=215)
         with col_b:
             st.markdown("**Top 5 PE OI Strikes**")
             top5_pe = df.nlargest(5, "pe_oi")[["strike_price", "pe_oi", "pe_ltp"]].reset_index(drop=True)
-            st.dataframe(top5_pe.style.format({"pe_oi": "{:,.0f}", "pe_ltp": "{:.2f}"}),
-                         use_container_width=True, height=215)
+            top5_pe["pe_oi"] = top5_pe["pe_oi"].map("{:,.0f}".format)
+            top5_pe["pe_ltp"] = top5_pe["pe_ltp"].map("{:.2f}".format)
+            st.dataframe(top5_pe, use_container_width=True, height=215)
 
         st.markdown("**OI Build-up Classification**")
         buildup_view = df[["strike_price", "CE Build-up", "PE Build-up"]].rename(
@@ -3948,12 +3987,9 @@ def show_option_chain(fyers):
                      "of every strike (color-coded by Final Recommendation)")
         ce_pe_table = style_ce_pe_analysis_table(df)
         numeric_ce_pe_cols = [c for c in ce_pe_table.select_dtypes("number").columns if c != "Strike ⚡"]
-        st.dataframe(
-            ce_pe_table.style.apply(_bigmove_row_style, axis=1)
-                .format({c: "{:,.1f}" for c in numeric_ce_pe_cols})
-                .format({"Strike ⚡": "{:,.0f}"}),
-            use_container_width=True, height=560,
-        )
+        ce_pe_fmt = {c: "{:,.1f}" for c in numeric_ce_pe_cols}
+        ce_pe_fmt["Strike ⚡"] = "{:,.0f}"
+        st.markdown(render_row_colored_table_html(ce_pe_table, numeric_fmt=ce_pe_fmt), unsafe_allow_html=True)
         st.caption(
             "CE AI Score / PE AI Score = independent 0-100 favourability for buying a CALL / PUT at "
             "that strike, built from OI, ΔOI, Volume, PCR, Max Pain, Spot/ATM distance, IV, "
@@ -3971,12 +4007,9 @@ def show_option_chain(fyers):
         with st.expander("Legacy combined Big Move Table (Overall Score view)"):
             bm_table = style_big_move_table(df)
             numeric_bm_cols = [c for c in bm_table.select_dtypes("number").columns if c != "Strike ⚡"]
-            st.dataframe(
-                bm_table.style.apply(_bigmove_row_style, axis=1)
-                    .format({c: "{:,.1f}" for c in numeric_bm_cols})
-                    .format({"Strike ⚡": "{:,.0f}"}),
-                use_container_width=True, height=420,
-            )
+            bm_fmt = {c: "{:,.1f}" for c in numeric_bm_cols}
+            bm_fmt["Strike ⚡"] = "{:,.0f}"
+            st.markdown(render_row_colored_table_html(bm_table, numeric_fmt=bm_fmt), unsafe_allow_html=True)
 
     with tab5:
         st.markdown("##### 🤖 AI Trade Signal Engine — High Confidence Only")
