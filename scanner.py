@@ -2661,6 +2661,25 @@ def _compute_oi_metrics(rows: list, prev_rows: Optional[list], spot: float, prev
     long_unwinding = "Yes" if (price_dn and pe_oi_dn and ce_oi_dn) else "No"
     short_covering = "Yes" if (price_up and ce_oi_dn and pe_oi_dn) else "No"
 
+    # Consolidated, single-sentence read of the six flags above — makes the
+    # nuance between e.g. isolated Put Writing (one leg only) and the
+    # stronger two-sided Long Build Up (both legs confirming) legible at a
+    # glance instead of requiring the reader to cross-reference 4+ flags.
+    if long_build_up == "Yes":
+        oi_pattern = "🟢🟢 Long Build Up — Both Legs Confirming"
+    elif short_build_up == "Yes":
+        oi_pattern = "🔴🔴 Short Build Up — Both Legs Confirming"
+    elif long_unwinding == "Yes":
+        oi_pattern = "🔴 Long Unwinding"
+    elif short_covering == "Yes":
+        oi_pattern = "🟢 Short Covering"
+    elif put_writing == "Yes":
+        oi_pattern = "🟢 Isolated Put Writing — CE OI Not Confirming"
+    elif call_writing == "Yes":
+        oi_pattern = "🔴 Isolated Call Writing — PE OI Not Confirming"
+    else:
+        oi_pattern = "🟡 No Clear OI Pattern"
+
     if pcr > 1.5:
         big_player = "🏦 Big Players Long"
     elif pcr < 0.6:
@@ -2795,6 +2814,7 @@ def _compute_oi_metrics(rows: list, prev_rows: Optional[list], spot: float, prev
         "Short Build Up": short_build_up,
         "Long Unwinding": long_unwinding,
         "Short Covering": short_covering,
+        "OI Pattern": oi_pattern,
         "_ce_oi_total": total_ce_oi,
         "_pe_oi_total": total_pe_oi,
         "_atm_iv": atm_iv,
@@ -2837,6 +2857,7 @@ def _sentinel_oi_row(reason: str) -> dict:
         "AI Summary": f"{reason} — signal generation skipped (requires valid OI data).",
         "Call Writing": reason, "Put Writing": reason, "Long Build Up": reason,
         "Short Build Up": reason, "Long Unwinding": reason, "Short Covering": reason,
+        "OI Pattern": reason,
         "_ce_oi_total": reason, "_pe_oi_total": reason, "_atm_iv": reason,
     }
 
@@ -3144,7 +3165,7 @@ _FO_OI_REPORT_COLUMNS = [
     "Stock", "LTP", "Signal", "Direction", "OI Bias", "OI Status",
     "Spot Price", "ATM Strike", "Expiry", "PCR", "Max Pain",
     "CE OI", "PE OI", "CE OI Change", "PE OI Change",
-    "Call Writing", "Put Writing", "Long Build Up", "Short Build Up",
+    "OI Pattern", "Call Writing", "Put Writing", "Long Build Up", "Short Build Up",
     "Long Unwinding", "Short Covering",
     "Support", "Resistance",
     "Probability %", "Confidence %",
@@ -3240,6 +3261,7 @@ def _build_fo_oi_report_df(results: List[dict]) -> pd.DataFrame:
             "PE OI": _oi_numeric_or_nan(r.get("_pe_oi_total", 0)),
             "CE OI Change": _oi_numeric_or_nan(r.get("15m CE OI Δ", 0)),
             "PE OI Change": _oi_numeric_or_nan(r.get("15m PE OI Δ", 0)),
+            "OI Pattern": r.get("OI Pattern", status),
             "Call Writing": r.get("Call Writing", status),
             "Put Writing": r.get("Put Writing", status),
             "Long Build Up": r.get("Long Build Up", status),
@@ -3663,6 +3685,8 @@ def _show_fo_oi_tab(fyers, fo_symbols: List[str]) -> None:
             oc3.metric("📞 CE Δ", _sf(row.get('CE OI Change'), '{:,.0f}'))
             oc4.metric("📤 PE Δ", _sf(row.get('PE OI Change'), '{:,.0f}'))
             oc5.metric("⚖️ Risk:Reward", f"1:{_sf(row.get('Risk Reward'), '{:.2f}')}")
+
+            st.markdown(f"**🧩 OI Pattern:** {row.get('OI Pattern', '—')}")
 
             wc1, wc2, wc3, wc4 = st.columns(4)
             wc1.metric("✍️ Call Writing", row.get("Call Writing", "—"))
