@@ -3580,7 +3580,14 @@ def _show_fo_oi_tab(fyers, fo_symbols: List[str]) -> None:
     show_cards = st.checkbox("📋 Show per-stock AI Summary cards", value=True, key="oi_show_cards")
     if show_cards:
         st.markdown(f"#### 🧠 AI OI Analysis Cards — {len(view)} stock(s)")
-        max_cards = st.slider("Max cards to show", 1, min(len(view), 30), min(10, len(view)), key="oi_max_cards")
+        # st.slider requires min_value < max_value (strict); with exactly
+        # one row, min(len(view), 30) == 1 == the slider's floor, which
+        # raised StreamlitAPIException. Only show the slider when there's
+        # a real range to pick from; otherwise just show what's available.
+        if len(view) > 1:
+            max_cards = st.slider("Max cards to show", 1, min(len(view), 30), min(10, len(view)), key="oi_max_cards")
+        else:
+            max_cards = len(view)
 
         for _, row in view.head(max_cards).iterrows():
             stock = str(row.get("Stock", "—"))
