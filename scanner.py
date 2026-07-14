@@ -2572,6 +2572,8 @@ def _compute_oi_metrics(rows: list, prev_rows: Optional[list], spot: float, prev
     max_pe_writing_strike = max_pe_row.get("strike", 0)
 
     if prev_rows:
+        # Most precise: compare against our own previously-cached 15-min
+        # snapshot (available once the in-memory cache has warmed up).
         prev_ce = {r["strike"]: r["ce_oi"] for r in prev_rows}
         prev_pe = {r["strike"]: r["pe_oi"] for r in prev_rows}
         cur_ce_sum = sum(r["ce_oi"] for r in rows)
@@ -2580,9 +2582,26 @@ def _compute_oi_metrics(rows: list, prev_rows: Optional[list], spot: float, prev
         prv_pe_sum = sum(prev_pe.get(r["strike"], r["pe_oi"]) for r in rows)
         ce_oi_delta_pct = round((cur_ce_sum - prv_ce_sum) / prv_ce_sum * 100, 2) if prv_ce_sum else 0.0
         pe_oi_delta_pct = round((cur_pe_sum - prv_pe_sum) / prv_pe_sum * 100, 2) if prv_pe_sum else 0.0
+        oi_change_basis = "vs previous 15-min scan"
     else:
-        ce_oi_delta_pct = 0.0
-        pe_oi_delta_pct = 0.0
+        # FIX: no self-tracked snapshot yet (first scan of the session, or
+        # the in-memory cache was reset — e.g. an app/container restart on
+        # Streamlit Cloud, which is common). Previously this silently
+        # hardcoded 0.0%, producing the misleading "CE OI reduced by 0.0%.
+        # PE OI reduced by 0.0%." message even though the API itself
+        # reported a real change. Fall back to the exchange's own
+        # session-change fields (ce_oi_chg/pe_oi_chg — Fyers 'oich' or
+        # NSE 'changeinOpenInterest') so this is never a fabricated zero;
+        # it only reads 0.0% when the broker itself reports no change.
+        total_ce_chg_now = sum(r["ce_oi_chg"] for r in rows)
+        total_pe_chg_now = sum(r["pe_oi_chg"] for r in rows)
+        total_ce_oi_now = sum(r["ce_oi"] for r in rows)
+        total_pe_oi_now = sum(r["pe_oi"] for r in rows)
+        prev_ce_session_total = total_ce_oi_now - total_ce_chg_now
+        prev_pe_session_total = total_pe_oi_now - total_pe_chg_now
+        ce_oi_delta_pct = round((total_ce_chg_now / prev_ce_session_total) * 100, 2) if prev_ce_session_total else 0.0
+        pe_oi_delta_pct = round((total_pe_chg_now / prev_pe_session_total) * 100, 2) if prev_pe_session_total else 0.0
+        oi_change_basis = "vs previous session close"
 
     price_chg_pct = round((spot - prev_spot) / prev_spot * 100, 3) if prev_spot else 0.0
 
@@ -2698,8 +2717,8 @@ def _compute_oi_metrics(rows: list, prev_rows: Optional[list], spot: float, prev
     rr = round(reward / risk, 2) if risk > 0 else 0.0
 
     ai_summary_parts = []
-    ai_summary_parts.append(f"CE OI {'increased' if ce_oi_delta_pct > 0 else 'reduced'} by {abs(ce_oi_delta_pct):.1f}%.")
-    ai_summary_parts.append(f"PE OI {'increased' if pe_oi_delta_pct > 0 else 'reduced'} by {abs(pe_oi_delta_pct):.1f}%.")
+    ai_summary_parts.append(f"CE OI {'increased' if ce_oi_delta_pct > 0 else 'reduced'} by {abs(ce_oi_delta_pct):.1f}% ({oi_change_basis}).")
+    ai_summary_parts.append(f"PE OI {'increased' if pe_oi_delta_pct > 0 else 'reduced'} by {abs(pe_oi_delta_pct):.1f}% ({oi_change_basis}).")
     if fresh_put_writing:
         ai_summary_parts.append("Fresh Put Writing observed.")
     if fresh_call_writing:
@@ -2739,6 +2758,7 @@ def _compute_oi_metrics(rows: list, prev_rows: Optional[list], spot: float, prev
         "15m PE OI Δ": total_pe_chg,
         "CE OI %": ce_oi_delta_pct,
         "PE OI %": pe_oi_delta_pct,
+        "OI Change Basis": oi_change_basis,
         "Net OI": net_oi_chg,
         "PCR": pcr,
         "OI Ratio": oi_ratio,
@@ -2801,6 +2821,7 @@ def _sentinel_oi_row(reason: str) -> dict:
     """
     return {
         "15m CE OI Δ": reason, "15m PE OI Δ": reason, "CE OI %": reason, "PE OI %": reason,
+        "OI Change Basis": reason,
         "Net OI": reason, "PCR": reason, "OI Ratio": reason, "Max Pain": reason,
         "Max CE Writing": reason, "Max PE Writing": reason,
         "OI Bias": reason, "OI Build Up": reason,
