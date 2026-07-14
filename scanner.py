@@ -2307,84 +2307,215 @@ def _oi_cache_key(symbol: str) -> str:
     return f"{symbol}|{epoch}"
 
 
-def _fetch_fyers_option_chain(fyers, symbol: str, spot: float) -> Optional[list]:
-    """Fetches option chain via Fyers API. Logic unchanged."""
+# ── OI Data Engine — sentinel statuses (Req #11: never silently zero-fill) ──
+OI_SENTINEL_NO_CHAIN = "No Option Chain"
+OI_SENTINEL_NO_EXPIRY = "Expiry Not Found"
+OI_SENTINEL_EMPTY_API = "API Returned Empty Data"
+OI_SENTINEL_NOT_AVAILABLE = "OI Not Available"
+_OI_SENTINEL_VALUES = {OI_SENTINEL_NO_CHAIN, OI_SENTINEL_NO_EXPIRY, OI_SENTINEL_EMPTY_API, OI_SENTINEL_NOT_AVAILABLE}
+
+# ── OI Data Engine — debug log ring buffer (Req #10/#14) ────────────────────
+_OI_DEBUG_LOG: List[dict] = []
+_OI_DEBUG_LOG_MAX = 300
+
+
+def _oi_debug_record(**fields) -> None:
+    """
+    Append one structured diagnostic record (Symbol, Expiry, Spot Price,
+    ATM Strike, API Response Status, Number of Strikes Received, API
+    Source, Reason, and — when available — Sample CE/PE OI & change) to
+    the in-memory debug ring buffer AND to scanner.log. Never raises, so a
+    logging failure can never break the scan itself.
+    """
     try:
-        ticker = symbol.replace("NSE:", "").replace("-EQ", "")
-        resp = fyers.optionchain({
-            "symbol": f"NSE:{ticker}",
-            "strikecount": 5,
-            "timestamp": ""
-        })
-        if not isinstance(resp, dict) or resp.get("s") != "ok":
-            return None
-        data = resp.get("data", {}).get("optionsChain", [])
-        if not data:
-            return None
-        rows = []
-        for item in data:
-            try:
-                rows.append({
-                    "strike": float(item.get("strikePrice", 0)),
-                    "ce_oi": int(item.get("CE", {}).get("openInterest", 0)),
-                    "ce_oi_chg": int(item.get("CE", {}).get("changeinOpenInterest", 0)),
-                    "pe_oi": int(item.get("PE", {}).get("openInterest", 0)),
-                    "pe_oi_chg": int(item.get("PE", {}).get("changeinOpenInterest", 0)),
-                    "ce_vol": int(item.get("CE", {}).get("totalTradedVolume", 0)),
-                    "pe_vol": int(item.get("PE", {}).get("totalTradedVolume", 0)),
-                    "ce_ltp": float(item.get("CE", {}).get("lastPrice", 0)),
-                    "pe_ltp": float(item.get("PE", {}).get("lastPrice", 0)),
-                    "ce_iv": float(item.get("CE", {}).get("impliedVolatility", 0)),
-                    "pe_iv": float(item.get("PE", {}).get("impliedVolatility", 0)),
-                })
-            except (TypeError, ValueError, KeyError):
-                continue
-        return rows if rows else None
+        fields["_ts"] = _now_ist().strftime("%H:%M:%S")
+        _OI_DEBUG_LOG.append(fields)
+        if len(_OI_DEBUG_LOG) > _OI_DEBUG_LOG_MAX:
+            del _OI_DEBUG_LOG[: len(_OI_DEBUG_LOG) - _OI_DEBUG_LOG_MAX]
+        logger.info(
+            "OI DEBUG | Symbol=%s Expiry=%s Spot=%s ATM=%s Status=%s Strikes=%s Source=%s Reason=%s "
+            "SampleCE_OI=%s SamplePE_OI=%s SampleCE_Chg=%s SamplePE_Chg=%s",
+            fields.get("Symbol"), fields.get("Expiry"), fields.get("Spot Price"),
+            fields.get("ATM Strike"), fields.get("API Response Status"),
+            fields.get("Number of Strikes Received"), fields.get("API Source"),
+            fields.get("Reason"), fields.get("Sample CE OI"), fields.get("Sample PE OI"),
+            fields.get("Sample CE Change"), fields.get("Sample PE Change"),
+        )
     except Exception:
+        pass
+
+
+def _fyers_fetch_expiry_list(fyers, symbol: str) -> List[Tuple[str, int]]:
+    """
+    Req #2: Calls Fyers optionchain ONCE with strikecount=1/timestamp=""
+    to retrieve the underlying's full expiry list. Returns
+    [(date_str, epoch_seconds), ...] sorted ascending, or [] on any
+    failure (never raises — callers treat [] as 'expiry not found').
+    """
+    try:
+        resp = fyers.optionchain({"symbol": symbol, "strikecount": 1, "timestamp": ""})
+    except Exception as e:
+        logger.warning("Fyers expiry fetch failed for %s: %s", symbol, e)
+        return []
+    if not isinstance(resp, dict) or resp.get("s") != "ok":
+        return []
+    expiry_data = resp.get("data", {}).get("expiryData", []) or []
+    out = []
+    for item in expiry_data:
+        try:
+            epoch = int(item.get("expiry") or item.get("date_epoch") or 0)
+            date_str = str(item.get("date") or item.get("expiry_date") or "")
+            if epoch > 0:
+                out.append((date_str, epoch))
+        except (TypeError, ValueError):
+            continue
+    out.sort(key=lambda t: t[1])
+    return out
+
+
+def _pick_nearest_expiry(expiry_list: List[Tuple[str, int]]) -> Optional[Tuple[str, int]]:
+    """Req #2: pick the nearest NON-expired expiry (epoch >= start of today IST)."""
+    if not expiry_list:
         return None
+    today_start = int(_now_ist().replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
+    upcoming = [e for e in expiry_list if e[1] >= today_start]
+    return upcoming[0] if upcoming else expiry_list[-1]
 
 
-def _fetch_nse_option_chain(symbol: str, spot: float) -> Optional[list]:
-    """Backup: fetches option chain from NSE public API. Logic unchanged."""
+def _fyers_fetch_chain_for_expiry(fyers, symbol: str, expiry_epoch: int, strikecount: int = 10) -> Tuple[list, Optional[float], str]:
+    """
+    Req #3/#4: Fetch the FULL option chain for one expiry from Fyers.
+
+    FIX: Fyers' real optionchain response is a FLAT list under
+    data.optionsChain — each row has option_type ('CE'/'PE'/'' for the
+    spot row), strike_price, oi, oich (OI change), volume, ltp, iv. There
+    is NO nested 'CE'/'PE' sub-dict on each row. The previous parser
+    assumed a nested schema (item['CE']['openInterest']) that never
+    matches Fyers' actual payload, so ce_oi/pe_oi/oi-change were always
+    read as 0 regardless of what the API returned. This pivots the flat
+    rows into one dict per strike with real CE/PE OI + OI-change values.
+
+    Returns (rows, spot_price_from_api, status) where status is
+    'ok' | 'empty' | 'error'.
+    """
+    try:
+        resp = fyers.optionchain({
+            "symbol": symbol,
+            "strikecount": strikecount,
+            "timestamp": str(expiry_epoch),
+        })
+    except Exception as e:
+        logger.warning("Fyers chain fetch error for %s: %s", symbol, e)
+        return [], None, "error"
+
+    if not isinstance(resp, dict) or resp.get("s") != "ok":
+        return [], None, "error"
+
+    chain = resp.get("data", {}).get("optionsChain", []) or []
+    if not chain:
+        return [], None, "empty"
+
+    spot_price = None
+    by_strike: Dict[float, dict] = {}
+    for item in chain:
+        try:
+            opt_type = str(item.get("option_type", "")).upper()
+            strike = float(item.get("strike_price", 0) or 0)
+            if opt_type == "" and strike == 0:
+                spot_price = float(item.get("ltp", 0) or 0) or spot_price
+                continue
+            if opt_type not in ("CE", "PE"):
+                continue
+            row = by_strike.setdefault(strike, {
+                "strike": strike, "ce_oi": 0, "ce_oi_chg": 0, "pe_oi": 0, "pe_oi_chg": 0,
+                "ce_vol": 0, "pe_vol": 0, "ce_ltp": 0.0, "pe_ltp": 0.0, "ce_iv": 0.0, "pe_iv": 0.0,
+            })
+            oi = int(item.get("oi", 0) or 0)
+            oich = int(item.get("oich", 0) or 0)
+            vol = int(item.get("volume", 0) or 0)
+            ltp = float(item.get("ltp", 0) or 0)
+            iv = float(item.get("iv", 0) or 0)
+            if opt_type == "CE":
+                row["ce_oi"] = oi; row["ce_oi_chg"] = oich; row["ce_vol"] = vol; row["ce_ltp"] = ltp; row["ce_iv"] = iv
+            else:
+                row["pe_oi"] = oi; row["pe_oi_chg"] = oich; row["pe_vol"] = vol; row["pe_ltp"] = ltp; row["pe_iv"] = iv
+        except (TypeError, ValueError, KeyError):
+            continue
+
+    rows = list(by_strike.values())
+    if not rows:
+        return [], spot_price, "empty"
+    return rows, spot_price, "ok"
+
+
+def _nse_fetch_chain_for_expiry(symbol: str, expiry_date_str: Optional[str] = None) -> Tuple[list, Optional[float], Optional[str], str]:
+    """
+    Req #6: Backup path — NSE public option-chain-equities API.
+
+    FIX: NSE's equity option-chain payload mixes rows from EVERY expiry
+    into a single 'records.data' array (each row carries its own
+    'expiryDate'). The previous implementation summed OI across ALL of
+    them regardless of expiry, silently blending multiple expiries'
+    open interest into one meaningless total. This now filters strictly
+    to a single resolved expiry before returning any row.
+
+    Returns (rows, spot_price, resolved_expiry_str, status) where status
+    is 'ok' | 'empty' | 'error'.
+    """
     try:
         ticker = symbol.replace("NSE:", "").replace("-EQ", "")
         session = requests.Session()
         session.get("https://www.nseindia.com", headers=_NSE_HEADERS, timeout=8)
-        resp = session.get(
-            _NSE_OC_URL.format(ticker),
-            headers=_NSE_HEADERS,
-            timeout=10,
-        )
+        resp = session.get(_NSE_OC_URL.format(ticker), headers=_NSE_HEADERS, timeout=10)
         if resp.status_code != 200:
-            return None
+            return [], None, None, "error"
         payload = resp.json()
-        records = payload.get("records", {}).get("data", [])
-        if not records:
-            return None
-        rows = []
-        for item in records:
-            try:
-                strike = float(item.get("strikePrice", 0))
-                ce = item.get("CE", {}) or {}
-                pe = item.get("PE", {}) or {}
-                rows.append({
-                    "strike": strike,
-                    "ce_oi": int(ce.get("openInterest", 0)),
-                    "ce_oi_chg": int(ce.get("changeinOpenInterest", 0)),
-                    "pe_oi": int(pe.get("openInterest", 0)),
-                    "pe_oi_chg": int(pe.get("changeinOpenInterest", 0)),
-                    "ce_vol": int(ce.get("totalTradedVolume", 0)),
-                    "pe_vol": int(pe.get("totalTradedVolume", 0)),
-                    "ce_ltp": float(ce.get("lastPrice", 0)),
-                    "pe_ltp": float(pe.get("lastPrice", 0)),
-                    "ce_iv": float(ce.get("impliedVolatility", 0)),
-                    "pe_iv": float(pe.get("impliedVolatility", 0)),
-                })
-            except (TypeError, ValueError, KeyError):
-                continue
-        return rows if rows else None
-    except Exception:
-        return None
+    except Exception as e:
+        logger.warning("NSE chain fetch error for %s: %s", symbol, e)
+        return [], None, None, "error"
+
+    records = payload.get("records", {}) or {}
+    data = records.get("data", []) or []
+    spot_price = records.get("underlyingValue")
+    try:
+        spot_price = float(spot_price) if spot_price is not None else None
+    except (TypeError, ValueError):
+        spot_price = None
+    expiry_dates = records.get("expiryDates", []) or []
+    if not data:
+        return [], spot_price, None, "empty"
+
+    resolved_expiry = expiry_date_str if expiry_date_str in expiry_dates else (expiry_dates[0] if expiry_dates else None)
+    if resolved_expiry is None:
+        return [], spot_price, None, "empty"
+
+    rows = []
+    for item in data:
+        if item.get("expiryDate") != resolved_expiry:
+            continue
+        try:
+            strike = float(item.get("strikePrice", 0))
+            ce = item.get("CE", {}) or {}
+            pe = item.get("PE", {}) or {}
+            rows.append({
+                "strike": strike,
+                "ce_oi": int(ce.get("openInterest", 0)),
+                "ce_oi_chg": int(ce.get("changeinOpenInterest", 0)),
+                "pe_oi": int(pe.get("openInterest", 0)),
+                "pe_oi_chg": int(pe.get("changeinOpenInterest", 0)),
+                "ce_vol": int(ce.get("totalTradedVolume", 0)),
+                "pe_vol": int(pe.get("totalTradedVolume", 0)),
+                "ce_ltp": float(ce.get("lastPrice", 0)),
+                "pe_ltp": float(pe.get("lastPrice", 0)),
+                "ce_iv": float(ce.get("impliedVolatility", 0)),
+                "pe_iv": float(pe.get("impliedVolatility", 0)),
+            })
+        except (TypeError, ValueError, KeyError):
+            continue
+
+    if not rows:
+        return [], spot_price, resolved_expiry, "empty"
+    return rows, spot_price, resolved_expiry, "ok"
 
 
 def _select_strikes(rows: list, spot: float, n_itm: int = 2, n_otm: int = 2) -> list:
@@ -2407,7 +2538,10 @@ def _compute_oi_metrics(rows: list, prev_rows: Optional[list], spot: float, prev
     NOTE: OI/PCR/Max Pain/Probability math is UNCHANGED from the original.
     """
     if not rows:
-        return _empty_oi_row()
+        # Defensive fallback only — _fetch_fo_oi_signal now guards against
+        # ever calling this with empty rows, but if it somehow happens,
+        # never fabricate zeros: use the explicit sentinel instead (Req #11).
+        return _sentinel_oi_row(OI_SENTINEL_NOT_AVAILABLE)
 
     total_ce_oi = sum(r["ce_oi"] for r in rows)
     total_pe_oi = sum(r["pe_oi"] for r in rows)
@@ -2497,6 +2631,16 @@ def _compute_oi_metrics(rows: list, prev_rows: Optional[list], spot: float, prev
 
     fresh_call_writing = ce_oi_up and price_dn
     fresh_put_writing = pe_oi_up and price_up
+
+    # Req #9: explicit Yes/No columns for each named OI pattern, derived
+    # from the exact same price/OI-delta conditions already computed above
+    # (price_up/price_dn/ce_oi_up/ce_oi_dn/pe_oi_up/pe_oi_dn) — no new math.
+    call_writing = "Yes" if fresh_call_writing else "No"
+    put_writing = "Yes" if fresh_put_writing else "No"
+    long_build_up = "Yes" if (price_up and ce_oi_up and pe_oi_up) else "No"
+    short_build_up = "Yes" if (price_dn and ce_oi_up and pe_oi_up) else "No"
+    long_unwinding = "Yes" if (price_dn and pe_oi_dn and ce_oi_dn) else "No"
+    short_covering = "Yes" if (price_up and ce_oi_dn and pe_oi_dn) else "No"
 
     if pcr > 1.5:
         big_player = "🏦 Big Players Long"
@@ -2625,6 +2769,12 @@ def _compute_oi_metrics(rows: list, prev_rows: Optional[list], spot: float, prev
         "Expected StopLoss": exp_sl,
         "Risk Reward": rr,
         "AI Summary": ai_summary,
+        "Call Writing": call_writing,
+        "Put Writing": put_writing,
+        "Long Build Up": long_build_up,
+        "Short Build Up": short_build_up,
+        "Long Unwinding": long_unwinding,
+        "Short Covering": short_covering,
         "_ce_oi_total": total_ce_oi,
         "_pe_oi_total": total_pe_oi,
         "_atm_iv": atm_iv,
@@ -2632,35 +2782,61 @@ def _compute_oi_metrics(rows: list, prev_rows: Optional[list], spot: float, prev
 
 
 def _empty_oi_row() -> dict:
-    """Returns a zero-filled OI row when option-chain data is unavailable. Logic unchanged."""
+    """
+    DEPRECATED — kept only so nothing that references it at import time
+    breaks. No longer called anywhere in the OI pipeline: every genuine
+    failure now routes through `_sentinel_oi_row()` below, which reports
+    the specific reason instead of a misleading zero (Req #11).
+    """
+    return _sentinel_oi_row(OI_SENTINEL_NOT_AVAILABLE)
+
+
+def _sentinel_oi_row(reason: str) -> dict:
+    """
+    Req #11: returned whenever option-chain data is genuinely unavailable.
+    Every OI-derived field is set to the exact sentinel string (`reason`)
+    instead of 0/"—", so the report and Excel export show precisely why
+    data is missing: 'No Option Chain', 'Expiry Not Found',
+    'API Returned Empty Data', or 'OI Not Available'.
+    """
     return {
-        "15m CE OI Δ": 0, "15m PE OI Δ": 0, "CE OI %": 0.0, "PE OI %": 0.0,
-        "Net OI": 0, "PCR": 0.0, "OI Ratio": 0.0, "Max Pain": 0,
-        "Max CE Writing": 0, "Max PE Writing": 0,
-        "OI Bias": "⚪ No Data", "OI Build Up": "No Data",
-        "OI Momentum": "⚪ No Data", "OI Acceleration %": 0.0,
-        "Vol Acceleration %": 0.0, "Price Change %": 0.0, "ATR %": 0.0,
-        "Expected Move": "—", "Expected Points": 0.0, "Expected Range": "—",
-        "Probability": "—", "Confidence": "—", "Bullish %": 0.0, "Bearish %": 0.0,
-        "Institutional Activity": "⚪ No OI Data",
-        "Smart Money Bias": "—", "Big Player Position": "—",
-        "Prediction Text": "⚪ OI data unavailable",
-        "Next Candle Prediction": "—", "Trade Direction": "—",
-        "Expected Target": 0.0, "Expected StopLoss": 0.0, "Risk Reward": 0.0,
-        "AI Summary": "OI data unavailable for this symbol.",
-        "_ce_oi_total": 0, "_pe_oi_total": 0, "_atm_iv": 0.0,
+        "15m CE OI Δ": reason, "15m PE OI Δ": reason, "CE OI %": reason, "PE OI %": reason,
+        "Net OI": reason, "PCR": reason, "OI Ratio": reason, "Max Pain": reason,
+        "Max CE Writing": reason, "Max PE Writing": reason,
+        "OI Bias": reason, "OI Build Up": reason,
+        "OI Momentum": reason, "OI Acceleration %": reason,
+        "Vol Acceleration %": reason, "Price Change %": reason, "ATR %": reason,
+        "Expected Move": reason, "Expected Points": reason, "Expected Range": reason,
+        "Probability": reason, "Confidence": reason, "Bullish %": reason, "Bearish %": reason,
+        "Institutional Activity": reason,
+        "Smart Money Bias": reason, "Big Player Position": reason,
+        "Prediction Text": reason,
+        "Next Candle Prediction": reason, "Trade Direction": reason,
+        "Expected Target": reason, "Expected StopLoss": reason, "Risk Reward": reason,
+        "AI Summary": f"{reason} — signal generation skipped (requires valid OI data).",
+        "Call Writing": reason, "Put Writing": reason, "Long Build Up": reason,
+        "Short Build Up": reason, "Long Unwinding": reason, "Short Covering": reason,
+        "_ce_oi_total": reason, "_pe_oi_total": reason, "_atm_iv": reason,
     }
 
 
-def _fetch_fo_oi_signal(fyers, symbol: str) -> Tuple[Optional[dict], Optional[str]]:
+def _fetch_fo_oi_signal(fyers, symbol: str, fo_universe: Optional[set] = None) -> Tuple[Optional[dict], Optional[str]]:
     """
-    Full pipeline for one F&O symbol. Logic unchanged from original:
-    1. Fetch 15-min candles (reuse _safe_history)
-    2. Fetch option chain (Fyers → NSE fallback)
-    3. Compute OI metrics
-    4. Return merged result dict — this dict is what feeds the report
-       pipeline (see _build_fo_oi_report_df below); its keys are never
-       renamed here.
+    Full OI pipeline for one F&O symbol — rewritten fetch/validate/compute
+    layer (Req #1–#12). 15-min candle fetch and every technical indicator
+    (RSI/ATR/EMA/VWAP/ADX/SMC/Support/Resistance) are UNCHANGED.
+
+    Steps:
+      1. Verify derivatives are actually available for this symbol.
+      2. Detect the nearest valid (non-expired) expiry automatically.
+      3. Fetch the complete option chain for that expiry from Fyers.
+      4. Retry automatically if Fyers returns empty data.
+      5. Fall back to NSE (expiry-aware) if Fyers still fails.
+      6. Validate every row before any calculation.
+      7. Only compute OI/AI metrics once valid data is confirmed.
+      8. Never zero-fill — genuine failures return one of the 4 sentinel
+         reasons and are still returned as a normal (non-error) result so
+         they show up in the report instead of disappearing.
     """
     if not isinstance(symbol, str) or not _VALID_EQ_SYMBOL_RE.match(symbol):
         return None, f"{symbol}: invalid format"
@@ -2669,6 +2845,18 @@ def _fetch_fo_oi_signal(fyers, symbol: str) -> Tuple[Optional[dict], Optional[st
     if cache_key in _OI_CACHE:
         return _OI_CACHE[cache_key], None
 
+    stock_ticker = symbol.replace("NSE:", "").replace("-EQ", "")
+
+    # ── Req #1: verify derivatives are available for this symbol ────────
+    if fo_universe is not None and symbol not in fo_universe:
+        _oi_debug_record(
+            Symbol=stock_ticker, Expiry="—", **{"Spot Price": "—"}, **{"ATM Strike": "—"},
+            **{"API Response Status": "skipped"}, **{"Number of Strikes Received": 0},
+            **{"API Source": "—"}, Reason="Symbol has no listed derivatives (not in F&O universe)",
+        )
+        return None, f"{symbol}: {OI_SENTINEL_NO_CHAIN} — no listed derivatives"
+
+    # ── Unchanged: fetch 15-min candles for spot/technical indicators ───
     date_from = (datetime.today() - timedelta(days=5)).strftime("%Y-%m-%d")
     date_to = datetime.today().strftime("%Y-%m-%d")
     resp, err = _safe_history(fyers, {
@@ -2697,77 +2885,159 @@ def _fetch_fo_oi_signal(fyers, symbol: str) -> Tuple[Optional[dict], Optional[st
 
         spot = float(df["Close"].iloc[-1])
         prev_spot = float(df["Close"].iloc[-2])
-
-        oc_rows = _fetch_fyers_option_chain(fyers, symbol, spot)
-        source = "Fyers"
-        if not oc_rows:
-            oc_rows = _fetch_nse_option_chain(symbol, spot)
-            source = "NSE"
-
-        selected = _select_strikes(oc_rows, spot) if oc_rows else []
-
-        prev_cache_key = f"{symbol}|{_current_15m_epoch() - 900}"
-        prev_rows = _OI_CACHE.get(prev_cache_key, {}).get("_oc_rows")
-
-        metrics = _compute_oi_metrics(selected, prev_rows, spot, prev_spot, df)
-
-        stock_ticker = symbol.replace("NSE:", "").replace("-EQ", "")
         rsi_val = round(float(calculate_rsi(df["Close"]).iloc[-1]), 1)
         atr_val = round(float(calculate_atr(df).iloc[-1]), 2)
         ema20 = round(float(df["Close"].ewm(span=20).mean().iloc[-1]), 2)
         ema50 = round(float(df["Close"].ewm(span=50).mean().iloc[-1]), 2) if len(df) >= 50 else ema20
         vwap_val = calculate_vwap_approx(df)
         adx_val, _, _ = calculate_adx(df) if len(df) >= 15 else (0.0, 0.0, 0.0)
-
         smc_structure, cisd_signal, _ = _calculate_smc_and_cisd(df)
         signal_date, signal_time = _candle_signal_timestamp(df, is_daily=False)
-
-        # Support/Resistance (20-period rolling), needed for the report
-        # columns requested — purely descriptive, does not affect OI/AI math.
         resistance = df["High"].rolling(20).max().shift(1).iloc[-1]
         support = df["Low"].rolling(20).min().shift(1).iloc[-1]
+    except Exception as e:
+        return None, f"{symbol}: candle processing error ({type(e).__name__})"
 
+    base_fields = {
+        "Signal Date": signal_date, "Signal Time": signal_time, "Stock": stock_ticker, "Spot": spot,
+        "RSI (15m)": rsi_val, "ATR (15m)": atr_val, "EMA20 (15m)": ema20, "EMA50 (15m)": ema50,
+        "VWAP (15m)": vwap_val, "ADX (15m)": adx_val, "SMC Structure": smc_structure, "CISD": cisd_signal,
+        "Support": round(float(support), 2) if pd.notna(support) else None,
+        "Resistance": round(float(resistance), 2) if pd.notna(resistance) else None,
+    }
+
+    # ── Req #2: detect nearest valid expiry automatically (Fyers first) ──
+    expiry_list: List[Tuple[str, int]] = []
+    for attempt in range(2):  # Req #5: retry automatically
+        expiry_list = _fyers_fetch_expiry_list(fyers, symbol)
+        if expiry_list:
+            break
+        time.sleep(0.5)
+
+    nearest_expiry = _pick_nearest_expiry(expiry_list)
+    expiry_date_str, expiry_epoch = (nearest_expiry if nearest_expiry else (None, None))
+
+    rows: list = []
+    api_source = "—"
+    api_status = "error"
+
+    # ── Req #3/#4/#5: fetch full chain from Fyers, retrying on empty ────
+    if expiry_epoch is not None:
+        for attempt in range(2):
+            rows, _fyers_spot, api_status = _fyers_fetch_chain_for_expiry(fyers, symbol, expiry_epoch, strikecount=10)
+            api_source = "Fyers"
+            if rows:
+                break
+            time.sleep(0.5)
+
+    # ── Req #6: NSE fallback (expiry-aware) if Fyers still has nothing ──
+    if not rows:
+        rows, _nse_spot, resolved_nse_expiry, nse_status = _nse_fetch_chain_for_expiry(symbol, expiry_date_str)
+        api_source = "NSE"
+        api_status = nse_status
+        if resolved_nse_expiry:
+            expiry_date_str = resolved_nse_expiry
+
+    strikes_received = len(rows)
+
+    # ── Determine the precise failure reason (Req #11 — never silent zero) ──
+    reason = None
+    if expiry_epoch is None and not expiry_date_str:
+        reason = OI_SENTINEL_NO_EXPIRY
+    elif not rows and api_status == "empty":
+        reason = OI_SENTINEL_EMPTY_API
+    elif not rows:
+        reason = OI_SENTINEL_NO_CHAIN
+
+    # ── Req #7: validate every row before any calculation ───────────────
+    if rows:
+        valid_rows = []
+        for r in rows:
+            try:
+                if r.get("strike", 0) <= 0:
+                    continue
+                int(r.get("ce_oi", 0)); int(r.get("pe_oi", 0))
+                valid_rows.append(r)
+            except (TypeError, ValueError):
+                continue
+        rows = valid_rows
+        if not rows:
+            reason = OI_SENTINEL_NOT_AVAILABLE
+
+    atm_for_log = _nearest_atm(spot, [r["strike"] for r in rows]) if rows else "—"
+    _oi_debug_record(
+        Symbol=stock_ticker, Expiry=expiry_date_str or "—", **{"Spot Price": spot},
+        **{"ATM Strike": atm_for_log}, **{"API Response Status": api_status},
+        **{"Number of Strikes Received": strikes_received}, **{"API Source": api_source},
+        Reason=reason or "OK",
+    )
+
+    if reason:
+        # Req #8/#11/#12: genuine failure — return the sentinel row rather
+        # than fabricating zeros, and skip AI/OI signal computation entirely.
         result = {
-            "Signal Date": signal_date,
-            "Signal Time": signal_time,
-            "Stock": stock_ticker,
-            "Spot": spot,
-            "ATM Strike": _nearest_atm(spot, [r["strike"] for r in selected]) if selected else round(spot / 50) * 50,
-            "OI Source": source if selected else "No Data",
-            "RSI (15m)": rsi_val,
-            "ATR (15m)": atr_val,
-            "EMA20 (15m)": ema20,
-            "EMA50 (15m)": ema50,
-            "VWAP (15m)": vwap_val,
-            "ADX (15m)": adx_val,
-            "SMC Structure": smc_structure,
-            "CISD": cisd_signal,
-            "Support": round(float(support), 2) if pd.notna(support) else None,
-            "Resistance": round(float(resistance), 2) if pd.notna(resistance) else None,
-            **metrics,
-            "_oc_rows": selected,
+            **base_fields, "ATM Strike": "—", "OI Source": api_source,
+            "Expiry": expiry_date_str or "—",
+            **_sentinel_oi_row(reason), "_oc_rows": [],
         }
-
         if len(_OI_CACHE) >= _OI_CACHE_MAX:
-            oldest = sorted(_OI_CACHE.keys())[:100]
-            for k in oldest:
+            for k in sorted(_OI_CACHE.keys())[:100]:
                 _OI_CACHE.pop(k, None)
         _OI_CACHE[cache_key] = result
-        return result, None
+        return result, None  # surfaced in the report as a sentinel row, never dropped
 
-    except Exception as e:
-        return None, f"{symbol}: OI error ({type(e).__name__}: {e})"
+    # ── Req #8: ATM strike selection with automatic nearest-available fallback ──
+    selected = _select_strikes(rows, spot)
+    if not selected:
+        selected = rows  # last-resort: use every validated row rather than dropping the symbol
+
+    prev_cache_key = f"{symbol}|{_current_15m_epoch() - 900}"
+    prev_rows = _OI_CACHE.get(prev_cache_key, {}).get("_oc_rows")
+
+    # ── Req #9/#12: compute OI/AI metrics only now that data is confirmed valid ──
+    metrics = _compute_oi_metrics(selected, prev_rows, spot, prev_spot, df)
+    atm_strike = _nearest_atm(spot, [r["strike"] for r in selected])
+
+    # Req #14: debug-mode sample values for the first strike returned.
+    if selected:
+        sample = selected[0]
+        _oi_debug_record(
+            Symbol=stock_ticker, Expiry=expiry_date_str or "—", **{"Spot Price": spot},
+            **{"ATM Strike": atm_strike}, **{"API Response Status": "ok"},
+            **{"Number of Strikes Received": len(selected)}, **{"API Source": api_source},
+            **{"Sample CE OI": sample.get("ce_oi")}, **{"Sample PE OI": sample.get("pe_oi")},
+            **{"Sample CE Change": sample.get("ce_oi_chg")}, **{"Sample PE Change": sample.get("pe_oi_chg")},
+            Reason="OK",
+        )
+
+    result = {
+        **base_fields,
+        "ATM Strike": atm_strike,
+        "OI Source": api_source,
+        "Expiry": expiry_date_str or "—",
+        **metrics,
+        "_oc_rows": selected,
+    }
+
+    if len(_OI_CACHE) >= _OI_CACHE_MAX:
+        for k in sorted(_OI_CACHE.keys())[:100]:
+            _OI_CACHE.pop(k, None)
+    _OI_CACHE[cache_key] = result
+    return result, None
 
 
 def run_fo_oi_scan(fyers, symbols: List[str]) -> Tuple[List[dict], List[str], "ScanStats"]:
     """
     Threaded F&O OI scan across `symbols` (should be F&O universe).
     Returns (results, errors, stats) — same shape as every other scanner.
-    FIX: every successful `_fetch_fo_oi_signal` call is appended to `results`
-    exactly once — this list is the single source of truth for the report
-    pipeline built in `_build_fo_oi_report_df` (see below).
+    FIX #1: every successful `_fetch_fo_oi_signal` call is appended to
+    `results` exactly once — this list is the single source of truth for
+    the report pipeline built in `_build_fo_oi_report_df` (see below).
+    Req #1: resolves the authoritative derivatives-available universe ONCE
+    per scan and passes it to every worker for the availability check.
     """
     symbols = _validate_symbols(symbols)
+    fo_master = set(load_nse_fo_stock_symbols())
     results: List[dict] = []
     errors: List[str] = []
     stats = ScanStats(total=len(symbols))
@@ -2777,7 +3047,7 @@ def run_fo_oi_scan(fyers, symbols: List[str]) -> Tuple[List[dict], List[str], "S
     for i in range(0, len(symbols), BATCH_SIZE):
         batch = symbols[i:i + BATCH_SIZE]
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            futures = {executor.submit(_fetch_fo_oi_signal, fyers, s): s for s in batch}
+            futures = {executor.submit(_fetch_fo_oi_signal, fyers, s, fo_master): s for s in batch}
             for future in as_completed(futures):
                 try:
                     res, err = future.result()
@@ -2801,10 +3071,15 @@ def run_fo_oi_scan(fyers, symbols: List[str]) -> Tuple[List[dict], List[str], "S
     return results, errors, stats
 
 
+
 def _oi_color_code(val) -> str:
-    """Cell-level colour coding for the F&O OI report's string columns. Logic unchanged."""
+    """Cell-level colour coding for the F&O OI report's string columns."""
     if not isinstance(val, str):
         return ""
+    # Req #11: sentinel "data unavailable" reasons get their own distinct
+    # gray styling so they are never mistaken for a real neutral/zero signal.
+    if val in _OI_SENTINEL_VALUES:
+        return "color: #616161; font-weight: bold; background-color: #eeeeee; font-style: italic;"
     v = val.upper()
     if any(x in v for x in ["VERY BULLISH", "STRONG BULL", "INSTITUTIONAL BUYING", "LONG BUILD UP", "HIGH PROBABILITY BREAKOUT", "🟢🟢"]):
         return "color: #006100; font-weight: bold; background-color: #e8f5e9;"
@@ -2845,24 +3120,44 @@ def _style_oi_df(df: pd.DataFrame):
 # ══════════════════════════════════════════════════════════════════════════
 
 _FO_OI_REPORT_COLUMNS = [
-    "Stock", "LTP", "Signal", "Direction", "OI Bias",
-    "Spot Price", "ATM Strike", "PCR", "Max Pain",
+    "Stock", "LTP", "Signal", "Direction", "OI Bias", "OI Status",
+    "Spot Price", "ATM Strike", "Expiry", "PCR", "Max Pain",
     "CE OI", "PE OI", "CE OI Change", "PE OI Change",
+    "Call Writing", "Put Writing", "Long Build Up", "Short Build Up",
+    "Long Unwinding", "Short Covering",
     "Support", "Resistance",
     "Probability %", "Confidence %",
     "Entry", "Stop Loss", "Target 1", "Target 2", "Risk Reward",
-    "AI Reason", "Timestamp",
+    "AI Reason", "OI Source", "Timestamp",
 ]
 
 
-def _pct_to_float(val, default: float = 0.0) -> float:
+def _pct_to_float(val, default: float = 0.0):
     """Safely turn '73.5%' / 73.5 / None into a float for sorting/filtering/export."""
     if val is None:
         return default
+    if isinstance(val, str) and val in _OI_SENTINEL_VALUES:
+        return np.nan  # Req #11: preserve "unavailable" as NaN, never a fabricated 0
     try:
         return float(str(val).replace("%", "").strip())
     except (ValueError, TypeError):
         return default
+
+
+def _oi_numeric_or_nan(value):
+    """
+    Req #11: convert an OI-engine value to float for the report/Excel/CSV,
+    but if the value is one of the 4 sentinel strings (or otherwise not
+    numeric), return NaN instead of silently fabricating a 0. NaN renders
+    as a blank cell in Excel/CSV/JSON — clearly different from a real 0
+    the API actually reported.
+    """
+    if isinstance(value, str):
+        return np.nan
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return np.nan
 
 
 def _build_fo_oi_report_df(results: List[dict]) -> pd.DataFrame:
@@ -2872,55 +3167,81 @@ def _build_fo_oi_report_df(results: List[dict]) -> pd.DataFrame:
     appended to inside `run_fo_oi_scan`). One row is emitted per successful
     result — nothing is re-derived, re-filtered, or dropped here, so if
     `len(results) == 115`, this dataframe always has 115 rows.
+
+    Req #11: rows where the OI engine returned a sentinel reason (no
+    option chain / no expiry / empty API / OI not available) carry that
+    exact text in Signal / Direction / OI Status / AI Reason, and their
+    numeric OI columns are NaN — never a fabricated 0 — so Excel/CSV/JSON
+    show the real reason instead of masking it as "no activity".
     """
     rows = []
     for r in results:
         if not isinstance(r, dict):
             continue  # defensive: never let one malformed entry break the whole report
 
-        spot = float(r.get("Spot", 0.0) or 0.0)
+        spot_raw = r.get("Spot", 0.0)
+        try:
+            spot = float(spot_raw) if spot_raw is not None else 0.0
+        except (TypeError, ValueError):
+            spot = 0.0
+
+        oi_bias_val = r.get("OI Bias", "—")
+        status = oi_bias_val if isinstance(oi_bias_val, str) and oi_bias_val in _OI_SENTINEL_VALUES else "OK"
+
         trade_dir = r.get("Trade Direction", "—")
-        exp_target = r.get("Expected Target", spot)
-        exp_pts = float(r.get("Expected Points", 0.0) or 0.0)
+        exp_target = _oi_numeric_or_nan(r.get("Expected Target", spot)) if status == "OK" else np.nan
+        exp_pts = _oi_numeric_or_nan(r.get("Expected Points", 0.0)) if status == "OK" else np.nan
 
         # Target 2 = simple display extension (2x expected move) — report-only,
         # does not touch the probability/AI engine, which only ever emits Target 1.
-        if "BUY" in str(trade_dir):
+        if status == "OK" and isinstance(trade_dir, str) and "BUY" in trade_dir and not np.isnan(exp_pts):
             target2 = round(spot + 2 * exp_pts, 2)
-        elif "SELL" in str(trade_dir):
+        elif status == "OK" and isinstance(trade_dir, str) and "SELL" in trade_dir and not np.isnan(exp_pts):
             target2 = round(spot - 2 * exp_pts, 2)
-        else:
+        elif status == "OK":
             target2 = spot
+        else:
+            target2 = np.nan
 
         rows.append({
             "Stock": r.get("Stock", "—"),
             "LTP": round(spot, 2),
-            "Signal": trade_dir,
-            "Direction": r.get("Next Candle Prediction", "—"),
-            "OI Bias": r.get("OI Bias", "—"),
+            "Signal": trade_dir if status == "OK" else status,
+            "Direction": (r.get("Next Candle Prediction", "—") if status == "OK" else status),
+            "OI Bias": oi_bias_val,
+            "OI Status": status,
             "Spot Price": round(spot, 2),
-            "ATM Strike": r.get("ATM Strike", 0),
-            "PCR": r.get("PCR", 0.0),
-            "Max Pain": r.get("Max Pain", 0),
-            "CE OI": r.get("_ce_oi_total", 0),
-            "PE OI": r.get("_pe_oi_total", 0),
-            "CE OI Change": r.get("15m CE OI Δ", 0),
-            "PE OI Change": r.get("15m PE OI Δ", 0),
+            "ATM Strike": r.get("ATM Strike", "—"),
+            "Expiry": r.get("Expiry", "—"),
+            "PCR": _oi_numeric_or_nan(r.get("PCR", 0.0)),
+            "Max Pain": _oi_numeric_or_nan(r.get("Max Pain", 0)),
+            "CE OI": _oi_numeric_or_nan(r.get("_ce_oi_total", 0)),
+            "PE OI": _oi_numeric_or_nan(r.get("_pe_oi_total", 0)),
+            "CE OI Change": _oi_numeric_or_nan(r.get("15m CE OI Δ", 0)),
+            "PE OI Change": _oi_numeric_or_nan(r.get("15m PE OI Δ", 0)),
+            "Call Writing": r.get("Call Writing", status),
+            "Put Writing": r.get("Put Writing", status),
+            "Long Build Up": r.get("Long Build Up", status),
+            "Short Build Up": r.get("Short Build Up", status),
+            "Long Unwinding": r.get("Long Unwinding", status),
+            "Short Covering": r.get("Short Covering", status),
             "Support": r.get("Support"),
             "Resistance": r.get("Resistance"),
             "Probability %": _pct_to_float(r.get("Probability")),
             "Confidence %": _pct_to_float(r.get("Confidence")),
             "Entry": round(spot, 2),
-            "Stop Loss": r.get("Expected StopLoss", 0.0),
+            "Stop Loss": _oi_numeric_or_nan(r.get("Expected StopLoss", 0.0)) if status == "OK" else np.nan,
             "Target 1": exp_target,
             "Target 2": target2,
-            "Risk Reward": r.get("Risk Reward", 0.0),
-            "AI Reason": f"{r.get('Prediction Text', '—')} — {r.get('AI Summary', '')}".strip(" —"),
+            "Risk Reward": _oi_numeric_or_nan(r.get("Risk Reward", 0.0)) if status == "OK" else np.nan,
+            "AI Reason": (f"{r.get('Prediction Text', '—')} — {r.get('AI Summary', '')}".strip(" —") if status == "OK" else status),
+            "OI Source": r.get("OI Source", "—"),
             "Timestamp": f"{r.get('Signal Date', '—')} {r.get('Signal Time', '—')}",
         })
 
     report_df = pd.DataFrame(rows, columns=_FO_OI_REPORT_COLUMNS)
     return report_df
+
 
 
 def _build_fo_oi_excel(df: pd.DataFrame) -> bytes:
@@ -2970,14 +3291,18 @@ def _build_fo_oi_excel(df: pd.DataFrame) -> bytes:
         cell.alignment = center
         cell.border = border
 
-    # ── Data rows with BUY/SELL/WATCH conditional formatting ────────────
+    # ── Data rows with BUY/SELL/WATCH/no-data conditional formatting ────
     buy_fill = PatternFill("solid", fgColor="C6EFCE")
     sell_fill = PatternFill("solid", fgColor="FFC7CE")
     wait_fill = PatternFill("solid", fgColor="FFEB9C")
+    nodata_fill = PatternFill("solid", fgColor="E0E0E0")  # Req #11: sentinel rows are visually distinct
 
     for r_idx, (_, row) in enumerate(df.iterrows(), start=4):
         signal_val = str(row.get("Signal", ""))
-        if "BUY" in signal_val:
+        oi_status_val = str(row.get("OI Status", "OK")) if "OI Status" in df.columns else "OK"
+        if oi_status_val in _OI_SENTINEL_VALUES:
+            row_fill = nodata_fill
+        elif "BUY" in signal_val:
             row_fill = buy_fill
         elif "SELL" in signal_val:
             row_fill = sell_fill
@@ -2988,6 +3313,12 @@ def _build_fo_oi_excel(df: pd.DataFrame) -> bytes:
 
         for c_idx, col_name in enumerate(df.columns, start=1):
             val = row[col_name]
+            # Req #13: export exactly the fetched values — but NaN is not a
+            # valid Excel cell value (openpyxl raises on it), so a missing
+            # numeric value is written as a blank cell rather than crashing
+            # the export or silently becoming a fabricated 0.
+            if isinstance(val, float) and np.isnan(val):
+                val = None
             cell = ws.cell(row=r_idx, column=c_idx, value=val)
             cell.border = border
             cell.alignment = center
@@ -3011,9 +3342,14 @@ def _build_fo_oi_excel(df: pd.DataFrame) -> bytes:
     return buf.getvalue()
 
 
-def _show_fo_oi_debug_panel(total_symbols: int, stats: Optional["ScanStats"], rows_before: int, rows_after: int, rows_displayed: int, rows_exported: int, failed_count: int) -> None:
-    """FIX #10: Debug panel showing every stage of the report pipeline."""
-    with st.expander("🩺 Debug Panel — Report Pipeline", expanded=False):
+def _show_fo_oi_debug_panel(total_symbols: int, stats: Optional["ScanStats"], rows_before: int, rows_after: int, rows_displayed: int, rows_exported: int, failed_count: int, report_df: Optional[pd.DataFrame] = None) -> None:
+    """
+    FIX #10 / Req #10 & #14: Debug panel showing every stage of the report
+    pipeline PLUS the OI data-engine diagnostics (expiry detection, API
+    source/status, strike counts, and sample OI values) for every symbol
+    scanned, so a zero/blank cell can always be traced back to its cause.
+    """
+    with st.expander("🩺 Debug Panel — Report Pipeline & OI Data Engine", expanded=False):
         st.write({
             "Total Symbols": total_symbols,
             "Scanned": stats.scanned if stats else 0,
@@ -3026,6 +3362,22 @@ def _show_fo_oi_debug_panel(total_symbols: int, stats: Optional["ScanStats"], ro
         })
         if stats and stats.successful > 0 and rows_before < stats.successful:
             st.error("⚠️ report_df has fewer rows than successful scan results — pipeline leak detected.")
+
+        if report_df is not None and not report_df.empty and "OI Status" in report_df.columns:
+            status_counts = report_df["OI Status"].value_counts().to_dict()
+            st.markdown("**OI Data Engine — Status Breakdown**")
+            st.write(status_counts)
+
+        if _OI_DEBUG_LOG:
+            st.markdown("**OI Data Engine — Recent Fetch Diagnostics** (Symbol · Expiry · Spot · ATM · Status · Strikes · Source · Reason · Sample CE/PE OI & Change)")
+            debug_df = pd.DataFrame(_OI_DEBUG_LOG[-100:])
+            preferred = ["_ts", "Symbol", "Expiry", "Spot Price", "ATM Strike", "API Response Status",
+                         "Number of Strikes Received", "API Source", "Reason",
+                         "Sample CE OI", "Sample PE OI", "Sample CE Change", "Sample PE Change"]
+            cols = [c for c in preferred if c in debug_df.columns] + [c for c in debug_df.columns if c not in preferred]
+            st.dataframe(debug_df[cols].iloc[::-1], use_container_width=True, height=300, hide_index=True)
+        else:
+            st.caption("No OI fetch diagnostics recorded yet — run a scan to populate this log.")
 
 
 def _show_fo_oi_failed_expander() -> None:
@@ -3232,6 +3584,7 @@ def _show_fo_oi_tab(fyers, fo_symbols: List[str]) -> None:
 
         for _, row in view.head(max_cards).iterrows():
             stock = str(row.get("Stock", "—"))
+            oi_status = str(row.get("OI Status", "OK"))
             signal_val = str(row.get("Signal", "—"))
             is_bull = "BUY" in signal_val
             is_bear = "SELL" in signal_val
@@ -3247,30 +3600,53 @@ def _show_fo_oi_tab(fyers, fo_symbols: List[str]) -> None:
                 f'</h3>'
                 f'<span style="font-size:13px;color:#555">'
                 f'📅 {row.get("Timestamp", "—")} &nbsp;·&nbsp; '
-                f'Spot: ₹{row.get("Spot Price", 0):.2f} &nbsp;·&nbsp; ATM: {row.get("ATM Strike", 0)}'
+                f'Spot: ₹{row.get("Spot Price", 0):.2f} &nbsp;·&nbsp; ATM: {row.get("ATM Strike", "—")} &nbsp;·&nbsp; '
+                f'Expiry: {row.get("Expiry", "—")} &nbsp;·&nbsp; Source: {row.get("OI Source", "—")}'
                 f'</span></div>',
                 unsafe_allow_html=True,
             )
 
+            if oi_status != "OK":
+                # Req #11/#12: no valid OI data — show the exact reason, never
+                # a numeric grid full of fabricated zeros, and skip AI signals.
+                st.warning(f"⚠️ **{oi_status}** — option-chain data unavailable for {stock}; AI/OI signal generation skipped.")
+                st.divider()
+                continue
+
+            def _sf(val, fmt="{:.2f}", default="—"):
+                """NaN-safe formatter for card metrics."""
+                try:
+                    if val is None or (isinstance(val, float) and np.isnan(val)):
+                        return default
+                    return fmt.format(val)
+                except (TypeError, ValueError):
+                    return default
+
             rc1, rc2, rc3, rc4, rc5 = st.columns(5)
             rc1.metric("📍 Direction", row.get("Direction", "—"))
-            rc2.metric("🎯 Probability", f"{row.get('Probability %', 0):.1f}%")
-            rc3.metric("💡 Confidence", f"{row.get('Confidence %', 0):.1f}%")
-            rc4.metric("⚖️ PCR", f"{row.get('PCR', 0):.3f}")
-            rc5.metric("💊 Max Pain", f"₹{row.get('Max Pain', 0):.0f}")
+            rc2.metric("🎯 Probability", f"{_sf(row.get('Probability %'), '{:.1f}')}%")
+            rc3.metric("💡 Confidence", f"{_sf(row.get('Confidence %'), '{:.1f}')}%")
+            rc4.metric("⚖️ PCR", _sf(row.get('PCR'), '{:.3f}'))
+            rc5.metric("💊 Max Pain", f"₹{_sf(row.get('Max Pain'), '{:.0f}')}")
 
             oc1, oc2, oc3, oc4, oc5 = st.columns(5)
-            oc1.metric("📞 CE OI", f"{int(row.get('CE OI', 0)):,}")
-            oc2.metric("📤 PE OI", f"{int(row.get('PE OI', 0)):,}")
-            oc3.metric("📞 CE Δ", f"{int(row.get('CE OI Change', 0)):,}")
-            oc4.metric("📤 PE Δ", f"{int(row.get('PE OI Change', 0)):,}")
-            oc5.metric("⚖️ Risk:Reward", f"1:{row.get('Risk Reward', 0):.2f}")
+            oc1.metric("📞 CE OI", _sf(row.get('CE OI'), '{:,.0f}'))
+            oc2.metric("📤 PE OI", _sf(row.get('PE OI'), '{:,.0f}'))
+            oc3.metric("📞 CE Δ", _sf(row.get('CE OI Change'), '{:,.0f}'))
+            oc4.metric("📤 PE Δ", _sf(row.get('PE OI Change'), '{:,.0f}'))
+            oc5.metric("⚖️ Risk:Reward", f"1:{_sf(row.get('Risk Reward'), '{:.2f}')}")
+
+            wc1, wc2, wc3, wc4 = st.columns(4)
+            wc1.metric("✍️ Call Writing", row.get("Call Writing", "—"))
+            wc2.metric("✍️ Put Writing", row.get("Put Writing", "—"))
+            wc3.metric("📈 Long Build Up", row.get("Long Build Up", "—"))
+            wc4.metric("📉 Short Build Up", row.get("Short Build Up", "—"))
 
             em1, em2, em3, em4 = st.columns(4)
-            em1.metric("🎯 Entry", f"₹{row.get('Entry', 0):.2f}")
-            em2.metric("🛑 Stop Loss", f"₹{row.get('Stop Loss', 0):.2f}")
-            em3.metric("🎯 Target 1", f"₹{row.get('Target 1', 0):.2f}")
-            em4.metric("🎯 Target 2", f"₹{row.get('Target 2', 0):.2f}")
+            em1.metric("🎯 Entry", f"₹{_sf(row.get('Entry'))}")
+            em2.metric("🛑 Stop Loss", f"₹{_sf(row.get('Stop Loss'))}")
+            em3.metric("🎯 Target 1", f"₹{_sf(row.get('Target 1'))}")
+            em4.metric("🎯 Target 2", f"₹{_sf(row.get('Target 2'))}")
 
             st.markdown("**🤖 AI Reason:**")
             ai_reason = str(row.get("AI Reason", "—"))
@@ -3283,7 +3659,7 @@ def _show_fo_oi_tab(fyers, fo_symbols: List[str]) -> None:
 
             st.divider()
 
-    # FIX #10: pipeline debug panel showing every stage.
+    # FIX #10: pipeline debug panel showing every stage + OI engine diagnostics.
     _show_fo_oi_debug_panel(
         total_symbols=st.session_state.get("fo_oi_total_symbols", len(oi_universe)),
         stats=st.session_state.get("fo_oi_stats"),
@@ -3292,6 +3668,7 @@ def _show_fo_oi_tab(fyers, fo_symbols: List[str]) -> None:
         rows_displayed=len(view),
         rows_exported=len(view),
         failed_count=len(st.session_state.get("fo_failed_symbols", [])),
+        report_df=view,
     )
 
     _show_fo_oi_failed_expander()
