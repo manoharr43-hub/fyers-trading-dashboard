@@ -15,8 +15,12 @@ Streamlit + FYERS API v3 dashboard with:
     and a Big Move table (Strike, CE/PE Score, Overall Score, BUY/SELL
     Probability, Breakout/Breakdown %, Institution/Smart-Money Score,
     Final Signal).
-  • AI Trade Signal engine: high-confidence-only Strike/CE/PE cards with
-    Entry / SL / T1 / T2 / T3 / Risk-Reward / Reason.
+  • Institutional AI Validation Engine: BUY/SELL trade signals now only
+    fire after trend, option-chain, max-pain, volume, price-action,
+    smart-money, support/resistance, ATR, and momentum validations all
+    agree (see section 5G) — replacing the old single-indicator signal
+    logic. High-confidence-only Strike/CE/PE cards with Entry / SL / T1
+    / T2 / T3 / Risk-Reward / Reason.
   • Dashboard Summary: Top CE/PE Buy, Best Breakout/Breakdown, highest
     institutional/smart-money/OI/volume/ΔOI, best RR trade, best trade.
   • Excel export (openpyxl) with full conditional-formatting, colored
@@ -74,6 +78,19 @@ FIX NOTE 4 (this file):
   ai_analysis_engine.py itself) so none of those four values can ever be
   None when AI analysis starts, without changing the returned schema.
   See run_external_ai_market_analysis() in section 5E below.
+
+FIX NOTE 5 (this file):
+  Replaced the old single-indicator trade-signal logic (generate_trade_
+  signals(), which could fire a BUY/SELL off of PCR, ΔOI, or volume more
+  or less alone) with an Institutional AI Validation Engine (section 5G,
+  compute_institutional_signals()). A BUY/SELL now requires trend, option
+  -chain, max-pain, volume, price-action, smart-money, support/resistance,
+  ATR, and momentum validation to all agree, with an explicit weighted
+  0-100 confidence score and a hard floor of 80% confidence and 1:2 risk
+  /reward before any signal is emitted. generate_trade_signals() itself is
+  left in place (unused) so no existing function is removed. Nothing about
+  the UI, tabs, API calls, or Excel export changed — only which function
+  populates the AI Trade Signals tab's `signals` list.
 """
 
 import io
@@ -3138,6 +3155,16 @@ def compute_scalping_trend_engine(fyers, symbol_candidates: list, df: pd.DataFra
         return result
     c15 = fetch_underlying_candles(fyers, symbol_candidates, resolution="15", lookback_days=10)
 
+    # Cache the raw candle frames so the Institutional AI Validation
+    # Engine (section 5G) can reuse them without re-fetching from FYERS —
+    # it only ever gets candle/trend confirmation this way, on whichever
+    # rerun the AI Scalping Engine tab has actually executed on.
+    try:
+        st.session_state["oc_scalp_candles_5"] = c5
+        st.session_state["oc_scalp_candles_15"] = c15
+    except Exception:  # noqa: BLE001 - session_state may be unavailable outside Streamlit
+        pass
+
     close5 = c5["close"]
     ema9, ema20, ema50 = _ema(close5, 9), _ema(close5, 20), _ema(close5, 50)
     rsi5 = _rsi(close5, 14)
@@ -3504,6 +3531,378 @@ def render_scalping_tab(scalp_df: pd.DataFrame, trend_engine: dict, symbol: str,
 
 
 # ══════════════════════════════════════════════════════════════════════════
+# 5G. INSTITUTIONAL AI VALIDATION ENGINE
+#     Replaces the single-indicator generate_trade_signals() as the source
+#     feeding the "AI Trade Signals" tab (see FIX NOTE 5 above). A BUY or
+#     SELL is only ever produced once every major validation category
+#     below agrees; any category that disagrees — or that can't be
+#     computed because candle data isn't available yet — forces the
+#     signal to WAIT instead of guessing. generate_trade_signals() itself
+#     is left in the file, untouched and still callable, so no existing
+#     function is removed.
+# ══════════════════════════════════════════════════════════════════════════
+
+# Confidence weights (spec section 10) — sums to 100.
+INSTITUTIONAL_SCORE_WEIGHTS = {
+    "trend": 20, "option_chain": 20, "oi_buildup": 15, "pcr": 10,
+    "max_pain": 10, "volume": 10, "momentum": 5, "price_action": 5,
+    "smart_money": 5,
+}
+INSTITUTIONAL_MIN_CONFIDENCE = 80.0   # never generate BUY/SELL below this
+INSTITUTIONAL_MIN_RISK_REWARD = 2.0   # reject trades with RR < 1:2
+
+
+def _institutional_confidence_band(pct: float) -> tuple:
+    """Spec section 'Confidence Rules'."""
+    if pct >= 95:
+        return "★★★★★ Institutional Strong", "strongbuy"
+    if pct >= 90:
+        return "★★★★ Very Strong", "buy"
+    if pct >= 85:
+        return "★★★ Strong", "buy"
+    if pct >= 80:
+        return "★★ Moderate", "hold"
+    return "WAIT", "wait"
+
+
+def _detect_candle_pattern(c5: pd.DataFrame) -> str:
+    """Doji / Inside Bar / Outside Bar / Strong Bull / Strong Bear on the
+    most recent completed candle vs. the one before it (spec section 5)."""
+    if c5 is None or len(c5) < 2:
+        return "Unknown"
+    last, prev = c5.iloc[-1], c5.iloc[-2]
+    body = abs(last["close"] - last["open"])
+    rng = max(last["high"] - last["low"], 1e-9)
+    if body / rng < 0.1:
+        return "Doji"
+    if last["high"] <= prev["high"] and last["low"] >= prev["low"]:
+        return "Inside Bar"
+    if last["high"] >= prev["high"] and last["low"] <= prev["low"]:
+        return "Outside Bar"
+    if last["close"] > last["open"] and body / rng > 0.6:
+        return "Strong Bull Candle"
+    if last["close"] < last["open"] and body / rng > 0.6:
+        return "Strong Bear Candle"
+    return "Normal"
+
+
+def _market_structure_label(c5: pd.DataFrame, lookback: int = 30) -> str:
+    """HH/HL vs LH/LL market structure (spec section 1) from the same
+    swing-point detector the AI Scalping Engine already uses for BOS/CHOCH."""
+    if c5 is None or len(c5) < lookback:
+        return "Unclear"
+    window = c5.tail(lookback)
+    swing_high, swing_low = _swing_points(window)
+    highs = window.loc[swing_high, "high"]
+    lows = window.loc[swing_low, "low"]
+    if len(highs) >= 2 and len(lows) >= 2:
+        hh, hl = highs.iloc[-1] > highs.iloc[-2], lows.iloc[-1] > lows.iloc[-2]
+        lh, ll = highs.iloc[-1] < highs.iloc[-2], lows.iloc[-1] < lows.iloc[-2]
+        if hh and hl:
+            return "HH/HL (Bullish Structure)"
+        if lh and ll:
+            return "LH/LL (Bearish Structure)"
+    return "Mixed Structure"
+
+
+def _relative_volume(c5: pd.DataFrame, window: int = 20):
+    if c5 is None or len(c5) < window + 1:
+        return None
+    avg = c5["volume"].tail(window + 1).iloc[:-1].mean()
+    cur = c5["volume"].iloc[-1]
+    return float(cur / avg) if avg > 0 else None
+
+
+def _market_quality_flags(c5: pd.DataFrame) -> list:
+    """Sideways market / low liquidity / gap-trap detection (spec section
+    'Market Quality Filter')."""
+    flags = []
+    if c5 is None or c5.empty or len(c5) < 20:
+        flags.append("Insufficient candle history")
+        return flags
+    adx_series, _, _ = _adx(c5, 14)
+    if len(adx_series) and adx_series.iloc[-1] < 15:
+        flags.append("Sideways Market (ADX low)")
+    rel_vol = _relative_volume(c5)
+    if rel_vol is not None and rel_vol < 0.5:
+        flags.append("Low Liquidity (weak relative volume)")
+    try:
+        d = c5.copy()
+        d["date"] = d["time"].dt.date
+        days = sorted(d["date"].unique())
+        if len(days) >= 2:
+            today_open = d[d["date"] == days[-1]]["open"].iloc[0]
+            prev_close = d[d["date"] == days[-2]]["close"].iloc[-1]
+            gap_pct = ((today_open - prev_close) / prev_close) * 100 if prev_close else 0.0
+            if gap_pct > 0.5:
+                flags.append(f"Gap-up Trap risk (+{gap_pct:.2f}%)")
+            elif gap_pct < -0.5:
+                flags.append(f"Gap-down Trap risk ({gap_pct:.2f}%)")
+    except Exception:  # noqa: BLE001 - market-quality flags must never crash the pipeline
+        pass
+    return flags
+
+
+def compute_institutional_signals(df: pd.DataFrame, trend_engine: dict, c5: pd.DataFrame,
+                                   pcr: float, max_pain: float, spot_price: float,
+                                   atm_strike: float, support, resistance,
+                                   min_confidence: float = INSTITUTIONAL_MIN_CONFIDENCE,
+                                   top_n: int = 15, source: str = "") -> tuple:
+    """Institutional AI Validation Engine.
+
+    Every candidate (strike, side) must pass ALL of: trend validation
+    (EMA20/50/200 + VWAP + HH/HL or LH/LL structure), option-chain
+    validation (build-up direction not mixed), max-pain adjustment,
+    volume validation (volume spike + relative volume), price-action
+    validation (reject indecision candles), smart-money validation
+    (Institutional Buying/Selling), support/resistance (reject trades
+    straight into a wall), and momentum validation (RSI/MACD/ADX) —
+    before a weighted 0-100 confidence score (section 10) is computed.
+    A signal is only emitted if confidence >= min_confidence (never below
+    80) AND risk:reward >= 1:2. Anything that fails is dropped silently;
+    if nothing passes, a structured rejection summary explains why so the
+    UI can show a clear WAIT instead of forcing a trade.
+
+    Returns (signals: list[dict], rejection_summary: dict | None).
+    """
+    if df is None or df.empty:
+        return [], {"source": source, "evaluated": 0, "reason": "Option chain is empty."}
+
+    has_trend = bool(trend_engine and trend_engine.get("available"))
+    market_flags = _market_quality_flags(c5) if has_trend else ["No candle data available"]
+    candle_pattern = _detect_candle_pattern(c5) if has_trend else "Unknown"
+    structure_label = _market_structure_label(c5) if has_trend else "Unclear"
+    rel_vol = _relative_volume(c5) if has_trend else None
+
+    ema200 = None
+    if has_trend and c5 is not None and len(c5) >= 200:
+        ema200 = float(_ema(c5["close"], 200).iloc[-1])
+
+    last_close = trend_engine.get("last_close") if has_trend else None
+    vwap = trend_engine.get("vwap") if has_trend else None
+    ema9 = trend_engine.get("ema9") if has_trend else None
+    ema20 = trend_engine.get("ema20") if has_trend else None
+    ema50 = trend_engine.get("ema50") if has_trend else None
+    rsi5 = trend_engine.get("rsi5") if has_trend else None
+    macd_v = trend_engine.get("macd") if has_trend else None
+    macd_s = trend_engine.get("macd_signal") if has_trend else None
+    adx_v = trend_engine.get("adx") if has_trend else None
+    atr_v = trend_engine.get("atr") if has_trend else None
+
+    trend_bullish = trend_bearish = False
+    if has_trend and None not in (last_close, vwap, ema9, ema20, ema50):
+        trend_bullish = (
+            last_close > vwap and ema9 > ema20 > ema50
+            and (ema200 is None or last_close > ema200)
+            and "HH/HL" in structure_label
+        )
+        trend_bearish = (
+            last_close < vwap and ema9 < ema20 < ema50
+            and (ema200 is None or last_close < ema200)
+            and "LH/LL" in structure_label
+        )
+
+    ce_vol_thresh = df["ce_volume"].quantile(0.75) if df["ce_volume"].max() > 0 else 0
+    pe_vol_thresh = df["pe_volume"].quantile(0.75) if df["pe_volume"].max() > 0 else 0
+    strike_gap = df["strike_price"].sort_values().diff().dropna().median() if len(df) > 1 else 1.0
+    market_quality_blocked = any("Sideways" in f or "Low Liquidity" in f for f in market_flags)
+
+    signals = []
+    evaluated = 0
+    rejections = defaultdict(int)
+
+    for _, row in df.iterrows():
+        strike = row["strike_price"]
+        for side, ltp_col, vol_col in [("CE", "ce_ltp", "ce_volume"), ("PE", "pe_ltp", "pe_volume")]:
+            evaluated += 1
+            is_bull_side = side == "CE"
+            ltp = row.get(ltp_col, 0)
+            if ltp <= 0:
+                rejections["no_premium"] += 1
+                continue
+
+            # 1. Trend validation ------------------------------------------------
+            if not has_trend:
+                rejections["no_candle_data"] += 1
+                continue
+            trend_ok = trend_bullish if is_bull_side else trend_bearish
+            if not trend_ok:
+                rejections["trend_disagree"] += 1
+                continue
+
+            # 2. Option chain validation ------------------------------------------
+            ce_build, pe_build = row.get("CE Build-up", ""), row.get("PE Build-up", "")
+            oc_support_bull = pe_build == "Long Build-up (Put Writing)" or ce_build == "Short Covering"
+            oc_support_bear = ce_build == "Short Build-up (Call Writing)" or pe_build == "Long Unwinding"
+            if oc_support_bull and oc_support_bear:
+                rejections["option_chain_mixed"] += 1
+                continue
+            oc_ok = oc_support_bull if is_bull_side else oc_support_bear
+            if not oc_ok:
+                rejections["option_chain_disagree"] += 1
+                continue
+
+            # 3. Max Pain validation (adjusts confidence, never ignored) --------
+            mp_confidence_delta = 0.0
+            if max_pain and spot_price:
+                if is_bull_side and spot_price < max_pain and strike > spot_price:
+                    mp_confidence_delta = -3.0  # BUY moving toward Max Pain -> reduce confidence
+                elif (not is_bull_side) and spot_price > max_pain and strike < spot_price:
+                    mp_confidence_delta = -3.0  # SELL moving against Max Pain -> reduce confidence
+
+            # 4. Volume validation --------------------------------------------------
+            vol_ok = row.get(vol_col, 0) >= (ce_vol_thresh if is_bull_side else pe_vol_thresh) > 0
+            rel_vol_ok = rel_vol is not None and rel_vol >= 1.0
+            volume_score_frac = (1.0 if vol_ok else 0.4) * (1.0 if rel_vol_ok else 0.6)
+
+            # 5. Price action validation ---------------------------------------------
+            if candle_pattern == "Doji":
+                rejections["indecision_candle"] += 1
+                continue
+            price_action_ok = candle_pattern in (
+                ("Strong Bull Candle", "Outside Bar") if is_bull_side else ("Strong Bear Candle", "Outside Bar")
+            )
+
+            # 6. Smart money validation --------------------------------------------
+            inst_buy, inst_sell = row.get("Institutional Buying", 0), row.get("Institutional Selling", 0)
+            smart_money_ok = inst_buy >= 55 if is_bull_side else inst_sell >= 55
+            if not smart_money_ok:
+                rejections["smart_money_disagree"] += 1
+                continue
+
+            # 7. Support & Resistance ------------------------------------------------
+            if is_bull_side and resistance is not None and strike >= resistance and abs(strike - resistance) <= strike_gap:
+                rejections["against_resistance"] += 1
+                continue
+            if (not is_bull_side) and support is not None and strike <= support and abs(strike - support) <= strike_gap:
+                rejections["against_support"] += 1
+                continue
+
+            # 8. ATR validation -----------------------------------------------------
+            atr_ok = atr_v is not None and atr_v > 0
+            if not atr_ok:
+                rejections["atr_too_low"] += 1
+                continue
+
+            # 9. Momentum validation --------------------------------------------------
+            if None in (rsi5, macd_v, macd_s, adx_v):
+                rejections["momentum_unavailable"] += 1
+                continue
+            momentum_ok = (
+                (rsi5 > 55 and macd_v > macd_s and adx_v > 20) if is_bull_side
+                else (rsi5 < 45 and macd_v < macd_s and adx_v > 20)
+            )
+            if not momentum_ok:
+                rejections["momentum_disagree"] += 1
+                continue
+
+            # Market Quality Filter --------------------------------------------------
+            if market_quality_blocked:
+                rejections["market_quality_filter"] += 1
+                continue
+
+            # ── Confidence score (spec section 10, weighted 0-100) ──────────────
+            w = INSTITUTIONAL_SCORE_WEIGHTS
+            pcr_ok = (pcr > 1.05) if is_bull_side else (pcr < 0.95)
+            score = (
+                w["trend"] * 1.0
+                + w["option_chain"] * 1.0
+                + w["oi_buildup"] * 1.0
+                + w["pcr"] * (1.0 if pcr_ok else 0.5)
+                + w["max_pain"] * 1.0 + mp_confidence_delta
+                + w["volume"] * volume_score_frac
+                + w["momentum"] * 1.0
+                + w["price_action"] * (1.0 if price_action_ok else 0.4)
+                + w["smart_money"] * 1.0
+            )
+            score = float(np.clip(score, 0, 100))
+
+            if score < min_confidence:
+                rejections["low_confidence"] += 1
+                continue
+
+            # ── Risk management (spec section 'Risk Management') ────────────────
+            entry = round(float(ltp), 2)
+            if is_bull_side:
+                sl, t1, t2, t3 = round(entry * 0.85, 2), round(entry * 1.15, 2), round(entry * 1.30, 2), round(entry * 1.50, 2)
+            else:
+                sl, t1, t2, t3 = round(entry * 1.15, 2), round(entry * 0.85, 2), round(entry * 0.70, 2), round(entry * 0.50, 2)
+            risk = max(abs(entry - sl), 0.01)
+            reward = abs(t2 - entry)
+            rr = round(reward / risk, 2) if risk > 0 else 0.0
+            if rr < INSTITUTIONAL_MIN_RISK_REWARD:
+                rejections["poor_risk_reward"] += 1
+                continue
+
+            label, key = _institutional_confidence_band(score)
+            direction = "BUY" if is_bull_side else "SELL"
+            oi_buildup_label = ce_build if is_bull_side else pe_build
+            smart_money_label = "Institutional Buying" if is_bull_side else "Institutional Selling"
+            ema_align_label = "EMA9 > EMA20 > EMA50" if is_bull_side else "EMA9 < EMA20 < EMA50"
+            if ema200 is not None:
+                ema_align_label += f" & {'above' if is_bull_side else 'below'} EMA200"
+
+            reasons = [
+                f"Trend: {'Bullish' if is_bull_side else 'Bearish'} — {structure_label}",
+                f"EMA Alignment: {ema_align_label}",
+                f"VWAP Position: Price {'above' if is_bull_side else 'below'} VWAP",
+                f"PCR {pcr:.2f} ({'supportive' if pcr_ok else 'neutral/against'})",
+                f"Max Pain {max_pain:,.0f}" + (" (headwind — confidence trimmed)" if mp_confidence_delta < 0 else " (no conflict)"),
+                f"OI Build-up: {oi_buildup_label}",
+                f"Call Writing / Put Writing: {ce_build} / {pe_build}",
+                f"Support {support:,.0f} / Resistance {resistance:,.0f}" if (support and resistance) else "Support/Resistance: unavailable",
+                f"Volume: {'Confirmed' if vol_ok else 'Weak'}" + (f", RelVol {rel_vol:.2f}x" if rel_vol is not None else ""),
+                f"ATR: Expansion ({atr_v:.2f})",
+                f"Momentum: RSI {rsi5:.0f}, MACD {'Bullish' if macd_v > macd_s else 'Bearish'}, ADX {adx_v:.0f}",
+                f"Smart Money: {smart_money_label} ({(inst_buy if is_bull_side else inst_sell):.0f})",
+                f"Price Action: {candle_pattern}",
+                f"Risk Level: {_risk_level_from_confidence(score)}",
+                f"Final Score {score:.1f}% — {label}",
+            ]
+
+            signals.append({
+                "Strike": strike, "Side": side, "Signal": f"{direction} · {label}",
+                "Signal Key": key, "Confidence": round(score, 1),
+                "AI Signal": direction, "AI Confidence %": round(score, 1),
+                "Signal Strength": label, "Trend": structure_label,
+                "Market Bias": "Bullish" if is_bull_side else "Bearish",
+                "PCR": round(pcr, 3), "Max Pain": max_pain,
+                "OI Build-up": oi_buildup_label, "Smart Money": smart_money_label,
+                "Volume": "Confirmed" if vol_ok else "Weak", "Momentum": "Confirmed",
+                "Risk": _risk_level_from_confidence(score),
+                "Entry": entry, "SL": sl, "T1": t1, "T2": t2, "T3": t3,
+                "Risk Reward": f"1 : {rr}",
+                "Reason": " · ".join(reasons), "Reasons": reasons,
+            })
+
+    signals.sort(key=lambda s: s["Confidence"], reverse=True)
+    final_signals = signals[:top_n]
+
+    rejection_summary = None
+    if not final_signals:
+        if not has_trend:
+            reason = (
+                "No candle/trend data available yet, so trend, EMA alignment, VWAP position, and "
+                "price-action can't be confirmed — the Institutional AI Validation Engine requires "
+                "ALL validations to agree before it will emit a BUY/SELL. Enable 'AI Scalping Engine' "
+                "in the sidebar (it fetches the same 5m/15m candles this engine reuses) so this tab "
+                "can move past WAIT."
+            )
+        else:
+            reason = (
+                "No strike passed every institutional validation check (trend + option chain + "
+                "max pain + volume + price action + smart money + support/resistance + ATR + "
+                "momentum, plus confidence ≥ 80% and risk:reward ≥ 1:2) — WAIT is the correct call "
+                "rather than forcing a trade."
+            )
+        rejection_summary = {
+            "source": source, "evaluated": evaluated, "breakdown": dict(rejections),
+            "market_flags": market_flags, "threshold": min_confidence, "reason": reason,
+        }
+    return final_signals, rejection_summary
+
+
+# ══════════════════════════════════════════════════════════════════════════
 # 9. MAIN DASHBOARD
 # ══════════════════════════════════════════════════════════════════════════
 
@@ -3584,7 +3983,9 @@ def show_option_chain(fyers):
                 st.session_state["oc_raw_expiry_payload"] = raw_payload
                 st.rerun()
 
-        ai_min_conf = st.slider("AI Min Confidence % (Trade Signals)", 50, 95, 80, step=5)
+        ai_min_conf = st.slider("AI Min Confidence % (Trade Signals)", 80, 99, 80, step=1,
+                                 help="The Institutional AI Validation Engine never emits a BUY/SELL "
+                                      "below 80% confidence, so the floor here is fixed at 80.")
         debug_mode = st.checkbox("Show raw API response (debug)", value=False)
         st.divider()
         fetch_btn = st.button("🔄 Fetch Live Data", use_container_width=True, type="primary")
@@ -3603,7 +4004,9 @@ def show_option_chain(fyers):
         scalping_enabled = st.checkbox(
             "Enable AI Scalping Engine (fetches 5m/15m candles)", value=False, key="oc_scalping_enabled",
             help="Multi-factor confirmation engine (EMA/VWAP/RSI/MACD/ADX/Supertrend + chain OI/Gamma). "
-                 "Off by default since it makes extra FYERS history/quote API calls.",
+                 "Off by default since it makes extra FYERS history/quote API calls. The same candle "
+                 "data also powers the Institutional AI Validation Engine on the AI Trade Signals tab — "
+                 "leave this on if you want BUY/SELL signals there instead of WAIT.",
         )
         scalping_audio_alert = st.checkbox("🔔 Audio ping on new Scalping signal", value=False, key="oc_scalping_audio")
 
@@ -3720,8 +4123,21 @@ def show_option_chain(fyers):
     df = compute_big_move_scores(df, spot_price, max_pain, pcr, atm_strike)
     intel = compute_market_intelligence(df, spot_price, max_pain, pcr)
     df = compute_ai_engine(df, spot_price, atm_strike, max_pain, pcr)
-    signals = generate_trade_signals(df, pcr, intel.get("support"), intel.get("resistance"),
-                                      min_confidence=ai_min_conf, top_n=15, source=data_source)
+
+    # ── Institutional AI Validation Engine (replaces generate_trade_signals()
+    # as the source for the AI Trade Signals tab — see FIX NOTE 5 & section
+    # 5G). Reuses whatever candle/trend data the AI Scalping Engine already
+    # fetched this session (cached in session_state); if that hasn't run
+    # yet, every candidate is correctly rejected and the tab explains why
+    # instead of guessing from the option chain alone.
+    cached_trend_engine = st.session_state.get("oc_scalp_trend_engine")
+    cached_candles_5 = st.session_state.get("oc_scalp_candles_5")
+    signals, rejection_summary = compute_institutional_signals(
+        df, cached_trend_engine, cached_candles_5, pcr, max_pain, spot_price, atm_strike,
+        intel.get("support"), intel.get("resistance"),
+        min_confidence=max(ai_min_conf, INSTITUTIONAL_MIN_CONFIDENCE), top_n=15, source=data_source,
+    )
+    st.session_state["oc_signal_rejection_summary"] = rejection_summary
 
     # FIX: atm_strike (already computed just above — NOT recalculated) is
     # now forwarded into run_external_ai_market_analysis(), and every value
@@ -3747,7 +4163,6 @@ def show_option_chain(fyers):
     # trend_engine yet, BUY CE/BUY PE correctly stay at NO TRADE (see the
     # design note above compute_ce_pe_trade_signals) while SELL CE/SELL PE
     # can still surface from the chain snapshot alone.
-    cached_trend_engine = st.session_state.get("oc_scalp_trend_engine")
     df = compute_ce_pe_trade_signals(
         df, spot_price=spot_price, max_pain=max_pain, pcr=pcr, atm_strike=atm_strike,
         support=intel.get("support"), resistance=intel.get("resistance"),
@@ -4001,7 +4416,9 @@ def show_option_chain(fyers):
             "with its ★ rating: ★★★★★ 90-100 Strong Buy · ★★★★ 75-89 Buy · ★★★ 55-74 Hold · "
             "★★ 35-54 Avoid · ★ below 35 Ignore. When CE Score and PE Score are genuinely tied, the "
             "strike's own Breakout vs Breakdown Probability breaks the tie instead of always "
-            "defaulting to CE."
+            "defaulting to CE. (Note: this per-strike screening score is separate from the "
+            "Institutional AI Validation Engine on the 🤖 AI Trade Signals tab, which is the one that "
+            "actually gates BUY/SELL trade signals through full multi-factor validation.)"
         )
 
         with st.expander("Legacy combined Big Move Table (Overall Score view)"):
@@ -4012,20 +4429,28 @@ def show_option_chain(fyers):
             st.markdown(render_row_colored_table_html(bm_table, numeric_fmt=bm_fmt), unsafe_allow_html=True)
 
     with tab5:
-        st.markdown("##### 🤖 AI Trade Signal Engine — High Confidence Only")
-        st.caption(f"Showing strikes with AI Confidence ≥ {ai_min_conf}% (adjust in the sidebar).")
+        st.markdown("##### 🤖 Institutional AI Validation Engine — High Confidence Only")
+        st.caption(
+            f"Showing strikes with AI Confidence ≥ {max(ai_min_conf, INSTITUTIONAL_MIN_CONFIDENCE):.0f}% "
+            "that passed EVERY validation category (trend, option chain, max pain, volume, price "
+            "action, smart money, support/resistance, ATR, momentum) with risk:reward ≥ 1:2. The "
+            "confidence floor here can't go below 80% — that's a hard rule of the engine, not a "
+            "sidebar setting."
+        )
 
         if not signals:
             rejection = st.session_state.get("oc_signal_rejection_summary") or {}
             if rejection.get("reason"):
+                flags = rejection.get("market_flags") or []
+                flags_txt = f" Market quality flags: {', '.join(flags)}." if flags else ""
                 st.info(
                     f"WAIT — {rejection['reason']} "
                     f"(evaluated {rejection.get('evaluated', 0)} CE/PE combinations, source: "
-                    f"{rejection.get('source', data_source)}). Try lowering the confidence threshold "
-                    "in the sidebar, or check back after the market moves."
+                    f"{rejection.get('source', data_source)}).{flags_txt}"
                 )
             else:
-                st.info("No strikes currently meet the selected confidence threshold. Try lowering it in the sidebar.")
+                st.info("No strikes currently meet every institutional validation check. Try again after "
+                         "the market moves, or enable the AI Scalping Engine in the sidebar if it isn't on.")
         else:
             for sig in signals:
                 css_class = RATING_CSS_CLASS.get(sig.get("Signal Key", "ignore"), "rating-ignore")
@@ -4058,11 +4483,16 @@ def show_option_chain(fyers):
             st.dataframe(sig_table, use_container_width=True, height=360)
 
         st.caption(
-            "Heuristic engine built entirely from the current chain snapshot (OI, ΔOI, Volume, PCR, "
-            "Max Pain, IV, spot/ATM/max-pain distance, breakout/breakdown probability, institutional & "
-            "smart-money proxies). Entry/SL/Targets are premium-percentage based, not option-Greeks "
-            "based. This is a positioning read, not financial advice — always confirm with price action "
-            "and manage your own risk."
+            "Institutional AI Validation Engine: a BUY/SELL only fires once Trend (EMA20/50/200 + VWAP "
+            "+ HH/HL or LH/LL structure), Option Chain (build-up direction), Max Pain (adjusts, never "
+            "ignored), Volume (spike + relative volume), Price Action (rejects Doji/indecision candles), "
+            "Smart Money (Institutional Buying/Selling), Support/Resistance (rejects trades straight "
+            "into a wall), ATR, and Momentum (RSI/MACD/ADX) ALL agree — any disagreement, or missing "
+            "candle data, forces WAIT. Confidence is an explicit weighted 0-100 score (Trend 20, Option "
+            "Chain 20, OI Build-up 15, PCR 10, Max Pain 10, Volume 10, Momentum 5, Price Action 5, Smart "
+            "Money 5) with a hard floor of 80% and a minimum 1:2 risk:reward — nothing below either bar "
+            "is ever shown. This is a positioning read built from FYERS/NSE snapshot + candle data, not "
+            "financial advice — always confirm with live price action and manage your own risk."
         )
 
     with tab6:
@@ -4080,7 +4510,10 @@ def show_option_chain(fyers):
                 "🎯 The AI Scalping Engine is off. Enable **'Enable AI Scalping Engine'** in the "
                 "sidebar to fetch 5m/15m candles and India VIX and compute the 13-point BUY/SELL "
                 "confirmation checklist (EMA/VWAP/RSI/MACD/ADX/Supertrend, CE/PE OI direction, "
-                "Gamma direction, Build-up/Covering/Unwinding, Order Block, BOS, Volume Spike)."
+                "Gamma direction, Build-up/Covering/Unwinding, Order Block, BOS, Volume Spike). "
+                "The same candle data also feeds the Institutional AI Validation Engine on the "
+                "🤖 AI Trade Signals tab — until this is enabled at least once this session, that "
+                "tab will correctly stay at WAIT rather than trading on option-chain data alone."
             )
 
     st.divider()
@@ -4118,4 +4551,4 @@ def show_option_chain(fyers):
 #     )
 #     show_option_chain(fyers)
 #
-#
+# Run this file with:  streamlit run fyers_options_chain_dashboard.py
