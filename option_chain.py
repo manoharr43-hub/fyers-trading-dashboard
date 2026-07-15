@@ -86,8 +86,10 @@ FIX NOTE 5 (this file):
   compute_institutional_signals()). A BUY/SELL now requires trend, option
   -chain, max-pain, volume, price-action, smart-money, support/resistance,
   ATR, and momentum validation to all agree, with an explicit weighted
-  0-100 confidence score and a hard floor of 80% confidence and 1:2 risk
-  /reward before any signal is emitted. generate_trade_signals() itself is
+  0-100 confidence score and a hard floor of 40% confidence and 1:2 risk
+  /reward before any signal is emitted (floor lowered from an initial 80%
+  at the user's request; the star rating bands were rescaled to match).
+  generate_trade_signals() itself is
   left in place (unused) so no existing function is removed. Nothing about
   the UI, tabs, API calls, or Excel export changed — only which function
   populates the AI Trade Signals tab's `signals` list.
@@ -3548,20 +3550,23 @@ INSTITUTIONAL_SCORE_WEIGHTS = {
     "max_pain": 10, "volume": 10, "momentum": 5, "price_action": 5,
     "smart_money": 5,
 }
-INSTITUTIONAL_MIN_CONFIDENCE = 80.0   # never generate BUY/SELL below this
+INSTITUTIONAL_MIN_CONFIDENCE = 40.0   # never generate BUY/SELL below this
 INSTITUTIONAL_MIN_RISK_REWARD = 2.0   # reject trades with RR < 1:2
 
 
 def _institutional_confidence_band(pct: float) -> tuple:
-    """Spec section 'Confidence Rules'."""
-    if pct >= 95:
-        return "★★★★★ Institutional Strong", "strongbuy"
+    """Confidence Rules, rescaled to a 40-100 usable range (floor lowered
+    from the original 80 to 40 per user request)."""
     if pct >= 90:
-        return "★★★★ Very Strong", "buy"
-    if pct >= 85:
-        return "★★★ Strong", "buy"
+        return "★★★★★ Institutional Strong", "strongbuy"
     if pct >= 80:
+        return "★★★★ Very Strong", "buy"
+    if pct >= 70:
+        return "★★★ Strong", "buy"
+    if pct >= 55:
         return "★★ Moderate", "hold"
+    if pct >= 40:
+        return "★ Speculative", "avoid"
     return "WAIT", "wait"
 
 
@@ -3983,9 +3988,10 @@ def show_option_chain(fyers):
                 st.session_state["oc_raw_expiry_payload"] = raw_payload
                 st.rerun()
 
-        ai_min_conf = st.slider("AI Min Confidence % (Trade Signals)", 80, 99, 80, step=1,
+        ai_min_conf = st.slider("AI Min Confidence % (Trade Signals)", 40, 99, 40, step=1,
                                  help="The Institutional AI Validation Engine never emits a BUY/SELL "
-                                      "below 80% confidence, so the floor here is fixed at 80.")
+                                      "below 40% confidence, so the floor here is fixed at 40. Raise it "
+                                      "to only see higher-conviction (★★★★/★★★★★) signals.")
         debug_mode = st.checkbox("Show raw API response (debug)", value=False)
         st.divider()
         fetch_btn = st.button("🔄 Fetch Live Data", use_container_width=True, type="primary")
@@ -4434,8 +4440,9 @@ def show_option_chain(fyers):
             f"Showing strikes with AI Confidence ≥ {max(ai_min_conf, INSTITUTIONAL_MIN_CONFIDENCE):.0f}% "
             "that passed EVERY validation category (trend, option chain, max pain, volume, price "
             "action, smart money, support/resistance, ATR, momentum) with risk:reward ≥ 1:2. The "
-            "confidence floor here can't go below 80% — that's a hard rule of the engine, not a "
-            "sidebar setting."
+            "confidence floor here can't go below 40% — that's a hard rule of the engine, not a "
+            "sidebar setting. Below ★★★ Strong (70%), treat signals as speculative rather than "
+            "institutional-grade."
         )
 
         if not signals:
@@ -4490,9 +4497,11 @@ def show_option_chain(fyers):
             "into a wall), ATR, and Momentum (RSI/MACD/ADX) ALL agree — any disagreement, or missing "
             "candle data, forces WAIT. Confidence is an explicit weighted 0-100 score (Trend 20, Option "
             "Chain 20, OI Build-up 15, PCR 10, Max Pain 10, Volume 10, Momentum 5, Price Action 5, Smart "
-            "Money 5) with a hard floor of 80% and a minimum 1:2 risk:reward — nothing below either bar "
-            "is ever shown. This is a positioning read built from FYERS/NSE snapshot + candle data, not "
-            "financial advice — always confirm with live price action and manage your own risk."
+            "Money 5) with a hard floor of 40% and a minimum 1:2 risk:reward — nothing below either bar "
+            "is ever shown. ★★★★★ 90-100 Institutional Strong · ★★★★ 80-89 Very Strong · ★★★ 70-79 "
+            "Strong · ★★ 55-69 Moderate · ★ 40-54 Speculative. This is a positioning read built from "
+            "FYERS/NSE snapshot + candle data, not financial advice — always confirm with live price "
+            "action and manage your own risk."
         )
 
     with tab6:
