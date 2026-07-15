@@ -2574,3 +2574,6 @@ def show_ai_market_intelligence(fyers: Any) -> None:
             "AI Prediction", render_ai_prediction_section, fyers, news_df, fii_dii_net,
             vix_value, global_df, true_breadth,
         )
+Run this file with:  streamlit run fyers_options_chain_dashboard.py# మెమరీ క్లీనప్ - ఇది యాప్ క్రాష్ అవ్వకుండా ఆపుతుంది[span_1](start_span)[span_1](end_span)
+        del df
+        gc.collect()
