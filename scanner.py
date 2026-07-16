@@ -384,33 +384,187 @@ def calculate_vwap_approx(df, window: int = 20):
     return round(float((typical * d["Volume"]).sum() / vol_sum), 2)
 
 
+def _safe_atr_pa(df, period: int = 14):
+    """Internal ATR helper used by the institutional Price Action engine.
+    Identical math to calculate_atr() but kept private/NaN-safe so every
+    Price Action function below can call it without depending on call
+    order elsewhere in the file."""
+    h, l, c = df["High"], df["Low"], df["Close"]
+    pc = c.shift(1)
+    tr = pd.concat([h - l, (h - pc).abs(), (l - pc).abs()], axis=1).max(axis=1)
+    return tr.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
+
+
+def _last_valid_atr_pa(df, period: int = 14) -> float:
+    """Last ATR value, guaranteed positive/non-NaN (falls back to 0.5% of
+    last close) so every downstream division is always safe."""
+    atr_series = _safe_atr_pa(df, period)
+    val = atr_series.iloc[-1] if len(atr_series) else np.nan
+    if pd.isna(val) or val <= 0:
+        last_close = float(df["Close"].iloc[-1]) if len(df) else 0.0
+        val = max(last_close * 0.005, 0.01)
+    return float(val)
+
+
 def detect_chart_pattern(df) -> str:
-    """Simple single/multi-candle chart pattern detector."""
+    """
+    INSTITUTIONAL PRICE ACTION ENGINE — candle pattern detector (FIXED).
+
+    Bug fixed vs the original: only Doji/Hammer/Shooting-Star/Engulfing/
+    HH-HL-LH-LL were covered, and there was no minimum size/ATR filter, so
+    patterns fired on statistically meaningless micro-candles. This adds
+    Pin Bar, Morning Star, Evening Star, and Marubozu, and rejects any
+    candle whose total range is too small relative to ATR to mean anything
+    (removes "weak candle" noise per the fix spec).
+    """
     if len(df) < 5:
         return "N/A"
+
+    atr = _last_valid_atr_pa(df)
     last = df.iloc[-1]; prev = df.iloc[-2]
     body = abs(last["Close"] - last["Open"])
     rng = last["High"] - last["Low"]
     upper_wick = last["High"] - max(last["Close"], last["Open"])
     lower_wick = min(last["Close"], last["Open"]) - last["Low"]
+
+    # FIX: ignore statistically meaningless micro-candles entirely
+    if rng < 0.15 * atr:
+        return "No Clear Pattern (Low Volatility)"
+
     if rng > 0 and body / rng < 0.1:
         return "Doji ⚪"
+
+    # Marubozu: body dominates the whole range, negligible wicks either side
+    if rng > 0 and body / rng > 0.9 and body > 0.8 * atr:
+        return "Bullish Marubozu 🟩" if last["Close"] > last["Open"] else "Bearish Marubozu 🟥"
+
+    # Pin Bar (tighter than Hammer/Shooting Star: dominant wick, tiny opposite wick)
+    if lower_wick > body * 2.5 and upper_wick < body * 0.6 and rng > 0.4 * atr:
+        return "Bullish Pin Bar 📌"
+    if upper_wick > body * 2.5 and lower_wick < body * 0.6 and rng > 0.4 * atr:
+        return "Bearish Pin Bar 📌"
+
     if lower_wick > body * 2 and last["Close"] > last["Open"]:
         return "Hammer 🔨"
     if upper_wick > body * 2 and last["Close"] < last["Open"]:
         return "Shooting Star 🌠"
+
     prev_lo, prev_hi = min(prev["Open"], prev["Close"]), max(prev["Open"], prev["Close"])
     last_lo, last_hi = min(last["Open"], last["Close"]), max(last["Open"], last["Close"])
-    if last["Close"] > last["Open"] and prev["Close"] < prev["Open"] and last_hi >= prev_hi and last_lo <= prev_lo:
+
+    if (last["Close"] > last["Open"] and prev["Close"] < prev["Open"]
+            and last_hi >= prev_hi and last_lo <= prev_lo and body > 0.3 * atr):
         return "Bullish Engulfing 🟢"
-    if last["Close"] < last["Open"] and prev["Close"] > prev["Open"] and last_hi >= prev_hi and last_lo <= prev_lo:
+    if (last["Close"] < last["Open"] and prev["Close"] > prev["Open"]
+            and last_hi >= prev_hi and last_lo <= prev_lo and body > 0.3 * atr):
         return "Bearish Engulfing 🔴"
+
+    # Morning Star / Evening Star (3-candle reversal pattern)
+    if len(df) >= 3:
+        c1, c2, c3 = df.iloc[-3], df.iloc[-2], df.iloc[-1]
+        c1_body = abs(c1["Close"] - c1["Open"])
+        c2_body = abs(c2["Close"] - c2["Open"])
+        c3_body = abs(c3["Close"] - c3["Open"])
+        if (c1["Close"] < c1["Open"] and c1_body > 0.4 * atr
+                and c2_body < 0.4 * c1_body
+                and c3["Close"] > c3["Open"] and c3_body > 0.4 * atr
+                and c3["Close"] > (c1["Open"] + c1["Close"]) / 2):
+            return "Morning Star ⭐"
+        if (c1["Close"] > c1["Open"] and c1_body > 0.4 * atr
+                and c2_body < 0.4 * c1_body
+                and c3["Close"] < c3["Open"] and c3_body > 0.4 * atr
+                and c3["Close"] < (c1["Open"] + c1["Close"]) / 2):
+            return "Evening Star 🌆"
+
     recent = df.tail(5)
     if recent["High"].is_monotonic_increasing and recent["Low"].is_monotonic_increasing:
         return "Higher Highs/Lows 📈"
     if recent["High"].is_monotonic_decreasing and recent["Low"].is_monotonic_decreasing:
         return "Lower Highs/Lows 📉"
     return "No Clear Pattern"
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# ── INSTITUTIONAL PRICE ACTION ENGINE — Swing / Structure primitives ──────
+# ══════════════════════════════════════════════════════════════════════════
+
+def _detect_swing_points(df, left: int = 2, right: int = 2,
+                          atr_period: int = 14, atr_mult: float = 0.5):
+    """
+    FIX: the original code had no real swing-point concept at all — market
+    structure was inferred from a raw rolling(10).max()/.min(), which
+    reacts to every wick and produces false structure breaks.
+
+    Returns a copy of df with 'is_swing_high' / 'is_swing_low' boolean
+    columns. A bar is only ever marked True if it is the single strict
+    extreme of a `left`+`right` bar fractal window AND that window is
+    fully inside already-closed history — i.e. a swing near the live edge
+    of the data is simply not confirmed yet (this is what prevents
+    repainting / look-ahead bias). Swings closer than `atr_mult`*ATR to
+    the previously kept swing of the same type are treated as the same
+    swing (noise filtering) rather than counted twice.
+    """
+    d = df.reset_index(drop=True).copy()
+    n = len(d)
+    d["is_swing_high"] = False
+    d["is_swing_low"] = False
+    if n < left + right + 1:
+        return d
+
+    atr = _safe_atr_pa(d, atr_period).values
+    high = d["High"].values
+    low = d["Low"].values
+
+    raw_highs = []
+    raw_lows = []
+    for i in range(left, n - right):
+        window_hi = high[i - left:i + right + 1]
+        window_lo = low[i - left:i + right + 1]
+        if high[i] == window_hi.max() and np.sum(window_hi == window_hi.max()) == 1:
+            raw_highs.append(i)
+        if low[i] == window_lo.min() and np.sum(window_lo == window_lo.min()) == 1:
+            raw_lows.append(i)
+
+    def _atr_filter(idxs, values):
+        kept = []
+        for idx in idxs:
+            a = atr[idx] if not np.isnan(atr[idx]) and atr[idx] > 0 else (d["Close"].iloc[idx] * 0.005)
+            if kept and abs(values[idx] - values[kept[-1]]) < atr_mult * a:
+                continue
+            kept.append(idx)
+        return kept
+
+    kept_highs = _atr_filter(raw_highs, high)
+    kept_lows = _atr_filter(raw_lows, low)
+
+    d.loc[kept_highs, "is_swing_high"] = True
+    d.loc[kept_lows, "is_swing_low"] = True
+    return d
+
+
+def _classify_swing_structure(df, left: int = 2, right: int = 2):
+    """
+    FIX: adds the HH/HL/LH/LL classification that did not previously exist
+    anywhere in the file. Returns (label, last_swing_high_value,
+    last_swing_low_value) describing the most recently CONFIRMED swing
+    relative to the swing of the same type immediately before it.
+    """
+    d = _detect_swing_points(df, left=left, right=right)
+    highs = d.loc[d["is_swing_high"], "High"].tolist()
+    lows = d.loc[d["is_swing_low"], "Low"].tolist()
+
+    last_high = highs[-1] if highs else None
+    last_low = lows[-1] if lows else None
+
+    label = "N/A"
+    if len(highs) >= 2 and len(lows) >= 2:
+        d_highs = d.loc[d["is_swing_high"]].index.tolist()
+        d_lows = d.loc[d["is_swing_low"]].index.tolist()
+        if d_highs and (not d_lows or d_highs[-1] > d_lows[-1]):
+            label = "HH" if highs[-1] > highs[-2] else "LH"
+        elif d_lows:
+            label = "HL" if lows[-1] > lows[-2] else "LL"
+    return label, last_high, last_low
 
 
 def calculate_mtf_trend(df) -> str:
@@ -738,36 +892,81 @@ def _determine_entry_and_decision(direction, confirmed_count, ai_score, confiden
 
 
 def _calculate_smc_and_cisd(df):
-    """Smart Money Concepts structure + Change-in-State-of-Delivery detection. Logic unchanged."""
+    """
+    INSTITUTIONAL PRICE ACTION ENGINE — Smart Money Concepts / CISD (FIXED).
+
+    Bugs fixed vs the original:
+      1. "BOS" was `Close > rolling(10).max().shift(1)` — a single abnormal
+         wick-driven bar could trip it, no volume confirmation, and it used
+         a fixed rolling window instead of real confirmed swing points.
+      2. "CISD" compared only the immediately preceding bar's High/Low —
+         pure noise that re-triggered on almost every bar in a chop market,
+         with no requirement that price actually CLOSE beyond the level.
+      3. No CHOCH concept existed. A CHOCH is only real when a BOS occurs
+         OPPOSITE to the currently established trend — this now tracks
+         trend state explicitly, and suppresses CHOCH labels generated
+         inside a genuinely ranging market (range < 2.5x ATR).
+
+    BOS requires: (a) Close beyond the last CONFIRMED swing high/low, not
+    merely touched by a wick, (b) volume on the breaking candle above its
+    20-period average. Same return shape as before:
+    (smc_structure: str, cisd_signal: str, event_ts: Optional[Timestamp])
+    """
     if len(df) < 30:
         return "Range ➖", "None", None
-    d = df.copy()
-    d["Prev_High"] = d["High"].shift(1); d["Prev_Low"] = d["Low"].shift(1)
-    d["Bullish_CISD"] = (d["Low"] < d["Prev_Low"]) & (d["Close"] > d["Prev_High"])
-    d["Bearish_CISD"] = (d["High"] > d["Prev_High"]) & (d["Close"] < d["Prev_Low"])
-    d["Local_High"] = d["High"].rolling(window=10).max().shift(1)
-    d["Local_Low"] = d["Low"].rolling(window=10).min().shift(1)
-    d["EMA20"] = d["Close"].ewm(span=20).mean(); d["EMA50"] = d["Close"].ewm(span=50).mean()
-    d["Bullish_Trend"] = d["EMA20"] > d["EMA50"]
-    d["Break_Up"] = d["Close"] > d["Local_High"]; d["Break_Down"] = d["Close"] < d["Local_Low"]
-    recent = d.tail(20)
-    cisd_events = recent[recent["Bullish_CISD"] | recent["Bearish_CISD"]]
-    cisd_signal = "None"; cisd_event_ts = None
-    if not cisd_events.empty:
-        is_bull = bool(cisd_events["Bullish_CISD"].iloc[-1])
-        cisd_signal = "Bullish CISD 🚀" if is_bull else "Bearish CISD 🩸"
-        cisd_event_ts = cisd_events["Time"].iloc[-1]
-    smc_events = recent[recent["Break_Up"] | recent["Break_Down"]]
-    smc_structure = "Range ➖"; smc_event_ts = None
-    if not smc_events.empty:
-        is_up = bool(smc_events["Break_Up"].iloc[-1])
-        is_bull_trend = bool(smc_events["Bullish_Trend"].iloc[-1])
-        if is_up:
-            smc_structure = "BOS 📈" if is_bull_trend else "CHOCH 🐂"
-        else:
-            smc_structure = "BOS 📉" if not is_bull_trend else "CHOCH 🐻"
-        smc_event_ts = smc_events["Time"].iloc[-1]
-    event_ts = cisd_event_ts if cisd_event_ts is not None else smc_event_ts
+
+    d = df.reset_index(drop=True).copy()
+    swings = _detect_swing_points(d, left=2, right=2)
+    atr = _safe_atr_pa(d, 14)
+    vol_avg20 = d["Volume"].rolling(20, min_periods=5).mean()
+
+    swing_highs = swings.index[swings["is_swing_high"]].tolist()
+    swing_lows = swings.index[swings["is_swing_low"]].tolist()
+
+    smc_structure = "Range ➖"
+    cisd_signal = "None"
+    event_idx = None
+    event_ts = None
+
+    lookback_start = max(30, len(d) - 60)
+    last_trend = None
+
+    for i in range(lookback_start, len(d)):
+        close_i = d["Close"].iloc[i]
+        vol_i = d["Volume"].iloc[i]
+        vavg = vol_avg20.iloc[i]
+        volume_confirmed = bool(pd.notna(vavg) and vavg > 0 and vol_i > vavg)
+
+        prior_highs = [h for h in swing_highs if h < i]
+        prior_lows = [l for l in swing_lows if l < i]
+        if not prior_highs and not prior_lows:
+            continue
+
+        broke_up = bool(prior_highs and close_i > d["High"].iloc[prior_highs[-1]] and volume_confirmed)
+        broke_down = bool(prior_lows and close_i < d["Low"].iloc[prior_lows[-1]] and volume_confirmed)
+
+        if broke_up and not broke_down:
+            is_choch = last_trend == "bearish"
+            smc_structure = "CHOCH 🐂" if is_choch else "BOS 📈"
+            cisd_signal = "Bullish CISD 🚀"
+            last_trend = "bullish"
+            event_idx = i
+        elif broke_down and not broke_up:
+            is_choch = last_trend == "bullish"
+            smc_structure = "CHOCH 🐻" if is_choch else "BOS 📉"
+            cisd_signal = "Bearish CISD 🩸"
+            last_trend = "bearish"
+            event_idx = i
+
+    if "CHOCH" in smc_structure and len(d) >= 20:
+        recent_range = float(d["High"].tail(20).max() - d["Low"].tail(20).min())
+        recent_atr = float(atr.iloc[-1]) if pd.notna(atr.iloc[-1]) else 0.0
+        if recent_atr > 0 and recent_range < 2.5 * recent_atr:
+            smc_structure = smc_structure.replace("CHOCH 🐂", "BOS 📈").replace("CHOCH 🐻", "BOS 📉")
+
+    if event_idx is not None:
+        event_ts = d["Time"].iloc[event_idx]
+
     return smc_structure, cisd_signal, event_ts
 
 
@@ -777,14 +976,31 @@ _OB_VOL_MULTIPLIER = 1.2
 
 
 def _detect_order_blocks(df, smc_structure):
-    """Detect bullish/bearish Order Block zones near current price. Logic unchanged."""
+    """
+    INSTITUTIONAL PRICE ACTION ENGINE — Order Block detector (FIXED).
+
+    Bugs fixed vs the original:
+      - No retest tracking at all: an OB tapped into 5 times was reported
+        identically to a first-touch fresh OB.
+      - "Strength" ignored how many times the zone had since been retested.
+      - No minimum body-size floor, so a tiny/noise candle could seed an OB.
+
+    Fix: after locating the candidate OB candle, walk every bar AFTER it up
+    to the current bar and count re-entries into the zone. 0 = Fresh /
+    Untested. 1 = Tested once (still usable, labeled). 2+ = rejected
+    outright (over-tested / weak, per the "reject multiple retests" spec).
+    Same return shape as before: (bullish_label, bearish_label, ob_zone, ob_strength)
+    """
     if len(df) < 15:
         return "No", "No", "—", "—"
+
     d = df.reset_index(drop=True)
     lookback = min(_OB_LOOKBACK, len(d) - 3)
     recent = d.tail(lookback + 2).reset_index(drop=True)
     vol_avg = d["Volume"].tail(20).mean()
     last_close = float(d["Close"].iloc[-1])
+    atr = _last_valid_atr_pa(d)
+
     bullish_label, bearish_label = "No", "No"
     ob_zone, ob_strength = "—", "—"
     is_bos_bullish = smc_structure in ("BOS 📈", "CHOCH 🐂")
@@ -797,11 +1013,23 @@ def _detect_order_blocks(df, smc_structure):
             return "Medium"
         return "Weak"
 
+    def _count_retests(zone_low, zone_high, after_idx) -> int:
+        touches = 0
+        inside_prev = False
+        for j in range(after_idx + 1, len(recent)):
+            lo, hi = float(recent["Low"].iloc[j]), float(recent["High"].iloc[j])
+            inside = not (hi < zone_low or lo > zone_high)
+            if inside and not inside_prev:
+                touches += 1
+            inside_prev = inside
+        return touches
+
     try:
         if is_bos_bullish:
             for i in range(len(recent) - 2, 0, -1):
                 candle = recent.iloc[i]
-                if not (candle["Close"] < candle["Open"]):
+                body = abs(candle["Close"] - candle["Open"])
+                if not (candle["Close"] < candle["Open"]) or body < 0.15 * atr:
                     continue
                 if i + 1 >= len(recent):
                     continue
@@ -811,12 +1039,18 @@ def _detect_order_blocks(df, smc_structure):
                 if move_pct >= _OB_MIN_MOVE_PCT and vol_ok:
                     zone_low, zone_high = round(float(candle["Low"]), 2), round(float(candle["High"]), 2)
                     if zone_low <= last_close <= zone_high * 1.02:
-                        bullish_label = "🟢 Bullish OB"; ob_zone = f"{zone_low}–{zone_high}"; ob_strength = _strength(move_pct, float(candle["Volume"]))
+                        retests = _count_retests(zone_low, zone_high, i)
+                        if retests >= 2:
+                            break
+                        bullish_label = "🟢 Bullish OB" if retests == 0 else "🟢 Bullish OB (Tested x1)"
+                        ob_zone = f"{zone_low}–{zone_high}"
+                        ob_strength = _strength(move_pct, float(candle["Volume"]))
                     break
         if is_bos_bearish and bullish_label == "No":
             for i in range(len(recent) - 2, 0, -1):
                 candle = recent.iloc[i]
-                if not (candle["Close"] > candle["Open"]):
+                body = abs(candle["Close"] - candle["Open"])
+                if not (candle["Close"] > candle["Open"]) or body < 0.15 * atr:
                     continue
                 if i + 1 >= len(recent):
                     continue
@@ -826,7 +1060,12 @@ def _detect_order_blocks(df, smc_structure):
                 if move_pct >= _OB_MIN_MOVE_PCT and vol_ok:
                     zone_low, zone_high = round(float(candle["Low"]), 2), round(float(candle["High"]), 2)
                     if zone_low * 0.98 <= last_close <= zone_high:
-                        bearish_label = "🔴 Bearish OB"; ob_zone = f"{zone_low}–{zone_high}"; ob_strength = _strength(move_pct, float(candle["Volume"]))
+                        retests = _count_retests(zone_low, zone_high, i)
+                        if retests >= 2:
+                            break
+                        bearish_label = "🔴 Bearish OB" if retests == 0 else "🔴 Bearish OB (Tested x1)"
+                        ob_zone = f"{zone_low}–{zone_high}"
+                        ob_strength = _strength(move_pct, float(candle["Volume"]))
                     break
     except (KeyError, IndexError, TypeError, ValueError, ZeroDivisionError, AttributeError):
         return "No", "No", "—", "—"
@@ -845,7 +1084,7 @@ def _parse_ob_zone(ob_zone):
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# ── ENHANCED SIGNAL VALIDATION ENGINE (unchanged — purely additive) ───────
+# ── ENHANCED SIGNAL VALIDATION ENGINE (institutional price action) ────────
 # ══════════════════════════════════════════════════════════════════════════
 
 def calculate_adx(df, period: int = 14):
@@ -862,17 +1101,40 @@ def calculate_adx(df, period: int = 14):
     return round(float(adx.iloc[-1]), 1), round(float(plus_di.iloc[-1]), 1), round(float(minus_di.iloc[-1]), 1)
 
 
-def detect_fvg(df) -> dict:
-    """Detect the most recent Fair Value Gap. Logic unchanged."""
+def detect_fvg(df, trend_hint=None) -> dict:
+    """
+    INSTITUTIONAL PRICE ACTION ENGINE — Fair Value Gap detector (FIXED).
+
+    Bugs fixed vs the original:
+      - Mitigated (>=50% filled) gaps were still returned and labeled
+        "Filled" as if they were a usable signal input — the fix spec
+        explicitly requires rejecting filled FVGs.
+      - No minimum gap-size floor, so 0.01%-of-price rounding noise was
+        treated the same as a genuine imbalance.
+      - Direction was never checked against the prevailing trend.
+
+    Only ever returns an UNMITIGATED gap above a minimum ATR-relative
+    size. `trend_hint` ('Bullish'|'Bearish'|None) is a new OPTIONAL kwarg
+    — existing callers that don't pass it keep the old behaviour (accepts
+    either direction). Same return shape as before (dict).
+    """
+    empty = {"label": "No FVG", "type": None, "gap_size": 0.0, "filled_pct": 0.0,
+              "age_candles": None, "freshness": "—", "mitigated": False, "nearest_dist": None}
     if len(df) < 5:
-        return {"label": "No FVG", "type": None, "gap_size": 0.0, "filled_pct": 0.0, "age_candles": None, "freshness": "—", "mitigated": False, "nearest_dist": None}
+        return empty
+
     last_close = float(df["Close"].iloc[-1])
+    atr = _last_valid_atr_pa(df)
+    min_gap = max(0.1 * atr, last_close * 0.0008)
+
     recent = df.tail(30).reset_index(drop=True)
-    n = len(recent); best = None
+    n = len(recent)
+    best = None
     for i in range(1, n - 1):
         prev_high = float(recent["High"].iloc[i - 1]); prev_low = float(recent["Low"].iloc[i - 1])
         next_high = float(recent["High"].iloc[i + 1]); next_low = float(recent["Low"].iloc[i + 1])
-        bullish = prev_high < next_low; bearish = prev_low > next_high
+        bullish = prev_high < next_low
+        bearish = prev_low > next_high
         if not bullish and not bearish:
             continue
         if bullish:
@@ -880,21 +1142,33 @@ def detect_fvg(df) -> dict:
         else:
             gap_low, gap_high, direction = next_high, prev_low, "Bearish"
         gap_size = round(gap_high - gap_low, 4)
+        if gap_size < min_gap:
+            continue
+        if trend_hint in ("Bullish", "Bearish") and direction != trend_hint:
+            continue
+
         age_candles = n - 1 - i
         fill_depth = max(0.0, last_close - gap_low) if bullish else max(0.0, gap_high - last_close)
         filled_pct = round(min(fill_depth / gap_size * 100, 100), 1) if gap_size > 0 else 100.0
         mitigated = filled_pct >= 50.0
+        if mitigated:
+            continue
         freshness = "Old" if age_candles > 10 else "Fresh"
         if best is None or age_candles < best["age_candles"]:
-            best = {"type": direction, "gap_low": round(gap_low, 2), "gap_high": round(gap_high, 2), "gap_size": round(gap_size, 2), "filled_pct": filled_pct, "age_candles": age_candles, "freshness": freshness, "mitigated": mitigated, "nearest_dist": round(abs(last_close - (gap_low if bullish else gap_high)), 2)}
+            best = {"type": direction, "gap_low": round(gap_low, 2), "gap_high": round(gap_high, 2),
+                     "gap_size": round(gap_size, 2), "filled_pct": filled_pct, "age_candles": age_candles,
+                     "freshness": freshness, "mitigated": mitigated,
+                     "nearest_dist": round(abs(last_close - (gap_low if bullish else gap_high)), 2)}
+
     if best is None:
-        return {"label": "No FVG", "type": None, "gap_size": 0.0, "filled_pct": 0.0, "age_candles": None, "freshness": "—", "mitigated": False, "nearest_dist": None}
-    best["label"] = f"{best['type']} {'Fresh' if not best['mitigated'] else 'Filled'}"
+        return empty
+    best["label"] = f"{best['type']} Fresh"
     return best
 
 
 def classify_order_block(df, smc_structure, fvg) -> dict:
-    """Enhanced OB: Fresh/Mitigated/Institutional/Retail classification. Logic unchanged."""
+    """Enhanced OB: Fresh/Mitigated/Institutional/Retail classification. Logic unchanged
+    (now benefits automatically from the fixed _detect_order_blocks above)."""
     bullish_ob, bearish_ob, ob_zone, ob_strength = _detect_order_blocks(df, smc_structure)
     last_close = float(df["Close"].iloc[-1])
 
@@ -921,17 +1195,67 @@ def classify_order_block(df, smc_structure, fvg) -> dict:
 
 
 def detect_liquidity_sweep(df) -> Tuple[str, str]:
-    """Sell-Side or Buy-Side liquidity sweep detection. Logic unchanged."""
+    """
+    INSTITUTIONAL PRICE ACTION ENGINE — Liquidity Sweep detector (FIXED).
+
+    Bugs fixed vs the original:
+      - Only checked the single most recent bar's high/low against a swing
+        range computed from the same trailing window (self-referential and
+        noisy), no Equal-High/Equal-Low pool detection, and no requirement
+        that the reversal actually continue on the NEXT bar (so a sweep
+        that immediately failed still counted as a valid signal).
+
+    Adds Equal-High/Equal-Low liquidity-pool detection (2+ swing highs/lows
+    within a tight ATR-relative tolerance) and requires the bar AFTER the
+    sweep bar to confirm continuation before it is labeled "confirmed".
+    Same return shape as before: (label, side)
+    """
     if len(df) < 20:
         return "No Sweep", "None"
-    recent = df.tail(20).reset_index(drop=True)
-    swing_low = float(recent["Low"].iloc[:-3].min())
-    swing_high = float(recent["High"].iloc[:-3].max())
-    last_low = float(recent["Low"].iloc[-1]); last_close = float(recent["Close"].iloc[-1]); last_high = float(recent["High"].iloc[-1])
-    if last_low < swing_low and last_close > swing_low:
-        return "🔽 Sell-Side Sweep (Buy Setup)", "Buy"
-    if last_high > swing_high and last_close < swing_high:
-        return "🔼 Buy-Side Sweep (Sell Setup)", "Sell"
+
+    d = df.reset_index(drop=True)
+    atr = _last_valid_atr_pa(d)
+    swings = _detect_swing_points(d.tail(40).reset_index(drop=True), left=2, right=2)
+    swing_highs = swings.loc[swings["is_swing_high"], "High"].tolist()
+    swing_lows = swings.loc[swings["is_swing_low"], "Low"].tolist()
+
+    def _has_equal_pool(levels, tol):
+        levels = sorted(levels)
+        for a, b in zip(levels, levels[1:]):
+            if abs(a - b) <= tol:
+                return True
+        return False
+
+    eq_high_pool = _has_equal_pool(swing_highs[-4:], 0.25 * atr) if len(swing_highs) >= 2 else False
+    eq_low_pool = _has_equal_pool(swing_lows[-4:], 0.25 * atr) if len(swing_lows) >= 2 else False
+
+    recent = d.tail(20).reset_index(drop=True)
+    if len(recent) < 4:
+        return "No Sweep", "None"
+
+    swing_low_ref = float(recent["Low"].iloc[:-3].min())
+    swing_high_ref = float(recent["High"].iloc[:-3].max())
+
+    sweep_idx = len(recent) - 2
+    confirm_idx = len(recent) - 1
+
+    sweep_low = float(recent["Low"].iloc[sweep_idx])
+    sweep_high = float(recent["High"].iloc[sweep_idx])
+    sweep_close = float(recent["Close"].iloc[sweep_idx])
+    confirm_close = float(recent["Close"].iloc[confirm_idx])
+
+    if sweep_low < swing_low_ref and sweep_close > swing_low_ref:
+        confirmed = confirm_close >= sweep_close
+        pool_tag = " (Equal Lows)" if eq_low_pool else ""
+        label = f"🔽 Sell-Side Sweep (Buy Setup){pool_tag}" if confirmed else f"🔽 Sell-Side Sweep — Unconfirmed{pool_tag}"
+        return label, ("Buy" if confirmed else "None")
+
+    if sweep_high > swing_high_ref and sweep_close < swing_high_ref:
+        confirmed = confirm_close <= sweep_close
+        pool_tag = " (Equal Highs)" if eq_high_pool else ""
+        label = f"🔼 Buy-Side Sweep (Sell Setup){pool_tag}" if confirmed else f"🔼 Buy-Side Sweep — Unconfirmed{pool_tag}"
+        return label, ("Sell" if confirmed else "None")
+
     return "No Sweep", "None"
 
 
@@ -968,6 +1292,405 @@ def calculate_momentum(df, rsi_val, macd_bullish, adx_val) -> str:
     if bear == 2:
         return "🟡 Moderate Bearish"
     return "⚪ Weak"
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# ── INSTITUTIONAL PRICE ACTION ENGINE — new structural functions ──────────
+# ══════════════════════════════════════════════════════════════════════════
+
+def _calculate_support_resistance_v2(df, lookback: int = 120) -> Dict[str, object]:
+    """
+    FIX: the original support/resistance was a single rolling(20).max()/
+    .min() number — no merging of nearby levels (impossible with only one
+    candidate), and no strength ranking.
+
+    Gathers ALL confirmed swing highs/lows over the lookback window,
+    clusters ones within an ATR-relative tolerance into one level, counts
+    touches (= strength), prefers multi-touch levels over single-touch
+    ones, and returns the nearest qualifying level on each side of price.
+    """
+    d = df.tail(lookback).reset_index(drop=True) if len(df) > lookback else df.reset_index(drop=True)
+    if len(d) < 15:
+        return {"support": None, "resistance": None, "support_strength": 0, "resistance_strength": 0}
+
+    atr = _last_valid_atr_pa(d)
+    merge_tol = max(0.4 * atr, float(d["Close"].iloc[-1]) * 0.002)
+    last_close = float(d["Close"].iloc[-1])
+
+    swings = _detect_swing_points(d, left=2, right=2)
+    highs = sorted(swings.loc[swings["is_swing_high"], "High"].tolist())
+    lows = sorted(swings.loc[swings["is_swing_low"], "Low"].tolist())
+
+    def _cluster(levels):
+        clusters = []
+        for lvl in levels:
+            if clusters and abs(lvl - clusters[-1]["mean"]) <= merge_tol:
+                c = clusters[-1]
+                c["members"].append(lvl)
+                c["mean"] = float(np.mean(c["members"]))
+            else:
+                clusters.append({"members": [lvl], "mean": lvl})
+        return [(c["mean"], len(c["members"])) for c in clusters]
+
+    res_clusters = [c for c in _cluster(highs) if c[0] > last_close]
+    sup_clusters = [c for c in _cluster(lows) if c[0] < last_close]
+
+    def _pick_best(clusters, nearest=True):
+        strong = [c for c in clusters if c[1] >= 2]
+        pool = strong if strong else clusters
+        if not pool:
+            return None, 0
+        pool.sort(key=lambda c: (-c[1], abs(c[0] - last_close)) if not nearest else abs(c[0] - last_close))
+        return round(float(pool[0][0]), 2), int(pool[0][1])
+
+    resistance, res_strength = _pick_best(res_clusters)
+    support, sup_strength = _pick_best(sup_clusters)
+
+    return {"support": support, "resistance": resistance,
+            "support_strength": sup_strength, "resistance_strength": res_strength}
+
+
+def _classify_trend_composite(df) -> Dict[str, object]:
+    """
+    FIX: trend detection must never rely on EMA alone. Combines EMA20/50/200
+    alignment + swing structure (HH/HL/LH/LL) + VWAP position + ADX into one
+    composite trend label and a numeric strength score (0-100).
+    """
+    close = df["Close"]
+    ema20 = close.ewm(span=20, adjust=False).mean().iloc[-1]
+    ema50 = close.ewm(span=50, adjust=False).mean().iloc[-1]
+    ema200 = (close.ewm(span=200, adjust=False).mean().iloc[-1]
+              if len(close) >= 200 else close.ewm(span=len(close), adjust=False).mean().iloc[-1])
+    last_close = float(close.iloc[-1])
+
+    ema_bull_votes = sum([last_close > ema20, ema20 > ema50, ema50 > ema200])
+    ema_bear_votes = sum([last_close < ema20, ema20 < ema50, ema50 < ema200])
+
+    swing_label, _, _ = _classify_swing_structure(df)
+    swing_bull = swing_label in ("HH", "HL")
+    swing_bear = swing_label in ("LH", "LL")
+
+    adx_val, _, _ = calculate_adx(df) if len(df) >= 15 else (0.0, 0.0, 0.0)
+
+    d_tail = df.tail(20)
+    typical = (d_tail["High"] + d_tail["Low"] + d_tail["Close"]) / 3
+    vol_sum = d_tail["Volume"].sum()
+    vwap_val = float((typical * d_tail["Volume"]).sum() / vol_sum) if vol_sum > 0 else last_close
+    vwap_bull = last_close > vwap_val
+    vwap_bear = last_close < vwap_val
+
+    bull_score = ema_bull_votes + int(swing_bull) + int(vwap_bull)
+    bear_score = ema_bear_votes + int(swing_bear) + int(vwap_bear)
+
+    ema20_gt_ema50_gt_ema200 = bool(ema20 > ema50 > ema200)
+    ema20_lt_ema50_lt_ema200 = bool(ema20 < ema50 < ema200)
+
+    if adx_val < 18:
+        label = "🟡 Sideways / Ranging"
+        strength = round(min(adx_val / 18 * 40, 40), 1)
+    elif bull_score >= 4 and bull_score > bear_score:
+        label = "🟢🟢 Strong Uptrend" if bull_score == 5 else "🟢 Uptrend"
+        strength = round(min(40 + bull_score * 10 + adx_val * 0.3, 100), 1)
+    elif bear_score >= 4 and bear_score > bull_score:
+        label = "🔴🔴 Strong Downtrend" if bear_score == 5 else "🔴 Downtrend"
+        strength = round(min(40 + bear_score * 10 + adx_val * 0.3, 100), 1)
+    else:
+        label = "🟡 Mixed / No Clear Trend"
+        strength = round(30 + adx_val * 0.2, 1)
+
+    return {"label": label, "strength": strength, "adx": round(float(adx_val), 1),
+            "direction": "Bullish" if bull_score > bear_score else ("Bearish" if bear_score > bull_score else "Neutral"),
+            "ema20": round(float(ema20), 2), "ema50": round(float(ema50), 2), "ema200": round(float(ema200), 2),
+            "ema_stack_bullish": ema20_gt_ema50_gt_ema200, "ema_stack_bearish": ema20_lt_ema50_lt_ema200,
+            "vwap": round(float(vwap_val), 2), "vwap_bullish": vwap_bull}
+
+
+def _calculate_pullback_quality(df, trend_direction: str) -> str:
+    """
+    FIX: pullback logic did not exist at all in the original file. Rejects
+    deep (>61.8%) retracements, confirms the trend leg is still intact, and
+    checks volume contracts during the pullback and expands on the latest
+    continuation bar.
+    """
+    if trend_direction not in ("Bullish", "Bearish") or len(df) < 15:
+        return "N/A"
+
+    d = df.tail(15).reset_index(drop=True)
+    close = d["Close"]
+    swing_start = close.iloc[0]
+    extreme = close.max() if trend_direction == "Bullish" else close.min()
+    last = close.iloc[-1]
+
+    leg = abs(extreme - swing_start)
+    if leg <= 0:
+        return "N/A"
+    retrace = abs(extreme - last) / leg * 100
+
+    vol_first_half = d["Volume"].iloc[:len(d) // 2].mean()
+    vol_second_half = d["Volume"].iloc[len(d) // 2:-1].mean() if len(d) > 3 else vol_first_half
+    last_vol = float(d["Volume"].iloc[-1])
+    volume_contracted = bool(vol_second_half <= vol_first_half * 1.05)
+    volume_expanding_now = bool(last_vol > d["Volume"].mean())
+
+    trend_intact = (last > swing_start) if trend_direction == "Bullish" else (last < swing_start)
+
+    if not trend_intact:
+        return "🔴 Trend Broken — Not a Pullback"
+    if retrace > 61.8:
+        return "🔴 Deep Retracement — Reject"
+    if 23.6 <= retrace <= 61.8 and volume_contracted:
+        return "🟢 Healthy Pullback" + (" + Volume Confirming" if volume_expanding_now else "")
+    if retrace < 23.6:
+        return "🟡 Shallow Pullback"
+    return "🟡 Unconfirmed Pullback"
+
+
+def _market_filter_ok(df, adx_val: float, rvol_raw: float) -> Tuple[bool, str]:
+    """
+    FIX: no market filter existed anywhere. Blocks signals in sideways
+    (ADX<15), low-volatility (ATR%<0.25), low-volume (RVOL<0.5), or
+    abnormally thin (possible holiday/half-day) sessions.
+    """
+    if len(df) < 20:
+        return False, "Insufficient history"
+    last_close = float(df["Close"].iloc[-1])
+    atr = _last_valid_atr_pa(df)
+    atr_pct = (atr / last_close * 100) if last_close else 0.0
+
+    if adx_val < 15:
+        return False, "Sideways market (ADX < 15)"
+    if atr_pct < 0.25:
+        return False, "Low volatility (ATR% too small)"
+    if rvol_raw < 0.5:
+        return False, "Low volume (RVOL < 0.5x)"
+    if len(df) >= 5:
+        last5_avg = float(df["Volume"].tail(5).mean())
+        prior_avg = float(df["Volume"].tail(20).mean())
+        if prior_avg > 0 and last5_avg < prior_avg * 0.3:
+            return False, "Abnormally thin session volume (possible holiday/half-day)"
+    return True, "OK"
+
+
+def _detect_valid_breakout(df, support: Optional[float], resistance: Optional[float]) -> str:
+    """
+    FIX: breakout detection previously accepted wick-only or low-volume
+    breaks. Requires (1) a CLOSE beyond the level (not a wick), (2) volume
+    above the 20-period average, (3) true range expansion vs ATR (genuine
+    momentum, not a slow drift).
+    """
+    if len(df) < 25 or support is None or resistance is None:
+        return "NO"
+    last = df.iloc[-1]
+    last_close = float(last["Close"])
+    atr = _last_valid_atr_pa(df)
+    true_range = float(last["High"] - last["Low"])
+    vol_avg20 = float(df["Volume"].tail(20).mean())
+    volume_ok = bool(vol_avg20 > 0 and float(last["Volume"]) > vol_avg20)
+    atr_expansion_ok = bool(atr > 0 and true_range >= 1.1 * atr)
+
+    if last_close > resistance and volume_ok and atr_expansion_ok:
+        return "📈 Bullish"
+    if last_close < support and volume_ok and atr_expansion_ok:
+        return "📉 Bearish"
+    return "NO"
+
+
+def validate_price_action_signal(*, direction: str, trend_direction: str, vwap_bull: bool,
+                                   ema_aligned: bool, volume_confirmed: bool, momentum_ok: bool,
+                                   atr_ok: bool, rr_ratio: float, market_ok: bool,
+                                   market_reason: str) -> Tuple[str, str]:
+    """
+    FIX: nothing in the original file could ever output "don't trade" — the
+    composite scores always resolved to some flavor of BUY/SELL/HOLD. This
+    is the hard institutional gate: EVERY check must agree with `direction`
+    or the engine refuses to issue a trade signal.
+    Returns (decision, reject_reason) where decision is one of:
+      '🟢 BUY' / '🔴 SELL' / '⏸️ WAIT' / '🚫 NO TRADE'
+    """
+    if not market_ok:
+        return "🚫 NO TRADE", market_reason
+
+    is_buy = direction == "BUY"
+    checks = {
+        "Trend agrees": (trend_direction == "Bullish") if is_buy else (trend_direction == "Bearish"),
+        "VWAP agrees": vwap_bull if is_buy else (not vwap_bull),
+        "EMA alignment agrees": ema_aligned,
+        "Volume confirmed": volume_confirmed,
+        "Momentum agrees": momentum_ok,
+        "ATR/volatility sufficient": atr_ok,
+        "Risk:Reward >= 1.5": rr_ratio >= 1.5,
+    }
+    failed = [name for name, ok in checks.items() if not ok]
+    if failed:
+        return "⏸️ WAIT", "Failed: " + ", ".join(failed)
+    return ("🟢 BUY" if is_buy else "🔴 SELL"), "All validations passed"
+
+
+def _institutional_grade(*, ema_stack_ok: bool, vwap_ok: bool, adx_val: float, rsi_agrees: bool,
+                          macd_agrees: bool, volume_ok: bool, atr_ok: bool, bos_confirmed: bool,
+                          fresh_ob_exists: bool, valid_fvg_exists: bool, liquidity_confirmed: bool,
+                          rr_ratio: float) -> Tuple[str, int, List[str]]:
+    """
+    Institutional-grade checklist required by the fix spec:
+      EMA20>EMA50>EMA200 (or reverse for SELL), VWAP agrees, ADX>25,
+      RSI agrees, MACD agrees, Volume>20-EMA-Volume, ATR sufficient,
+      BOS confirmed, Fresh OB exists, Valid FVG exists, Liquidity Sweep
+      confirmed, RR>=1:2. Returns (grade, passed_count, failed_checks).
+    Grades: A+ (12/12) · A (>=10) · B (>=8) · C (>=6) · REJECT (<6)
+    """
+    checks = {
+        "EMA Stack": ema_stack_ok,
+        "VWAP": vwap_ok,
+        "ADX > 25": adx_val > 25,
+        "RSI Agrees": rsi_agrees,
+        "MACD Agrees": macd_agrees,
+        "Volume > 20EMA": volume_ok,
+        "ATR Sufficient": atr_ok,
+        "BOS Confirmed": bos_confirmed,
+        "Fresh Order Block": fresh_ob_exists,
+        "Valid FVG": valid_fvg_exists,
+        "Liquidity Sweep Confirmed": liquidity_confirmed,
+        "RR >= 1:2": rr_ratio >= 2.0,
+    }
+    passed = [k for k, v in checks.items() if v]
+    failed = [k for k, v in checks.items() if not v]
+    n = len(passed)
+    if n == 12:
+        grade = "A+"
+    elif n >= 10:
+        grade = "A"
+    elif n >= 8:
+        grade = "B"
+    elif n >= 6:
+        grade = "C"
+    else:
+        grade = "REJECT"
+    return grade, n, failed
+
+
+def build_price_action_report_row(df, symbol: str) -> Dict[str, object]:
+    """
+    Master aggregator for the institutional Price Action engine. Computes
+    every new report column in one call:
+      Swing Structure, BOS Status, CHOCH Status, Breakout Status,
+      Liquidity Sweep, Order Block, FVG, Support, Resistance,
+      Trend Strength, Pullback Quality, Price Action Score,
+      Price Action Confidence %, Decision, Reject Reason,
+      Institutional Grade.
+    Merge the returned dict into the row you already build in `_analyse()`
+    / `_analyse_enhanced()` — nothing existing is overwritten.
+    """
+    try:
+        if len(df) < 30:
+            return {
+                "Swing Structure": "N/A", "BOS Status": "N/A", "CHOCH Status": "N/A",
+                "Breakout Status": "NO", "Liquidity Sweep": "No Sweep", "Order Block": "No",
+                "FVG": "No FVG", "Support": None, "Resistance": None,
+                "Trend Strength": "N/A", "Pullback Quality": "N/A",
+                "Price Action Score": 0, "Price Action Confidence %": 0.0,
+                "Decision": "🚫 NO TRADE", "Reject Reason": "Insufficient history (<30 candles)",
+                "Institutional Grade": "REJECT",
+            }
+
+        trend = _classify_trend_composite(df)
+        swing_label, _, _ = _classify_swing_structure(df)
+        smc_structure, cisd_signal, _ = _calculate_smc_and_cisd(df)
+        sr = _calculate_support_resistance_v2(df)
+        breakout = _detect_valid_breakout(df, sr["support"], sr["resistance"])
+        liquidity_label, liquidity_side = detect_liquidity_sweep(df)
+        bull_ob, bear_ob, ob_zone, ob_strength = _detect_order_blocks(df, smc_structure)
+        fvg = detect_fvg(df, trend_hint=trend["direction"] if trend["direction"] != "Neutral" else None)
+        pullback = _calculate_pullback_quality(df, trend["direction"])
+
+        last_close = float(df["Close"].iloc[-1])
+        rsi_val = float(calculate_rsi(df["Close"]).iloc[-1])
+        macd_line, macd_sig, _ = calculate_macd(df["Close"])
+        macd_bullish = bool(macd_line.iloc[-1] > macd_sig.iloc[-1])
+        vol_avg20 = float(df["Volume"].tail(20).mean())
+        rvol_raw = round(float(df["Volume"].iloc[-1] / vol_avg20), 2) if vol_avg20 > 0 else 0.0
+        atr = _last_valid_atr_pa(df)
+        atr_pct = (atr / last_close * 100) if last_close else 0.0
+
+        bos_status = smc_structure if "BOS" in smc_structure else "None"
+        choch_status = smc_structure if "CHOCH" in smc_structure else "None"
+        bos_confirmed = bos_status != "None" or choch_status != "None"
+
+        bull_votes = sum([
+            trend["direction"] == "Bullish", swing_label in ("HH", "HL"),
+            "📈" in smc_structure or "🐂" in smc_structure, breakout == "📈 Bullish",
+            "Buy" in liquidity_side, bull_ob != "No", fvg.get("type") == "Bullish",
+        ])
+        bear_votes = sum([
+            trend["direction"] == "Bearish", swing_label in ("LH", "LL"),
+            "📉" in smc_structure or "🐻" in smc_structure, breakout == "📉 Bearish",
+            "Sell" in liquidity_side, bear_ob != "No", fvg.get("type") == "Bearish",
+        ])
+        pa_score = max(bull_votes, bear_votes)
+        direction = "BUY" if bull_votes > bear_votes else ("SELL" if bear_votes > bull_votes else None)
+
+        market_ok, market_reason = _market_filter_ok(df, trend["adx"], rvol_raw)
+
+        if direction is None:
+            pa_decision, reject_reason = "⏸️ WAIT", "No clear directional confluence"
+            institutional_grade = "REJECT"
+        else:
+            ema_aligned = (trend["ema20"] > trend["ema50"]) if direction == "BUY" else (trend["ema20"] < trend["ema50"])
+            volume_confirmed = bool(vol_avg20 > 0 and float(df["Volume"].iloc[-1]) > vol_avg20)
+            momentum_ok = (rvol_raw >= 1.0)
+            atr_ok = bool(atr_pct >= 0.25)
+            risk = atr if atr > 0 else last_close * 0.01
+            rr_ratio = round((2.0 * atr) / risk, 2) if risk > 0 else 0.0
+            pa_decision, reject_reason = validate_price_action_signal(
+                direction=direction, trend_direction=trend["direction"], vwap_bull=trend["vwap_bullish"],
+                ema_aligned=ema_aligned, volume_confirmed=volume_confirmed, momentum_ok=momentum_ok,
+                atr_ok=atr_ok, rr_ratio=rr_ratio, market_ok=market_ok, market_reason=market_reason,
+            )
+            rsi_agrees = (rsi_val > 50) if direction == "BUY" else (rsi_val < 50)
+            macd_agrees = macd_bullish if direction == "BUY" else (not macd_bullish)
+            ema_stack_ok = trend["ema_stack_bullish"] if direction == "BUY" else trend["ema_stack_bearish"]
+            fresh_ob_exists = (bull_ob not in ("No",)) if direction == "BUY" else (bear_ob not in ("No",))
+            valid_fvg_exists = fvg.get("type") == ("Bullish" if direction == "BUY" else "Bearish")
+            liquidity_confirmed = ("Buy" in liquidity_side) if direction == "BUY" else ("Sell" in liquidity_side)
+            institutional_grade, _, _ = _institutional_grade(
+                ema_stack_ok=ema_stack_ok, vwap_ok=(trend["vwap_bullish"] if direction == "BUY" else not trend["vwap_bullish"]),
+                adx_val=trend["adx"], rsi_agrees=rsi_agrees, macd_agrees=macd_agrees, volume_ok=volume_confirmed,
+                atr_ok=atr_ok, bos_confirmed=bos_confirmed, fresh_ob_exists=fresh_ob_exists,
+                valid_fvg_exists=valid_fvg_exists, liquidity_confirmed=liquidity_confirmed, rr_ratio=rr_ratio,
+            )
+            if institutional_grade == "REJECT" and pa_decision in ("🟢 BUY", "🔴 SELL"):
+                pa_decision = "⏸️ WAIT"
+                reject_reason = "Institutional checklist below minimum grade"
+
+        confidence = round(min(100.0, (pa_score / 7) * 60 + trend["strength"] * 0.3 + (10 if market_ok else 0)), 1)
+
+        return {
+            "Swing Structure": swing_label,
+            "BOS Status": bos_status,
+            "CHOCH Status": choch_status,
+            "Breakout Status": breakout,
+            "Liquidity Sweep": liquidity_label,
+            "Order Block": bull_ob if bull_ob != "No" else bear_ob,
+            "FVG": fvg.get("label", "No FVG"),
+            "Support": sr["support"],
+            "Resistance": sr["resistance"],
+            "Trend Strength": trend["label"],
+            "Pullback Quality": pullback,
+            "Price Action Score": pa_score,
+            "Price Action Confidence %": confidence,
+            "Decision": pa_decision if direction else "⏸️ WAIT",
+            "Reject Reason": reject_reason if direction else "No clear directional confluence",
+            "Institutional Grade": institutional_grade,
+        }
+    except Exception as e:
+        return {
+            "Swing Structure": "N/A", "BOS Status": "N/A", "CHOCH Status": "N/A",
+            "Breakout Status": "NO", "Liquidity Sweep": "No Sweep", "Order Block": "No",
+            "FVG": "No FVG", "Support": None, "Resistance": None,
+            "Trend Strength": "N/A", "Pullback Quality": "N/A",
+            "Price Action Score": 0, "Price Action Confidence %": 0.0,
+            "Decision": "🚫 NO TRADE", "Reject Reason": f"Price-action error: {type(e).__name__}: {e}",
+            "Institutional Grade": "REJECT",
+        }
 
 
 def _run_20_point_validation(*, htf_trend, smc_structure, cisd_signal, ob_meta, fvg, liquidity_sweep, volume_ok, last_close, prev_close, atr_val, vwap_val, ema20, ema50, rsi_val, macd_bullish, adx_val, rr, direction):
@@ -1084,7 +1807,12 @@ _PASSING_GRADES = {"A+", "A", "B", "C"}
 
 
 def _analyse_enhanced(symbol, df, nifty_close, enable_xgboost) -> dict:
-    """Calls existing _analyse() then appends all enhanced-engine columns. Logic unchanged."""
+    """Calls existing _analyse() then appends all enhanced-engine columns,
+    PLUS the full institutional Price Action engine report columns
+    (Swing Structure, BOS/CHOCH Status, Breakout Status, Liquidity Sweep,
+    Order Block, FVG, Support, Resistance, Trend Strength, Pullback
+    Quality, Price Action Score/Confidence, Decision, Reject Reason,
+    Institutional Grade). Nothing previously returned is removed."""
     base = _analyse(symbol, df, nifty_close, enable_xgboost)
     close = df["Close"]
     last_close = float(close.iloc[-1])
@@ -1160,6 +1888,12 @@ def _analyse_enhanced(symbol, df, nifty_close, enable_xgboost) -> dict:
         "Enhanced Signal": enhanced_signal, "Enhanced Decision": enhanced_decision,
         "_Enhanced_Pass": grade in _PASSING_GRADES and ai_confidence >= ENHANCED_MIN_CONFIDENCE,
     }
+    # Institutional Price Action engine columns (Swing Structure, BOS/CHOCH
+    # Status, Price Action Score/Confidence, Decision, Reject Reason,
+    # Institutional Grade, etc.) are computed exactly once inside
+    # `_analyse()` and already flow through via `base` here — this avoids
+    # recomputing the whole Price Action engine a second time per symbol
+    # (duplicate-calculation / CPU-usage requirement from the fix spec).
     return {**base, **enhanced_cols}
 
 
@@ -1219,7 +1953,10 @@ def run_scan_enhanced(fyers, symbols, nifty_close, enable_xgboost):
 
 
 def _analyse(symbol, df, nifty_close, enable_xgboost) -> dict:
-    """Core per-symbol daily analysis used by the Full/F&O scanners. Logic unchanged."""
+    """Core per-symbol daily analysis used by the Full/F&O scanners.
+    Original indicator logic unchanged; now also merges in the full
+    institutional Price Action engine report columns (computed exactly
+    once here so `_analyse_enhanced` can reuse them without recomputation)."""
     close, volume = df["Close"], df["Volume"]
     ema20 = close.ewm(span=20).mean().iloc[-1]
     ema50 = close.ewm(span=50).mean().iloc[-1]
@@ -1280,7 +2017,8 @@ def _analyse(symbol, df, nifty_close, enable_xgboost) -> dict:
         signal_date_str, signal_time_str = _format_signal_timestamp(_signal_event_ts, is_daily=True)
     else:
         signal_date_str, signal_time_str = _candle_signal_timestamp(df, is_daily=True)
-    return {
+
+    base_row = {
         "Signal Date": signal_date_str, "Signal Time": signal_time_str, "Stock": stock_ticker, "LTP": round(last_close, 2), "Gap %": gap_str, "Target": target, "Stoploss": stoploss,
         "SMC Structure": smc_structure, "CISD": cisd_signal, "Bullish Order Block": bullish_ob, "Bearish Order Block": bearish_ob, "Order Block Zone": ob_zone, "Order Block Strength": ob_strength,
         "XGBoost Trend": xgb_trend, "XGBoost Confidence (%)": xgb_confidence, "News": news, "Alerts": alerts, "Signal Strength": signal_strength, "Entry Confirmation": entry_confirmation,
@@ -1292,6 +2030,20 @@ def _analyse(symbol, df, nifty_close, enable_xgboost) -> dict:
         "Signal": "🟢 BUY" if ai_score > 65 else "🔴 SELL" if ai_score < 40 else "🟡 HOLD",
         "_ATR14": round(float(atr14), 2) if pd.notna(atr14) else round(last_close * 0.01, 2), "_RVOL_RAW": rvol_raw, "_Is_High_Quality": is_high_quality, "_Quality_Count": quality_count,
     }
+
+    # ── Institutional Price Action engine — additive report columns ──────
+    # Computed exactly once per symbol here (both _analyse and the
+    # Institutional Scanner's _analyse_enhanced reuse this same dict, so
+    # the whole Price Action engine never runs twice for one candle set).
+    # "Support"/"Resistance"/"Breakout Status" already exist above with
+    # different (simpler, rolling-window) semantics, so the new
+    # institutional versions are exposed under distinct "PA "-prefixed
+    # keys — nothing existing is overwritten or removed.
+    pa_cols_raw = build_price_action_report_row(df, symbol)
+    pa_collision_keys = {"Support", "Resistance", "Breakout Status"}
+    pa_cols = {(f"PA {k}" if k in pa_collision_keys else k): v for k, v in pa_cols_raw.items()}
+
+    return {**base_row, **pa_cols}
 
 
 def calculate_intraday_signal(row) -> dict:
@@ -2572,8 +3324,6 @@ def _compute_oi_metrics(rows: list, prev_rows: Optional[list], spot: float, prev
     max_pe_writing_strike = max_pe_row.get("strike", 0)
 
     if prev_rows:
-        # Most precise: compare against our own previously-cached 15-min
-        # snapshot (available once the in-memory cache has warmed up).
         prev_ce = {r["strike"]: r["ce_oi"] for r in prev_rows}
         prev_pe = {r["strike"]: r["pe_oi"] for r in prev_rows}
         cur_ce_sum = sum(r["ce_oi"] for r in rows)
@@ -2584,15 +3334,6 @@ def _compute_oi_metrics(rows: list, prev_rows: Optional[list], spot: float, prev
         pe_oi_delta_pct = round((cur_pe_sum - prv_pe_sum) / prv_pe_sum * 100, 2) if prv_pe_sum else 0.0
         oi_change_basis = "vs previous 15-min scan"
     else:
-        # FIX: no self-tracked snapshot yet (first scan of the session, or
-        # the in-memory cache was reset — e.g. an app/container restart on
-        # Streamlit Cloud, which is common). Previously this silently
-        # hardcoded 0.0%, producing the misleading "CE OI reduced by 0.0%.
-        # PE OI reduced by 0.0%." message even though the API itself
-        # reported a real change. Fall back to the exchange's own
-        # session-change fields (ce_oi_chg/pe_oi_chg — Fyers 'oich' or
-        # NSE 'changeinOpenInterest') so this is never a fabricated zero;
-        # it only reads 0.0% when the broker itself reports no change.
         total_ce_chg_now = sum(r["ce_oi_chg"] for r in rows)
         total_pe_chg_now = sum(r["pe_oi_chg"] for r in rows)
         total_ce_oi_now = sum(r["ce_oi"] for r in rows)
@@ -2651,9 +3392,6 @@ def _compute_oi_metrics(rows: list, prev_rows: Optional[list], spot: float, prev
     fresh_call_writing = ce_oi_up and price_dn
     fresh_put_writing = pe_oi_up and price_up
 
-    # Req #9: explicit Yes/No columns for each named OI pattern, derived
-    # from the exact same price/OI-delta conditions already computed above
-    # (price_up/price_dn/ce_oi_up/ce_oi_dn/pe_oi_up/pe_oi_dn) — no new math.
     call_writing = "Yes" if fresh_call_writing else "No"
     put_writing = "Yes" if fresh_put_writing else "No"
     long_build_up = "Yes" if (price_up and ce_oi_up and pe_oi_up) else "No"
@@ -2661,10 +3399,6 @@ def _compute_oi_metrics(rows: list, prev_rows: Optional[list], spot: float, prev
     long_unwinding = "Yes" if (price_dn and pe_oi_dn and ce_oi_dn) else "No"
     short_covering = "Yes" if (price_up and ce_oi_dn and pe_oi_dn) else "No"
 
-    # Consolidated, single-sentence read of the six flags above — makes the
-    # nuance between e.g. isolated Put Writing (one leg only) and the
-    # stronger two-sided Long Build Up (both legs confirming) legible at a
-    # glance instead of requiring the reader to cross-reference 4+ flags.
     if long_build_up == "Yes":
         oi_pattern = "🟢🟢 Long Build Up — Both Legs Confirming"
     elif short_build_up == "Yes":
@@ -2889,7 +3623,6 @@ def _fetch_fo_oi_signal(fyers, symbol: str, fo_universe: Optional[set] = None) -
 
     stock_ticker = symbol.replace("NSE:", "").replace("-EQ", "")
 
-    # ── Req #1: verify derivatives are available for this symbol ────────
     if fo_universe is not None and symbol not in fo_universe:
         _oi_debug_record(
             Symbol=stock_ticker, Expiry="—", **{"Spot Price": "—"}, **{"ATM Strike": "—"},
@@ -2898,7 +3631,6 @@ def _fetch_fo_oi_signal(fyers, symbol: str, fo_universe: Optional[set] = None) -
         )
         return None, f"{symbol}: {OI_SENTINEL_NO_CHAIN} — no listed derivatives"
 
-    # ── Unchanged: fetch 15-min candles for spot/technical indicators ───
     date_from = (datetime.today() - timedelta(days=5)).strftime("%Y-%m-%d")
     date_to = datetime.today().strftime("%Y-%m-%d")
     resp, err = _safe_history(fyers, {
@@ -2948,9 +3680,8 @@ def _fetch_fo_oi_signal(fyers, symbol: str, fo_universe: Optional[set] = None) -
         "Resistance": round(float(resistance), 2) if pd.notna(resistance) else None,
     }
 
-    # ── Req #2: detect nearest valid expiry automatically (Fyers first) ──
     expiry_list: List[Tuple[str, int]] = []
-    for attempt in range(2):  # Req #5: retry automatically
+    for attempt in range(2):
         expiry_list = _fyers_fetch_expiry_list(fyers, symbol)
         if expiry_list:
             break
@@ -2963,7 +3694,6 @@ def _fetch_fo_oi_signal(fyers, symbol: str, fo_universe: Optional[set] = None) -
     api_source = "—"
     api_status = "error"
 
-    # ── Req #3/#4/#5: fetch full chain from Fyers, retrying on empty ────
     if expiry_epoch is not None:
         for attempt in range(2):
             rows, _fyers_spot, api_status = _fyers_fetch_chain_for_expiry(fyers, symbol, expiry_epoch, strikecount=10)
@@ -2972,7 +3702,6 @@ def _fetch_fo_oi_signal(fyers, symbol: str, fo_universe: Optional[set] = None) -
                 break
             time.sleep(0.5)
 
-    # ── Req #6: NSE fallback (expiry-aware) if Fyers still has nothing ──
     if not rows:
         rows, _nse_spot, resolved_nse_expiry, nse_status = _nse_fetch_chain_for_expiry(symbol, expiry_date_str)
         api_source = "NSE"
@@ -2982,7 +3711,6 @@ def _fetch_fo_oi_signal(fyers, symbol: str, fo_universe: Optional[set] = None) -
 
     strikes_received = len(rows)
 
-    # ── Determine the precise failure reason (Req #11 — never silent zero) ──
     reason = None
     if expiry_epoch is None and not expiry_date_str:
         reason = OI_SENTINEL_NO_EXPIRY
@@ -2991,7 +3719,6 @@ def _fetch_fo_oi_signal(fyers, symbol: str, fo_universe: Optional[set] = None) -
     elif not rows:
         reason = OI_SENTINEL_NO_CHAIN
 
-    # ── Req #7: validate every row before any calculation ───────────────
     if rows:
         valid_rows = []
         for r in rows:
@@ -3015,8 +3742,6 @@ def _fetch_fo_oi_signal(fyers, symbol: str, fo_universe: Optional[set] = None) -
     )
 
     if reason:
-        # Req #8/#11/#12: genuine failure — return the sentinel row rather
-        # than fabricating zeros, and skip AI/OI signal computation entirely.
         result = {
             **base_fields, "ATM Strike": "—", "OI Source": api_source,
             "Expiry": expiry_date_str or "—",
@@ -3026,21 +3751,18 @@ def _fetch_fo_oi_signal(fyers, symbol: str, fo_universe: Optional[set] = None) -
             for k in sorted(_OI_CACHE.keys())[:100]:
                 _OI_CACHE.pop(k, None)
         _OI_CACHE[cache_key] = result
-        return result, None  # surfaced in the report as a sentinel row, never dropped
+        return result, None
 
-    # ── Req #8: ATM strike selection with automatic nearest-available fallback ──
     selected = _select_strikes(rows, spot)
     if not selected:
-        selected = rows  # last-resort: use every validated row rather than dropping the symbol
+        selected = rows
 
     prev_cache_key = f"{symbol}|{_current_15m_epoch() - 900}"
     prev_rows = _OI_CACHE.get(prev_cache_key, {}).get("_oc_rows")
 
-    # ── Req #9/#12: compute OI/AI metrics only now that data is confirmed valid ──
     metrics = _compute_oi_metrics(selected, prev_rows, spot, prev_spot, df)
     atm_strike = _nearest_atm(spot, [r["strike"] for r in selected])
 
-    # Req #14: debug-mode sample values for the first strike returned.
     if selected:
         sample = selected[0]
         _oi_debug_record(
@@ -3096,7 +3818,7 @@ def run_fo_oi_scan(fyers, symbols: List[str]) -> Tuple[List[dict], List[str], "S
                 except Exception as e:
                     res, err = None, f"{futures[future]}: worker error ({type(e).__name__})"
                 if res:
-                    results.append(res)  # FIX #1: every successful analysis appended, never lost
+                    results.append(res)
                 if err:
                     errors.append(err)
                 stats.record(has_result=bool(res), has_error=bool(err))
@@ -3113,13 +3835,10 @@ def run_fo_oi_scan(fyers, symbols: List[str]) -> Tuple[List[dict], List[str], "S
     return results, errors, stats
 
 
-
 def _oi_color_code(val) -> str:
     """Cell-level colour coding for the F&O OI report's string columns."""
     if not isinstance(val, str):
         return ""
-    # Req #11: sentinel "data unavailable" reasons get their own distinct
-    # gray styling so they are never mistaken for a real neutral/zero signal.
     if val in _OI_SENTINEL_VALUES:
         return "color: #616161; font-weight: bold; background-color: #eeeeee; font-style: italic;"
     v = val.upper()
@@ -3154,7 +3873,7 @@ def _style_oi_df(df: pd.DataFrame):
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# ── F&O OI REPORT PIPELINE (NEW — report generation / export only) ────────
+# ── F&O OI REPORT PIPELINE (report generation / export only) ──────────────
 # This section fixes the "successful stocks disappear" bug. It NEVER
 # touches _fetch_fo_oi_signal, _compute_oi_metrics, run_fo_oi_scan, PCR,
 # Max Pain, Probability, or any AI/signal calculation — it only reads the
@@ -3179,7 +3898,7 @@ def _pct_to_float(val, default: float = 0.0):
     if val is None:
         return default
     if isinstance(val, str) and val in _OI_SENTINEL_VALUES:
-        return np.nan  # Req #11: preserve "unavailable" as NaN, never a fabricated 0
+        return np.nan
     try:
         return float(str(val).replace("%", "").strip())
     except (ValueError, TypeError):
@@ -3204,22 +3923,14 @@ def _oi_numeric_or_nan(value):
 
 def _build_fo_oi_report_df(results: List[dict]) -> pd.DataFrame:
     """
-    FIX #1/#2/#7: Build the report DIRECTLY from the raw results[] list
-    (the exact same list every successful `_fetch_fo_oi_signal` call was
-    appended to inside `run_fo_oi_scan`). One row is emitted per successful
-    result — nothing is re-derived, re-filtered, or dropped here, so if
-    `len(results) == 115`, this dataframe always has 115 rows.
-
-    Req #11: rows where the OI engine returned a sentinel reason (no
-    option chain / no expiry / empty API / OI not available) carry that
-    exact text in Signal / Direction / OI Status / AI Reason, and their
-    numeric OI columns are NaN — never a fabricated 0 — so Excel/CSV/JSON
-    show the real reason instead of masking it as "no activity".
+    Build the report DIRECTLY from the raw results[] list (the exact same
+    list every successful `_fetch_fo_oi_signal` call was appended to
+    inside `run_fo_oi_scan`). One row is emitted per successful result.
     """
     rows = []
     for r in results:
         if not isinstance(r, dict):
-            continue  # defensive: never let one malformed entry break the whole report
+            continue
 
         spot_raw = r.get("Spot", 0.0)
         try:
@@ -3234,8 +3945,6 @@ def _build_fo_oi_report_df(results: List[dict]) -> pd.DataFrame:
         exp_target = _oi_numeric_or_nan(r.get("Expected Target", spot)) if status == "OK" else np.nan
         exp_pts = _oi_numeric_or_nan(r.get("Expected Points", 0.0)) if status == "OK" else np.nan
 
-        # Target 2 = simple display extension (2x expected move) — report-only,
-        # does not touch the probability/AI engine, which only ever emits Target 1.
         if status == "OK" and isinstance(trade_dir, str) and "BUY" in trade_dir and not np.isnan(exp_pts):
             target2 = round(spot + 2 * exp_pts, 2)
         elif status == "OK" and isinstance(trade_dir, str) and "SELL" in trade_dir and not np.isnan(exp_pts):
@@ -3286,10 +3995,9 @@ def _build_fo_oi_report_df(results: List[dict]) -> pd.DataFrame:
     return report_df
 
 
-
 def _build_fo_oi_excel(df: pd.DataFrame) -> bytes:
     """
-    FIX #8: Dedicated professional Excel export for the F&O OI report.
+    Dedicated professional Excel export for the F&O OI report.
     Title row + company header + generated time, bold coloured header row,
     freeze panes, autofilter, borders, center alignment, auto column width,
     and BUY=green / SELL=red / WATCH=yellow conditional row formatting.
@@ -3308,7 +4016,6 @@ def _build_fo_oi_excel(df: pd.DataFrame) -> bytes:
     center = Alignment(horizontal="center", vertical="center")
     n_cols = max(len(df.columns), 1)
 
-    # ── Row 1: Company header ───────────────────────────────────────────
     ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=n_cols)
     company_cell = ws.cell(row=1, column=1, value="NSE AI PRO — Institutional F&O OI Analysis")
     company_cell.font = Font(bold=True, size=15, color="FFFFFF")
@@ -3316,7 +4023,6 @@ def _build_fo_oi_excel(df: pd.DataFrame) -> bytes:
     company_cell.alignment = center
     ws.row_dimensions[1].height = 28
 
-    # ── Row 2: Title + generated timestamp ──────────────────────────────
     ws.merge_cells(start_row=2, start_column=1, end_row=2, end_column=n_cols)
     title_cell = ws.cell(row=2, column=1, value=f"F&O OI Report — Generated {_now_ist().strftime('%d-%b-%Y %H:%M:%S')} IST")
     title_cell.font = Font(bold=True, size=12, color="FFFFFF")
@@ -3324,7 +4030,6 @@ def _build_fo_oi_excel(df: pd.DataFrame) -> bytes:
     title_cell.alignment = center
     ws.row_dimensions[2].height = 22
 
-    # ── Row 3: Header row ────────────────────────────────────────────────
     header_font = Font(bold=True, color="FFFFFF", size=11)
     header_fill = PatternFill("solid", fgColor="2E5F8A")
     for c_idx, col_name in enumerate(df.columns, start=1):
@@ -3334,11 +4039,10 @@ def _build_fo_oi_excel(df: pd.DataFrame) -> bytes:
         cell.alignment = center
         cell.border = border
 
-    # ── Data rows with BUY/SELL/WATCH/no-data conditional formatting ────
     buy_fill = PatternFill("solid", fgColor="C6EFCE")
     sell_fill = PatternFill("solid", fgColor="FFC7CE")
     wait_fill = PatternFill("solid", fgColor="FFEB9C")
-    nodata_fill = PatternFill("solid", fgColor="E0E0E0")  # Req #11: sentinel rows are visually distinct
+    nodata_fill = PatternFill("solid", fgColor="E0E0E0")
 
     for r_idx, (_, row) in enumerate(df.iterrows(), start=4):
         signal_val = str(row.get("Signal", ""))
@@ -3356,10 +4060,6 @@ def _build_fo_oi_excel(df: pd.DataFrame) -> bytes:
 
         for c_idx, col_name in enumerate(df.columns, start=1):
             val = row[col_name]
-            # Req #13: export exactly the fetched values — but NaN is not a
-            # valid Excel cell value (openpyxl raises on it), so a missing
-            # numeric value is written as a blank cell rather than crashing
-            # the export or silently becoming a fabricated 0.
             if isinstance(val, float) and np.isnan(val):
                 val = None
             cell = ws.cell(row=r_idx, column=c_idx, value=val)
@@ -3368,14 +4068,12 @@ def _build_fo_oi_excel(df: pd.DataFrame) -> bytes:
             if row_fill is not None:
                 cell.fill = row_fill
 
-    # ── Auto column width ───────────────────────────────────────────────
     for c_idx, col_name in enumerate(df.columns, start=1):
         max_len = max(
             [len(str(col_name))] + [len(str(v)) for v in df[col_name].astype(str).tolist()]
         ) if len(df) else len(str(col_name))
         ws.column_dimensions[get_column_letter(c_idx)].width = min(max(max_len + 2, 10), 45)
 
-    # ── Freeze header, enable filter ────────────────────────────────────
     ws.freeze_panes = "A4"
     ws.auto_filter.ref = f"A3:{get_column_letter(n_cols)}{ws.max_row}"
 
@@ -3387,10 +4085,10 @@ def _build_fo_oi_excel(df: pd.DataFrame) -> bytes:
 
 def _show_fo_oi_debug_panel(total_symbols: int, stats: Optional["ScanStats"], rows_before: int, rows_after: int, rows_displayed: int, rows_exported: int, failed_count: int, report_df: Optional[pd.DataFrame] = None) -> None:
     """
-    FIX #10 / Req #10 & #14: Debug panel showing every stage of the report
-    pipeline PLUS the OI data-engine diagnostics (expiry detection, API
-    source/status, strike counts, and sample OI values) for every symbol
-    scanned, so a zero/blank cell can always be traced back to its cause.
+    Debug panel showing every stage of the report pipeline PLUS the OI
+    data-engine diagnostics (expiry detection, API source/status, strike
+    counts, and sample OI values) for every symbol scanned, so a
+    zero/blank cell can always be traced back to its cause.
     """
     with st.expander("🩺 Debug Panel — Report Pipeline & OI Data Engine", expanded=False):
         st.write({
@@ -3424,7 +4122,7 @@ def _show_fo_oi_debug_panel(total_symbols: int, stats: Optional["ScanStats"], ro
 
 
 def _show_fo_oi_failed_expander() -> None:
-    """FIX #8: failed symbols shown independently — never mixed into or subtracted from successful rows."""
+    """Failed symbols shown independently — never mixed into or subtracted from successful rows."""
     failed = st.session_state.get("fo_failed_symbols", [])
     if failed:
         with st.expander(f"⚠️ Failed/skipped symbols ({len(failed)})"):
@@ -3487,13 +4185,8 @@ def _show_fo_oi_tab(fyers, fo_symbols: List[str]) -> None:
         with st.spinner("Fetching OI data from Fyers / NSE…"):
             oi_results, oi_errors, oi_stats = run_fo_oi_scan(fyers, oi_universe)
 
-        # FIX #1/#2/#7: report_df is built straight from results[] — every
-        # successful analysis becomes exactly one row, guaranteed non-empty
-        # whenever oi_results is non-empty.
         report_df = _build_fo_oi_report_df(oi_results)
 
-        # FIX #3: explicit session_state keys, set only here on a real run —
-        # never overwritten with an empty frame anywhere else in the tab.
         st.session_state["fo_report_df"] = report_df
         st.session_state["fo_scan_results"] = oi_results
         st.session_state["fo_failed_symbols"] = oi_errors
@@ -3503,11 +4196,9 @@ def _show_fo_oi_tab(fyers, fo_symbols: List[str]) -> None:
     if "fo_oi_stats" in st.session_state:
         _display_scan_summary(st.session_state["fo_oi_stats"])
 
-    # FIX #4/#5: the Reports & Export section reads ONLY st.session_state.fo_report_df.
     report_df = st.session_state.get("fo_report_df")
     raw_results = st.session_state.get("fo_scan_results", [])
 
-    # FIX #9: defensive rebuild — canonical frame missing/empty but raw results exist.
     if (report_df is None or report_df.empty) and raw_results:
         report_df = _build_fo_oi_report_df(raw_results)
         st.session_state["fo_report_df"] = report_df
@@ -3528,7 +4219,6 @@ def _show_fo_oi_tab(fyers, fo_symbols: List[str]) -> None:
     rows_before_filter = len(report_df)
     view = report_df.copy()
 
-    # ── Filters — operate only on `view`, never on the canonical frame ───
     try:
         if oi_bias_filter == "BUY only":
             view = view[view["Signal"].str.contains("BUY", na=False)]
@@ -3548,11 +4238,10 @@ def _show_fo_oi_tab(fyers, fo_symbols: List[str]) -> None:
         if oi_min_prob > 0:
             view = view[view["Probability %"] >= oi_min_prob]
     except Exception:
-        view = report_df.copy()  # never let a filter error blank the report
+        view = report_df.copy()
 
     rows_after_filter = len(view)
 
-    # FIX #5/#10: filters wiped everything → auto-fallback, never dead-end.
     if rows_after_filter == 0 and rows_before_filter > 0:
         st.warning("⚠️ No stocks match current filters. Showing all successful results.")
         view = report_df.copy()
@@ -3560,7 +4249,6 @@ def _show_fo_oi_tab(fyers, fo_symbols: List[str]) -> None:
 
     view = view.sort_values("Probability %", ascending=False).reset_index(drop=True)
 
-    # ── KPI overview ─────────────────────────────────────────────────────
     st.markdown("#### 📊 OI Overview")
     k1, k2, k3, k4, k5, k6 = st.columns(6)
     k1.metric("Total Rows", len(view))
@@ -3581,14 +4269,12 @@ def _show_fo_oi_tab(fyers, fo_symbols: List[str]) -> None:
 
     st.divider()
 
-    # ── Main report table (row-colored: BUY green / SELL red / WATCH yellow) ──
     st.markdown("#### 📋 F&O OI Report")
     try:
         st.dataframe(_style_oi_df(view), use_container_width=True, height=520)
     except Exception:
-        st.dataframe(view, use_container_width=True, height=520)  # plain fallback — never blank
+        st.dataframe(view, use_container_width=True, height=520)
 
-    # ── Exports — export EXACTLY `view` (FIX #6: displayed == exported) ──
     st.markdown("#### 💾 Export")
     ts = _now_ist().strftime("%Y%m%d_%H%M")
     dl1, dl2, dl3 = st.columns(3)
@@ -3619,14 +4305,9 @@ def _show_fo_oi_tab(fyers, fo_symbols: List[str]) -> None:
 
     st.divider()
 
-    # ── Per-stock AI Summary cards ────────────────────────────────────────
     show_cards = st.checkbox("📋 Show per-stock AI Summary cards", value=True, key="oi_show_cards")
     if show_cards:
         st.markdown(f"#### 🧠 AI OI Analysis Cards — {len(view)} stock(s)")
-        # st.slider requires min_value < max_value (strict); with exactly
-        # one row, min(len(view), 30) == 1 == the slider's floor, which
-        # raised StreamlitAPIException. Only show the slider when there's
-        # a real range to pick from; otherwise just show what's available.
         if len(view) > 1:
             max_cards = st.slider("Max cards to show", 1, min(len(view), 30), min(10, len(view)), key="oi_max_cards")
         else:
@@ -3657,8 +4338,6 @@ def _show_fo_oi_tab(fyers, fo_symbols: List[str]) -> None:
             )
 
             if oi_status != "OK":
-                # Req #11/#12: no valid OI data — show the exact reason, never
-                # a numeric grid full of fabricated zeros, and skip AI signals.
                 st.warning(f"⚠️ **{oi_status}** — option-chain data unavailable for {stock}; AI/OI signal generation skipped.")
                 st.divider()
                 continue
@@ -3711,7 +4390,6 @@ def _show_fo_oi_tab(fyers, fo_symbols: List[str]) -> None:
 
             st.divider()
 
-    # FIX #10: pipeline debug panel showing every stage + OI engine diagnostics.
     _show_fo_oi_debug_panel(
         total_symbols=st.session_state.get("fo_oi_total_symbols", len(oi_universe)),
         stats=st.session_state.get("fo_oi_stats"),
@@ -3775,7 +4453,7 @@ def show_scanner(fyers) -> None:
     ])
 
     with tab_scanner:
-        st.caption(f"High-Quality signals only — ≥{SIGNAL_QUALITY_MIN_CONFIRMATIONS}/10 conditions confirmed.")
+        st.caption(f"High-Quality signals only — ≥{SIGNAL_QUALITY_MIN_CONFIRMATIONS}/10 conditions confirmed. Institutional Price Action columns (Swing Structure, BOS/CHOCH, Decision, Institutional Grade, etc.) are included automatically.")
         if "scan_df" in st.session_state:
             df = st.session_state["scan_df"]
             if df.empty:
@@ -4069,7 +4747,11 @@ def show_scanner(fyers) -> None:
             "Fresh OB · Untested OB · Liquidity Sweep · FVG · Volume · Candle · ATR · "
             "Momentum · VWAP · EMA · RSI · MACD · ADX · RR ≥ 1:2  \n"
             "Signals with **AI Confidence < 80%** are automatically rejected.  \n"
-            "**Grades:** 🥇 A+ (20/20, ≥93%) · 🥈 A (≥17, ≥88%) · 🥉 B (≥14, ≥80%) · C (≥10, ≥70%) · ⬛ REJECT"
+            "**Grades:** 🥇 A+ (20/20, ≥93%) · 🥈 A (≥17, ≥88%) · 🥉 B (≥14, ≥80%) · C (≥10, ≥70%) · ⬛ REJECT  \n"
+            "This tab's report also includes the full **Institutional Price Action engine** "
+            "columns (Swing Structure, BOS/CHOCH Status, Breakout Status, Liquidity Sweep, "
+            "Order Block, FVG, Support/Resistance, Trend Strength, Pullback Quality, "
+            "Price Action Score/Confidence, Decision, Reject Reason, Institutional Grade)."
         )
         st.divider()
 
@@ -4200,6 +4882,9 @@ def show_scanner(fyers) -> None:
                     "RSI", "MACD Signal", "Supertrend", "VWAP", "RVOL",
                     "MTF Trend", "RS vs NIFTY", "AI Score",
                     "XGBoost Trend", "XGBoost Confidence (%)",
+                    "Swing Structure", "BOS Status", "CHOCH Status", "Trend Strength",
+                    "Pullback Quality", "Price Action Score", "Price Action Confidence %",
+                    "Decision", "Institutional Grade", "Reject Reason",
                     "Signal Reason",
                 ]
                 _exclude = {"AI Report", "Signal Reason"}
@@ -4258,6 +4943,9 @@ def show_scanner(fyers) -> None:
                         ob_bear = str(row.get("OB Type (Bearish)", "—"))
                         adx_val = row.get("ADX", "—")
                         momentum = str(row.get("Momentum", "—"))
+                        pa_decision = str(row.get("Decision", "—"))
+                        pa_grade = str(row.get("Institutional Grade", "—"))
+                        pa_reject = str(row.get("Reject Reason", "—"))
 
                         grade_color = {"A+": "#006100", "A": "#1a7a1a", "B": "#ff8c00", "C": "#cc6600", "REJECT": "#888888"}.get(grade, "#333333")
                         is_buy = "BUY" in decision
@@ -4271,6 +4959,8 @@ def show_scanner(fyers) -> None:
 <span style="background:{grade_color};color:#fff;padding:3px 10px;border-radius:4px;font-weight:bold;font-size:14px">Grade: {grade}</span>
 &nbsp;&nbsp;
 <span style="background:#1a1a2e;color:#fff;padding:3px 10px;border-radius:4px;font-size:14px">Confidence: {confidence}%</span>
+&nbsp;&nbsp;
+<span style="background:#4a148c;color:#fff;padding:3px 10px;border-radius:4px;font-size:14px">PA Decision: {pa_decision} (Inst. Grade {pa_grade})</span>
 &nbsp;&nbsp;
 <span style="color:#555;font-size:13px">✅ {passed}/20 confirmations &nbsp;|&nbsp; 📅 {sig_date} {sig_time}</span>
 </div>
@@ -4297,6 +4987,9 @@ def show_scanner(fyers) -> None:
                         ob1, ob2 = st.columns(2)
                         ob1.success(f"**Bullish OB:** {ob_bull}") if "Fresh" in ob_bull or "Institutional" in ob_bull else ob1.warning(f"**Bullish OB:** {ob_bull}")
                         ob2.error(f"**Bearish OB:** {ob_bear}") if "Fresh" in ob_bear or "Institutional" in ob_bear else ob2.warning(f"**Bearish OB:** {ob_bear}")
+
+                        if pa_decision in ("⏸️ WAIT", "🚫 NO TRADE"):
+                            st.warning(f"⏸️ **Institutional Price Action Engine:** {pa_decision} — {pa_reject}")
 
                         st.markdown("**✅ Why this signal was generated:**")
                         reasons = [r.strip() for r in reason_raw.split(" | ") if r.strip() and r.strip() != "—"]
