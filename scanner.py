@@ -5065,3 +5065,294 @@ def show_scanner(fyers) -> None:
 
 # Pass your Fyers object here:
 # show_scanner(fyers)
+# ════════════════════════════════════════════════════════════════════════
+# VOLUME TOP / BOTTOM IDENTIFIER  —  additive module
+# ────────────────────────────────────────────────────────────────────────
+# Paste this whole block into your main scanner .py file (anywhere below
+# the existing helper functions such as calculate_rsi / calculate_atr /
+# _validate_symbols / ScanStats / _safe_history, since it reuses them).
+#
+# It does NOT modify or remove anything you already have. It adds:
+#   1. _classify_volume_top_bottom(df)   -> pure detection logic
+#   2. _fetch_volume_top_bottom(...)     -> per-symbol worker (threaded)
+#   3. run_volume_top_bottom_scan(...)   -> batch scan (same pattern as
+#                                            your other run_* functions)
+#   4. A ready-made Streamlit tab block (`tab_vol_tb`) to drop into
+#      show_scanner(), with two separate tables: TOP list and BOTTOM list,
+#      plus Excel/CSV/JSON export.
+#
+# WHAT IT DETECTS
+# ────────────────
+# On the most recently CLOSED daily candle for each stock:
+#   • RVOL = today's volume ÷ 20-day average volume
+#   • Only candles with RVOL >= 2.0x (configurable) are considered
+#   • "Volume Top"    -> close is within 2% of the 20-day high AND shows a
+#                         bearish tell (red candle / long upper wick / RSI>=68)
+#                         => possible exhaustion / distribution top
+#   • "Volume Bottom" -> close is within 2% of the 20-day low AND shows a
+#                         bullish tell (green candle / long lower wick / RSI<=32)
+#                         => possible capitulation / accumulation bottom
+# ════════════════════════════════════════════════════════════════════════
+
+VOL_TB_LOOKBACK = 20          # candles used to define "recent high/low"
+VOL_TB_MIN_RVOL = 2.0         # minimum relative volume to qualify at all
+VOL_TB_PROXIMITY_PCT = 2.0    # must be within this % of the recent high/low
+
+
+def _volume_top_reason(last_close, last_open, upper_wick, body, rsi_val) -> str:
+    reasons = []
+    if last_close < last_open:
+        reasons.append("Red candle on the spike")
+    if upper_wick > body * 1.2:
+        reasons.append("Long upper wick (selling into strength)")
+    if rsi_val >= 68:
+        reasons.append(f"RSI overbought ({rsi_val:.1f})")
+    return ", ".join(reasons) if reasons else "High volume at recent high"
+
+
+def _volume_bottom_reason(last_close, last_open, lower_wick, body, rsi_val) -> str:
+    reasons = []
+    if last_close > last_open:
+        reasons.append("Green candle on the spike")
+    if lower_wick > body * 1.2:
+        reasons.append("Long lower wick (buying into weakness)")
+    if rsi_val <= 32:
+        reasons.append(f"RSI oversold ({rsi_val:.1f})")
+    return ", ".join(reasons) if reasons else "High volume at recent low"
+
+
+def _classify_volume_top_bottom(df) -> dict:
+    """
+    Classifies the most recently CLOSED candle as a Volume Top, Volume
+    Bottom, or Neither. Returns a dict with type = 'TOP' | 'BOTTOM' | 'NONE'.
+    Uses the same calculate_rsi() helper already defined in this file.
+    """
+    if len(df) < VOL_TB_LOOKBACK + 5:
+        return {"type": "NONE"}
+
+    last = df.iloc[-1]
+    recent = df.tail(VOL_TB_LOOKBACK)
+    vol_avg = df["Volume"].tail(VOL_TB_LOOKBACK).mean()
+    rvol = float(last["Volume"] / vol_avg) if vol_avg > 0 else 0.0
+    if rvol < VOL_TB_MIN_RVOL:
+        return {"type": "NONE", "rvol": round(rvol, 2)}
+
+    recent_high = float(recent["High"].max())
+    recent_low = float(recent["Low"].min())
+    last_close = float(last["Close"])
+    last_open = float(last["Open"])
+    last_high = float(last["High"])
+    last_low = float(last["Low"])
+
+    dist_from_high_pct = ((recent_high - last_close) / recent_high * 100) if recent_high else 100.0
+    dist_from_low_pct = ((last_close - recent_low) / recent_low * 100) if recent_low else 100.0
+
+    rsi_val = float(calculate_rsi(df["Close"]).iloc[-1])
+    body = abs(last_close - last_open)
+    upper_wick = last_high - max(last_close, last_open)
+    lower_wick = min(last_close, last_open) - last_low
+
+    # --- Volume Top: exhaustion / distribution near the recent high ---
+    if dist_from_high_pct <= VOL_TB_PROXIMITY_PCT:
+        bearish_tell = (last_close < last_open) or (upper_wick > body * 1.2) or (rsi_val >= 68)
+        if bearish_tell:
+            return {
+                "type": "TOP",
+                "rvol": round(rvol, 2),
+                "rsi": round(rsi_val, 1),
+                "reference_level": round(recent_high, 2),
+                "distance_pct": round(dist_from_high_pct, 2),
+                "reason": _volume_top_reason(last_close, last_open, upper_wick, body, rsi_val),
+            }
+
+    # --- Volume Bottom: capitulation / accumulation near the recent low ---
+    if dist_from_low_pct <= VOL_TB_PROXIMITY_PCT:
+        bullish_tell = (last_close > last_open) or (lower_wick > body * 1.2) or (rsi_val <= 32)
+        if bullish_tell:
+            return {
+                "type": "BOTTOM",
+                "rvol": round(rvol, 2),
+                "rsi": round(rsi_val, 1),
+                "reference_level": round(recent_low, 2),
+                "distance_pct": round(dist_from_low_pct, 2),
+                "reason": _volume_bottom_reason(last_close, last_open, lower_wick, body, rsi_val),
+            }
+
+    return {"type": "NONE", "rvol": round(rvol, 2)}
+
+
+def _fetch_volume_top_bottom(fyers, symbol):
+    """Per-symbol worker. Follows the exact same pattern as your other
+    _fetch_* functions (uses _safe_history / _VALID_EQ_SYMBOL_RE)."""
+    if not isinstance(symbol, str) or not _VALID_EQ_SYMBOL_RE.match(symbol):
+        return None, f"{symbol}: invalid symbol format — skipped"
+    resp, err = _safe_history(fyers, {
+        "symbol": symbol, "resolution": "D", "date_format": "1",
+        "range_from": DATE_FROM, "range_to": DATE_TO, "cont_flag": "1",
+    })
+    if err:
+        return None, f"{symbol}: {err}"
+    candles = resp.get("candles") if resp else None
+    if not candles or len(candles) < VOL_TB_LOOKBACK + 5:
+        return None, f"{symbol}: insufficient history"
+    try:
+        df = pd.DataFrame(candles, columns=["Time", "Open", "High", "Low", "Close", "Volume"])
+        df["Time"] = pd.to_datetime(df["Time"], unit="s", utc=True).dt.tz_convert("Asia/Kolkata")
+        df[["Open", "High", "Low", "Close", "Volume"]] = df[["Open", "High", "Low", "Close", "Volume"]].apply(pd.to_numeric, errors="coerce")
+        df = df.dropna(subset=["Open", "High", "Low", "Close"])
+        if len(df) < VOL_TB_LOOKBACK + 5:
+            return None, f"{symbol}: insufficient valid candle data"
+    except (KeyError, ValueError, TypeError) as e:
+        return None, f"{symbol}: malformed candle data ({e})"
+
+    try:
+        result = _classify_volume_top_bottom(df)
+        if result["type"] == "NONE":
+            return None, None  # not an error, just doesn't qualify
+
+        last_close = float(df["Close"].iloc[-1])
+        last_volume = int(df["Volume"].iloc[-1])
+        vol_avg = float(df["Volume"].tail(VOL_TB_LOOKBACK).mean())
+        stock_ticker = symbol.replace("NSE:", "").replace("-EQ", "")
+        signal_date_str, signal_time_str = _candle_signal_timestamp(df, is_daily=True)
+
+        row = {
+            "Signal Date": signal_date_str,
+            "Signal Time": signal_time_str,
+            "Stock": stock_ticker,
+            "LTP": round(last_close, 2),
+            "Type": "🔴 Volume TOP" if result["type"] == "TOP" else "🟢 Volume BOTTOM",
+            "RVOL": _format_rvol_display(result["rvol"]),
+            "_RVOL_RAW": result["rvol"],
+            "Volume": last_volume,
+            "Avg Volume (20d)": int(vol_avg),
+            "RSI": result["rsi"],
+            f"{VOL_TB_LOOKBACK}D {'High' if result['type'] == 'TOP' else 'Low'}": result["reference_level"],
+            "Distance %": result["distance_pct"],
+            "Reason": result["reason"],
+        }
+        return row, None
+    except (KeyError, IndexError, TypeError, ValueError, ZeroDivisionError, AttributeError) as e:
+        return None, f"{symbol}: analysis error ({type(e).__name__})"
+
+
+def run_volume_top_bottom_scan(fyers, symbols):
+    """Threaded batch scan — identical pattern to run_scan() etc."""
+    symbols = _validate_symbols(symbols)
+    results, errors = [], []
+    stats = ScanStats(total=len(symbols))
+    progress = st.progress(0.0, text=f"Scanning Volume Top/Bottom 0 / {len(symbols)}")
+    done = 0
+    for i in range(0, len(symbols), BATCH_SIZE):
+        batch = symbols[i:i + BATCH_SIZE]
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            futures = {executor.submit(_fetch_volume_top_bottom, fyers, s): s for s in batch}
+            for future in as_completed(futures):
+                try:
+                    res, err = future.result()
+                except Exception as e:
+                    res, err = None, f"{futures[future]}: worker error ({type(e).__name__})"
+                if res:
+                    results.append(res)
+                if err:
+                    errors.append(err)
+                stats.record(has_result=bool(res), has_error=bool(err))
+                done += 1
+                progress.progress(done / max(len(symbols), 1), text=f"Scanning Volume Top/Bottom {done} / {len(symbols)}")
+        if i + BATCH_SIZE < len(symbols):
+            time.sleep(BATCH_PAUSE_SECONDS)
+    progress.empty()
+    gc.collect()
+    return results, errors, stats
+
+
+# ════════════════════════════════════════════════════════════════════════
+# STREAMLIT TAB — paste inside show_scanner()
+# ────────────────────────────────────────────────────────────────────────
+# Step A) Add a new tab to your st.tabs([...]) call, e.g. rename the
+#          existing line to add one more label and unpack one more
+#          variable, for example:
+#
+#   (tab_scanner, tab_intraday, tab_swing, tab_fo, tab_intraday_cisd,
+#    tab_fo_cisd, tab_golden_death, tab_premarket, tab_fo_15m_cisd,
+#    tab_live_ob, tab_ema_swing, tab_institutional, tab_fo_oi,
+#    tab_vol_tb) = st.tabs([
+#       "📊 Full Scanner", "⚡ Intraday Scanner", "📈 Swing Trade Scanner",
+#       "🏛️ F&O Stocks Scanner", "🕐 Intraday CISD Signals",
+#       "🎯 F&O CISD Scanner", "✝️ Swing Trading (Golden/Death Cross)",
+#       "🌅 Pre-Market Scanner", "🎯 NSE F&O 15-Min CISD Scanner",
+#       "🔔 Live OB Signal Scanner", "🌟 EMA 50/200 Swing (4H)",
+#       "🏆 Institutional Scanner", "🔬 F&O OI Analysis",
+#       "🌋 Volume Top/Bottom Scanner",
+#   ])
+#
+# Step B) Paste the `with tab_vol_tb:` block below anywhere among the
+#          other `with tab_xxx:` blocks in show_scanner().
+# ════════════════════════════════════════════════════════════════════════
+
+VOL_TB_TAB_CODE = '''
+    with tab_vol_tb:
+        st.markdown(
+            "### 🌋 Volume Top / Bottom Identifier\\n"
+            f"Flags stocks with a volume spike (RVOL ≥ {VOL_TB_MIN_RVOL}x) landing within "
+            f"{VOL_TB_PROXIMITY_PCT}% of their {VOL_TB_LOOKBACK}-day high or low, "
+            "with a matching bearish/bullish tell — a classic exhaustion-top or "
+            "capitulation-bottom volume signature."
+        )
+        vt_lim = st.number_input("Limit (0=all)", min_value=0, max_value=len(symbols), value=min(300, len(symbols)), step=50, key="vol_tb_limit")
+        vt_universe = symbols if vt_lim == 0 else symbols[:vt_lim]
+        if st.button(f"🌋 Run Volume Top/Bottom Scan ({len(vt_universe)} symbols)", key="vol_tb_run"):
+            with st.spinner("Scanning for volume top/bottom signatures…"):
+                vt_results, vt_errors, vt_stats = run_volume_top_bottom_scan(fyers, vt_universe)
+                st.session_state["vol_tb_df"] = pd.DataFrame(vt_results)
+                st.session_state["vol_tb_errors"] = vt_errors
+                st.session_state["vol_tb_stats"] = vt_stats
+
+        if "vol_tb_stats" in st.session_state:
+            _display_scan_summary(st.session_state["vol_tb_stats"])
+
+        vt_df = st.session_state.get("vol_tb_df")
+        if vt_df is not None and not vt_df.empty:
+            display_cols = [c for c in vt_df.columns if not c.startswith("_")]
+            top_df = vt_df[vt_df["Type"].str.contains("TOP", na=False)][display_cols].sort_values("RSI", ascending=False)
+            bottom_df = vt_df[vt_df["Type"].str.contains("BOTTOM", na=False)][display_cols].sort_values("RSI", ascending=True)
+
+            k1, k2, k3 = st.columns(3)
+            k1.metric("Total Signals", len(vt_df))
+            k2.metric("🔴 Volume Tops", len(top_df))
+            k3.metric("🟢 Volume Bottoms", len(bottom_df))
+
+            st.markdown("#### 🔴 Volume Top Candidates (possible exhaustion / distribution)")
+            if not top_df.empty:
+                st.dataframe(_style_dataframe(top_df), use_container_width=True, height=350)
+            else:
+                st.caption("No Volume Top signals found in this scan.")
+
+            st.markdown("#### 🟢 Volume Bottom Candidates (possible capitulation / accumulation)")
+            if not bottom_df.empty:
+                st.dataframe(_style_dataframe(bottom_df), use_container_width=True, height=350)
+            else:
+                st.caption("No Volume Bottom signals found in this scan.")
+
+            st.markdown("#### 💾 Export")
+            ts = _now_ist().strftime("%Y%m%d_%H%M")
+            e1, e2, e3 = st.columns(3)
+            with e1:
+                st.download_button(
+                    "📥 Download Full List (Excel)",
+                    data=to_excel_bytes_multi({"Volume Tops": top_df, "Volume Bottoms": bottom_df}),
+                    file_name=f"volume_top_bottom_{ts}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key="dl_vol_tb_xlsx",
+                )
+            with e2:
+                st.download_button("📥 CSV", data=to_csv_bytes(vt_df[display_cols]), file_name=f"volume_top_bottom_{ts}.csv", mime="text/csv", key="dl_vol_tb_csv")
+            with e3:
+                st.download_button("📥 JSON", data=to_json_bytes(vt_df[display_cols]), file_name=f"volume_top_bottom_{ts}.json", mime="application/json", key="dl_vol_tb_json")
+        else:
+            st.info("Run a Volume Top/Bottom scan above.")
+
+        if st.session_state.get("vol_tb_errors"):
+            with st.expander(f"⚠️ Skipped ({len(st.session_state['vol_tb_errors'])})"):
+                st.text("\\n".join(st.session_state["vol_tb_errors"][:20]))
+'''
