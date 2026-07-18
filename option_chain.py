@@ -32,6 +32,12 @@ Streamlit + FYERS API v3 dashboard with:
     Gamma monitoring with Gamma Change / Change % / Trend / Signal /
     Strength / Trade Action / AI Rating, blinking Buy/Sell rows, smart
     alerts, optional audio ping, and a live summary panel.
+  • 15-Minute Top / Bottom Volume Scanner (NEW, additive — see section
+    5H / render_volume_scanner_tab): scans a configurable watchlist of
+    indices + F&O stocks on the 15m timeframe and ranks them by Top /
+    Bottom relative volume, in a new 8th tab, so unusual volume activity
+    across the whole watchlist can be spotted at a glance instead of
+    checking one symbol at a time.
 
 FIX NOTE (this file):
   render_scalping_html_table() previously looked up the column key
@@ -93,6 +99,18 @@ FIX NOTE 5 (this file):
   left in place (unused) so no existing function is removed. Nothing about
   the UI, tabs, API calls, or Excel export changed — only which function
   populates the AI Trade Signals tab's `signals` list.
+
+FIX NOTE 6 (this file):
+  Added a new 8th tab, "📡 15m Volume Scanner" (render_volume_scanner_tab,
+  imported from the new companion module volume_scanner.py). It scans a
+  configurable watchlist of indices + F&O stocks on the 15-minute
+  timeframe, comparing each symbol's latest completed bar volume against
+  its own trailing 20-bar average, and ranks the watchlist into Top /
+  Bottom relative-volume tables. This is purely additive: tab1-tab7 and
+  every function above this note are byte-for-byte unchanged; the only
+  edits are (a) one new import, (b) tab1..tab7 -> tab1..tab8 in the
+  st.tabs(...) call, and (c) one new `with tab8:` block after the
+  existing `with tab7:` block.
 """
 
 import io
@@ -113,6 +131,10 @@ from plotly.subplots import make_subplots
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
+
+# NEW (FIX NOTE 6) — 15m Top/Bottom Volume Scanner tab. Additive only;
+# nothing below this line was changed to accommodate this import.
+from volume_scanner import render_volume_scanner_tab
 
 # ─── Logging (used by the FYERS -> NSE automatic fallback layer) ──────────
 logger = logging.getLogger("options_chain_dashboard")
@@ -4314,9 +4336,10 @@ def show_option_chain(fyers):
 
     st.divider()
 
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs(
         ["📋 Chain Table", "📊 OI Analysis", "📈 IV Skew", "🔥 Big Move Ready",
-         "🤖 AI Trade Signals", "⚡ Gamma Build-up", "🎯 AI Scalping Engine"]
+         "🤖 AI Trade Signals", "⚡ Gamma Build-up", "🎯 AI Scalping Engine",
+         "📡 15m Volume Scanner"]
     )
 
     with tab1:
@@ -4524,6 +4547,12 @@ def show_option_chain(fyers):
                 "🤖 AI Trade Signals tab — until this is enabled at least once this session, that "
                 "tab will correctly stay at WAIT rather than trading on option-chain data alone."
             )
+
+    # NEW (FIX NOTE 6) — 15-Minute Top/Bottom Volume Scanner. Purely
+    # additive: tab1-tab7 above are byte-for-byte unchanged; this is the
+    # only new `with tabN:` block in the whole file.
+    with tab8:
+        render_volume_scanner_tab(fyers)
 
     st.divider()
     st.markdown('<div class="block-title">📥 Export</div>', unsafe_allow_html=True)
