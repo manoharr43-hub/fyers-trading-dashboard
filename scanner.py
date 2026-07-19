@@ -409,13 +409,6 @@ def _last_valid_atr_pa(df, period: int = 14) -> float:
 def detect_chart_pattern(df) -> str:
     """
     INSTITUTIONAL PRICE ACTION ENGINE — candle pattern detector (FIXED).
-
-    Bug fixed vs the original: only Doji/Hammer/Shooting-Star/Engulfing/
-    HH-HL-LH-LL were covered, and there was no minimum size/ATR filter, so
-    patterns fired on statistically meaningless micro-candles. This adds
-    Pin Bar, Morning Star, Evening Star, and Marubozu, and rejects any
-    candle whose total range is too small relative to ATR to mean anything
-    (removes "weak candle" noise per the fix spec).
     """
     if len(df) < 5:
         return "N/A"
@@ -427,18 +420,15 @@ def detect_chart_pattern(df) -> str:
     upper_wick = last["High"] - max(last["Close"], last["Open"])
     lower_wick = min(last["Close"], last["Open"]) - last["Low"]
 
-    # FIX: ignore statistically meaningless micro-candles entirely
     if rng < 0.15 * atr:
         return "No Clear Pattern (Low Volatility)"
 
     if rng > 0 and body / rng < 0.1:
         return "Doji ⚪"
 
-    # Marubozu: body dominates the whole range, negligible wicks either side
     if rng > 0 and body / rng > 0.9 and body > 0.8 * atr:
         return "Bullish Marubozu 🟩" if last["Close"] > last["Open"] else "Bearish Marubozu 🟥"
 
-    # Pin Bar (tighter than Hammer/Shooting Star: dominant wick, tiny opposite wick)
     if lower_wick > body * 2.5 and upper_wick < body * 0.6 and rng > 0.4 * atr:
         return "Bullish Pin Bar 📌"
     if upper_wick > body * 2.5 and lower_wick < body * 0.6 and rng > 0.4 * atr:
@@ -459,7 +449,6 @@ def detect_chart_pattern(df) -> str:
             and last_hi >= prev_hi and last_lo <= prev_lo and body > 0.3 * atr):
         return "Bearish Engulfing 🔴"
 
-    # Morning Star / Evening Star (3-candle reversal pattern)
     if len(df) >= 3:
         c1, c2, c3 = df.iloc[-3], df.iloc[-2], df.iloc[-1]
         c1_body = abs(c1["Close"] - c1["Open"])
@@ -484,26 +473,9 @@ def detect_chart_pattern(df) -> str:
     return "No Clear Pattern"
 
 
-# ══════════════════════════════════════════════════════════════════════════
-# ── INSTITUTIONAL PRICE ACTION ENGINE — Swing / Structure primitives ──────
-# ══════════════════════════════════════════════════════════════════════════
-
 def _detect_swing_points(df, left: int = 2, right: int = 2,
                           atr_period: int = 14, atr_mult: float = 0.5):
-    """
-    FIX: the original code had no real swing-point concept at all — market
-    structure was inferred from a raw rolling(10).max()/.min(), which
-    reacts to every wick and produces false structure breaks.
-
-    Returns a copy of df with 'is_swing_high' / 'is_swing_low' boolean
-    columns. A bar is only ever marked True if it is the single strict
-    extreme of a `left`+`right` bar fractal window AND that window is
-    fully inside already-closed history — i.e. a swing near the live edge
-    of the data is simply not confirmed yet (this is what prevents
-    repainting / look-ahead bias). Swings closer than `atr_mult`*ATR to
-    the previously kept swing of the same type are treated as the same
-    swing (noise filtering) rather than counted twice.
-    """
+    """FIX: real fractal-based swing-point detection with ATR noise filtering."""
     d = df.reset_index(drop=True).copy()
     n = len(d)
     d["is_swing_high"] = False
@@ -543,12 +515,7 @@ def _detect_swing_points(df, left: int = 2, right: int = 2,
 
 
 def _classify_swing_structure(df, left: int = 2, right: int = 2):
-    """
-    FIX: adds the HH/HL/LH/LL classification that did not previously exist
-    anywhere in the file. Returns (label, last_swing_high_value,
-    last_swing_low_value) describing the most recently CONFIRMED swing
-    relative to the swing of the same type immediately before it.
-    """
+    """FIX: adds HH/HL/LH/LL classification."""
     d = _detect_swing_points(df, left=left, right=right)
     highs = d.loc[d["is_swing_high"], "High"].tolist()
     lows = d.loc[d["is_swing_low"], "Low"].tolist()
@@ -894,23 +861,6 @@ def _determine_entry_and_decision(direction, confirmed_count, ai_score, confiden
 def _calculate_smc_and_cisd(df):
     """
     INSTITUTIONAL PRICE ACTION ENGINE — Smart Money Concepts / CISD (FIXED).
-
-    Bugs fixed vs the original:
-      1. "BOS" was `Close > rolling(10).max().shift(1)` — a single abnormal
-         wick-driven bar could trip it, no volume confirmation, and it used
-         a fixed rolling window instead of real confirmed swing points.
-      2. "CISD" compared only the immediately preceding bar's High/Low —
-         pure noise that re-triggered on almost every bar in a chop market,
-         with no requirement that price actually CLOSE beyond the level.
-      3. No CHOCH concept existed. A CHOCH is only real when a BOS occurs
-         OPPOSITE to the currently established trend — this now tracks
-         trend state explicitly, and suppresses CHOCH labels generated
-         inside a genuinely ranging market (range < 2.5x ATR).
-
-    BOS requires: (a) Close beyond the last CONFIRMED swing high/low, not
-    merely touched by a wick, (b) volume on the breaking candle above its
-    20-period average. Same return shape as before:
-    (smc_structure: str, cisd_signal: str, event_ts: Optional[Timestamp])
     """
     if len(df) < 30:
         return "Range ➖", "None", None
@@ -977,19 +927,9 @@ _OB_VOL_MULTIPLIER = 1.2
 
 def _detect_order_blocks(df, smc_structure):
     """
-    INSTITUTIONAL PRICE ACTION ENGINE — Order Block detector (FIXED).
-
-    Bugs fixed vs the original:
-      - No retest tracking at all: an OB tapped into 5 times was reported
-        identically to a first-touch fresh OB.
-      - "Strength" ignored how many times the zone had since been retested.
-      - No minimum body-size floor, so a tiny/noise candle could seed an OB.
-
-    Fix: after locating the candidate OB candle, walk every bar AFTER it up
-    to the current bar and count re-entries into the zone. 0 = Fresh /
-    Untested. 1 = Tested once (still usable, labeled). 2+ = rejected
-    outright (over-tested / weak, per the "reject multiple retests" spec).
-    Same return shape as before: (bullish_label, bearish_label, ob_zone, ob_strength)
+    INSTITUTIONAL PRICE ACTION ENGINE — Order Block detector (FIXED), with
+    retest tracking: 0 = Fresh/Untested. 1 = Tested once. 2+ = rejected.
+    Returns (bullish_label, bearish_label, ob_zone, ob_strength)
     """
     if len(df) < 15:
         return "No", "No", "—", "—"
@@ -1083,10 +1023,6 @@ def _parse_ob_zone(ob_zone):
         return None, None
 
 
-# ══════════════════════════════════════════════════════════════════════════
-# ── ENHANCED SIGNAL VALIDATION ENGINE (institutional price action) ────────
-# ══════════════════════════════════════════════════════════════════════════
-
 def calculate_adx(df, period: int = 14):
     """ADX. Returns (ADX, +DI, -DI). ADX>25=trending, <20=sideways."""
     h, l, c = df["High"], df["Low"], df["Close"]
@@ -1104,19 +1040,7 @@ def calculate_adx(df, period: int = 14):
 def detect_fvg(df, trend_hint=None) -> dict:
     """
     INSTITUTIONAL PRICE ACTION ENGINE — Fair Value Gap detector (FIXED).
-
-    Bugs fixed vs the original:
-      - Mitigated (>=50% filled) gaps were still returned and labeled
-        "Filled" as if they were a usable signal input — the fix spec
-        explicitly requires rejecting filled FVGs.
-      - No minimum gap-size floor, so 0.01%-of-price rounding noise was
-        treated the same as a genuine imbalance.
-      - Direction was never checked against the prevailing trend.
-
-    Only ever returns an UNMITIGATED gap above a minimum ATR-relative
-    size. `trend_hint` ('Bullish'|'Bearish'|None) is a new OPTIONAL kwarg
-    — existing callers that don't pass it keep the old behaviour (accepts
-    either direction). Same return shape as before (dict).
+    Only ever returns an UNMITIGATED gap above a minimum ATR-relative size.
     """
     empty = {"label": "No FVG", "type": None, "gap_size": 0.0, "filled_pct": 0.0,
               "age_candles": None, "freshness": "—", "mitigated": False, "nearest_dist": None}
@@ -1167,8 +1091,7 @@ def detect_fvg(df, trend_hint=None) -> dict:
 
 
 def classify_order_block(df, smc_structure, fvg) -> dict:
-    """Enhanced OB: Fresh/Mitigated/Institutional/Retail classification. Logic unchanged
-    (now benefits automatically from the fixed _detect_order_blocks above)."""
+    """Enhanced OB: Fresh/Mitigated/Institutional/Retail classification."""
     bullish_ob, bearish_ob, ob_zone, ob_strength = _detect_order_blocks(df, smc_structure)
     last_close = float(df["Close"].iloc[-1])
 
@@ -1197,18 +1120,6 @@ def classify_order_block(df, smc_structure, fvg) -> dict:
 def detect_liquidity_sweep(df) -> Tuple[str, str]:
     """
     INSTITUTIONAL PRICE ACTION ENGINE — Liquidity Sweep detector (FIXED).
-
-    Bugs fixed vs the original:
-      - Only checked the single most recent bar's high/low against a swing
-        range computed from the same trailing window (self-referential and
-        noisy), no Equal-High/Equal-Low pool detection, and no requirement
-        that the reversal actually continue on the NEXT bar (so a sweep
-        that immediately failed still counted as a valid signal).
-
-    Adds Equal-High/Equal-Low liquidity-pool detection (2+ swing highs/lows
-    within a tight ATR-relative tolerance) and requires the bar AFTER the
-    sweep bar to confirm continuation before it is labeled "confirmed".
-    Same return shape as before: (label, side)
     """
     if len(df) < 20:
         return "No Sweep", "None"
@@ -1294,20 +1205,11 @@ def calculate_momentum(df, rsi_val, macd_bullish, adx_val) -> str:
     return "⚪ Weak"
 
 
-# ══════════════════════════════════════════════════════════════════════════
-# ── INSTITUTIONAL PRICE ACTION ENGINE — new structural functions ──────────
-# ══════════════════════════════════════════════════════════════════════════
-
 def _calculate_support_resistance_v2(df, lookback: int = 120) -> Dict[str, object]:
     """
-    FIX: the original support/resistance was a single rolling(20).max()/
-    .min() number — no merging of nearby levels (impossible with only one
-    candidate), and no strength ranking.
-
     Gathers ALL confirmed swing highs/lows over the lookback window,
     clusters ones within an ATR-relative tolerance into one level, counts
-    touches (= strength), prefers multi-touch levels over single-touch
-    ones, and returns the nearest qualifying level on each side of price.
+    touches (= strength), returns the nearest qualifying level per side.
     """
     d = df.tail(lookback).reset_index(drop=True) if len(df) > lookback else df.reset_index(drop=True)
     if len(d) < 15:
@@ -1352,9 +1254,8 @@ def _calculate_support_resistance_v2(df, lookback: int = 120) -> Dict[str, objec
 
 def _classify_trend_composite(df) -> Dict[str, object]:
     """
-    FIX: trend detection must never rely on EMA alone. Combines EMA20/50/200
-    alignment + swing structure (HH/HL/LH/LL) + VWAP position + ADX into one
-    composite trend label and a numeric strength score (0-100).
+    Combines EMA20/50/200 alignment + swing structure (HH/HL/LH/LL) + VWAP
+    position + ADX into one composite trend label and numeric strength (0-100).
     """
     close = df["Close"]
     ema20 = close.ewm(span=20, adjust=False).mean().iloc[-1]
@@ -1406,12 +1307,8 @@ def _classify_trend_composite(df) -> Dict[str, object]:
 
 
 def _calculate_pullback_quality(df, trend_direction: str) -> str:
-    """
-    FIX: pullback logic did not exist at all in the original file. Rejects
-    deep (>61.8%) retracements, confirms the trend leg is still intact, and
-    checks volume contracts during the pullback and expands on the latest
-    continuation bar.
-    """
+    """Rejects deep (>61.8%) retracements, confirms trend leg intact, checks
+    volume contracts during pullback and expands on continuation bar."""
     if trend_direction not in ("Bullish", "Bearish") or len(df) < 15:
         return "N/A"
 
@@ -1446,11 +1343,8 @@ def _calculate_pullback_quality(df, trend_direction: str) -> str:
 
 
 def _market_filter_ok(df, adx_val: float, rvol_raw: float) -> Tuple[bool, str]:
-    """
-    FIX: no market filter existed anywhere. Blocks signals in sideways
-    (ADX<15), low-volatility (ATR%<0.25), low-volume (RVOL<0.5), or
-    abnormally thin (possible holiday/half-day) sessions.
-    """
+    """Blocks signals in sideways (ADX<15), low-volatility (ATR%<0.25),
+    low-volume (RVOL<0.5), or abnormally thin sessions."""
     if len(df) < 20:
         return False, "Insufficient history"
     last_close = float(df["Close"].iloc[-1])
@@ -1472,12 +1366,8 @@ def _market_filter_ok(df, adx_val: float, rvol_raw: float) -> Tuple[bool, str]:
 
 
 def _detect_valid_breakout(df, support: Optional[float], resistance: Optional[float]) -> str:
-    """
-    FIX: breakout detection previously accepted wick-only or low-volume
-    breaks. Requires (1) a CLOSE beyond the level (not a wick), (2) volume
-    above the 20-period average, (3) true range expansion vs ATR (genuine
-    momentum, not a slow drift).
-    """
+    """Requires (1) a CLOSE beyond the level, (2) volume above the 20-period
+    average, (3) true range expansion vs ATR."""
     if len(df) < 25 or support is None or resistance is None:
         return "NO"
     last = df.iloc[-1]
@@ -1499,14 +1389,8 @@ def validate_price_action_signal(*, direction: str, trend_direction: str, vwap_b
                                    ema_aligned: bool, volume_confirmed: bool, momentum_ok: bool,
                                    atr_ok: bool, rr_ratio: float, market_ok: bool,
                                    market_reason: str) -> Tuple[str, str]:
-    """
-    FIX: nothing in the original file could ever output "don't trade" — the
-    composite scores always resolved to some flavor of BUY/SELL/HOLD. This
-    is the hard institutional gate: EVERY check must agree with `direction`
-    or the engine refuses to issue a trade signal.
-    Returns (decision, reject_reason) where decision is one of:
-      '🟢 BUY' / '🔴 SELL' / '⏸️ WAIT' / '🚫 NO TRADE'
-    """
+    """Hard institutional gate: EVERY check must agree with `direction` or
+    the engine refuses to issue a trade signal."""
     if not market_ok:
         return "🚫 NO TRADE", market_reason
 
@@ -1530,14 +1414,7 @@ def _institutional_grade(*, ema_stack_ok: bool, vwap_ok: bool, adx_val: float, r
                           macd_agrees: bool, volume_ok: bool, atr_ok: bool, bos_confirmed: bool,
                           fresh_ob_exists: bool, valid_fvg_exists: bool, liquidity_confirmed: bool,
                           rr_ratio: float) -> Tuple[str, int, List[str]]:
-    """
-    Institutional-grade checklist required by the fix spec:
-      EMA20>EMA50>EMA200 (or reverse for SELL), VWAP agrees, ADX>25,
-      RSI agrees, MACD agrees, Volume>20-EMA-Volume, ATR sufficient,
-      BOS confirmed, Fresh OB exists, Valid FVG exists, Liquidity Sweep
-      confirmed, RR>=1:2. Returns (grade, passed_count, failed_checks).
-    Grades: A+ (12/12) · A (>=10) · B (>=8) · C (>=6) · REJECT (<6)
-    """
+    """Institutional-grade checklist. Grades: A+ (12/12) · A (>=10) · B (>=8) · C (>=6) · REJECT (<6)"""
     checks = {
         "EMA Stack": ema_stack_ok,
         "VWAP": vwap_ok,
@@ -1566,6 +1443,116 @@ def _institutional_grade(*, ema_stack_ok: bool, vwap_ok: bool, adx_val: float, r
     else:
         grade = "REJECT"
     return grade, n, failed
+def _detect_breaker_blocks(df, smc_structure) -> str:
+    """
+    Breaker Block: a prior Order Block that has since been broken THROUGH
+    by a confirmed CLOSE (not a wick) in the opposite direction to its
+    original polarity — it then flips role and acts as support/resistance
+    of the OPPOSITE type to what it originally was.
+      Bearish OB (supply) broken upward by a confirmed close -> Bullish Breaker
+      Bullish OB (demand) broken downward by a confirmed close -> Bearish Breaker
+    Reuses the same body/ATR filter as _detect_order_blocks so it only
+    fires on genuine impulse candles, not noise.
+    """
+    if len(df) < 20:
+        return "No Breaker Block"
+    d = df.reset_index(drop=True)
+    atr = _last_valid_atr_pa(d)
+    vol_avg = d["Volume"].tail(20).mean()
+    lookback = min(_OB_LOOKBACK + 5, len(d) - 2)
+    recent = d.tail(lookback + 2).reset_index(drop=True)
+    n = len(recent)
+    if n < 4:
+        return "No Breaker Block"
+    last_close = float(recent["Close"].iloc[-1])
+
+    for i in range(n - 3, 0, -1):
+        candle = recent.iloc[i]
+        body = abs(candle["Close"] - candle["Open"])
+        if candle["Close"] >= candle["Open"] or body < 0.15 * atr:
+            continue
+        ob_high = float(candle["High"])
+        after = recent.iloc[i + 1:]
+        broke = after[(after["Close"] > ob_high) & (after["Volume"] > (vol_avg or 0))]
+        if not broke.empty and last_close > ob_high:
+            return f"🧱 Bullish Breaker ({round(ob_high, 2)})"
+
+    for i in range(n - 3, 0, -1):
+        candle = recent.iloc[i]
+        body = abs(candle["Close"] - candle["Open"])
+        if candle["Close"] <= candle["Open"] or body < 0.15 * atr:
+            continue
+        ob_low = float(candle["Low"])
+        after = recent.iloc[i + 1:]
+        broke = after[(after["Close"] < ob_low) & (after["Volume"] > (vol_avg or 0))]
+        if not broke.empty and last_close < ob_low:
+            return f"🧱 Bearish Breaker ({round(ob_low, 2)})"
+
+    return "No Breaker Block"
+
+
+def _detect_inverse_fvg(df) -> dict:
+    """
+    Inverse FVG: an FVG that has since been fully invalidated by a CLOSE
+    through its far edge (not merely filled to 50%, which is normal
+    mitigation) — meaning it has flipped polarity and now acts as the
+    opposite type of zone. Uses the same 3-candle imbalance definition as
+    detect_fvg(). Returns {'label', 'type': 'Bullish'|'Bearish'|None, 'level'}.
+    """
+    empty = {"label": "No Inverse FVG", "type": None, "level": None}
+    if len(df) < 6:
+        return empty
+    recent = df.tail(40).reset_index(drop=True)
+    n = len(recent)
+    best = None
+    for i in range(1, n - 1):
+        prev_high = float(recent["High"].iloc[i - 1]); prev_low = float(recent["Low"].iloc[i - 1])
+        next_high = float(recent["High"].iloc[i + 1]); next_low = float(recent["Low"].iloc[i + 1])
+        bullish = prev_high < next_low
+        bearish = prev_low > next_high
+        if not bullish and not bearish:
+            continue
+        gap_low, gap_high = (prev_high, next_low) if bullish else (next_high, prev_low)
+        after = recent.iloc[i + 2:]
+        if after.empty:
+            continue
+        if bullish:
+            invalidated = bool((after["Close"] < gap_low).any())
+            if invalidated:
+                age = n - 1 - i
+                if best is None or age < best[0]:
+                    best = (age, {"label": "Bearish Inverse FVG (was Bullish)", "type": "Bearish", "level": round(gap_low, 2)})
+        else:
+            invalidated = bool((after["Close"] > gap_high).any())
+            if invalidated:
+                age = n - 1 - i
+                if best is None or age < best[0]:
+                    best = (age, {"label": "Bullish Inverse FVG (was Bearish)", "type": "Bullish", "level": round(gap_high, 2)})
+    return best[1] if best else empty
+
+
+def _classify_premium_discount(df, lookback: int = 50) -> str:
+    """
+    Classifies current price within its recent swing range as Premium
+    (upper half, favors selling), Discount (lower half, favors buying), or
+    Golden Zone (61.8%-78.6% Fibonacci retracement from the discount side)
+    — mirrors the Pine Script indicator's Fib Zone logic.
+    """
+    d = df.tail(lookback).reset_index(drop=True) if len(df) > lookback else df.reset_index(drop=True)
+    if len(d) < 10:
+        return "N/A"
+    swing_high = float(d["High"].max())
+    swing_low = float(d["Low"].min())
+    last_close = float(d["Close"].iloc[-1])
+    rng = swing_high - swing_low
+    if rng <= 0:
+        return "N/A"
+    pct_from_low = (last_close - swing_low) / rng
+    if 0.618 <= pct_from_low <= 0.786:
+        return "🟡 Golden Zone"
+    if pct_from_low > 0.5:
+        return "🔴 Premium"
+    return "🟢 Discount"
 
 
 def build_price_action_report_row(df, symbol: str) -> Dict[str, object]:
@@ -1576,7 +1563,7 @@ def build_price_action_report_row(df, symbol: str) -> Dict[str, object]:
       Liquidity Sweep, Order Block, FVG, Support, Resistance,
       Trend Strength, Pullback Quality, Price Action Score,
       Price Action Confidence %, Decision, Reject Reason,
-      Institutional Grade.
+      Institutional Grade, Breaker Block, Inverse FVG, Premium/Discount Zone.
     Merge the returned dict into the row you already build in `_analyse()`
     / `_analyse_enhanced()` — nothing existing is overwritten.
     """
@@ -1590,6 +1577,8 @@ def build_price_action_report_row(df, symbol: str) -> Dict[str, object]:
                 "Price Action Score": 0, "Price Action Confidence %": 0.0,
                 "Decision": "🚫 NO TRADE", "Reject Reason": "Insufficient history (<30 candles)",
                 "Institutional Grade": "REJECT",
+                "Breaker Block": "No Breaker Block", "Inverse FVG": "No Inverse FVG",
+                "Premium/Discount Zone": "N/A",
             }
 
         trend = _classify_trend_composite(df)
@@ -1601,6 +1590,11 @@ def build_price_action_report_row(df, symbol: str) -> Dict[str, object]:
         bull_ob, bear_ob, ob_zone, ob_strength = _detect_order_blocks(df, smc_structure)
         fvg = detect_fvg(df, trend_hint=trend["direction"] if trend["direction"] != "Neutral" else None)
         pullback = _calculate_pullback_quality(df, trend["direction"])
+
+        # ── new: Breaker Block / Inverse FVG / Premium-Discount Zone ──────
+        breaker_block_label = _detect_breaker_blocks(df, smc_structure)
+        inverse_fvg_result = _detect_inverse_fvg(df)
+        premium_discount_zone = _classify_premium_discount(df)
 
         last_close = float(df["Close"].iloc[-1])
         rsi_val = float(calculate_rsi(df["Close"]).iloc[-1])
@@ -1680,6 +1674,9 @@ def build_price_action_report_row(df, symbol: str) -> Dict[str, object]:
             "Decision": pa_decision if direction else "⏸️ WAIT",
             "Reject Reason": reject_reason if direction else "No clear directional confluence",
             "Institutional Grade": institutional_grade,
+            "Breaker Block": breaker_block_label,
+            "Inverse FVG": inverse_fvg_result.get("label", "No Inverse FVG"),
+            "Premium/Discount Zone": premium_discount_zone,
         }
     except Exception as e:
         return {
@@ -1690,6 +1687,8 @@ def build_price_action_report_row(df, symbol: str) -> Dict[str, object]:
             "Price Action Score": 0, "Price Action Confidence %": 0.0,
             "Decision": "🚫 NO TRADE", "Reject Reason": f"Price-action error: {type(e).__name__}: {e}",
             "Institutional Grade": "REJECT",
+            "Breaker Block": "No Breaker Block", "Inverse FVG": "No Inverse FVG",
+            "Premium/Discount Zone": "N/A",
         }
 
 
@@ -1807,12 +1806,7 @@ _PASSING_GRADES = {"A+", "A", "B", "C"}
 
 
 def _analyse_enhanced(symbol, df, nifty_close, enable_xgboost) -> dict:
-    """Calls existing _analyse() then appends all enhanced-engine columns,
-    PLUS the full institutional Price Action engine report columns
-    (Swing Structure, BOS/CHOCH Status, Breakout Status, Liquidity Sweep,
-    Order Block, FVG, Support, Resistance, Trend Strength, Pullback
-    Quality, Price Action Score/Confidence, Decision, Reject Reason,
-    Institutional Grade). Nothing previously returned is removed."""
+    """Calls existing _analyse() then appends all enhanced-engine columns."""
     base = _analyse(symbol, df, nifty_close, enable_xgboost)
     close = df["Close"]
     last_close = float(close.iloc[-1])
@@ -1888,12 +1882,6 @@ def _analyse_enhanced(symbol, df, nifty_close, enable_xgboost) -> dict:
         "Enhanced Signal": enhanced_signal, "Enhanced Decision": enhanced_decision,
         "_Enhanced_Pass": grade in _PASSING_GRADES and ai_confidence >= ENHANCED_MIN_CONFIDENCE,
     }
-    # Institutional Price Action engine columns (Swing Structure, BOS/CHOCH
-    # Status, Price Action Score/Confidence, Decision, Reject Reason,
-    # Institutional Grade, etc.) are computed exactly once inside
-    # `_analyse()` and already flow through via `base` here — this avoids
-    # recomputing the whole Price Action engine a second time per symbol
-    # (duplicate-calculation / CPU-usage requirement from the fix spec).
     return {**base, **enhanced_cols}
 
 
@@ -1954,9 +1942,8 @@ def run_scan_enhanced(fyers, symbols, nifty_close, enable_xgboost):
 
 def _analyse(symbol, df, nifty_close, enable_xgboost) -> dict:
     """Core per-symbol daily analysis used by the Full/F&O scanners.
-    Original indicator logic unchanged; now also merges in the full
-    institutional Price Action engine report columns (computed exactly
-    once here so `_analyse_enhanced` can reuse them without recomputation)."""
+    Original indicator logic unchanged; merges in the full institutional
+    Price Action engine report columns (computed exactly once here)."""
     close, volume = df["Close"], df["Volume"]
     ema20 = close.ewm(span=20).mean().iloc[-1]
     ema50 = close.ewm(span=50).mean().iloc[-1]
@@ -2032,13 +2019,6 @@ def _analyse(symbol, df, nifty_close, enable_xgboost) -> dict:
     }
 
     # ── Institutional Price Action engine — additive report columns ──────
-    # Computed exactly once per symbol here (both _analyse and the
-    # Institutional Scanner's _analyse_enhanced reuse this same dict, so
-    # the whole Price Action engine never runs twice for one candle set).
-    # "Support"/"Resistance"/"Breakout Status" already exist above with
-    # different (simpler, rolling-window) semantics, so the new
-    # institutional versions are exposed under distinct "PA "-prefixed
-    # keys — nothing existing is overwritten or removed.
     pa_cols_raw = build_price_action_report_row(df, symbol)
     pa_collision_keys = {"Support", "Resistance", "Breakout Status"}
     pa_cols = {(f"PA {k}" if k in pa_collision_keys else k): v for k, v in pa_cols_raw.items()}
@@ -2921,8 +2901,7 @@ def _persist_new_live_ob_rows(fyers, new_rows) -> None:
             logger.warning("Could not persist live OB signal for %s: %s", row.get("Stock"), e)
 
 
-EMA_SWING_RESOLUTION = "240"; EMA_SWING_RESOLUTION_MINUTES = 240
-EMA_SWING_LOOKBACK_DAYS = 400; EMA_SWING_FAST_SPAN = 50; EMA_SWING_SLOW_SPAN = 200; EMA_SWING_MIN_CANDLES = 60
+EMA_SWING_RESOLUTION = "240"; EMA_SWING_LOOKBACK_DAYS = 400
 
 
 def _fetch_ema_swing_signal(fyers, symbol):
@@ -2935,72 +2914,53 @@ def _fetch_ema_swing_signal(fyers, symbol):
     if err:
         return None, f"{symbol}: {err}"
     candles = resp.get("candles") if resp else None
-    if not candles or len(candles) < EMA_SWING_MIN_CANDLES:
+    if not candles or len(candles) < 210:
         return None, None
     try:
         df = pd.DataFrame(candles, columns=["Time", "Open", "High", "Low", "Close", "Volume"])
         df["Time"] = pd.to_datetime(df["Time"], unit="s", utc=True).dt.tz_convert("Asia/Kolkata")
         df[["Open", "High", "Low", "Close", "Volume"]] = df[["Open", "High", "Low", "Close", "Volume"]].apply(pd.to_numeric, errors="coerce")
         df = df.dropna(subset=["Open", "High", "Low", "Close"]).sort_values("Time").reset_index(drop=True)
-        if len(df) > 0 and not _is_intraday_candle_closed(df["Time"].iloc[-1], EMA_SWING_RESOLUTION_MINUTES):
-            df = df.iloc[:-1].reset_index(drop=True)
-        if len(df) < EMA_SWING_MIN_CANDLES:
+        if len(df) < 210:
             return None, None
-        close = df["Close"]
-        ema50 = close.ewm(span=EMA_SWING_FAST_SPAN, adjust=False).mean()
-        ema200 = close.ewm(span=EMA_SWING_SLOW_SPAN, adjust=False).mean() if len(close) >= EMA_SWING_SLOW_SPAN else close.ewm(span=len(close), adjust=False).mean()
-        lookback = min(5, len(close) - 1); diff_tail = (ema50 - ema200).tail(lookback + 1)
-        prev_sign = np.sign(diff_tail.iloc[0]); curr_sign = np.sign(diff_tail.iloc[-1])
+        close = df["Close"]; ema50 = close.ewm(span=50, adjust=False).mean(); ema200 = close.ewm(span=200, adjust=False).mean()
+        diff_tail = (ema50 - ema200).tail(3); prev_sign = np.sign(diff_tail.iloc[0]); curr_sign = np.sign(diff_tail.iloc[-1])
         if prev_sign <= 0 and curr_sign > 0:
-            direction = "BUY"; golden_cross, death_cross = "Yes", "No"
+            cross_type = "Golden Cross"
         elif prev_sign >= 0 and curr_sign < 0:
-            direction = "SELL"; golden_cross, death_cross = "No", "Yes"
+            cross_type = "Death Cross"
         else:
             return None, None
-        last_close = float(close.iloc[-1]); ema50_last = round(float(ema50.iloc[-1]), 2); ema200_last = round(float(ema200.iloc[-1]), 2)
-        rsi_val = round(float(calculate_rsi(close).iloc[-1]), 1)
-        macd_line, macd_signal_line, _ = calculate_macd(close); macd_bullish = bool(macd_line.iloc[-1] > macd_signal_line.iloc[-1])
-        vol_avg20 = float(df["Volume"].tail(20).mean()); last_volume = float(df["Volume"].iloc[-1])
-        volume_ok = bool(vol_avg20 > 0 and last_volume > vol_avg20); volume_ratio = round(last_volume / vol_avg20, 2) if vol_avg20 > 0 else 0.0
-        vwap_val = calculate_vwap_approx(df); is_buy = direction == "BUY"
-        if is_buy:
-            confs = {"RSI>55": rsi_val > 55, "MACD Bullish": macd_bullish, "Volume>20avg": volume_ok, "Price>VWAP": vwap_val is not None and last_close > vwap_val}
-        else:
-            confs = {"RSI<45": rsi_val < 45, "MACD Bearish": not macd_bullish, "Volume>20avg": volume_ok, "Price<VWAP": vwap_val is not None and last_close < vwap_val}
-        confirmed_count = sum(confs.values()); all_confirmed = confirmed_count == len(confs)
-        if all_confirmed and is_buy:
-            trade_decision = "🟢 BUY"
-        elif all_confirmed and not is_buy:
-            trade_decision = "🔴 SELL"
+        last_close = float(close.iloc[-1]); rsi_val = round(float(calculate_rsi(close).iloc[-1]), 1)
+        macd_line, macd_sig, _ = calculate_macd(close); macd_bullish = bool(macd_line.iloc[-1] > macd_sig.iloc[-1])
+        vol_avg20 = df["Volume"].tail(20).mean(); rvol_raw = round(float(df["Volume"].iloc[-1] / vol_avg20), 2) if vol_avg20 > 0 else 0.0
+        vwap_val = calculate_vwap_approx(df); is_bull = cross_type == "Golden Cross"
+        confirmations = sum([(rsi_val > 50) if is_bull else (rsi_val < 50), macd_bullish if is_bull else not macd_bullish, rvol_raw >= 1.2, (last_close > vwap_val) if is_bull else (last_close < vwap_val)])
+        if confirmations >= 3:
+            trade_decision = "🟢 BUY" if is_bull else "🔴 SELL"
         else:
             trade_decision = "🟡 WATCH"
-        ds = 1 if is_buy else -1
-        ai_score = round(min(max(50 + ds * (confirmed_count * 10) + ds * min(volume_ratio, 3) * 3, 0), 100), 1)
-        if confirmed_count == 4:
-            swing_trend = "🟢🟢 Strong Bullish Reversal" if is_buy else "🔴🔴 Strong Bearish Reversal"
-        elif confirmed_count >= 2:
-            swing_trend = "🟢 Bullish Bias" if is_buy else "🔴 Bearish Bias"
-        else:
-            swing_trend = "🟡 Weak / Unconfirmed"
         atr = float(calculate_atr(df).iloc[-1])
         if pd.isna(atr) or atr <= 0:
             atr = last_close * 0.01
         entry = round(last_close, 2)
-        if is_buy:
-            stop_loss = round(entry - 2.0 * atr, 2); target1 = round(entry + 2.0 * atr, 2); target2 = round(entry + 3.5 * atr, 2)
+        if is_bull:
+            sl = round(entry - 2.0 * atr, 2); t1 = round(entry + 2.0 * atr, 2); t2 = round(entry + 3.5 * atr, 2); t3 = round(entry + 5.0 * atr, 2)
         else:
-            stop_loss = round(entry + 2.0 * atr, 2); target1 = round(entry - 2.0 * atr, 2); target2 = round(entry - 3.5 * atr, 2)
+            sl = round(entry + 2.0 * atr, 2); t1 = round(entry - 2.0 * atr, 2); t2 = round(entry - 3.5 * atr, 2); t3 = round(entry - 5.0 * atr, 2)
+        ema200_last = float(ema200.iloc[-1]); ema_gap_pct = abs((float(ema50.iloc[-1]) - ema200_last) / ema200_last * 100) if ema200_last else 0
+        ai_score = round(min(max(50 + (15 if is_bull else -15) + confirmations * 5 + min(rvol_raw, 3) * 4, 0), 100), 1)
         stock_ticker = symbol.replace("NSE:", "").replace("-EQ", "")
         signal_date_str, signal_time_str = _candle_signal_timestamp(df, is_daily=False)
-        return {"Signal Date": signal_date_str, "Signal Time": signal_time_str, "Stock": stock_ticker, "LTP": round(last_close, 2), "EMA 50": ema50_last, "EMA 200": ema200_last, "Golden Cross": golden_cross, "Death Cross": death_cross, "RSI": rsi_val, "MACD": "🟢 Bullish" if macd_bullish else "🔴 Bearish", "Volume Ratio": volume_ratio, "VWAP": vwap_val, "AI Score": ai_score, "Swing Trend": swing_trend, "Entry": entry, "Stop Loss": stop_loss, "Target 1": target1, "Target 2": target2, "Trade Decision": trade_decision}, None
-    except Exception as e:
-        return None, f"{symbol}: error ({type(e).__name__})"
+        return {"Signal Date": signal_date_str, "Signal Time": signal_time_str, "Stock": stock_ticker, "Cross Type": cross_type, "Trade Decision": trade_decision, "LTP": entry, "Entry": entry, "Stoploss": sl, "Target 1": t1, "Target 2": t2, "Target 3": t3, "RSI": rsi_val, "MACD Signal": "🟢 Bullish" if macd_bullish else "🔴 Bearish", "VWAP": vwap_val, "RVOL": _format_rvol_display(rvol_raw), "Confirmations": f"{confirmations}/4", "EMA Gap %": round(ema_gap_pct, 2), "AI Score": ai_score}, None
+    except (KeyError, IndexError, TypeError, ValueError, ZeroDivisionError, AttributeError) as e:
+        return None, f"{symbol}: analysis error ({type(e).__name__})"
 
 
 def run_ema_swing_scan(fyers, symbols):
     """Threaded batch scan for the 'EMA 50/200 Swing (4H)' tab. Logic unchanged."""
     symbols = _validate_symbols(symbols); results, errors = [], []
-    stats = ScanStats(total=len(symbols)); progress = st.progress(0.0, text=f"Scanning EMA 50/200 Swing (4H) 0 / {len(symbols)}"); done = 0
+    stats = ScanStats(total=len(symbols)); progress = st.progress(0.0, text=f"Scanning EMA Swing (4H) 0 / {len(symbols)}"); done = 0
     for i in range(0, len(symbols), BATCH_SIZE):
         batch = symbols[i:i + BATCH_SIZE]
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
@@ -3015,803 +2975,324 @@ def run_ema_swing_scan(fyers, symbols):
                 if err:
                     errors.append(err)
                 stats.record(has_result=bool(res), has_error=bool(err)); done += 1
-                progress.progress(done / max(len(symbols), 1), text=f"Scanning EMA 50/200 Swing (4H) {done} / {len(symbols)}")
+                progress.progress(done / len(symbols), text=f"Scanning EMA Swing (4H) {done} / {len(symbols)}")
         if i + BATCH_SIZE < len(symbols):
             time.sleep(BATCH_PAUSE_SECONDS)
     progress.empty(); gc.collect()
     return results, errors, stats
 
 
-# ══════════════════════════════════════════════════════════════════════════
-# ── INSTITUTIONAL F&O OI ANALYSIS MODULE (OI/PCR/Max Pain math unchanged) ─
-# ══════════════════════════════════════════════════════════════════════════
-
-import functools
-import hashlib
-
-_OI_CACHE: dict = {}
-_OI_CACHE_MAX = 500
-
-_NSE_OC_URL = "https://www.nseindia.com/api/option-chain-equities?symbol={}"
+# ════════════════════════════════════════════════════════════════════════
+# F&O OPTION-CHAIN / OPEN-INTEREST ANALYSIS MODULE
+# ════════════════════════════════════════════════════════════════════════
+_NSE_OC_BASE = "https://www.nseindia.com"
+_NSE_OC_EQUITY_URL = _NSE_OC_BASE + "/api/option-chain-equities?symbol={symbol}"
 _NSE_HEADERS = {
-    "User-Agent": "Mozilla/5.0",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Accept-Encoding": "gzip, deflate, br",
-    "Referer": "https://www.nseindia.com/",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+    "Accept": "*/*", "Accept-Language": "en-US,en;q=0.9", "Referer": "https://www.nseindia.com/option-chain",
 }
+_OI_CACHE_TTL_SECONDS = 60 * 3
+_oi_cache: Dict[str, Tuple[float, object]] = {}
+_OI_DEBUG_LOG: List[str] = []
 
 
-def _current_15m_epoch() -> int:
-    """Epoch second of the START of the most recently COMPLETED 15-min candle."""
-    now = int(_now_ist().timestamp())
-    slot = (now // 900) * 900
-    return slot - 900
+def _oi_debug_record(msg: str) -> None:
+    """Append a timestamped line to the in-memory OI debug log (capped)."""
+    _OI_DEBUG_LOG.append(f"{_now_ist().strftime('%H:%M:%S')} | {msg}")
+    if len(_OI_DEBUG_LOG) > 200:
+        del _OI_DEBUG_LOG[: len(_OI_DEBUG_LOG) - 200]
 
 
-def _nearest_atm(spot: float, strikes: list) -> float:
-    if not strikes:
-        return round(spot / 50) * 50
+def _oi_cache_get(key: str):
+    entry = _oi_cache.get(key)
+    if not entry:
+        return None
+    ts, val = entry
+    if time.time() - ts > _OI_CACHE_TTL_SECONDS:
+        _oi_cache.pop(key, None)
+        return None
+    return val
+
+
+def _oi_cache_set(key: str, val) -> None:
+    _oi_cache[key] = (time.time(), val)
+
+
+def _nearest_atm(spot: float, strikes: List[float]) -> Optional[float]:
+    """Return the strike nearest to spot from a list of available strikes."""
+    if not strikes or spot is None:
+        return None
     return min(strikes, key=lambda s: abs(s - spot))
 
 
-def _oi_cache_key(symbol: str) -> str:
-    epoch = _current_15m_epoch()
-    return f"{symbol}|{epoch}"
+_nse_session = requests.Session()
+_nse_session.headers.update(_NSE_HEADERS)
 
 
-# ── OI Data Engine — sentinel statuses (Req #11: never silently zero-fill) ──
-OI_SENTINEL_NO_CHAIN = "No Option Chain"
-OI_SENTINEL_NO_EXPIRY = "Expiry Not Found"
-OI_SENTINEL_EMPTY_API = "API Returned Empty Data"
-OI_SENTINEL_NOT_AVAILABLE = "OI Not Available"
-_OI_SENTINEL_VALUES = {OI_SENTINEL_NO_CHAIN, OI_SENTINEL_NO_EXPIRY, OI_SENTINEL_EMPTY_API, OI_SENTINEL_NOT_AVAILABLE}
-
-# ── OI Data Engine — debug log ring buffer (Req #10/#14) ────────────────────
-_OI_DEBUG_LOG: List[dict] = []
-_OI_DEBUG_LOG_MAX = 300
-
-
-def _oi_debug_record(**fields) -> None:
+def _nse_fetch_chain_for_expiry(symbol_ticker: str, expiry: Optional[str] = None):
     """
-    Append one structured diagnostic record (Symbol, Expiry, Spot Price,
-    ATM Strike, API Response Status, Number of Strikes Received, API
-    Source, Reason, and — when available — Sample CE/PE OI & change) to
-    the in-memory debug ring buffer AND to scanner.log. Never raises, so a
-    logging failure can never break the scan itself.
+    Fetch the live option chain for `symbol_ticker` from the NSE public API,
+    optionally filtered to a single expiry. Returns (payload_dict, error).
+    Warms the session cookie first (NSE requires a prior GET to the site).
     """
+    cache_key = f"nse::{symbol_ticker}::{expiry or 'ALL'}"
+    cached = _oi_cache_get(cache_key)
+    if cached is not None:
+        return cached, None
     try:
-        fields["_ts"] = _now_ist().strftime("%H:%M:%S")
-        _OI_DEBUG_LOG.append(fields)
-        if len(_OI_DEBUG_LOG) > _OI_DEBUG_LOG_MAX:
-            del _OI_DEBUG_LOG[: len(_OI_DEBUG_LOG) - _OI_DEBUG_LOG_MAX]
-        logger.info(
-            "OI DEBUG | Symbol=%s Expiry=%s Spot=%s ATM=%s Status=%s Strikes=%s Source=%s Reason=%s "
-            "SampleCE_OI=%s SamplePE_OI=%s SampleCE_Chg=%s SamplePE_Chg=%s",
-            fields.get("Symbol"), fields.get("Expiry"), fields.get("Spot Price"),
-            fields.get("ATM Strike"), fields.get("API Response Status"),
-            fields.get("Number of Strikes Received"), fields.get("API Source"),
-            fields.get("Reason"), fields.get("Sample CE OI"), fields.get("Sample PE OI"),
-            fields.get("Sample CE Change"), fields.get("Sample PE Change"),
-        )
-    except Exception:
-        pass
-
-
-def _fyers_fetch_expiry_list(fyers, symbol: str) -> List[Tuple[str, int]]:
-    """
-    Req #2: Calls Fyers optionchain ONCE with strikecount=1/timestamp=""
-    to retrieve the underlying's full expiry list. Returns
-    [(date_str, epoch_seconds), ...] sorted ascending, or [] on any
-    failure (never raises — callers treat [] as 'expiry not found').
-    """
-    try:
-        resp = fyers.optionchain({"symbol": symbol, "strikecount": 1, "timestamp": ""})
-    except Exception as e:
-        logger.warning("Fyers expiry fetch failed for %s: %s", symbol, e)
-        return []
-    if not isinstance(resp, dict) or resp.get("s") != "ok":
-        return []
-    expiry_data = resp.get("data", {}).get("expiryData", []) or []
-    out = []
-    for item in expiry_data:
-        try:
-            epoch = int(item.get("expiry") or item.get("date_epoch") or 0)
-            date_str = str(item.get("date") or item.get("expiry_date") or "")
-            if epoch > 0:
-                out.append((date_str, epoch))
-        except (TypeError, ValueError):
-            continue
-    out.sort(key=lambda t: t[1])
-    return out
-
-
-def _pick_nearest_expiry(expiry_list: List[Tuple[str, int]]) -> Optional[Tuple[str, int]]:
-    """Req #2: pick the nearest NON-expired expiry (epoch >= start of today IST)."""
-    if not expiry_list:
-        return None
-    today_start = int(_now_ist().replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
-    upcoming = [e for e in expiry_list if e[1] >= today_start]
-    return upcoming[0] if upcoming else expiry_list[-1]
-
-
-def _fyers_fetch_chain_for_expiry(fyers, symbol: str, expiry_epoch: int, strikecount: int = 10) -> Tuple[list, Optional[float], str]:
-    """
-    Req #3/#4: Fetch the FULL option chain for one expiry from Fyers.
-
-    FIX: Fyers' real optionchain response is a FLAT list under
-    data.optionsChain — each row has option_type ('CE'/'PE'/'' for the
-    spot row), strike_price, oi, oich (OI change), volume, ltp, iv. There
-    is NO nested 'CE'/'PE' sub-dict on each row. The previous parser
-    assumed a nested schema (item['CE']['openInterest']) that never
-    matches Fyers' actual payload, so ce_oi/pe_oi/oi-change were always
-    read as 0 regardless of what the API returned. This pivots the flat
-    rows into one dict per strike with real CE/PE OI + OI-change values.
-
-    Returns (rows, spot_price_from_api, status) where status is
-    'ok' | 'empty' | 'error'.
-    """
-    try:
-        resp = fyers.optionchain({
-            "symbol": symbol,
-            "strikecount": strikecount,
-            "timestamp": str(expiry_epoch),
-        })
-    except Exception as e:
-        logger.warning("Fyers chain fetch error for %s: %s", symbol, e)
-        return [], None, "error"
-
-    if not isinstance(resp, dict) or resp.get("s") != "ok":
-        return [], None, "error"
-
-    chain = resp.get("data", {}).get("optionsChain", []) or []
-    if not chain:
-        return [], None, "empty"
-
-    spot_price = None
-    by_strike: Dict[float, dict] = {}
-    for item in chain:
-        try:
-            opt_type = str(item.get("option_type", "")).upper()
-            strike = float(item.get("strike_price", 0) or 0)
-            if opt_type == "" and strike == 0:
-                spot_price = float(item.get("ltp", 0) or 0) or spot_price
-                continue
-            if opt_type not in ("CE", "PE"):
-                continue
-            row = by_strike.setdefault(strike, {
-                "strike": strike, "ce_oi": 0, "ce_oi_chg": 0, "pe_oi": 0, "pe_oi_chg": 0,
-                "ce_vol": 0, "pe_vol": 0, "ce_ltp": 0.0, "pe_ltp": 0.0, "ce_iv": 0.0, "pe_iv": 0.0,
-            })
-            oi = int(item.get("oi", 0) or 0)
-            oich = int(item.get("oich", 0) or 0)
-            vol = int(item.get("volume", 0) or 0)
-            ltp = float(item.get("ltp", 0) or 0)
-            iv = float(item.get("iv", 0) or 0)
-            if opt_type == "CE":
-                row["ce_oi"] = oi; row["ce_oi_chg"] = oich; row["ce_vol"] = vol; row["ce_ltp"] = ltp; row["ce_iv"] = iv
-            else:
-                row["pe_oi"] = oi; row["pe_oi_chg"] = oich; row["pe_vol"] = vol; row["pe_ltp"] = ltp; row["pe_iv"] = iv
-        except (TypeError, ValueError, KeyError):
-            continue
-
-    rows = list(by_strike.values())
-    if not rows:
-        return [], spot_price, "empty"
-    return rows, spot_price, "ok"
-
-
-def _nse_fetch_chain_for_expiry(symbol: str, expiry_date_str: Optional[str] = None) -> Tuple[list, Optional[float], Optional[str], str]:
-    """
-    Req #6: Backup path — NSE public option-chain-equities API.
-
-    FIX: NSE's equity option-chain payload mixes rows from EVERY expiry
-    into a single 'records.data' array (each row carries its own
-    'expiryDate'). The previous implementation summed OI across ALL of
-    them regardless of expiry, silently blending multiple expiries'
-    open interest into one meaningless total. This now filters strictly
-    to a single resolved expiry before returning any row.
-
-    Returns (rows, spot_price, resolved_expiry_str, status) where status
-    is 'ok' | 'empty' | 'error'.
-    """
-    try:
-        ticker = symbol.replace("NSE:", "").replace("-EQ", "")
-        session = requests.Session()
-        session.get("https://www.nseindia.com", headers=_NSE_HEADERS, timeout=8)
-        resp = session.get(_NSE_OC_URL.format(ticker), headers=_NSE_HEADERS, timeout=10)
+        _nse_session.get(_NSE_OC_BASE, timeout=8)
+        resp = _nse_session.get(_NSE_OC_EQUITY_URL.format(symbol=symbol_ticker), timeout=12)
         if resp.status_code != 200:
-            return [], None, None, "error"
-        payload = resp.json()
+            _oi_debug_record(f"NSE {symbol_ticker}: HTTP {resp.status_code}")
+            return None, f"NSE HTTP {resp.status_code}"
+        data = resp.json()
+        records = data.get("records", {})
+        all_data = records.get("data", [])
+        if expiry:
+            all_data = [d for d in all_data if d.get("expiryDate") == expiry]
+        payload = {"underlyingValue": records.get("underlyingValue"), "expiryDates": records.get("expiryDates", []), "data": all_data}
+        _oi_cache_set(cache_key, payload)
+        return payload, None
+    except requests.exceptions.RequestException as e:
+        _oi_debug_record(f"NSE {symbol_ticker}: request error {e}")
+        return None, f"NSE request error: {e}"
+    except (ValueError, KeyError) as e:
+        _oi_debug_record(f"NSE {symbol_ticker}: parse error {e}")
+        return None, f"NSE parse error: {e}"
+
+
+def _fyers_fetch_expiry_list(fyers, underlying_fyers_symbol: str):
+    """Fetch available option expiries for an underlying via Fyers optionchain API."""
+    try:
+        resp = fyers.optionchain({"symbol": underlying_fyers_symbol, "strikecount": 1, "timestamp": ""})
+        if not isinstance(resp, dict) or resp.get("s") != "ok":
+            return [], str(resp.get("message", "unknown")) if isinstance(resp, dict) else "invalid response"
+        expiry_data = resp.get("data", {}).get("expiryData", [])
+        expiries = [{"date": e.get("date"), "expiry": e.get("expiry")} for e in expiry_data if e.get("expiry")]
+        return expiries, None
     except Exception as e:
-        logger.warning("NSE chain fetch error for %s: %s", symbol, e)
-        return [], None, None, "error"
+        return [], f"Fyers expiry fetch error: {type(e).__name__}: {e}"
 
-    records = payload.get("records", {}) or {}
-    data = records.get("data", []) or []
-    spot_price = records.get("underlyingValue")
+
+def _pick_nearest_expiry(expiries: List[dict]) -> Optional[dict]:
+    """Pick the nearest (soonest) expiry from a Fyers expiry-list response."""
+    if not expiries:
+        return None
     try:
-        spot_price = float(spot_price) if spot_price is not None else None
-    except (TypeError, ValueError):
-        spot_price = None
-    expiry_dates = records.get("expiryDates", []) or []
-    if not data:
-        return [], spot_price, None, "empty"
-
-    resolved_expiry = expiry_date_str if expiry_date_str in expiry_dates else (expiry_dates[0] if expiry_dates else None)
-    if resolved_expiry is None:
-        return [], spot_price, None, "empty"
-
-    rows = []
-    for item in data:
-        if item.get("expiryDate") != resolved_expiry:
-            continue
-        try:
-            strike = float(item.get("strikePrice", 0))
-            ce = item.get("CE", {}) or {}
-            pe = item.get("PE", {}) or {}
-            rows.append({
-                "strike": strike,
-                "ce_oi": int(ce.get("openInterest", 0)),
-                "ce_oi_chg": int(ce.get("changeinOpenInterest", 0)),
-                "pe_oi": int(pe.get("openInterest", 0)),
-                "pe_oi_chg": int(pe.get("changeinOpenInterest", 0)),
-                "ce_vol": int(ce.get("totalTradedVolume", 0)),
-                "pe_vol": int(pe.get("totalTradedVolume", 0)),
-                "ce_ltp": float(ce.get("lastPrice", 0)),
-                "pe_ltp": float(pe.get("lastPrice", 0)),
-                "ce_iv": float(ce.get("impliedVolatility", 0)),
-                "pe_iv": float(pe.get("impliedVolatility", 0)),
-            })
-        except (TypeError, ValueError, KeyError):
-            continue
-
-    if not rows:
-        return [], spot_price, resolved_expiry, "empty"
-    return rows, spot_price, resolved_expiry, "ok"
+        return sorted(expiries, key=lambda e: int(e["expiry"]))[0]
+    except (KeyError, ValueError, TypeError):
+        return expiries[0]
 
 
-def _select_strikes(rows: list, spot: float, n_itm: int = 2, n_otm: int = 2) -> list:
-    """Return ATM ± n_itm/n_otm strikes centred on spot. Logic unchanged."""
-    if not rows:
-        return []
-    strikes = sorted(set(r["strike"] for r in rows))
-    atm = _nearest_atm(spot, strikes)
-    idx = strikes.index(atm) if atm in strikes else 0
-    lo = max(0, idx - n_itm)
-    hi = min(len(strikes), idx + n_otm + 1)
-    selected = set(strikes[lo:hi])
-    return [r for r in rows if r["strike"] in selected]
-
-
-def _compute_oi_metrics(rows: list, prev_rows: Optional[list], spot: float, prev_spot: float, df_15m: pd.DataFrame) -> dict:
+def _fyers_fetch_chain_for_expiry(fyers, underlying_fyers_symbol: str, expiry_epoch: str, strike_count: int = 20):
     """
-    Given current + previous option chain rows and the 15-min OHLCV df,
-    returns the full OI metric dict that becomes new columns.
-    NOTE: OI/PCR/Max Pain/Probability math is UNCHANGED from the original.
+    Fetch the option chain for one expiry via Fyers optionchain API.
+    FIX: Fyers returns a FLAT list of strike rows (not nested CE/PE per
+    strike) with an "option_type" field and a separate pivot "sp" (spot)
+    entry — this parser pivots that flat list into {strike: {CE, PE}}.
     """
-    if not rows:
-        # Defensive fallback only — _fetch_fo_oi_signal now guards against
-        # ever calling this with empty rows, but if it somehow happens,
-        # never fabricate zeros: use the explicit sentinel instead (Req #11).
-        return _sentinel_oi_row(OI_SENTINEL_NOT_AVAILABLE)
-
-    total_ce_oi = sum(r["ce_oi"] for r in rows)
-    total_pe_oi = sum(r["pe_oi"] for r in rows)
-    total_ce_chg = sum(r["ce_oi_chg"] for r in rows)
-    total_pe_chg = sum(r["pe_oi_chg"] for r in rows)
-    total_ce_vol = sum(r["ce_vol"] for r in rows)
-    total_pe_vol = sum(r["pe_vol"] for r in rows)
-
-    net_oi_chg = total_pe_chg - total_ce_chg
-    pcr = round(total_pe_oi / total_ce_oi, 3) if total_ce_oi else 0.0
-    oi_ratio = round(total_ce_oi / total_pe_oi, 3) if total_pe_oi else 0.0
-
+    cache_key = f"fyers::{underlying_fyers_symbol}::{expiry_epoch}"
+    cached = _oi_cache_get(cache_key)
+    if cached is not None:
+        return cached, None
     try:
-        def pain(k):
-            return sum(
-                r["ce_oi"] * max(0, k - r["strike"]) +
-                r["pe_oi"] * max(0, r["strike"] - k)
-                for r in rows
-            )
-        all_strikes = [r["strike"] for r in rows]
-        max_pain_strike = min(all_strikes, key=pain) if all_strikes else spot
-    except Exception:
-        max_pain_strike = spot
-
-    max_ce_row = max(rows, key=lambda r: r["ce_oi_chg"], default={})
-    max_pe_row = max(rows, key=lambda r: r["pe_oi_chg"], default={})
-    max_ce_writing_strike = max_ce_row.get("strike", 0)
-    max_pe_writing_strike = max_pe_row.get("strike", 0)
-
-    if prev_rows:
-        prev_ce = {r["strike"]: r["ce_oi"] for r in prev_rows}
-        prev_pe = {r["strike"]: r["pe_oi"] for r in prev_rows}
-        cur_ce_sum = sum(r["ce_oi"] for r in rows)
-        cur_pe_sum = sum(r["pe_oi"] for r in rows)
-        prv_ce_sum = sum(prev_ce.get(r["strike"], r["ce_oi"]) for r in rows)
-        prv_pe_sum = sum(prev_pe.get(r["strike"], r["pe_oi"]) for r in rows)
-        ce_oi_delta_pct = round((cur_ce_sum - prv_ce_sum) / prv_ce_sum * 100, 2) if prv_ce_sum else 0.0
-        pe_oi_delta_pct = round((cur_pe_sum - prv_pe_sum) / prv_pe_sum * 100, 2) if prv_pe_sum else 0.0
-        oi_change_basis = "vs previous 15-min scan"
-    else:
-        total_ce_chg_now = sum(r["ce_oi_chg"] for r in rows)
-        total_pe_chg_now = sum(r["pe_oi_chg"] for r in rows)
-        total_ce_oi_now = sum(r["ce_oi"] for r in rows)
-        total_pe_oi_now = sum(r["pe_oi"] for r in rows)
-        prev_ce_session_total = total_ce_oi_now - total_ce_chg_now
-        prev_pe_session_total = total_pe_oi_now - total_pe_chg_now
-        ce_oi_delta_pct = round((total_ce_chg_now / prev_ce_session_total) * 100, 2) if prev_ce_session_total else 0.0
-        pe_oi_delta_pct = round((total_pe_chg_now / prev_pe_session_total) * 100, 2) if prev_pe_session_total else 0.0
-        oi_change_basis = "vs previous session close"
-
-    price_chg_pct = round((spot - prev_spot) / prev_spot * 100, 3) if prev_spot else 0.0
-
-    try:
-        atr_val = float(calculate_atr(df_15m).iloc[-1])
-        atr_pct = round(atr_val / spot * 100, 3) if spot else 0.0
-    except Exception:
-        atr_val = spot * 0.005
-        atr_pct = 0.5
-
-    try:
-        vol_series = df_15m["Volume"]
-        vol_avg = float(vol_series.tail(10).mean())
-        vol_last = float(vol_series.iloc[-1])
-        vol_accel = round((vol_last - vol_avg) / vol_avg * 100, 1) if vol_avg else 0.0
-    except Exception:
-        vol_accel = 0.0
-
-    oi_accel = round(abs(ce_oi_delta_pct) + abs(pe_oi_delta_pct), 2)
-
-    price_up = price_chg_pct > 0.05
-    price_dn = price_chg_pct < -0.05
-    ce_oi_up = ce_oi_delta_pct > 1
-    ce_oi_dn = ce_oi_delta_pct < -1
-    pe_oi_up = pe_oi_delta_pct > 1
-    pe_oi_dn = pe_oi_delta_pct < -1
-
-    if price_up and pe_oi_up and ce_oi_dn:
-        oi_build_up = "Fresh Put Writing"; oi_bias = "🟢 Very Bullish"; inst_activity = "🏦 Institutional Long Build Up"; smart_money = "Bullish"
-    elif price_up and ce_oi_dn and pe_oi_dn:
-        oi_build_up = "Short Covering"; oi_bias = "🟢 Bullish"; inst_activity = "📈 Short Covering Detected"; smart_money = "Bullish"
-    elif price_up and ce_oi_up and pe_oi_up:
-        oi_build_up = "Long Build Up"; oi_bias = "🟢 Bullish"; inst_activity = "🏦 Long Build Up"; smart_money = "Bullish"
-    elif price_dn and ce_oi_up and pe_oi_dn:
-        oi_build_up = "Fresh Call Writing"; oi_bias = "🔴 Bearish"; inst_activity = "🐻 Institutional Short Build Up"; smart_money = "Bearish"
-    elif price_dn and pe_oi_dn and ce_oi_dn:
-        oi_build_up = "Long Unwinding"; oi_bias = "🔴 Bearish"; inst_activity = "📉 Long Unwinding"; smart_money = "Bearish"
-    elif price_dn and ce_oi_up and pe_oi_up:
-        oi_build_up = "Short Build Up"; oi_bias = "🔴 Strong Bearish"; inst_activity = "🔴 Strong Short Build Up"; smart_money = "Bearish"
-    elif abs(price_chg_pct) <= 0.05 and pcr > 1.2:
-        oi_build_up = "Range Bound - Bullish Bias"; oi_bias = "🟡 Neutral-Bullish"; inst_activity = "⚖️ Range Bound"; smart_money = "Neutral"
-    elif abs(price_chg_pct) <= 0.05 and pcr < 0.8:
-        oi_build_up = "Range Bound - Bearish Bias"; oi_bias = "🟡 Neutral-Bearish"; inst_activity = "⚖️ Range Bound"; smart_money = "Neutral"
-    else:
-        oi_build_up = "Neutral"; oi_bias = "🟡 Neutral"; inst_activity = "⚖️ No Clear Bias"; smart_money = "Neutral"
-
-    fresh_call_writing = ce_oi_up and price_dn
-    fresh_put_writing = pe_oi_up and price_up
-
-    call_writing = "Yes" if fresh_call_writing else "No"
-    put_writing = "Yes" if fresh_put_writing else "No"
-    long_build_up = "Yes" if (price_up and ce_oi_up and pe_oi_up) else "No"
-    short_build_up = "Yes" if (price_dn and ce_oi_up and pe_oi_up) else "No"
-    long_unwinding = "Yes" if (price_dn and pe_oi_dn and ce_oi_dn) else "No"
-    short_covering = "Yes" if (price_up and ce_oi_dn and pe_oi_dn) else "No"
-
-    if long_build_up == "Yes":
-        oi_pattern = "🟢🟢 Long Build Up — Both Legs Confirming"
-    elif short_build_up == "Yes":
-        oi_pattern = "🔴🔴 Short Build Up — Both Legs Confirming"
-    elif long_unwinding == "Yes":
-        oi_pattern = "🔴 Long Unwinding"
-    elif short_covering == "Yes":
-        oi_pattern = "🟢 Short Covering"
-    elif put_writing == "Yes":
-        oi_pattern = "🟢 Isolated Put Writing — CE OI Not Confirming"
-    elif call_writing == "Yes":
-        oi_pattern = "🔴 Isolated Call Writing — PE OI Not Confirming"
-    else:
-        oi_pattern = "🟡 No Clear OI Pattern"
-
-    if pcr > 1.5:
-        big_player = "🏦 Big Players Long"
-    elif pcr < 0.6:
-        big_player = "🐻 Big Players Short"
-    elif 0.8 <= pcr <= 1.2:
-        big_player = "⚖️ Balanced"
-    else:
-        big_player = "🟡 Neutral"
-
-    atm_row = min(rows, key=lambda r: abs(r["strike"] - spot), default=None)
-    atm_iv = ((atm_row["ce_iv"] + atm_row["pe_iv"]) / 2) if atm_row else 20.0
-    if atm_iv <= 0:
-        atm_iv = 20.0
-    t_frac = 1 / 96
-    exp_move_pct = round(atm_iv / 100 * (t_frac ** 0.5) * 100, 3)
-    exp_move_pts = round(spot * exp_move_pct / 100, 2)
-    exp_range_low = round(spot - exp_move_pts, 2)
-    exp_range_high = round(spot + exp_move_pts, 2)
-
-    oi_score = min(oi_accel * 3, 30)
-    vol_score = min(max(vol_accel / 5, 0), 20)
-    pcr_score = min(abs(pcr - 1.0) * 20, 20)
-    atr_score = min(atr_pct * 4, 15)
-    price_score = min(abs(price_chg_pct) * 10, 15)
-    confidence = round(min(oi_score + vol_score + pcr_score + atr_score + price_score + 40, 97), 1)
-    probability = round(min(confidence * 0.95, 95), 1)
-
-    if "Bullish" in oi_bias or "Bullish" in oi_build_up:
-        bullish_pct = round(min(50 + (pcr - 1) * 25 + abs(pe_oi_delta_pct) * 0.5, 95), 1)
-        bearish_pct = round(100 - bullish_pct, 1)
-    elif "Bearish" in oi_bias:
-        bearish_pct = round(min(50 + (1 - pcr) * 25 + abs(ce_oi_delta_pct) * 0.5, 95), 1)
-        bullish_pct = round(100 - bearish_pct, 1)
-    else:
-        bullish_pct = 50.0
-        bearish_pct = 50.0
-
-    if oi_accel > 10:
-        oi_momentum = "🔥 High Acceleration"
-    elif oi_accel > 5:
-        oi_momentum = "⚡ Moderate"
-    else:
-        oi_momentum = "⚪ Low"
-
-    if bullish_pct >= 70:
-        next_candle = "📈 Likely Up"; trade_dir = "🟢 BUY"; exp_target = round(spot + exp_move_pts, 2); exp_sl = round(spot - exp_move_pts * 0.6, 2)
-    elif bearish_pct >= 70:
-        next_candle = "📉 Likely Down"; trade_dir = "🔴 SELL"; exp_target = round(spot - exp_move_pts, 2); exp_sl = round(spot + exp_move_pts * 0.6, 2)
-    else:
-        next_candle = "🟡 Range Bound"; trade_dir = "🟡 WAIT"; exp_target = spot; exp_sl = spot
-
-    risk = abs(spot - exp_sl)
-    reward = abs(exp_target - spot)
-    rr = round(reward / risk, 2) if risk > 0 else 0.0
-
-    ai_summary_parts = []
-    ai_summary_parts.append(f"CE OI {'increased' if ce_oi_delta_pct > 0 else 'reduced'} by {abs(ce_oi_delta_pct):.1f}% ({oi_change_basis}).")
-    ai_summary_parts.append(f"PE OI {'increased' if pe_oi_delta_pct > 0 else 'reduced'} by {abs(pe_oi_delta_pct):.1f}% ({oi_change_basis}).")
-    if fresh_put_writing:
-        ai_summary_parts.append("Fresh Put Writing observed.")
-    if fresh_call_writing:
-        ai_summary_parts.append("Fresh Call Writing observed.")
-    ai_summary_parts.append(f"{inst_activity} detected.")
-    direction_word = "upside" if bullish_pct > bearish_pct else "downside"
-    ai_summary_parts.append(f"Expected {direction_word} move {exp_move_pct:.2f}%. Probability {probability}%.")
-    ai_summary = " ".join(ai_summary_parts)
-
-    if price_up and ce_oi_up and pe_oi_dn and oi_accel > 5:
-        prediction_text = "⚠️ Trap Probability — False Breakout Risk"
-    elif price_dn and pe_oi_up and ce_oi_dn and oi_accel > 5:
-        prediction_text = "⚠️ Trap Probability — False Breakdown Risk"
-    elif "Long Build Up" in oi_build_up and vol_accel > 10:
-        prediction_text = "🚀 High Probability Breakout"
-    elif "Short Build Up" in oi_build_up and vol_accel > 10:
-        prediction_text = "🔻 High Probability Breakdown"
-    elif fresh_call_writing and fresh_put_writing:
-        prediction_text = "📦 Range Bound"
-    elif fresh_put_writing:
-        prediction_text = "📈 Strong Put Writing"
-    elif fresh_call_writing:
-        prediction_text = "📉 Strong Call Writing"
-    elif "Short Covering" in oi_build_up:
-        prediction_text = "📈 Short Covering"
-    elif "Long Unwinding" in oi_build_up:
-        prediction_text = "📉 Long Unwinding"
-    elif "Institutional" in inst_activity and "Long" in inst_activity:
-        prediction_text = "🏦 Institutional Buying"
-    elif "Institutional" in inst_activity and "Short" in inst_activity:
-        prediction_text = "🏦 Institutional Selling"
-    else:
-        prediction_text = "🟡 Neutral / No Strong Signal"
-
-    return {
-        "15m CE OI Δ": total_ce_chg,
-        "15m PE OI Δ": total_pe_chg,
-        "CE OI %": ce_oi_delta_pct,
-        "PE OI %": pe_oi_delta_pct,
-        "OI Change Basis": oi_change_basis,
-        "Net OI": net_oi_chg,
-        "PCR": pcr,
-        "OI Ratio": oi_ratio,
-        "Max Pain": max_pain_strike,
-        "Max CE Writing": max_ce_writing_strike,
-        "Max PE Writing": max_pe_writing_strike,
-        "OI Bias": oi_bias,
-        "OI Build Up": oi_build_up,
-        "OI Momentum": oi_momentum,
-        "OI Acceleration %": oi_accel,
-        "Vol Acceleration %": vol_accel,
-        "Price Change %": price_chg_pct,
-        "ATR %": atr_pct,
-        "Expected Move": f"{exp_move_pct:.3f}%",
-        "Expected Points": exp_move_pts,
-        "Expected Range": f"{exp_range_low}–{exp_range_high}",
-        "Probability": f"{probability}%",
-        "Confidence": f"{confidence}%",
-        "Bullish %": bullish_pct,
-        "Bearish %": bearish_pct,
-        "Institutional Activity": inst_activity,
-        "Smart Money Bias": smart_money,
-        "Big Player Position": big_player,
-        "Prediction Text": prediction_text,
-        "Next Candle Prediction": next_candle,
-        "Trade Direction": trade_dir,
-        "Expected Target": exp_target,
-        "Expected StopLoss": exp_sl,
-        "Risk Reward": rr,
-        "AI Summary": ai_summary,
-        "Call Writing": call_writing,
-        "Put Writing": put_writing,
-        "Long Build Up": long_build_up,
-        "Short Build Up": short_build_up,
-        "Long Unwinding": long_unwinding,
-        "Short Covering": short_covering,
-        "OI Pattern": oi_pattern,
-        "_ce_oi_total": total_ce_oi,
-        "_pe_oi_total": total_pe_oi,
-        "_atm_iv": atm_iv,
-    }
-
-
-def _empty_oi_row() -> dict:
-    """
-    DEPRECATED — kept only so nothing that references it at import time
-    breaks. No longer called anywhere in the OI pipeline: every genuine
-    failure now routes through `_sentinel_oi_row()` below, which reports
-    the specific reason instead of a misleading zero (Req #11).
-    """
-    return _sentinel_oi_row(OI_SENTINEL_NOT_AVAILABLE)
-
-
-def _sentinel_oi_row(reason: str) -> dict:
-    """
-    Req #11: returned whenever option-chain data is genuinely unavailable.
-    Every OI-derived field is set to the exact sentinel string (`reason`)
-    instead of 0/"—", so the report and Excel export show precisely why
-    data is missing: 'No Option Chain', 'Expiry Not Found',
-    'API Returned Empty Data', or 'OI Not Available'.
-    """
-    return {
-        "15m CE OI Δ": reason, "15m PE OI Δ": reason, "CE OI %": reason, "PE OI %": reason,
-        "OI Change Basis": reason,
-        "Net OI": reason, "PCR": reason, "OI Ratio": reason, "Max Pain": reason,
-        "Max CE Writing": reason, "Max PE Writing": reason,
-        "OI Bias": reason, "OI Build Up": reason,
-        "OI Momentum": reason, "OI Acceleration %": reason,
-        "Vol Acceleration %": reason, "Price Change %": reason, "ATR %": reason,
-        "Expected Move": reason, "Expected Points": reason, "Expected Range": reason,
-        "Probability": reason, "Confidence": reason, "Bullish %": reason, "Bearish %": reason,
-        "Institutional Activity": reason,
-        "Smart Money Bias": reason, "Big Player Position": reason,
-        "Prediction Text": reason,
-        "Next Candle Prediction": reason, "Trade Direction": reason,
-        "Expected Target": reason, "Expected StopLoss": reason, "Risk Reward": reason,
-        "AI Summary": f"{reason} — signal generation skipped (requires valid OI data).",
-        "Call Writing": reason, "Put Writing": reason, "Long Build Up": reason,
-        "Short Build Up": reason, "Long Unwinding": reason, "Short Covering": reason,
-        "OI Pattern": reason,
-        "_ce_oi_total": reason, "_pe_oi_total": reason, "_atm_iv": reason,
-    }
-
-
-def _fetch_fo_oi_signal(fyers, symbol: str, fo_universe: Optional[set] = None) -> Tuple[Optional[dict], Optional[str]]:
-    """
-    Full OI pipeline for one F&O symbol — rewritten fetch/validate/compute
-    layer (Req #1–#12). 15-min candle fetch and every technical indicator
-    (RSI/ATR/EMA/VWAP/ADX/SMC/Support/Resistance) are UNCHANGED.
-
-    Steps:
-      1. Verify derivatives are actually available for this symbol.
-      2. Detect the nearest valid (non-expired) expiry automatically.
-      3. Fetch the complete option chain for that expiry from Fyers.
-      4. Retry automatically if Fyers returns empty data.
-      5. Fall back to NSE (expiry-aware) if Fyers still fails.
-      6. Validate every row before any calculation.
-      7. Only compute OI/AI metrics once valid data is confirmed.
-      8. Never zero-fill — genuine failures return one of the 4 sentinel
-         reasons and are still returned as a normal (non-error) result so
-         they show up in the report instead of disappearing.
-    """
-    if not isinstance(symbol, str) or not _VALID_EQ_SYMBOL_RE.match(symbol):
-        return None, f"{symbol}: invalid format"
-
-    cache_key = _oi_cache_key(symbol)
-    if cache_key in _OI_CACHE:
-        return _OI_CACHE[cache_key], None
-
-    stock_ticker = symbol.replace("NSE:", "").replace("-EQ", "")
-
-    if fo_universe is not None and symbol not in fo_universe:
-        _oi_debug_record(
-            Symbol=stock_ticker, Expiry="—", **{"Spot Price": "—"}, **{"ATM Strike": "—"},
-            **{"API Response Status": "skipped"}, **{"Number of Strikes Received": 0},
-            **{"API Source": "—"}, Reason="Symbol has no listed derivatives (not in F&O universe)",
-        )
-        return None, f"{symbol}: {OI_SENTINEL_NO_CHAIN} — no listed derivatives"
-
-    date_from = (datetime.today() - timedelta(days=5)).strftime("%Y-%m-%d")
-    date_to = datetime.today().strftime("%Y-%m-%d")
-    resp, err = _safe_history(fyers, {
-        "symbol": symbol, "resolution": "15", "date_format": "1",
-        "range_from": date_from, "range_to": date_to, "cont_flag": "1",
-    })
-    if err:
-        return None, f"{symbol}: {err}"
-
-    candles = resp.get("candles") if resp else None
-    if not candles or len(candles) < 5:
-        return None, f"{symbol}: insufficient 15m history"
-
-    try:
-        df = pd.DataFrame(candles, columns=["Time", "Open", "High", "Low", "Close", "Volume"])
-        df["Time"] = pd.to_datetime(df["Time"], unit="s", utc=True).dt.tz_convert("Asia/Kolkata")
-        df[["Open", "High", "Low", "Close", "Volume"]] = df[["Open", "High", "Low", "Close", "Volume"]].apply(
-            pd.to_numeric, errors="coerce"
-        )
-        df = df.dropna(subset=["Close"]).sort_values("Time").reset_index(drop=True)
-
-        if len(df) > 0 and not _is_intraday_candle_closed(df["Time"].iloc[-1], 15):
-            df = df.iloc[:-1].reset_index(drop=True)
-        if len(df) < 3:
-            return None, f"{symbol}: insufficient completed candles"
-
-        spot = float(df["Close"].iloc[-1])
-        prev_spot = float(df["Close"].iloc[-2])
-        rsi_val = round(float(calculate_rsi(df["Close"]).iloc[-1]), 1)
-        atr_val = round(float(calculate_atr(df).iloc[-1]), 2)
-        ema20 = round(float(df["Close"].ewm(span=20).mean().iloc[-1]), 2)
-        ema50 = round(float(df["Close"].ewm(span=50).mean().iloc[-1]), 2) if len(df) >= 50 else ema20
-        vwap_val = calculate_vwap_approx(df)
-        adx_val, _, _ = calculate_adx(df) if len(df) >= 15 else (0.0, 0.0, 0.0)
-        smc_structure, cisd_signal, _ = _calculate_smc_and_cisd(df)
-        signal_date, signal_time = _candle_signal_timestamp(df, is_daily=False)
-        resistance = df["High"].rolling(20).max().shift(1).iloc[-1]
-        support = df["Low"].rolling(20).min().shift(1).iloc[-1]
-    except Exception as e:
-        return None, f"{symbol}: candle processing error ({type(e).__name__})"
-
-    base_fields = {
-        "Signal Date": signal_date, "Signal Time": signal_time, "Stock": stock_ticker, "Spot": spot,
-        "RSI (15m)": rsi_val, "ATR (15m)": atr_val, "EMA20 (15m)": ema20, "EMA50 (15m)": ema50,
-        "VWAP (15m)": vwap_val, "ADX (15m)": adx_val, "SMC Structure": smc_structure, "CISD": cisd_signal,
-        "Support": round(float(support), 2) if pd.notna(support) else None,
-        "Resistance": round(float(resistance), 2) if pd.notna(resistance) else None,
-    }
-
-    expiry_list: List[Tuple[str, int]] = []
-    for attempt in range(2):
-        expiry_list = _fyers_fetch_expiry_list(fyers, symbol)
-        if expiry_list:
-            break
-        time.sleep(0.5)
-
-    nearest_expiry = _pick_nearest_expiry(expiry_list)
-    expiry_date_str, expiry_epoch = (nearest_expiry if nearest_expiry else (None, None))
-
-    rows: list = []
-    api_source = "—"
-    api_status = "error"
-
-    if expiry_epoch is not None:
-        for attempt in range(2):
-            rows, _fyers_spot, api_status = _fyers_fetch_chain_for_expiry(fyers, symbol, expiry_epoch, strikecount=10)
-            api_source = "Fyers"
-            if rows:
-                break
-            time.sleep(0.5)
-
-    if not rows:
-        rows, _nse_spot, resolved_nse_expiry, nse_status = _nse_fetch_chain_for_expiry(symbol, expiry_date_str)
-        api_source = "NSE"
-        api_status = nse_status
-        if resolved_nse_expiry:
-            expiry_date_str = resolved_nse_expiry
-
-    strikes_received = len(rows)
-
-    reason = None
-    if expiry_epoch is None and not expiry_date_str:
-        reason = OI_SENTINEL_NO_EXPIRY
-    elif not rows and api_status == "empty":
-        reason = OI_SENTINEL_EMPTY_API
-    elif not rows:
-        reason = OI_SENTINEL_NO_CHAIN
-
-    if rows:
-        valid_rows = []
-        for r in rows:
-            try:
-                if r.get("strike", 0) <= 0:
-                    continue
-                int(r.get("ce_oi", 0)); int(r.get("pe_oi", 0))
-                valid_rows.append(r)
-            except (TypeError, ValueError):
+        resp = fyers.optionchain({"symbol": underlying_fyers_symbol, "strikecount": strike_count, "timestamp": expiry_epoch})
+        if not isinstance(resp, dict) or resp.get("s") != "ok":
+            return None, str(resp.get("message", "unknown")) if isinstance(resp, dict) else "invalid response"
+        data = resp.get("data", {})
+        options_chain = data.get("optionsChain", [])
+        spot = None
+        pivot: Dict[float, Dict[str, dict]] = {}
+        for row in options_chain:
+            strike = row.get("strike_price")
+            opt_type = row.get("option_type")
+            if opt_type in (None, "", "-") or strike in (None, -1):
+                if row.get("ltp") and spot is None:
+                    spot = row.get("ltp")
                 continue
-        rows = valid_rows
-        if not rows:
-            reason = OI_SENTINEL_NOT_AVAILABLE
-
-    atm_for_log = _nearest_atm(spot, [r["strike"] for r in rows]) if rows else "—"
-    _oi_debug_record(
-        Symbol=stock_ticker, Expiry=expiry_date_str or "—", **{"Spot Price": spot},
-        **{"ATM Strike": atm_for_log}, **{"API Response Status": api_status},
-        **{"Number of Strikes Received": strikes_received}, **{"API Source": api_source},
-        Reason=reason or "OK",
-    )
-
-    if reason:
-        result = {
-            **base_fields, "ATM Strike": "—", "OI Source": api_source,
-            "Expiry": expiry_date_str or "—",
-            **_sentinel_oi_row(reason), "_oc_rows": [],
-        }
-        if len(_OI_CACHE) >= _OI_CACHE_MAX:
-            for k in sorted(_OI_CACHE.keys())[:100]:
-                _OI_CACHE.pop(k, None)
-        _OI_CACHE[cache_key] = result
-        return result, None
-
-    selected = _select_strikes(rows, spot)
-    if not selected:
-        selected = rows
-
-    prev_cache_key = f"{symbol}|{_current_15m_epoch() - 900}"
-    prev_rows = _OI_CACHE.get(prev_cache_key, {}).get("_oc_rows")
-
-    metrics = _compute_oi_metrics(selected, prev_rows, spot, prev_spot, df)
-    atm_strike = _nearest_atm(spot, [r["strike"] for r in selected])
-
-    if selected:
-        sample = selected[0]
-        _oi_debug_record(
-            Symbol=stock_ticker, Expiry=expiry_date_str or "—", **{"Spot Price": spot},
-            **{"ATM Strike": atm_strike}, **{"API Response Status": "ok"},
-            **{"Number of Strikes Received": len(selected)}, **{"API Source": api_source},
-            **{"Sample CE OI": sample.get("ce_oi")}, **{"Sample PE OI": sample.get("pe_oi")},
-            **{"Sample CE Change": sample.get("ce_oi_chg")}, **{"Sample PE Change": sample.get("pe_oi_chg")},
-            Reason="OK",
-        )
-
-    result = {
-        **base_fields,
-        "ATM Strike": atm_strike,
-        "OI Source": api_source,
-        "Expiry": expiry_date_str or "—",
-        **metrics,
-        "_oc_rows": selected,
-    }
-
-    if len(_OI_CACHE) >= _OI_CACHE_MAX:
-        for k in sorted(_OI_CACHE.keys())[:100]:
-            _OI_CACHE.pop(k, None)
-    _OI_CACHE[cache_key] = result
-    return result, None
+            bucket = pivot.setdefault(float(strike), {})
+            bucket[opt_type] = row
+        if spot is None:
+            spot = data.get("callOi") and None
+        payload = {"spot": spot, "strikes": pivot}
+        _oi_cache_set(cache_key, payload)
+        return payload, None
+    except Exception as e:
+        return None, f"Fyers chain fetch error: {type(e).__name__}: {e}"
 
 
-def run_fo_oi_scan(fyers, symbols: List[str]) -> Tuple[List[dict], List[str], "ScanStats"]:
+def _select_strikes(strikes: List[float], atm: float, n_each_side: int = 10) -> List[float]:
+    """Select the ATM strike plus n_each_side strikes above and below it."""
+    if not strikes or atm is None:
+        return sorted(strikes)
+    ordered = sorted(strikes)
+    try:
+        atm_idx = min(range(len(ordered)), key=lambda i: abs(ordered[i] - atm))
+    except ValueError:
+        return ordered
+    lo = max(0, atm_idx - n_each_side)
+    hi = min(len(ordered), atm_idx + n_each_side + 1)
+    return ordered[lo:hi]
+
+
+def _pct_to_float(val) -> float:
+    try:
+        if val is None:
+            return 0.0
+        if isinstance(val, str):
+            val = val.replace("%", "").strip()
+        return float(val)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _oi_numeric_or_nan(val):
+    try:
+        return float(val) if val not in (None, "", "-") else np.nan
+    except (TypeError, ValueError):
+        return np.nan
+
+
+def _compute_oi_metrics(chain_rows: List[dict], spot: float) -> Dict[str, object]:
     """
-    Threaded F&O OI scan across `symbols` (should be F&O universe).
-    Returns (results, errors, stats) — same shape as every other scanner.
-    FIX #1: every successful `_fetch_fo_oi_signal` call is appended to
-    `results` exactly once — this list is the single source of truth for
-    the report pipeline built in `_build_fo_oi_report_df` (see below).
-    Req #1: resolves the authoritative derivatives-available universe ONCE
-    per scan and passes it to every worker for the availability check.
+    Compute PCR, Max Pain, and per-strike Long/Short Buildup, Long
+    Unwinding, and Short Covering classification from a normalized list of
+    {strike, ce_oi, ce_oi_chg, ce_ltp, ce_ltp_chg, pe_oi, pe_oi_chg,
+    pe_ltp, pe_ltp_chg} rows.
     """
+    if not chain_rows:
+        return {"pcr": None, "max_pain": None, "rows": []}
+
+    total_ce_oi = sum((r["ce_oi"] or 0) for r in chain_rows)
+    total_pe_oi = sum((r["pe_oi"] or 0) for r in chain_rows)
+    pcr = round(total_pe_oi / total_ce_oi, 2) if total_ce_oi > 0 else None
+
+    strikes = [r["strike"] for r in chain_rows]
+    max_pain_losses = {}
+    for candidate in strikes:
+        loss = 0.0
+        for r in chain_rows:
+            if candidate > r["strike"]:
+                loss += (candidate - r["strike"]) * (r["ce_oi"] or 0)
+            if candidate < r["strike"]:
+                loss += (r["strike"] - candidate) * (r["pe_oi"] or 0)
+        max_pain_losses[candidate] = loss
+    max_pain = min(max_pain_losses, key=max_pain_losses.get) if max_pain_losses else None
+
+    enriched_rows = []
+    for r in chain_rows:
+        def _classify(oi_chg, ltp_chg):
+            if oi_chg is None or ltp_chg is None:
+                return "—"
+            if oi_chg > 0 and ltp_chg > 0:
+                return "🟢 Long Buildup"
+            if oi_chg > 0 and ltp_chg < 0:
+                return "🔴 Short Buildup"
+            if oi_chg < 0 and ltp_chg < 0:
+                return "🟡 Long Unwinding"
+            if oi_chg < 0 and ltp_chg > 0:
+                return "🟣 Short Covering"
+            return "⚪ Neutral"
+
+        ce_signal = _classify(r.get("ce_oi_chg"), r.get("ce_ltp_chg"))
+        pe_signal = _classify(r.get("pe_oi_chg"), r.get("pe_ltp_chg"))
+        row_out = dict(r)
+        row_out["ce_signal"] = ce_signal
+        row_out["pe_signal"] = pe_signal
+        row_out["is_atm"] = bool(spot and abs(r["strike"] - spot) == min(abs(s - spot) for s in strikes))
+        enriched_rows.append(row_out)
+
+    return {"pcr": pcr, "max_pain": max_pain, "rows": enriched_rows,
+            "total_ce_oi": total_ce_oi, "total_pe_oi": total_pe_oi}
+
+
+def _normalize_nse_chain(nse_payload: dict) -> Tuple[List[dict], Optional[float]]:
+    """Normalize a raw NSE option-chain payload into the row shape expected by _compute_oi_metrics."""
+    spot = nse_payload.get("underlyingValue")
+    rows = []
+    for entry in nse_payload.get("data", []):
+        strike = entry.get("strikePrice")
+        if strike is None:
+            continue
+        ce = entry.get("CE", {}) or {}
+        pe = entry.get("PE", {}) or {}
+        rows.append({
+            "strike": float(strike),
+            "ce_oi": _oi_numeric_or_nan(ce.get("openInterest")), "ce_oi_chg": _oi_numeric_or_nan(ce.get("changeinOpenInterest")),
+            "ce_ltp": _oi_numeric_or_nan(ce.get("lastPrice")), "ce_ltp_chg": _oi_numeric_or_nan(ce.get("change")),
+            "ce_iv": _oi_numeric_or_nan(ce.get("impliedVolatility")), "ce_volume": _oi_numeric_or_nan(ce.get("totalTradedVolume")),
+            "pe_oi": _oi_numeric_or_nan(pe.get("openInterest")), "pe_oi_chg": _oi_numeric_or_nan(pe.get("changeinOpenInterest")),
+            "pe_ltp": _oi_numeric_or_nan(pe.get("lastPrice")), "pe_ltp_chg": _oi_numeric_or_nan(pe.get("change")),
+            "pe_iv": _oi_numeric_or_nan(pe.get("impliedVolatility")), "pe_volume": _oi_numeric_or_nan(pe.get("totalTradedVolume")),
+        })
+    return rows, spot
+
+
+def _normalize_fyers_chain(fyers_payload: dict) -> Tuple[List[dict], Optional[float]]:
+    """Normalize a pivoted Fyers option-chain payload into the row shape expected by _compute_oi_metrics."""
+    spot = fyers_payload.get("spot")
+    rows = []
+    for strike, sides in fyers_payload.get("strikes", {}).items():
+        ce = sides.get("CE", {}) or {}
+        pe = sides.get("PE", {}) or {}
+        rows.append({
+            "strike": float(strike),
+            "ce_oi": _oi_numeric_or_nan(ce.get("oi")), "ce_oi_chg": _oi_numeric_or_nan(ce.get("oich")),
+            "ce_ltp": _oi_numeric_or_nan(ce.get("ltp")), "ce_ltp_chg": _oi_numeric_or_nan(ce.get("ltpch")),
+            "ce_iv": np.nan, "ce_volume": _oi_numeric_or_nan(ce.get("volume")),
+            "pe_oi": _oi_numeric_or_nan(pe.get("oi")), "pe_oi_chg": _oi_numeric_or_nan(pe.get("oich")),
+            "pe_ltp": _oi_numeric_or_nan(pe.get("ltp")), "pe_ltp_chg": _oi_numeric_or_nan(pe.get("ltpch")),
+            "pe_iv": np.nan, "pe_volume": _oi_numeric_or_nan(pe.get("volume")),
+        })
+    return rows, spot
+
+
+def _fetch_fo_oi_signal(fyers, symbol: str):
+    """Per-symbol worker for the F&O OI Analysis tab. Tries NSE first (has
+    IV/volume), falls back to Fyers optionchain on failure."""
+    stock_ticker = symbol.replace("NSE:", "").replace("-EQ", "")
+    nse_payload, nse_err = _nse_fetch_chain_for_expiry(stock_ticker)
+    rows, spot, source = [], None, None
+    if nse_payload and nse_payload.get("data"):
+        rows, spot = _normalize_nse_chain(nse_payload)
+        source = "NSE"
+    else:
+        _oi_debug_record(f"{stock_ticker}: NSE failed ({nse_err}), trying Fyers")
+        expiries, exp_err = _fyers_fetch_expiry_list(fyers, symbol)
+        nearest = _pick_nearest_expiry(expiries)
+        if nearest:
+            fyers_payload, fy_err = _fyers_fetch_chain_for_expiry(fyers, symbol, nearest["expiry"])
+            if fyers_payload:
+                rows, spot = _normalize_fyers_chain(fyers_payload)
+                source = "Fyers"
+            else:
+                return None, f"{stock_ticker}: NSE failed ({nse_err}); Fyers failed ({fy_err})"
+        else:
+            return None, f"{stock_ticker}: NSE failed ({nse_err}); Fyers expiry lookup failed ({exp_err})"
+    if not rows:
+        return None, f"{stock_ticker}: no option chain data from either source"
+    if spot:
+        atm = _nearest_atm(spot, [r["strike"] for r in rows])
+        selected_strikes = set(_select_strikes([r["strike"] for r in rows], atm, n_each_side=10))
+        rows = [r for r in rows if r["strike"] in selected_strikes]
+    metrics = _compute_oi_metrics(rows, spot)
+    metrics["symbol"] = stock_ticker
+    metrics["spot"] = spot
+    metrics["source"] = source
+    return metrics, None
+
+
+def run_fo_oi_scan(fyers, symbols):
+    """Threaded batch scan for the F&O OI Analysis tab."""
     symbols = _validate_symbols(symbols)
-    fo_master = set(load_nse_fo_stock_symbols())
-    results: List[dict] = []
-    errors: List[str] = []
+    results, errors = [], []
     stats = ScanStats(total=len(symbols))
-    progress = st.progress(0.0, text=f"F&O OI Scan 0 / {len(symbols)}")
+    progress = st.progress(0.0, text=f"Scanning F&O OI 0 / {len(symbols)}")
     done = 0
-
     for i in range(0, len(symbols), BATCH_SIZE):
         batch = symbols[i:i + BATCH_SIZE]
-        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            futures = {executor.submit(_fetch_fo_oi_signal, fyers, s, fo_master): s for s in batch}
+        with ThreadPoolExecutor(max_workers=min(MAX_WORKERS, 4)) as executor:
+            futures = {executor.submit(_fetch_fo_oi_signal, fyers, s): s for s in batch}
             for future in as_completed(futures):
                 try:
                     res, err = future.result()
@@ -3823,585 +3304,306 @@ def run_fo_oi_scan(fyers, symbols: List[str]) -> Tuple[List[dict], List[str], "S
                     errors.append(err)
                 stats.record(has_result=bool(res), has_error=bool(err))
                 done += 1
-                progress.progress(
-                    done / max(len(symbols), 1),
-                    text=f"F&O OI Scan {done} / {len(symbols)}"
-                )
+                progress.progress(done / max(len(symbols), 1), text=f"Scanning F&O OI {done} / {len(symbols)}")
         if i + BATCH_SIZE < len(symbols):
             time.sleep(BATCH_PAUSE_SECONDS)
-
     progress.empty()
     gc.collect()
     return results, errors, stats
 
 
+_FO_OI_REPORT_COLUMNS = ["Strike", "CE OI", "CE OI Chg", "CE LTP", "CE LTP Chg", "CE Signal", "PE OI", "PE OI Chg", "PE LTP", "PE LTP Chg", "PE Signal", "ATM"]
+
+
+def _build_fo_oi_report_df(metrics: dict) -> pd.DataFrame:
+    """Flatten one symbol's OI metrics dict into a display-ready DataFrame."""
+    rows = metrics.get("rows", [])
+    out = []
+    for r in sorted(rows, key=lambda x: x["strike"]):
+        out.append({
+            "Strike": r["strike"], "CE OI": r.get("ce_oi"), "CE OI Chg": r.get("ce_oi_chg"),
+            "CE LTP": r.get("ce_ltp"), "CE LTP Chg": r.get("ce_ltp_chg"), "CE Signal": r.get("ce_signal", "—"),
+            "PE OI": r.get("pe_oi"), "PE OI Chg": r.get("pe_oi_chg"), "PE LTP": r.get("pe_ltp"),
+            "PE LTP Chg": r.get("pe_ltp_chg"), "PE Signal": r.get("pe_signal", "—"),
+            "ATM": "🎯" if r.get("is_atm") else "",
+        })
+    return pd.DataFrame(out, columns=_FO_OI_REPORT_COLUMNS)
+
+
+def _build_fo_oi_excel(all_metrics: List[dict]) -> bytes:
+    """Multi-sheet Excel export — one sheet per symbol plus a summary sheet."""
+    summary_rows = [{"Symbol": m["symbol"], "Spot": m.get("spot"), "PCR": m.get("pcr"), "Max Pain": m.get("max_pain"), "Source": m.get("source")} for m in all_metrics]
+    sheets = {"Summary": pd.DataFrame(summary_rows)}
+    for m in all_metrics:
+        sheets[m["symbol"][:31]] = _build_fo_oi_report_df(m)
+    return to_excel_bytes_multi(sheets)
+
+
 def _oi_color_code(val) -> str:
-    """Cell-level colour coding for the F&O OI report's string columns."""
-    if not isinstance(val, str):
-        return ""
-    if val in _OI_SENTINEL_VALUES:
-        return "color: #616161; font-weight: bold; background-color: #eeeeee; font-style: italic;"
-    v = val.upper()
-    if any(x in v for x in ["VERY BULLISH", "STRONG BULL", "INSTITUTIONAL BUYING", "LONG BUILD UP", "HIGH PROBABILITY BREAKOUT", "🟢🟢"]):
-        return "color: #006100; font-weight: bold; background-color: #e8f5e9;"
-    if any(x in v for x in ["BULLISH", "BUY", "PUT WRITING", "SHORT COVERING", "UPSIDE", "BREAKOUT", "🟢"]):
-        return "color: #1b5e20; font-weight: bold;"
-    if any(x in v for x in ["NEUTRAL", "RANGE", "BALANCED", "WAIT", "🟡", "⚖️"]):
-        return "color: #b8860b; font-weight: bold;"
-    if any(x in v for x in ["BEARISH", "SELL", "CALL WRITING", "UNWINDING", "BREAKDOWN", "INSTITUTIONAL SELLING", "🔴", "🟠"]):
-        return "color: #b71c1c; font-weight: bold;"
-    if any(x in v for x in ["STRONG BEAR", "STRONG SELL", "SHORT BUILD", "TRAP", "FALSE BREAK", "🔴🔴"]):
-        return "color: #7f0000; font-weight: bold; background-color: #ffebee;"
+    if isinstance(val, str):
+        if "Long Buildup" in val or "Short Covering" in val:
+            return "color: green; font-weight: bold;"
+        if "Short Buildup" in val or "Long Unwinding" in val:
+            return "color: red; font-weight: bold;"
     return ""
 
 
-def _style_oi_df(df: pd.DataFrame):
-    """Safe OI-aware styler — only applied to string columns."""
+def _style_oi_df(df):
     try:
         str_cols = [c for c in df.columns if df[c].dtype == object]
-        if not str_cols:
-            return df.style
         styler = df.style
         if hasattr(styler, "map"):
             return styler.map(_oi_color_code, subset=str_cols)
         return styler.applymap(_oi_color_code, subset=str_cols)
     except Exception:
-        try:
-            return df.style
-        except Exception:
-            return df
+        return df.style
 
 
-# ══════════════════════════════════════════════════════════════════════════
-# ── F&O OI REPORT PIPELINE (report generation / export only) ──────────────
-# This section fixes the "successful stocks disappear" bug. It NEVER
-# touches _fetch_fo_oi_signal, _compute_oi_metrics, run_fo_oi_scan, PCR,
-# Max Pain, Probability, or any AI/signal calculation — it only reads the
-# dicts those functions already produce and turns them into a report.
-# ══════════════════════════════════════════════════════════════════════════
-
-_FO_OI_REPORT_COLUMNS = [
-    "Stock", "LTP", "Signal", "Direction", "OI Bias", "OI Status",
-    "Spot Price", "ATM Strike", "Expiry", "PCR", "Max Pain",
-    "CE OI", "PE OI", "CE OI Change", "PE OI Change",
-    "OI Pattern", "Call Writing", "Put Writing", "Long Build Up", "Short Build Up",
-    "Long Unwinding", "Short Covering",
-    "Support", "Resistance",
-    "Probability %", "Confidence %",
-    "Entry", "Stop Loss", "Target 1", "Target 2", "Risk Reward",
-    "AI Reason", "OI Source", "Timestamp",
-]
-
-
-def _pct_to_float(val, default: float = 0.0):
-    """Safely turn '73.5%' / 73.5 / None into a float for sorting/filtering/export."""
-    if val is None:
-        return default
-    if isinstance(val, str) and val in _OI_SENTINEL_VALUES:
-        return np.nan
-    try:
-        return float(str(val).replace("%", "").strip())
-    except (ValueError, TypeError):
-        return default
-
-
-def _oi_numeric_or_nan(value):
-    """
-    Req #11: convert an OI-engine value to float for the report/Excel/CSV,
-    but if the value is one of the 4 sentinel strings (or otherwise not
-    numeric), return NaN instead of silently fabricating a 0. NaN renders
-    as a blank cell in Excel/CSV/JSON — clearly different from a real 0
-    the API actually reported.
-    """
-    if isinstance(value, str):
-        return np.nan
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return np.nan
-
-
-def _build_fo_oi_report_df(results: List[dict]) -> pd.DataFrame:
-    """
-    Build the report DIRECTLY from the raw results[] list (the exact same
-    list every successful `_fetch_fo_oi_signal` call was appended to
-    inside `run_fo_oi_scan`). One row is emitted per successful result.
-    """
-    rows = []
-    for r in results:
-        if not isinstance(r, dict):
-            continue
-
-        spot_raw = r.get("Spot", 0.0)
-        try:
-            spot = float(spot_raw) if spot_raw is not None else 0.0
-        except (TypeError, ValueError):
-            spot = 0.0
-
-        oi_bias_val = r.get("OI Bias", "—")
-        status = oi_bias_val if isinstance(oi_bias_val, str) and oi_bias_val in _OI_SENTINEL_VALUES else "OK"
-
-        trade_dir = r.get("Trade Direction", "—")
-        exp_target = _oi_numeric_or_nan(r.get("Expected Target", spot)) if status == "OK" else np.nan
-        exp_pts = _oi_numeric_or_nan(r.get("Expected Points", 0.0)) if status == "OK" else np.nan
-
-        if status == "OK" and isinstance(trade_dir, str) and "BUY" in trade_dir and not np.isnan(exp_pts):
-            target2 = round(spot + 2 * exp_pts, 2)
-        elif status == "OK" and isinstance(trade_dir, str) and "SELL" in trade_dir and not np.isnan(exp_pts):
-            target2 = round(spot - 2 * exp_pts, 2)
-        elif status == "OK":
-            target2 = spot
-        else:
-            target2 = np.nan
-
-        rows.append({
-            "Stock": r.get("Stock", "—"),
-            "LTP": round(spot, 2),
-            "Signal": trade_dir if status == "OK" else status,
-            "Direction": (r.get("Next Candle Prediction", "—") if status == "OK" else status),
-            "OI Bias": oi_bias_val,
-            "OI Status": status,
-            "Spot Price": round(spot, 2),
-            "ATM Strike": r.get("ATM Strike", "—"),
-            "Expiry": r.get("Expiry", "—"),
-            "PCR": _oi_numeric_or_nan(r.get("PCR", 0.0)),
-            "Max Pain": _oi_numeric_or_nan(r.get("Max Pain", 0)),
-            "CE OI": _oi_numeric_or_nan(r.get("_ce_oi_total", 0)),
-            "PE OI": _oi_numeric_or_nan(r.get("_pe_oi_total", 0)),
-            "CE OI Change": _oi_numeric_or_nan(r.get("15m CE OI Δ", 0)),
-            "PE OI Change": _oi_numeric_or_nan(r.get("15m PE OI Δ", 0)),
-            "OI Pattern": r.get("OI Pattern", status),
-            "Call Writing": r.get("Call Writing", status),
-            "Put Writing": r.get("Put Writing", status),
-            "Long Build Up": r.get("Long Build Up", status),
-            "Short Build Up": r.get("Short Build Up", status),
-            "Long Unwinding": r.get("Long Unwinding", status),
-            "Short Covering": r.get("Short Covering", status),
-            "Support": r.get("Support"),
-            "Resistance": r.get("Resistance"),
-            "Probability %": _pct_to_float(r.get("Probability")),
-            "Confidence %": _pct_to_float(r.get("Confidence")),
-            "Entry": round(spot, 2),
-            "Stop Loss": _oi_numeric_or_nan(r.get("Expected StopLoss", 0.0)) if status == "OK" else np.nan,
-            "Target 1": exp_target,
-            "Target 2": target2,
-            "Risk Reward": _oi_numeric_or_nan(r.get("Risk Reward", 0.0)) if status == "OK" else np.nan,
-            "AI Reason": (f"{r.get('Prediction Text', '—')} — {r.get('AI Summary', '')}".strip(" —") if status == "OK" else status),
-            "OI Source": r.get("OI Source", "—"),
-            "Timestamp": f"{r.get('Signal Date', '—')} {r.get('Signal Time', '—')}",
-        })
-
-    report_df = pd.DataFrame(rows, columns=_FO_OI_REPORT_COLUMNS)
-    return report_df
-
-
-def _build_fo_oi_excel(df: pd.DataFrame) -> bytes:
-    """
-    Dedicated professional Excel export for the F&O OI report.
-    Title row + company header + generated time, bold coloured header row,
-    freeze panes, autofilter, borders, center alignment, auto column width,
-    and BUY=green / SELL=red / WATCH=yellow conditional row formatting.
-    Exports EXACTLY the dataframe passed in — Displayed rows == Excel rows.
-    """
-    from openpyxl import Workbook
-    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
-    from openpyxl.utils import get_column_letter
-
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "F&O OI Report"
-
-    thin = Side(style="thin", color="B0B0B0")
-    border = Border(left=thin, right=thin, top=thin, bottom=thin)
-    center = Alignment(horizontal="center", vertical="center")
-    n_cols = max(len(df.columns), 1)
-
-    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=n_cols)
-    company_cell = ws.cell(row=1, column=1, value="NSE AI PRO — Institutional F&O OI Analysis")
-    company_cell.font = Font(bold=True, size=15, color="FFFFFF")
-    company_cell.fill = PatternFill("solid", fgColor="0B2545")
-    company_cell.alignment = center
-    ws.row_dimensions[1].height = 28
-
-    ws.merge_cells(start_row=2, start_column=1, end_row=2, end_column=n_cols)
-    title_cell = ws.cell(row=2, column=1, value=f"F&O OI Report — Generated {_now_ist().strftime('%d-%b-%Y %H:%M:%S')} IST")
-    title_cell.font = Font(bold=True, size=12, color="FFFFFF")
-    title_cell.fill = PatternFill("solid", fgColor="1F4E78")
-    title_cell.alignment = center
-    ws.row_dimensions[2].height = 22
-
-    header_font = Font(bold=True, color="FFFFFF", size=11)
-    header_fill = PatternFill("solid", fgColor="2E5F8A")
-    for c_idx, col_name in enumerate(df.columns, start=1):
-        cell = ws.cell(row=3, column=c_idx, value=col_name)
-        cell.font = header_font
-        cell.fill = header_fill
-        cell.alignment = center
-        cell.border = border
-
-    buy_fill = PatternFill("solid", fgColor="C6EFCE")
-    sell_fill = PatternFill("solid", fgColor="FFC7CE")
-    wait_fill = PatternFill("solid", fgColor="FFEB9C")
-    nodata_fill = PatternFill("solid", fgColor="E0E0E0")
-
-    for r_idx, (_, row) in enumerate(df.iterrows(), start=4):
-        signal_val = str(row.get("Signal", ""))
-        oi_status_val = str(row.get("OI Status", "OK")) if "OI Status" in df.columns else "OK"
-        if oi_status_val in _OI_SENTINEL_VALUES:
-            row_fill = nodata_fill
-        elif "BUY" in signal_val:
-            row_fill = buy_fill
-        elif "SELL" in signal_val:
-            row_fill = sell_fill
-        elif "WAIT" in signal_val or "WATCH" in signal_val:
-            row_fill = wait_fill
-        else:
-            row_fill = None
-
-        for c_idx, col_name in enumerate(df.columns, start=1):
-            val = row[col_name]
-            if isinstance(val, float) and np.isnan(val):
-                val = None
-            cell = ws.cell(row=r_idx, column=c_idx, value=val)
-            cell.border = border
-            cell.alignment = center
-            if row_fill is not None:
-                cell.fill = row_fill
-
-    for c_idx, col_name in enumerate(df.columns, start=1):
-        max_len = max(
-            [len(str(col_name))] + [len(str(v)) for v in df[col_name].astype(str).tolist()]
-        ) if len(df) else len(str(col_name))
-        ws.column_dimensions[get_column_letter(c_idx)].width = min(max(max_len + 2, 10), 45)
-
-    ws.freeze_panes = "A4"
-    ws.auto_filter.ref = f"A3:{get_column_letter(n_cols)}{ws.max_row}"
-
-    buf = io.BytesIO()
-    wb.save(buf)
-    buf.seek(0)
-    return buf.getvalue()
-
-
-def _show_fo_oi_debug_panel(total_symbols: int, stats: Optional["ScanStats"], rows_before: int, rows_after: int, rows_displayed: int, rows_exported: int, failed_count: int, report_df: Optional[pd.DataFrame] = None) -> None:
-    """
-    Debug panel showing every stage of the report pipeline PLUS the OI
-    data-engine diagnostics (expiry detection, API source/status, strike
-    counts, and sample OI values) for every symbol scanned, so a
-    zero/blank cell can always be traced back to its cause.
-    """
-    with st.expander("🩺 Debug Panel — Report Pipeline & OI Data Engine", expanded=False):
-        st.write({
-            "Total Symbols": total_symbols,
-            "Scanned": stats.scanned if stats else 0,
-            "Successful": stats.successful if stats else 0,
-            "Failed": stats.failed if stats else 0,
-            "Rows Before Filter": rows_before,
-            "Rows After Filter": rows_after,
-            "Rows Displayed": rows_displayed,
-            "Rows Exported": rows_exported,
-        })
-        if stats and stats.successful > 0 and rows_before < stats.successful:
-            st.error("⚠️ report_df has fewer rows than successful scan results — pipeline leak detected.")
-
-        if report_df is not None and not report_df.empty and "OI Status" in report_df.columns:
-            status_counts = report_df["OI Status"].value_counts().to_dict()
-            st.markdown("**OI Data Engine — Status Breakdown**")
-            st.write(status_counts)
-
+def _show_fo_oi_debug_panel() -> None:
+    with st.expander("🔧 OI Fetch Debug Log"):
         if _OI_DEBUG_LOG:
-            st.markdown("**OI Data Engine — Recent Fetch Diagnostics** (Symbol · Expiry · Spot · ATM · Status · Strikes · Source · Reason · Sample CE/PE OI & Change)")
-            debug_df = pd.DataFrame(_OI_DEBUG_LOG[-100:])
-            preferred = ["_ts", "Symbol", "Expiry", "Spot Price", "ATM Strike", "API Response Status",
-                         "Number of Strikes Received", "API Source", "Reason",
-                         "Sample CE OI", "Sample PE OI", "Sample CE Change", "Sample PE Change"]
-            cols = [c for c in preferred if c in debug_df.columns] + [c for c in debug_df.columns if c not in preferred]
-            st.dataframe(debug_df[cols].iloc[::-1], use_container_width=True, height=300, hide_index=True)
+            st.text("\n".join(_OI_DEBUG_LOG[-50:]))
         else:
-            st.caption("No OI fetch diagnostics recorded yet — run a scan to populate this log.")
-
-
-def _show_fo_oi_failed_expander() -> None:
-    """Failed symbols shown independently — never mixed into or subtracted from successful rows."""
-    failed = st.session_state.get("fo_failed_symbols", [])
-    if failed:
-        with st.expander(f"⚠️ Failed/skipped symbols ({len(failed)})"):
-            st.caption("Most stocks are skipped for missing/invalid data, not app errors.")
-            st.text("\n".join(failed[:40]))
+            st.caption("No debug entries yet.")
 
 
 def _show_fo_oi_tab(fyers, fo_symbols: List[str]) -> None:
-    """
-    Renders the complete 🔬 F&O OI Analysis tab.
-    Report pipeline hardened per the fixed data flow:
-        Scanner → results[] → report_df → session_state.fo_report_df
-        → Filters (never permanently hide data) → Displayed Report → Export
-    No scanner/OI/AI/PCR/Max Pain/Probability logic is touched here.
-    """
-    st.markdown(
-        "### 🔬 Institutional F&O OI Analysis — 15-Minute\n"
-        "Tracks CE/PE Open Interest changes on the latest **completed 15-minute candle** "
-        "for every F&O stock. Identifies Fresh Writing, Long/Short Build-Up, Institutional "
-        "activity, and estimates the probability of the next directional move."
-    )
-
-    next_candle_at = _current_15m_epoch() + 900
-    next_dt = datetime.fromtimestamp(next_candle_at, tz=IST).strftime("%H:%M:%S IST")
-    st.caption(
-        f"📡 OI Source: **Fyers** (NSE fallback) · "
-        f"Data refreshes after every completed 15-min candle · "
-        f"Next candle at **{next_dt}** · "
-        f"Cache entries: {len(_OI_CACHE)}"
-    )
-    st.divider()
-
-    oi_c1, oi_c2, oi_c3, oi_c4 = st.columns([1, 1, 1, 1])
-    with oi_c1:
-        oi_limit = st.number_input(
-            "Limit F&O symbols (0 = all)", min_value=0,
-            max_value=len(fo_symbols), value=min(50, len(fo_symbols)),
-            step=25, key="oi_limit",
-            help="Start with 50 to test. OI API calls are rate-limited."
-        )
-    with oi_c2:
-        oi_bias_filter = st.selectbox(
-            "Filter by Signal / Bias",
-            ["All", "BUY only", "SELL only", "WATCH/WAIT only",
-             "Bullish Bias", "Bearish Bias", "High Probability",
-             "Institutional Activity"],
-            key="oi_bias_filter"
-        )
-    with oi_c3:
-        oi_min_prob = st.slider("Min Probability %", min_value=0, max_value=90, value=0, step=5, key="oi_min_prob")
-    with oi_c4:
-        if st.button("🗑️ Clear OI Cache", key="oi_clear_cache"):
-            _OI_CACHE.clear()
-            st.success("OI cache cleared.")
-
-    oi_universe = fo_symbols if oi_limit == 0 else fo_symbols[:oi_limit]
-    st.caption(f"Scanning **{len(oi_universe)}** F&O stocks.")
-
-    if st.button(f"🔬 Run F&O OI Analysis ({len(oi_universe)} symbols)", key="oi_run"):
-        with st.spinner("Fetching OI data from Fyers / NSE…"):
-            oi_results, oi_errors, oi_stats = run_fo_oi_scan(fyers, oi_universe)
-
-        report_df = _build_fo_oi_report_df(oi_results)
-
-        st.session_state["fo_report_df"] = report_df
-        st.session_state["fo_scan_results"] = oi_results
-        st.session_state["fo_failed_symbols"] = oi_errors
-        st.session_state["fo_oi_stats"] = oi_stats
-        st.session_state["fo_oi_total_symbols"] = len(oi_universe)
-
-    if "fo_oi_stats" in st.session_state:
-        _display_scan_summary(st.session_state["fo_oi_stats"])
-
-    report_df = st.session_state.get("fo_report_df")
-    raw_results = st.session_state.get("fo_scan_results", [])
-
-    if (report_df is None or report_df.empty) and raw_results:
-        report_df = _build_fo_oi_report_df(raw_results)
-        st.session_state["fo_report_df"] = report_df
-
-    if report_df is None or report_df.empty:
-        if "fo_scan_results" in st.session_state:
-            st.info("Scan completed but produced no successful rows. Check failed symbols below.")
-        else:
-            st.info(
-                "👆 Click **'Run F&O OI Analysis'** above to start.  \n"
-                "The scanner fetches live option chain data for each F&O stock, "
-                "computes CE/PE OI changes on the latest completed 15-min candle, "
-                "and generates institutional-grade directional signals."
-            )
-        _show_fo_oi_failed_expander()
+    """Full UI body for the 'F&O OI Analysis' tab."""
+    st.caption(f"Loaded {len(fo_symbols)} F&O-permitted NSE stocks. Fetches live CE/PE OI (NSE primary, Fyers fallback), PCR, Max Pain, and Long/Short Buildup classification.")
+    if not fo_symbols:
+        st.warning("No F&O symbols loaded.")
         return
+    oi_lim = st.number_input("Limit symbols (0=all)", min_value=0, max_value=len(fo_symbols), value=min(20, len(fo_symbols)), step=5, key="oi_limit")
+    oi_universe = fo_symbols if oi_lim == 0 else fo_symbols[:oi_lim]
+    if st.button(f"🔬 Run F&O OI Scan ({len(oi_universe)} symbols)", key="oi_run"):
+        with st.spinner("Fetching option chains…"):
+            oi_results, oi_errors, oi_stats = run_fo_oi_scan(fyers, oi_universe)
+            st.session_state["oi_results"] = oi_results
+            st.session_state["oi_errors"] = oi_errors
+            st.session_state["oi_stats"] = oi_stats
+    if "oi_stats" in st.session_state:
+        _display_scan_summary(st.session_state["oi_stats"])
+    oi_results = st.session_state.get("oi_results")
+    if oi_results:
+        summary_df = pd.DataFrame([{"Symbol": m["symbol"], "Spot": m.get("spot"), "PCR": m.get("pcr"), "Max Pain": m.get("max_pain"), "Source": m.get("source")} for m in oi_results])
+        st.markdown("#### 📊 PCR & Max Pain Summary")
+        st.dataframe(summary_df, use_container_width=True, height=min(38 * len(summary_df) + 60, 400))
+        sel_symbol = st.selectbox("View strike-level chain for:", [m["symbol"] for m in oi_results], key="oi_sel_symbol")
+        sel_metrics = next((m for m in oi_results if m["symbol"] == sel_symbol), None)
+        if sel_metrics:
+            detail_df = _build_fo_oi_report_df(sel_metrics)
+            st.markdown(f"#### 🔬 {sel_symbol} — Spot {sel_metrics.get('spot')} | PCR {sel_metrics.get('pcr')} | Max Pain {sel_metrics.get('max_pain')} | Source: {sel_metrics.get('source')}")
+            st.dataframe(_style_oi_df(detail_df), use_container_width=True, height=500)
+        st.download_button("📥 Download Full OI Report (Excel, all symbols)", data=_build_fo_oi_excel(oi_results), file_name=f"nse_fo_oi_{_now_ist().strftime('%Y%m%d_%H%M')}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="dl_oi_xlsx")
+    else:
+        st.info("Run an F&O OI scan above.")
+    if st.session_state.get("oi_errors"):
+        with st.expander(f"⚠️ Skipped/failed ({len(st.session_state['oi_errors'])})"):
+            st.text("\n".join(st.session_state["oi_errors"][:20]))
+    _show_fo_oi_debug_panel()
+# ════════════════════════════════════════════════════════════════════════
+# VOLUME TOP / BOTTOM IDENTIFIER  —  additive module
+# ────────────────────────────────────────────────────────────────────────
+# Paste this whole block into your main scanner .py file (anywhere below
+# the existing helper functions such as calculate_rsi / calculate_atr /
+# _validate_symbols / ScanStats / _safe_history, since it reuses them).
+#
+# It does NOT modify or remove anything you already have. It adds:
+#   1. _classify_volume_top_bottom(df)   -> pure detection logic
+#   2. _fetch_volume_top_bottom(...)     -> per-symbol worker (threaded)
+#   3. run_volume_top_bottom_scan(...)   -> batch scan (same pattern as
+#                                            your other run_* functions)
+#   4. A ready-made Streamlit tab block (`tab_vol_tb`) to drop into
+#      show_scanner(), with two separate tables: TOP list and BOTTOM list,
+#      plus Excel/CSV/JSON export.
+#
+# WHAT IT DETECTS
+# ────────────────
+# On the most recently CLOSED daily candle for each stock:
+#   • RVOL = today's volume ÷ 20-day average volume
+#   • Only candles with RVOL >= 2.0x (configurable) are considered
+#   • "Volume Top"    -> close is within 2% of the 20-day high AND shows a
+#                         bearish tell (red candle / long upper wick / RSI>=68)
+#                         => possible exhaustion / distribution top
+#   • "Volume Bottom" -> close is within 2% of the 20-day low AND shows a
+#                         bullish tell (green candle / long lower wick / RSI<=32)
+#                         => possible capitulation / accumulation bottom
+# ════════════════════════════════════════════════════════════════════════
 
-    rows_before_filter = len(report_df)
-    view = report_df.copy()
+VOL_TB_LOOKBACK = 20          # candles used to define "recent high/low"
+VOL_TB_MIN_RVOL = 2.0         # minimum relative volume to qualify at all
+VOL_TB_PROXIMITY_PCT = 2.0    # must be within this % of the recent high/low
+
+
+def _volume_top_reason(last_close, last_open, upper_wick, body, rsi_val) -> str:
+    reasons = []
+    if last_close < last_open:
+        reasons.append("Red candle on the spike")
+    if upper_wick > body * 1.2:
+        reasons.append("Long upper wick (selling into strength)")
+    if rsi_val >= 68:
+        reasons.append(f"RSI overbought ({rsi_val:.1f})")
+    return ", ".join(reasons) if reasons else "High volume at recent high"
+
+
+def _volume_bottom_reason(last_close, last_open, lower_wick, body, rsi_val) -> str:
+    reasons = []
+    if last_close > last_open:
+        reasons.append("Green candle on the spike")
+    if lower_wick > body * 1.2:
+        reasons.append("Long lower wick (buying into weakness)")
+    if rsi_val <= 32:
+        reasons.append(f"RSI oversold ({rsi_val:.1f})")
+    return ", ".join(reasons) if reasons else "High volume at recent low"
+
+
+def _classify_volume_top_bottom(df) -> dict:
+    """
+    Classifies the most recently CLOSED candle as a Volume Top, Volume
+    Bottom, or Neither. Returns a dict with type = 'TOP' | 'BOTTOM' | 'NONE'.
+    Uses the same calculate_rsi() helper already defined in this file.
+    """
+    if len(df) < VOL_TB_LOOKBACK + 5:
+        return {"type": "NONE"}
+
+    last = df.iloc[-1]
+    recent = df.tail(VOL_TB_LOOKBACK)
+    vol_avg = df["Volume"].tail(VOL_TB_LOOKBACK).mean()
+    rvol = float(last["Volume"] / vol_avg) if vol_avg > 0 else 0.0
+    if rvol < VOL_TB_MIN_RVOL:
+        return {"type": "NONE", "rvol": round(rvol, 2)}
+
+    recent_high = float(recent["High"].max())
+    recent_low = float(recent["Low"].min())
+    last_close = float(last["Close"])
+    last_open = float(last["Open"])
+    last_high = float(last["High"])
+    last_low = float(last["Low"])
+
+    dist_from_high_pct = ((recent_high - last_close) / recent_high * 100) if recent_high else 100.0
+    dist_from_low_pct = ((last_close - recent_low) / recent_low * 100) if recent_low else 100.0
+
+    rsi_val = float(calculate_rsi(df["Close"]).iloc[-1])
+    body = abs(last_close - last_open)
+    upper_wick = last_high - max(last_close, last_open)
+    lower_wick = min(last_close, last_open) - last_low
+
+    # --- Volume Top: exhaustion / distribution near the recent high ---
+    if dist_from_high_pct <= VOL_TB_PROXIMITY_PCT:
+        bearish_tell = (last_close < last_open) or (upper_wick > body * 1.2) or (rsi_val >= 68)
+        if bearish_tell:
+            return {
+                "type": "TOP",
+                "rvol": round(rvol, 2),
+                "rsi": round(rsi_val, 1),
+                "reference_level": round(recent_high, 2),
+                "distance_pct": round(dist_from_high_pct, 2),
+                "reason": _volume_top_reason(last_close, last_open, upper_wick, body, rsi_val),
+            }
+
+    # --- Volume Bottom: capitulation / accumulation near the recent low ---
+    if dist_from_low_pct <= VOL_TB_PROXIMITY_PCT:
+        bullish_tell = (last_close > last_open) or (lower_wick > body * 1.2) or (rsi_val <= 32)
+        if bullish_tell:
+            return {
+                "type": "BOTTOM",
+                "rvol": round(rvol, 2),
+                "rsi": round(rsi_val, 1),
+                "reference_level": round(recent_low, 2),
+                "distance_pct": round(dist_from_low_pct, 2),
+                "reason": _volume_bottom_reason(last_close, last_open, lower_wick, body, rsi_val),
+            }
+
+    return {"type": "NONE", "rvol": round(rvol, 2)}
+
+
+def _fetch_volume_top_bottom(fyers, symbol):
+    """Per-symbol worker. Follows the exact same pattern as your other
+    _fetch_* functions (uses _safe_history / _VALID_EQ_SYMBOL_RE)."""
+    if not isinstance(symbol, str) or not _VALID_EQ_SYMBOL_RE.match(symbol):
+        return None, f"{symbol}: invalid symbol format — skipped"
+    resp, err = _safe_history(fyers, {
+        "symbol": symbol, "resolution": "D", "date_format": "1",
+        "range_from": DATE_FROM, "range_to": DATE_TO, "cont_flag": "1",
+    })
+    if err:
+        return None, f"{symbol}: {err}"
+    candles = resp.get("candles") if resp else None
+    if not candles or len(candles) < VOL_TB_LOOKBACK + 5:
+        return None, f"{symbol}: insufficient history"
+    try:
+        df = pd.DataFrame(candles, columns=["Time", "Open", "High", "Low", "Close", "Volume"])
+        df["Time"] = pd.to_datetime(df["Time"], unit="s", utc=True).dt.tz_convert("Asia/Kolkata")
+        df[["Open", "High", "Low", "Close", "Volume"]] = df[["Open", "High", "Low", "Close", "Volume"]].apply(pd.to_numeric, errors="coerce")
+        df = df.dropna(subset=["Open", "High", "Low", "Close"])
+        if len(df) < VOL_TB_LOOKBACK + 5:
+            return None, f"{symbol}: insufficient valid candle data"
+    except (KeyError, ValueError, TypeError) as e:
+        return None, f"{symbol}: malformed candle data ({e})"
 
     try:
-        if oi_bias_filter == "BUY only":
-            view = view[view["Signal"].str.contains("BUY", na=False)]
-        elif oi_bias_filter == "SELL only":
-            view = view[view["Signal"].str.contains("SELL", na=False)]
-        elif oi_bias_filter == "WATCH/WAIT only":
-            view = view[view["Signal"].str.contains("WAIT|WATCH", na=False, regex=True)]
-        elif oi_bias_filter == "Bullish Bias":
-            view = view[view["OI Bias"].str.contains("Bullish", na=False)]
-        elif oi_bias_filter == "Bearish Bias":
-            view = view[view["OI Bias"].str.contains("Bearish", na=False)]
-        elif oi_bias_filter == "High Probability":
-            view = view[view["Probability %"] >= 70]
-        elif oi_bias_filter == "Institutional Activity":
-            view = view[view["AI Reason"].str.contains("Institutional|🏦", na=False, regex=True)]
+        result = _classify_volume_top_bottom(df)
+        if result["type"] == "NONE":
+            return None, None  # not an error, just doesn't qualify
 
-        if oi_min_prob > 0:
-            view = view[view["Probability %"] >= oi_min_prob]
-    except Exception:
-        view = report_df.copy()
+        last_close = float(df["Close"].iloc[-1])
+        last_volume = int(df["Volume"].iloc[-1])
+        vol_avg = float(df["Volume"].tail(VOL_TB_LOOKBACK).mean())
+        stock_ticker = symbol.replace("NSE:", "").replace("-EQ", "")
+        signal_date_str, signal_time_str = _candle_signal_timestamp(df, is_daily=True)
 
-    rows_after_filter = len(view)
+        row = {
+            "Signal Date": signal_date_str,
+            "Signal Time": signal_time_str,
+            "Stock": stock_ticker,
+            "LTP": round(last_close, 2),
+            "Type": "🔴 Volume TOP" if result["type"] == "TOP" else "🟢 Volume BOTTOM",
+            "RVOL": _format_rvol_display(result["rvol"]),
+            "_RVOL_RAW": result["rvol"],
+            "Volume": last_volume,
+            "Avg Volume (20d)": int(vol_avg),
+            "RSI": result["rsi"],
+            f"{VOL_TB_LOOKBACK}D Reference Level": result["reference_level"],
+            "Reference Type": "High" if result["type"] == "TOP" else "Low",
+            "Distance %": result["distance_pct"],
+            "Reason": result["reason"],
+        }
+        return row, None
+    except (KeyError, IndexError, TypeError, ValueError, ZeroDivisionError, AttributeError) as e:
+        return None, f"{symbol}: analysis error ({type(e).__name__})"
 
-    if rows_after_filter == 0 and rows_before_filter > 0:
-        st.warning("⚠️ No stocks match current filters. Showing all successful results.")
-        view = report_df.copy()
-        rows_after_filter = len(view)
 
-    view = view.sort_values("Probability %", ascending=False).reset_index(drop=True)
-
-    st.markdown("#### 📊 OI Overview")
-    k1, k2, k3, k4, k5, k6 = st.columns(6)
-    k1.metric("Total Rows", len(view))
-    try:
-        k2.metric("🟢 BUY", int(view["Signal"].str.contains("BUY", na=False).sum()))
-        k3.metric("🔴 SELL", int(view["Signal"].str.contains("SELL", na=False).sum()))
-        k4.metric("🟡 WAIT/WATCH", int(view["Signal"].str.contains("WAIT|WATCH", na=False, regex=True).sum()))
-    except Exception:
-        k2.metric("🟢 BUY", "—"); k3.metric("🔴 SELL", "—"); k4.metric("🟡 WAIT/WATCH", "—")
-    try:
-        k5.metric("Avg Probability", f"{view['Probability %'].mean():.1f}%" if len(view) else "—")
-    except Exception:
-        k5.metric("Avg Probability", "—")
-    try:
-        k6.metric("Avg PCR", f"{view['PCR'].mean():.2f}" if len(view) else "—")
-    except Exception:
-        k6.metric("Avg PCR", "—")
-
-    st.divider()
-
-    st.markdown("#### 📋 F&O OI Report")
-    try:
-        st.dataframe(_style_oi_df(view), use_container_width=True, height=520)
-    except Exception:
-        st.dataframe(view, use_container_width=True, height=520)
-
-    st.markdown("#### 💾 Export")
-    ts = _now_ist().strftime("%Y%m%d_%H%M")
-    dl1, dl2, dl3 = st.columns(3)
-    with dl1:
-        st.download_button(
-            "📥 Download Excel (Professional)",
-            data=_build_fo_oi_excel(view),
-            file_name=f"FO_OI_Report_{ts}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            key="dl_oi_xlsx",
-        )
-    with dl2:
-        st.download_button(
-            "📥 Download CSV",
-            data=to_csv_bytes(view),
-            file_name=f"FO_OI_Report_{ts}.csv",
-            mime="text/csv",
-            key="dl_oi_csv",
-        )
-    with dl3:
-        st.download_button(
-            "📥 Download JSON",
-            data=to_json_bytes(view),
-            file_name=f"FO_OI_Report_{ts}.json",
-            mime="application/json",
-            key="dl_oi_json",
-        )
-
-    st.divider()
-
-    show_cards = st.checkbox("📋 Show per-stock AI Summary cards", value=True, key="oi_show_cards")
-    if show_cards:
-        st.markdown(f"#### 🧠 AI OI Analysis Cards — {len(view)} stock(s)")
-        if len(view) > 1:
-            max_cards = st.slider("Max cards to show", 1, min(len(view), 30), min(10, len(view)), key="oi_max_cards")
-        else:
-            max_cards = len(view)
-
-        for _, row in view.head(max_cards).iterrows():
-            stock = str(row.get("Stock", "—"))
-            oi_status = str(row.get("OI Status", "OK"))
-            signal_val = str(row.get("Signal", "—"))
-            is_bull = "BUY" in signal_val
-            is_bear = "SELL" in signal_val
-            card_color = "#006100" if is_bull else "#9C0006" if is_bear else "#b8860b"
-            card_bg = "#f0fff0" if is_bull else "#fff0f0" if is_bear else "#fffde7"
-            icon = "🟢" if is_bull else "🔴" if is_bear else "🟡"
-
-            st.markdown(
-                f'<div style="border:2px solid {card_color};border-radius:10px;'
-                f'padding:14px;margin-bottom:6px;background:{card_bg}">'
-                f'<h3 style="margin:0 0 4px 0;color:{card_color}">'
-                f'{icon} {stock} &nbsp;|&nbsp; {row.get("OI Bias", "—")} &nbsp;|&nbsp; {signal_val}'
-                f'</h3>'
-                f'<span style="font-size:13px;color:#555">'
-                f'📅 {row.get("Timestamp", "—")} &nbsp;·&nbsp; '
-                f'Spot: ₹{row.get("Spot Price", 0):.2f} &nbsp;·&nbsp; ATM: {row.get("ATM Strike", "—")} &nbsp;·&nbsp; '
-                f'Expiry: {row.get("Expiry", "—")} &nbsp;·&nbsp; Source: {row.get("OI Source", "—")}'
-                f'</span></div>',
-                unsafe_allow_html=True,
-            )
-
-            if oi_status != "OK":
-                st.warning(f"⚠️ **{oi_status}** — option-chain data unavailable for {stock}; AI/OI signal generation skipped.")
-                st.divider()
-                continue
-
-            def _sf(val, fmt="{:.2f}", default="—"):
-                """NaN-safe formatter for card metrics."""
+def run_volume_top_bottom_scan(fyers, symbols):
+    """Threaded batch scan — identical pattern to run_scan() etc."""
+    symbols = _validate_symbols(symbols)
+    results, errors = [], []
+    stats = ScanStats(total=len(symbols))
+    progress = st.progress(0.0, text=f"Scanning Volume Top/Bottom 0 / {len(symbols)}")
+    done = 0
+    for i in range(0, len(symbols), BATCH_SIZE):
+        batch = symbols[i:i + BATCH_SIZE]
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            futures = {executor.submit(_fetch_volume_top_bottom, fyers, s): s for s in batch}
+            for future in as_completed(futures):
                 try:
-                    if val is None or (isinstance(val, float) and np.isnan(val)):
-                        return default
-                    return fmt.format(val)
-                except (TypeError, ValueError):
-                    return default
+                    res, err = future.result()
+                except Exception as e:
+                    res, err = None, f"{futures[future]}: worker error ({type(e).__name__})"
+                if res:
+                    results.append(res)
+                if err:
+                    errors.append(err)
+                stats.record(has_result=bool(res), has_error=bool(err))
+                done += 1
+                progress.progress(done / max(len(symbols), 1), text=f"Scanning Volume Top/Bottom {done} / {len(symbols)}")
+        if i + BATCH_SIZE < len(symbols):
+            time.sleep(BATCH_PAUSE_SECONDS)
+    progress.empty()
+    gc.collect()
+    return results, errors, stats
 
-            rc1, rc2, rc3, rc4, rc5 = st.columns(5)
-            rc1.metric("📍 Direction", row.get("Direction", "—"))
-            rc2.metric("🎯 Probability", f"{_sf(row.get('Probability %'), '{:.1f}')}%")
-            rc3.metric("💡 Confidence", f"{_sf(row.get('Confidence %'), '{:.1f}')}%")
-            rc4.metric("⚖️ PCR", _sf(row.get('PCR'), '{:.3f}'))
-            rc5.metric("💊 Max Pain", f"₹{_sf(row.get('Max Pain'), '{:.0f}')}")
 
-            oc1, oc2, oc3, oc4, oc5 = st.columns(5)
-            oc1.metric("📞 CE OI", _sf(row.get('CE OI'), '{:,.0f}'))
-            oc2.metric("📤 PE OI", _sf(row.get('PE OI'), '{:,.0f}'))
-            oc3.metric("📞 CE Δ", _sf(row.get('CE OI Change'), '{:,.0f}'))
-            oc4.metric("📤 PE Δ", _sf(row.get('PE OI Change'), '{:,.0f}'))
-            oc5.metric("⚖️ Risk:Reward", f"1:{_sf(row.get('Risk Reward'), '{:.2f}')}")
 
-            st.markdown(f"**🧩 OI Pattern:** {row.get('OI Pattern', '—')}")
-
-            wc1, wc2, wc3, wc4 = st.columns(4)
-            wc1.metric("✍️ Call Writing", row.get("Call Writing", "—"))
-            wc2.metric("✍️ Put Writing", row.get("Put Writing", "—"))
-            wc3.metric("📈 Long Build Up", row.get("Long Build Up", "—"))
-            wc4.metric("📉 Short Build Up", row.get("Short Build Up", "—"))
-
-            em1, em2, em3, em4 = st.columns(4)
-            em1.metric("🎯 Entry", f"₹{_sf(row.get('Entry'))}")
-            em2.metric("🛑 Stop Loss", f"₹{_sf(row.get('Stop Loss'))}")
-            em3.metric("🎯 Target 1", f"₹{_sf(row.get('Target 1'))}")
-            em4.metric("🎯 Target 2", f"₹{_sf(row.get('Target 2'))}")
-
-            st.markdown("**🤖 AI Reason:**")
-            ai_reason = str(row.get("AI Reason", "—"))
-            if is_bull:
-                st.success(ai_reason)
-            elif is_bear:
-                st.error(ai_reason)
-            else:
-                st.warning(ai_reason)
-
-            st.divider()
-
-    _show_fo_oi_debug_panel(
-        total_symbols=st.session_state.get("fo_oi_total_symbols", len(oi_universe)),
-        stats=st.session_state.get("fo_oi_stats"),
-        rows_before=rows_before_filter,
-        rows_after=rows_after_filter,
-        rows_displayed=len(view),
-        rows_exported=len(view),
-        failed_count=len(st.session_state.get("fo_failed_symbols", [])),
-        report_df=view,
-    )
-
-    _show_fo_oi_failed_expander()
 
 
 def show_scanner(fyers) -> None:
@@ -4445,11 +3647,12 @@ def show_scanner(fyers) -> None:
 
     (tab_scanner, tab_intraday, tab_swing, tab_fo, tab_intraday_cisd, tab_fo_cisd,
      tab_golden_death, tab_premarket, tab_fo_15m_cisd, tab_live_ob, tab_ema_swing,
-     tab_institutional, tab_fo_oi) = st.tabs([
+     tab_institutional, tab_fo_oi, tab_vol_tb) = st.tabs([
         "📊 Full Scanner", "⚡ Intraday Scanner", "📈 Swing Trade Scanner", "🏛️ F&O Stocks Scanner",
         "🕐 Intraday CISD Signals", "🎯 F&O CISD Scanner", "✝️ Swing Trading (Golden/Death Cross)",
         "🌅 Pre-Market Scanner", "🎯 NSE F&O 15-Min CISD Scanner", "🔔 Live OB Signal Scanner",
         "🌟 EMA 50/200 Swing (4H)", "🏆 Institutional Scanner", "🔬 F&O OI Analysis",
+        "🌋 Volume Top/Bottom Scanner",
     ])
 
     with tab_scanner:
@@ -5056,12 +4259,66 @@ def show_scanner(fyers) -> None:
         _fo_oi_symbols = load_nse_fo_stock_symbols()
         _show_fo_oi_tab(fyers, _fo_oi_symbols)
 
+    with tab_vol_tb:
+        st.markdown(
+            "### 🌋 Volume Top / Bottom Identifier\n"
+            f"Flags stocks with a volume spike (RVOL ≥ {VOL_TB_MIN_RVOL}x) landing within "
+            f"{VOL_TB_PROXIMITY_PCT}% of their {VOL_TB_LOOKBACK}-day high or low, "
+            "with a matching bearish/bullish tell."
+        )
+        vt_lim = st.number_input("Limit (0=all)", min_value=0, max_value=len(symbols), value=min(300, len(symbols)), step=50, key="vol_tb_limit")
+        vt_universe = symbols if vt_lim == 0 else symbols[:vt_lim]
+        if st.button(f"🌋 Run Volume Top/Bottom Scan ({len(vt_universe)} symbols)", key="vol_tb_run"):
+            with st.spinner("Scanning for volume top/bottom signatures…"):
+                vt_results, vt_errors, vt_stats = run_volume_top_bottom_scan(fyers, vt_universe)
+                st.session_state["vol_tb_df"] = pd.DataFrame(vt_results)
+                st.session_state["vol_tb_errors"] = vt_errors
+                st.session_state["vol_tb_stats"] = vt_stats
+
+        if "vol_tb_stats" in st.session_state:
+            _display_scan_summary(st.session_state["vol_tb_stats"])
+
+        vt_df = st.session_state.get("vol_tb_df")
+        if vt_df is not None and not vt_df.empty:
+            display_cols = [c for c in vt_df.columns if not c.startswith("_")]
+            top_df = vt_df[vt_df["Type"].str.contains("TOP", na=False)][display_cols].sort_values("RSI", ascending=False)
+            bottom_df = vt_df[vt_df["Type"].str.contains("BOTTOM", na=False)][display_cols].sort_values("RSI", ascending=True)
+
+            k1, k2, k3 = st.columns(3)
+            k1.metric("Total Signals", len(vt_df))
+            k2.metric("🔴 Volume Tops", len(top_df))
+            k3.metric("🟢 Volume Bottoms", len(bottom_df))
+
+            st.markdown("#### 🔴 Volume Top Candidates")
+            if not top_df.empty:
+                st.dataframe(_style_dataframe(top_df), use_container_width=True, height=350)
+            else:
+                st.caption("None found.")
+
+            st.markdown("#### 🟢 Volume Bottom Candidates")
+            if not bottom_df.empty:
+                st.dataframe(_style_dataframe(bottom_df), use_container_width=True, height=350)
+            else:
+                st.caption("None found.")
+
+            st.markdown("#### 💾 Export")
+            ts = _now_ist().strftime("%Y%m%d_%H%M")
+            e1, e2, e3 = st.columns(3)
+            with e1:
+                st.download_button("📥 Excel", data=to_excel_bytes_multi({"Volume Tops": top_df, "Volume Bottoms": bottom_df}), file_name=f"volume_top_bottom_{ts}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="dl_vol_tb_xlsx")
+            with e2:
+                st.download_button("📥 CSV", data=to_csv_bytes(vt_df[display_cols]), file_name=f"volume_top_bottom_{ts}.csv", mime="text/csv", key="dl_vol_tb_csv")
+            with e3:
+                st.download_button("📥 JSON", data=to_json_bytes(vt_df[display_cols]), file_name=f"volume_top_bottom_{ts}.json", mime="application/json", key="dl_vol_tb_json")
+        else:
+            st.info("Run a Volume Top/Bottom scan above.")
+
+        if st.session_state.get("vol_tb_errors"):
+            with st.expander(f"⚠️ Skipped ({len(st.session_state['vol_tb_errors'])})"):
+                st.text("\n".join(st.session_state["vol_tb_errors"][:20]))
+
     if st.session_state.get("scan_errors"):
         with st.expander(f"⚠️ Skipped/failed symbols ({len(st.session_state['scan_errors'])})"):
             st.text("\n".join(st.session_state["scan_errors"][:20]))
 
     gc.collect()
-
-
-# Pass your Fyers object here:
-# show_scanner(fyers)
