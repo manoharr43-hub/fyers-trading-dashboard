@@ -3402,32 +3402,7 @@ def _show_fo_oi_tab(fyers, fo_symbols: List[str]) -> None:
             st.text("\n".join(st.session_state["oi_errors"][:20]))
     _show_fo_oi_debug_panel()
 # ════════════════════════════════════════════════════════════════════════
-# VOLUME TOP / BOTTOM IDENTIFIER  —  additive module
-# ────────────────────────────────────────────────────────────────────────
-# Paste this whole block into your main scanner .py file (anywhere below
-# the existing helper functions such as calculate_rsi / calculate_atr /
-# _validate_symbols / ScanStats / _safe_history, since it reuses them).
-#
-# It does NOT modify or remove anything you already have. It adds:
-#   1. _classify_volume_top_bottom(df)   -> pure detection logic
-#   2. _fetch_volume_top_bottom(...)     -> per-symbol worker (threaded)
-#   3. run_volume_top_bottom_scan(...)   -> batch scan (same pattern as
-#                                            your other run_* functions)
-#   4. A ready-made Streamlit tab block (`tab_vol_tb`) to drop into
-#      show_scanner(), with two separate tables: TOP list and BOTTOM list,
-#      plus Excel/CSV/JSON export.
-#
-# WHAT IT DETECTS
-# ────────────────
-# On the most recently CLOSED daily candle for each stock:
-#   • RVOL = today's volume ÷ 20-day average volume
-#   • Only candles with RVOL >= 2.0x (configurable) are considered
-#   • "Volume Top"    -> close is within 2% of the 20-day high AND shows a
-#                         bearish tell (red candle / long upper wick / RSI>=68)
-#                         => possible exhaustion / distribution top
-#   • "Volume Bottom" -> close is within 2% of the 20-day low AND shows a
-#                         bullish tell (green candle / long lower wick / RSI<=32)
-#                         => possible capitulation / accumulation bottom
+# VOLUME TOP / BOTTOM IDENTIFIER  —  additive module (with FULL AUDIT REPORT)
 # ════════════════════════════════════════════════════════════════════════
 
 VOL_TB_LOOKBACK = 20          # candles used to define "recent high/low"
@@ -3462,6 +3437,7 @@ def _classify_volume_top_bottom(df) -> dict:
     Classifies the most recently CLOSED candle as a Volume Top, Volume
     Bottom, or Neither. Returns a dict with type = 'TOP' | 'BOTTOM' | 'NONE'.
     Uses the same calculate_rsi() helper already defined in this file.
+    Filtering logic is UNCHANGED from the original module.
     """
     if len(df) < VOL_TB_LOOKBACK + 5:
         return {"type": "NONE"}
@@ -3518,65 +3494,125 @@ def _classify_volume_top_bottom(df) -> dict:
 
 
 def _fetch_volume_top_bottom(fyers, symbol):
-    """Per-symbol worker. Follows the exact same pattern as your other
-    _fetch_* functions (uses _safe_history / _VALID_EQ_SYMBOL_RE)."""
-    if not isinstance(symbol, str) or not _VALID_EQ_SYMBOL_RE.match(symbol):
-        return None, f"{symbol}: invalid symbol format — skipped"
-    resp, err = _safe_history(fyers, {
-        "symbol": symbol, "resolution": "D", "date_format": "1",
-        "range_from": DATE_FROM, "range_to": DATE_TO, "cont_flag": "1",
-    })
-    if err:
-        return None, f"{symbol}: {err}"
-    candles = resp.get("candles") if resp else None
-    if not candles or len(candles) < VOL_TB_LOOKBACK + 5:
-        return None, f"{symbol}: insufficient history"
+    """Per-symbol worker. ALWAYS returns a 3-tuple:
+    (qualifying_row_or_None, error_or_None, report_row)
+    report_row is populated for EVERY symbol (SUCCESS/FAILED/SKIPPED) so the
+    full audit report can include every scanned stock, not just qualifiers.
+    Detection/filtering logic itself is unchanged — only reporting is added."""
+    stock_ticker = symbol.replace("NSE:", "").replace("-EQ", "") if isinstance(symbol, str) else str(symbol)
+    report_row = {
+        "Symbol": stock_ticker, "Status": "SKIPPED", "Reason": "Unknown",
+        "RVOL": None, "20D High": None, "20D Low": None,
+        "Distance to High %": None, "Distance to Low %": None,
+        "Pattern": "NONE", "Signal": "—", "Remarks": "",
+    }
     try:
+        if not isinstance(symbol, str) or not _VALID_EQ_SYMBOL_RE.match(symbol):
+            report_row["Status"] = "FAILED"
+            report_row["Reason"] = "Data Missing"
+            report_row["Remarks"] = "Invalid symbol format"
+            return None, f"{symbol}: invalid symbol format — skipped", report_row
+
+        resp, err = _safe_history(fyers, {
+            "symbol": symbol, "resolution": "D", "date_format": "1",
+            "range_from": DATE_FROM, "range_to": DATE_TO, "cont_flag": "1",
+        })
+        if err:
+            report_row["Status"] = "FAILED"
+            report_row["Reason"] = "API Error"
+            report_row["Remarks"] = str(err)
+            return None, f"{symbol}: {err}", report_row
+
+        candles = resp.get("candles") if resp else None
+        if not candles or len(candles) < VOL_TB_LOOKBACK + 5:
+            report_row["Status"] = "FAILED"
+            report_row["Reason"] = "Insufficient History"
+            return None, f"{symbol}: insufficient history", report_row
+
         df = pd.DataFrame(candles, columns=["Time", "Open", "High", "Low", "Close", "Volume"])
         df["Time"] = pd.to_datetime(df["Time"], unit="s", utc=True).dt.tz_convert("Asia/Kolkata")
         df[["Open", "High", "Low", "Close", "Volume"]] = df[["Open", "High", "Low", "Close", "Volume"]].apply(pd.to_numeric, errors="coerce")
         df = df.dropna(subset=["Open", "High", "Low", "Close"])
         if len(df) < VOL_TB_LOOKBACK + 5:
-            return None, f"{symbol}: insufficient valid candle data"
+            report_row["Status"] = "FAILED"
+            report_row["Reason"] = "Data Missing"
+            report_row["Remarks"] = "Insufficient valid candle data after cleaning"
+            return None, f"{symbol}: insufficient valid candle data", report_row
     except (KeyError, ValueError, TypeError) as e:
-        return None, f"{symbol}: malformed candle data ({e})"
+        report_row["Status"] = "FAILED"
+        report_row["Reason"] = "Data Missing"
+        report_row["Remarks"] = f"{type(e).__name__}: {e}"
+        return None, f"{symbol}: malformed candle data ({e})", report_row
+    except Exception as e:
+        report_row["Status"] = "FAILED"
+        report_row["Reason"] = "Exception"
+        report_row["Remarks"] = f"{type(e).__name__}: {e}"
+        return None, f"{symbol}: unexpected error ({type(e).__name__})", report_row
 
     try:
         result = _classify_volume_top_bottom(df)
-        if result["type"] == "NONE":
-            return None, None  # not an error, just doesn't qualify
 
+        recent = df.tail(VOL_TB_LOOKBACK)
+        recent_high = float(recent["High"].max())
+        recent_low = float(recent["Low"].min())
         last_close = float(df["Close"].iloc[-1])
+        dist_high = round((recent_high - last_close) / recent_high * 100, 2) if recent_high else None
+        dist_low = round((last_close - recent_low) / recent_low * 100, 2) if recent_low else None
+
+        report_row["RVOL"] = result.get("rvol")
+        report_row["20D High"] = round(recent_high, 2)
+        report_row["20D Low"] = round(recent_low, 2)
+        report_row["Distance to High %"] = dist_high
+        report_row["Distance to Low %"] = dist_low
+
+        if result["type"] == "NONE":
+            rvol = result.get("rvol", 0.0) or 0.0
+            report_row["Status"] = "SKIPPED"
+            report_row["Reason"] = "No Volume Spike" if rvol < VOL_TB_MIN_RVOL else "No Price Confirmation"
+            return None, None, report_row
+
         last_volume = int(df["Volume"].iloc[-1])
         vol_avg = float(df["Volume"].tail(VOL_TB_LOOKBACK).mean())
-        stock_ticker = symbol.replace("NSE:", "").replace("-EQ", "")
         signal_date_str, signal_time_str = _candle_signal_timestamp(df, is_daily=True)
 
         row = {
-            "Signal Date": signal_date_str,
-            "Signal Time": signal_time_str,
-            "Stock": stock_ticker,
+            "Signal Date": signal_date_str, "Signal Time": signal_time_str, "Stock": stock_ticker,
             "LTP": round(last_close, 2),
             "Type": "🔴 Volume TOP" if result["type"] == "TOP" else "🟢 Volume BOTTOM",
-            "RVOL": _format_rvol_display(result["rvol"]),
-            "_RVOL_RAW": result["rvol"],
-            "Volume": last_volume,
-            "Avg Volume (20d)": int(vol_avg),
-            "RSI": result["rsi"],
+            "RVOL": _format_rvol_display(result["rvol"]), "_RVOL_RAW": result["rvol"],
+            "Volume": last_volume, "Avg Volume (20d)": int(vol_avg), "RSI": result["rsi"],
             f"{VOL_TB_LOOKBACK}D Reference Level": result["reference_level"],
             "Reference Type": "High" if result["type"] == "TOP" else "Low",
-            "Distance %": result["distance_pct"],
-            "Reason": result["reason"],
+            "Distance %": result["distance_pct"], "Reason": result["reason"],
         }
-        return row, None
+
+        report_row["Status"] = "SUCCESS"
+        report_row["Reason"] = "Volume Spike Confirmed"
+        report_row["Pattern"] = result["type"]
+        report_row["Signal"] = row["Type"]
+        report_row["Remarks"] = result["reason"]
+        return row, None, report_row
     except (KeyError, IndexError, TypeError, ValueError, ZeroDivisionError, AttributeError) as e:
-        return None, f"{symbol}: analysis error ({type(e).__name__})"
+        report_row["Status"] = "FAILED"
+        report_row["Reason"] = "Exception"
+        report_row["Remarks"] = f"{type(e).__name__}: {e}"
+        return None, f"{symbol}: analysis error ({type(e).__name__})", report_row
+    except Exception as e:
+        report_row["Status"] = "FAILED"
+        report_row["Reason"] = "Exception"
+        report_row["Remarks"] = f"{type(e).__name__}: {e}"
+        return None, f"{symbol}: unexpected error ({type(e).__name__})", report_row
 
 
 def run_volume_top_bottom_scan(fyers, symbols):
-    """Threaded batch scan — identical pattern to run_scan() etc."""
+    """Threaded batch scan. Returns (results, errors, stats, report_df).
+    report_df ALWAYS contains one row per scanned symbol — SUCCESS, FAILED,
+    or SKIPPED — and is NEVER empty, regardless of how many stocks qualify.
+    Filtering/detection logic (_classify_volume_top_bottom) is unchanged;
+    only the reporting/export path was added."""
     symbols = _validate_symbols(symbols)
     results, errors = [], []
+    success_rows, failed_rows, skipped_rows = [], [], []
     stats = ScanStats(total=len(symbols))
     progress = st.progress(0.0, text=f"Scanning Volume Top/Bottom 0 / {len(symbols)}")
     done = 0
@@ -3585,25 +3621,55 @@ def run_volume_top_bottom_scan(fyers, symbols):
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
             futures = {executor.submit(_fetch_volume_top_bottom, fyers, s): s for s in batch}
             for future in as_completed(futures):
+                sym = futures[future]
                 try:
-                    res, err = future.result()
+                    res, err, report_row = future.result()
                 except Exception as e:
-                    res, err = None, f"{futures[future]}: worker error ({type(e).__name__})"
+                    res, err = None, f"{sym}: worker error ({type(e).__name__})"
+                    report_row = {
+                        "Symbol": sym.replace("NSE:", "").replace("-EQ", "") if isinstance(sym, str) else str(sym),
+                        "Status": "FAILED", "Reason": "Exception", "RVOL": None,
+                        "20D High": None, "20D Low": None, "Distance to High %": None,
+                        "Distance to Low %": None, "Pattern": "NONE", "Signal": "—",
+                        "Remarks": f"{type(e).__name__}: {e}",
+                    }
                 if res:
                     results.append(res)
                 if err:
                     errors.append(err)
+
+                status = report_row.get("Status") if isinstance(report_row, dict) else "FAILED"
+                if status == "SUCCESS":
+                    success_rows.append(report_row)
+                elif status == "FAILED":
+                    failed_rows.append(report_row)
+                else:
+                    skipped_rows.append(report_row)
+
                 stats.record(has_result=bool(res), has_error=bool(err))
                 done += 1
                 progress.progress(done / max(len(symbols), 1), text=f"Scanning Volume Top/Bottom {done} / {len(symbols)}")
         if i + BATCH_SIZE < len(symbols):
             time.sleep(BATCH_PAUSE_SECONDS)
     progress.empty()
+
+    # ── Build the full audit report — NEVER empty, NEVER conditional ──────
+    report_df = pd.DataFrame(success_rows + failed_rows + skipped_rows)
+    if report_df.empty:
+        report_df = pd.DataFrame([{
+            "Symbol": "—", "Status": "INFO", "Reason": "No qualifying stocks found.",
+            "RVOL": None, "20D High": None, "20D Low": None,
+            "Distance to High %": None, "Distance to Low %": None,
+            "Pattern": "NONE", "Signal": "—", "Remarks": "Scan completed successfully.",
+        }])
+
+    logger.info(f"Success={len(success_rows)}")
+    logger.info(f"Failed={len(failed_rows)}")
+    logger.info(f"Skipped={len(skipped_rows)}")
+    logger.info(f"Export Rows={len(report_df)}")
+
     gc.collect()
-    return results, errors, stats
-
-
-
+    return results, errors, stats, report_df
 
 
 def show_scanner(fyers) -> None:
@@ -4270,10 +4336,11 @@ def show_scanner(fyers) -> None:
         vt_universe = symbols if vt_lim == 0 else symbols[:vt_lim]
         if st.button(f"🌋 Run Volume Top/Bottom Scan ({len(vt_universe)} symbols)", key="vol_tb_run"):
             with st.spinner("Scanning for volume top/bottom signatures…"):
-                vt_results, vt_errors, vt_stats = run_volume_top_bottom_scan(fyers, vt_universe)
+                vt_results, vt_errors, vt_stats, vt_report_df = run_volume_top_bottom_scan(fyers, vt_universe)
                 st.session_state["vol_tb_df"] = pd.DataFrame(vt_results)
                 st.session_state["vol_tb_errors"] = vt_errors
                 st.session_state["vol_tb_stats"] = vt_stats
+                st.session_state["volume_tb_report_df"] = vt_report_df
 
         if "vol_tb_stats" in st.session_state:
             _display_scan_summary(st.session_state["vol_tb_stats"])
@@ -4300,18 +4367,45 @@ def show_scanner(fyers) -> None:
                 st.dataframe(_style_dataframe(bottom_df), use_container_width=True, height=350)
             else:
                 st.caption("None found.")
-
-            st.markdown("#### 💾 Export")
-            ts = _now_ist().strftime("%Y%m%d_%H%M")
-            e1, e2, e3 = st.columns(3)
-            with e1:
-                st.download_button("📥 Excel", data=to_excel_bytes_multi({"Volume Tops": top_df, "Volume Bottoms": bottom_df}), file_name=f"volume_top_bottom_{ts}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="dl_vol_tb_xlsx")
-            with e2:
-                st.download_button("📥 CSV", data=to_csv_bytes(vt_df[display_cols]), file_name=f"volume_top_bottom_{ts}.csv", mime="text/csv", key="dl_vol_tb_csv")
-            with e3:
-                st.download_button("📥 JSON", data=to_json_bytes(vt_df[display_cols]), file_name=f"volume_top_bottom_{ts}.json", mime="application/json", key="dl_vol_tb_json")
         else:
-            st.info("Run a Volume Top/Bottom scan above.")
+            st.info("No qualifying Volume Top/Bottom signals in this scan — see the full audit report below for every scanned stock and why it was skipped or failed.")
+
+        # ── Full audit report — ALWAYS present, ALWAYS exportable ─────────
+        st.divider()
+        st.markdown("#### 📋 Full Scan Audit Report (Success / Failed / Skipped)")
+        vt_report_df_state = st.session_state.get("volume_tb_report_df")
+        if vt_report_df_state is None or vt_report_df_state.empty:
+            vt_report_df_state = pd.DataFrame([{
+                "Symbol": "—", "Status": "INFO", "Reason": "No scan has been run yet.",
+                "RVOL": None, "20D High": None, "20D Low": None,
+                "Distance to High %": None, "Distance to Low %": None,
+                "Pattern": "NONE", "Signal": "—", "Remarks": "Run the scan above to generate a report.",
+            }])
+
+        try:
+            r1, r2, r3 = st.columns(3)
+            r1.metric("✅ Success", int((vt_report_df_state["Status"] == "SUCCESS").sum()))
+            r2.metric("❌ Failed", int((vt_report_df_state["Status"] == "FAILED").sum()))
+            r3.metric("⏭️ Skipped", int((vt_report_df_state["Status"] == "SKIPPED").sum()))
+        except Exception:
+            pass
+
+        st.dataframe(vt_report_df_state, use_container_width=True, height=400)
+
+        ts = _now_ist().strftime("%Y%m%d_%H%M")
+        st.download_button(
+            "📥 Download Volume Top Bottom Report",
+            data=to_excel_bytes(vt_report_df_state, "Volume TB Report"),
+            file_name=f"volume_top_bottom_report_{ts}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="dl_vol_tb_report_xlsx",
+        )
+
+        e1, e2 = st.columns(2)
+        with e1:
+            st.download_button("📥 CSV", data=to_csv_bytes(vt_report_df_state), file_name=f"volume_top_bottom_report_{ts}.csv", mime="text/csv", key="dl_vol_tb_report_csv")
+        with e2:
+            st.download_button("📥 JSON", data=to_json_bytes(vt_report_df_state), file_name=f"volume_top_bottom_report_{ts}.json", mime="application/json", key="dl_vol_tb_report_json")
 
         if st.session_state.get("vol_tb_errors"):
             with st.expander(f"⚠️ Skipped ({len(st.session_state['vol_tb_errors'])})"):
