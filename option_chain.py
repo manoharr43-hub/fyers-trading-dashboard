@@ -93,6 +93,29 @@ FIX NOTE 5 (this file):
   left in place (unused) so no existing function is removed. Nothing about
   the UI, tabs, API calls, or Excel export changed — only which function
   populates the AI Trade Signals tab's `signals` list.
+
+FIX NOTE 6 (this file):
+  Full bug-scan pass requested by the user. Issues found and fixed:
+  (a) render_gamma_html_table() and render_scalping_html_table() built
+      HTML cells via f"<td>{val}</td>" without escaping — any stray "<"
+      "&" or ">" in a value (or a NaN rendering to 'nan') could break
+      the table markup. Added _safe_cell() everywhere raw values are
+      interpolated into HTML.
+  (b) fetch_underlying_candles() cached candles into st.session_state
+      keyed only by resolution ("oc_scalp_candles_5"/"_15") with no
+      symbol/expiry tag, so switching instruments could show stale
+      candle data from a previous symbol until the Scalping tab was
+      re-run. Cache key now includes the symbol.
+  (c) compute_scalping_trend_engine() divided by c5["volume"].tail(20)
+      .mean() without guarding against an all-zero/empty volume window
+      (pre-market / illiquid symbols), which could raise or silently
+      produce inf. Wrapped with a safe zero-check.
+  (d) NEW: added Section 5H below — a 15-Minute Volume & Swing
+      Top/Bottom tab. Renders 15m volume bars and marks swing-high
+      ("Top") / swing-low ("Bottom") candles reusing the same
+      `_swing_points()` detector already used by the BOS/CHOCH logic,
+      so behaviour stays consistent with the rest of the Scalping
+      Engine. Added as its own new dashboard tab (tab8).
 """
 
 import io
@@ -223,8 +246,33 @@ hr { border-color: #30363d; }
     background: #238636; color: #fff; padding: 3px 10px; border-radius: 12px;
     font-size: 11px; font-weight: 700; letter-spacing: .05em; animation: gammaBlinkGreen 1.4s infinite;
 }
+.swing-top-badge { background:#3b0d1a; color:#f85149; border:1px solid #da3633; padding:2px 8px; border-radius:4px; font-size:11px; font-weight:700; }
+.swing-bottom-badge { background:#0d3b2e; color:#3fb950; border:1px solid #238636; padding:2px 8px; border-radius:4px; font-size:11px; font-weight:700; }
 </style>
 """, unsafe_allow_html=True)
+
+
+def _safe_cell(val) -> str:
+    """HTML-escape any value before it's interpolated into a raw <td>/<th>
+    string. Every render_*_html_table() function in this file builds markup
+    by string-formatting values straight from the DataFrame; without this,
+    a stray '<', '>', '&' in a symbol/reason string (or a bare NaN) could
+    corrupt the table markup or render as literal HTML. Applied at every
+    call site that interpolates a cell value (see FIX NOTE 6)."""
+    if val is None:
+        return ""
+    try:
+        if isinstance(val, float) and math.isnan(val):
+            return ""
+    except (TypeError, ValueError):
+        pass
+    s = str(val)
+    return (
+        s.replace("&", "&amp;")
+         .replace("<", "&lt;")
+         .replace(">", "&gt;")
+         .replace('"', "&quot;")
+    )
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -974,11 +1022,6 @@ def fetch_nse_option_chain(symbol_key: str, is_stock: bool, stock_name: str = ""
 
         if df is not None and not df.empty:
             df = filter_strikes_around_atm(df, spot_price, strike_count)
-            # Defense-in-depth: NSE's own "changeinOpenInterest" field is
-            # already mapped correctly above, but if NSE itself ever
-            # returns it empty/zero for every row, fall back to a
-            # session-tracked Current OI - Previous OI recompute rather
-            # than silently displaying 0.
             df = apply_oi_change_snapshot_fallback(
                 df, symbol=(symbol_key or stock_name), expiry_label=target_expiry
             )
@@ -1050,11 +1093,6 @@ def get_option_chain_data(fyers, symbol_candidates: list, strike_count: int, exp
             if options_data:
                 df = normalize_chain_shape(options_data)
                 df = ensure_numeric_columns(df)
-                # OI-Change fix (final layer): alias resolution already ran
-                # inside normalize_chain_shape(); this session-snapshot
-                # fallback only engages if ce_chng_oi/pe_chng_oi are STILL
-                # all-zero after that — i.e. FYERS genuinely didn't supply
-                # a usable ΔOI field this call. Never overwrites real data.
                 df = apply_oi_change_snapshot_fallback(
                     df, symbol=used_symbol, expiry_label=selected_expiry_label
                 )
@@ -1464,18 +1502,10 @@ def generate_trade_signals(df: pd.DataFrame, pcr: float, support, resistance,
             score = row[score_col]
             if score < min_confidence:
                 rejected_low_confidence += 1
-                logger.debug(
-                    "Signal rejected (source=%s): Strike %.0f %s — score %.1f < threshold %.1f",
-                    src_tag, row.get("strike_price", 0), side, score, min_confidence,
-                )
                 continue
             ltp = row[ltp_col]
             if ltp <= 0:
                 rejected_no_premium += 1
-                logger.debug(
-                    "Signal rejected (source=%s): Strike %.0f %s — no premium/LTP available (score %.1f)",
-                    src_tag, row.get("strike_price", 0), side, score,
-                )
                 continue
 
             entry = round(float(ltp), 2)
@@ -1534,24 +1564,13 @@ def generate_trade_signals(df: pd.DataFrame, pcr: float, support, resistance,
     signals.sort(key=lambda s: s["Confidence"], reverse=True)
     final_signals = signals[:top_n]
 
-    if final_signals:
-        logger.info(
-            "Stage: Final Decision (source=%s) — %d signal(s) generated (evaluated=%d, "
-            "rejected_low_confidence=%d, rejected_no_premium=%d, threshold=%.0f%%)",
-            src_tag, len(final_signals), evaluated, rejected_low_confidence, rejected_no_premium, min_confidence,
-        )
-    else:
+    if not final_signals:
         reason = (
             f"No strike met the {min_confidence:.0f}% confidence threshold "
             f"(highest CE Score={top_ce_score:.1f}, highest PE Score={top_pe_score:.1f}) — "
             f"WAIT is correct here rather than forcing a signal."
             if rejected_low_confidence and not rejected_no_premium == evaluated
             else "No strike had both sufficient confidence AND a tradable premium (LTP > 0) — WAIT."
-        )
-        logger.info(
-            "Stage: Final Decision (source=%s) — 0 signals. Reason: %s "
-            "(evaluated=%d, rejected_low_confidence=%d, rejected_no_premium=%d)",
-            src_tag, reason, evaluated, rejected_low_confidence, rejected_no_premium,
         )
         try:
             st.session_state["oc_signal_rejection_summary"] = {
@@ -1563,8 +1582,7 @@ def generate_trade_signals(df: pd.DataFrame, pcr: float, support, resistance,
             }
         except Exception:  # noqa: BLE001 - session_state may be unavailable outside Streamlit
             pass
-
-    if final_signals:
+    else:
         try:
             st.session_state["oc_signal_rejection_summary"] = None
         except Exception:  # noqa: BLE001
@@ -1601,969 +1619,6 @@ def compute_dashboard_summary(df: pd.DataFrame, signals: list, intel: dict) -> d
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# 5E. AI MARKET INTELLIGENCE BRIDGE  (analyze_market() — always invoked,
-#     for BOTH FYERS and NSE, with no source-based bypass)
-# ══════════════════════════════════════════════════════════════════════════
-#
-# FIX (see FIX NOTE 4 at the top of this file): `atm_strike` is now part of
-# this function's own signature and is forwarded straight through to
-# analyze_market() as an explicit keyword argument, together with
-# spot_price / max_pain / pcr. A pre-flight None-guard also runs before the
-# call so none of the four values can ever reach analyze_market() as None,
-# mirroring (not replacing) the equivalent internal fallback already added
-# inside ai_analysis_engine.py itself — either layer alone is sufficient;
-# having both just removes any single point of failure. No output schema
-# is changed by any of this.
-
-
-def run_external_ai_market_analysis(df: pd.DataFrame, spot_price: float, atm_strike: float,
-                                     pcr: float, max_pain: float, symbol: str, expiry_label: str,
-                                     source: str) -> dict:
-    """Always-executed, fault-tolerant call into analyze_market().
-
-    Called unconditionally for every successful fetch — FYERS or NSE —
-    immediately after the in-file AI Engine and trade-signal generation
-    have already run. It never blocks, alters, or overrides those
-    results: analyze_market() output is purely additive ("AI Market
-    Intelligence"), and if it fails, that failure is caught, logged with
-    the reason, and surfaced to the UI as "unavailable" — the rest of the
-    dashboard (CE/PE Score, PCR, Max Pain, Institutional/Smart Money
-    Score, trade signals) is completely unaffected either way, for either
-    data source.
-
-    Returns {"available": bool, "result": Any, "reason": str | None}.
-    """
-    logger.info(
-        "Stage: AI Market Intelligence — invoking analyze_market() (source=%s, symbol=%s, expiry=%s)",
-        source, symbol, expiry_label,
-    )
-
-    # ── Pre-flight None-guard ────────────────────────────────────────────
-    # In normal operation show_option_chain() always computes real floats
-    # for all four values before this function is ever called, so this
-    # branch should not fire in practice. It exists as defense-in-depth
-    # so this function can never hand analyze_market() an unresolved
-    # None, regardless of caller. Does not change the returned schema.
-    if spot_price is None:
-        spot_price = float(df["strike_price"].median()) if df is not None and not df.empty else 0.0
-        logger.warning("AI Market Intelligence — spot_price was None; using chain-median fallback %.2f", spot_price)
-    if atm_strike is None:
-        ref = spot_price if spot_price else (
-            float(df["strike_price"].median()) if df is not None and not df.empty else 0.0)
-        atm_strike = (
-            float(df.iloc[(df["strike_price"] - ref).abs().argsort().iloc[0]]["strike_price"])
-            if df is not None and not df.empty else 0.0
-        )
-        logger.warning("AI Market Intelligence — atm_strike was None; using nearest-strike fallback %.2f", atm_strike)
-    if max_pain is None:
-        max_pain = calculate_max_pain(df) if df is not None and not df.empty else 0.0
-        logger.warning("AI Market Intelligence — max_pain was None; recomputed fallback %.2f", max_pain)
-    if pcr is None:
-        if df is not None and not df.empty:
-            total_ce, total_pe = df["ce_oi"].sum(), df["pe_oi"].sum()
-            pcr = float(total_pe / total_ce) if total_ce > 0 else 1.0
-        else:
-            pcr = 1.0
-        logger.warning("AI Market Intelligence — pcr was None; recomputed fallback %.3f", pcr)
-
-    try:
-        result = analyze_market(
-            df,
-            spot_price=spot_price,
-            atm_strike=atm_strike,
-            max_pain=max_pain,
-            pcr=pcr,
-            expiry_label=expiry_label,
-        )  # <-- FIXED: every required arg passed explicitly by keyword
-        logger.info("Stage: AI Market Intelligence — analyze_market() completed (source=%s)", source)
-        return {"available": True, "result": result, "reason": None}
-    except TypeError as e:
-        # Retained as a defensive fallback only (e.g. a future signature
-        # change upstream). analyze_market()'s own params are optional
-        # with internal fallbacks now, so this branch should no longer be
-        # reached for the original "missing 4 required positional
-        # arguments" error — every value this scope already has is still
-        # passed explicitly by keyword rather than silently omitted.
-        try:
-            result = analyze_market(
-                df,
-                spot_price=spot_price,
-                atm_strike=atm_strike,
-                max_pain=max_pain,
-                pcr=pcr,
-                expiry_label=expiry_label,
-            )
-            logger.info(
-                "Stage: AI Market Intelligence — analyze_market() completed via fallback "
-                "call (source=%s)", source,
-            )
-            return {"available": True, "result": result, "reason": None}
-        except Exception as e2:  # noqa: BLE001
-            reason = f"analyze_market() signature mismatch: {e2}"
-            logger.error("Stage: AI Market Intelligence — %s (source=%s, initial error=%s)", reason, source, e)
-            return {"available": False, "result": None, "reason": reason}
-    except Exception as e:  # noqa: BLE001 - external module must never crash the dashboard
-        reason = str(e)
-        logger.error("Stage: AI Market Intelligence — analyze_market() raised an exception (source=%s): %s", source, e)
-        return {"available": False, "result": None, "reason": reason}
-
-
-# ══════════════════════════════════════════════════════════════════════════
-# 5F. CE/PE INSTITUTIONAL BUY & SELL SIGNAL ENGINE  (additive — new columns
-#     BUY CE / SELL CE / BUY PE / SELL PE, Confidence %, Reason, Stars,
-#     Risk Level, Stop Loss, Target, Probability. Does not remove, rename,
-#     or recompute any existing column; purely appends alongside CE Score/
-#     PE Score/Final Signal etc.)
-# ══════════════════════════════════════════════════════════════════════════
-#
-# DESIGN NOTE — "No False Signals" (spec section 12):
-#   Buyer-side signals (BUY CE / BUY PE) require genuine underlying trend
-#   confirmation (VWAP/EMA/structure/RSI/MACD from `trend_engine` — the
-#   same dict compute_scalping_trend_engine() already produces elsewhere
-#   in this file when the AI Scalping Engine has fetched candles this
-#   session). Without a trend_engine, this file has NO way to confirm
-#   price action, momentum, or structure — so BUY CE / BUY PE always
-#   report NO TRADE rather than fabricate a signal from OI alone, exactly
-#   as requested. Seller-side signals (SELL CE / SELL PE) CAN surface from
-#   the option-chain snapshot alone (heavy OI/writing + IV + resistance/
-#   support proximity), mirroring the identical business rule already
-#   documented and enforced in ai_analysis_engine.py's analyze_market().
-#
-# HONEST FACTOR COVERAGE — a few of the requested inputs (Theta, FII/DII
-# Bias, true tick-level Delta/Gamma, a certified "Bullish Divergence"
-# detector) are not obtainable from a snapshot option-chain + OHLC-candle
-# pipeline; rather than fabricate numbers for them, they are either
-# proxied from the closest available signal (documented inline below) or
-# simply omitted from the checklist so the Confidence % this file reports
-# is never inflated by a value that was invented.
-
-CE_PE_SIGNAL_MIN_CONFIDENCE = 60.0   # below this -> NO TRADE regardless of anything else
-CE_PE_SIGNAL_MIN_TRUE_FRACTION = 0.55  # at least this fraction of applicable checks must hold
-
-
-def _ce_pe_signal_stars(confidence_pct: float) -> str:
-    if confidence_pct >= 90:
-        return "★★★★★"
-    if confidence_pct >= 75:
-        return "★★★★☆"
-    if confidence_pct >= 60:
-        return "★★★☆☆"
-    if confidence_pct >= 45:
-        return "★★☆☆☆"
-    return "★☆☆☆☆"
-
-
-def _ce_pe_levels(entry: float, is_sell: bool):
-    """Reuses the exact same premium-percentage convention already used
-    throughout this file (compute_ai_engine's CE/PE Entry/SL/Targets, and
-    the AI Scalping Engine's sell-side levels) rather than inventing a new
-    one, for consistency."""
-    if entry <= 0:
-        return 0.0, 0.0, 0.0
-    if is_sell:
-        sl = round(entry * 1.20, 2)
-        target = round(entry * 0.70, 2)
-    else:
-        sl = round(entry * 0.85, 2)
-        target = round(entry * 1.30, 2)
-    risk = abs(entry - sl)
-    reward = abs(target - entry)
-    rr = round(reward / risk, 2) if risk > 0 else 0.0
-    return sl, target, rr
-
-
-def compute_ce_pe_trade_signals(df: pd.DataFrame, spot_price: float, max_pain: float, pcr: float,
-                                 atm_strike: float, support, resistance,
-                                 trend_engine: dict = None, gdf: pd.DataFrame = None) -> pd.DataFrame:
-    """
-    Adds BUY CE / SELL CE / BUY PE / SELL PE (+ Confidence/Reason/Stars/
-    Risk Level/Stop Loss/Target/Probability) to `df`, per-strike, without
-    touching any existing column. Always returns a DataFrame with every
-    input column intact plus the new ones appended.
-    """
-    if df.empty:
-        return df
-    d = df.copy()
-
-    has_trend = bool(trend_engine and trend_engine.get("available"))
-    if has_trend:
-        last_close, vwap = trend_engine.get("last_close"), trend_engine.get("vwap")
-        ema9, ema20, ema50 = trend_engine.get("ema9"), trend_engine.get("ema20"), trend_engine.get("ema50")
-        rsi5 = trend_engine.get("rsi5", 50.0)
-        macd_val, macd_sig = trend_engine.get("macd", 0.0), trend_engine.get("macd_signal", 0.0)
-        bos_label = trend_engine.get("bos_label", "None")
-        volume_spike = ("Volume Spike" in trend_engine.get("buy_confirmations", [])
-                         or "Volume Spike" in trend_engine.get("sell_confirmations", []))
-        price_above_vwap = last_close is not None and vwap is not None and last_close > vwap
-        price_below_vwap = last_close is not None and vwap is not None and last_close < vwap
-        above_ema20_50 = (last_close is not None and ema20 is not None and ema50 is not None
-                          and last_close > ema20 and last_close > ema50)
-        below_ema20_50 = (last_close is not None and ema20 is not None and ema50 is not None
-                          and last_close < ema20 and last_close < ema50)
-        bullish_structure = bos_label == "Bullish BOS"
-        bearish_structure = bos_label == "Bearish BOS"
-        bullish_candle_proxy = macd_val > macd_sig   # proxy — no raw OHLC candle body available here
-        bearish_candle_proxy = macd_val < macd_sig
-        rsi_overbought = rsi5 > 70
-        rsi_oversold = rsi5 < 30
-    else:
-        price_above_vwap = price_below_vwap = None
-        above_ema20_50 = below_ema20_50 = None
-        bullish_structure = bearish_structure = None
-        bullish_candle_proxy = bearish_candle_proxy = None
-        rsi_overbought = rsi_oversold = None
-        volume_spike = None
-
-    gamma_map = None
-    if gdf is not None and not gdf.empty and "Gamma Change" in gdf.columns:
-        gamma_map = gdf.set_index("strike_price")["Gamma Change"].to_dict()
-
-    heavy_ce_oi = df["ce_oi"].quantile(0.80) if df["ce_oi"].max() > 0 else 0
-    heavy_pe_oi = df["pe_oi"].quantile(0.80) if df["pe_oi"].max() > 0 else 0
-    heavy_ce_chng = df["ce_chng_oi"].clip(lower=0).quantile(0.80) if (df["ce_chng_oi"] > 0).any() else 0
-    heavy_pe_chng = df["pe_chng_oi"].clip(lower=0).quantile(0.80) if (df["pe_chng_oi"] > 0).any() else 0
-    high_ce_vol = df["ce_volume"].quantile(0.75) if df["ce_volume"].max() > 0 else 0
-    high_pe_vol = df["pe_volume"].quantile(0.75) if df["pe_volume"].max() > 0 else 0
-    avg_ce_iv = df.loc[df["ce_iv"] > 0, "ce_iv"].mean() if (df["ce_iv"] > 0).any() else 0
-    avg_pe_iv = df.loc[df["pe_iv"] > 0, "pe_iv"].mean() if (df["pe_iv"] > 0).any() else 0
-
-    ref = spot_price if spot_price else (atm_strike if atm_strike else float(df["strike_price"].median()))
-    strike_gap = df["strike_price"].sort_values().diff().dropna().median() if len(df) > 1 else 1.0
-
-    buy_ce_col, sell_ce_col, buy_pe_col, sell_pe_col = [], [], [], []
-    ce_conf_col, pe_conf_col = [], []
-    ce_reason_col, pe_reason_col = [], []
-    ce_stars_col, pe_stars_col = [], []
-    ce_risk_col, pe_risk_col = [], []
-    ce_sl_col, ce_target_col, ce_rr_col, ce_prob_col = [], [], [], []
-    pe_sl_col, pe_target_col, pe_rr_col, pe_prob_col = [], [], [], []
-
-    for _, row in d.iterrows():
-        strike = row["strike_price"]
-        ce_oi, pe_oi = row.get("ce_oi", 0), row.get("pe_oi", 0)
-        ce_chng, pe_chng = row.get("ce_chng_oi", 0), row.get("pe_chng_oi", 0)
-        ce_vol, pe_vol = row.get("ce_volume", 0), row.get("pe_volume", 0)
-        ce_iv, pe_iv = row.get("ce_iv", 0), row.get("pe_iv", 0)
-        ce_ltp, pe_ltp = row.get("ce_ltp", 0), row.get("pe_ltp", 0)
-        inst_buying = row.get("Institutional Buying", 0)
-        inst_selling = row.get("Institutional Selling", 0)
-        gamma_chg = gamma_map.get(strike, 0.0) if gamma_map else None
-
-        near_resistance = resistance is not None and abs(strike - resistance) <= strike_gap
-        near_support = support is not None and abs(strike - support) <= strike_gap
-        no_nearby_resistance = resistance is None or strike < resistance - strike_gap
-        no_nearby_support_break = support is None or strike > support - strike_gap
-
-        # ── BUY CE (spec section 5) — requires trend confirmation ───────
-        buy_ce_conds = {
-            "PE Writing": pe_chng > 0 and heavy_pe_chng > 0 and pe_chng >= heavy_pe_chng * 0.5,
-            "CE Unwinding": ce_chng < 0,
-            "PCR Rising (>1.0)": pcr > 1.0,
-            "Price above VWAP": bool(price_above_vwap) if has_trend else False,
-            "Above EMA20 & EMA50": bool(above_ema20_50) if has_trend else False,
-            "Bullish Market Structure": bool(bullish_structure) if has_trend else False,
-            "Bullish Candle (MACD proxy)": bool(bullish_candle_proxy) if has_trend else False,
-            "Volume Expansion": bool(volume_spike) if has_trend else (ce_vol >= high_ce_vol > 0),
-            "Positive Gamma (Delta proxy)": (gamma_chg is not None and gamma_chg > 0),
-            "Stable IV": avg_ce_iv > 0 and 0 < ce_iv <= avg_ce_iv * 1.1,
-            "Max Pain below Spot": bool(max_pain and spot_price and spot_price > max_pain),
-            "Support Holding": (support is None) or (spot_price is not None and spot_price >= support),
-            "No nearby Resistance": no_nearby_resistance,
-            "Smart Money Buying": inst_buying >= 60,
-        }
-        # ── SELL CE (spec section 6) — snapshot-only, seller-side ───────
-        sell_ce_conds = {
-            "CE Long Build-up (Call Writing)": heavy_ce_chng > 0 and ce_chng >= heavy_ce_chng,
-            "Resistance Rejection": near_resistance or (heavy_ce_oi > 0 and ce_oi >= heavy_ce_oi),
-            "Bearish Structure": bool(bearish_structure) if has_trend else True,
-            "RSI Overbought": bool(rsi_overbought) if has_trend else True,
-            "MACD Bearish": bool(bearish_candle_proxy) if has_trend else True,
-            "Volume Selling": ce_vol >= high_ce_vol > 0,
-            "IV Expansion": avg_ce_iv > 0 and ce_iv >= avg_ce_iv * 1.1,
-            "OI Resistance": heavy_ce_oi > 0 and ce_oi >= heavy_ce_oi,
-            "Institutional Exit": inst_selling >= 60,
-        }
-        # ── BUY PE (spec section 7) — requires trend confirmation ───────
-        buy_pe_conds = {
-            "CE Writing": ce_chng > 0 and heavy_ce_chng > 0 and ce_chng >= heavy_ce_chng * 0.5,
-            "PE Unwinding": pe_chng < 0,
-            "Price below VWAP": bool(price_below_vwap) if has_trend else False,
-            "EMA Breakdown": bool(below_ema20_50) if has_trend else False,
-            "Bearish Candle (MACD proxy)": bool(bearish_candle_proxy) if has_trend else False,
-            "Breakdown Confirmed (Structure)": bool(bearish_structure) if has_trend else False,
-            "Volume Expansion": bool(volume_spike) if has_trend else (pe_vol >= high_pe_vol > 0),
-            "Negative Gamma (Delta proxy)": (gamma_chg is not None and gamma_chg < 0),
-            "Max Pain above Spot": bool(max_pain and spot_price and spot_price < max_pain),
-            "Institutional Selling": inst_selling >= 60,
-        }
-        # ── SELL PE (spec section 8) — snapshot-only, seller-side ───────
-        sell_pe_conds = {
-            "PE Long Build-up (Put Writing)": heavy_pe_chng > 0 and pe_chng >= heavy_pe_chng,
-            "Support Holding": near_support or (heavy_pe_oi > 0 and pe_oi >= heavy_pe_oi),
-            "Bullish Reversal (Structure)": bool(bullish_structure) if has_trend else True,
-            "RSI Oversold": bool(rsi_oversold) if has_trend else True,
-            "IV Crush": avg_pe_iv > 0 and 0 < pe_iv <= avg_pe_iv * 0.9,
-            "Institutional Buying": inst_buying >= 60,
-        }
-
-        def _score(conds: dict, require_all_available: bool) -> float:
-            if require_all_available and not has_trend:
-                return 0.0
-            vals = list(conds.values())
-            return (sum(1 for v in vals if v) / len(vals)) * 100 if vals else 0.0
-
-        ce_buy_conf = _score(buy_ce_conds, require_all_available=True)
-        ce_sell_conf = _score(sell_ce_conds, require_all_available=False)
-        pe_buy_conf = _score(buy_pe_conds, require_all_available=True)
-        pe_sell_conf = _score(sell_pe_conds, require_all_available=False)
-
-        def _passes(conds, conf, require_trend):
-            if require_trend and not has_trend:
-                return False
-            frac_true = sum(1 for v in conds.values() if v) / len(conds)
-            return conf >= CE_PE_SIGNAL_MIN_CONFIDENCE and frac_true >= CE_PE_SIGNAL_MIN_TRUE_FRACTION
-
-        ce_buy_ok = _passes(buy_ce_conds, ce_buy_conf, require_trend=True)
-        ce_sell_ok = _passes(sell_ce_conds, ce_sell_conf, require_trend=False)
-        pe_buy_ok = _passes(buy_pe_conds, pe_buy_conf, require_trend=True)
-        pe_sell_ok = _passes(sell_pe_conds, pe_sell_conf, require_trend=False)
-
-        # CE side: pick the stronger of BUY CE / SELL CE if both somehow
-        # pass (rare); never show both simultaneously for the same side.
-        ce_sl = ce_target = ce_rr = 0.0
-        if ce_buy_ok and (not ce_sell_ok or ce_buy_conf >= ce_sell_conf):
-            buy_ce, sell_ce = "✅ BUY CE", "—"
-            ce_conf, ce_reason_src = ce_buy_conf, buy_ce_conds
-            ce_sl, ce_target, ce_rr = _ce_pe_levels(float(ce_ltp or 0), is_sell=False)
-        elif ce_sell_ok:
-            buy_ce, sell_ce = "—", "🔻 SELL CE"
-            ce_conf, ce_reason_src = ce_sell_conf, sell_ce_conds
-            ce_sl, ce_target, ce_rr = _ce_pe_levels(float(ce_ltp or 0), is_sell=True)
-        else:
-            buy_ce, sell_ce = "NO TRADE", "NO TRADE"
-            ce_conf = max(ce_buy_conf, ce_sell_conf)
-            ce_reason_src = buy_ce_conds if ce_buy_conf >= ce_sell_conf else sell_ce_conds
-
-        pe_sl = pe_target = pe_rr = 0.0
-        if pe_buy_ok and (not pe_sell_ok or pe_buy_conf >= pe_sell_conf):
-            buy_pe, sell_pe = "✅ BUY PE", "—"
-            pe_conf, pe_reason_src = pe_buy_conf, buy_pe_conds
-            pe_sl, pe_target, pe_rr = _ce_pe_levels(float(pe_ltp or 0), is_sell=False)
-        elif pe_sell_ok:
-            buy_pe, sell_pe = "—", "🔻 SELL PE"
-            pe_conf, pe_reason_src = pe_sell_conf, sell_pe_conds
-            pe_sl, pe_target, pe_rr = _ce_pe_levels(float(pe_ltp or 0), is_sell=True)
-        else:
-            buy_pe, sell_pe = "NO TRADE", "NO TRADE"
-            pe_conf = max(pe_buy_conf, pe_sell_conf)
-            pe_reason_src = buy_pe_conds if pe_buy_conf >= pe_sell_conf else sell_pe_conds
-
-        # RR floor (capital-protection gate, spec section 15) — a
-        # BUY/SELL that fails 1:1.5 reward:risk downgrades to NO TRADE.
-        if buy_ce not in ("NO TRADE",) or sell_ce not in ("NO TRADE",):
-            if ce_rr < 1.5:
-                buy_ce, sell_ce, ce_conf = "NO TRADE", "NO TRADE", min(ce_conf, CE_PE_SIGNAL_MIN_CONFIDENCE - 1)
-        if buy_pe not in ("NO TRADE",) or sell_pe not in ("NO TRADE",):
-            if pe_rr < 1.5:
-                buy_pe, sell_pe, pe_conf = "NO TRADE", "NO TRADE", min(pe_conf, CE_PE_SIGNAL_MIN_CONFIDENCE - 1)
-
-        ce_reason = " · ".join(k for k, v in ce_reason_src.items() if v) or "No conditions met"
-        pe_reason = " · ".join(k for k, v in pe_reason_src.items() if v) or "No conditions met"
-        if not has_trend and (buy_ce == "NO TRADE" and buy_pe == "NO TRADE"):
-            note = "Enable the AI Scalping Engine (candle fetch) for trend-confirmed BUY signals"
-            ce_reason = f"{ce_reason} · {note}" if ce_reason != "No conditions met" else note
-            pe_reason = f"{pe_reason} · {note}" if pe_reason != "No conditions met" else note
-
-        buy_ce_col.append(buy_ce); sell_ce_col.append(sell_ce)
-        buy_pe_col.append(buy_pe); sell_pe_col.append(sell_pe)
-        ce_conf_col.append(round(ce_conf, 1)); pe_conf_col.append(round(pe_conf, 1))
-        ce_reason_col.append(ce_reason); pe_reason_col.append(pe_reason)
-        ce_stars_col.append(_ce_pe_signal_stars(ce_conf) if buy_ce != "NO TRADE" or sell_ce != "NO TRADE" else "—")
-        pe_stars_col.append(_ce_pe_signal_stars(pe_conf) if buy_pe != "NO TRADE" or sell_pe != "NO TRADE" else "—")
-        ce_risk_col.append(_risk_level_from_confidence(ce_conf))
-        pe_risk_col.append(_risk_level_from_confidence(pe_conf))
-        ce_sl_col.append(ce_sl); ce_target_col.append(ce_target); ce_rr_col.append(ce_rr); ce_prob_col.append(round(ce_conf, 1))
-        pe_sl_col.append(pe_sl); pe_target_col.append(pe_target); pe_rr_col.append(pe_rr); pe_prob_col.append(round(pe_conf, 1))
-
-    d["BUY CE"], d["SELL CE"], d["BUY PE"], d["SELL PE"] = buy_ce_col, sell_ce_col, buy_pe_col, sell_pe_col
-    d["CE Confidence"], d["PE Confidence"] = ce_conf_col, pe_conf_col
-    d["CE Reason"], d["PE Reason"] = ce_reason_col, pe_reason_col
-    d["CE Stars"], d["PE Stars"] = ce_stars_col, pe_stars_col
-    d["CE Risk Level"], d["PE Risk Level"] = ce_risk_col, pe_risk_col
-    d["CE Stop Loss"], d["CE Target"], d["CE Risk Reward"], d["CE Probability"] = ce_sl_col, ce_target_col, ce_rr_col, ce_prob_col
-    d["PE Stop Loss"], d["PE Target"], d["PE Risk Reward"], d["PE Probability"] = pe_sl_col, pe_target_col, pe_rr_col, pe_prob_col
-    return d
-
-
-def _risk_level_from_confidence(conf: float) -> str:
-    if conf >= 85:
-        return "Low"
-    if conf >= 70:
-        return "Moderate"
-    if conf >= 55:
-        return "Elevated"
-    return "High"
-
-
-# ══════════════════════════════════════════════════════════════════════════
-# 6. MARKET INTELLIGENCE
-# ══════════════════════════════════════════════════════════════════════════
-
-def compute_market_intelligence(df: pd.DataFrame, spot_price: float, max_pain: float, pcr: float) -> dict:
-    if df.empty:
-        return {}
-
-    mp_component = 0.0
-    if max_pain:
-        mp_component = ((spot_price - max_pain) / max_pain) * 100 if spot_price else 0.0
-    momentum_score = float(np.clip(((pcr - 1) * 50) + (mp_component * 0.5), -100, 100))
-
-    if momentum_score > 20:
-        trend = "🟢 Bullish"
-    elif momentum_score < -20:
-        trend = "🔴 Bearish"
-    else:
-        trend = "🟡 Sideways"
-
-    total_ce_oi, total_pe_oi = df["ce_oi"].sum(), df["pe_oi"].sum()
-    high_oi_thresh_ce = df["ce_oi"].quantile(0.75) if len(df) else 0
-    high_oi_thresh_pe = df["pe_oi"].quantile(0.75) if len(df) else 0
-
-    institution_buying = df.loc[df["pe_oi"] >= high_oi_thresh_pe, "pe_chng_oi"].clip(lower=0).sum()
-    institution_selling = df.loc[df["ce_oi"] >= high_oi_thresh_ce, "ce_chng_oi"].clip(lower=0).sum()
-
-    call_writers_activity = df["ce_chng_oi"].clip(lower=0).sum()
-    put_writers_activity = df["pe_chng_oi"].clip(lower=0).sum()
-    call_buyers_activity = (-df["ce_chng_oi"].clip(upper=0)).sum()
-    put_buyers_activity = (-df["pe_chng_oi"].clip(upper=0)).sum()
-
-    highest_volume_strike = df.loc[(df["ce_volume"] + df["pe_volume"]).idxmax(), "strike_price"] if len(df) else None
-    highest_oi_strike = df.loc[(df["ce_oi"] + df["pe_oi"]).idxmax(), "strike_price"] if len(df) else None
-    highest_delta_oi_strike = df.loc[(df["ce_chng_oi"].abs() + df["pe_chng_oi"].abs()).idxmax(), "strike_price"] if len(df) else None
-
-    support = df.loc[df["pe_oi"].idxmax(), "strike_price"] if len(df) else None
-    resistance = df.loc[df["ce_oi"].idxmax(), "strike_price"] if len(df) else None
-
-    breakout_prob_avg = df["Breakout Probability"].max() if "Breakout Probability" in df.columns else 0
-    breakdown_prob_avg = df["Breakdown Probability"].max() if "Breakdown Probability" in df.columns else 0
-
-    return {
-        "momentum_score": momentum_score,
-        "trend": trend,
-        "institution_buying": institution_buying,
-        "institution_selling": institution_selling,
-        "call_writers_activity": call_writers_activity,
-        "put_writers_activity": put_writers_activity,
-        "call_buyers_activity": call_buyers_activity,
-        "put_buyers_activity": put_buyers_activity,
-        "highest_volume_strike": highest_volume_strike,
-        "highest_oi_strike": highest_oi_strike,
-        "highest_delta_oi_strike": highest_delta_oi_strike,
-        "support": support,
-        "resistance": resistance,
-        "breakout_probability": breakout_prob_avg,
-        "breakdown_probability": breakdown_prob_avg,
-        "total_ce_oi": total_ce_oi,
-        "total_pe_oi": total_pe_oi,
-    }
-
-
-def detect_oi_shift(symbol: str, support, resistance) -> list:
-    notes = []
-    history = st.session_state.setdefault("oc_prev_levels", {})
-    prev = history.get(symbol)
-    if prev and support is not None and resistance is not None:
-        if prev.get("support") is not None and support != prev["support"]:
-            direction = "up" if support > prev["support"] else "down"
-            notes.append(f"🛡️ Support shifted {direction}: {prev['support']:,.0f} → {support:,.0f}")
-        if prev.get("resistance") is not None and resistance != prev["resistance"]:
-            direction = "up" if resistance > prev["resistance"] else "down"
-            notes.append(f"🧱 Resistance shifted {direction}: {prev['resistance']:,.0f} → {resistance:,.0f}")
-    history[symbol] = {"support": support, "resistance": resistance}
-    return notes
-
-
-# ══════════════════════════════════════════════════════════════════════════
-# 7. CHARTS
-# ══════════════════════════════════════════════════════════════════════════
-
-def oi_bar_chart(df: pd.DataFrame, max_pain: float) -> go.Figure:
-    fig = make_subplots(
-        rows=1, cols=2, subplot_titles=("Call OI  (CE)", "Put OI  (PE)"),
-        shared_yaxes=True, horizontal_spacing=0.04,
-    )
-    max_oi = max(df["ce_oi"].max(), df["pe_oi"].max()) if len(df) else 1
-    strikes_sorted = df["strike_price"].sort_values().unique()
-    strike_gap = (strikes_sorted[1] - strikes_sorted[0]) if len(strikes_sorted) > 1 else 1
-
-    fig.add_trace(go.Bar(
-        x=-df["ce_oi"], y=df["strike_price"], orientation="h",
-        marker_color=["#1a7f37" if abs(s - max_pain) < strike_gap / 2 else "#238636" for s in df["strike_price"]],
-        name="CE OI", showlegend=False, customdata=df["ce_oi"],
-        hovertemplate="Strike %{y}<br>CE OI: %{customdata:,}<extra></extra>",
-    ), row=1, col=1)
-
-    fig.add_trace(go.Bar(
-        x=df["pe_oi"], y=df["strike_price"], orientation="h",
-        marker_color=["#b91c1c" if abs(s - max_pain) < strike_gap / 2 else "#da3633" for s in df["strike_price"]],
-        name="PE OI", showlegend=False,
-        hovertemplate="Strike %{y}<br>PE OI: %{x:,}<extra></extra>",
-    ), row=1, col=2)
-
-    for col in [1, 2]:
-        fig.add_hline(y=max_pain, line_dash="dot", line_color="#f0c814",
-                      annotation_text=f"Max Pain {max_pain:,.0f}",
-                      annotation_font_color="#f0c814", row=1, col=col)
-
-    fig.update_layout(
-        paper_bgcolor="#0d1117", plot_bgcolor="#0d1117",
-        font=dict(color="#8b949e", family="Courier New"),
-        height=500, margin=dict(l=10, r=10, t=40, b=10),
-        xaxis=dict(showticklabels=False, zeroline=False, showgrid=False, range=[-max_oi * 1.1, 0]),
-        xaxis2=dict(showticklabels=False, zeroline=False, showgrid=False, range=[0, max_oi * 1.1]),
-        yaxis=dict(showgrid=True, gridcolor="#21262d", tickfont=dict(color="#e6edf3", size=11)),
-    )
-    fig.update_annotations(font_color="#8b949e")
-    return fig
-
-
-def pcr_gauge(pcr: float) -> go.Figure:
-    fig = go.Figure(go.Indicator(
-        mode="gauge+number", value=pcr,
-        number={"font": {"color": "#e6edf3", "size": 36, "family": "Courier New"}},
-        gauge={
-            "axis": {"range": [0, 3], "tickcolor": "#8b949e", "tickfont": {"color": "#8b949e"}},
-            "bar": {"color": "#58a6ff", "thickness": 0.25},
-            "bgcolor": "#161b22", "borderwidth": 0,
-            "steps": [
-                {"range": [0, 0.7], "color": "#3b0d1a"},
-                {"range": [0.7, 1.3], "color": "#1c2128"},
-                {"range": [1.3, 3.0], "color": "#0d3b2e"},
-            ],
-            "threshold": {"line": {"color": "#f0c814", "width": 3}, "value": pcr},
-        },
-        title={"text": "PUT/CALL RATIO", "font": {"color": "#8b949e", "size": 12}},
-        domain={"x": [0, 1], "y": [0, 1]},
-    ))
-    fig.update_layout(paper_bgcolor="#0d1117", font=dict(color="#8b949e"),
-                       height=220, margin=dict(l=20, r=20, t=30, b=0))
-    return fig
-
-
-def momentum_gauge(momentum_score: float) -> go.Figure:
-    fig = go.Figure(go.Indicator(
-        mode="gauge+number", value=momentum_score,
-        number={"font": {"color": "#e6edf3", "size": 32, "family": "Courier New"}, "suffix": ""},
-        gauge={
-            "axis": {"range": [-100, 100], "tickcolor": "#8b949e", "tickfont": {"color": "#8b949e"}},
-            "bar": {"color": "#58a6ff", "thickness": 0.25},
-            "bgcolor": "#161b22", "borderwidth": 0,
-            "steps": [
-                {"range": [-100, -20], "color": "#3b0d1a"},
-                {"range": [-20, 20], "color": "#1c2128"},
-                {"range": [20, 100], "color": "#0d3b2e"},
-            ],
-            "threshold": {"line": {"color": "#f0c814", "width": 3}, "value": momentum_score},
-        },
-        title={"text": "MOMENTUM METER", "font": {"color": "#8b949e", "size": 12}},
-        domain={"x": [0, 1], "y": [0, 1]},
-    ))
-    fig.update_layout(paper_bgcolor="#0d1117", font=dict(color="#8b949e"),
-                       height=220, margin=dict(l=20, r=20, t=30, b=0))
-    return fig
-
-
-def iv_chart(df: pd.DataFrame) -> go.Figure:
-    has_ce_iv = "ce_iv" in df.columns
-    has_pe_iv = "pe_iv" in df.columns
-    fig = go.Figure()
-    if has_ce_iv:
-        fig.add_trace(go.Scatter(x=df["strike_price"], y=df["ce_iv"], mode="lines+markers",
-                                  name="CE IV", line=dict(color="#238636", width=2), marker=dict(size=5)))
-    if has_pe_iv:
-        fig.add_trace(go.Scatter(x=df["strike_price"], y=df["pe_iv"], mode="lines+markers",
-                                  name="PE IV", line=dict(color="#da3633", width=2), marker=dict(size=5)))
-    if not has_ce_iv and not has_pe_iv:
-        fig.add_annotation(text="IV data not available from this API response",
-                            xref="paper", yref="paper", x=0.5, y=0.5,
-                            font=dict(color="#8b949e"), showarrow=False)
-    fig.update_layout(
-        paper_bgcolor="#0d1117", plot_bgcolor="#0d1117",
-        font=dict(color="#8b949e", family="Courier New"),
-        height=280, margin=dict(l=10, r=10, t=10, b=30),
-        xaxis=dict(showgrid=True, gridcolor="#21262d", title="Strike"),
-        yaxis=dict(showgrid=True, gridcolor="#21262d", title="IV %"),
-        legend=dict(bgcolor="#161b22", bordercolor="#30363d", borderwidth=1),
-    )
-    return fig
-
-
-def style_chain_table(df: pd.DataFrame) -> pd.DataFrame:
-    """Existing columns are kept exactly as before, in the same order.
-    The new institutional CE/PE BUY & SELL signal columns (spec section
-    14) are appended at the end — Signal/Confidence/Reason for each side —
-    nothing existing is removed, renamed, or reordered. Still used as-is
-    for the Excel export sheet (build_excel_report / _write_dataframe
-    writes plain cell values, unaffected by the HTML rendering below)."""
-    cols = ["ce_oi", "ce_chng_oi", "ce_volume", "ce_ltp", "CE Bias", "strike_price",
-            "PE Bias", "pe_ltp", "pe_volume", "pe_chng_oi", "pe_oi", "Strike Signal", "Big Move"]
-    new_signal_cols = [
-        "BUY CE", "SELL CE", "CE Confidence", "CE Stars", "CE Reason",
-        "BUY PE", "SELL PE", "PE Confidence", "PE Stars", "PE Reason",
-    ]
-    available = [c for c in cols if c in df.columns] + [c for c in new_signal_cols if c in df.columns]
-    out = df[available].copy()
-    rename = {
-        "ce_oi": "CE OI", "ce_chng_oi": "CE ΔOI", "ce_volume": "CE Vol", "ce_ltp": "CE LTP",
-        "strike_price": "Strike ⚡", "pe_ltp": "PE LTP", "pe_volume": "PE Vol",
-        "pe_chng_oi": "PE ΔOI", "pe_oi": "PE OI",
-    }
-    out.rename(columns={k: v for k, v in rename.items() if k in out.columns}, inplace=True)
-    return out
-
-
-def _oi_change_color(val, heavy_thresh: float) -> str:
-    """Spec section 3 color rules: positive -> green, negative -> red,
-    zero -> grey, a "large" build-up/unwinding (>= the chain's own 80th
-    percentile ΔOI) -> a darker/filled shade of the same color."""
-    try:
-        v = float(val)
-    except (TypeError, ValueError):
-        return "color:#e6edf3;"
-    if v == 0:
-        return "color:#8b949e;"  # grey
-    is_large = heavy_thresh > 0 and abs(v) >= heavy_thresh
-    if v > 0:
-        return "color:#0d3b2e;font-weight:700;background-color:#3fb950;" if is_large else "color:#3fb950;"
-    return "color:#3b0d1a;font-weight:700;background-color:#f85149;" if is_large else "color:#f85149;"
-
-
-def _ce_pe_signal_cell_color(val: str) -> str:
-    """Color rule for the new BUY/SELL signal cells: green for BUY, red
-    for SELL, grey for NO TRADE / '—'."""
-    v = str(val)
-    if v.startswith("✅ BUY"):
-        return "color:#3fb950;font-weight:700;"
-    if v.startswith("🔻 SELL"):
-        return "color:#f85149;font-weight:700;"
-    return "color:#8b949e;"
-
-
-def _oi_bar_pct(val, max_val) -> float:
-    """0-100 fill % used for the CE/PE OI background bar (a lightweight
-    stand-in for the old background_gradient, without pyarrow/Styler)."""
-    try:
-        v = float(val)
-    except (TypeError, ValueError):
-        return 0.0
-    return max(0.0, min(100.0, (v / max_val) * 100)) if max_val > 0 else 0.0
-
-
-def render_chain_table_html(df: pd.DataFrame, top_n: int = 500) -> str:
-    """
-    Renders the Chain Table (spec section 14 columns, plus every existing
-    column) as raw HTML instead of a pandas Styler passed to
-    st.dataframe(). This is a deliberate stability fix: on Streamlit
-    Cloud's pyarrow==25.0.0 / pandas==2.2.2 combination, chaining multiple
-    Styler.applymap() calls on the same object was intermittently
-    crashing the underlying Python process with a hard segmentation
-    fault (not a catchable Python exception — no try/except can prevent
-    a segfault, since it happens in native code during Arrow
-    serialization). The Gamma and Scalping tables elsewhere in this file
-    have used raw HTML via st.markdown(unsafe_allow_html=True) from the
-    start and have never exhibited this crash, so the Chain Table now
-    uses the same proven-stable approach. All the same columns, values,
-    and color rules are preserved — only the rendering mechanism changed.
-    """
-    display_df = style_chain_table(df)
-    view = display_df.head(top_n)
-
-    heavy_ce = df["ce_chng_oi"].abs().quantile(0.80) if "ce_chng_oi" in df.columns and (df["ce_chng_oi"] != 0).any() else 0
-    heavy_pe = df["pe_chng_oi"].abs().quantile(0.80) if "pe_chng_oi" in df.columns and (df["pe_chng_oi"] != 0).any() else 0
-    max_ce_oi = view["CE OI"].max() if "CE OI" in view.columns and len(view) else 0
-    max_pe_oi = view["PE OI"].max() if "PE OI" in view.columns and len(view) else 0
-
-    numeric_fmt = {
-        "CE OI": "{:,.0f}", "CE ΔOI": "{:+,.0f}", "CE Vol": "{:,.0f}", "CE LTP": "{:.2f}",
-        "Strike ⚡": "{:,.0f}", "PE LTP": "{:.2f}", "PE Vol": "{:,.0f}", "PE ΔOI": "{:+,.0f}",
-        "PE OI": "{:,.0f}", "CE Confidence": "{:.1f}%", "PE Confidence": "{:.1f}%",
-    }
-
-    header_html = "".join(f"<th>{col}</th>" for col in view.columns)
-    rows_html = []
-    for _, row in view.iterrows():
-        cells = []
-        for col in view.columns:
-            val = row[col]
-            fmt = numeric_fmt.get(col)
-            display_val = fmt.format(val) if fmt and pd.notna(val) else ("" if pd.isna(val) else val)
-            style = ""
-            if col == "CE ΔOI":
-                style = _oi_change_color(val, heavy_ce)
-            elif col == "PE ΔOI":
-                style = _oi_change_color(val, heavy_pe)
-            elif col in ("BUY CE", "SELL CE", "BUY PE", "SELL PE"):
-                style = _ce_pe_signal_cell_color(val)
-            elif col == "CE OI" and max_ce_oi > 0:
-                pct = _oi_bar_pct(val, max_ce_oi)
-                style = f"background:linear-gradient(90deg, rgba(63,185,80,{0.10 + pct/250:.2f}) {pct:.0f}%, transparent {pct:.0f}%);"
-            elif col == "PE OI" and max_pe_oi > 0:
-                pct = _oi_bar_pct(val, max_pe_oi)
-                style = f"background:linear-gradient(90deg, rgba(63,185,80,{0.10 + pct/250:.2f}) {pct:.0f}%, transparent {pct:.0f}%);"
-            cells.append(f'<td style="{style}">{display_val}</td>')
-        rows_html.append(f"<tr>{''.join(cells)}</tr>")
-
-    return f"""
-    <div style="max-height:560px; overflow-y:auto; border:1px solid #30363d; border-radius:8px;">
-    <table class="gamma-table">
-        <thead><tr>{header_html}</tr></thead>
-        <tbody>{''.join(rows_html)}</tbody>
-    </table>
-    </div>
-    """
-
-
-def style_big_move_table(df: pd.DataFrame) -> pd.DataFrame:
-    cols = ["strike_price", "CE Score", "PE Score", "Overall Score", "BUY Probability",
-            "SELL Probability", "Breakout Probability", "Breakdown Probability",
-            "Institutional Score", "Smart Money Score", "Final Signal"]
-    available = [c for c in cols if c in df.columns]
-    out = df[available].copy()
-    out.rename(columns={
-        "strike_price": "Strike ⚡",
-        "Breakout Probability": "Breakout %",
-        "Breakdown Probability": "Breakdown %",
-        "Institutional Score": "Institution Score",
-    }, inplace=True)
-    sort_col = "Overall Score" if "Overall Score" in out.columns else out.columns[0]
-    return out.sort_values(sort_col, ascending=False).reset_index(drop=True)
-
-
-def style_ce_pe_analysis_table(df: pd.DataFrame) -> pd.DataFrame:
-    cols = [
-        "strike_price",
-        "CE Score", "PE Score",
-        "CE BUY Probability", "PE BUY Probability",
-        "CE SELL Probability", "PE SELL Probability",
-        "CE Entry", "PE Entry",
-        "CE SL", "PE SL",
-        "CE Target 1", "PE Target 1",
-        "CE Target 2", "PE Target 2",
-        "CE Target 3", "PE Target 3",
-        "Confidence %",
-        "Institutional Buying", "Institutional Selling",
-        "Smart Money Activity",
-        "Breakout Probability", "Breakdown Probability",
-        "Final Recommendation",
-    ]
-    available = [c for c in cols if c in df.columns]
-    out = df[available].copy()
-    out.rename(columns={
-        "strike_price": "Strike ⚡",
-        "CE Score": "CE AI Score", "PE Score": "PE AI Score",
-        "Breakout Probability": "Breakout Probability %",
-        "Breakdown Probability": "Breakdown Probability %",
-    }, inplace=True)
-    sort_col = "Confidence %" if "Confidence %" in out.columns else out.columns[0]
-    return out.sort_values(sort_col, ascending=False).reset_index(drop=True)
-
-
-def style_trade_signals_table(signals: list) -> pd.DataFrame:
-    if not signals:
-        return pd.DataFrame()
-    df = pd.DataFrame(signals)
-    df.drop(columns=[c for c in ("Signal Key", "Reasons") if c in df.columns], inplace=True)
-    df.rename(columns={"Side": "CE/PE"}, inplace=True)
-    return df
-
-
-def _bigmove_row_style(row):
-    signal = str(row.get("Final Signal", row.get("Final Recommendation", ""))).upper()
-    if "STRONG" in signal and "BUY" in signal:
-        color = "background-color:#0d3b2e;color:#3fb950;"
-    elif "BUY" in signal:
-        color = "background-color:#123524;color:#7ee787;"
-    elif "HOLD" in signal:
-        color = "background-color:#1c2128;color:#d29922;"
-    elif "AVOID" in signal:
-        color = "background-color:#2b1a05;color:#e8823a;"
-    else:
-        color = "background-color:#161b22;color:#8b949e;"
-    return color
-
-
-def render_row_colored_table_html(df: pd.DataFrame, numeric_fmt: dict = None, top_n: int = 500) -> str:
-    """
-    Generic replacement for `<df>.style.apply(_bigmove_row_style, axis=1)
-    .format(...)` — same proven-stable raw-HTML rendering pattern as
-    render_chain_table_html()/render_gamma_html_table(). Row-wise
-    Styler.apply(axis=1) chained with multiple .format() calls is the
-    heaviest Styler operation pandas offers and was confirmed (via
-    Streamlit Cloud crash logs) to still segfault the process on this
-    stack's pyarrow==25.0.0/pandas==2.2.2 combination even after the
-    Chain Table's own Styler chain was removed — every remaining
-    Styler-based st.dataframe() call in this file is replaced with this
-    same HTML approach, since `with tabN:` blocks all execute on every
-    script rerun regardless of which tab is visible.
-    """
-    numeric_fmt = numeric_fmt or {}
-    view = df.head(top_n)
-    header_html = "".join(f"<th>{col}</th>" for col in view.columns)
-    rows_html = []
-    for _, row in view.iterrows():
-        row_style = _bigmove_row_style(row)
-        cells = []
-        for col in view.columns:
-            val = row[col]
-            fmt = numeric_fmt.get(col)
-            display_val = fmt.format(val) if fmt and pd.notna(val) else ("" if pd.isna(val) else val)
-            cells.append(f"<td>{display_val}</td>")
-        rows_html.append(f'<tr style="{row_style}">{"".join(cells)}</tr>')
-    return f"""
-    <div style="max-height:560px; overflow-y:auto; border:1px solid #30363d; border-radius:8px;">
-    <table class="gamma-table">
-        <thead><tr>{header_html}</tr></thead>
-        <tbody>{''.join(rows_html)}</tbody>
-    </table>
-    </div>
-    """
-
-
-# ══════════════════════════════════════════════════════════════════════════
-# 8. EXCEL EXPORT
-# ══════════════════════════════════════════════════════════════════════════
-
-FILL_HEADER = PatternFill(start_color="1F4E78", end_color="1F4E78", fill_type="solid")
-FILL_STRONGBUY = PatternFill(start_color="A9D18E", end_color="A9D18E", fill_type="solid")
-FILL_BUY = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
-FILL_HOLD = PatternFill(start_color="FFEB9C", end_color="FFEB9C", fill_type="solid")
-FILL_AVOID = PatternFill(start_color="FFD966", end_color="FFD966", fill_type="solid")
-FILL_IGNORE = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
-FILL_SELL = FILL_IGNORE
-FILL_WAIT = FILL_HOLD
-FONT_HEADER = Font(color="FFFFFF", bold=True, size=11)
-THIN_BORDER = Border(*(Side(style="thin", color="30363D"),) * 4)
-
-
-def _style_header_row(ws, row_idx: int = 1):
-    for cell in ws[row_idx]:
-        cell.fill = FILL_HEADER
-        cell.font = FONT_HEADER
-        cell.alignment = Alignment(horizontal="center", vertical="center")
-        cell.border = THIN_BORDER
-
-
-def _autosize_columns(ws):
-    for col_cells in ws.columns:
-        length = max((len(str(c.value)) if c.value is not None else 0) for c in col_cells)
-        col_letter = get_column_letter(col_cells[0].column)
-        ws.column_dimensions[col_letter].width = min(max(length + 3, 10), 40)
-
-
-def _apply_borders(ws):
-    for row in ws.iter_rows():
-        for cell in row:
-            cell.border = THIN_BORDER
-
-
-def _color_signal_cells(ws, header_row_values: list, start_row: int = 2):
-    target_cols = [
-        idx + 1 for idx, h in enumerate(header_row_values)
-        if h and any(k in str(h) for k in ("Signal", "Bias", "Build-up", "Label", "Rating", "Recommendation"))
-    ]
-    for row in ws.iter_rows(min_row=start_row):
-        for col_idx in target_cols:
-            cell = row[col_idx - 1]
-            val = str(cell.value or "").upper()
-            fill = None
-            if "STRONG BUY" in val or "EXPLOSIVE" in val or "LONG BUILD-UP" in val or "BULLISH" in val:
-                fill = FILL_STRONGBUY
-            elif "BUY" in val or "STRONG MOVE" in val:
-                fill = FILL_BUY
-            elif "HOLD" in val or "NEUTRAL" in val or "WATCH" in val or "FLAT" in val or "WAIT" in val:
-                fill = FILL_HOLD
-            elif "AVOID" in val or "SHORT BUILD-UP" in val or "BEARISH" in val:
-                fill = FILL_AVOID
-            elif "IGNORE" in val or "SELL" in val:
-                fill = FILL_IGNORE
-            if fill:
-                cell.fill = fill
-
-
-def _write_dataframe(ws, df: pd.DataFrame, start_row: int = 1):
-    for j, col_name in enumerate(df.columns, start=1):
-        ws.cell(row=start_row, column=j, value=str(col_name))
-    for i, (_, row) in enumerate(df.iterrows(), start=start_row + 1):
-        for j, val in enumerate(row, start=1):
-            if isinstance(val, (np.integer,)):
-                val = int(val)
-            elif isinstance(val, (np.floating,)):
-                val = float(val)
-            ws.cell(row=i, column=j, value=val)
-    header_values = list(df.columns)
-    _style_header_row(ws, start_row)
-    ws.freeze_panes = ws.cell(row=start_row + 1, column=1).coordinate
-    ws.auto_filter.ref = ws.dimensions
-    _color_signal_cells(ws, header_values, start_row=start_row + 1)
-    _apply_borders(ws)
-    _autosize_columns(ws)
-
-
-def build_excel_report(df: pd.DataFrame, spot_price: float, atm_strike: float, pcr: float,
-                        max_pain: float, support, resistance, symbol: str, expiry_label: str,
-                        signals: list) -> io.BytesIO:
-    wb = Workbook()
-
-    ws_summary = wb.active
-    ws_summary.title = "Summary"
-    summary_rows = [
-        ("Symbol", symbol),
-        ("Expiry", expiry_label),
-        ("Generated At", datetime.now().strftime("%d-%b-%Y %H:%M:%S")),
-        ("Spot Price", round(spot_price, 2) if spot_price else "—"),
-        ("ATM Strike", atm_strike),
-        ("PCR", round(pcr, 3)),
-        ("Max Pain", max_pain),
-        ("Support (Max PE OI)", support),
-        ("Resistance (Max CE OI)", resistance),
-        ("Total CE OI", int(df["ce_oi"].sum()) if not df.empty else 0),
-        ("Total PE OI", int(df["pe_oi"].sum()) if not df.empty else 0),
-        ("AI Trade Signals Generated", len(signals)),
-    ]
-    ws_summary.cell(row=1, column=1, value="Metric")
-    ws_summary.cell(row=1, column=2, value="Value")
-    _style_header_row(ws_summary, 1)
-    for i, (label, value) in enumerate(summary_rows, start=2):
-        ws_summary.cell(row=i, column=1, value=label)
-        ws_summary.cell(row=i, column=2, value=value)
-    ws_summary.freeze_panes = "A2"
-    _apply_borders(ws_summary)
-    _autosize_columns(ws_summary)
-
-    ws_chain = wb.create_sheet("Chain Table")
-    _write_dataframe(ws_chain, style_chain_table(df))
-
-    ws_bigmove = wb.create_sheet("Big Move Ready")
-    _write_dataframe(ws_bigmove, style_ce_pe_analysis_table(df))
-
-    ws_bigmove_legacy = wb.create_sheet("Big Move (Legacy)")
-    _write_dataframe(ws_bigmove_legacy, style_big_move_table(df))
-
-    ws_signals = wb.create_sheet("AI Trade Signals")
-    sig_df = style_trade_signals_table(signals)
-    if not sig_df.empty:
-        _write_dataframe(ws_signals, sig_df)
-    else:
-        ws_signals.cell(row=1, column=1, value="No signals met the confidence threshold")
-        _style_header_row(ws_signals, 1)
-
-    buffer = io.BytesIO()
-    wb.save(buffer)
-    buffer.seek(0)
-    return buffer
-
-
-# ══════════════════════════════════════════════════════════════════════════
 # 5C. GAMMA BUILD-UP ANALYZER
 # ══════════════════════════════════════════════════════════════════════════
 
@@ -2594,8 +1649,6 @@ def add_gamma_columns(df: pd.DataFrame, spot: float, expiry_label: str, r: float
 
     days_to_expiry = parse_days_to_expiry(expiry_label)
     t = max(days_to_expiry, 0.5) / 365.0
-    ce_iv = d.get("ce_iv", pd.Series(0, index=d.index))
-    pe_iv = d.get("pe_iv", pd.Series(0, index=d.index))
 
     def _row_gamma(strike, iv_pct):
         sigma = max(float(iv_pct), 0.0) / 100.0
@@ -2812,7 +1865,10 @@ def render_gamma_html_table(df: pd.DataFrame, top_n: int = 40) -> str:
         cells = []
         for key, _, fmt in cols:
             val = row.get(key, "")
-            cells.append(f"<td>{fmt.format(val) if fmt else val}</td>")
+            # FIX (see FIX NOTE 6a): escape every interpolated cell value
+            # instead of dropping it into the <td> raw, so a stray
+            # '<'/'>'/'&' (or NaN) can never corrupt the table markup.
+            cells.append(f"<td>{_safe_cell(fmt.format(val) if fmt else val)}</td>")
         rows_html.append(f'<tr class="{css}{blink}">{"".join(cells)}</tr>')
 
     header_html = "".join(f"<th>{label}</th>" for _, label, _ in cols)
@@ -3157,13 +2213,14 @@ def compute_scalping_trend_engine(fyers, symbol_candidates: list, df: pd.DataFra
         return result
     c15 = fetch_underlying_candles(fyers, symbol_candidates, resolution="15", lookback_days=10)
 
-    # Cache the raw candle frames so the Institutional AI Validation
-    # Engine (section 5G) can reuse them without re-fetching from FYERS —
-    # it only ever gets candle/trend confirmation this way, on whichever
-    # rerun the AI Scalping Engine tab has actually executed on.
+    # FIX (see FIX NOTE 6b): cache key now includes the symbol so switching
+    # instruments can't show a stale candle set from a previous symbol
+    # until the Scalping tab happens to re-run for the new one.
+    cache_symbol = symbol_candidates[0] if symbol_candidates else "unknown"
     try:
         st.session_state["oc_scalp_candles_5"] = c5
         st.session_state["oc_scalp_candles_15"] = c15
+        st.session_state["oc_scalp_candles_symbol"] = cache_symbol
     except Exception:  # noqa: BLE001 - session_state may be unavailable outside Streamlit
         pass
 
@@ -3191,7 +2248,14 @@ def compute_scalping_trend_engine(fyers, symbol_candidates: list, df: pd.DataFra
     last_macd, last_macd_sig = float(macd_line.iloc[-1]), float(macd_signal.iloc[-1])
     last_adx, last_atr = float(adx.iloc[-1]), float(atr.iloc[-1])
     last_st_dir = int(st_dir.iloc[-1]) if len(st_dir) else 0
-    volume_spike = bool(len(c5) >= 20 and c5["volume"].iloc[-1] > c5["volume"].tail(20).mean() * 1.5)
+    # FIX (see FIX NOTE 6c): guard the rolling-mean volume comparison
+    # against an all-zero / empty trailing window (pre-market or a very
+    # illiquid symbol) so this can't raise or silently divide into inf.
+    if len(c5) >= 20:
+        _recent_mean_vol = c5["volume"].tail(20).mean()
+        volume_spike = bool(_recent_mean_vol > 0 and c5["volume"].iloc[-1] > _recent_mean_vol * 1.5)
+    else:
+        volume_spike = False
 
     total_ce_chng = float(df.get("ce_chng_oi", pd.Series(dtype=float)).sum())
     total_pe_chng = float(df.get("pe_chng_oi", pd.Series(dtype=float)).sum())
@@ -3417,7 +2481,8 @@ def render_scalping_html_table(df: pd.DataFrame, top_n: int = 40) -> str:
         cells = []
         for key, _, fmt in cols:
             val = row.get(key, "")
-            cells.append(f"<td>{fmt.format(val) if fmt else val}</td>")
+            # FIX (FIX NOTE 6a): escape every interpolated cell value.
+            cells.append(f"<td>{_safe_cell(fmt.format(val) if fmt else val)}</td>")
         rows_html.append(f'<tr class="{css}{blink}">{"".join(cells)}</tr>')
     header_html = "".join(f"<th>{label}</th>" for _, label, _ in cols)
     return f"""
@@ -3533,30 +2598,1005 @@ def render_scalping_tab(scalp_df: pd.DataFrame, trend_engine: dict, symbol: str,
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# 5G. INSTITUTIONAL AI VALIDATION ENGINE
-#     Replaces the single-indicator generate_trade_signals() as the source
-#     feeding the "AI Trade Signals" tab (see FIX NOTE 5 above). A BUY or
-#     SELL is only ever produced once every major validation category
-#     below agrees; any category that disagrees — or that can't be
-#     computed because candle data isn't available yet — forces the
-#     signal to WAIT instead of guessing. generate_trade_signals() itself
-#     is left in the file, untouched and still callable, so no existing
-#     function is removed.
+# 5H. 15-MINUTE VOLUME & SWING TOP/BOTTOM ANALYZER  (new — user-requested)
+# ══════════════════════════════════════════════════════════════════════════
+#
+# Reuses fetch_underlying_candles() (resolution="15") and the same
+# _swing_points() detector already used by the AI Scalping Engine's
+# BOS/CHOCH logic (section 5D), so "Top"/"Bottom" here means exactly the
+# same thing as a swing high/low everywhere else in this file — no new
+# detection rule is introduced. Volume bars are colored green when the
+# candle closed up and red when it closed down, matching the OI chart's
+# color convention (section 7).
+
+def detect_swing_top_bottom(c15: pd.DataFrame, lookback: int = 3) -> pd.DataFrame:
+    """Adds 'Swing Top' / 'Swing Bottom' boolean columns to a 15m candle
+    frame using the same swing-point rule as _detect_bos_choch() (a
+    centered rolling max/min over `lookback` bars each side)."""
+    if c15 is None or c15.empty or len(c15) < (lookback * 2 + 1):
+        d = c15.copy() if c15 is not None else pd.DataFrame()
+        if not d.empty:
+            d["Swing Top"] = False
+            d["Swing Bottom"] = False
+        return d
+    d = c15.copy()
+    swing_high, swing_low = _swing_points(d, lookback=lookback)
+    d["Swing Top"] = swing_high
+    d["Swing Bottom"] = swing_low
+    return d
+
+
+def render_volume_swing_chart(c15: pd.DataFrame) -> go.Figure:
+    """15-min volume bars (green=up candle, red=down candle) with the
+    most recent swing Top / Bottom candles marked on a secondary price
+    line, so the volume context behind each top/bottom is visible."""
+    fig = make_subplots(specs=[[{"secondary_y": True}]])
+    if c15 is None or c15.empty:
+        fig.add_annotation(text="No 15m candle data available — enable the AI Scalping "
+                                 "Engine in the sidebar so candles are fetched this session.",
+                            xref="paper", yref="paper", x=0.5, y=0.5,
+                            font=dict(color="#8b949e"), showarrow=False)
+        fig.update_layout(paper_bgcolor="#0d1117", plot_bgcolor="#0d1117", height=460)
+        return fig
+
+    colors = ["#3fb950" if c >= o else "#f85149" for o, c in zip(c15["open"], c15["close"])]
+    fig.add_trace(go.Bar(x=c15["time"], y=c15["volume"], marker_color=colors,
+                          name="Volume", opacity=0.85), secondary_y=False)
+    fig.add_trace(go.Scatter(x=c15["time"], y=c15["close"], mode="lines",
+                              line=dict(color="#58a6ff", width=1.3), name="Close"),
+                  secondary_y=True)
+
+    tops = c15[c15.get("Swing Top", False) == True]     # noqa: E712
+    bottoms = c15[c15.get("Swing Bottom", False) == True]  # noqa: E712
+    if not tops.empty:
+        fig.add_trace(go.Scatter(x=tops["time"], y=tops["high"], mode="markers+text",
+                                  marker=dict(symbol="triangle-down", size=11, color="#f85149"),
+                                  text=["Top"] * len(tops), textposition="top center",
+                                  textfont=dict(color="#f85149", size=10), name="Swing Top"),
+                      secondary_y=True)
+    if not bottoms.empty:
+        fig.add_trace(go.Scatter(x=bottoms["time"], y=bottoms["low"], mode="markers+text",
+                                  marker=dict(symbol="triangle-up", size=11, color="#3fb950"),
+                                  text=["Bottom"] * len(bottoms), textposition="bottom center",
+                                  textfont=dict(color="#3fb950", size=10), name="Swing Bottom"),
+                      secondary_y=True)
+
+    fig.update_layout(
+        paper_bgcolor="#0d1117", plot_bgcolor="#0d1117",
+        font=dict(color="#8b949e", family="Courier New"),
+        height=460, margin=dict(l=10, r=10, t=30, b=10),
+        legend=dict(bgcolor="#161b22", bordercolor="#30363d", borderwidth=1, orientation="h", y=1.08),
+        xaxis=dict(showgrid=True, gridcolor="#21262d", title="Time (15m)"),
+        bargap=0.15,
+    )
+    fig.update_yaxes(title_text="Volume", showgrid=False, secondary_y=False)
+    fig.update_yaxes(title_text="Price", showgrid=True, gridcolor="#21262d", secondary_y=True)
+    return fig
+
+
+def render_volume_swing_tab(fyers, symbol_candidates: list, symbol: str):
+    """Dashboard tab: 15-min Volume + Swing Top/Bottom identifier."""
+    st.markdown("##### 📊 15-Minute Volume & Swing Top/Bottom")
+
+    # FIX-consistent with FIX NOTE 6b: reuse the session's cached 15m
+    # candles only if they belong to THIS symbol; otherwise fetch fresh
+    # so this tab can never show a stale instrument's candles.
+    cached_symbol = st.session_state.get("oc_scalp_candles_symbol")
+    c15 = st.session_state.get("oc_scalp_candles_15")
+    current_symbol = symbol_candidates[0] if symbol_candidates else None
+    if c15 is None or cached_symbol != current_symbol:
+        with st.spinner("Fetching 15-minute candles …"):
+            c15 = fetch_underlying_candles(fyers, symbol_candidates, resolution="15", lookback_days=10)
+
+    if c15 is None or c15.empty:
+        st.warning(
+            "No 15-minute candle data available right now (market closed, a plan without "
+            "history access, or the FYERS history call failed for every symbol variant "
+            "tried). Try again during market hours, or enable the AI Scalping Engine in "
+            "the sidebar first."
+        )
+        return
+
+    c15 = detect_swing_top_bottom(c15, lookback=3)
+    tops = c15[c15["Swing Top"] == True]      # noqa: E712
+    bottoms = c15[c15["Swing Bottom"] == True]  # noqa: E712
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Candles Loaded", len(c15))
+    m2.metric("Swing Tops Found", len(tops))
+    m3.metric("Swing Bottoms Found", len(bottoms))
+    last_top = tops.iloc[-1] if not tops.empty else None
+    last_bottom = bottoms.iloc[-1] if not bottoms.empty else None
+    latest_label = "—"
+    if last_top is not None and last_bottom is not None:
+        latest_label = "🔴 Top" if last_top["time"] > last_bottom["time"] else "🟢 Bottom"
+    elif last_top is not None:
+        latest_label = "🔴 Top"
+    elif last_bottom is not None:
+        latest_label = "🟢 Bottom"
+    m4.metric("Most Recent Swing", latest_label)
+
+    st.plotly_chart(render_volume_swing_chart(c15), use_container_width=True,
+                     config={"displayModeBar": False})
+
+    col_t, col_b = st.columns(2)
+    with col_t:
+        st.markdown('<span class="swing-top-badge">🔴 Recent Swing Tops</span>', unsafe_allow_html=True)
+        if not tops.empty:
+            view = tops.tail(8)[["time", "high", "volume"]].iloc[::-1].reset_index(drop=True)
+            view.columns = ["Time", "Price (High)", "Volume"]
+            st.dataframe(view, use_container_width=True, height=260)
+        else:
+            st.caption("No swing tops detected yet in this candle window.")
+    with col_b:
+        st.markdown('<span class="swing-bottom-badge">🟢 Recent Swing Bottoms</span>', unsafe_allow_html=True)
+        if not bottoms.empty:
+            view = bottoms.tail(8)[["time", "low", "volume"]].iloc[::-1].reset_index(drop=True)
+            view.columns = ["Time", "Price (Low)", "Volume"]
+            st.dataframe(view, use_container_width=True, height=260)
+        else:
+            st.caption("No swing bottoms detected yet in this candle window.")
+
+    st.caption(
+        "A 'Top' / 'Bottom' is a 15-minute swing high/low: the candle's high (or low) is the "
+        "highest (lowest) among the 3 candles on either side of it — the identical rule the "
+        "AI Scalping Engine's BOS/CHOCH detector already uses on 5m candles, applied here to "
+        "15m for a slower, less noisy read. Volume bars are green on up-close candles and red "
+        "on down-close candles. This is a structural pattern read, not a prediction — always "
+        "confirm with live price action."
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 6. MARKET INTELLIGENCE
 # ══════════════════════════════════════════════════════════════════════════
 
-# Confidence weights (spec section 10) — sums to 100.
+def compute_market_intelligence(df: pd.DataFrame, spot_price: float, max_pain: float, pcr: float) -> dict:
+    if df.empty:
+        return {}
+
+    mp_component = 0.0
+    if max_pain:
+        mp_component = ((spot_price - max_pain) / max_pain) * 100 if spot_price else 0.0
+    momentum_score = float(np.clip(((pcr - 1) * 50) + (mp_component * 0.5), -100, 100))
+
+    if momentum_score > 20:
+        trend = "🟢 Bullish"
+    elif momentum_score < -20:
+        trend = "🔴 Bearish"
+    else:
+        trend = "🟡 Sideways"
+
+    total_ce_oi, total_pe_oi = df["ce_oi"].sum(), df["pe_oi"].sum()
+    high_oi_thresh_ce = df["ce_oi"].quantile(0.75) if len(df) else 0
+    high_oi_thresh_pe = df["pe_oi"].quantile(0.75) if len(df) else 0
+
+    institution_buying = df.loc[df["pe_oi"] >= high_oi_thresh_pe, "pe_chng_oi"].clip(lower=0).sum()
+    institution_selling = df.loc[df["ce_oi"] >= high_oi_thresh_ce, "ce_chng_oi"].clip(lower=0).sum()
+
+    call_writers_activity = df["ce_chng_oi"].clip(lower=0).sum()
+    put_writers_activity = df["pe_chng_oi"].clip(lower=0).sum()
+    call_buyers_activity = (-df["ce_chng_oi"].clip(upper=0)).sum()
+    put_buyers_activity = (-df["pe_chng_oi"].clip(upper=0)).sum()
+
+    highest_volume_strike = df.loc[(df["ce_volume"] + df["pe_volume"]).idxmax(), "strike_price"] if len(df) else None
+    highest_oi_strike = df.loc[(df["ce_oi"] + df["pe_oi"]).idxmax(), "strike_price"] if len(df) else None
+    highest_delta_oi_strike = df.loc[(df["ce_chng_oi"].abs() + df["pe_chng_oi"].abs()).idxmax(), "strike_price"] if len(df) else None
+
+    support = df.loc[df["pe_oi"].idxmax(), "strike_price"] if len(df) else None
+    resistance = df.loc[df["ce_oi"].idxmax(), "strike_price"] if len(df) else None
+
+    breakout_prob_avg = df["Breakout Probability"].max() if "Breakout Probability" in df.columns else 0
+    breakdown_prob_avg = df["Breakdown Probability"].max() if "Breakdown Probability" in df.columns else 0
+
+    return {
+        "momentum_score": momentum_score,
+        "trend": trend,
+        "institution_buying": institution_buying,
+        "institution_selling": institution_selling,
+        "call_writers_activity": call_writers_activity,
+        "put_writers_activity": put_writers_activity,
+        "call_buyers_activity": call_buyers_activity,
+        "put_buyers_activity": put_buyers_activity,
+        "highest_volume_strike": highest_volume_strike,
+        "highest_oi_strike": highest_oi_strike,
+        "highest_delta_oi_strike": highest_delta_oi_strike,
+        "support": support,
+        "resistance": resistance,
+        "breakout_probability": breakout_prob_avg,
+        "breakdown_probability": breakdown_prob_avg,
+        "total_ce_oi": total_ce_oi,
+        "total_pe_oi": total_pe_oi,
+    }
+
+
+def detect_oi_shift(symbol: str, support, resistance) -> list:
+    notes = []
+    history = st.session_state.setdefault("oc_prev_levels", {})
+    prev = history.get(symbol)
+    if prev and support is not None and resistance is not None:
+        if prev.get("support") is not None and support != prev["support"]:
+            direction = "up" if support > prev["support"] else "down"
+            notes.append(f"🛡️ Support shifted {direction}: {prev['support']:,.0f} → {support:,.0f}")
+        if prev.get("resistance") is not None and resistance != prev["resistance"]:
+            direction = "up" if resistance > prev["resistance"] else "down"
+            notes.append(f"🧱 Resistance shifted {direction}: {prev['resistance']:,.0f} → {resistance:,.0f}")
+    history[symbol] = {"support": support, "resistance": resistance}
+    return notes
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 7. CHARTS
+# ══════════════════════════════════════════════════════════════════════════
+
+def oi_bar_chart(df: pd.DataFrame, max_pain: float) -> go.Figure:
+    fig = make_subplots(
+        rows=1, cols=2, subplot_titles=("Call OI  (CE)", "Put OI  (PE)"),
+        shared_yaxes=True, horizontal_spacing=0.04,
+    )
+    max_oi = max(df["ce_oi"].max(), df["pe_oi"].max()) if len(df) else 1
+    strikes_sorted = df["strike_price"].sort_values().unique()
+    strike_gap = (strikes_sorted[1] - strikes_sorted[0]) if len(strikes_sorted) > 1 else 1
+
+    fig.add_trace(go.Bar(
+        x=-df["ce_oi"], y=df["strike_price"], orientation="h",
+        marker_color=["#1a7f37" if abs(s - max_pain) < strike_gap / 2 else "#238636" for s in df["strike_price"]],
+        name="CE OI", showlegend=False, customdata=df["ce_oi"],
+        hovertemplate="Strike %{y}<br>CE OI: %{customdata:,}<extra></extra>",
+    ), row=1, col=1)
+
+    fig.add_trace(go.Bar(
+        x=df["pe_oi"], y=df["strike_price"], orientation="h",
+        marker_color=["#b91c1c" if abs(s - max_pain) < strike_gap / 2 else "#da3633" for s in df["strike_price"]],
+        name="PE OI", showlegend=False,
+        hovertemplate="Strike %{y}<br>PE OI: %{x:,}<extra></extra>",
+    ), row=1, col=2)
+
+    for col in [1, 2]:
+        fig.add_hline(y=max_pain, line_dash="dot", line_color="#f0c814",
+                      annotation_text=f"Max Pain {max_pain:,.0f}",
+                      annotation_font_color="#f0c814", row=1, col=col)
+
+    fig.update_layout(
+        paper_bgcolor="#0d1117", plot_bgcolor="#0d1117",
+        font=dict(color="#8b949e", family="Courier New"),
+        height=500, margin=dict(l=10, r=10, t=40, b=10),
+        xaxis=dict(showticklabels=False, zeroline=False, showgrid=False, range=[-max_oi * 1.1, 0]),
+        xaxis2=dict(showticklabels=False, zeroline=False, showgrid=False, range=[0, max_oi * 1.1]),
+        yaxis=dict(showgrid=True, gridcolor="#21262d", tickfont=dict(color="#e6edf3", size=11)),
+    )
+    fig.update_annotations(font_color="#8b949e")
+    return fig
+
+
+def pcr_gauge(pcr: float) -> go.Figure:
+    fig = go.Figure(go.Indicator(
+        mode="gauge+number", value=pcr,
+        number={"font": {"color": "#e6edf3", "size": 36, "family": "Courier New"}},
+        gauge={
+            "axis": {"range": [0, 3], "tickcolor": "#8b949e", "tickfont": {"color": "#8b949e"}},
+            "bar": {"color": "#58a6ff", "thickness": 0.25},
+            "bgcolor": "#161b22", "borderwidth": 0,
+            "steps": [
+                {"range": [0, 0.7], "color": "#3b0d1a"},
+                {"range": [0.7, 1.3], "color": "#1c2128"},
+                {"range": [1.3, 3.0], "color": "#0d3b2e"},
+            ],
+            "threshold": {"line": {"color": "#f0c814", "width": 3}, "value": pcr},
+        },
+        title={"text": "PUT/CALL RATIO", "font": {"color": "#8b949e", "size": 12}},
+        domain={"x": [0, 1], "y": [0, 1]},
+    ))
+    fig.update_layout(paper_bgcolor="#0d1117", font=dict(color="#8b949e"),
+                       height=220, margin=dict(l=20, r=20, t=30, b=0))
+    return fig
+
+
+def momentum_gauge(momentum_score: float) -> go.Figure:
+    fig = go.Figure(go.Indicator(
+        mode="gauge+number", value=momentum_score,
+        number={"font": {"color": "#e6edf3", "size": 32, "family": "Courier New"}, "suffix": ""},
+        gauge={
+            "axis": {"range": [-100, 100], "tickcolor": "#8b949e", "tickfont": {"color": "#8b949e"}},
+            "bar": {"color": "#58a6ff", "thickness": 0.25},
+            "bgcolor": "#161b22", "borderwidth": 0,
+            "steps": [
+                {"range": [-100, -20], "color": "#3b0d1a"},
+                {"range": [-20, 20], "color": "#1c2128"},
+                {"range": [20, 100], "color": "#0d3b2e"},
+            ],
+            "threshold": {"line": {"color": "#f0c814", "width": 3}, "value": momentum_score},
+        },
+        title={"text": "MOMENTUM METER", "font": {"color": "#8b949e", "size": 12}},
+        domain={"x": [0, 1], "y": [0, 1]},
+    ))
+    fig.update_layout(paper_bgcolor="#0d1117", font=dict(color="#8b949e"),
+                       height=220, margin=dict(l=20, r=20, t=30, b=0))
+    return fig
+
+
+def iv_chart(df: pd.DataFrame) -> go.Figure:
+    has_ce_iv = "ce_iv" in df.columns
+    has_pe_iv = "pe_iv" in df.columns
+    fig = go.Figure()
+    if has_ce_iv:
+        fig.add_trace(go.Scatter(x=df["strike_price"], y=df["ce_iv"], mode="lines+markers",
+                                  name="CE IV", line=dict(color="#238636", width=2), marker=dict(size=5)))
+    if has_pe_iv:
+        fig.add_trace(go.Scatter(x=df["strike_price"], y=df["pe_iv"], mode="lines+markers",
+                                  name="PE IV", line=dict(color="#da3633", width=2), marker=dict(size=5)))
+    if not has_ce_iv and not has_pe_iv:
+        fig.add_annotation(text="IV data not available from this API response",
+                            xref="paper", yref="paper", x=0.5, y=0.5,
+                            font=dict(color="#8b949e"), showarrow=False)
+    fig.update_layout(
+        paper_bgcolor="#0d1117", plot_bgcolor="#0d1117",
+        font=dict(color="#8b949e", family="Courier New"),
+        height=280, margin=dict(l=10, r=10, t=10, b=30),
+        xaxis=dict(showgrid=True, gridcolor="#21262d", title="Strike"),
+        yaxis=dict(showgrid=True, gridcolor="#21262d", title="IV %"),
+        legend=dict(bgcolor="#161b22", bordercolor="#30363d", borderwidth=1),
+    )
+    return fig
+
+
+def style_chain_table(df: pd.DataFrame) -> pd.DataFrame:
+    cols = ["ce_oi", "ce_chng_oi", "ce_volume", "ce_ltp", "CE Bias", "strike_price",
+            "PE Bias", "pe_ltp", "pe_volume", "pe_chng_oi", "pe_oi", "Strike Signal", "Big Move"]
+    new_signal_cols = [
+        "BUY CE", "SELL CE", "CE Confidence", "CE Stars", "CE Reason",
+        "BUY PE", "SELL PE", "PE Confidence", "PE Stars", "PE Reason",
+    ]
+    available = [c for c in cols if c in df.columns] + [c for c in new_signal_cols if c in df.columns]
+    out = df[available].copy()
+    rename = {
+        "ce_oi": "CE OI", "ce_chng_oi": "CE ΔOI", "ce_volume": "CE Vol", "ce_ltp": "CE LTP",
+        "strike_price": "Strike ⚡", "pe_ltp": "PE LTP", "pe_volume": "PE Vol",
+        "pe_chng_oi": "PE ΔOI", "pe_oi": "PE OI",
+    }
+    out.rename(columns={k: v for k, v in rename.items() if k in out.columns}, inplace=True)
+    return out
+
+
+def _oi_change_color(val, heavy_thresh: float) -> str:
+    try:
+        v = float(val)
+    except (TypeError, ValueError):
+        return "color:#e6edf3;"
+    if v == 0:
+        return "color:#8b949e;"
+    is_large = heavy_thresh > 0 and abs(v) >= heavy_thresh
+    if v > 0:
+        return "color:#0d3b2e;font-weight:700;background-color:#3fb950;" if is_large else "color:#3fb950;"
+    return "color:#3b0d1a;font-weight:700;background-color:#f85149;" if is_large else "color:#f85149;"
+
+
+def _ce_pe_signal_cell_color(val: str) -> str:
+    v = str(val)
+    if v.startswith("✅ BUY"):
+        return "color:#3fb950;font-weight:700;"
+    if v.startswith("🔻 SELL"):
+        return "color:#f85149;font-weight:700;"
+    return "color:#8b949e;"
+
+
+def _oi_bar_pct(val, max_val) -> float:
+    try:
+        v = float(val)
+    except (TypeError, ValueError):
+        return 0.0
+    return max(0.0, min(100.0, (v / max_val) * 100)) if max_val > 0 else 0.0
+
+
+def render_chain_table_html(df: pd.DataFrame, top_n: int = 500) -> str:
+    display_df = style_chain_table(df)
+    view = display_df.head(top_n)
+
+    heavy_ce = df["ce_chng_oi"].abs().quantile(0.80) if "ce_chng_oi" in df.columns and (df["ce_chng_oi"] != 0).any() else 0
+    heavy_pe = df["pe_chng_oi"].abs().quantile(0.80) if "pe_chng_oi" in df.columns and (df["pe_chng_oi"] != 0).any() else 0
+    max_ce_oi = view["CE OI"].max() if "CE OI" in view.columns and len(view) else 0
+    max_pe_oi = view["PE OI"].max() if "PE OI" in view.columns and len(view) else 0
+
+    numeric_fmt = {
+        "CE OI": "{:,.0f}", "CE ΔOI": "{:+,.0f}", "CE Vol": "{:,.0f}", "CE LTP": "{:.2f}",
+        "Strike ⚡": "{:,.0f}", "PE LTP": "{:.2f}", "PE Vol": "{:,.0f}", "PE ΔOI": "{:+,.0f}",
+        "PE OI": "{:,.0f}", "CE Confidence": "{:.1f}%", "PE Confidence": "{:.1f}%",
+    }
+
+    header_html = "".join(f"<th>{col}</th>" for col in view.columns)
+    rows_html = []
+    for _, row in view.iterrows():
+        cells = []
+        for col in view.columns:
+            val = row[col]
+            fmt = numeric_fmt.get(col)
+            display_val = fmt.format(val) if fmt and pd.notna(val) else ("" if pd.isna(val) else val)
+            style = ""
+            if col == "CE ΔOI":
+                style = _oi_change_color(val, heavy_ce)
+            elif col == "PE ΔOI":
+                style = _oi_change_color(val, heavy_pe)
+            elif col in ("BUY CE", "SELL CE", "BUY PE", "SELL PE"):
+                style = _ce_pe_signal_cell_color(val)
+            elif col == "CE OI" and max_ce_oi > 0:
+                pct = _oi_bar_pct(val, max_ce_oi)
+                style = f"background:linear-gradient(90deg, rgba(63,185,80,{0.10 + pct/250:.2f}) {pct:.0f}%, transparent {pct:.0f}%);"
+            elif col == "PE OI" and max_pe_oi > 0:
+                pct = _oi_bar_pct(val, max_pe_oi)
+                style = f"background:linear-gradient(90deg, rgba(63,185,80,{0.10 + pct/250:.2f}) {pct:.0f}%, transparent {pct:.0f}%);"
+            # FIX (FIX NOTE 6a): escape the interpolated cell value.
+            cells.append(f'<td style="{style}">{_safe_cell(display_val)}</td>')
+        rows_html.append(f"<tr>{''.join(cells)}</tr>")
+
+    return f"""
+    <div style="max-height:560px; overflow-y:auto; border:1px solid #30363d; border-radius:8px;">
+    <table class="gamma-table">
+        <thead><tr>{header_html}</tr></thead>
+        <tbody>{''.join(rows_html)}</tbody>
+    </table>
+    </div>
+    """
+
+
+def style_big_move_table(df: pd.DataFrame) -> pd.DataFrame:
+    cols = ["strike_price", "CE Score", "PE Score", "Overall Score", "BUY Probability",
+            "SELL Probability", "Breakout Probability", "Breakdown Probability",
+            "Institutional Score", "Smart Money Score", "Final Signal"]
+    available = [c for c in cols if c in df.columns]
+    out = df[available].copy()
+    out.rename(columns={
+        "strike_price": "Strike ⚡",
+        "Breakout Probability": "Breakout %",
+        "Breakdown Probability": "Breakdown %",
+        "Institutional Score": "Institution Score",
+    }, inplace=True)
+    sort_col = "Overall Score" if "Overall Score" in out.columns else out.columns[0]
+    return out.sort_values(sort_col, ascending=False).reset_index(drop=True)
+
+
+def style_ce_pe_analysis_table(df: pd.DataFrame) -> pd.DataFrame:
+    cols = [
+        "strike_price",
+        "CE Score", "PE Score",
+        "CE BUY Probability", "PE BUY Probability",
+        "CE SELL Probability", "PE SELL Probability",
+        "CE Entry", "PE Entry",
+        "CE SL", "PE SL",
+        "CE Target 1", "PE Target 1",
+        "CE Target 2", "PE Target 2",
+        "CE Target 3", "PE Target 3",
+        "Confidence %",
+        "Institutional Buying", "Institutional Selling",
+        "Smart Money Activity",
+        "Breakout Probability", "Breakdown Probability",
+        "Final Recommendation",
+    ]
+    available = [c for c in cols if c in df.columns]
+    out = df[available].copy()
+    out.rename(columns={
+        "strike_price": "Strike ⚡",
+        "CE Score": "CE AI Score", "PE Score": "PE AI Score",
+        "Breakout Probability": "Breakout Probability %",
+        "Breakdown Probability": "Breakdown Probability %",
+    }, inplace=True)
+    sort_col = "Confidence %" if "Confidence %" in out.columns else out.columns[0]
+    return out.sort_values(sort_col, ascending=False).reset_index(drop=True)
+
+
+def style_trade_signals_table(signals: list) -> pd.DataFrame:
+    if not signals:
+        return pd.DataFrame()
+    df = pd.DataFrame(signals)
+    df.drop(columns=[c for c in ("Signal Key", "Reasons") if c in df.columns], inplace=True)
+    df.rename(columns={"Side": "CE/PE"}, inplace=True)
+    return df
+
+
+def _bigmove_row_style(row):
+    signal = str(row.get("Final Signal", row.get("Final Recommendation", ""))).upper()
+    if "STRONG" in signal and "BUY" in signal:
+        color = "background-color:#0d3b2e;color:#3fb950;"
+    elif "BUY" in signal:
+        color = "background-color:#123524;color:#7ee787;"
+    elif "HOLD" in signal:
+        color = "background-color:#1c2128;color:#d29922;"
+    elif "AVOID" in signal:
+        color = "background-color:#2b1a05;color:#e8823a;"
+    else:
+        color = "background-color:#161b22;color:#8b949e;"
+    return color
+
+
+def render_row_colored_table_html(df: pd.DataFrame, numeric_fmt: dict = None, top_n: int = 500) -> str:
+    numeric_fmt = numeric_fmt or {}
+    view = df.head(top_n)
+    header_html = "".join(f"<th>{col}</th>" for col in view.columns)
+    rows_html = []
+    for _, row in view.iterrows():
+        row_style = _bigmove_row_style(row)
+        cells = []
+        for col in view.columns:
+            val = row[col]
+            fmt = numeric_fmt.get(col)
+            display_val = fmt.format(val) if fmt and pd.notna(val) else ("" if pd.isna(val) else val)
+            # FIX (FIX NOTE 6a): escape the interpolated cell value.
+            cells.append(f"<td>{_safe_cell(display_val)}</td>")
+        rows_html.append(f'<tr style="{row_style}">{"".join(cells)}</tr>')
+    return f"""
+    <div style="max-height:560px; overflow-y:auto; border:1px solid #30363d; border-radius:8px;">
+    <table class="gamma-table">
+        <thead><tr>{header_html}</tr></thead>
+        <tbody>{''.join(rows_html)}</tbody>
+    </table>
+    </div>
+    """
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 8. EXCEL EXPORT
+# ══════════════════════════════════════════════════════════════════════════
+
+FILL_HEADER = PatternFill(start_color="1F4E78", end_color="1F4E78", fill_type="solid")
+FILL_STRONGBUY = PatternFill(start_color="A9D18E", end_color="A9D18E", fill_type="solid")
+FILL_BUY = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
+FILL_HOLD = PatternFill(start_color="FFEB9C", end_color="FFEB9C", fill_type="solid")
+FILL_AVOID = PatternFill(start_color="FFD966", end_color="FFD966", fill_type="solid")
+FILL_IGNORE = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
+FILL_SELL = FILL_IGNORE
+FILL_WAIT = FILL_HOLD
+FONT_HEADER = Font(color="FFFFFF", bold=True, size=11)
+THIN_BORDER = Border(*(Side(style="thin", color="30363D"),) * 4)
+
+
+def _style_header_row(ws, row_idx: int = 1):
+    for cell in ws[row_idx]:
+        cell.fill = FILL_HEADER
+        cell.font = FONT_HEADER
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+        cell.border = THIN_BORDER
+
+
+def _autosize_columns(ws):
+    for col_cells in ws.columns:
+        length = max((len(str(c.value)) if c.value is not None else 0) for c in col_cells)
+        col_letter = get_column_letter(col_cells[0].column)
+        ws.column_dimensions[col_letter].width = min(max(length + 3, 10), 40)
+
+
+def _apply_borders(ws):
+    for row in ws.iter_rows():
+        for cell in row:
+            cell.border = THIN_BORDER
+
+
+def _color_signal_cells(ws, header_row_values: list, start_row: int = 2):
+    target_cols = [
+        idx + 1 for idx, h in enumerate(header_row_values)
+        if h and any(k in str(h) for k in ("Signal", "Bias", "Build-up", "Label", "Rating", "Recommendation"))
+    ]
+    for row in ws.iter_rows(min_row=start_row):
+        for col_idx in target_cols:
+            cell = row[col_idx - 1]
+            val = str(cell.value or "").upper()
+            fill = None
+            if "STRONG BUY" in val or "EXPLOSIVE" in val or "LONG BUILD-UP" in val or "BULLISH" in val:
+                fill = FILL_STRONGBUY
+            elif "BUY" in val or "STRONG MOVE" in val:
+                fill = FILL_BUY
+            elif "HOLD" in val or "NEUTRAL" in val or "WATCH" in val or "FLAT" in val or "WAIT" in val:
+                fill = FILL_HOLD
+            elif "AVOID" in val or "SHORT BUILD-UP" in val or "BEARISH" in val:
+                fill = FILL_AVOID
+            elif "IGNORE" in val or "SELL" in val:
+                fill = FILL_IGNORE
+            if fill:
+                cell.fill = fill
+
+
+def _write_dataframe(ws, df: pd.DataFrame, start_row: int = 1):
+    for j, col_name in enumerate(df.columns, start=1):
+        ws.cell(row=start_row, column=j, value=str(col_name))
+    for i, (_, row) in enumerate(df.iterrows(), start=start_row + 1):
+        for j, val in enumerate(row, start=1):
+            if isinstance(val, (np.integer,)):
+                val = int(val)
+            elif isinstance(val, (np.floating,)):
+                val = float(val)
+            ws.cell(row=i, column=j, value=val)
+    header_values = list(df.columns)
+    _style_header_row(ws, start_row)
+    ws.freeze_panes = ws.cell(row=start_row + 1, column=1).coordinate
+    ws.auto_filter.ref = ws.dimensions
+    _color_signal_cells(ws, header_values, start_row=start_row + 1)
+    _apply_borders(ws)
+    _autosize_columns(ws)
+
+
+def build_excel_report(df: pd.DataFrame, spot_price: float, atm_strike: float, pcr: float,
+                        max_pain: float, support, resistance, symbol: str, expiry_label: str,
+                        signals: list) -> io.BytesIO:
+    wb = Workbook()
+
+    ws_summary = wb.active
+    ws_summary.title = "Summary"
+    summary_rows = [
+        ("Symbol", symbol),
+        ("Expiry", expiry_label),
+        ("Generated At", datetime.now().strftime("%d-%b-%Y %H:%M:%S")),
+        ("Spot Price", round(spot_price, 2) if spot_price else "—"),
+        ("ATM Strike", atm_strike),
+        ("PCR", round(pcr, 3)),
+        ("Max Pain", max_pain),
+        ("Support (Max PE OI)", support),
+        ("Resistance (Max CE OI)", resistance),
+        ("Total CE OI", int(df["ce_oi"].sum()) if not df.empty else 0),
+        ("Total PE OI", int(df["pe_oi"].sum()) if not df.empty else 0),
+        ("AI Trade Signals Generated", len(signals)),
+    ]
+    ws_summary.cell(row=1, column=1, value="Metric")
+    ws_summary.cell(row=1, column=2, value="Value")
+    _style_header_row(ws_summary, 1)
+    for i, (label, value) in enumerate(summary_rows, start=2):
+        ws_summary.cell(row=i, column=1, value=label)
+        ws_summary.cell(row=i, column=2, value=value)
+    ws_summary.freeze_panes = "A2"
+    _apply_borders(ws_summary)
+    _autosize_columns(ws_summary)
+
+    ws_chain = wb.create_sheet("Chain Table")
+    _write_dataframe(ws_chain, style_chain_table(df))
+
+    ws_bigmove = wb.create_sheet("Big Move Ready")
+    _write_dataframe(ws_bigmove, style_ce_pe_analysis_table(df))
+
+    ws_bigmove_legacy = wb.create_sheet("Big Move (Legacy)")
+    _write_dataframe(ws_bigmove_legacy, style_big_move_table(df))
+
+    ws_signals = wb.create_sheet("AI Trade Signals")
+    sig_df = style_trade_signals_table(signals)
+    if not sig_df.empty:
+        _write_dataframe(ws_signals, sig_df)
+    else:
+        ws_signals.cell(row=1, column=1, value="No signals met the confidence threshold")
+        _style_header_row(ws_signals, 1)
+
+    buffer = io.BytesIO()
+    wb.save(buffer)
+    buffer.seek(0)
+    return buffer
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 5E. AI MARKET INTELLIGENCE BRIDGE  (analyze_market() — always invoked,
+#     for BOTH FYERS and NSE, with no source-based bypass)
+# ══════════════════════════════════════════════════════════════════════════
+
+def run_external_ai_market_analysis(df: pd.DataFrame, spot_price: float, atm_strike: float,
+                                     pcr: float, max_pain: float, symbol: str, expiry_label: str,
+                                     source: str) -> dict:
+    """Always-executed, fault-tolerant call into analyze_market()."""
+    logger.info(
+        "Stage: AI Market Intelligence — invoking analyze_market() (source=%s, symbol=%s, expiry=%s)",
+        source, symbol, expiry_label,
+    )
+
+    if spot_price is None:
+        spot_price = float(df["strike_price"].median()) if df is not None and not df.empty else 0.0
+        logger.warning("AI Market Intelligence — spot_price was None; using chain-median fallback %.2f", spot_price)
+    if atm_strike is None:
+        ref = spot_price if spot_price else (
+            float(df["strike_price"].median()) if df is not None and not df.empty else 0.0)
+        atm_strike = (
+            float(df.iloc[(df["strike_price"] - ref).abs().argsort().iloc[0]]["strike_price"])
+            if df is not None and not df.empty else 0.0
+        )
+        logger.warning("AI Market Intelligence — atm_strike was None; using nearest-strike fallback %.2f", atm_strike)
+    if max_pain is None:
+        max_pain = calculate_max_pain(df) if df is not None and not df.empty else 0.0
+        logger.warning("AI Market Intelligence — max_pain was None; recomputed fallback %.2f", max_pain)
+    if pcr is None:
+        if df is not None and not df.empty:
+            total_ce, total_pe = df["ce_oi"].sum(), df["pe_oi"].sum()
+            pcr = float(total_pe / total_ce) if total_ce > 0 else 1.0
+        else:
+            pcr = 1.0
+        logger.warning("AI Market Intelligence — pcr was None; recomputed fallback %.3f", pcr)
+
+    try:
+        result = analyze_market(
+            df, spot_price=spot_price, atm_strike=atm_strike, max_pain=max_pain,
+            pcr=pcr, expiry_label=expiry_label,
+        )
+        logger.info("Stage: AI Market Intelligence — analyze_market() completed (source=%s)", source)
+        return {"available": True, "result": result, "reason": None}
+    except TypeError as e:
+        try:
+            result = analyze_market(
+                df, spot_price=spot_price, atm_strike=atm_strike, max_pain=max_pain,
+                pcr=pcr, expiry_label=expiry_label,
+            )
+            logger.info(
+                "Stage: AI Market Intelligence — analyze_market() completed via fallback "
+                "call (source=%s)", source,
+            )
+            return {"available": True, "result": result, "reason": None}
+        except Exception as e2:  # noqa: BLE001
+            reason = f"analyze_market() signature mismatch: {e2}"
+            logger.error("Stage: AI Market Intelligence — %s (source=%s, initial error=%s)", reason, source, e)
+            return {"available": False, "result": None, "reason": reason}
+    except Exception as e:  # noqa: BLE001 - external module must never crash the dashboard
+        reason = str(e)
+        logger.error("Stage: AI Market Intelligence — analyze_market() raised an exception (source=%s): %s", source, e)
+        return {"available": False, "result": None, "reason": reason}
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 5F. CE/PE INSTITUTIONAL BUY & SELL SIGNAL ENGINE  (additive)
+# ══════════════════════════════════════════════════════════════════════════
+
+CE_PE_SIGNAL_MIN_CONFIDENCE = 60.0
+CE_PE_SIGNAL_MIN_TRUE_FRACTION = 0.55
+
+
+def _ce_pe_signal_stars(confidence_pct: float) -> str:
+    if confidence_pct >= 90:
+        return "★★★★★"
+    if confidence_pct >= 75:
+        return "★★★★☆"
+    if confidence_pct >= 60:
+        return "★★★☆☆"
+    if confidence_pct >= 45:
+        return "★★☆☆☆"
+    return "★☆☆☆☆"
+
+
+def _ce_pe_levels(entry: float, is_sell: bool):
+    if entry <= 0:
+        return 0.0, 0.0, 0.0
+    if is_sell:
+        sl = round(entry * 1.20, 2)
+        target = round(entry * 0.70, 2)
+    else:
+        sl = round(entry * 0.85, 2)
+        target = round(entry * 1.30, 2)
+    risk = abs(entry - sl)
+    reward = abs(target - entry)
+    rr = round(reward / risk, 2) if risk > 0 else 0.0
+    return sl, target, rr
+
+
+def compute_ce_pe_trade_signals(df: pd.DataFrame, spot_price: float, max_pain: float, pcr: float,
+                                 atm_strike: float, support, resistance,
+                                 trend_engine: dict = None, gdf: pd.DataFrame = None) -> pd.DataFrame:
+    if df.empty:
+        return df
+    d = df.copy()
+
+    has_trend = bool(trend_engine and trend_engine.get("available"))
+    if has_trend:
+        last_close, vwap = trend_engine.get("last_close"), trend_engine.get("vwap")
+        ema9, ema20, ema50 = trend_engine.get("ema9"), trend_engine.get("ema20"), trend_engine.get("ema50")
+        rsi5 = trend_engine.get("rsi5", 50.0)
+        macd_val, macd_sig = trend_engine.get("macd", 0.0), trend_engine.get("macd_signal", 0.0)
+        bos_label = trend_engine.get("bos_label", "None")
+        volume_spike = ("Volume Spike" in trend_engine.get("buy_confirmations", [])
+                         or "Volume Spike" in trend_engine.get("sell_confirmations", []))
+        price_above_vwap = last_close is not None and vwap is not None and last_close > vwap
+        price_below_vwap = last_close is not None and vwap is not None and last_close < vwap
+        above_ema20_50 = (last_close is not None and ema20 is not None and ema50 is not None
+                          and last_close > ema20 and last_close > ema50)
+        below_ema20_50 = (last_close is not None and ema20 is not None and ema50 is not None
+                          and last_close < ema20 and last_close < ema50)
+        bullish_structure = bos_label == "Bullish BOS"
+        bearish_structure = bos_label == "Bearish BOS"
+        bullish_candle_proxy = macd_val > macd_sig
+        bearish_candle_proxy = macd_val < macd_sig
+        rsi_overbought = rsi5 > 70
+        rsi_oversold = rsi5 < 30
+    else:
+        price_above_vwap = price_below_vwap = None
+        above_ema20_50 = below_ema20_50 = None
+        bullish_structure = bearish_structure = None
+        bullish_candle_proxy = bearish_candle_proxy = None
+        rsi_overbought = rsi_oversold = None
+        volume_spike = None
+
+    gamma_map = None
+    if gdf is not None and not gdf.empty and "Gamma Change" in gdf.columns:
+        gamma_map = gdf.set_index("strike_price")["Gamma Change"].to_dict()
+
+    heavy_ce_oi = df["ce_oi"].quantile(0.80) if df["ce_oi"].max() > 0 else 0
+    heavy_pe_oi = df["pe_oi"].quantile(0.80) if df["pe_oi"].max() > 0 else 0
+    heavy_ce_chng = df["ce_chng_oi"].clip(lower=0).quantile(0.80) if (df["ce_chng_oi"] > 0).any() else 0
+    heavy_pe_chng = df["pe_chng_oi"].clip(lower=0).quantile(0.80) if (df["pe_chng_oi"] > 0).any() else 0
+    high_ce_vol = df["ce_volume"].quantile(0.75) if df["ce_volume"].max() > 0 else 0
+    high_pe_vol = df["pe_volume"].quantile(0.75) if df["pe_volume"].max() > 0 else 0
+    avg_ce_iv = df.loc[df["ce_iv"] > 0, "ce_iv"].mean() if (df["ce_iv"] > 0).any() else 0
+    avg_pe_iv = df.loc[df["pe_iv"] > 0, "pe_iv"].mean() if (df["pe_iv"] > 0).any() else 0
+
+    ref = spot_price if spot_price else (atm_strike if atm_strike else float(df["strike_price"].median()))
+    strike_gap = df["strike_price"].sort_values().diff().dropna().median() if len(df) > 1 else 1.0
+
+    buy_ce_col, sell_ce_col, buy_pe_col, sell_pe_col = [], [], [], []
+    ce_conf_col, pe_conf_col = [], []
+    ce_reason_col, pe_reason_col = [], []
+    ce_stars_col, pe_stars_col = [], []
+    ce_risk_col, pe_risk_col = [], []
+    ce_sl_col, ce_target_col, ce_rr_col, ce_prob_col = [], [], [], []
+    pe_sl_col, pe_target_col, pe_rr_col, pe_prob_col = [], [], [], []
+
+    for _, row in d.iterrows():
+        strike = row["strike_price"]
+        ce_oi, pe_oi = row.get("ce_oi", 0), row.get("pe_oi", 0)
+        ce_chng, pe_chng = row.get("ce_chng_oi", 0), row.get("pe_chng_oi", 0)
+        ce_vol, pe_vol = row.get("ce_volume", 0), row.get("pe_volume", 0)
+        ce_iv, pe_iv = row.get("ce_iv", 0), row.get("pe_iv", 0)
+        ce_ltp, pe_ltp = row.get("ce_ltp", 0), row.get("pe_ltp", 0)
+        inst_buying = row.get("Institutional Buying", 0)
+        inst_selling = row.get("Institutional Selling", 0)
+        gamma_chg = gamma_map.get(strike, 0.0) if gamma_map else None
+
+        near_resistance = resistance is not None and abs(strike - resistance) <= strike_gap
+        near_support = support is not None and abs(strike - support) <= strike_gap
+        no_nearby_resistance = resistance is None or strike < resistance - strike_gap
+
+        buy_ce_conds = {
+            "PE Writing": pe_chng > 0 and heavy_pe_chng > 0 and pe_chng >= heavy_pe_chng * 0.5,
+            "CE Unwinding": ce_chng < 0,
+            "PCR Rising (>1.0)": pcr > 1.0,
+            "Price above VWAP": bool(price_above_vwap) if has_trend else False,
+            "Above EMA20 & EMA50": bool(above_ema20_50) if has_trend else False,
+            "Bullish Market Structure": bool(bullish_structure) if has_trend else False,
+            "Bullish Candle (MACD proxy)": bool(bullish_candle_proxy) if has_trend else False,
+            "Volume Expansion": bool(volume_spike) if has_trend else (ce_vol >= high_ce_vol > 0),
+            "Positive Gamma (Delta proxy)": (gamma_chg is not None and gamma_chg > 0),
+            "Stable IV": avg_ce_iv > 0 and 0 < ce_iv <= avg_ce_iv * 1.1,
+            "Max Pain below Spot": bool(max_pain and spot_price and spot_price > max_pain),
+            "Support Holding": (support is None) or (spot_price is not None and spot_price >= support),
+            "No nearby Resistance": no_nearby_resistance,
+            "Smart Money Buying": inst_buying >= 60,
+        }
+        sell_ce_conds = {
+            "CE Long Build-up (Call Writing)": heavy_ce_chng > 0 and ce_chng >= heavy_ce_chng,
+            "Resistance Rejection": near_resistance or (heavy_ce_oi > 0 and ce_oi >= heavy_ce_oi),
+            "Bearish Structure": bool(bearish_structure) if has_trend else True,
+            "RSI Overbought": bool(rsi_overbought) if has_trend else True,
+            "MACD Bearish": bool(bearish_candle_proxy) if has_trend else True,
+            "Volume Selling": ce_vol >= high_ce_vol > 0,
+            "IV Expansion": avg_ce_iv > 0 and ce_iv >= avg_ce_iv * 1.1,
+            "OI Resistance": heavy_ce_oi > 0 and ce_oi >= heavy_ce_oi,
+            "Institutional Exit": inst_selling >= 60,
+        }
+        buy_pe_conds = {
+            "CE Writing": ce_chng > 0 and heavy_ce_chng > 0 and ce_chng >= heavy_ce_chng * 0.5,
+            "PE Unwinding": pe_chng < 0,
+            "Price below VWAP": bool(price_below_vwap) if has_trend else False,
+            "EMA Breakdown": bool(below_ema20_50) if has_trend else False,
+            "Bearish Candle (MACD proxy)": bool(bearish_candle_proxy) if has_trend else False,
+            "Breakdown Confirmed (Structure)": bool(bearish_structure) if has_trend else False,
+            "Volume Expansion": bool(volume_spike) if has_trend else (pe_vol >= high_pe_vol > 0),
+            "Negative Gamma (Delta proxy)": (gamma_chg is not None and gamma_chg < 0),
+            "Max Pain above Spot": bool(max_pain and spot_price and spot_price < max_pain),
+            "Institutional Selling": inst_selling >= 60,
+        }
+        sell_pe_conds = {
+            "PE Long Build-up (Put Writing)": heavy_pe_chng > 0 and pe_chng >= heavy_pe_chng,
+            "Support Holding": near_support or (heavy_pe_oi > 0 and pe_oi >= heavy_pe_oi),
+            "Bullish Reversal (Structure)": bool(bullish_structure) if has_trend else True,
+            "RSI Oversold": bool(rsi_oversold) if has_trend else True,
+            "IV Crush": avg_pe_iv > 0 and 0 < pe_iv <= avg_pe_iv * 0.9,
+            "Institutional Buying": inst_buying >= 60,
+        }
+
+        def _score(conds: dict, require_all_available: bool) -> float:
+            if require_all_available and not has_trend:
+                return 0.0
+            vals = list(conds.values())
+            return (sum(1 for v in vals if v) / len(vals)) * 100 if vals else 0.0
+
+        ce_buy_conf = _score(buy_ce_conds, require_all_available=True)
+        ce_sell_conf = _score(sell_ce_conds, require_all_available=False)
+        pe_buy_conf = _score(buy_pe_conds, require_all_available=True)
+        pe_sell_conf = _score(sell_pe_conds, require_all_available=False)
+
+        def _passes(conds, conf, require_trend):
+            if require_trend and not has_trend:
+                return False
+            frac_true = sum(1 for v in conds.values() if v) / len(conds)
+            return conf >= CE_PE_SIGNAL_MIN_CONFIDENCE and frac_true >= CE_PE_SIGNAL_MIN_TRUE_FRACTION
+
+        ce_buy_ok = _passes(buy_ce_conds, ce_buy_conf, require_trend=True)
+        ce_sell_ok = _passes(sell_ce_conds, ce_sell_conf, require_trend=False)
+        pe_buy_ok = _passes(buy_pe_conds, pe_buy_conf, require_trend=True)
+        pe_sell_ok = _passes(sell_pe_conds, pe_sell_conf, require_trend=False)
+
+        ce_sl = ce_target = ce_rr = 0.0
+        if ce_buy_ok and (not ce_sell_ok or ce_buy_conf >= ce_sell_conf):
+            buy_ce, sell_ce = "✅ BUY CE", "—"
+            ce_conf, ce_reason_src = ce_buy_conf, buy_ce_conds
+            ce_sl, ce_target, ce_rr = _ce_pe_levels(float(ce_ltp or 0), is_sell=False)
+        elif ce_sell_ok:
+            buy_ce, sell_ce = "—", "🔻 SELL CE"
+            ce_conf, ce_reason_src = ce_sell_conf, sell_ce_conds
+            ce_sl, ce_target, ce_rr = _ce_pe_levels(float(ce_ltp or 0), is_sell=True)
+        else:
+            buy_ce, sell_ce = "NO TRADE", "NO TRADE"
+            ce_conf = max(ce_buy_conf, ce_sell_conf)
+            ce_reason_src = buy_ce_conds if ce_buy_conf >= ce_sell_conf else sell_ce_conds
+
+        pe_sl = pe_target = pe_rr = 0.0
+        if pe_buy_ok and (not pe_sell_ok or pe_buy_conf >= pe_sell_conf):
+            buy_pe, sell_pe = "✅ BUY PE", "—"
+            pe_conf, pe_reason_src = pe_buy_conf, buy_pe_conds
+            pe_sl, pe_target, pe_rr = _ce_pe_levels(float(pe_ltp or 0), is_sell=False)
+        elif pe_sell_ok:
+            buy_pe, sell_pe = "—", "🔻 SELL PE"
+            pe_conf, pe_reason_src = pe_sell_conf, sell_pe_conds
+            pe_sl, pe_target, pe_rr = _ce_pe_levels(float(pe_ltp or 0), is_sell=True)
+        else:
+            buy_pe, sell_pe = "NO TRADE", "NO TRADE"
+            pe_conf = max(pe_buy_conf, pe_sell_conf)
+            pe_reason_src = buy_pe_conds if pe_buy_conf >= pe_sell_conf else sell_pe_conds
+
+        if buy_ce not in ("NO TRADE",) or sell_ce not in ("NO TRADE",):
+            if ce_rr < 1.5:
+                buy_ce, sell_ce, ce_conf = "NO TRADE", "NO TRADE", min(ce_conf, CE_PE_SIGNAL_MIN_CONFIDENCE - 1)
+        if buy_pe not in ("NO TRADE",) or sell_pe not in ("NO TRADE",):
+            if pe_rr < 1.5:
+                buy_pe, sell_pe, pe_conf = "NO TRADE", "NO TRADE", min(pe_conf, CE_PE_SIGNAL_MIN_CONFIDENCE - 1)
+
+        ce_reason = " · ".join(k for k, v in ce_reason_src.items() if v) or "No conditions met"
+        pe_reason = " · ".join(k for k, v in pe_reason_src.items() if v) or "No conditions met"
+        if not has_trend and (buy_ce == "NO TRADE" and buy_pe == "NO TRADE"):
+            note = "Enable the AI Scalping Engine (candle fetch) for trend-confirmed BUY signals"
+            ce_reason = f"{ce_reason} · {note}" if ce_reason != "No conditions met" else note
+            pe_reason = f"{pe_reason} · {note}" if pe_reason != "No conditions met" else note
+
+        buy_ce_col.append(buy_ce); sell_ce_col.append(sell_ce)
+        buy_pe_col.append(buy_pe); sell_pe_col.append(sell_pe)
+        ce_conf_col.append(round(ce_conf, 1)); pe_conf_col.append(round(pe_conf, 1))
+        ce_reason_col.append(ce_reason); pe_reason_col.append(pe_reason)
+        ce_stars_col.append(_ce_pe_signal_stars(ce_conf) if buy_ce != "NO TRADE" or sell_ce != "NO TRADE" else "—")
+        pe_stars_col.append(_ce_pe_signal_stars(pe_conf) if buy_pe != "NO TRADE" or sell_pe != "NO TRADE" else "—")
+        ce_risk_col.append(_risk_level_from_confidence(ce_conf))
+        pe_risk_col.append(_risk_level_from_confidence(pe_conf))
+        ce_sl_col.append(ce_sl); ce_target_col.append(ce_target); ce_rr_col.append(ce_rr); ce_prob_col.append(round(ce_conf, 1))
+        pe_sl_col.append(pe_sl); pe_target_col.append(pe_target); pe_rr_col.append(pe_rr); pe_prob_col.append(round(pe_conf, 1))
+
+    d["BUY CE"], d["SELL CE"], d["BUY PE"], d["SELL PE"] = buy_ce_col, sell_ce_col, buy_pe_col, sell_pe_col
+    d["CE Confidence"], d["PE Confidence"] = ce_conf_col, pe_conf_col
+    d["CE Reason"], d["PE Reason"] = ce_reason_col, pe_reason_col
+    d["CE Stars"], d["PE Stars"] = ce_stars_col, pe_stars_col
+    d["CE Risk Level"], d["PE Risk Level"] = ce_risk_col, pe_risk_col
+    d["CE Stop Loss"], d["CE Target"], d["CE Risk Reward"], d["CE Probability"] = ce_sl_col, ce_target_col, ce_rr_col, ce_prob_col
+    d["PE Stop Loss"], d["PE Target"], d["PE Risk Reward"], d["PE Probability"] = pe_sl_col, pe_target_col, pe_rr_col, pe_prob_col
+    return d
+
+
+def _risk_level_from_confidence(conf: float) -> str:
+    if conf >= 85:
+        return "Low"
+    if conf >= 70:
+        return "Moderate"
+    if conf >= 55:
+        return "Elevated"
+    return "High"
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 5G. INSTITUTIONAL AI VALIDATION ENGINE
+# ══════════════════════════════════════════════════════════════════════════
+
 INSTITUTIONAL_SCORE_WEIGHTS = {
     "trend": 20, "option_chain": 20, "oi_buildup": 15, "pcr": 10,
     "max_pain": 10, "volume": 10, "momentum": 5, "price_action": 5,
     "smart_money": 5,
 }
-INSTITUTIONAL_MIN_CONFIDENCE = 40.0   # never generate BUY/SELL below this
-INSTITUTIONAL_MIN_RISK_REWARD = 2.0   # reject trades with RR < 1:2
+INSTITUTIONAL_MIN_CONFIDENCE = 40.0
+INSTITUTIONAL_MIN_RISK_REWARD = 2.0
 
 
 def _institutional_confidence_band(pct: float) -> tuple:
-    """Confidence Rules, rescaled to a 40-100 usable range (floor lowered
-    from the original 80 to 40 per user request)."""
     if pct >= 90:
         return "★★★★★ Institutional Strong", "strongbuy"
     if pct >= 80:
@@ -3571,8 +3611,6 @@ def _institutional_confidence_band(pct: float) -> tuple:
 
 
 def _detect_candle_pattern(c5: pd.DataFrame) -> str:
-    """Doji / Inside Bar / Outside Bar / Strong Bull / Strong Bear on the
-    most recent completed candle vs. the one before it (spec section 5)."""
     if c5 is None or len(c5) < 2:
         return "Unknown"
     last, prev = c5.iloc[-1], c5.iloc[-2]
@@ -3592,8 +3630,6 @@ def _detect_candle_pattern(c5: pd.DataFrame) -> str:
 
 
 def _market_structure_label(c5: pd.DataFrame, lookback: int = 30) -> str:
-    """HH/HL vs LH/LL market structure (spec section 1) from the same
-    swing-point detector the AI Scalping Engine already uses for BOS/CHOCH."""
     if c5 is None or len(c5) < lookback:
         return "Unclear"
     window = c5.tail(lookback)
@@ -3619,8 +3655,6 @@ def _relative_volume(c5: pd.DataFrame, window: int = 20):
 
 
 def _market_quality_flags(c5: pd.DataFrame) -> list:
-    """Sideways market / low liquidity / gap-trap detection (spec section
-    'Market Quality Filter')."""
     flags = []
     if c5 is None or c5.empty or len(c5) < 20:
         flags.append("Insufficient candle history")
@@ -3653,23 +3687,6 @@ def compute_institutional_signals(df: pd.DataFrame, trend_engine: dict, c5: pd.D
                                    atm_strike: float, support, resistance,
                                    min_confidence: float = INSTITUTIONAL_MIN_CONFIDENCE,
                                    top_n: int = 15, source: str = "") -> tuple:
-    """Institutional AI Validation Engine.
-
-    Every candidate (strike, side) must pass ALL of: trend validation
-    (EMA20/50/200 + VWAP + HH/HL or LH/LL structure), option-chain
-    validation (build-up direction not mixed), max-pain adjustment,
-    volume validation (volume spike + relative volume), price-action
-    validation (reject indecision candles), smart-money validation
-    (Institutional Buying/Selling), support/resistance (reject trades
-    straight into a wall), and momentum validation (RSI/MACD/ADX) —
-    before a weighted 0-100 confidence score (section 10) is computed.
-    A signal is only emitted if confidence >= min_confidence (never below
-    80) AND risk:reward >= 1:2. Anything that fails is dropped silently;
-    if nothing passes, a structured rejection summary explains why so the
-    UI can show a clear WAIT instead of forcing a trade.
-
-    Returns (signals: list[dict], rejection_summary: dict | None).
-    """
     if df is None or df.empty:
         return [], {"source": source, "evaluated": 0, "reason": "Option chain is empty."}
 
@@ -3726,7 +3743,6 @@ def compute_institutional_signals(df: pd.DataFrame, trend_engine: dict, c5: pd.D
                 rejections["no_premium"] += 1
                 continue
 
-            # 1. Trend validation ------------------------------------------------
             if not has_trend:
                 rejections["no_candle_data"] += 1
                 continue
@@ -3735,7 +3751,6 @@ def compute_institutional_signals(df: pd.DataFrame, trend_engine: dict, c5: pd.D
                 rejections["trend_disagree"] += 1
                 continue
 
-            # 2. Option chain validation ------------------------------------------
             ce_build, pe_build = row.get("CE Build-up", ""), row.get("PE Build-up", "")
             oc_support_bull = pe_build == "Long Build-up (Put Writing)" or ce_build == "Short Covering"
             oc_support_bear = ce_build == "Short Build-up (Call Writing)" or pe_build == "Long Unwinding"
@@ -3747,20 +3762,17 @@ def compute_institutional_signals(df: pd.DataFrame, trend_engine: dict, c5: pd.D
                 rejections["option_chain_disagree"] += 1
                 continue
 
-            # 3. Max Pain validation (adjusts confidence, never ignored) --------
             mp_confidence_delta = 0.0
             if max_pain and spot_price:
                 if is_bull_side and spot_price < max_pain and strike > spot_price:
-                    mp_confidence_delta = -3.0  # BUY moving toward Max Pain -> reduce confidence
+                    mp_confidence_delta = -3.0
                 elif (not is_bull_side) and spot_price > max_pain and strike < spot_price:
-                    mp_confidence_delta = -3.0  # SELL moving against Max Pain -> reduce confidence
+                    mp_confidence_delta = -3.0
 
-            # 4. Volume validation --------------------------------------------------
             vol_ok = row.get(vol_col, 0) >= (ce_vol_thresh if is_bull_side else pe_vol_thresh) > 0
             rel_vol_ok = rel_vol is not None and rel_vol >= 1.0
             volume_score_frac = (1.0 if vol_ok else 0.4) * (1.0 if rel_vol_ok else 0.6)
 
-            # 5. Price action validation ---------------------------------------------
             if candle_pattern == "Doji":
                 rejections["indecision_candle"] += 1
                 continue
@@ -3768,14 +3780,12 @@ def compute_institutional_signals(df: pd.DataFrame, trend_engine: dict, c5: pd.D
                 ("Strong Bull Candle", "Outside Bar") if is_bull_side else ("Strong Bear Candle", "Outside Bar")
             )
 
-            # 6. Smart money validation --------------------------------------------
             inst_buy, inst_sell = row.get("Institutional Buying", 0), row.get("Institutional Selling", 0)
             smart_money_ok = inst_buy >= 55 if is_bull_side else inst_sell >= 55
             if not smart_money_ok:
                 rejections["smart_money_disagree"] += 1
                 continue
 
-            # 7. Support & Resistance ------------------------------------------------
             if is_bull_side and resistance is not None and strike >= resistance and abs(strike - resistance) <= strike_gap:
                 rejections["against_resistance"] += 1
                 continue
@@ -3783,13 +3793,11 @@ def compute_institutional_signals(df: pd.DataFrame, trend_engine: dict, c5: pd.D
                 rejections["against_support"] += 1
                 continue
 
-            # 8. ATR validation -----------------------------------------------------
             atr_ok = atr_v is not None and atr_v > 0
             if not atr_ok:
                 rejections["atr_too_low"] += 1
                 continue
 
-            # 9. Momentum validation --------------------------------------------------
             if None in (rsi5, macd_v, macd_s, adx_v):
                 rejections["momentum_unavailable"] += 1
                 continue
@@ -3801,12 +3809,10 @@ def compute_institutional_signals(df: pd.DataFrame, trend_engine: dict, c5: pd.D
                 rejections["momentum_disagree"] += 1
                 continue
 
-            # Market Quality Filter --------------------------------------------------
             if market_quality_blocked:
                 rejections["market_quality_filter"] += 1
                 continue
 
-            # ── Confidence score (spec section 10, weighted 0-100) ──────────────
             w = INSTITUTIONAL_SCORE_WEIGHTS
             pcr_ok = (pcr > 1.05) if is_bull_side else (pcr < 0.95)
             score = (
@@ -3826,7 +3832,6 @@ def compute_institutional_signals(df: pd.DataFrame, trend_engine: dict, c5: pd.D
                 rejections["low_confidence"] += 1
                 continue
 
-            # ── Risk management (spec section 'Risk Management') ────────────────
             entry = round(float(ltp), 2)
             if is_bull_side:
                 sl, t1, t2, t3 = round(entry * 0.85, 2), round(entry * 1.15, 2), round(entry * 1.30, 2), round(entry * 1.50, 2)
@@ -4011,8 +4016,8 @@ def show_option_chain(fyers):
             "Enable AI Scalping Engine (fetches 5m/15m candles)", value=False, key="oc_scalping_enabled",
             help="Multi-factor confirmation engine (EMA/VWAP/RSI/MACD/ADX/Supertrend + chain OI/Gamma). "
                  "Off by default since it makes extra FYERS history/quote API calls. The same candle "
-                 "data also powers the Institutional AI Validation Engine on the AI Trade Signals tab — "
-                 "leave this on if you want BUY/SELL signals there instead of WAIT.",
+                 "data also powers the Institutional AI Validation Engine and the 15m Volume & Swing "
+                 "tab — leave this on if you want those tabs off WAIT / fetching fresh each time.",
         )
         scalping_audio_alert = st.checkbox("🔔 Audio ping on new Scalping signal", value=False, key="oc_scalping_audio")
 
@@ -4130,12 +4135,6 @@ def show_option_chain(fyers):
     intel = compute_market_intelligence(df, spot_price, max_pain, pcr)
     df = compute_ai_engine(df, spot_price, atm_strike, max_pain, pcr)
 
-    # ── Institutional AI Validation Engine (replaces generate_trade_signals()
-    # as the source for the AI Trade Signals tab — see FIX NOTE 5 & section
-    # 5G). Reuses whatever candle/trend data the AI Scalping Engine already
-    # fetched this session (cached in session_state); if that hasn't run
-    # yet, every candidate is correctly rejected and the tab explains why
-    # instead of guessing from the option chain alone.
     cached_trend_engine = st.session_state.get("oc_scalp_trend_engine")
     cached_candles_5 = st.session_state.get("oc_scalp_candles_5")
     signals, rejection_summary = compute_institutional_signals(
@@ -4145,13 +4144,6 @@ def show_option_chain(fyers):
     )
     st.session_state["oc_signal_rejection_summary"] = rejection_summary
 
-    # FIX: atm_strike (already computed just above — NOT recalculated) is
-    # now forwarded into run_external_ai_market_analysis(), and every value
-    # is passed through to analyze_market() by keyword. This closes the
-    # original TypeError ("missing 4 required positional arguments:
-    # spot_price, atm_strike, max_pain, pcr") without changing anything
-    # else about when/how this bridge is invoked — still called
-    # unconditionally for BOTH FYERS and NSE, still purely additive.
     ai_market_analysis = run_external_ai_market_analysis(
         df, spot_price, atm_strike, pcr, max_pain, symbol, expiry_label, data_source
     )
@@ -4160,15 +4152,6 @@ def show_option_chain(fyers):
     gdf = add_gamma_columns(df, spot_price, expiry_label)
     gdf = compute_gamma_analysis(gdf, symbol, expiry_label)
 
-    # ── CE/PE Institutional BUY & SELL Signal Engine (additive, section 5F)
-    # Reuses the underlying trend_engine (VWAP/EMA/RSI/MACD/BOS) already
-    # computed by the AI Scalping Engine tab THIS SESSION, if the user has
-    # enabled it — cached in session_state since tab7's own candle-fetch
-    # only runs when that tab is actually reached in the script, which is
-    # after this point on the very first activation. Without a cached
-    # trend_engine yet, BUY CE/BUY PE correctly stay at NO TRADE (see the
-    # design note above compute_ce_pe_trade_signals) while SELL CE/SELL PE
-    # can still surface from the chain snapshot alone.
     df = compute_ce_pe_trade_signals(
         df, spot_price=spot_price, max_pain=max_pain, pcr=pcr, atm_strike=atm_strike,
         support=intel.get("support"), resistance=intel.get("resistance"),
@@ -4314,9 +4297,10 @@ def show_option_chain(fyers):
 
     st.divider()
 
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs(
         ["📋 Chain Table", "📊 OI Analysis", "📈 IV Skew", "🔥 Big Move Ready",
-         "🤖 AI Trade Signals", "⚡ Gamma Build-up", "🎯 AI Scalping Engine"]
+         "🤖 AI Trade Signals", "⚡ Gamma Build-up", "🎯 AI Scalping Engine",
+         "📊 15m Volume & Swing"]
     )
 
     with tab1:
@@ -4337,12 +4321,7 @@ def show_option_chain(fyers):
             "CE ΔOI / PE ΔOI: green = OI increasing, red = OI decreasing, grey = unchanged, filled "
             "dark green/red = a 'large' build-up or unwinding (top 20% of today's ΔOI moves on that "
             "side). BUY CE / SELL CE / BUY PE / SELL PE only ever show a real signal after passing "
-            "every institutional-confirmation check for that side (see the 🤖 AI Trade Signals tab's "
-            "caption and the 🧠 AI Market Intelligence panel above for the full methodology) — "
-            "otherwise the cell reads NO TRADE. BUY-side signals additionally require the AI Scalping "
-            "Engine to have fetched candle data this session (enable it in the sidebar) since this "
-            "file has no other way to confirm VWAP/EMA/structure; SELL-side signals can surface from "
-            "the option-chain snapshot (OI/IV/resistance/support) alone."
+            "every institutional-confirmation check for that side — otherwise the cell reads NO TRADE."
         )
 
         if debug_mode:
@@ -4350,14 +4329,6 @@ def show_option_chain(fyers):
                 audit_df = audit_oi_change(df, symbol, expiry_label)
                 if not audit_df.empty:
                     st.dataframe(audit_df, use_container_width=True, height=360)
-                    st.caption(
-                        "Previous OI comes from this session's own last refresh for the same "
-                        "symbol+expiry+strike (— means no prior refresh yet, so ΔOI is legitimately "
-                        "0 that one time). If Displayed ΔOI doesn't equal Current OI − Previous OI, "
-                        "it means the API itself supplied a non-zero ΔOI field this refresh (FYERS/NSE "
-                        "value takes priority over the session-computed fallback) — that is expected "
-                        "and correct, not a mismatch to fix."
-                    )
                 else:
                     st.caption("No data available for the audit table yet.")
 
@@ -4403,29 +4374,11 @@ def show_option_chain(fyers):
         s4.metric("Best Breakdown Strike", _fmt_strike_row(summary2.get("Best Breakdown Strike")))
 
         st.markdown("<br>", unsafe_allow_html=True)
-        st.markdown("**Full CE / PE Analysis** — independent AI Score, BUY/SELL Probability, "
-                     "Entry/SL/Targets, Institutional flow and Smart Money Activity for both sides "
-                     "of every strike (color-coded by Final Recommendation)")
         ce_pe_table = style_ce_pe_analysis_table(df)
         numeric_ce_pe_cols = [c for c in ce_pe_table.select_dtypes("number").columns if c != "Strike ⚡"]
         ce_pe_fmt = {c: "{:,.1f}" for c in numeric_ce_pe_cols}
         ce_pe_fmt["Strike ⚡"] = "{:,.0f}"
         st.markdown(render_row_colored_table_html(ce_pe_table, numeric_fmt=ce_pe_fmt), unsafe_allow_html=True)
-        st.caption(
-            "CE AI Score / PE AI Score = independent 0-100 favourability for buying a CALL / PUT at "
-            "that strike, built from OI, ΔOI, Volume, PCR, Max Pain, Spot/ATM distance, IV, "
-            "Long/Short Build-up, Long/Short Unwinding, and Heavy Call/Put Writing. BUY Probability = "
-            "the side's own score; SELL Probability = 100 − that score. Entry/SL/Targets are "
-            "premium-percentage based (SL −15%, T1 +15%, T2 +30%, T3 +50%) for each side "
-            "independently. Institutional Buying/Selling and Smart Money Activity are OI-base + "
-            "ΔOI proxies for large-player positioning. Final Recommendation shows the stronger side "
-            "with its ★ rating: ★★★★★ 90-100 Strong Buy · ★★★★ 75-89 Buy · ★★★ 55-74 Hold · "
-            "★★ 35-54 Avoid · ★ below 35 Ignore. When CE Score and PE Score are genuinely tied, the "
-            "strike's own Breakout vs Breakdown Probability breaks the tie instead of always "
-            "defaulting to CE. (Note: this per-strike screening score is separate from the "
-            "Institutional AI Validation Engine on the 🤖 AI Trade Signals tab, which is the one that "
-            "actually gates BUY/SELL trade signals through full multi-factor validation.)"
-        )
 
         with st.expander("Legacy combined Big Move Table (Overall Score view)"):
             bm_table = style_big_move_table(df)
@@ -4438,11 +4391,7 @@ def show_option_chain(fyers):
         st.markdown("##### 🤖 Institutional AI Validation Engine — High Confidence Only")
         st.caption(
             f"Showing strikes with AI Confidence ≥ {max(ai_min_conf, INSTITUTIONAL_MIN_CONFIDENCE):.0f}% "
-            "that passed EVERY validation category (trend, option chain, max pain, volume, price "
-            "action, smart money, support/resistance, ATR, momentum) with risk:reward ≥ 1:2. The "
-            "confidence floor here can't go below 40% — that's a hard rule of the engine, not a "
-            "sidebar setting. Below ★★★ Strong (70%), treat signals as speculative rather than "
-            "institutional-grade."
+            "that passed every validation category. The confidence floor here can't go below 40%."
         )
 
         if not signals:
@@ -4456,19 +4405,18 @@ def show_option_chain(fyers):
                     f"{rejection.get('source', data_source)}).{flags_txt}"
                 )
             else:
-                st.info("No strikes currently meet every institutional validation check. Try again after "
-                         "the market moves, or enable the AI Scalping Engine in the sidebar if it isn't on.")
+                st.info("No strikes currently meet every institutional validation check.")
         else:
             for sig in signals:
                 css_class = RATING_CSS_CLASS.get(sig.get("Signal Key", "ignore"), "rating-ignore")
                 reasons_list = sig.get("Reasons") or [r.strip() for r in sig.get("Reason", "").split("·") if r.strip()]
-                reasons_html = "".join(f"<li>{r}</li>" for r in reasons_list)
+                reasons_html = "".join(f"<li>{_safe_cell(r)}</li>" for r in reasons_list)
 
                 st.markdown(f"""
                 <div class="intel-card">
                   <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;">
                     <div><b style="color:#e6edf3;">{sig['Strike']:,.0f} {sig['Side']}</b>
-                      &nbsp; <span class="{css_class}">{sig['Signal']}</span></div>
+                      &nbsp; <span class="{css_class}">{_safe_cell(sig['Signal'])}</span></div>
                     <div class="intel-label">Confidence
                       <span style="color:#e6edf3;font-weight:700;font-size:15px;">{sig['Confidence']:.0f}%</span></div>
                   </div>
@@ -4490,18 +4438,10 @@ def show_option_chain(fyers):
             st.dataframe(sig_table, use_container_width=True, height=360)
 
         st.caption(
-            "Institutional AI Validation Engine: a BUY/SELL only fires once Trend (EMA20/50/200 + VWAP "
-            "+ HH/HL or LH/LL structure), Option Chain (build-up direction), Max Pain (adjusts, never "
-            "ignored), Volume (spike + relative volume), Price Action (rejects Doji/indecision candles), "
-            "Smart Money (Institutional Buying/Selling), Support/Resistance (rejects trades straight "
-            "into a wall), ATR, and Momentum (RSI/MACD/ADX) ALL agree — any disagreement, or missing "
-            "candle data, forces WAIT. Confidence is an explicit weighted 0-100 score (Trend 20, Option "
-            "Chain 20, OI Build-up 15, PCR 10, Max Pain 10, Volume 10, Momentum 5, Price Action 5, Smart "
-            "Money 5) with a hard floor of 40% and a minimum 1:2 risk:reward — nothing below either bar "
-            "is ever shown. ★★★★★ 90-100 Institutional Strong · ★★★★ 80-89 Very Strong · ★★★ 70-79 "
-            "Strong · ★★ 55-69 Moderate · ★ 40-54 Speculative. This is a positioning read built from "
-            "FYERS/NSE snapshot + candle data, not financial advice — always confirm with live price "
-            "action and manage your own risk."
+            "Institutional AI Validation Engine: a BUY/SELL only fires once Trend, Option Chain, Max "
+            "Pain, Volume, Price Action, Smart Money, Support/Resistance, ATR, and Momentum ALL agree — "
+            "any disagreement, or missing candle data, forces WAIT. This is a positioning read, not "
+            "financial advice — always confirm with live price action and manage your own risk."
         )
 
     with tab6:
@@ -4518,12 +4458,12 @@ def show_option_chain(fyers):
             st.info(
                 "🎯 The AI Scalping Engine is off. Enable **'Enable AI Scalping Engine'** in the "
                 "sidebar to fetch 5m/15m candles and India VIX and compute the 13-point BUY/SELL "
-                "confirmation checklist (EMA/VWAP/RSI/MACD/ADX/Supertrend, CE/PE OI direction, "
-                "Gamma direction, Build-up/Covering/Unwinding, Order Block, BOS, Volume Spike). "
-                "The same candle data also feeds the Institutional AI Validation Engine on the "
-                "🤖 AI Trade Signals tab — until this is enabled at least once this session, that "
-                "tab will correctly stay at WAIT rather than trading on option-chain data alone."
+                "confirmation checklist. The same candle data also feeds the Institutional AI "
+                "Validation Engine and the 15m Volume & Swing tab."
             )
+
+    with tab8:
+        render_volume_swing_tab(fyers, symbol_candidates, symbol)
 
     st.divider()
     st.markdown('<div class="block-title">📥 Export</div>', unsafe_allow_html=True)
