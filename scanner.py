@@ -2633,7 +2633,15 @@ def _format_worksheet(ws, df) -> None:
             col_name = columns[c - 1] if c - 1 < len(columns) else ""
             fill, font = _get_conditional_fill_font(col_name, cell.value)
             if fill is not None:
-                cell.fill = fill; cell.font = font if font else cell.font
+                cell.fill = fill
+                # BUGFIX: never do `cell.font = cell.font` — openpyxl returns a
+                # StyleProxy (not a real Font) from a `cell.font` read, and
+                # writing that proxy straight back crashes with
+                # "TypeError: unhashable type: 'StyleProxy'" the moment
+                # openpyxl tries to intern it into the shared style table.
+                # Only assign a real Font object, and only when one exists.
+                if font is not None:
+                    cell.font = font
             elif row_is_band:
                 cell.fill = band_fill
     for col_cells in ws.columns:
