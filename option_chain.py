@@ -2020,7 +2020,19 @@ def fetch_underlying_candles(fyers, symbol_candidates: list, resolution: str = "
             continue
         try:
             cdf = pd.DataFrame(candles, columns=["time", "open", "high", "low", "close", "volume"])
-            cdf["time"] = pd.to_datetime(cdf["time"], unit="s")
+            # FIX (TIMEWRONG bug reported by user): FYERS candle timestamps are
+            # UNIX epoch seconds in UTC. pd.to_datetime(..., unit="s") alone
+            # returns naive UTC wall-clock time, which sits 5h30m BEHIND real
+            # IST market time — a genuine 09:15 AM IST candle (market open)
+            # was rendering as 03:45. Localize to UTC first, then convert to
+            # Asia/Kolkata, then drop the tz so every downstream comparison
+            # (BOS/CHOCH, prev-day high/low, gap detection, this candle
+            # frame's own "time" column) works against correct IST times.
+            cdf["time"] = (
+                pd.to_datetime(cdf["time"], unit="s", utc=True)
+                .dt.tz_convert("Asia/Kolkata")
+                .dt.tz_localize(None)
+            )
             cdf.sort_values("time", inplace=True)
             cdf.reset_index(drop=True, inplace=True)
             return cdf
