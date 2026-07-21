@@ -4147,11 +4147,16 @@ def show_scanner(fyers) -> None:
         st.caption(f"~{((limit or len(symbols)) / MAX_WORKERS) * 0.3 / 60:.1f}–{((limit or len(symbols)) / MAX_WORKERS) * 1.0 / 60:.1f} min estimated.")
     scan_universe = symbols if limit == 0 else symbols[:limit]
 
-    if st.button(f"🚀 Run Scan ({len(scan_universe)} symbols)"):
+    def _run_full_scan_and_store(universe, use_xgb) -> None:
+        """Runs the Full/Intraday/Swing scan pipeline and stores results in
+        session_state. Shared by the manual '🚀 Run Scan' button AND the
+        automatic startup scan below, so both paths stay in lockstep and
+        there is exactly one place that defines what 'running the scan'
+        means (no duplicated/divergent logic between auto-start and manual)."""
         with st.spinner("Fetching NIFTY benchmark…"):
             nifty_close = fetch_nifty_benchmark(fyers)
         with st.spinner("Scanning…"):
-            results, errors, stats = run_scan(fyers, scan_universe, nifty_close, enable_xgboost)
+            results, errors, stats = run_scan(fyers, universe, nifty_close, use_xgb)
             full_df = pd.DataFrame(results)
             if not full_df.empty and "_Is_High_Quality" in full_df.columns:
                 full_df = full_df[full_df["_Is_High_Quality"] == True]
@@ -4163,6 +4168,36 @@ def show_scanner(fyers) -> None:
         st.session_state["swing_df"] = swing_df; st.session_state["scan_errors"] = errors; st.session_state["scan_stats"] = stats
         del full_df
         gc.collect()
+
+    manual_run_clicked = st.button(f"🚀 Run Scan ({len(scan_universe)} symbols)")
+
+    # ── Automatic startup scan ────────────────────────────────────────────
+    # Runs the Full Scanner exactly once per browser session, the first time
+    # this page renders, so a report is already on screen without requiring
+    # a manual button click. Uses a capped, fast default universe (100
+    # symbols) regardless of the "Limit symbols" input, purely to keep the
+    # very first automatic load quick; the person can always click
+    # "🚀 Run Scan" afterwards (or change the limit and re-run) to scan the
+    # full universe they've configured. This never runs a second time in
+    # the same session, and never overrides a scan already in progress or
+    # already completed.
+    AUTO_SCAN_ON_STARTUP = True
+    AUTO_SCAN_DEFAULT_SYMBOL_COUNT = 100
+    auto_scan_pending = (
+        AUTO_SCAN_ON_STARTUP
+        and not manual_run_clicked
+        and not st.session_state.get("_auto_scan_done", False)
+        and "scan_stats" not in st.session_state
+    )
+
+    if manual_run_clicked:
+        _run_full_scan_and_store(scan_universe, enable_xgboost)
+        st.session_state["_auto_scan_done"] = True  # a manual run also satisfies the "don't auto-run" condition
+    elif auto_scan_pending:
+        st.session_state["_auto_scan_done"] = True  # set BEFORE running so a mid-scan rerun can't trigger it twice
+        auto_universe = scan_universe[:AUTO_SCAN_DEFAULT_SYMBOL_COUNT] if scan_universe else scan_universe
+        st.info(f"⚡ Auto-running startup scan on the first {len(auto_universe)} symbols so a report is ready immediately. Click '🚀 Run Scan' anytime to re-scan your full selected universe.")
+        _run_full_scan_and_store(auto_universe, enable_xgboost)
 
     if "scan_stats" in st.session_state:
         _display_scan_summary(st.session_state["scan_stats"])
