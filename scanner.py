@@ -1940,10 +1940,348 @@ def run_scan_enhanced(fyers, symbols, nifty_close, enable_xgboost):
     return results, errors, stats
 
 
+# ════════════════════════════════════════════════════════════════════════
+# INSTITUTIONAL UPGRADE MODULE
+# ────────────────────────────────────────────────────────────────────────
+# Additive institutional-grade logic merged directly into this file:
+#   • OBV / CMF base indicators
+#   • AI Direction Engine (5-state: Strong Bullish → Strong Bearish)
+#   • OI Buildup Classifier (Long/Short Buildup, Long Unwinding, Short
+#     Covering) driven by aggregate option-chain OI deltas as the OI-change
+#     proxy, since this app has no standalone futures-OI history endpoint
+#   • Smart-money (OBV/CMF) confluence scoring for the Volume Top/Bottom
+#     detector
+#   • Weighted institutional AI Score (Price Action 20 / OI 15 / Volume 15 /
+#     Trend 10 / Momentum 10 / VWAP 5 / RSI 5 / MACD 5 / Smart Money 10 /
+#     AI Validation 5 = 100) with A+/A/B/C/D grading
+#   • Centralized structured error logging
+#   • Extra Excel conditional-format rules for the new categories
+#
+# Every function below is additive: it reads the same OHLCV `df` shape
+# already used throughout this file and returns NEW keys that are merged
+# into existing report rows further down. Nothing above this section was
+# changed, and no existing keys are overwritten anywhere.
+# ════════════════════════════════════════════════════════════════════════
+
+DIRECTION_LABELS = ["Strong Bearish", "Bearish", "Neutral", "Bullish", "Strong Bullish"]
+
+
+def log_scan_error(function_name: str, stock: str, reason: str) -> None:
+    """Centralized structured error log (stock / timestamp / reason / function).
+    Never raises — safe to call from any except-block anywhere in this file."""
+    try:
+        logger.warning("SCAN_ERROR | fn=%s | stock=%s | ts=%s | reason=%s",
+                        function_name, stock, _now_ist().isoformat(), reason)
+    except Exception:
+        pass
+
+
+def calculate_obv(df) -> pd.Series:
+    """On-Balance Volume. Cumulative signed volume — rising OBV confirms
+    buying pressure, falling OBV confirms selling pressure, independent of
+    price alone. Used to validate buildup / distribution / accumulation
+    calls elsewhere in this module."""
+    if df is None or len(df) == 0:
+        return pd.Series(dtype=float)
+    close = df["Close"]
+    volume = df["Volume"].fillna(0)
+    direction = np.sign(close.diff().fillna(0))
+    return (direction * volume).fillna(0).cumsum()
+
+
+def calculate_cmf(df, period: int = 20) -> pd.Series:
+    """Chaikin Money Flow. Positive = accumulation (buying pressure inside
+    the bar's range), negative = distribution (selling pressure)."""
+    if df is None or len(df) == 0:
+        return pd.Series(dtype=float)
+    h, l, c, v = df["High"], df["Low"], df["Close"], df["Volume"].fillna(0)
+    rng = (h - l).replace(0, np.nan)
+    mfm = (((c - l) - (h - c)) / rng).fillna(0.0)
+    mfv = mfm * v
+    min_p = max(2, period // 2)
+    vol_sum = v.rolling(period, min_periods=min_p).sum().replace(0, np.nan)
+    return (mfv.rolling(period, min_periods=min_p).sum() / vol_sum).fillna(0.0)
+
+
+def obv_cmf_snapshot(df, obv_lookback: int = 6) -> Dict[str, object]:
+    """Latest OBV trend label + CMF value, safe on short/insufficient data."""
+    try:
+        if df is None or len(df) < max(obv_lookback + 1, 10):
+            return {"obv_trend": "N/A", "obv_rising": None, "cmf": 0.0, "cmf_positive": None}
+        obv = calculate_obv(df)
+        obv_rising = bool(obv.iloc[-1] > obv.iloc[-obv_lookback])
+        cmf_val = round(float(calculate_cmf(df).iloc[-1]), 3)
+        return {"obv_trend": "🟢 Rising" if obv_rising else "🔴 Falling", "obv_rising": obv_rising,
+                "cmf": cmf_val, "cmf_positive": bool(cmf_val > 0)}
+    except Exception as e:
+        log_scan_error("obv_cmf_snapshot", "N/A", f"{type(e).__name__}: {e}")
+        return {"obv_trend": "N/A", "obv_rising": None, "cmf": 0.0, "cmf_positive": None}
+
+
+def calculate_ai_direction(df) -> Dict[str, object]:
+    """
+    Institutional AI Direction Engine (5-state). Combines EMA/VWAP/ADX/RSI/
+    MACD/OBV/CMF/SMC-structure/liquidity/trend/momentum into a single
+    directional call, replacing a binary BUY/SELL framing where callers
+    want a graded read (Strong Bullish → Strong Bearish) instead.
+    Returns: direction, confidence, institutional_grade, bull_votes,
+    bear_votes, support, resistance.
+    """
+    empty = {"direction": "Neutral", "confidence": 0.0, "institutional_grade": "REJECT",
+              "bull_votes": 0, "bear_votes": 0, "support": None, "resistance": None}
+    try:
+        if df is None or len(df) < 30:
+            return empty
+
+        close = df["Close"]
+        last_close = float(close.iloc[-1])
+        ema20 = float(close.ewm(span=20, adjust=False).mean().iloc[-1])
+        ema50 = float(close.ewm(span=50, adjust=False).mean().iloc[-1])
+
+        vwap_val = calculate_vwap_approx(df)
+        adx_val, _plus_di, _minus_di = calculate_adx(df)
+        rsi_val = float(calculate_rsi(close).iloc[-1])
+        macd_line, macd_sig, _ = calculate_macd(close)
+        macd_bullish = bool(macd_line.iloc[-1] > macd_sig.iloc[-1])
+
+        snap = obv_cmf_snapshot(df)
+        obv_rising = snap["obv_rising"] if snap["obv_rising"] is not None else (last_close > ema20)
+        cmf_val = snap["cmf"]
+
+        smc_structure, _cisd_signal, _ts = _calculate_smc_and_cisd(df)
+        _liq_label, liquidity_side = detect_liquidity_sweep(df)
+        sr = _calculate_support_resistance_v2(df)
+        trend = _classify_trend_composite(df)
+        momentum = calculate_momentum(df, rsi_val, macd_bullish, adx_val)
+
+        bull_checks = [
+            last_close > ema20, ema20 > ema50, vwap_val is not None and last_close > vwap_val,
+            rsi_val > 55, macd_bullish, obv_rising, cmf_val > 0.03,
+            ("📈" in smc_structure or "🐂" in smc_structure), ("Buy" in liquidity_side),
+            trend.get("direction") == "Bullish", ("Bullish" in momentum),
+        ]
+        bear_checks = [
+            last_close < ema20, ema20 < ema50, vwap_val is not None and last_close < vwap_val,
+            rsi_val < 45, not macd_bullish, not obv_rising, cmf_val < -0.03,
+            ("📉" in smc_structure or "🐻" in smc_structure), ("Sell" in liquidity_side),
+            trend.get("direction") == "Bearish", ("Bearish" in momentum),
+        ]
+        bull_votes = sum(bull_checks)
+        bear_votes = sum(bear_checks)
+        net = bull_votes - bear_votes
+
+        if net >= 6:
+            direction = "Strong Bullish"
+        elif net >= 2:
+            direction = "Bullish"
+        elif net <= -6:
+            direction = "Strong Bearish"
+        elif net <= -2:
+            direction = "Bearish"
+        else:
+            direction = "Neutral"
+
+        confidence = round(min(97.0, 50 + abs(net) * 6 + min(adx_val, 40) * 0.3), 1)
+
+        if adx_val >= 25 and confidence >= 88 and direction != "Neutral":
+            institutional_grade = "A"
+        elif adx_val >= 20 and confidence >= 75 and direction != "Neutral":
+            institutional_grade = "B"
+        elif direction != "Neutral" and confidence >= 60:
+            institutional_grade = "C"
+        else:
+            institutional_grade = "REJECT"
+
+        return {"direction": direction, "confidence": confidence, "institutional_grade": institutional_grade,
+                "bull_votes": bull_votes, "bear_votes": bear_votes,
+                "support": sr.get("support"), "resistance": sr.get("resistance")}
+    except Exception as e:
+        log_scan_error("calculate_ai_direction", "N/A", f"{type(e).__name__}: {e}")
+        return empty
+
+
+def classify_oi_buildup(df, oi_change_pct: Optional[float]) -> Dict[str, object]:
+    """
+    Long Buildup / Short Buildup / Long Unwinding / Short Covering
+    classifier, validated across the last 15 candles (not one bar).
+
+    NOTE ON DATA AVAILABILITY: genuine Open Interest belongs to futures/
+    options, not the cash-market candles this scanner already fetches. The
+    only live OI source in this app is the option chain used by the F&O OI
+    Analysis tab, which exposes `changeinOpenInterest` per strike for the
+    current session but not a multi-day OI history. `oi_change_pct` is
+    therefore computed by the caller (`_fetch_fo_oi_signal`) as the
+    aggregate near-ATM CE+PE OI-change total as a % of total OI — a proxy
+    for stock-level futures-OI change. If a true futures-OI history feed
+    becomes available later, only the caller needs to change; this
+    classifier's thresholds do not need to change.
+    """
+    empty = {"category": "⚪ Neutral", "is_strong": False, "confidence": 0.0,
+             "institutional_score": 0.0, "reason": "Insufficient data"}
+    if df is None or len(df) < 20 or oi_change_pct is None:
+        return empty
+    try:
+        close = df["Close"]
+        last_close = float(close.iloc[-1])
+        price_up_15 = bool(close.iloc[-1] > close.iloc[-15]) if len(close) >= 15 else bool(close.iloc[-1] > close.iloc[-2])
+
+        ema20 = float(close.ewm(span=20, adjust=False).mean().iloc[-1])
+        ema50 = float(close.ewm(span=50, adjust=False).mean().iloc[-1])
+        ema200 = float(close.ewm(span=200 if len(close) >= 200 else len(close), adjust=False).mean().iloc[-1])
+        vwap_val = calculate_vwap_approx(df)
+        adx_val, _plus_di, _minus_di = calculate_adx(df)
+        rsi_val = float(calculate_rsi(close).iloc[-1])
+        macd_line, macd_sig, _ = calculate_macd(close)
+        macd_bullish = bool(macd_line.iloc[-1] > macd_sig.iloc[-1])
+
+        snap = obv_cmf_snapshot(df)
+        obv_rising = snap["obv_rising"] if snap["obv_rising"] is not None else price_up_15
+        cmf_val = snap["cmf"]
+
+        vol_avg20 = float(df["Volume"].tail(20).mean())
+        volume_ok = bool(vol_avg20 > 0 and float(df["Volume"].iloc[-1]) > vol_avg20)
+
+        oi_rising = oi_change_pct > 5
+        oi_falling = oi_change_pct < -5
+
+        long_checks = [price_up_15, volume_ok, vwap_val is not None and last_close > vwap_val,
+                       ema20 > ema50, ema50 > ema200, adx_val > 25, rsi_val > 55,
+                       macd_bullish, obv_rising, cmf_val > 0]
+        short_checks = [not price_up_15, volume_ok, vwap_val is not None and last_close < vwap_val,
+                        ema20 < ema50, ema50 < ema200, adx_val > 25, rsi_val < 45,
+                        not macd_bullish, not obv_rising, cmf_val < 0]
+        long_score = round(sum(long_checks) / len(long_checks) * 100, 1)
+        short_score = round(sum(short_checks) / len(short_checks) * 100, 1)
+
+        if price_up_15 and oi_rising:
+            category, base_score, strong_threshold = "🟢 Long Buildup", long_score, 85
+        elif (not price_up_15) and oi_rising:
+            category, base_score, strong_threshold = "🔴 Short Buildup", short_score, 85
+        elif (not price_up_15) and oi_falling:
+            category, base_score, strong_threshold = "🟡 Long Unwinding", 45.0 + max(0, short_score - 50) * 0.2, 999
+        elif price_up_15 and oi_falling:
+            category, base_score, strong_threshold = "🟣 Short Covering", 45.0 + max(0, long_score - 50) * 0.2, 999
+        else:
+            category, base_score, strong_threshold = "⚪ Neutral", 35.0, 999
+
+        confidence = round(min(97.0, base_score), 1)
+        is_strong = ("Buildup" in category) and confidence >= strong_threshold
+        display_category = f"STRONG {category}" if is_strong else category
+
+        reason_bits = [
+            f"OI {'▲' if oi_rising else ('▼' if oi_falling else '→')} {oi_change_pct:+.1f}%",
+            "Price ↑15D" if price_up_15 else "Price ↓15D",
+        ]
+        if volume_ok:
+            reason_bits.append("Vol > 20EMA")
+        reason_bits.append(f"ADX {adx_val}")
+        reason_bits.append(f"RSI {rsi_val:.1f}")
+        reason_bits.append("OBV " + ("↑" if obv_rising else "↓"))
+        reason_bits.append(f"CMF {cmf_val:+.2f}")
+
+        return {"category": display_category, "is_strong": is_strong, "confidence": confidence,
+                "institutional_score": confidence, "reason": ", ".join(reason_bits)}
+    except Exception as e:
+        log_scan_error("classify_oi_buildup", "N/A", f"{type(e).__name__}: {e}")
+        return empty
+
+
+def enrich_volume_signal_with_smart_money(df, vt_result: Dict[str, object]) -> Dict[str, object]:
+    """
+    Smart-money (OBV/CMF) confluence add-on for the Volume Top/Bottom
+    detector. Adds obv_trend / cmf / smart_money_confirmed /
+    accumulation_score (BOTTOM) / distribution_score (TOP) on top of the
+    dict already returned by `_classify_volume_top_bottom(df)`, without
+    touching that function's own RVOL + proximity + candle-tell filtering.
+    """
+    extra = {"obv_trend": "N/A", "cmf": 0.0, "smart_money_confirmed": False,
+             "accumulation_score": None, "distribution_score": None}
+    try:
+        sig_type = vt_result.get("type", "NONE")
+        if sig_type == "NONE":
+            return extra
+        snap = obv_cmf_snapshot(df)
+        extra["obv_trend"] = snap["obv_trend"]
+        extra["cmf"] = snap["cmf"]
+        rvol = float(vt_result.get("rvol", 0.0) or 0.0)
+
+        if sig_type == "TOP":
+            confirmed = bool((snap["obv_rising"] is False) and (snap["cmf"] < 0))
+            extra["smart_money_confirmed"] = confirmed
+            score = 40.0 + (20 if snap["obv_rising"] is False else 0) + (20 if snap["cmf"] < 0 else 0) + min(rvol, 4) * 5
+            extra["distribution_score"] = round(min(100.0, score), 1)
+        elif sig_type == "BOTTOM":
+            confirmed = bool((snap["obv_rising"] is True) and (snap["cmf"] > 0))
+            extra["smart_money_confirmed"] = confirmed
+            score = 40.0 + (20 if snap["obv_rising"] is True else 0) + (20 if snap["cmf"] > 0 else 0) + min(rvol, 4) * 5
+            extra["accumulation_score"] = round(min(100.0, score), 1)
+        return extra
+    except Exception as e:
+        log_scan_error("enrich_volume_signal_with_smart_money", "N/A", f"{type(e).__name__}: {e}")
+        return extra
+
+
+def institutional_ai_score(price_action_pct: float, oi_pct: float, volume_pct: float, trend_pct: float,
+                            momentum_pct: float, vwap_ok: bool, rsi_ok: bool, macd_ok: bool,
+                            smart_money_pct: float, ai_validation_pct: float) -> Dict[str, object]:
+    """Weighted institutional AI Score (0-100): Price Action 20 · OI 15 ·
+    Volume 15 · Trend 10 · Momentum 10 · VWAP 5 · RSI 5 · MACD 5 ·
+    Smart Money 10 · AI Validation 5. Returns components + total + grade."""
+    def _clip(x):
+        try:
+            return max(0.0, min(100.0, float(x)))
+        except (TypeError, ValueError):
+            return 0.0
+
+    components = {
+        "Price Action (20)": round(_clip(price_action_pct) * 0.20, 1),
+        "OI (15)": round(_clip(oi_pct) * 0.15, 1),
+        "Volume (15)": round(_clip(volume_pct) * 0.15, 1),
+        "Trend (10)": round(_clip(trend_pct) * 0.10, 1),
+        "Momentum (10)": round(_clip(momentum_pct) * 0.10, 1),
+        "VWAP (5)": 5.0 if vwap_ok else 0.0,
+        "RSI (5)": 5.0 if rsi_ok else 0.0,
+        "MACD (5)": 5.0 if macd_ok else 0.0,
+        "Smart Money (10)": round(_clip(smart_money_pct) * 0.10, 1),
+        "AI Validation (5)": round(_clip(ai_validation_pct) * 0.05, 1),
+    }
+    total = round(sum(components.values()), 1)
+    if total >= 90:
+        grade = "A+"
+    elif total >= 80:
+        grade = "A"
+    elif total >= 65:
+        grade = "B"
+    elif total >= 50:
+        grade = "C"
+    else:
+        grade = "D"
+    return {"components": components, "total": total, "grade": grade}
+
+
+# Extra Excel conditional-format rules; merged into _SIGNAL_FILL_RULES below
+# where that list is defined (search: "_SIGNAL_FILL_RULES = [").
+INSTITUTIONAL_FILL_RULES: List[Tuple[str, str, str, bool]] = [
+    ("STRONG LONG BUILDUP", "006100", "FFFFFF", True),   # dark green
+    ("STRONG SHORT BUILDUP", "9C0006", "FFFFFF", True),  # dark red
+    ("LONG BUILDUP", "92D050", "000000", True),            # green
+    ("SHORT BUILDUP", "FF6666", "000000", True),           # red
+    ("LONG UNWINDING", "FFF2CC", "000000", False),         # pale yellow
+    ("SHORT COVERING", "E1D5E7", "000000", False),         # pale purple
+    ("VOLUME BOTTOM", "9BC2E6", "000000", True),           # blue
+    ("VOLUME TOP", "FFC000", "000000", True),              # orange
+    ("SMART MONEY", "7030A0", "FFFFFF", True),             # purple
+    ("STRONG BULLISH", "006100", "FFFFFF", True),
+    ("STRONG BEARISH", "9C0006", "FFFFFF", True),
+]
+
+
 def _analyse(symbol, df, nifty_close, enable_xgboost) -> dict:
     """Core per-symbol daily analysis used by the Full/F&O scanners.
     Original indicator logic unchanged; merges in the full institutional
-    Price Action engine report columns (computed exactly once here)."""
+    Price Action engine report columns (computed exactly once here), plus
+    the AI Direction Engine / OBV / CMF / weighted Institutional AI Score
+    (also additive — no existing key is overwritten)."""
     close, volume = df["Close"], df["Volume"]
     ema20 = close.ewm(span=20).mean().iloc[-1]
     ema50 = close.ewm(span=50).mean().iloc[-1]
@@ -2023,7 +2361,39 @@ def _analyse(symbol, df, nifty_close, enable_xgboost) -> dict:
     pa_collision_keys = {"Support", "Resistance", "Breakout Status"}
     pa_cols = {(f"PA {k}" if k in pa_collision_keys else k): v for k, v in pa_cols_raw.items()}
 
-    return {**base_row, **pa_cols}
+    # ── AI Direction Engine + OBV/CMF + weighted Institutional AI Score ──
+    # (additive; a failure here never breaks the scan — falls back to
+    # neutral/zeroed columns and logs via log_scan_error)
+    try:
+        ai_dir = calculate_ai_direction(df)
+        snap = obv_cmf_snapshot(df)
+        inst_score = institutional_ai_score(
+            price_action_pct=pa_cols_raw.get("Price Action Confidence %", 0.0),
+            oi_pct=0.0,  # populated with real OI confidence only in the F&O OI tab, where OI data exists
+            volume_pct=min(rvol_raw / 3.0, 1.0) * 100,
+            trend_pct=(pa_cols_raw.get("Price Action Score", 0) / 7.0) * 100,
+            momentum_pct=70.0 if "Bullish" in macd_signal_str or "Bearish" in macd_signal_str else 50.0,
+            vwap_ok=bool(vwap_val and last_close > vwap_val),
+            rsi_ok=bool(45 < rsi_val < 80),
+            macd_ok=macd_bullish,
+            smart_money_pct=60.0 if snap["cmf_positive"] else 40.0,
+            ai_validation_pct=ai_dir["confidence"],
+        )
+        smart_money_cols = {
+            "OBV Trend": snap["obv_trend"], "CMF": snap["cmf"],
+            "AI Direction": ai_dir["direction"], "AI Direction Confidence %": ai_dir["confidence"],
+            "AI Direction Grade": ai_dir["institutional_grade"],
+            "Institutional AI Score": inst_score["total"], "Institutional AI Grade": inst_score["grade"],
+        }
+    except Exception as e:
+        log_scan_error("_analyse.smart_money", symbol, f"{type(e).__name__}: {e}")
+        smart_money_cols = {
+            "OBV Trend": "N/A", "CMF": 0.0, "AI Direction": "Neutral",
+            "AI Direction Confidence %": 0.0, "AI Direction Grade": "REJECT",
+            "Institutional AI Score": 0.0, "Institutional AI Grade": "D",
+        }
+
+    return {**base_row, **pa_cols, **smart_money_cols}
 
 
 def calculate_intraday_signal(row) -> dict:
@@ -2211,6 +2581,13 @@ _SIGNAL_FILL_RULES = [
     ("CISD UP", "92D050", "000000", True), ("CISD DOWN", "FF0000", "FFFFFF", True),
     ("REJECT", "888888", "FFFFFF", True),
 ]
+# Extend with the institutional-upgrade categories (Long/Short Buildup,
+# Long Unwinding, Short Covering, Volume Top/Bottom, Smart Money, AI
+# Direction). Additive only — every original rule above is preserved and
+# still takes precedence for its own keywords since the loop below tries
+# rules in list order and returns on first match.
+_SIGNAL_FILL_RULES = _SIGNAL_FILL_RULES + INSTITUTIONAL_FILL_RULES
+
 _SUPPORT_FILL_HEX = "E2EFDA"; _RESISTANCE_FILL_HEX = "FCE4D6"
 _HIGH_AI_SCORE_FILL_HEX = "7030A0"; _HIGH_RVOL_FILL_HEX = "00FFFF"
 _HEADER_FILL_HEX = "1F4E78"; _BAND_FILL_HEX = "F2F2F2"
@@ -3249,7 +3626,12 @@ def _normalize_fyers_chain(fyers_payload: dict) -> Tuple[List[dict], Optional[fl
 
 def _fetch_fo_oi_signal(fyers, symbol: str):
     """Per-symbol worker for the F&O OI Analysis tab. Tries NSE first (has
-    IV/volume), falls back to Fyers optionchain on failure."""
+    IV/volume), falls back to Fyers optionchain on failure. Also runs the
+    institutional OI Buildup classifier (Long/Short Buildup, Long
+    Unwinding, Short Covering) using this stock's daily candles plus an
+    OI-change-% proxy derived from the aggregate near-ATM CE+PE OI deltas
+    already fetched here — additive, wrapped so a classifier failure never
+    breaks the OI scan itself."""
     stock_ticker = symbol.replace("NSE:", "").replace("-EQ", "")
     nse_payload, nse_err = _nse_fetch_chain_for_expiry(stock_ticker)
     rows, spot, source = [], None, None
@@ -3279,6 +3661,50 @@ def _fetch_fo_oi_signal(fyers, symbol: str):
     metrics["symbol"] = stock_ticker
     metrics["spot"] = spot
     metrics["source"] = source
+
+    # ── Institutional OI Buildup classification (additive) ───────────────
+    try:
+        resp_d, err_d = _safe_history(fyers, {
+            "symbol": symbol, "resolution": "D", "date_format": "1",
+            "range_from": DATE_FROM, "range_to": DATE_TO, "cont_flag": "1",
+        })
+        candles_d = resp_d.get("candles") if resp_d else None
+        if candles_d and len(candles_d) >= 20:
+            df_d = pd.DataFrame(candles_d, columns=["Time", "Open", "High", "Low", "Close", "Volume"])
+            df_d["Time"] = pd.to_datetime(df_d["Time"], unit="s", utc=True).dt.tz_convert("Asia/Kolkata")
+            df_d[["Open", "High", "Low", "Close", "Volume"]] = df_d[["Open", "High", "Low", "Close", "Volume"]].apply(pd.to_numeric, errors="coerce")
+            df_d = df_d.dropna(subset=["Open", "High", "Low", "Close"])
+            total_oi = (metrics.get("total_ce_oi", 0) or 0) + (metrics.get("total_pe_oi", 0) or 0)
+            # Proxy for stock-level OI change %: net signed OI change across
+            # the fetched near-ATM strikes as a % of total OI (see
+            # classify_oi_buildup()'s docstring for why this proxy is used
+            # instead of a dedicated futures-OI history feed).
+            net_oi_chg = sum((r.get("ce_oi_chg") or 0) + (r.get("pe_oi_chg") or 0) for r in metrics.get("rows", []))
+            oi_change_pct = round((net_oi_chg / total_oi) * 100, 2) if total_oi else None
+            buildup = classify_oi_buildup(df_d, oi_change_pct)
+            ai_dir = calculate_ai_direction(df_d)
+            metrics["oi_change_pct"] = oi_change_pct
+            metrics["buildup_category"] = buildup["category"]
+            metrics["buildup_confidence"] = buildup["confidence"]
+            metrics["buildup_reason"] = buildup["reason"]
+            metrics["ai_direction"] = ai_dir["direction"]
+            metrics["ai_direction_confidence"] = ai_dir["confidence"]
+        else:
+            metrics["oi_change_pct"] = None
+            metrics["buildup_category"] = "⚪ Neutral"
+            metrics["buildup_confidence"] = 0.0
+            metrics["buildup_reason"] = "Insufficient daily history"
+            metrics["ai_direction"] = "Neutral"
+            metrics["ai_direction_confidence"] = 0.0
+    except Exception as e:
+        log_scan_error("_fetch_fo_oi_signal.buildup", stock_ticker, f"{type(e).__name__}: {e}")
+        metrics["oi_change_pct"] = None
+        metrics["buildup_category"] = "⚪ Neutral"
+        metrics["buildup_confidence"] = 0.0
+        metrics["buildup_reason"] = "N/A"
+        metrics["ai_direction"] = "Neutral"
+        metrics["ai_direction_confidence"] = 0.0
+
     return metrics, None
 
 
@@ -3330,9 +3756,21 @@ def _build_fo_oi_report_df(metrics: dict) -> pd.DataFrame:
     return pd.DataFrame(out, columns=_FO_OI_REPORT_COLUMNS)
 
 
+def _build_fo_oi_summary_row(m: dict) -> dict:
+    """Single source of truth for the F&O OI summary row shape — used by
+    both the on-screen summary table and the Excel Summary sheet so the two
+    can never drift out of sync (this was duplicated inline previously)."""
+    return {
+        "Symbol": m["symbol"], "Spot": m.get("spot"), "PCR": m.get("pcr"), "Max Pain": m.get("max_pain"),
+        "Source": m.get("source"), "OI Change %": m.get("oi_change_pct"), "Buildup": m.get("buildup_category"),
+        "Buildup Confidence": m.get("buildup_confidence"), "AI Direction": m.get("ai_direction"),
+        "AI Direction Confidence %": m.get("ai_direction_confidence"),
+    }
+
+
 def _build_fo_oi_excel(all_metrics: List[dict]) -> bytes:
     """Multi-sheet Excel export — one sheet per symbol plus a summary sheet."""
-    summary_rows = [{"Symbol": m["symbol"], "Spot": m.get("spot"), "PCR": m.get("pcr"), "Max Pain": m.get("max_pain"), "Source": m.get("source")} for m in all_metrics]
+    summary_rows = [_build_fo_oi_summary_row(m) for m in all_metrics]
     sheets = {"Summary": pd.DataFrame(summary_rows)}
     for m in all_metrics:
         sheets[m["symbol"][:31]] = _build_fo_oi_report_df(m)
@@ -3369,7 +3807,7 @@ def _show_fo_oi_debug_panel() -> None:
 
 def _show_fo_oi_tab(fyers, fo_symbols: List[str]) -> None:
     """Full UI body for the 'F&O OI Analysis' tab."""
-    st.caption(f"Loaded {len(fo_symbols)} F&O-permitted NSE stocks. Fetches live CE/PE OI (NSE primary, Fyers fallback), PCR, Max Pain, and Long/Short Buildup classification.")
+    st.caption(f"Loaded {len(fo_symbols)} F&O-permitted NSE stocks. Fetches live CE/PE OI (NSE primary, Fyers fallback), PCR, Max Pain, Long/Short Buildup classification, and AI Direction.")
     if not fo_symbols:
         st.warning("No F&O symbols loaded.")
         return
@@ -3385,14 +3823,15 @@ def _show_fo_oi_tab(fyers, fo_symbols: List[str]) -> None:
         _display_scan_summary(st.session_state["oi_stats"])
     oi_results = st.session_state.get("oi_results")
     if oi_results:
-        summary_df = pd.DataFrame([{"Symbol": m["symbol"], "Spot": m.get("spot"), "PCR": m.get("pcr"), "Max Pain": m.get("max_pain"), "Source": m.get("source")} for m in oi_results])
+        summary_df = pd.DataFrame([_build_fo_oi_summary_row(m) for m in oi_results])
         st.markdown("#### 📊 PCR & Max Pain Summary")
-        st.dataframe(summary_df, use_container_width=True, height=min(38 * len(summary_df) + 60, 400))
+        st.dataframe(_style_dataframe(summary_df) if "Buildup" in summary_df.columns else summary_df, use_container_width=True, height=min(38 * len(summary_df) + 60, 400))
         sel_symbol = st.selectbox("View strike-level chain for:", [m["symbol"] for m in oi_results], key="oi_sel_symbol")
         sel_metrics = next((m for m in oi_results if m["symbol"] == sel_symbol), None)
         if sel_metrics:
             detail_df = _build_fo_oi_report_df(sel_metrics)
             st.markdown(f"#### 🔬 {sel_symbol} — Spot {sel_metrics.get('spot')} | PCR {sel_metrics.get('pcr')} | Max Pain {sel_metrics.get('max_pain')} | Source: {sel_metrics.get('source')}")
+            st.info(f"**Buildup:** {sel_metrics.get('buildup_category', '⚪ Neutral')} ({sel_metrics.get('buildup_confidence', 0)}%) — {sel_metrics.get('buildup_reason', 'N/A')}  \n**AI Direction:** {sel_metrics.get('ai_direction', 'Neutral')} ({sel_metrics.get('ai_direction_confidence', 0)}%)")
             st.dataframe(_style_oi_df(detail_df), use_container_width=True, height=500)
         st.download_button("📥 Download Full OI Report (Excel, all symbols)", data=_build_fo_oi_excel(oi_results), file_name=f"nse_fo_oi_{_now_ist().strftime('%Y%m%d_%H%M')}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="dl_oi_xlsx")
     else:
@@ -3401,6 +3840,8 @@ def _show_fo_oi_tab(fyers, fo_symbols: List[str]) -> None:
         with st.expander(f"⚠️ Skipped/failed ({len(st.session_state['oi_errors'])})"):
             st.text("\n".join(st.session_state["oi_errors"][:20]))
     _show_fo_oi_debug_panel()
+
+
 # ════════════════════════════════════════════════════════════════════════
 # VOLUME TOP / BOTTOM IDENTIFIER  —  additive module (with FULL AUDIT REPORT)
 # ════════════════════════════════════════════════════════════════════════
@@ -3498,7 +3939,8 @@ def _fetch_volume_top_bottom(fyers, symbol):
     (qualifying_row_or_None, error_or_None, report_row)
     report_row is populated for EVERY symbol (SUCCESS/FAILED/SKIPPED) so the
     full audit report can include every scanned stock, not just qualifiers.
-    Detection/filtering logic itself is unchanged — only reporting is added."""
+    Detection/filtering logic itself is unchanged — only reporting (and the
+    additive OBV/CMF smart-money confluence columns) was added."""
     stock_ticker = symbol.replace("NSE:", "").replace("-EQ", "") if isinstance(symbol, str) else str(symbol)
     report_row = {
         "Symbol": stock_ticker, "Status": "SKIPPED", "Reason": "Unknown",
@@ -3551,6 +3993,8 @@ def _fetch_volume_top_bottom(fyers, symbol):
 
     try:
         result = _classify_volume_top_bottom(df)
+        # ── Smart-money (OBV/CMF) confluence add-on (additive) ───────────
+        result = {**result, **enrich_volume_signal_with_smart_money(df, result)}
 
         recent = df.tail(VOL_TB_LOOKBACK)
         recent_high = float(recent["High"].max())
@@ -3584,6 +4028,10 @@ def _fetch_volume_top_bottom(fyers, symbol):
             f"{VOL_TB_LOOKBACK}D Reference Level": result["reference_level"],
             "Reference Type": "High" if result["type"] == "TOP" else "Low",
             "Distance %": result["distance_pct"], "Reason": result["reason"],
+            "OBV Trend": result.get("obv_trend", "N/A"), "CMF": result.get("cmf", 0.0),
+            "Smart Money Confirmed": "✅ Yes" if result.get("smart_money_confirmed") else "❌ No",
+            "Accumulation Score": result.get("accumulation_score"),
+            "Distribution Score": result.get("distribution_score"),
         }
 
         report_row["Status"] = "SUCCESS"
@@ -3609,7 +4057,7 @@ def run_volume_top_bottom_scan(fyers, symbols):
     report_df ALWAYS contains one row per scanned symbol — SUCCESS, FAILED,
     or SKIPPED — and is NEVER empty, regardless of how many stocks qualify.
     Filtering/detection logic (_classify_volume_top_bottom) is unchanged;
-    only the reporting/export path was added."""
+    only the reporting/export path (and OBV/CMF enrichment) was added."""
     symbols = _validate_symbols(symbols)
     results, errors = [], []
     success_rows, failed_rows, skipped_rows = [], [], []
@@ -3722,7 +4170,7 @@ def show_scanner(fyers) -> None:
     ])
 
     with tab_scanner:
-        st.caption(f"High-Quality signals only — ≥{SIGNAL_QUALITY_MIN_CONFIRMATIONS}/10 conditions confirmed. Institutional Price Action columns (Swing Structure, BOS/CHOCH, Decision, Institutional Grade, etc.) are included automatically.")
+        st.caption(f"High-Quality signals only — ≥{SIGNAL_QUALITY_MIN_CONFIRMATIONS}/10 conditions confirmed. Institutional Price Action columns (Swing Structure, BOS/CHOCH, Decision, Institutional Grade, AI Direction, Institutional AI Score, etc.) are included automatically.")
         if "scan_df" in st.session_state:
             df = st.session_state["scan_df"]
             if df.empty:
@@ -4020,7 +4468,9 @@ def show_scanner(fyers) -> None:
             "This tab's report also includes the full **Institutional Price Action engine** "
             "columns (Swing Structure, BOS/CHOCH Status, Breakout Status, Liquidity Sweep, "
             "Order Block, FVG, Support/Resistance, Trend Strength, Pullback Quality, "
-            "Price Action Score/Confidence, Decision, Reject Reason, Institutional Grade)."
+            "Price Action Score/Confidence, Decision, Reject Reason, Institutional Grade) "
+            "plus the **AI Direction Engine** (5-state Strong Bullish → Strong Bearish), "
+            "**OBV/CMF**, and the weighted **Institutional AI Score** (0-100, A+ to D)."
         )
         st.divider()
 
@@ -4141,13 +4591,15 @@ def show_scanner(fyers) -> None:
                 priority_cols = [
                     "Signal Date", "Signal Time", "Stock", "LTP",
                     "Enhanced Decision", "Enhanced Signal", "Signal Grade", "AI Confidence %",
+                    "AI Direction", "AI Direction Confidence %", "AI Direction Grade",
+                    "Institutional AI Score", "Institutional AI Grade",
                     "Confirmations Passed", "Confirmations Failed",
                     "Enhanced Entry", "Enhanced SL",
                     "Enhanced Target 1", "Enhanced Target 2", "Enhanced Target 3", "Enhanced RR",
                     "HTF Trend", "SMC Structure", "CISD",
                     "OB Type (Bullish)", "OB Type (Bearish)", "Order Block Zone", "Order Block Strength",
                     "FVG", "FVG Freshness", "FVG Filled %", "FVG Gap Size", "FVG Nearest Distance",
-                    "Liquidity Sweep", "ADX", "+DI", "-DI", "Momentum",
+                    "Liquidity Sweep", "ADX", "+DI", "-DI", "Momentum", "OBV Trend", "CMF",
                     "RSI", "MACD Signal", "Supertrend", "VWAP", "RVOL",
                     "MTF Trend", "RS vs NIFTY", "AI Score",
                     "XGBoost Trend", "XGBoost Confidence (%)",
@@ -4215,6 +4667,10 @@ def show_scanner(fyers) -> None:
                         pa_decision = str(row.get("Decision", "—"))
                         pa_grade = str(row.get("Institutional Grade", "—"))
                         pa_reject = str(row.get("Reject Reason", "—"))
+                        ai_direction = str(row.get("AI Direction", "—"))
+                        ai_direction_conf = row.get("AI Direction Confidence %", "—")
+                        inst_ai_score = row.get("Institutional AI Score", "—")
+                        inst_ai_grade = str(row.get("Institutional AI Grade", "—"))
 
                         grade_color = {"A+": "#006100", "A": "#1a7a1a", "B": "#ff8c00", "C": "#cc6600", "REJECT": "#888888"}.get(grade, "#333333")
                         is_buy = "BUY" in decision
@@ -4230,6 +4686,10 @@ def show_scanner(fyers) -> None:
 <span style="background:#1a1a2e;color:#fff;padding:3px 10px;border-radius:4px;font-size:14px">Confidence: {confidence}%</span>
 &nbsp;&nbsp;
 <span style="background:#4a148c;color:#fff;padding:3px 10px;border-radius:4px;font-size:14px">PA Decision: {pa_decision} (Inst. Grade {pa_grade})</span>
+&nbsp;&nbsp;
+<span style="background:#0d47a1;color:#fff;padding:3px 10px;border-radius:4px;font-size:14px">AI Direction: {ai_direction} ({ai_direction_conf}%)</span>
+&nbsp;&nbsp;
+<span style="background:#b71c1c;color:#fff;padding:3px 10px;border-radius:4px;font-size:14px">Institutional AI Score: {inst_ai_score}/100 ({inst_ai_grade})</span>
 &nbsp;&nbsp;
 <span style="color:#555;font-size:13px">✅ {passed}/20 confirmations &nbsp;|&nbsp; 📅 {sig_date} {sig_time}</span>
 </div>
@@ -4330,7 +4790,8 @@ def show_scanner(fyers) -> None:
             "### 🌋 Volume Top / Bottom Identifier\n"
             f"Flags stocks with a volume spike (RVOL ≥ {VOL_TB_MIN_RVOL}x) landing within "
             f"{VOL_TB_PROXIMITY_PCT}% of their {VOL_TB_LOOKBACK}-day high or low, "
-            "with a matching bearish/bullish tell."
+            "with a matching bearish/bullish tell — confirmed with OBV/CMF smart-money "
+            "confluence and an Accumulation/Distribution score."
         )
         vt_lim = st.number_input("Limit (0=all)", min_value=0, max_value=len(symbols), value=min(300, len(symbols)), step=50, key="vol_tb_limit")
         vt_universe = symbols if vt_lim == 0 else symbols[:vt_lim]
@@ -4351,18 +4812,22 @@ def show_scanner(fyers) -> None:
             top_df = vt_df[vt_df["Type"].str.contains("TOP", na=False)][display_cols].sort_values("RSI", ascending=False)
             bottom_df = vt_df[vt_df["Type"].str.contains("BOTTOM", na=False)][display_cols].sort_values("RSI", ascending=True)
 
-            k1, k2, k3 = st.columns(3)
+            k1, k2, k3, k4 = st.columns(4)
             k1.metric("Total Signals", len(vt_df))
             k2.metric("🔴 Volume Tops", len(top_df))
             k3.metric("🟢 Volume Bottoms", len(bottom_df))
+            try:
+                k4.metric("✅ Smart Money Confirmed", int((vt_df["Smart Money Confirmed"] == "✅ Yes").sum()))
+            except Exception:
+                k4.metric("✅ Smart Money Confirmed", "—")
 
-            st.markdown("#### 🔴 Volume Top Candidates")
+            st.markdown("#### 🔴 Volume Top Candidates (Distribution)")
             if not top_df.empty:
                 st.dataframe(_style_dataframe(top_df), use_container_width=True, height=350)
             else:
                 st.caption("None found.")
 
-            st.markdown("#### 🟢 Volume Bottom Candidates")
+            st.markdown("#### 🟢 Volume Bottom Candidates (Accumulation)")
             if not bottom_df.empty:
                 st.dataframe(_style_dataframe(bottom_df), use_container_width=True, height=350)
             else:
