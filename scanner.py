@@ -1097,11 +1097,19 @@ def classify_order_block(df, smc_structure, fvg) -> dict:
 
     def _ob_meta(ob_label, side):
         if ob_label == "No":
-            return {"label": f"No {side} OB", "fresh": False, "institutional": False, "ob_type": "None"}
+            return {"label": f"No {side} OB", "fresh": False, "untested": False, "institutional": False, "ob_type": "None"}
         zone_low, zone_high = _parse_ob_zone(ob_zone)
         if zone_low is None:
-            return {"label": ob_label, "fresh": False, "institutional": False, "ob_type": "Unknown"}
+            return {"label": ob_label, "fresh": False, "untested": False, "institutional": False, "ob_type": "Unknown"}
         fresh = not (zone_low <= last_close <= zone_high)
+        # BUGFIX: "untested" is now a distinct signal from "fresh" — it reads
+        # the retest count baked into the raw label by _detect_order_blocks
+        # ("... (Tested x1)" suffix means at least one retest has occurred).
+        # Previously the "8. Untested OB" checklist item in
+        # _run_20_point_validation reused "bull_ob_fresh"/"bear_ob_fresh"
+        # verbatim, making it a duplicate of the "7. Fresh OB" check instead
+        # of an independent confirmation.
+        untested = "Tested" not in ob_label
         institutional = ob_strength == "Strong" and fvg.get("type") == side and not fvg.get("mitigated", True)
         retail = ob_strength == "Weak" or fvg.get("type") != side
         if institutional:
@@ -1110,11 +1118,11 @@ def classify_order_block(df, smc_structure, fvg) -> dict:
             ob_type, prefix = "Retail", "Weak"
         else:
             ob_type, prefix = "Strong", "Strong"
-        return {"label": f"{'Fresh' if fresh else 'Mitigated'} {prefix} {side} OB", "fresh": fresh, "institutional": institutional, "ob_type": ob_type}
+        return {"label": f"{'Fresh' if fresh else 'Mitigated'} {prefix} {side} OB", "fresh": fresh, "untested": untested, "institutional": institutional, "ob_type": ob_type}
 
     bull_meta = _ob_meta(bullish_ob, "Bullish")
     bear_meta = _ob_meta(bearish_ob, "Bearish")
-    return {"bullish_ob_label": bull_meta["label"], "bearish_ob_label": bear_meta["label"], "ob_zone": ob_zone, "ob_strength": ob_strength, "bull_ob_fresh": bull_meta["fresh"], "bear_ob_fresh": bear_meta["fresh"], "bull_ob_institutional": bull_meta["institutional"], "bear_ob_institutional": bear_meta["institutional"], "bear_ob_type": bear_meta["ob_type"], "bull_ob_type": bull_meta["ob_type"]}
+    return {"bullish_ob_label": bull_meta["label"], "bearish_ob_label": bear_meta["label"], "ob_zone": ob_zone, "ob_strength": ob_strength, "bull_ob_fresh": bull_meta["fresh"], "bear_ob_fresh": bear_meta["fresh"], "bull_ob_untested": bull_meta["untested"], "bear_ob_untested": bear_meta["untested"], "bull_ob_institutional": bull_meta["institutional"], "bear_ob_institutional": bear_meta["institutional"], "bear_ob_type": bear_meta["ob_type"], "bull_ob_type": bull_meta["ob_type"]}
 
 
 def detect_liquidity_sweep(df) -> Tuple[str, str]:
@@ -1175,7 +1183,16 @@ def detect_htf_trend(df) -> str:
     if len(df) < 60:
         return "Insufficient Data"
     d = df.set_index("Time")
-    monthly = d["Close"].resample("ME").last().dropna()
+    try:
+        monthly = d["Close"].resample("ME").last().dropna()
+    except ValueError:
+        # BUGFIX: the "ME" (month-end) resample alias only exists on
+        # pandas >= 2.2. On older pandas this raised an uncaught
+        # ValueError ("Invalid frequency: ME") that crashed any scan
+        # calling detect_htf_trend() (used inside _analyse_enhanced()).
+        # Fall back to the legacy "M" alias so this works on older pandas
+        # too.
+        monthly = d["Close"].resample("M").last().dropna()
     if len(monthly) < 4:
         return "N/A"
     span = min(6, len(monthly) - 1)
@@ -1459,6 +1476,12 @@ def _detect_breaker_blocks(df, smc_structure) -> str:
     d = df.reset_index(drop=True)
     atr = _last_valid_atr_pa(d)
     vol_avg = d["Volume"].tail(20).mean()
+    # BUGFIX: `vol_avg` can be NaN if the tail window is short; NaN is
+    # truthy in Python, so the old `(vol_avg or 0)` pattern below silently
+    # kept NaN instead of falling back to 0, and every comparison against
+    # NaN is False — the volume filter was quietly disabled rather than
+    # falling back as intended. Coerce to a clean float here instead.
+    vol_avg = float(vol_avg) if pd.notna(vol_avg) else 0.0
     lookback = min(_OB_LOOKBACK + 5, len(d) - 2)
     recent = d.tail(lookback + 2).reset_index(drop=True)
     n = len(recent)
@@ -1473,7 +1496,7 @@ def _detect_breaker_blocks(df, smc_structure) -> str:
             continue
         ob_high = float(candle["High"])
         after = recent.iloc[i + 1:]
-        broke = after[(after["Close"] > ob_high) & (after["Volume"] > (vol_avg or 0))]
+        broke = after[(after["Close"] > ob_high) & (after["Volume"] > vol_avg)]
         if not broke.empty and last_close > ob_high:
             return f"🧱 Bullish Breaker ({round(ob_high, 2)})"
 
@@ -1484,7 +1507,7 @@ def _detect_breaker_blocks(df, smc_structure) -> str:
             continue
         ob_low = float(candle["Low"])
         after = recent.iloc[i + 1:]
-        broke = after[(after["Close"] < ob_low) & (after["Volume"] > (vol_avg or 0))]
+        broke = after[(after["Close"] < ob_low) & (after["Volume"] > vol_avg)]
         if not broke.empty and last_close < ob_low:
             return f"🧱 Bearish Breaker ({round(ob_low, 2)})"
 
@@ -1693,7 +1716,8 @@ def build_price_action_report_row(df, symbol: str) -> Dict[str, object]:
 
 
 def _run_20_point_validation(*, htf_trend, smc_structure, cisd_signal, ob_meta, fvg, liquidity_sweep, volume_ok, last_close, prev_close, atr_val, vwap_val, ema20, ema50, rsi_val, macd_bullish, adx_val, rr, direction):
-    """20-point institutional validation checklist. Logic unchanged."""
+    """20-point institutional validation checklist. Logic unchanged (except
+    BUGFIX below)."""
     is_buy = direction == "BUY"
     checks = [
         ("1. HTF Trend", ("Bullish" in htf_trend) if is_buy else ("Bearish" in htf_trend)),
@@ -1703,7 +1727,13 @@ def _run_20_point_validation(*, htf_trend, smc_structure, cisd_signal, ob_meta, 
         ("5. CISD", ("Bullish" in cisd_signal) if is_buy else ("Bearish" in cisd_signal)),
         ("6. OB Quality", ob_meta.get("bull_ob_type") not in ("Retail", "None") if is_buy else ob_meta.get("bear_ob_type") not in ("Retail", "None")),
         ("7. Fresh OB", ob_meta.get("bull_ob_fresh", False) if is_buy else ob_meta.get("bear_ob_fresh", False)),
-        ("8. Untested OB", ob_meta.get("bull_ob_fresh", False) if is_buy else ob_meta.get("bear_ob_fresh", False)),
+        # BUGFIX: this used to re-check "bull_ob_fresh"/"bear_ob_fresh" —
+        # the exact same field as check #7 above — so it was a silent
+        # duplicate that double-counted "Fresh OB" toward passed_count
+        # instead of independently confirming the OB has never been
+        # retested. Now reads the dedicated "untested" flag (see
+        # classify_order_block's BUGFIX note).
+        ("8. Untested OB", ob_meta.get("bull_ob_untested", False) if is_buy else ob_meta.get("bear_ob_untested", False)),
         ("9. Liquidity Sweep", ("Buy" in liquidity_sweep) if is_buy else ("Sell" in liquidity_sweep)),
         ("10. FVG", fvg.get("type") == ("Bullish" if is_buy else "Bearish") and not fvg.get("mitigated", True)),
         ("11. Volume", volume_ok),
@@ -2223,10 +2253,22 @@ def enrich_volume_signal_with_smart_money(df, vt_result: Dict[str, object]) -> D
 
 def institutional_ai_score(price_action_pct: float, oi_pct: float, volume_pct: float, trend_pct: float,
                             momentum_pct: float, vwap_ok: bool, rsi_ok: bool, macd_ok: bool,
-                            smart_money_pct: float, ai_validation_pct: float) -> Dict[str, object]:
+                            smart_money_pct: float, ai_validation_pct: float,
+                            oi_available: bool = True) -> Dict[str, object]:
     """Weighted institutional AI Score (0-100): Price Action 20 · OI 15 ·
     Volume 15 · Trend 10 · Momentum 10 · VWAP 5 · RSI 5 · MACD 5 ·
-    Smart Money 10 · AI Validation 5. Returns components + total + grade."""
+    Smart Money 10 · AI Validation 5. Returns components + total + grade.
+
+    BUGFIX: added `oi_available`. Every call site outside the F&O OI
+    Analysis tab has no real OI data and previously always passed
+    `oi_pct=0.0`, which silently burned 15 of the 100 weighted points on
+    every score and capped the achievable total at 85/100 — meaning the
+    A+ grade (>=90) was mathematically unreachable anywhere except the OI
+    tab, without that being visible to the user or documented in the
+    grade thresholds. When `oi_available=False`, the OI component is
+    excluded entirely and the remaining 85 points are rescaled to a
+    0-100 basis so the grade thresholds behave as documented again.
+    """
     def _clip(x):
         try:
             return max(0.0, min(100.0, float(x)))
@@ -2235,7 +2277,7 @@ def institutional_ai_score(price_action_pct: float, oi_pct: float, volume_pct: f
 
     components = {
         "Price Action (20)": round(_clip(price_action_pct) * 0.20, 1),
-        "OI (15)": round(_clip(oi_pct) * 0.15, 1),
+        "OI (15)": round(_clip(oi_pct) * 0.15, 1) if oi_available else None,
         "Volume (15)": round(_clip(volume_pct) * 0.15, 1),
         "Trend (10)": round(_clip(trend_pct) * 0.10, 1),
         "Momentum (10)": round(_clip(momentum_pct) * 0.10, 1),
@@ -2245,7 +2287,12 @@ def institutional_ai_score(price_action_pct: float, oi_pct: float, volume_pct: f
         "Smart Money (10)": round(_clip(smart_money_pct) * 0.10, 1),
         "AI Validation (5)": round(_clip(ai_validation_pct) * 0.05, 1),
     }
-    total = round(sum(components.values()), 1)
+    counted_points = [v for v in components.values() if v is not None]
+    max_possible = 100.0 if oi_available else 85.0
+    raw_total = sum(counted_points)
+    total = round(min(100.0, (raw_total / max_possible) * 100.0), 1) if max_possible > 0 else 0.0
+    if not oi_available:
+        components["OI (15)"] = "N/A (no OI data for this scan)"
     if total >= 90:
         grade = "A+"
     elif total >= 80:
@@ -2369,7 +2416,7 @@ def _analyse(symbol, df, nifty_close, enable_xgboost) -> dict:
         snap = obv_cmf_snapshot(df)
         inst_score = institutional_ai_score(
             price_action_pct=pa_cols_raw.get("Price Action Confidence %", 0.0),
-            oi_pct=0.0,  # populated with real OI confidence only in the F&O OI tab, where OI data exists
+            oi_pct=0.0,  # not available outside the F&O OI tab — excluded via oi_available=False below
             volume_pct=min(rvol_raw / 3.0, 1.0) * 100,
             trend_pct=(pa_cols_raw.get("Price Action Score", 0) / 7.0) * 100,
             momentum_pct=70.0 if "Bullish" in macd_signal_str or "Bearish" in macd_signal_str else 50.0,
@@ -2378,6 +2425,7 @@ def _analyse(symbol, df, nifty_close, enable_xgboost) -> dict:
             macd_ok=macd_bullish,
             smart_money_pct=60.0 if snap["cmf_positive"] else 40.0,
             ai_validation_pct=ai_dir["confidence"],
+            oi_available=False,  # BUGFIX: rescale to the 85-pt basis actually available here instead of silently capping every score at 85/100
         )
         smart_money_cols = {
             "OBV Trend": snap["obv_trend"], "CMF": snap["cmf"],
