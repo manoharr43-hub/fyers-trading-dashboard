@@ -1578,6 +1578,247 @@ def _classify_premium_discount(df, lookback: int = 50) -> str:
     return "🟢 Discount"
 
 
+# ════════════════════════════════════════════════════════════════════════
+# MINI SWING BUY/SELL PIN  —  ported from the "Institutional Intraday
+# Signal Pro + Mini Swing Pins" Pine Script indicator
+# ────────────────────────────────────────────────────────────────────────
+# A lightweight, high-frequency top/bottom flag: a pivot high/low that
+# prints on volume meaningfully above its average is pinned the bar it
+# confirms — independent of trend and of the heavier scored engines
+# elsewhere in this file. Meant to flag developing swing turns early.
+# Non-repainting: only pivots confirmable `right` bars back are considered.
+# ════════════════════════════════════════════════════════════════════════
+
+MINI_PIN_LEFT = 3
+MINI_PIN_RIGHT = 3
+MINI_PIN_VOL_MULT = 1.3
+MINI_PIN_VOL_SMA_LEN = 20
+
+
+def _detect_mini_swing_pin(df, left: int = MINI_PIN_LEFT, right: int = MINI_PIN_RIGHT,
+                            vol_mult: float = MINI_PIN_VOL_MULT) -> Dict[str, object]:
+    """Returns the most recently confirmed Mini Buy/Sell pin, or empty if
+    none qualifies. Pure volume-gated pivot detector (no ATR noise filter,
+    unlike `_detect_swing_points`) — mirrors the Pine Script's
+    `ta.pivothigh`/`ta.pivotlow` + volume-multiple condition exactly."""
+    empty = {"label": "—", "type": None, "price": None, "bars_ago": None, "rvol_at_pivot": None}
+    try:
+        n = len(df)
+        if n < left + right + MINI_PIN_VOL_SMA_LEN:
+            return empty
+        high = df["High"].values
+        low = df["Low"].values
+        volume = df["Volume"].values
+        vol_sma = df["Volume"].rolling(MINI_PIN_VOL_SMA_LEN, min_periods=5).mean().values
+        # Scan backward from the most recent confirmable bar so the first
+        # hit is the latest qualifying pin.
+        for i in range(n - right - 1, left - 1, -1):
+            vavg = vol_sma[i]
+            if not (pd.notna(vavg) and vavg > 0):
+                continue
+            if volume[i] <= vavg * vol_mult:
+                continue
+            window_hi = high[i - left:i + right + 1]
+            window_lo = low[i - left:i + right + 1]
+            is_pivot_high = high[i] == window_hi.max() and np.sum(window_hi == window_hi.max()) == 1
+            is_pivot_low = low[i] == window_lo.min() and np.sum(window_lo == window_lo.min()) == 1
+            if is_pivot_high:
+                return {"label": "📌 Mini Sell", "type": "SELL", "price": round(float(high[i]), 2),
+                        "bars_ago": (n - 1) - i, "rvol_at_pivot": round(float(volume[i] / vavg), 2)}
+            if is_pivot_low:
+                return {"label": "📌 Mini Buy", "type": "BUY", "price": round(float(low[i]), 2),
+                        "bars_ago": (n - 1) - i, "rvol_at_pivot": round(float(volume[i] / vavg), 2)}
+        return empty
+    except Exception as e:
+        log_scan_error("_detect_mini_swing_pin", "N/A", f"{type(e).__name__}: {e}")
+        return empty
+
+
+# ════════════════════════════════════════════════════════════════════════
+# 1-2-3 REVERSAL MAP  —  ported from the "1-2-3 Reversal Map [AGPro
+# Series]" Pine Script indicator
+# ────────────────────────────────────────────────────────────────────────
+# Maps the latest alternating swing triplet (low-high-low for a bullish
+# structure, high-low-high for bearish) into a numbered Point 1/2/3
+# structure, validates leg size / Point-3 hold / retracement against ATR-
+# relative thresholds, tracks the neckline (Point 2 level), and reports
+# whether it has broken, is being retested, or has invalidated. Unlike the
+# stateful Pine Script version (which persists across every historical
+# bar), this is a point-in-time snapshot computed fresh from the supplied
+# `df` on each call — appropriate for a scanner that only needs "what's
+# the current status" rather than a full bar-by-bar replay.
+# ════════════════════════════════════════════════════════════════════════
+
+REV123_MIN_LEG_ATR = 0.65
+REV123_MIN_HOLD_ATR = 0.05
+REV123_MIN_RETRACE = 0.15
+REV123_MAX_RETRACE = 0.92
+REV123_BREAK_BUFFER_ATR = 0.05
+REV123_POCKET_WIDTH_ATR = 0.30
+REV123_RETEST_WINDOW = 40
+REV123_INVALID_BUFFER_ATR = 0.15
+REV123_MAX_AGE_BARS = 160
+
+
+def _rev123_grade(score: float) -> str:
+    if score >= 85:
+        return "A+"
+    if score >= 75:
+        return "A"
+    if score >= 62:
+        return "B"
+    return "C"
+
+
+def _rev123_structure_score(direction: int, p1: float, p2: float, p3: float, b1: int, b2: int, b3: int, atr_val: float) -> float:
+    leg = abs(p2 - p1)
+    safe_leg = max(leg, 1e-9)
+    hold = (p3 - p1) if direction == 1 else (p1 - p3)
+    retrace = ((p2 - p3) / safe_leg) if direction == 1 else ((p3 - p2) / safe_leg)
+    left_span = max(1, b2 - b1)
+    right_span = max(1, b3 - b2)
+    symmetry = min(left_span, right_span) / max(left_span, right_span)
+    leg_score = min(max((leg / atr_val) / max(REV123_MIN_LEG_ATR, 0.10) * 25.0, 0.0), 25.0)
+    hold_score = min(max((hold / atr_val) / max(REV123_MIN_HOLD_ATR, 0.05) * 20.0, 0.0), 20.0)
+    retrace_score = min(max(25.0 - abs(retrace - 0.55) * 70.0, 0.0), 25.0)
+    symmetry_score = min(max(symmetry * 20.0, 0.0), 20.0)
+    spacing_score = min(max((min(left_span, right_span) / max(left_span + right_span, 1)) * 10.0, 0.0), 10.0)
+    return min(max(leg_score + hold_score + retrace_score + symmetry_score + spacing_score, 0.0), 100.0)
+
+
+def _detect_123_reversal(df, left: int = 2, right: int = 2, atr_len: int = 14) -> Dict[str, object]:
+    """Snapshot of the latest 1-2-3 reversal structure, if any qualifies."""
+    empty = {"structure": "None", "direction": "None", "stage": "Waiting", "neckline": None,
+             "score": None, "grade": "-", "p1": None, "p2": None, "p3": None}
+    try:
+        if len(df) < 40:
+            return empty
+        d = df.reset_index(drop=True)
+        atr_val = _last_valid_atr_pa(d, atr_len)
+        if not atr_val or atr_val <= 0:
+            return empty
+
+        swings = _detect_swing_points(d, left=left, right=right)
+        # Build the alternating pivot chain (type 1=high, -1=low), collapsing
+        # consecutive same-side pivots down to the most extreme one — the
+        # same behaviour as the Pine Script's f_add_pivot().
+        pivots: List[Tuple[int, int, float]] = []
+        for idx in range(len(swings)):
+            if bool(swings["is_swing_high"].iloc[idx]):
+                price = float(swings["High"].iloc[idx])
+                if pivots and pivots[-1][0] == 1:
+                    if price > pivots[-1][2]:
+                        pivots[-1] = (1, idx, price)
+                else:
+                    pivots.append((1, idx, price))
+            if bool(swings["is_swing_low"].iloc[idx]):
+                price = float(swings["Low"].iloc[idx])
+                if pivots and pivots[-1][0] == -1:
+                    if price < pivots[-1][2]:
+                        pivots[-1] = (-1, idx, price)
+                else:
+                    pivots.append((-1, idx, price))
+
+        if len(pivots) < 3:
+            return empty
+
+        t1, b1, p1 = pivots[-3]
+        t2, b2, p2 = pivots[-2]
+        t3, b3, p3 = pivots[-1]
+        bull_chain = t1 == -1 and t2 == 1 and t3 == -1
+        bear_chain = t1 == 1 and t2 == -1 and t3 == 1
+        direction = 1 if bull_chain else (-1 if bear_chain else 0)
+        if direction == 0:
+            return empty
+
+        leg = abs(p2 - p1)
+        if leg < atr_val * REV123_MIN_LEG_ATR:
+            return empty
+        hold = (p3 - p1) if direction == 1 else (p1 - p3)
+        if hold < atr_val * REV123_MIN_HOLD_ATR:
+            return empty
+        retrace = ((p2 - p3) / leg) if direction == 1 else ((p3 - p2) / leg)
+        if not (REV123_MIN_RETRACE <= retrace <= REV123_MAX_RETRACE):
+            return empty
+
+        score = _rev123_structure_score(direction, p1, p2, p3, b1, b2, b3, atr_val)
+        neckline = p2
+        structure_label = f"{'Bullish' if direction == 1 else 'Bearish'} 1-2-3"
+        direction_label = "Bullish" if direction == 1 else "Bearish"
+
+        def _row_out(stage, score_val):
+            return {"structure": structure_label, "direction": direction_label, "stage": stage,
+                    "neckline": round(neckline, 2), "score": round(score_val, 1), "grade": _rev123_grade(score_val),
+                    "p1": round(p1, 2), "p2": round(p2, 2), "p3": round(p3, 2)}
+
+        post_p3 = d.iloc[b3 + 1:] if b3 + 1 < len(d) else d.iloc[0:0]
+        bars_since_p3 = (len(d) - 1) - b3
+
+        if len(post_p3) == 0:
+            if bars_since_p3 > REV123_MAX_AGE_BARS:
+                return _row_out("Expired", score)
+            return _row_out("Structure Armed", score)
+
+        # Which happens first after P3: pre-break invalidation, or a
+        # confirmed neckline break by CLOSE?
+        if direction == 1:
+            invalid_mask = post_p3["Low"] < (p1 - atr_val * REV123_INVALID_BUFFER_ATR)
+            break_mask = post_p3["Close"] > (neckline + atr_val * REV123_BREAK_BUFFER_ATR)
+        else:
+            invalid_mask = post_p3["High"] > (p1 + atr_val * REV123_INVALID_BUFFER_ATR)
+            break_mask = post_p3["Close"] < (neckline - atr_val * REV123_BREAK_BUFFER_ATR)
+
+        inv_pos = int(np.argmax(invalid_mask.values)) if invalid_mask.any() else None
+        brk_pos = int(np.argmax(break_mask.values)) if break_mask.any() else None
+
+        if inv_pos is not None and (brk_pos is None or inv_pos <= brk_pos):
+            return _row_out("Invalidated", score)
+
+        if brk_pos is None:
+            if bars_since_p3 > REV123_MAX_AGE_BARS:
+                return _row_out("Expired", score)
+            return _row_out("Structure Armed", score)
+
+        # Neckline break confirmed — recompute score with break-quality add-on.
+        break_row = post_p3.iloc[brk_pos]
+        distance = abs(float(break_row["Close"]) - neckline) / atr_val
+        body = abs(float(break_row["Close"]) - float(break_row["Open"])) / atr_val
+        rng = max(float(break_row["High"]) - float(break_row["Low"]), 1e-9)
+        close_loc = ((float(break_row["Close"]) - float(break_row["Low"])) / rng) if direction == 1 else \
+                    ((float(break_row["High"]) - float(break_row["Close"])) / rng)
+        vol_avg20 = d["Volume"].tail(20).mean()
+        vol_score = 10.0 if (pd.notna(vol_avg20) and float(break_row["Volume"]) > vol_avg20) else 3.0
+        break_add = min(max(distance * 18.0, 0.0), 10.0) + min(max(body * 10.0, 0.0), 8.0) + \
+            min(max(close_loc * 8.0, 0.0), 8.0) + vol_score
+        score = min(max(score * 0.75 + break_add, 0.0), 100.0)
+
+        pocket_top = neckline + atr_val * REV123_POCKET_WIDTH_ATR
+        pocket_bottom = neckline - atr_val * REV123_POCKET_WIDTH_ATR
+        after_break = post_p3.iloc[brk_pos + 1:brk_pos + 1 + REV123_RETEST_WINDOW]
+
+        stage = "Neckline Break"
+        for _, row in after_break.iterrows():
+            post_break_invalid = (float(row["Close"]) < p3 - atr_val * REV123_INVALID_BUFFER_ATR) if direction == 1 else \
+                                  (float(row["Close"]) > p3 + atr_val * REV123_INVALID_BUFFER_ATR)
+            if post_break_invalid:
+                stage = "Invalidated"
+                break
+            touched = (float(row["Low"]) <= pocket_top) if direction == 1 else (float(row["High"]) >= pocket_bottom)
+            held = (float(row["Close"]) >= pocket_bottom and float(row["Close"]) > neckline) if direction == 1 else \
+                   (float(row["Close"]) <= pocket_top and float(row["Close"]) < neckline)
+            if touched and held:
+                stage = "Retest Held"
+                score = min(score + 10.0, 100.0)
+                break
+        if stage == "Neckline Break" and len(after_break) >= REV123_RETEST_WINDOW:
+            stage = "Breakout Active"
+
+        return _row_out(stage, score)
+    except Exception as e:
+        log_scan_error("_detect_123_reversal", "N/A", f"{type(e).__name__}: {e}")
+        return empty
+
+
 def build_price_action_report_row(df, symbol: str) -> Dict[str, object]:
     """
     Master aggregator for the institutional Price Action engine. Computes
@@ -2441,7 +2682,30 @@ def _analyse(symbol, df, nifty_close, enable_xgboost) -> dict:
             "Institutional AI Score": 0.0, "Institutional AI Grade": "D",
         }
 
-    return {**base_row, **pa_cols, **smart_money_cols}
+    # ── Mini Swing Pin + 1-2-3 Reversal Map (additive; isolated so a
+    # failure here never breaks the rest of the row) ─────────────────────
+    try:
+        mini_pin = _detect_mini_swing_pin(df)
+        rev123 = _detect_123_reversal(df)
+        mini_and_123_cols = {
+            "Mini Pin": mini_pin["label"],
+            "Mini Pin Price": mini_pin["price"],
+            "Mini Pin Bars Ago": mini_pin["bars_ago"],
+            "123 Structure": rev123["structure"],
+            "123 Stage": rev123["stage"],
+            "123 Neckline": rev123["neckline"],
+            "123 Score": rev123["score"],
+            "123 Grade": rev123["grade"],
+        }
+    except Exception as e:
+        log_scan_error("_analyse.mini_and_123", symbol, f"{type(e).__name__}: {e}")
+        mini_and_123_cols = {
+            "Mini Pin": "—", "Mini Pin Price": None, "Mini Pin Bars Ago": None,
+            "123 Structure": "None", "123 Stage": "Waiting", "123 Neckline": None,
+            "123 Score": None, "123 Grade": "-",
+        }
+
+    return {**base_row, **pa_cols, **smart_money_cols, **mini_and_123_cols}
 
 
 def calculate_intraday_signal(row) -> dict:
