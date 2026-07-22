@@ -1,705 +1,685 @@
 """
-FYERS Options Chain Dashboard — Pro Edition (AI Upgrade)
-=========================================================
-Streamlit + FYERS API v3 dashboard with:
-  • Fixed multi-index expiry handling (NIFTY / BANKNIFTY / FINNIFTY /
-    MIDCPNIFTY / NIFTYNEXT50 / SENSEX / BANKEX) — always resolves the
-    nearest available expiry, tags Weekly vs Monthly, auto-refreshes on
-    instrument change and after every fetch, and auto-falls-back to the
-    next valid expiry if the selected one returns no data. The dashboard
-    makes NO assumption about which indices are weekly vs monthly-only —
-    every expiry the FYERS API actually returns is shown, unfiltered, and
-    the raw API expiry payload is surfaced in the UI for inspection.
-  • AI Engine: independent 0-100 CE Score / PE Score per strike, star
-    ratings (Strong Buy / Buy / Hold / Avoid / Ignore), AI Confidence,
-    and a Big Move table (Strike, CE/PE Score, Overall Score, BUY/SELL
-    Probability, Breakout/Breakdown %, Institution/Smart-Money Score,
-    Final Signal).
-  • Institutional AI Validation Engine: BUY/SELL trade signals now only
-    fire after trend, option-chain, max-pain, volume, price-action,
-    smart-money, support/resistance, ATR, and momentum validations all
-    agree (see section 5G) — replacing the old single-indicator signal
-    logic. High-confidence-only Strike/CE/PE cards with Entry / SL / T1
-    / T2 / T3 / Risk-Reward / Reason.
-  • Dashboard Summary: Top CE/PE Buy, Best Breakout/Breakdown, highest
-    institutional/smart-money/OI/volume/ΔOI, best RR trade, best trade.
-  • Excel export (openpyxl) with full conditional-formatting, colored
-    headers, auto-width, borders, freeze panes, across Summary / Chain
-    Table / Big Move Ready / AI Trade Signals sheets.
-  • All original features preserved: PCR, Max Pain, IV chart, OI chart,
-    Chain table, Big Move Alerts, Support/Resistance, Strike Signal.
-  • Gamma Build-up Analyzer: real-time (session-tracked) per-strike
-    Gamma monitoring with Gamma Change / Change % / Trend / Signal /
-    Strength / Trade Action / AI Rating, blinking Buy/Sell rows, smart
-    alerts, optional audio ping, and a live summary panel.
+option_chain.py
+================
+Institutional-grade NSE India Options Chain Dashboard.
 
-FIX NOTE (this file):
-  render_scalping_html_table() previously looked up the column key
-  "Gamma" (capital G) while compute_scalping_table() actually creates
-  the column as lowercase "gamma". Because the lookup key didn't match
-  any column, row.get("Gamma", "") silently fell back to an empty
-  string, and then the numeric format spec "{:.5f}".format("") raised:
-      ValueError: Unknown format code 'f' for object of type 'str'
-  Fixed by changing the column key from "Gamma" to "gamma" in the
-  `cols` list inside render_scalping_html_table (see section 5D below).
+Covers NIFTY, BANKNIFTY, FINNIFTY, MIDCPNIFTY and any NSE F&O stock, using
+NSE India's public option-chain endpoints directly (no broker/API-key
+dependency, so this file runs standalone).
 
-FIX NOTE 2 (this file):
-  compute_ai_engine()'s _final_signal() and _final_recommendation()
-  previously compared CE Score >= PE Score, which handed every tie (and
-  therefore every near-tie) to CE. Because roughly 37% of the weight in
-  both scores comes from identical shared inputs (proximity, highest
-  OI/volume/ΔOI, max-pain distance), CE Score and PE Score land very
-  close together whenever the market is balanced — and the old `>=`
-  silently resolved that closeness in CE's favor every single time, so
-  PE/SELL signals almost never surfaced even on bearish-leaning chains.
-  Fixed by using strict `>` comparisons on both sides and only breaking
-  a genuine tie using the strike's own Breakout vs Breakdown Probability
-  instead of hardcoding a CE win (see section 5B below).
+Feature set:
+    - Live CE/PE chain: Strike, LTP, Bid, Ask, Volume, OI, OI Change,
+      OI Change %, IV, Delta, Gamma, Theta, Vega
+    - AI Engine: BUY / SELL / HOLD per strike, Institutional Signal,
+      Smart Money detection, Long/Short Buildup, Long/Short Unwinding,
+      Call/Put Writing, Call/Put Unwinding, PCR, Max Pain, Max OI,
+      OI Shift Detection
+    - Greeks Engine: Black-Scholes Delta/Gamma/Theta/Vega, IV Rank,
+      IV Percentile (session-based history), Gamma Exposure (GEX),
+      Delta Exposure (DEX)
+    - Intraday AI: Support & Resistance, ATM/ITM/OTM classification,
+      Breakout / Reversal / Trend probability, Scalping & Swing signal
+    - Dashboard: Streamlit UI, summary cards, color-coded/heatmapped
+      chain table, Plotly charts, auto-refresh, filters, symbol search,
+      expiry selection
+    - Reports: Excel export (openpyxl, conditional formatting, auto
+      column width) and CSV export
+    - Robust error handling: retry logic, timeout handling, missing/NaN
+      data handling, empty-response handling, structured logging
+    - Performance: st.cache_data / st.cache_resource, vectorized pandas
 
-FIX NOTE 3 (this file):
-  Added a robust, automatic FYERS -> NSE fallback data-source layer
-  (sections 1B / 1C below) so a FYERS outage, auth failure, timeout,
-  malformed JSON, or an incomplete Option Chain payload no longer takes
-  the whole dashboard down. See get_option_chain_data() for details.
-
-FIX NOTE 4 (this file):
-  run_external_ai_market_analysis() was calling analyze_market(payload)
-  and, on TypeError, analyze_market(df) — neither call actually passed
-  spot_price / atm_strike / max_pain / pcr as the named arguments
-  analyze_market() requires, and atm_strike was never even threaded
-  through this function's own signature. That raised:
-      TypeError: analyze_market() missing 4 required positional
-      arguments: 'spot_price', 'atm_strike', 'max_pain', 'pcr'
-  Fixed by (a) adding `atm_strike` to run_external_ai_market_analysis()'s
-  signature and to its call site inside show_option_chain(), (b) calling
-  analyze_market() with spot_price / atm_strike / max_pain / pcr passed
-  explicitly by keyword instead of a bare dict/DataFrame, and (c) adding
-  a pre-flight None-guard here (mirrored by an internal fallback inside
-  ai_analysis_engine.py itself) so none of those four values can ever be
-  None when AI analysis starts, without changing the returned schema.
-  See run_external_ai_market_analysis() in section 5E below.
-
-FIX NOTE 5 (this file):
-  Replaced the old single-indicator trade-signal logic (generate_trade_
-  signals(), which could fire a BUY/SELL off of PCR, ΔOI, or volume more
-  or less alone) with an Institutional AI Validation Engine (section 5G,
-  compute_institutional_signals()). A BUY/SELL now requires trend, option
-  -chain, max-pain, volume, price-action, smart-money, support/resistance,
-  ATR, and momentum validation to all agree, with an explicit weighted
-  0-100 confidence score and a hard floor of 40% confidence and 1:2 risk
-  /reward before any signal is emitted (floor lowered from an initial 80%
-  at the user's request; the star rating bands were rescaled to match).
-  generate_trade_signals() itself is
-  left in place (unused) so no existing function is removed. Nothing about
-  the UI, tabs, API calls, or Excel export changed — only which function
-  populates the AI Trade Signals tab's `signals` list.
-
-FIX NOTE 6 (this file):
-  Full bug-scan pass requested by the user. Issues found and fixed:
-  (a) render_gamma_html_table() and render_scalping_html_table() built
-      HTML cells via f"<td>{val}</td>" without escaping — any stray "<"
-      "&" or ">" in a value (or a NaN rendering to 'nan') could break
-      the table markup. Added _safe_cell() everywhere raw values are
-      interpolated into HTML.
-  (b) fetch_underlying_candles() cached candles into st.session_state
-      keyed only by resolution ("oc_scalp_candles_5"/"_15") with no
-      symbol/expiry tag, so switching instruments could show stale
-      candle data from a previous symbol until the Scalping tab was
-      re-run. Cache key now includes the symbol.
-  (c) compute_scalping_trend_engine() divided by c5["volume"].tail(20)
-      .mean() without guarding against an all-zero/empty volume window
-      (pre-market / illiquid symbols), which could raise or silently
-      produce inf. Wrapped with a safe zero-check.
-  (d) NEW: added Section 5H below — a 15-Minute Volume & Swing
-      Top/Bottom tab. Renders 15m volume bars and marks swing-high
-      ("Top") / swing-low ("Bottom") candles reusing the same
-      `_swing_points()` detector already used by the BOS/CHOCH logic,
-      so behaviour stays consistent with the rest of the Scalping
-      Engine. Added as its own new dashboard tab (tab8).
+Run with:
+    streamlit run option_chain.py
 """
+
+from __future__ import annotations
 
 import io
 import logging
 import math
 import time
-from collections import defaultdict
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from typing import Any, Optional
 
 import numpy as np
-from ai_analysis_engine import analyze_market
 import pandas as pd
 import plotly.graph_objects as go
 import requests
 import streamlit as st
 from plotly.subplots import make_subplots
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
-# ─── Logging (used by the FYERS -> NSE automatic fallback layer) ──────────
-logger = logging.getLogger("options_chain_dashboard")
+# ══════════════════════════════════════════════════════════════════════════
+# 1. LOGGING
+# ══════════════════════════════════════════════════════════════════════════
+
+logger = logging.getLogger("option_chain_dashboard")
 if not logger.handlers:
-    _log_handler = logging.StreamHandler()
-    _log_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
-    logger.addHandler(_log_handler)
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(
+        logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+    )
+    logger.addHandler(_handler)
 logger.setLevel(logging.INFO)
 
-# ─── Page Config ────────────────────────────────────────────────────────────
-# Guarded: set_page_config() must be Streamlit's first command and can only
-# run once per session. If this module is imported after app.py has already
-# executed any other Streamlit command (or if this module is re-imported),
-# Streamlit raises StreamlitAPIException here. That is a wiring/import-order
-# issue in the hosting app, not a bug in the dashboard's logic, so it is
-# caught and logged instead of crashing the whole app — the page title/icon/
-# layout simply won't be (re)applied in that case, but every other feature
-# below continues to work normally.
-try:
-    st.set_page_config(
-        page_title="Options Chain Dashboard",
-        page_icon="📊",
-        layout="wide",
-        initial_sidebar_state="expanded",
+
+# ══════════════════════════════════════════════════════════════════════════
+# 2. CONSTANTS
+# ══════════════════════════════════════════════════════════════════════════
+
+NSE_BASE_URL = "https://www.nseindia.com"
+NSE_INDEX_CHAIN_URL = f"{NSE_BASE_URL}/api/option-chain-indices"
+NSE_EQUITY_CHAIN_URL = f"{NSE_BASE_URL}/api/option-chain-equities"
+
+INDEX_SYMBOLS: dict[str, str] = {
+    "NIFTY": "NIFTY",
+    "BANKNIFTY": "BANKNIFTY",
+    "FINNIFTY": "FINNIFTY",
+    "MIDCPNIFTY": "MIDCPNIFTY",
+}
+
+# Default lot sizes used only as a starting point for GEX/DEX & notional
+# calculations. NSE revises lot sizes periodically (quarterly review), so
+# these are editable from the sidebar rather than trusted blindly.
+DEFAULT_LOT_SIZES: dict[str, int] = {
+    "NIFTY": 25,
+    "BANKNIFTY": 15,
+    "FINNIFTY": 25,
+    "MIDCPNIFTY": 50,
+    "_STOCK_DEFAULT": 1,
+}
+
+RISK_FREE_RATE = 0.07  # annualized, used only as a Black-Scholes input
+MIN_SIGMA = 0.01
+MAX_SIGMA = 5.0
+TRADING_DAYS_MIN_T = 0.25  # floor of 6 hours expressed in days, avoids T=0
+
+REQUEST_TIMEOUT = 10
+MAX_RETRIES = 3
+RETRY_BACKOFF_SECONDS = 1.5
+
+_NSE_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+    ),
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Referer": f"{NSE_BASE_URL}/option-chain",
+    "Connection": "keep-alive",
+}
+
+REQUIRED_CHAIN_COLUMNS = ["strike_price", "ce_ltp", "ce_oi", "pe_ltp", "pe_oi"]
+
+DARK_BG = "#0d1117"
+PANEL_BG = "#161b22"
+BORDER_COLOR = "#30363d"
+TEXT_MAIN = "#e6edf3"
+TEXT_MUTED = "#8b949e"
+GREEN = "#3fb950"
+RED = "#f85149"
+AMBER = "#d29922"
+BLUE = "#58a6ff"
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 3. HTTP / SESSION LAYER  (retry logic + timeout handling)
+# ══════════════════════════════════════════════════════════════════════════
+
+def _build_retrying_session() -> requests.Session:
+    """Build a requests.Session with connection-level retry (urllib3 Retry)
+    for transient network errors, on top of which fetch_json_with_retry()
+    adds an application-level retry loop for NSE's anti-bot / cookie
+    quirks (401s that resolve after a fresh warm-up)."""
+    session = requests.Session()
+    session.headers.update(_NSE_HEADERS)
+    retry_cfg = Retry(
+        total=MAX_RETRIES,
+        backoff_factor=RETRY_BACKOFF_SECONDS,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=("GET",),
+        raise_on_status=False,
     )
-except Exception as _page_config_err:  # noqa: BLE001 - st.errors.StreamlitAPIException etc.
-    logger.warning(
-        "st.set_page_config() was skipped: %s. This means it was not the first "
-        "Streamlit command executed this run (commonly because the hosting "
-        "app.py called a Streamlit command, or imported another module that "
-        "did, before importing option_chain). Move `from option_chain import "
-        "show_option_chain` to the very top of app.py, before any other `st.*` "
-        "call, to have this dashboard's page config apply.",
-        _page_config_err,
-    )
-
-# ─── Custom CSS ─────────────────────────────────────────────────────────────
-st.markdown("""
-<style>
-.stApp { background-color: #0d1117; }
-section[data-testid="stSidebar"] { background-color: #161b22; border-right: 1px solid #30363d; }
-
-div[data-testid="metric-container"] {
-    background: #161b22;
-    border: 1px solid #30363d;
-    border-radius: 8px;
-    padding: 16px 20px;
-}
-div[data-testid="metric-container"] label { color: #8b949e !important; font-size: 12px; text-transform: uppercase; letter-spacing: 0.08em; }
-div[data-testid="metric-container"] div[data-testid="stMetricValue"] { color: #e6edf3 !important; font-size: 22px; font-weight: 700; font-family: 'Courier New', monospace; }
-
-h1, h2, h3 { color: #e6edf3 !important; }
-.block-title { color: #58a6ff; font-size: 13px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.1em; margin-bottom: 8px; }
-
-.ce-badge { background: #0d3b2e; color: #3fb950; border: 1px solid #238636; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 700; }
-.pe-badge { background: #3b0d1a; color: #f85149; border: 1px solid #da3633; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 700; }
-
-button[data-baseweb="tab"] { color: #8b949e !important; }
-button[data-baseweb="tab"][aria-selected="true"] { color: #58a6ff !important; border-bottom: 2px solid #58a6ff; }
-
-.stDataFrame { border: 1px solid #30363d; border-radius: 8px; overflow: hidden; }
-hr { border-color: #30363d; }
-
-.signal-bull { background: #0d3b2e; color: #3fb950; border: 1px solid #238636; padding: 4px 14px; border-radius: 20px; font-size: 13px; font-weight: 700; display: inline-block; }
-.signal-bear { background: #3b0d1a; color: #f85149; border: 1px solid #da3633; padding: 4px 14px; border-radius: 20px; font-size: 13px; font-weight: 700; display: inline-block; }
-.signal-neu  { background: #1c2128; color: #d29922; border: 1px solid #9e6a03; padding: 4px 14px; border-radius: 20px; font-size: 13px; font-weight: 700; display: inline-block; }
-
-.badge-explosive { background: #0d3b2e; color: #3fb950; border: 1px solid #238636; padding: 3px 10px; border-radius: 6px; font-size: 12px; font-weight: 700; }
-.badge-strong    { background: #123524; color: #7ee787; border: 1px solid #238636; padding: 3px 10px; border-radius: 6px; font-size: 12px; font-weight: 700; }
-.badge-watch     { background: #1c2128; color: #d29922; border: 1px solid #9e6a03; padding: 3px 10px; border-radius: 6px; font-size: 12px; font-weight: 700; }
-.badge-ignore    { background: #161b22; color: #8b949e; border: 1px solid #30363d; padding: 3px 10px; border-radius: 6px; font-size: 12px; font-weight: 700; }
-
-.intel-card { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 14px 16px; margin-bottom: 8px; }
-.intel-label { color: #8b949e; font-size: 11px; text-transform: uppercase; letter-spacing: .08em; }
-.intel-value { color: #e6edf3; font-size: 20px; font-weight: 700; font-family: 'Courier New', monospace; }
-
-.rating-strongbuy { background:#0d3b2e; color:#3fb950; border:1px solid #238636; padding:3px 10px; border-radius:6px; font-size:12px; font-weight:700; }
-.rating-buy        { background:#123524; color:#7ee787; border:1px solid #238636; padding:3px 10px; border-radius:6px; font-size:12px; font-weight:700; }
-.rating-hold       { background:#3a2f05; color:#d29922; border:1px solid #9e6a03; padding:3px 10px; border-radius:6px; font-size:12px; font-weight:700; }
-.rating-avoid      { background:#3a2405; color:#e8823a; border:1px solid #b5650a; padding:3px 10px; border-radius:6px; font-size:12px; font-weight:700; }
-.rating-ignore     { background:#3b0d1a; color:#f85149; border:1px solid #da3633; padding:3px 10px; border-radius:6px; font-size:12px; font-weight:700; }
-
-/* ── Gamma Build-up Analyzer: blink animations ────────────────────────── */
-@keyframes gammaBlinkGreen {
-    0%   { background-color: #0d3b2e; }
-    50%  { background-color: #1d5c3f; }
-    100% { background-color: #0d3b2e; }
-}
-@keyframes gammaBlinkRed {
-    0%   { background-color: #3b0d1a; }
-    50%  { background-color: #5c1d2c; }
-    100% { background-color: #3b0d1a; }
-}
-.gamma-table { width: 100%; border-collapse: collapse; font-family: 'Courier New', monospace; font-size: 12.5px; }
-.gamma-table th {
-    background: #1F4E78; color: #ffffff; padding: 8px 10px; text-align: center;
-    position: sticky; top: 0; font-size: 11px; text-transform: uppercase; letter-spacing: .04em;
-}
-.gamma-table td { padding: 7px 10px; text-align: center; border-bottom: 1px solid #21262d; color: #e6edf3; }
-.gamma-row-strongbuy { background-color: #0d3b2e; }
-.gamma-row-buy       { background-color: #123524; }
-.gamma-row-hold      { background-color: #1c2128; }
-.gamma-row-sell      { background-color: #2b1a05; }
-.gamma-row-strongsell{ background-color: #3b0d1a; }
-.gamma-row-blink-green { animation: gammaBlinkGreen 1.1s infinite; }
-.gamma-row-blink-red   { animation: gammaBlinkRed 1.1s infinite; }
-.gamma-live-badge {
-    background: #238636; color: #fff; padding: 3px 10px; border-radius: 12px;
-    font-size: 11px; font-weight: 700; letter-spacing: .05em; animation: gammaBlinkGreen 1.4s infinite;
-}
-.swing-top-badge { background:#3b0d1a; color:#f85149; border:1px solid #da3633; padding:2px 8px; border-radius:4px; font-size:11px; font-weight:700; }
-.swing-bottom-badge { background:#0d3b2e; color:#3fb950; border:1px solid #238636; padding:2px 8px; border-radius:4px; font-size:11px; font-weight:700; }
-</style>
-""", unsafe_allow_html=True)
+    adapter = HTTPAdapter(max_retries=retry_cfg)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
 
 
-def _safe_cell(val) -> str:
-    """HTML-escape any value before it's interpolated into a raw <td>/<th>
-    string. Every render_*_html_table() function in this file builds markup
-    by string-formatting values straight from the DataFrame; without this,
-    a stray '<', '>', '&' in a symbol/reason string (or a bare NaN) could
-    corrupt the table markup or render as literal HTML. Applied at every
-    call site that interpolates a cell value (see FIX NOTE 6)."""
-    if val is None:
-        return ""
+@st.cache_resource(show_spinner=False)
+def get_nse_session() -> requests.Session:
+    """One warmed-up session per Streamlit server process. Cached as a
+    resource (not data) since requests.Session objects are not picklable
+    in a meaningful way and must be reused, not recreated, per refresh."""
+    session = _build_retrying_session()
+    _warm_up_session(session)
+    return session
+
+
+def _warm_up_session(session: requests.Session) -> bool:
+    """NSE requires a same-session cookie obtained by first hitting the
+    website itself before the JSON API will respond with data (otherwise
+    it returns 401/403). Never raises — a failed warm-up degrades to a
+    later fetch failure that is itself handled gracefully."""
     try:
-        if isinstance(val, float) and math.isnan(val):
-            return ""
-    except (TypeError, ValueError):
-        pass
-    s = str(val)
-    return (
-        s.replace("&", "&amp;")
-         .replace("<", "&lt;")
-         .replace(">", "&gt;")
-         .replace('"', "&quot;")
-    )
+        session.get(NSE_BASE_URL, timeout=REQUEST_TIMEOUT)
+        session.get(f"{NSE_BASE_URL}/option-chain", timeout=REQUEST_TIMEOUT)
+        return True
+    except requests.exceptions.RequestException as e:
+        logger.warning("NSE session warm-up failed (will retry on next fetch): %s", e)
+        return False
 
 
-# ══════════════════════════════════════════════════════════════════════════
-# 1. SYMBOL HANDLING  (fixes NIFTYNEXT50 / SENSEX / BANKEX / F&O stocks)
-# ══════════════════════════════════════════════════════════════════════════
-
-INDEX_SYMBOL_CANDIDATES = {
-    "NIFTY":       ["NSE:NIFTY50-INDEX"],
-    "BANKNIFTY":   ["NSE:NIFTYBANK-INDEX", "NSE:BANKNIFTY-INDEX"],
-    "FINNIFTY":    ["NSE:FINNIFTY-INDEX"],
-    "MIDCPNIFTY":  ["NSE:MIDCPNIFTY-INDEX", "NSE:MIDCAPNIFTY-INDEX"],
-    "NIFTYNEXT50": ["NSE:NIFTYNEXT50-INDEX", "NSE:NIFTYNXT50-INDEX", "NSE:NIFTY_NEXT_50-INDEX"],
-    "SENSEX":      ["BSE:SENSEX-INDEX", "BSE:SENSEX-INDEX50"],
-    "BANKEX":      ["BSE:BANKEX-INDEX"],
-}
-
-
-def get_stock_symbol_candidates(stock: str) -> list:
-    base = stock.strip().upper()
-    if base.endswith("-EQ"):
-        base = base[:-3]
-    if ":" in base:
-        base = base.split(":")[-1]
-    return [f"NSE:{base}-EQ", f"NSE:{base}"]
-
-
-def normalize_symbol(stock: str, with_eq: bool = False) -> str:
-    stock = stock.strip().upper()
-    if stock.endswith("-EQ"):
-        stock = stock[:-3]
-    if ":" in stock:
-        stock = stock.split(":")[-1]
-    return f"NSE:{stock}-EQ" if with_eq else f"NSE:{stock}"
-
-
-def fetch_optionchain_with_fallback(fyers, symbol_candidates: list, strikecount: int,
-                                     expiry_timestamp: str = ""):
-    attempts = []
-    last_response = None
-    for sym in symbol_candidates:
-        req = {"symbol": sym, "strikecount": int(strikecount)}
-        if expiry_timestamp and str(expiry_timestamp).strip():
-            req["timestamp"] = str(expiry_timestamp).strip()
+def fetch_json_with_retry(
+    session: requests.Session, url: str, params: Optional[dict] = None,
+    max_retries: int = MAX_RETRIES,
+) -> tuple[Optional[dict], Optional[str]]:
+    """Fetches JSON with an application-level retry loop. Returns
+    (payload, error_message) — payload is None on failure, with a
+    human-readable error_message explaining why. Handles: connection
+    errors, timeouts, non-200 status, invalid/empty JSON, and NSE's
+    occasional stale-cookie 401 (recovered via a fresh warm-up + retry)."""
+    last_error = "Unknown error"
+    for attempt in range(1, max_retries + 1):
         try:
-            resp = fyers.optionchain(data=req)
-        except Exception as e:  # noqa: BLE001 - external SDK, keep resilient
-            attempts.append((sym, f"exception: {e}"))
+            resp = session.get(url, params=params, timeout=REQUEST_TIMEOUT)
+        except requests.exceptions.Timeout:
+            last_error = f"Timeout on attempt {attempt}/{max_retries}"
+            logger.warning("%s for %s", last_error, url)
+            time.sleep(RETRY_BACKOFF_SECONDS * attempt)
             continue
-        status = resp.get("s") if isinstance(resp, dict) else "no response"
-        attempts.append((sym, status))
-        last_response = resp
-        if isinstance(resp, dict) and resp.get("s") == "ok":
-            chain, _ = extract_options_data(resp)
-            if chain:
-                return resp, sym, attempts
-    return last_response, symbol_candidates[-1] if symbol_candidates else "", attempts
+        except requests.exceptions.ConnectionError as e:
+            last_error = f"Connection error on attempt {attempt}/{max_retries}: {e}"
+            logger.warning(last_error)
+            time.sleep(RETRY_BACKOFF_SECONDS * attempt)
+            continue
+        except requests.exceptions.RequestException as e:
+            last_error = f"Request exception on attempt {attempt}/{max_retries}: {e}"
+            logger.warning(last_error)
+            time.sleep(RETRY_BACKOFF_SECONDS * attempt)
+            continue
+
+        if resp.status_code in (401, 403):
+            last_error = f"HTTP {resp.status_code} (stale session) on attempt {attempt}/{max_retries}"
+            logger.warning("%s — re-warming NSE session and retrying", last_error)
+            _warm_up_session(session)
+            time.sleep(RETRY_BACKOFF_SECONDS * attempt)
+            continue
+
+        if resp.status_code != 200:
+            last_error = f"HTTP {resp.status_code} on attempt {attempt}/{max_retries}"
+            logger.warning(last_error)
+            time.sleep(RETRY_BACKOFF_SECONDS * attempt)
+            continue
+
+        try:
+            payload = resp.json()
+        except ValueError as e:
+            last_error = f"Invalid JSON on attempt {attempt}/{max_retries}: {e}"
+            logger.warning(last_error)
+            time.sleep(RETRY_BACKOFF_SECONDS * attempt)
+            continue
+
+        if not payload:
+            last_error = f"Empty JSON payload on attempt {attempt}/{max_retries}"
+            logger.warning(last_error)
+            time.sleep(RETRY_BACKOFF_SECONDS * attempt)
+            continue
+
+        return payload, None
+
+    logger.error("fetch_json_with_retry exhausted all retries for %s: %s", url, last_error)
+    return None, last_error
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# 2. EXPIRY HANDLING
+# 4. DATA FETCH + PARSE LAYER
 # ══════════════════════════════════════════════════════════════════════════
 
-def format_expiry_label(ts) -> str:
-    try:
-        return datetime.fromtimestamp(int(float(ts))).strftime("%d-%b-%Y")
-    except (TypeError, ValueError, OSError):
-        return str(ts)
+def normalize_stock_symbol(raw: str) -> str:
+    s = (raw or "").strip().upper()
+    if s.endswith("-EQ"):
+        s = s[:-3]
+    if ":" in s:
+        s = s.split(":")[-1]
+    return s
 
 
-def _to_int_ts(ts) -> int:
+@st.cache_data(ttl=15, show_spinner=False)
+def fetch_option_chain_raw(symbol: str, is_index: bool) -> dict:
+    """Cached (15s TTL) raw NSE option-chain JSON fetch. Returns a dict
+    that always has the keys 'ok', 'payload', 'error' so callers never
+    need to guess the shape of a failure. Cached at the Streamlit level
+    so rapid re-renders (widget interactions) don't re-hit NSE."""
+    session = get_nse_session()
+    url = NSE_INDEX_CHAIN_URL if is_index else NSE_EQUITY_CHAIN_URL
+    payload, error = fetch_json_with_retry(session, url, params={"symbol": symbol})
+    if payload is None:
+        return {"ok": False, "payload": None, "error": error or "No data returned."}
+    records = payload.get("records") if isinstance(payload, dict) else None
+    if not isinstance(records, dict) or not records.get("data"):
+        return {"ok": False, "payload": payload, "error": "Response had no option-chain records."}
+    return {"ok": True, "payload": payload, "error": None}
+
+
+def _safe_num(val: Any, default: float = 0.0) -> float:
     try:
-        return int(float(ts))
+        if val is None:
+            return default
+        f = float(val)
+        if math.isnan(f) or math.isinf(f):
+            return default
+        return f
     except (TypeError, ValueError):
-        return 0
+        return default
 
 
-def extract_raw_expiry_payload(response: dict) -> list:
-    data = response.get("data", {}) if isinstance(response, dict) else {}
-    raw = data.get("expiryData") or data.get("expirydata") or []
-    return raw if isinstance(raw, list) else []
+def parse_option_chain(payload: dict, preferred_expiry: str = "") -> tuple[pd.DataFrame, dict]:
+    """Parses NSE's raw option-chain payload into a flat, numeric,
+    NaN-free DataFrame plus a metadata dict (spot price, expiry list,
+    selected expiry, fetch timestamp). Never raises: malformed rows are
+    skipped individually rather than aborting the whole parse."""
+    meta = {
+        "spot_price": 0.0, "expiry_dates": [], "selected_expiry": "",
+        "fetched_at": datetime.now(), "total_rows_seen": 0, "rows_parsed": 0,
+    }
+    records = payload.get("records", {}) if isinstance(payload, dict) else {}
+    chain = records.get("data", []) if isinstance(records, dict) else []
+    meta["spot_price"] = _safe_num(records.get("underlyingValue"))
+    expiry_dates = records.get("expiryDates", []) or []
+    meta["expiry_dates"] = expiry_dates
 
+    if not chain:
+        return pd.DataFrame(), meta
 
-def extract_expiry_list(response: dict) -> list:
-    raw = extract_raw_expiry_payload(response)
-    out = []
-    for item in raw:
+    selected_expiry = preferred_expiry if preferred_expiry in expiry_dates else (
+        expiry_dates[0] if expiry_dates else ""
+    )
+    meta["selected_expiry"] = selected_expiry
+
+    rows = []
+    meta["total_rows_seen"] = len(chain)
+    for item in chain:
         if not isinstance(item, dict):
             continue
-        ts = item.get("expiry") or item.get("timestamp")
-        if ts is None:
+        if selected_expiry and item.get("expiryDate") != selected_expiry:
             continue
-        out.append((format_expiry_label(ts), str(ts)))
-    seen = set()
-    deduped = []
-    for label, ts in out:
-        if ts not in seen:
-            seen.add(ts)
-            deduped.append((label, ts))
-    deduped.sort(key=lambda x: _to_int_ts(x[1]))
-    return deduped
+        strike = item.get("strikePrice")
+        if strike is None:
+            continue
+        ce, pe = item.get("CE") or {}, item.get("PE") or {}
+        rows.append({
+            "strike_price": _safe_num(strike),
+            "ce_ltp": _safe_num(ce.get("lastPrice")),
+            "ce_change": _safe_num(ce.get("change")),
+            "ce_bid": _safe_num(ce.get("bidprice")),
+            "ce_bid_qty": _safe_num(ce.get("bidQty")),
+            "ce_ask": _safe_num(ce.get("askPrice")),
+            "ce_ask_qty": _safe_num(ce.get("askQty")),
+            "ce_volume": _safe_num(ce.get("totalTradedVolume")),
+            "ce_oi": _safe_num(ce.get("openInterest")),
+            "ce_chng_oi": _safe_num(ce.get("changeinOpenInterest")),
+            "ce_oi_change_pct": _safe_num(ce.get("pchangeinOpenInterest")),
+            "ce_iv": _safe_num(ce.get("impliedVolatility")),
+            "pe_ltp": _safe_num(pe.get("lastPrice")),
+            "pe_change": _safe_num(pe.get("change")),
+            "pe_bid": _safe_num(pe.get("bidprice")),
+            "pe_bid_qty": _safe_num(pe.get("bidQty")),
+            "pe_ask": _safe_num(pe.get("askPrice")),
+            "pe_ask_qty": _safe_num(pe.get("askQty")),
+            "pe_volume": _safe_num(pe.get("totalTradedVolume")),
+            "pe_oi": _safe_num(pe.get("openInterest")),
+            "pe_chng_oi": _safe_num(pe.get("changeinOpenInterest")),
+            "pe_oi_change_pct": _safe_num(pe.get("pchangeinOpenInterest")),
+            "pe_iv": _safe_num(pe.get("impliedVolatility")),
+        })
+
+    meta["rows_parsed"] = len(rows)
+    if not rows:
+        return pd.DataFrame(), meta
+
+    df = pd.DataFrame(rows)
+    df = df.groupby("strike_price", as_index=False).first()
+    df.sort_values("strike_price", inplace=True)
+    df.reset_index(drop=True, inplace=True)
+    return df, meta
 
 
-def classify_expiries(expiry_list: list) -> list:
-    if not expiry_list:
-        return []
-    by_month = defaultdict(list)
-    for label, ts in expiry_list:
-        dt = datetime.fromtimestamp(_to_int_ts(ts)) if _to_int_ts(ts) else None
-        key = (dt.year, dt.month) if dt else ("unknown", ts)
-        by_month[key].append((label, ts, dt))
-    monthly_ts = set()
-    for _, items in by_month.items():
-        items_sorted = sorted(items, key=lambda x: _to_int_ts(x[1]))
-        monthly_ts.add(items_sorted[-1][1])
-    return [(label, ts, "Monthly" if ts in monthly_ts else "Weekly") for label, ts in expiry_list]
+def validate_chain_df(df: pd.DataFrame) -> bool:
+    try:
+        if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+            return False
+        if not all(c in df.columns for c in REQUIRED_CHAIN_COLUMNS):
+            return False
+        strikes = pd.to_numeric(df["strike_price"], errors="coerce").dropna()
+        return bool((strikes > 0).sum() > 0)
+    except Exception as e:  # noqa: BLE001 - validation must never raise
+        logger.error("validate_chain_df raised an exception: %s", e)
+        return False
 
 
-def fetch_expiry_list(fyers, symbol_candidates: list) -> tuple:
-    response, used_symbol, _ = fetch_optionchain_with_fallback(
-        fyers, symbol_candidates, strikecount=2, expiry_timestamp=""
-    )
-    if not response or response.get("s") != "ok":
-        return [], "", []
-    return extract_expiry_list(response), used_symbol, extract_raw_expiry_payload(response)
+def filter_strikes_around_atm(df: pd.DataFrame, spot: float, n_each_side: int) -> pd.DataFrame:
+    if df is None or df.empty or n_each_side <= 0:
+        return df
+    d = df.sort_values("strike_price").reset_index(drop=True)
+    ref = spot if spot else float(d["strike_price"].median())
+    atm_idx = int((d["strike_price"] - ref).abs().idxmin())
+    lo = max(0, atm_idx - n_each_side)
+    hi = min(len(d), atm_idx + n_each_side + 1)
+    return d.iloc[lo:hi].reset_index(drop=True)
 
 
-# ══════════════════════════════════════════════════════════════════════════
-# 3. RESPONSE PARSING
-# ══════════════════════════════════════════════════════════════════════════
-
-def extract_options_data(response: dict):
-    data = response.get("data", {}) if isinstance(response, dict) else {}
-    if isinstance(data, dict):
-        for key in ("options", "optionsChain", "optionschain", "data"):
-            candidate = data.get(key)
-            if isinstance(candidate, list) and len(candidate) > 0:
-                return candidate, data
-    if isinstance(data, list) and len(data) > 0:
-        return data, {}
-    return [], data
-
-
-def extract_spot_price(response: dict, data) -> float:
-    candidates = []
-    if isinstance(data, dict):
-        candidates.extend([
-            data.get("ltp"), data.get("spot_price"), data.get("spotPrice"),
-            data.get("underlyingValue"), data.get("underlying_value"),
-            data.get("underlyingLtp"), data.get("underlying_ltp"),
-        ])
-    if isinstance(response, dict):
-        candidates.extend([
-            response.get("ltp"), response.get("spot_price"), response.get("spotPrice"),
-            response.get("underlyingValue"), response.get("underlying_value"),
-        ])
-    for val in candidates:
+def parse_days_to_expiry(expiry_label: str) -> float:
+    """Returns days-to-expiry, floored at TRADING_DAYS_MIN_T so Black-
+    Scholes never divides by (or takes log against) T=0 on expiry day."""
+    if not expiry_label:
+        return 7.0
+    for fmt in ("%d-%b-%Y", "%d-%m-%Y", "%Y-%m-%d"):
         try:
-            f = float(val)
-            if f > 0:
-                return f
-        except (TypeError, ValueError):
+            exp_dt = datetime.strptime(expiry_label, fmt)
+            delta_days = (exp_dt.replace(hour=15, minute=30) - datetime.now()).total_seconds() / 86400
+            return max(delta_days, TRADING_DAYS_MIN_T)
+        except ValueError:
             continue
-    return 0.0
-
-
-def normalize_chain_shape(options_data: list) -> pd.DataFrame:
-    """
-    FYERS/NSE option-chain payloads have been observed under multiple shapes
-    AND multiple field-name spellings for the same data — most critically
-    for OI Change, which is why "CE OI Change" / "PE OI Change" previously
-    displayed 0 for every strike regardless of the real value.
-
-    ROOT CAUSE (fixed here): the old field_map only recognised the exact,
-    case-sensitive source keys "chng_oi" / "change_oi" / "oi_change". Any
-    other real-world spelling — "changeinOpenInterest" (NSE-style),
-    "changeInOpenInterest", "oiChange", "changeOI", "oich", "chgoi", etc,
-    OR a wide-shaped payload whose ce_/pe_ columns use a different ΔOI
-    suffix entirely — was silently ignored, so ce_chng_oi/pe_chng_oi never
-    existed and ensure_numeric_columns() unconditionally back-filled them
-    with a hardcoded 0. This function now resolves ANY known OI-Change
-    spelling, case-insensitively, for both the long shape (below) and the
-    already-wide shape (see resolve_oi_change_aliases(), applied by the
-    caller after this function returns) — 0 is now only ever displayed
-    when the OI Change genuinely is zero.
-    """
-    raw = pd.DataFrame(options_data)
-    if raw.empty:
-        return raw
-
-    if any(c.startswith("ce_") or c.startswith("pe_") for c in raw.columns):
-        # Already wide-shaped. Still resolve OI-Change aliases in case the
-        # API used a suffix other than "chng_oi" (e.g. ce_oich, ce_oiChange).
-        return resolve_oi_change_aliases(raw)
-
-    type_col = next(
-        (c for c in ("option_type", "optionType", "type", "instrument_type") if c in raw.columns),
-        None,
-    )
-    if type_col is None:
-        return raw
-
-    raw[type_col] = raw[type_col].astype(str).str.upper()
-
-    # Case-insensitive alias resolution for the long-shape source columns.
-    # Every column in `raw` is matched (ignoring case/underscores) against
-    # every known spelling for oi / ltp / volume / OI-change / iv, and
-    # renamed to the single canonical name the rest of this file expects.
-    CANONICAL_FIELD_ALIASES = {
-        "oi": {"oi", "open_interest", "openinterest"},
-        "ltp": {"ltp", "last_price", "lastprice"},
-        "volume": {"volume", "vol", "totaltradedvolume", "traded_volume"},
-        "chng_oi": OI_CHANGE_FIELD_ALIASES,
-        "iv": {"iv", "implied_volatility", "impliedvolatility"},
-    }
-    normalized_lookup = {_normalize_field_name(c): c for c in raw.columns}
-    rename_map = {}
-    for canonical, aliases in CANONICAL_FIELD_ALIASES.items():
-        for alias in aliases:
-            actual_col = normalized_lookup.get(_normalize_field_name(alias))
-            if actual_col:
-                rename_map[actual_col] = canonical
-                break
-    raw_renamed = raw.rename(columns=rename_map)
-    value_cols = [c for c in ("oi", "ltp", "volume", "chng_oi", "iv") if c in raw_renamed.columns]
-
-    ce_df = raw_renamed[raw_renamed[type_col] == "CE"][["strike_price"] + value_cols].copy()
-    pe_df = raw_renamed[raw_renamed[type_col] == "PE"][["strike_price"] + value_cols].copy()
-    ce_df.rename(columns={c: f"ce_{c}" for c in value_cols}, inplace=True)
-    pe_df.rename(columns={c: f"pe_{c}" for c in value_cols}, inplace=True)
-
-    return pd.merge(ce_df, pe_df, on="strike_price", how="outer")
-
-
-# Every OI-Change spelling observed across FYERS/NSE/third-party payloads,
-# matched case-insensitively with underscores stripped (see
-# _normalize_field_name). Add new spellings here if a future API variant
-# uses yet another name — nothing else in this file needs to change.
-OI_CHANGE_FIELD_ALIASES = {
-    "chng_oi", "change_oi", "oi_change", "changeinopeninterest",
-    "changeinopeninterest_", "changeopeninterest", "oichange", "oich",
-    "changeoi", "chgoi", "oi_chg", "deltaoi", "delta_oi", "oidelta",
-    "oi_delta", "netchangeoi", "net_change_oi",
-}
-
-
-def _normalize_field_name(name: str) -> str:
-    """Case/underscore/space-insensitive key for matching field-name
-    aliases, e.g. 'changeinOpenInterest' and 'change_in_open_interest'
-    and 'CHANGE_IN_OPEN_INTEREST' all normalize to the same string."""
-    return str(name).strip().lower().replace("_", "").replace(" ", "")
-
-
-def resolve_oi_change_aliases(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Catches the wide-shape case: the payload already has ce_/pe_ prefixed
-    columns, but the OI-Change field itself might be named ce_oich,
-    ce_changeInOpenInterest, ce_oiChange, etc. instead of ce_chng_oi. If
-    ce_chng_oi/pe_chng_oi are missing OR are present but entirely zero
-    while an alias column with real (non-zero) data exists, this copies
-    the alias's values in — never overwrites a column that already has
-    genuine non-zero data.
-    """
-    if df is None or df.empty:
-        return df
-    d = df.copy()
-    normalized_lookup = {_normalize_field_name(c): c for c in d.columns}
-    for side in ("ce", "pe"):
-        target = f"{side}_chng_oi"
-        target_has_signal = target in d.columns and pd.to_numeric(
-            d[target], errors="coerce"
-        ).fillna(0).abs().sum() > 0
-        if target_has_signal:
-            continue
-        for alias in OI_CHANGE_FIELD_ALIASES:
-            candidate_key = _normalize_field_name(f"{side}_{alias}")
-            actual_col = normalized_lookup.get(candidate_key)
-            if actual_col and actual_col != target:
-                candidate_vals = pd.to_numeric(d[actual_col], errors="coerce").fillna(0)
-                if candidate_vals.abs().sum() > 0:
-                    d[target] = candidate_vals
-                    logger.info(
-                        "OI Change alias resolved: %s -> %s (found real non-zero data)",
-                        actual_col, target,
-                    )
-                    break
-    return d
-
-
-OI_CHANGE_SNAPSHOT_KEY = "oc_oi_change_prev_snapshot"
-
-
-def _strike_snapshot_key(strike_price) -> str:
-    """Single, dtype-independent formatting for strike-price snapshot keys.
-    Without this, a DataFrame row visited via iterrows() can silently
-    upcast strike_price from int to float partway through a function (as
-    soon as any OTHER column in the same row becomes float64, pandas
-    unifies the whole row's dtype for that iteration) — producing '100'
-    at one point and '100.0' at another for the exact same strike, which
-    would otherwise cause the previous-snapshot lookup to silently miss."""
-    return f"{float(strike_price):.4f}"
-
-
-def apply_oi_change_snapshot_fallback(df: pd.DataFrame, symbol: str, expiry_label: str) -> pd.DataFrame:
-    """
-    Final fallback layer for OI Change, run every refresh regardless of
-    source: if ce_chng_oi/pe_chng_oi are still all-zero across every
-    strike after alias resolution above (meaning neither FYERS nor NSE
-    supplied a usable ΔOI field this time), OI Change is computed directly
-    as Current OI - Previous OI, using this session's own last snapshot
-    for the same symbol+expiry+strike (stored in st.session_state, the
-    same pattern the Gamma Analyzer already uses). On the very first fetch
-    for a symbol+expiry there is no prior snapshot yet, so OI Change is
-    legitimately 0 that one time — this is an inherent property of a
-    single point-in-time API, not a bug, and resolves itself from the next
-    refresh onward. Never overwrites a column that already has real data.
-    """
-    if df is None or df.empty:
-        return df
-    d = df.copy()
-    history = st.session_state.setdefault(OI_CHANGE_SNAPSHOT_KEY, {})
-    hist_key = f"{symbol}|{expiry_label}"
-    prev_strikes = history.get(hist_key, {})
-
-    for side in ("ce", "pe"):
-        oi_col, chng_col = f"{side}_oi", f"{side}_chng_oi"
-        if oi_col not in d.columns:
-            continue
-        if chng_col not in d.columns:
-            d[chng_col] = 0.0
-        has_real_signal = pd.to_numeric(d[chng_col], errors="coerce").fillna(0).abs().sum() > 0
-        if has_real_signal:
-            continue  # API/alias already supplied genuine (non-zero) data
-        recomputed = []
-        for _, row in d.iterrows():
-            strike_key = _strike_snapshot_key(row.get("strike_price"))
-            cur_oi = float(pd.to_numeric(row.get(oi_col), errors="coerce") or 0)
-            prev_oi = prev_strikes.get(f"{side}|{strike_key}")
-            recomputed.append(cur_oi - prev_oi if prev_oi is not None else 0.0)
-        d[chng_col] = recomputed
-        logger.info(
-            "OI Change (%s) recomputed from session snapshot (Current OI - Previous OI) "
-            "for %s — no non-zero ΔOI field was found in the API response.",
-            side.upper(), hist_key,
-        )
-
-    new_snapshot = {}
-    for side in ("ce", "pe"):
-        oi_col = f"{side}_oi"
-        if oi_col not in d.columns:
-            continue
-        for _, row in d.iterrows():
-            strike_key = _strike_snapshot_key(row.get("strike_price"))
-            new_snapshot[f"{side}|{strike_key}"] = float(pd.to_numeric(row.get(oi_col), errors="coerce") or 0)
-    history[hist_key] = new_snapshot
-    st.session_state[OI_CHANGE_SNAPSHOT_KEY] = history
-    return d
-
-
-def audit_oi_change(df: pd.DataFrame, symbol: str, expiry_label: str) -> pd.DataFrame:
-    """
-    Builds the "OI Change Audit" table shown in debug mode: Current OI,
-    Previous OI (from this session's snapshot, if any), and the final
-    displayed OI Change, per strike/side — so a mismatch between what the
-    API sent and what's on screen can be verified directly instead of
-    just trusted.
-    """
-    if df is None or df.empty:
-        return pd.DataFrame()
-    history = st.session_state.get(OI_CHANGE_SNAPSHOT_KEY, {})
-    hist_key = f"{symbol}|{expiry_label}"
-    prev_strikes = history.get(hist_key, {})
-    rows = []
-    for _, row in df.iterrows():
-        strike = row.get("strike_price")
-        rec = {"Strike": strike}
-        for side in ("ce", "pe"):
-            cur_oi = row.get(f"{side}_oi", 0)
-            prev_oi = prev_strikes.get(f"{side}|{_strike_snapshot_key(strike)}")
-            rec[f"{side.upper()} Current OI"] = cur_oi
-            rec[f"{side.upper()} Previous OI"] = prev_oi if prev_oi is not None else "—"
-            rec[f"{side.upper()} Displayed ΔOI"] = row.get(f"{side}_chng_oi", 0)
-        rows.append(rec)
-    return pd.DataFrame(rows)
-
-
-def ensure_numeric_columns(df: pd.DataFrame) -> pd.DataFrame:
-    num_cols = ["strike_price", "ce_ltp", "ce_oi", "ce_volume", "ce_chng_oi",
-                "pe_ltp", "pe_oi", "pe_volume", "pe_chng_oi", "ce_iv", "pe_iv"]
-    df = df.copy()
-    for col in num_cols:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
-        else:
-            df[col] = 0
-    return df
+    return 7.0
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# 4. CORE ANALYTICS
+# 5. GREEKS ENGINE  (Black-Scholes: Delta / Gamma / Theta / Vega)
 # ══════════════════════════════════════════════════════════════════════════
-
-def calculate_max_pain(df: pd.DataFrame) -> float:
-    if df.empty:
-        return 0.0
-    strikes = df["strike_price"].values
-    ce_oi = df["ce_oi"].values
-    pe_oi = df["pe_oi"].values
-    pain = [
-        np.sum(np.maximum(s - strikes, 0) * ce_oi) + np.sum(np.maximum(strikes - s, 0) * pe_oi)
-        for s in strikes
-    ]
-    return float(strikes[int(np.argmin(pain))]) if pain else 0.0
-
-
-def pcr_signal(pcr: float) -> str:
-    if pcr > 1.3:
-        return '<span class="signal-bull">🟢 Bullish (High PCR)</span>'
-    elif pcr < 0.7:
-        return '<span class="signal-bear">🔴 Bearish (Low PCR)</span>'
-    return '<span class="signal-neu">🟡 Neutral</span>'
-
 
 def _norm_cdf(x: float) -> float:
     return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
 
 
-def _bs_price(spot, strike, t, r, sigma, is_call: bool) -> float:
+def _norm_pdf(x: float) -> float:
+    return math.exp(-0.5 * x * x) / math.sqrt(2.0 * math.pi)
+
+
+def bs_greeks(spot: float, strike: float, t_years: float, r: float, sigma: float,
+              is_call: bool) -> dict[str, float]:
+    """Standard Black-Scholes Greeks. sigma is annualized volatility as a
+    fraction (0.18, not 18). Returns zeros (not NaN/inf) on any degenerate
+    input so downstream DataFrame math never has to special-case this."""
+    if spot <= 0 or strike <= 0 or t_years <= 0 or sigma <= 0:
+        return {"delta": 0.0, "gamma": 0.0, "theta": 0.0, "vega": 0.0}
+    sigma = min(max(sigma, MIN_SIGMA), MAX_SIGMA)
+    sqrt_t = math.sqrt(t_years)
+    try:
+        d1 = (math.log(spot / strike) + (r + 0.5 * sigma ** 2) * t_years) / (sigma * sqrt_t)
+        d2 = d1 - sigma * sqrt_t
+    except (ValueError, ZeroDivisionError):
+        return {"delta": 0.0, "gamma": 0.0, "theta": 0.0, "vega": 0.0}
+
+    pdf_d1 = _norm_pdf(d1)
+    gamma = pdf_d1 / (spot * sigma * sqrt_t)
+    vega = spot * pdf_d1 * sqrt_t / 100.0  # per 1% (i.e. 0.01) change in vol
+
+    if is_call:
+        delta = _norm_cdf(d1)
+        theta = (
+            -(spot * pdf_d1 * sigma) / (2 * sqrt_t)
+            - r * strike * math.exp(-r * t_years) * _norm_cdf(d2)
+        ) / 365.0
+    else:
+        delta = _norm_cdf(d1) - 1.0
+        theta = (
+            -(spot * pdf_d1 * sigma) / (2 * sqrt_t)
+            + r * strike * math.exp(-r * t_years) * _norm_cdf(-d2)
+        ) / 365.0
+
+    return {
+        "delta": round(delta, 4), "gamma": round(gamma, 6),
+        "theta": round(theta, 4), "vega": round(vega, 4),
+    }
+
+
+def add_greeks_columns(df: pd.DataFrame, spot: float, expiry_label: str,
+                        r: float = RISK_FREE_RATE) -> pd.DataFrame:
+    """Adds ce_delta/ce_gamma/ce_theta/ce_vega and pe_* equivalents,
+    computed from each strike's own NSE-supplied IV. Strikes with IV<=0
+    (illiquid / no trades) get all-zero Greeks rather than a fabricated
+    fallback volatility, since a fabricated IV would silently mislead
+    the AI engine and GEX/DEX calculations that consume these columns."""
+    d = df.copy()
+    if d.empty:
+        for col in ("ce_delta", "ce_gamma", "ce_theta", "ce_vega",
+                    "pe_delta", "pe_gamma", "pe_theta", "pe_vega"):
+            d[col] = 0.0
+        return d
+
+    t_years = parse_days_to_expiry(expiry_label) / 365.0
+
+    ce_g = d.apply(
+        lambda row: bs_greeks(spot, row["strike_price"], t_years, r, row["ce_iv"] / 100.0, True),
+        axis=1,
+    )
+    pe_g = d.apply(
+        lambda row: bs_greeks(spot, row["strike_price"], t_years, r, row["pe_iv"] / 100.0, False),
+        axis=1,
+    )
+    for key in ("delta", "gamma", "theta", "vega"):
+        d[f"ce_{key}"] = ce_g.apply(lambda x: x[key])
+        d[f"pe_{key}"] = pe_g.apply(lambda x: x[key])
+    return d
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 6. IV RANK / IV PERCENTILE  (session-based rolling history)
+# ══════════════════════════════════════════════════════════════════════════
+
+IV_HISTORY_KEY = "oc_atm_iv_history"
+IV_HISTORY_MAX_POINTS = 500
+
+
+def _atm_iv(df: pd.DataFrame, spot: float) -> float:
+    if df.empty or not spot:
+        return 0.0
+    idx = (df["strike_price"] - spot).abs().idxmin()
+    row = df.loc[idx]
+    ivs = [v for v in (row.get("ce_iv", 0), row.get("pe_iv", 0)) if v and v > 0]
+    return float(np.mean(ivs)) if ivs else 0.0
+
+
+def update_iv_history(symbol: str, expiry_label: str, atm_iv: float) -> None:
+    """Appends this refresh's ATM IV to a session-scoped rolling history,
+    keyed per symbol+expiry so switching instruments doesn't pollute
+    another instrument's IV Rank/Percentile calculation. This is a
+    within-session history (resets when the Streamlit process restarts) —
+    a genuine multi-day IV Rank needs a persisted historical IV series,
+    which this standalone script does not have a database for."""
+    if atm_iv <= 0:
+        return
+    history = st.session_state.setdefault(IV_HISTORY_KEY, {})
+    key = f"{symbol}|{expiry_label}"
+    series = history.get(key, [])
+    series.append(atm_iv)
+    if len(series) > IV_HISTORY_MAX_POINTS:
+        series = series[-IV_HISTORY_MAX_POINTS:]
+    history[key] = series
+    st.session_state[IV_HISTORY_KEY] = history
+
+
+def compute_iv_rank_percentile(symbol: str, expiry_label: str, current_iv: float) -> tuple[float, float]:
+    """IV Rank = where current IV sits between this session's observed
+    min/max (0-100). IV Percentile = % of session observations at or
+    below current IV. Both return 0.0 until enough history has
+    accumulated (first refresh) rather than a misleading fabricated 50."""
+    history = st.session_state.get(IV_HISTORY_KEY, {})
+    series = history.get(f"{symbol}|{expiry_label}", [])
+    if len(series) < 2 or current_iv <= 0:
+        return 0.0, 0.0
+    lo, hi = min(series), max(series)
+    iv_rank = ((current_iv - lo) / (hi - lo)) * 100 if hi > lo else 50.0
+    iv_percentile = (sum(1 for v in series if v <= current_iv) / len(series)) * 100
+    return round(float(np.clip(iv_rank, 0, 100)), 1), round(iv_percentile, 1)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 7. GAMMA EXPOSURE (GEX) / DELTA EXPOSURE (DEX)
+# ══════════════════════════════════════════════════════════════════════════
+
+def compute_gex_dex(df: pd.DataFrame, spot: float, lot_size: int) -> dict[str, Any]:
+    """Dealer-perspective Gamma/Delta Exposure approximation, computed
+    per strike and summed. Convention used (standard retail approximation):
+    dealers are assumed net SHORT calls and net SHORT puts they've sold
+    to buyers, so:
+        GEX_strike = (ce_gamma * ce_oi - pe_gamma * pe_oi) * spot^2 * 0.01 * lot_size
+        DEX_strike = (ce_delta * ce_oi + pe_delta * pe_oi) * spot * lot_size
+    Positive total GEX implies dealers hedge by buying dips/selling rips
+    (dampening volatility); negative GEX implies the opposite (amplifying
+    moves). This is a heuristic widely used in retail options analytics,
+    not a certified market-maker positioning feed — no such feed exists
+    publicly for NSE."""
+    if df.empty or not spot:
+        return {"total_gex": 0.0, "total_dex": 0.0, "by_strike": pd.DataFrame(),
+                "max_gex_strike": None, "min_gex_strike": None, "gamma_flip": None}
+
+    d = df.copy()
+    d["gex"] = (
+        (d.get("ce_gamma", 0) * d.get("ce_oi", 0)) - (d.get("pe_gamma", 0) * d.get("pe_oi", 0))
+    ) * (spot ** 2) * 0.01 * lot_size
+    d["dex"] = (
+        (d.get("ce_delta", 0) * d.get("ce_oi", 0)) + (d.get("pe_delta", 0) * d.get("pe_oi", 0))
+    ) * spot * lot_size
+
+    total_gex = float(d["gex"].sum())
+    total_dex = float(d["dex"].sum())
+    max_gex_row = d.loc[d["gex"].idxmax()] if len(d) else None
+    min_gex_row = d.loc[d["gex"].idxmin()] if len(d) else None
+
+    # Gamma flip: the strike nearest to where cumulative GEX (sorted by
+    # strike) crosses from negative to positive — an approximate proxy
+    # for the "gamma flip point" some options-flow tools reference.
+    d_sorted = d.sort_values("strike_price").reset_index(drop=True)
+    cum_gex = d_sorted["gex"].cumsum()
+    gamma_flip = None
+    sign_changes = np.where(np.diff(np.sign(cum_gex.replace(0, np.nan).ffill().fillna(0))) != 0)[0]
+    if len(sign_changes) > 0:
+        idx = int(sign_changes[0])
+        gamma_flip = float(d_sorted.loc[idx, "strike_price"])
+
+    return {
+        "total_gex": total_gex, "total_dex": total_dex,
+        "by_strike": d[["strike_price", "gex", "dex"]],
+        "max_gex_strike": float(max_gex_row["strike_price"]) if max_gex_row is not None else None,
+        "min_gex_strike": float(min_gex_row["strike_price"]) if min_gex_row is not None else None,
+        "gamma_flip": gamma_flip,
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 7B. FYERS DATA SOURCE  (primary when an authenticated client is supplied)
+# ══════════════════════════════════════════════════════════════════════════
+#
+# NSE's own website sits behind an Akamai anti-bot layer that routinely
+# blocks requests from datacenter / cloud IP ranges — including Streamlit
+# Community Cloud, Render, Railway, most VPS providers, etc. — typically
+# returning 401/403, or a bare 404 that disguises the block. A pure
+# NSE-scrape therefore tends to work fine when run locally on a home/
+# office IP and fail unpredictably once deployed to the cloud.
+#
+# FYERS (or any authenticated broker API) does not have this problem,
+# since it's a real API meant for programmatic/hosted use. When a hosting
+# app supplies an authenticated `fyers` client (fyers-apiv3), it is used
+# as the PRIMARY data source; NSE is used only when no client is supplied
+# or the FYERS call itself fails, so this file still works standalone.
+
+FYERS_INDEX_SYMBOL_CANDIDATES: dict[str, list[str]] = {
+    "NIFTY": ["NSE:NIFTY50-INDEX"],
+    "BANKNIFTY": ["NSE:NIFTYBANK-INDEX", "NSE:BANKNIFTY-INDEX"],
+    "FINNIFTY": ["NSE:FINNIFTY-INDEX"],
+    "MIDCPNIFTY": ["NSE:MIDCPNIFTY-INDEX", "NSE:MIDCAPNIFTY-INDEX"],
+}
+
+
+def fyers_stock_symbol_candidates(stock: str) -> list[str]:
+    base = normalize_stock_symbol(stock)
+    return [f"NSE:{base}-EQ", f"NSE:{base}"]
+
+
+def _fyers_index_candidates(symbol_key: str) -> list[str]:
+    return FYERS_INDEX_SYMBOL_CANDIDATES.get(symbol_key, [f"NSE:{symbol_key}-INDEX"])
+
+
+def _fyers_call_optionchain(fyers: Any, symbol: str, strikecount: int, timestamp: str = "") -> Optional[dict]:
+    req: dict[str, Any] = {"symbol": symbol, "strikecount": int(strikecount)}
+    if timestamp:
+        req["timestamp"] = str(timestamp)
+    try:
+        return fyers.optionchain(data=req)
+    except Exception as e:  # noqa: BLE001 - external SDK, keep resilient
+        logger.warning("FYERS optionchain() call raised for %s: %s", symbol, e)
+        return None
+
+
+def _fyers_field(d: dict, *aliases: str, default: Any = None) -> Any:
+    for alias in aliases:
+        if alias in d and d[alias] is not None:
+            return d[alias]
+    return default
+
+
+def _fyers_extract_expiry_list(response: dict) -> list[tuple[str, str]]:
+    data = response.get("data", {}) if isinstance(response, dict) else {}
+    raw = data.get("expiryData") or data.get("expirydata") or []
+    out = []
+    for item in raw if isinstance(raw, list) else []:
+        if not isinstance(item, dict):
+            continue
+        ts = item.get("expiry") or item.get("timestamp")
+        if ts is None:
+            continue
+        try:
+            label = datetime.fromtimestamp(int(float(ts))).strftime("%d-%b-%Y")
+        except (TypeError, ValueError, OSError):
+            label = str(ts)
+        out.append((label, str(ts)))
+    seen: set = set()
+    deduped = []
+    for label, ts in out:
+        if ts not in seen:
+            seen.add(ts)
+            deduped.append((label, ts))
+
+    def _ts_key(pair: tuple[str, str]) -> float:
+        try:
+            return float(pair[1])
+        except (TypeError, ValueError):
+            return 0.0
+
+    deduped.sort(key=_ts_key)
+    return deduped
+
+
+def _fyers_extract_chain_rows(response: dict) -> tuple[list[dict], dict]:
+    data = response.get("data", {}) if isinstance(response, dict) else {}
+    for key in ("optionsChain", "options", "optionschain"):
+        candidate = data.get(key)
+        if isinstance(candidate, list) and candidate:
+            return candidate, data
+    return [], data
+
+
+def _fyers_extract_spot(response: dict, data: dict) -> float:
+    for src in (data, response if isinstance(response, dict) else {}):
+        if not isinstance(src, dict):
+            continue
+        for key in ("ltp", "spot_price", "spotPrice", "underlyingValue", "underlying_value"):
+            f = _safe_num(src.get(key), 0.0)
+            if f > 0:
+                return f
+    return 0.0
+
+
+def _bs_price(spot: float, strike: float, t: float, r: float, sigma: float, is_call: bool) -> float:
     if t <= 0 or sigma <= 0 or spot <= 0 or strike <= 0:
         return max(0.0, (spot - strike) if is_call else (strike - spot))
     d1 = (math.log(spot / strike) + (r + 0.5 * sigma ** 2) * t) / (sigma * math.sqrt(t))
@@ -709,467 +689,323 @@ def _bs_price(spot, strike, t, r, sigma, is_call: bool) -> float:
     return strike * math.exp(-r * t) * _norm_cdf(-d2) - spot * _norm_cdf(-d1)
 
 
-def implied_volatility(price, spot, strike, t, is_call: bool, r: float = 0.07) -> float:
-    if price <= 0 or spot <= 0 or strike <= 0 or t <= 0:
+def implied_volatility(price: float, spot: float, strike: float, t_years: float,
+                        is_call: bool, r: float = RISK_FREE_RATE) -> float:
+    """Newton-Raphson implied-volatility solver used only to backfill IV
+    for FYERS-sourced rows whose chain payload doesn't carry a usable IV
+    field (FYERS's option-chain endpoint does not reliably return IV,
+    unlike NSE). Returns 0.0 on any degenerate input rather than raising
+    or propagating NaN/inf into downstream Greeks."""
+    if price <= 0 or spot <= 0 or strike <= 0 or t_years <= 0:
         return 0.0
-    sigma = 0.3
+    sigma = 0.30
     for _ in range(50):
-        model_price = _bs_price(spot, strike, t, r, sigma, is_call)
-        d1 = (math.log(spot / strike) + (r + 0.5 * sigma ** 2) * t) / (sigma * math.sqrt(t))
-        vega = spot * math.exp(-0.5 * d1 ** 2) / math.sqrt(2 * math.pi) * math.sqrt(t)
+        model_price = _bs_price(spot, strike, t_years, r, sigma, is_call)
+        try:
+            d1 = (math.log(spot / strike) + (r + 0.5 * sigma ** 2) * t_years) / (sigma * math.sqrt(t_years))
+        except (ValueError, ZeroDivisionError):
+            break
+        vega_raw = spot * _norm_pdf(d1) * math.sqrt(t_years)
         diff = model_price - price
         if abs(diff) < 1e-4:
             break
-        if vega < 1e-8:
+        if vega_raw < 1e-8:
             break
-        sigma -= diff / vega
-        sigma = max(0.001, min(sigma, 5.0))
+        sigma -= diff / vega_raw
+        sigma = max(MIN_SIGMA, min(sigma, MAX_SIGMA))
     return round(sigma * 100, 2)
 
 
-def parse_days_to_expiry(expiry_label: str) -> float:
-    if not expiry_label:
-        return 7.0
-    for fmt in ("%d-%b-%Y", "%d-%m-%Y", "%Y-%m-%d"):
-        try:
-            exp_date = datetime.strptime(expiry_label, fmt)
-            delta = (exp_date - datetime.now()).total_seconds() / 86400
-            return max(delta, 0.5)
-        except ValueError:
+def parse_fyers_chain(rows: list[dict], spot: float, expiry_label: str) -> pd.DataFrame:
+    """Normalizes FYERS's long-shape option list (one row per CE or PE
+    contract) into the same wide ce_*/pe_* schema NSE parsing produces,
+    so every downstream analytics function works unchanged regardless of
+    source. IV is backfilled via implied_volatility() wherever FYERS
+    didn't supply a usable (>0) value."""
+    ce_rows: dict[float, dict] = {}
+    pe_rows: dict[float, dict] = {}
+    for item in rows:
+        if not isinstance(item, dict):
             continue
-    return 7.0
+        opt_type = str(_fyers_field(item, "option_type", "optionType", "type", default="")).upper()
+        strike = _safe_num(_fyers_field(item, "strike_price", "strikePrice"))
+        if strike <= 0 or opt_type not in ("CE", "PE"):
+            continue
+        rec = {
+            "ltp": _safe_num(_fyers_field(item, "ltp", "last_price")),
+            "change": _safe_num(_fyers_field(item, "ltpch", "change")),
+            "bid": _safe_num(_fyers_field(item, "bid", "bidprice", "bidPrice")),
+            "ask": _safe_num(_fyers_field(item, "ask", "askprice", "askPrice")),
+            "volume": _safe_num(_fyers_field(item, "volume", "vol")),
+            "oi": _safe_num(_fyers_field(item, "oi", "openInterest")),
+            "chng_oi": _safe_num(_fyers_field(item, "oich", "chng_oi", "change_oi")),
+            "oi_change_pct": _safe_num(_fyers_field(item, "oichp", "pchangeinOpenInterest")),
+            "iv": _safe_num(_fyers_field(item, "iv", "impliedVolatility")),
+        }
+        (ce_rows if opt_type == "CE" else pe_rows)[strike] = rec
 
+    strikes = sorted(set(ce_rows) | set(pe_rows))
+    if not strikes:
+        return pd.DataFrame()
 
-def add_iv_columns(df: pd.DataFrame, spot: float, expiry_label: str) -> pd.DataFrame:
-    if "ce_iv" in df.columns and "pe_iv" in df.columns and df["ce_iv"].abs().sum() > 0:
-        return df
-    if not spot or df.empty:
-        return df
-    days_to_expiry = parse_days_to_expiry(expiry_label)
-    t = max(days_to_expiry, 0.5) / 365.0
-    df = df.copy()
-    df["ce_iv"] = df.apply(
-        lambda row: implied_volatility(row.get("ce_ltp", 0), spot, row["strike_price"], t, True), axis=1)
-    df["pe_iv"] = df.apply(
-        lambda row: implied_volatility(row.get("pe_ltp", 0), spot, row["strike_price"], t, False), axis=1)
+    t_years = parse_days_to_expiry(expiry_label) / 365.0
+    out_rows = []
+    for strike in strikes:
+        ce, pe = ce_rows.get(strike, {}), pe_rows.get(strike, {})
+        ce_iv = ce.get("iv", 0.0)
+        if ce_iv <= 0 and ce.get("ltp", 0) > 0 and spot > 0:
+            ce_iv = implied_volatility(ce["ltp"], spot, strike, t_years, True)
+        pe_iv = pe.get("iv", 0.0)
+        if pe_iv <= 0 and pe.get("ltp", 0) > 0 and spot > 0:
+            pe_iv = implied_volatility(pe["ltp"], spot, strike, t_years, False)
+        out_rows.append({
+            "strike_price": strike,
+            "ce_ltp": ce.get("ltp", 0.0), "ce_change": ce.get("change", 0.0),
+            "ce_bid": ce.get("bid", 0.0), "ce_bid_qty": 0.0,
+            "ce_ask": ce.get("ask", 0.0), "ce_ask_qty": 0.0,
+            "ce_volume": ce.get("volume", 0.0), "ce_oi": ce.get("oi", 0.0),
+            "ce_chng_oi": ce.get("chng_oi", 0.0), "ce_oi_change_pct": ce.get("oi_change_pct", 0.0),
+            "ce_iv": round(ce_iv, 2),
+            "pe_ltp": pe.get("ltp", 0.0), "pe_change": pe.get("change", 0.0),
+            "pe_bid": pe.get("bid", 0.0), "pe_bid_qty": 0.0,
+            "pe_ask": pe.get("ask", 0.0), "pe_ask_qty": 0.0,
+            "pe_volume": pe.get("volume", 0.0), "pe_oi": pe.get("oi", 0.0),
+            "pe_chng_oi": pe.get("chng_oi", 0.0), "pe_oi_change_pct": pe.get("oi_change_pct", 0.0),
+            "pe_iv": round(pe_iv, 2),
+        })
+    df = pd.DataFrame(out_rows)
+    df.sort_values("strike_price", inplace=True)
+    df.reset_index(drop=True, inplace=True)
     return df
 
 
-def compute_strike_bias(df: pd.DataFrame) -> pd.DataFrame:
-    out = df.copy()
-    ce_chng = out["ce_chng_oi"] if "ce_chng_oi" in out.columns else pd.Series(0, index=out.index)
-    pe_chng = out["pe_chng_oi"] if "pe_chng_oi" in out.columns else pd.Series(0, index=out.index)
-
-    def ce_label(v):
-        if v > 0:
-            return "🔴 Sell Side (Call Writing)"
-        elif v < 0:
-            return "🟢 Unwinding"
-        return "⚪ Flat"
-
-    def pe_label(v):
-        if v > 0:
-            return "🟢 Buy Side (Put Writing)"
-        elif v < 0:
-            return "🔴 Unwinding"
-        return "⚪ Flat"
-
-    out["CE Bias"] = ce_chng.apply(ce_label)
-    out["PE Bias"] = pe_chng.apply(pe_label)
-
-    def combined(row):
-        ce_v, pe_v = row["_ce_chng"], row["_pe_chng"]
-        if pe_v > 0 and pe_v >= max(ce_v, 0):
-            return "🟢 BUY"
-        if ce_v > 0 and ce_v >= max(pe_v, 0):
-            return "🔴 SELL"
-        return "🟡 NEUTRAL"
-
-    out["_ce_chng"] = ce_chng
-    out["_pe_chng"] = pe_chng
-    out["Strike Signal"] = out.apply(combined, axis=1)
-
-    magnitudes = pd.concat([ce_chng.abs(), pe_chng.abs()])
-    threshold = magnitudes.quantile(0.8) if len(magnitudes) > 0 and magnitudes.max() > 0 else float("inf")
-    out["Big Move"] = ((ce_chng.abs() >= threshold) | (pe_chng.abs() >= threshold)).map(
-        {True: "🚨 Big Move", False: ""}
+def fetch_via_fyers(fyers: Any, symbol_key: str, is_index: bool, stock_name: str,
+                     preferred_expiry: str, strike_count: int) -> dict:
+    """Attempts a full expiry-list + chain fetch through an authenticated
+    FYERS client, trying every known symbol-name variant. Returns the
+    same {"ok","df","meta","error"} shape the NSE path returns, so the
+    unified fetch layer can treat both sources identically. Never
+    raises — every SDK call is wrapped in a try/except internally."""
+    symbol_candidates = (
+        _fyers_index_candidates(symbol_key) if is_index else fyers_stock_symbol_candidates(stock_name)
     )
-    out.drop(columns=["_ce_chng", "_pe_chng"], inplace=True)
-    return out
+    if not symbol_candidates:
+        return {"ok": False, "df": pd.DataFrame(), "meta": {}, "error": "No FYERS symbol candidates resolved."}
+
+    expiry_resp, used_symbol = None, symbol_candidates[0]
+    for sym in symbol_candidates:
+        resp = _fyers_call_optionchain(fyers, sym, strikecount=2)
+        if isinstance(resp, dict) and resp.get("s") == "ok":
+            expiry_resp, used_symbol = resp, sym
+            break
+    if expiry_resp is None:
+        return {"ok": False, "df": pd.DataFrame(), "meta": {},
+                "error": "FYERS returned no usable response for any symbol variant tried."}
+
+    expiry_list = _fyers_extract_expiry_list(expiry_resp)
+    if not expiry_list:
+        return {"ok": False, "df": pd.DataFrame(), "meta": {}, "error": "FYERS returned no expiry dates."}
+
+    selected_label, selected_ts = expiry_list[0]
+    for label, ts in expiry_list:
+        if label == preferred_expiry:
+            selected_label, selected_ts = label, ts
+            break
+
+    chain_resp = _fyers_call_optionchain(fyers, used_symbol, strikecount=strike_count, timestamp=selected_ts)
+    if not isinstance(chain_resp, dict) or chain_resp.get("s") != "ok":
+        code = chain_resp.get("code") if isinstance(chain_resp, dict) else "—"
+        return {"ok": False, "df": pd.DataFrame(), "meta": {}, "error": f"FYERS chain fetch failed (code {code})."}
+
+    rows, data = _fyers_extract_chain_rows(chain_resp)
+    if not rows:
+        return {"ok": False, "df": pd.DataFrame(), "meta": {}, "error": "FYERS returned an empty options chain."}
+
+    spot = _fyers_extract_spot(chain_resp, data)
+    if not spot:
+        try:
+            q = fyers.quotes(data={"symbols": used_symbol})
+            qv = q.get("d", [{}])[0].get("v", {}) if isinstance(q, dict) else {}
+            spot = _safe_num(qv.get("lp"), 0.0)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("FYERS quotes() spot-price fallback raised: %s", e)
+
+    df = parse_fyers_chain(rows, spot, selected_label)
+    if not validate_chain_df(df):
+        return {"ok": False, "df": pd.DataFrame(), "meta": {}, "error": "FYERS chain failed schema validation after parsing."}
+
+    meta = {
+        "spot_price": spot, "expiry_dates": [lbl for lbl, _ in expiry_list],
+        "selected_expiry": selected_label, "fetched_at": datetime.now(),
+        "total_rows_seen": len(rows), "rows_parsed": len(df),
+    }
+    return {"ok": True, "df": df, "meta": meta, "error": None}
 
 
-def detect_big_moves(df: pd.DataFrame, top_n: int = 3) -> list:
-    alerts = []
-    if df.empty or "ce_chng_oi" not in df.columns or "pe_chng_oi" not in df.columns:
-        return alerts
+def fetch_chain_unified(fyers: Any, symbol_key: str, is_index: bool, stock_name: str,
+                         preferred_expiry: str, strike_count: int) -> dict:
+    """FYERS-first, NSE-fallback data source layer. FYERS is tried first
+    whenever an authenticated client is supplied, since it works
+    reliably from any host (including cloud deployments where NSE's own
+    site blocks the request). NSE is used only when no client is
+    available or the FYERS call itself fails — this keeps the file fully
+    standalone-runnable while being reliable when wired into a hosting
+    app that already manages a FYERS session."""
+    fyers_error = None
+    if fyers is not None:
+        result = fetch_via_fyers(fyers, symbol_key, is_index, stock_name, preferred_expiry, strike_count)
+        if result["ok"]:
+            result["source"] = "FYERS"
+            return result
+        fyers_error = result.get("error")
+        logger.warning("FYERS fetch failed, falling back to NSE: %s", fyers_error)
 
-    ce_thresh = df["ce_chng_oi"].abs().quantile(0.85) if df["ce_chng_oi"].abs().max() > 0 else 0
-    pe_thresh = df["pe_chng_oi"].abs().quantile(0.85) if df["pe_chng_oi"].abs().max() > 0 else 0
+    nse_symbol = symbol_key if is_index else normalize_stock_symbol(stock_name)
+    raw_result = fetch_option_chain_raw(nse_symbol, is_index)
+    if not raw_result.get("ok"):
+        error = raw_result.get("error") or "NSE fetch failed."
+        combined = f"FYERS: {fyers_error} | NSE: {error}" if fyers_error else error
+        return {"ok": False, "df": pd.DataFrame(), "meta": {}, "error": combined, "source": "NONE"}
 
-    top_ce = df.reindex(df["ce_chng_oi"].abs().sort_values(ascending=False).index).head(top_n)
-    top_pe = df.reindex(df["pe_chng_oi"].abs().sort_values(ascending=False).index).head(top_n)
+    df, meta = parse_option_chain(raw_result["payload"], preferred_expiry=preferred_expiry)
+    if not validate_chain_df(df):
+        error = "NSE response did not contain a usable option chain."
+        combined = f"FYERS: {fyers_error} | NSE: {error}" if fyers_error else error
+        return {"ok": False, "df": pd.DataFrame(), "meta": meta, "error": combined, "source": "NONE"}
 
-    for _, row in top_ce.iterrows():
-        chg = row["ce_chng_oi"]
-        if abs(chg) < ce_thresh or chg == 0:
-            continue
-        if chg > 0:
-            alerts.append({
-                "strike": row["strike_price"], "side": "CE", "direction": "SELL", "oi_change": chg,
-                "note": f"Heavy CALL writing at {row['strike_price']:,.0f} — resistance building, "
-                        f"bearish/range bias near this strike.",
-            })
-        else:
-            alerts.append({
-                "strike": row["strike_price"], "side": "CE", "direction": "BUY", "oi_change": chg,
-                "note": f"CALL OI unwinding at {row['strike_price']:,.0f} — resistance weakening, "
-                        f"possible breakout above.",
-            })
-
-    for _, row in top_pe.iterrows():
-        chg = row["pe_chng_oi"]
-        if abs(chg) < pe_thresh or chg == 0:
-            continue
-        if chg > 0:
-            alerts.append({
-                "strike": row["strike_price"], "side": "PE", "direction": "BUY", "oi_change": chg,
-                "note": f"Heavy PUT writing at {row['strike_price']:,.0f} — support building, "
-                        f"bullish bias near this strike.",
-            })
-        else:
-            alerts.append({
-                "strike": row["strike_price"], "side": "PE", "direction": "SELL", "oi_change": chg,
-                "note": f"PUT OI unwinding at {row['strike_price']:,.0f} — support weakening, "
-                        f"possible breakdown below.",
-            })
-
-    alerts.sort(key=lambda a: abs(a["oi_change"]), reverse=True)
-    return alerts
+    return {"ok": True, "df": df, "meta": meta, "error": None, "source": "NSE"}
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# 4B. DATA SOURCE FALLBACK LAYER  (FYERS primary -> automatic NSE backup)
+# 8. CORE ANALYTICS — PCR / MAX PAIN / SUPPORT-RESISTANCE / BUILDUP / MONEYNESS
 # ══════════════════════════════════════════════════════════════════════════
 
-REQUIRED_OPTION_CHAIN_COLUMNS = ["strike_price", "ce_ltp", "ce_oi", "pe_ltp", "pe_oi"]
+def calc_pcr(df: pd.DataFrame) -> float:
+    if df.empty:
+        return 0.0
+    total_ce = df["ce_oi"].sum()
+    total_pe = df["pe_oi"].sum()
+    return round(float(total_pe / total_ce), 3) if total_ce > 0 else 0.0
 
 
-def validate_option_chain_df(df) -> bool:
-    try:
-        if df is None or not isinstance(df, pd.DataFrame) or df.empty:
-            return False
-        if not all(col in df.columns for col in REQUIRED_OPTION_CHAIN_COLUMNS):
-            return False
-        valid_strikes = pd.to_numeric(df["strike_price"], errors="coerce").dropna()
-        return bool((valid_strikes > 0).sum() > 0)
-    except Exception as e:  # noqa: BLE001 - validation itself must never raise
-        logger.error("Option chain validation raised an exception: %s", e)
-        return False
+def calc_max_pain(df: pd.DataFrame) -> float:
+    if df.empty:
+        return 0.0
+    strikes = df["strike_price"].values
+    ce_oi = df["ce_oi"].values
+    pe_oi = df["pe_oi"].values
+    pain = [
+        float(np.sum(np.maximum(s - strikes, 0) * ce_oi) + np.sum(np.maximum(strikes - s, 0) * pe_oi))
+        for s in strikes
+    ]
+    return float(strikes[int(np.argmin(pain))]) if pain else 0.0
 
 
-def filter_strikes_around_atm(df: pd.DataFrame, spot_price: float, strike_count) -> pd.DataFrame:
-    try:
-        if df is None or df.empty or "strike_price" not in df.columns:
-            return df
-        n = int(strike_count) if strike_count else 0
-        if n <= 0:
-            return df
-        d = df.sort_values("strike_price").reset_index(drop=True)
-        ref = spot_price if spot_price else float(d["strike_price"].median())
-        atm_idx = int((d["strike_price"] - ref).abs().idxmin())
-        lo = max(0, atm_idx - n)
-        hi = min(len(d), atm_idx + n + 1)
-        out = d.iloc[lo:hi].reset_index(drop=True)
-        logger.info(
-            "NSE Stage: Strike Selection — restricted chain from %d to %d strikes "
-            "(%d each side of ATM ref=%.2f), matching FYERS strikecount behaviour",
-            len(d), len(out), n, ref,
-        )
-        return out
-    except Exception as e:  # noqa: BLE001 - strike selection must never crash the pipeline
-        logger.error("Strike selection (filter_strikes_around_atm) raised an exception: %s", e)
-        return df
+def calc_max_oi(df: pd.DataFrame) -> dict[str, Optional[float]]:
+    if df.empty:
+        return {"max_ce_oi_strike": None, "max_pe_oi_strike": None}
+    return {
+        "max_ce_oi_strike": float(df.loc[df["ce_oi"].idxmax(), "strike_price"]),
+        "max_pe_oi_strike": float(df.loc[df["pe_oi"].idxmax(), "strike_price"]),
+    }
 
 
-def normalize_nse_to_fyers_schema(df: pd.DataFrame) -> pd.DataFrame:
-    logger.info("NSE Stage: Column Mapping — normalizing NSE fields to FYERS schema")
-    if df is None or df.empty:
-        logger.error("NSE Stage: Column Mapping — received an empty/None DataFrame, nothing to map")
-        return df
+def calc_support_resistance(df: pd.DataFrame) -> tuple[Optional[float], Optional[float]]:
+    """Support = strike with the highest Put OI (put writers defend this
+    level). Resistance = strike with the highest Call OI (call writers
+    defend this level). Standard options-chain heuristic."""
+    if df.empty:
+        return None, None
+    support = float(df.loc[df["pe_oi"].idxmax(), "strike_price"])
+    resistance = float(df.loc[df["ce_oi"].idxmax(), "strike_price"])
+    return support, resistance
+
+
+def classify_buildup(df: pd.DataFrame) -> pd.DataFrame:
+    """Classifies each strike's CE and PE independently into Long
+    Buildup / Short Buildup / Long Unwinding / Short Covering / Flat,
+    using the standard price-vs-OI-change matrix (applied to that
+    option's own LTP change, not the underlying's):
+        Price Up   + OI Up   -> Long Buildup   (bullish for that option)
+        Price Up   + OI Down -> Short Covering (bullish for that option)
+        Price Down + OI Up   -> Short Buildup  (bearish for that option)
+        Price Down + OI Down -> Long Unwinding (bearish for that option)
+    Also derives Call Writing / Put Writing / Call Unwinding / Put
+    Unwinding directly from OI-change sign, which is the simpler and
+    more commonly quoted version of the same signal.
+    """
     d = df.copy()
-    d = ensure_numeric_columns(d)
-    logger.info("NSE Stage: Column Mapping complete — columns=%s", list(d.columns))
+
+    def _matrix(price_chg: float, oi_chg: float) -> str:
+        if price_chg > 0 and oi_chg > 0:
+            return "Long Buildup"
+        if price_chg > 0 and oi_chg < 0:
+            return "Short Covering"
+        if price_chg < 0 and oi_chg > 0:
+            return "Short Buildup"
+        if price_chg < 0 and oi_chg < 0:
+            return "Long Unwinding"
+        return "Flat"
+
+    d["CE Buildup"] = d.apply(lambda r: _matrix(r.get("ce_change", 0), r.get("ce_chng_oi", 0)), axis=1)
+    d["PE Buildup"] = d.apply(lambda r: _matrix(r.get("pe_change", 0), r.get("pe_chng_oi", 0)), axis=1)
+
+    d["Call Writing"] = d["ce_chng_oi"] > 0
+    d["Call Unwinding"] = d["ce_chng_oi"] < 0
+    d["Put Writing"] = d["pe_chng_oi"] > 0
+    d["Put Unwinding"] = d["pe_chng_oi"] < 0
     return d
 
 
-NSE_INDEX_SYMBOL_MAP = {
-    "NIFTY": "NIFTY",
-    "BANKNIFTY": "BANKNIFTY",
-    "FINNIFTY": "FINNIFTY",
-    "MIDCPNIFTY": "MIDCPNIFTY",
-}
-
-_NSE_SESSION_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                  "(KHTML, like Gecko) Chrome/122.0 Safari/537.36",
-    "Accept": "application/json, text/plain, */*",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Referer": "https://www.nseindia.com/option-chain",
-}
-
-
-def _nse_session():
-    s = requests.Session()
-    s.headers.update(_NSE_SESSION_HEADERS)
-    s.get("https://www.nseindia.com", timeout=8)
-    s.get("https://www.nseindia.com/option-chain", timeout=8)
-    return s
-
-
-def fetch_nse_option_chain_raw(symbol_key: str, is_stock: bool, stock_name: str = "") -> dict:
-    logger.info("NSE Stage 1/5: Data Download — requesting NSE option chain for %s", symbol_key or stock_name)
-    try:
-        if is_stock:
-            nse_symbol = (stock_name or "").strip().upper()
-            if nse_symbol.endswith("-EQ"):
-                nse_symbol = nse_symbol[:-3]
-            if not nse_symbol:
-                logger.error("NSE Stage 1/5: Data Download failed — no stock symbol provided")
-                return {}
-            url = f"https://www.nseindia.com/api/option-chain-equities?symbol={nse_symbol}"
-        else:
-            nse_symbol = NSE_INDEX_SYMBOL_MAP.get(symbol_key)
-            if not nse_symbol:
-                logger.error(
-                    "NSE Stage 1/5: Data Download skipped — %s is not available on NSE's "
-                    "option-chain endpoint (BSE instrument or no listed options)", symbol_key,
-                )
-                return {}
-            url = f"https://www.nseindia.com/api/option-chain-indices?symbol={nse_symbol}"
-
-        session = _nse_session()
-        resp = session.get(url, timeout=10)
-        if resp.status_code != 200:
-            logger.error("NSE Stage 1/5: Data Download failed — HTTP %s for %s", resp.status_code, symbol_key or stock_name)
-            return {}
-        try:
-            payload = resp.json()
-            logger.info("NSE Stage 1/5: Data Download succeeded for %s", symbol_key or stock_name)
-            return payload
-        except ValueError as e:
-            logger.error("NSE Stage 1/5: Data Download failed — invalid JSON for %s: %s", symbol_key or stock_name, e)
-            return {}
-    except Exception as e:  # noqa: BLE001
-        logger.error("NSE Stage 1/5: Data Download raised an exception for %s: %s", symbol_key or stock_name, e)
-        return {}
+def classify_moneyness(df: pd.DataFrame, spot: float) -> pd.DataFrame:
+    """Tags each strike's CE and PE as ITM / ATM / OTM relative to spot.
+    ATM = the single strike nearest spot; everything else is a strict
+    ITM/OTM classification (a call is ITM below spot, a put is ITM
+    above spot)."""
+    d = df.copy()
+    if d.empty:
+        d["ATM"] = False
+        d["CE Moneyness"] = ""
+        d["PE Moneyness"] = ""
+        return d
+    ref = spot if spot else float(d["strike_price"].median())
+    atm_idx = (d["strike_price"] - ref).abs().idxmin()
+    d["ATM"] = d.index == atm_idx
+    d["CE Moneyness"] = np.where(
+        d["ATM"], "ATM", np.where(d["strike_price"] < ref, "ITM", "OTM")
+    )
+    d["PE Moneyness"] = np.where(
+        d["ATM"], "ATM", np.where(d["strike_price"] > ref, "ITM", "OTM")
+    )
+    return d
 
 
-def fetch_nse_option_chain(symbol_key: str, is_stock: bool, stock_name: str = "",
-                            preferred_expiry_label: str = "", strike_count=None) -> tuple:
-    try:
-        raw = fetch_nse_option_chain_raw(symbol_key, is_stock, stock_name)
-        records = raw.get("records", {}) if isinstance(raw, dict) else {}
-        chain = records.get("data", []) if isinstance(records, dict) else []
-        if not chain:
-            logger.error("NSE Stage 1/5: Data Download returned no contracts for %s", symbol_key or stock_name)
-            return None, 0.0, "", []
-
-        spot_price = 0.0
-        try:
-            spot_price = float(records.get("underlyingValue", 0) or 0)
-        except (TypeError, ValueError):
-            pass
-
-        nse_expiry_dates = records.get("expiryDates", []) or []
-        target_expiry = preferred_expiry_label if preferred_expiry_label in nse_expiry_dates else (
-            nse_expiry_dates[0] if nse_expiry_dates else ""
-        )
-
-        rows = []
-        for item in chain:
-            if not isinstance(item, dict):
-                continue
-            if target_expiry and item.get("expiryDate") != target_expiry:
-                continue
-            strike = item.get("strikePrice")
-            if strike is None:
-                continue
-            ce, pe = item.get("CE", {}) or {}, item.get("PE", {}) or {}
-            rows.append({
-                "strike_price": strike,
-                "ce_oi": ce.get("openInterest", 0), "ce_chng_oi": ce.get("changeinOpenInterest", 0),
-                "ce_volume": ce.get("totalTradedVolume", 0), "ce_ltp": ce.get("lastPrice", 0),
-                "ce_iv": ce.get("impliedVolatility", 0),
-                "pe_oi": pe.get("openInterest", 0), "pe_chng_oi": pe.get("changeinOpenInterest", 0),
-                "pe_volume": pe.get("totalTradedVolume", 0), "pe_ltp": pe.get("lastPrice", 0),
-                "pe_iv": pe.get("impliedVolatility", 0),
-            })
-
-        if not rows:
-            logger.error(
-                "NSE Stage 1/5: Data Download — %s had an expiry list but zero strikes matched "
-                "expiry '%s' for %s", len(chain), target_expiry, symbol_key or stock_name,
-            )
-            return None, spot_price, target_expiry, nse_expiry_dates
-
-        logger.info(
-            "NSE Stage 1/5: Data Download complete — %d strikes for %s @ expiry %s",
-            len(rows), symbol_key or stock_name, target_expiry,
-        )
-
-        df = pd.DataFrame(rows)
-        df = normalize_nse_to_fyers_schema(df)
-
-        if df is not None and not df.empty:
-            df = filter_strikes_around_atm(df, spot_price, strike_count)
-            df = apply_oi_change_snapshot_fallback(
-                df, symbol=(symbol_key or stock_name), expiry_label=target_expiry
-            )
-            df.sort_values("strike_price", inplace=True)
-            df.reset_index(drop=True, inplace=True)
-
-        if validate_option_chain_df(df):
-            logger.info(
-                "NSE Stage 3/5: Validation passed — %d strikes ready for the AI engine (spot=%.2f)",
-                len(df), spot_price,
-            )
-        else:
-            logger.error("NSE Stage 3/5: Validation failed for %s — data did not pass schema checks", symbol_key or stock_name)
-
-        return df, spot_price, target_expiry, nse_expiry_dates
-    except Exception as e:  # noqa: BLE001
-        logger.error("NSE pipeline raised an exception for %s: %s", symbol_key or stock_name, e)
-        return None, 0.0, "", []
+OI_SHIFT_HISTORY_KEY = "oc_prev_support_resistance"
 
 
-def get_option_chain_data(fyers, symbol_candidates: list, strike_count: int, expiry_timestamp: str,
-                           expiry_options: list, symbol_key: str, is_stock: bool, stock_name: str,
-                           selected_expiry_label: str, debug_mode: bool = False) -> dict:
-    result = {
-        "df": pd.DataFrame(), "spot_price": 0.0,
-        "symbol": symbol_candidates[0] if symbol_candidates else "",
-        "expiry_label": selected_expiry_label, "expiry_timestamp": expiry_timestamp,
-        "source": "NONE", "error": None, "attempts": [],
-        "raw_expiry_payload": [], "expiry_list": [],
-    }
-
-    fyers_df, fyers_spot, fyers_symbol, fyers_attempts, fyers_err = None, 0.0, "", [], None
-    try:
-        response, used_symbol, attempts = fetch_optionchain_with_fallback(
-            fyers, symbol_candidates, strike_count, expiry_timestamp
-        )
-        fyers_attempts = attempts
-
-        if (not response or response.get("s") != "ok") and expiry_options:
-            for _, ts in expiry_options:
-                if ts == expiry_timestamp:
-                    continue
-                try:
-                    response, used_symbol, attempts = fetch_optionchain_with_fallback(
-                        fyers, symbol_candidates, strike_count, ts
-                    )
-                except Exception as e:  # noqa: BLE001
-                    logger.error("FYERS fallback-expiry attempt raised: %s", e)
-                    continue
-                fyers_attempts = attempts
-                if response and isinstance(response, dict) and response.get("s") == "ok":
-                    expiry_timestamp = ts
-                    selected_expiry_label = format_expiry_label(ts)
-                    result["expiry_timestamp"] = expiry_timestamp
-                    result["expiry_label"] = selected_expiry_label
-                    break
-
-        if response and isinstance(response, dict) and response.get("s") == "ok":
-            options_data, data = extract_options_data(response)
-            spot = extract_spot_price(response, data)
-            if not spot:
-                try:
-                    quote_resp = fyers.quotes(data={"symbols": used_symbol})
-                    q = quote_resp.get("d", [{}])[0].get("v", {}) if isinstance(quote_resp, dict) else {}
-                    spot = float(q.get("lp", 0) or 0)
-                except Exception as e:  # noqa: BLE001
-                    logger.error("FYERS quotes() fallback for spot price raised: %s", e)
-
-            if options_data:
-                df = normalize_chain_shape(options_data)
-                df = ensure_numeric_columns(df)
-                df = apply_oi_change_snapshot_fallback(
-                    df, symbol=used_symbol, expiry_label=selected_expiry_label
-                )
-                df.sort_values("strike_price", inplace=True)
-                df.reset_index(drop=True, inplace=True)
-                if validate_option_chain_df(df):
-                    fyers_df, fyers_spot, fyers_symbol = df, spot, used_symbol
-                    result["raw_expiry_payload"] = extract_raw_expiry_payload(response)
-                    result["expiry_list"] = extract_expiry_list(response)
-                else:
-                    fyers_err = "FYERS response failed validation (missing/empty required option-chain fields)."
-            else:
-                fyers_err = "FYERS returned no options data."
-        elif response and isinstance(response, dict):
-            fyers_err = f"FYERS API error (code {response.get('code', '—')}): {response.get('message', 'No data returned')}"
-        else:
-            fyers_err = "FYERS returned no response / invalid response for all symbol variants tried."
-    except Exception as e:  # noqa: BLE001 - never let a fetch error crash the app
-        fyers_err = f"FYERS raised an exception: {e}"
-        logger.error(fyers_err)
-
-    if fyers_df is not None and not fyers_df.empty:
-        logger.info(
-            "Using FYERS Option Chain. FYERS Stage 3/5: Validation passed — %d strikes. "
-            "FYERS Stage 4/5: AI Engine handoff — proceeding to the full AI/scoring pipeline.",
-            len(fyers_df),
-        )
-        result.update({
-            "df": fyers_df, "spot_price": fyers_spot, "symbol": fyers_symbol,
-            "source": "FYERS", "error": None, "attempts": fyers_attempts,
-        })
-        return result
-
-    logger.error("FYERS failed. Switching to NSE Option Chain. Reason: %s", fyers_err)
-    result["attempts"] = fyers_attempts
-    result["error"] = fyers_err
-
-    try:
-        nse_df, nse_spot, nse_expiry_label, nse_expiry_list = fetch_nse_option_chain(
-            symbol_key=symbol_key, is_stock=is_stock, stock_name=stock_name,
-            preferred_expiry_label=selected_expiry_label, strike_count=strike_count,
-        )
-
-        if nse_df is not None and validate_option_chain_df(nse_df):
-            logger.info(
-                "Using NSE Option Chain (fallback). NSE Stage 4/5: AI Engine handoff — "
-                "%d strikes, schema-identical to FYERS, proceeding to the full AI/scoring "
-                "pipeline unmodified (no AI calculations are skipped for NSE).",
-                len(nse_df),
-            )
-            result.update({
-                "df": nse_df, "spot_price": nse_spot,
-                "symbol": (f"NSE:{stock_name.strip().upper()}-EQ" if is_stock else symbol_key),
-                "expiry_label": nse_expiry_label or selected_expiry_label,
-                "expiry_timestamp": "",
-                "source": "NSE", "error": None,
-                "expiry_list": nse_expiry_list or result["expiry_list"],
-            })
-            return result
-        else:
-            reason = "NSE returned no data" if nse_df is None else "NSE data failed schema validation"
-            logger.error("NSE Stage 3/5: Validation failed — %s. WAIT will be shown with this reason.", reason)
-            result["error"] = f"{result['error']} | NSE fallback returned no valid Option Chain data ({reason})."
-    except Exception as e:  # noqa: BLE001
-        err = f"NSE fallback also raised an exception: {e}"
-        logger.error(err)
-        result["error"] = f"{result['error']} | {err}"
-
-    result["source"] = "NONE"
-    return result
+def detect_oi_shift(symbol: str, expiry_label: str, support: Optional[float],
+                     resistance: Optional[float]) -> list[str]:
+    """Compares this refresh's Support/Resistance against the previous
+    refresh stored in session state for the same symbol+expiry, and
+    reports any level shift. First refresh for a symbol+expiry has
+    nothing to compare against, so it legitimately reports no shift."""
+    notes = []
+    history = st.session_state.setdefault(OI_SHIFT_HISTORY_KEY, {})
+    key = f"{symbol}|{expiry_label}"
+    prev = history.get(key)
+    if prev:
+        if prev.get("support") is not None and support is not None and support != prev["support"]:
+            direction = "up" if support > prev["support"] else "down"
+            notes.append(f"Support shifted {direction}: {prev['support']:,.0f} -> {support:,.0f}")
+        if prev.get("resistance") is not None and resistance is not None and resistance != prev["resistance"]:
+            direction = "up" if resistance > prev["resistance"] else "down"
+            notes.append(f"Resistance shifted {direction}: {prev['resistance']:,.0f} -> {resistance:,.0f}")
+    history[key] = {"support": support, "resistance": resistance}
+    st.session_state[OI_SHIFT_HISTORY_KEY] = history
+    return notes
 
 
-# ══════════════════════════════════════════════════════════════════════════
-# 5. BIG MOVE READY STRIKE ENGINE
-# ══════════════════════════════════════════════════════════════════════════
-
-def _normalize(series: pd.Series) -> pd.Series:
+def _normalize_series(series: pd.Series) -> pd.Series:
     s = series.astype(float)
     if s.empty:
         return s
@@ -1178,1989 +1014,478 @@ def _normalize(series: pd.Series) -> pd.Series:
     return (s - s.min()) / (s.max() - s.min())
 
 
-BIG_MOVE_WEIGHTS = {
-    "delta_oi": 0.15, "total_oi": 0.12, "volume": 0.10, "confirmation": 0.08,
-    "put_writing": 0.10, "call_writing": 0.10, "unwinding": 0.05,
-    "spot_distance": 0.08, "atm_distance": 0.07, "maxpain_distance": 0.05,
-    "iv": 0.05, "pcr": 0.05,
+# ══════════════════════════════════════════════════════════════════════════
+# 9. AI SIGNAL ENGINE — BUY/SELL/HOLD, INSTITUTIONAL, SMART MONEY
+# ══════════════════════════════════════════════════════════════════════════
+
+AI_SCORE_WEIGHTS = {
+    "put_writing": 0.18, "call_unwind": 0.12, "volume": 0.12, "pcr_bias": 0.12,
+    "proximity": 0.12, "max_pain_proximity": 0.10, "highest_oi": 0.10,
+    "delta_oi_magnitude": 0.08, "iv_stability": 0.06,
 }
 
 
-def compute_big_move_scores(df: pd.DataFrame, spot_price: float, max_pain: float,
-                             pcr: float, atm_strike: float) -> pd.DataFrame:
-    if df.empty:
-        return df
-
-    d = df.copy()
-    ce_oi = d.get("ce_oi", pd.Series(0, index=d.index))
-    pe_oi = d.get("pe_oi", pd.Series(0, index=d.index))
-    ce_chng = d.get("ce_chng_oi", pd.Series(0, index=d.index))
-    pe_chng = d.get("pe_chng_oi", pd.Series(0, index=d.index))
-    ce_vol = d.get("ce_volume", pd.Series(0, index=d.index))
-    pe_vol = d.get("pe_volume", pd.Series(0, index=d.index))
-    ce_iv = d.get("ce_iv", pd.Series(0, index=d.index))
-    pe_iv = d.get("pe_iv", pd.Series(0, index=d.index))
-    strikes = d["strike_price"]
-
-    total_oi = ce_oi + pe_oi
-    total_delta_oi = ce_chng.abs() + pe_chng.abs()
-    total_volume = ce_vol + pe_vol
-    avg_iv = (ce_iv + pe_iv) / 2
-
-    oi_score = _normalize(total_oi)
-    delta_oi_score = _normalize(total_delta_oi)
-    volume_score = _normalize(total_volume)
-    confirmation_score = (delta_oi_score.clip(lower=0) * volume_score.clip(lower=0)) ** 0.5
-
-    put_writing_score = _normalize(pe_chng.clip(lower=0))
-    call_writing_score = _normalize(ce_chng.clip(lower=0))
-    unwinding_score = _normalize((-ce_chng.clip(upper=0)) + (-pe_chng.clip(upper=0)))
-
-    ref = spot_price if spot_price else (atm_strike if atm_strike else float(strikes.median()))
-    spot_distance_score = 1 - _normalize((strikes - ref).abs()) if ref else pd.Series(0.5, index=d.index)
-    atm_distance_score = 1 - _normalize((strikes - atm_strike).abs()) if atm_strike else pd.Series(0.5, index=d.index)
-    maxpain_distance_score = 1 - _normalize((strikes - max_pain).abs()) if max_pain else pd.Series(0.5, index=d.index)
-
-    iv_score = _normalize(avg_iv)
-    pcr_bias = min(abs((pcr or 1) - 1) / 1.0, 1.0)
-    pcr_score = pd.Series(pcr_bias, index=d.index)
-
-    w = BIG_MOVE_WEIGHTS
-    score = (
-        delta_oi_score * w["delta_oi"] + oi_score * w["total_oi"] + volume_score * w["volume"]
-        + confirmation_score * w["confirmation"] + put_writing_score * w["put_writing"]
-        + call_writing_score * w["call_writing"] + unwinding_score * w["unwinding"]
-        + spot_distance_score * w["spot_distance"] + atm_distance_score * w["atm_distance"]
-        + maxpain_distance_score * w["maxpain_distance"] + iv_score * w["iv"] + pcr_score * w["pcr"]
-    ) * 100
-
-    d["Big Move Score"] = score.clip(0, 100).round(1)
-
-    def _label(v):
-        if v >= 90:
-            return "🔥 Explosive Move Ready"
-        if v >= 80:
-            return "🟢 Strong Move"
-        if v >= 60:
-            return "🟡 Watch"
-        return "⚪ Ignore"
-
-    d["Big Move Label"] = d["Big Move Score"].apply(_label)
-
-    def _ce_buildup(v):
-        if v > 0:
-            return "Short Build-up (Call Writing)"
-        if v < 0:
-            return "Short Covering"
-        return "Flat"
-
-    def _pe_buildup(v):
-        if v > 0:
-            return "Long Build-up (Put Writing)"
-        if v < 0:
-            return "Long Unwinding"
-        return "Flat"
-
-    d["CE Build-up"] = ce_chng.apply(_ce_buildup)
-    d["PE Build-up"] = pe_chng.apply(_pe_buildup)
-
-    above_spot = strikes > ref
-    below_spot = strikes < ref
-    breakout_prob = pd.Series(0.0, index=d.index)
-    breakdown_prob = pd.Series(0.0, index=d.index)
-    breakout_prob.loc[above_spot] = (unwinding_score.loc[above_spot] * 0.6 + delta_oi_score.loc[above_spot] * 0.4) * 100
-    breakdown_prob.loc[below_spot] = (unwinding_score.loc[below_spot] * 0.6 + delta_oi_score.loc[below_spot] * 0.4) * 100
-    d["Breakout Probability"] = breakout_prob.round(1)
-    d["Breakdown Probability"] = breakdown_prob.round(1)
-
-    d["Institutional Score"] = ((oi_score * 0.7 + delta_oi_score * 0.3) * 100).round(1)
-    d["Smart Money Score"] = ((unwinding_score * 0.5 + volume_score * 0.5) * 100).round(1)
-
-    return d
-
-
-def _safe_top(sub_df: pd.DataFrame, col: str):
-    if sub_df is None or sub_df.empty or col not in sub_df.columns:
-        return None
-    return sub_df.loc[sub_df[col].idxmax()]
-
-
-# ══════════════════════════════════════════════════════════════════════════
-# 5B. AI ENGINE
-# ══════════════════════════════════════════════════════════════════════════
-
-RATING_BANDS = [
-    (90, "★★★★★ Strong Buy", "strongbuy"),
-    (75, "★★★★ Buy", "buy"),
-    (55, "★★★ Hold", "hold"),
-    (35, "★★ Avoid", "avoid"),
-    (0, "★ Ignore", "ignore"),
-]
-RATING_CSS_CLASS = {
-    "strongbuy": "rating-strongbuy", "buy": "rating-buy", "hold": "rating-hold",
-    "avoid": "rating-avoid", "ignore": "rating-ignore",
-}
-
-
-def rating_from_score(score: float) -> tuple:
-    for threshold, label, key in RATING_BANDS:
-        if score >= threshold:
-            return label, key
-    return "★ Ignore", "ignore"
-
-
-SIDE_RATING_BANDS = [
-    (90, "★★★★★", "STRONG {side} BUY", "strongbuy"),
-    (75, "★★★★", "{side} BUY", "buy"),
-    (55, "★★★", "{side} HOLD", "hold"),
-    (35, "★★", "{side} AVOID", "avoid"),
-    (0, "★", "{side} IGNORE", "ignore"),
-]
-
-
-def rating_label_for_side(score: float, side: str) -> tuple:
-    for threshold, stars, template, key in SIDE_RATING_BANDS:
-        if score >= threshold:
-            return f"{stars} {template.format(side=side)}", key
-    stars, template, key = SIDE_RATING_BANDS[-1][1:]
-    return f"{stars} {template.format(side=side)}", key
-
-
-def compute_ai_engine(df: pd.DataFrame, spot_price: float, atm_strike: float,
+def compute_ai_scores(df: pd.DataFrame, spot: float, atm_strike: float,
                        max_pain: float, pcr: float) -> pd.DataFrame:
-    if df.empty:
-        return df
+    """Independent 0-100 CE Score / PE Score per strike, built from a
+    weighted blend of OI buildup direction, volume, PCR bias, proximity
+    to spot/max-pain, and IV stability. Mirrors the same signal families
+    a discretionary options trader would read off a chain by eye."""
     d = df.copy()
+    if d.empty:
+        d["CE Score"] = pd.Series(dtype=float)
+        d["PE Score"] = pd.Series(dtype=float)
+        return d
 
-    ce_oi, pe_oi = d.get("ce_oi", pd.Series(0, index=d.index)), d.get("pe_oi", pd.Series(0, index=d.index))
-    ce_chng, pe_chng = d.get("ce_chng_oi", pd.Series(0, index=d.index)), d.get("pe_chng_oi", pd.Series(0, index=d.index))
-    ce_vol, pe_vol = d.get("ce_volume", pd.Series(0, index=d.index)), d.get("pe_volume", pd.Series(0, index=d.index))
-    ce_iv, pe_iv = d.get("ce_iv", pd.Series(0, index=d.index)), d.get("pe_iv", pd.Series(0, index=d.index))
-    strikes = d["strike_price"]
+    ce_oi_s = _normalize_series(d["ce_oi"])
+    pe_oi_s = _normalize_series(d["pe_oi"])
+    pe_chng_s = _normalize_series(d["pe_chng_oi"])
+    ce_chng_s = _normalize_series(d["ce_chng_oi"])
+    ce_unwind_s = _normalize_series((-d["ce_chng_oi"]).clip(lower=0))
+    pe_unwind_s = _normalize_series((-d["pe_chng_oi"]).clip(lower=0))
+    ce_vol_s = _normalize_series(d["ce_volume"])
+    pe_vol_s = _normalize_series(d["pe_volume"])
+    delta_oi_mag_s = _normalize_series(d["ce_chng_oi"].abs() + d["pe_chng_oi"].abs())
 
-    ce_oi_s = _normalize(ce_oi)
-    pe_oi_s = _normalize(pe_oi)
-    ce_dchng_s = _normalize(ce_chng)
-    pe_dchng_s = _normalize(pe_chng)
-    ce_unwind_s = _normalize(-ce_chng.clip(upper=0))
-    pe_unwind_s = _normalize(-pe_chng.clip(upper=0))
-    ce_vol_s = _normalize(ce_vol)
-    pe_vol_s = _normalize(pe_vol)
+    avg_ce_iv = d.loc[d["ce_iv"] > 0, "ce_iv"].mean() if (d["ce_iv"] > 0).any() else 0.0
+    avg_pe_iv = d.loc[d["pe_iv"] > 0, "pe_iv"].mean() if (d["pe_iv"] > 0).any() else 0.0
+    ce_iv_stability_s = _normalize_series(-(d["ce_iv"] - avg_ce_iv).abs())
+    pe_iv_stability_s = _normalize_series(-(d["pe_iv"] - avg_pe_iv).abs())
 
-    avg_ce_iv = ce_iv[ce_iv > 0].mean() if (ce_iv > 0).any() else 0
-    avg_pe_iv = pe_iv[pe_iv > 0].mean() if (pe_iv > 0).any() else 0
-    ce_iv_dev = _normalize(-(ce_iv - avg_ce_iv).abs())
-    pe_iv_dev = _normalize(-(pe_iv - avg_pe_iv).abs())
+    ref = spot if spot else (atm_strike if atm_strike else float(d["strike_price"].median()))
+    proximity_s = 1 - _normalize_series((d["strike_price"] - ref).abs())
+    maxpain_proximity_s = 1 - _normalize_series((d["strike_price"] - max_pain).abs()) if max_pain else pd.Series(0.5, index=d.index)
 
-    ref = spot_price if spot_price else (atm_strike if atm_strike else float(strikes.median()))
-    proximity_s = 1 - _normalize((strikes - ref).abs()) if ref else pd.Series(0.5, index=d.index)
-    maxpain_proximity_s = 1 - _normalize((strikes - max_pain).abs()) if max_pain else pd.Series(0.5, index=d.index)
-
-    total_oi = ce_oi + pe_oi
-    total_vol = ce_vol + pe_vol
-    total_dchng = ce_chng.abs() + pe_chng.abs()
-    highest_oi_s = _normalize(total_oi)
-    highest_vol_s = _normalize(total_vol)
-    highest_dchng_s = _normalize(total_dchng)
-
-    pcr_bull = float(np.clip(((pcr or 1) - 1) / 1.0, -1, 1))
-    pcr_bull_s = (pcr_bull + 1) / 2
+    pcr_bull_bias = float(np.clip(((pcr or 1.0) - 1.0), -1, 1))
+    pcr_bull_s = (pcr_bull_bias + 1) / 2
     pcr_bear_s = 1 - pcr_bull_s
 
-    breakout_s = _normalize(d["Breakout Probability"]) if "Breakout Probability" in d.columns else pd.Series(0, index=d.index)
-    breakdown_s = _normalize(d["Breakdown Probability"]) if "Breakdown Probability" in d.columns else pd.Series(0, index=d.index)
-
-    cw = {"put_writing": 0.16, "call_unwind": 0.12, "ce_volume": 0.10, "pcr_bull": 0.10,
-          "proximity": 0.10, "breakout": 0.10, "highest_oi": 0.06, "highest_vol": 0.06,
-          "highest_dchng": 0.06, "maxpain": 0.06, "iv": 0.05, "pe_oi_support": 0.03}
+    w = AI_SCORE_WEIGHTS
     ce_score = (
-        pe_dchng_s * cw["put_writing"] + ce_unwind_s * cw["call_unwind"] + ce_vol_s * cw["ce_volume"]
-        + pcr_bull_s * cw["pcr_bull"] + proximity_s * cw["proximity"] + breakout_s * cw["breakout"]
-        + highest_oi_s * cw["highest_oi"] + highest_vol_s * cw["highest_vol"]
-        + highest_dchng_s * cw["highest_dchng"] + maxpain_proximity_s * cw["maxpain"]
-        + ce_iv_dev * cw["iv"] + pe_oi_s * cw["pe_oi_support"]
+        pe_chng_s * w["put_writing"] + ce_unwind_s * w["call_unwind"] + ce_vol_s * w["volume"]
+        + pcr_bull_s * w["pcr_bias"] + proximity_s * w["proximity"]
+        + maxpain_proximity_s * w["max_pain_proximity"] + ce_oi_s * w["highest_oi"]
+        + delta_oi_mag_s * w["delta_oi_magnitude"] + ce_iv_stability_s * w["iv_stability"]
     ) * 100
 
-    pw = {"call_writing": 0.16, "put_unwind": 0.12, "pe_volume": 0.10, "pcr_bear": 0.10,
-          "proximity": 0.10, "breakdown": 0.10, "highest_oi": 0.06, "highest_vol": 0.06,
-          "highest_dchng": 0.06, "maxpain": 0.06, "iv": 0.05, "ce_oi_resistance": 0.03}
     pe_score = (
-        ce_dchng_s * pw["call_writing"] + pe_unwind_s * pw["put_unwind"] + pe_vol_s * pw["pe_volume"]
-        + pcr_bear_s * pw["pcr_bear"] + proximity_s * pw["proximity"] + breakdown_s * pw["breakdown"]
-        + highest_oi_s * pw["highest_oi"] + highest_vol_s * pw["highest_vol"]
-        + highest_dchng_s * pw["highest_dchng"] + maxpain_proximity_s * pw["maxpain"]
-        + pe_iv_dev * pw["iv"] + ce_oi_s * pw["ce_oi_resistance"]
+        ce_chng_s * w["put_writing"] + pe_unwind_s * w["call_unwind"] + pe_vol_s * w["volume"]
+        + pcr_bear_s * w["pcr_bias"] + proximity_s * w["proximity"]
+        + maxpain_proximity_s * w["max_pain_proximity"] + pe_oi_s * w["highest_oi"]
+        + delta_oi_mag_s * w["delta_oi_magnitude"] + pe_iv_stability_s * w["iv_stability"]
     ) * 100
 
     d["CE Score"] = ce_score.clip(0, 100).round(1)
     d["PE Score"] = pe_score.clip(0, 100).round(1)
 
-    ce_ratings = d["CE Score"].apply(rating_from_score)
-    pe_ratings = d["PE Score"].apply(rating_from_score)
-    d["CE Rating"] = ce_ratings.apply(lambda x: x[0])
-    d["CE Rating Key"] = ce_ratings.apply(lambda x: x[1])
-    d["PE Rating"] = pe_ratings.apply(lambda x: x[0])
-    d["PE Rating Key"] = pe_ratings.apply(lambda x: x[1])
-
-    d["Overall Score"] = ((d["CE Score"] + d["PE Score"]) / 2).round(1)
-    d["AI Confidence"] = d[["CE Score", "PE Score"]].max(axis=1).round(1)
-    d["BUY Probability"] = d["CE Score"]
-    d["SELL Probability"] = d["PE Score"]
-
-    def _final_signal(row):
+    def _decision(row) -> str:
         ce, pe = row["CE Score"], row["PE Score"]
-        if ce > pe:
-            return f"CE · {row['CE Rating']}"
-        if pe > ce:
-            return f"PE · {row['PE Rating']}"
-        if row.get("Breakdown Probability", 0) > row.get("Breakout Probability", 0):
-            return f"PE · {row['PE Rating']}"
-        return f"CE · {row['CE Rating']}"
+        if abs(ce - pe) < 3:
+            return "HOLD"
+        return "BUY CE" if ce > pe else "BUY PE"
 
-    d["Final Signal"] = d.apply(_final_signal, axis=1)
-
-    d["CE BUY Probability"] = d["CE Score"]
-    d["PE BUY Probability"] = d["PE Score"]
-    d["CE SELL Probability"] = (100 - d["CE Score"]).clip(0, 100).round(1)
-    d["PE SELL Probability"] = (100 - d["PE Score"]).clip(0, 100).round(1)
-
-    def _levels(ltp: pd.Series) -> dict:
-        entry = ltp.round(2)
-        sl = (ltp * 0.85).round(2)
-        t1 = (ltp * 1.15).round(2)
-        t2 = (ltp * 1.30).round(2)
-        t3 = (ltp * 1.50).round(2)
-        return {"Entry": entry, "SL": sl, "T1": t1, "T2": t2, "T3": t3}
-
-    ce_levels = _levels(d.get("ce_ltp", pd.Series(0, index=d.index)))
-    pe_levels = _levels(d.get("pe_ltp", pd.Series(0, index=d.index)))
-    d["CE Entry"], d["CE SL"] = ce_levels["Entry"], ce_levels["SL"]
-    d["CE Target 1"], d["CE Target 2"], d["CE Target 3"] = ce_levels["T1"], ce_levels["T2"], ce_levels["T3"]
-    d["PE Entry"], d["PE SL"] = pe_levels["Entry"], pe_levels["SL"]
-    d["PE Target 1"], d["PE Target 2"], d["PE Target 3"] = pe_levels["T1"], pe_levels["T2"], pe_levels["T3"]
-
-    d["Institutional Buying"] = ((pe_oi_s * 0.5 + pe_dchng_s * 0.5) * 100).round(1)
-    d["Institutional Selling"] = ((ce_oi_s * 0.5 + ce_dchng_s * 0.5) * 100).round(1)
-    d["Smart Money Activity"] = d.get("Smart Money Score", pd.Series(0, index=d.index))
-
-    d["Confidence %"] = d["AI Confidence"]
-
-    def _final_recommendation(row):
-        ce, pe = row["CE Score"], row["PE Score"]
-        if ce > pe:
-            label, _ = rating_label_for_side(ce, "CE")
-            return label
-        if pe > ce:
-            label, _ = rating_label_for_side(pe, "PE")
-            return label
-        if row.get("Breakdown Probability", 0) > row.get("Breakout Probability", 0):
-            label, _ = rating_label_for_side(pe, "PE")
-            return label
-        label, _ = rating_label_for_side(ce, "CE")
-        return label
-
-    d["Final Recommendation"] = d.apply(_final_recommendation, axis=1)
+    d["AI Signal"] = d.apply(_decision, axis=1)
+    d["AI Confidence %"] = d[["CE Score", "PE Score"]].max(axis=1).round(1)
     return d
 
 
-def generate_trade_signals(df: pd.DataFrame, pcr: float, support, resistance,
-                            min_confidence: float = 80, top_n: int = 15, source: str = "") -> list:
-    src_tag = source or "UNKNOWN"
-    if df.empty or "CE Score" not in df.columns:
-        logger.error(
-            "Stage: Final Decision (source=%s) — AI Engine columns missing or chain empty; "
-            "no signals can be generated. Returning WAIT.", src_tag,
-        )
-        try:
-            st.session_state["oc_signal_rejection_summary"] = {
-                "source": src_tag, "evaluated": 0, "passed": 0,
-                "top_ce_score": 0.0, "top_pe_score": 0.0, "threshold": min_confidence,
-                "reason": "AI Engine did not run (empty chain or missing CE/PE Score columns).",
-            }
-        except Exception:  # noqa: BLE001 - session_state may be unavailable outside Streamlit
-            pass
-        return []
-
-    ce_vol_thresh = df["ce_volume"].quantile(0.75) if df["ce_volume"].max() > 0 else 0
-    pe_vol_thresh = df["pe_volume"].quantile(0.75) if df["pe_volume"].max() > 0 else 0
-    diffs = df["strike_price"].sort_values().diff().dropna()
-    strike_gap = diffs.median() if len(diffs) else 1
-
-    signals = []
-    evaluated = 0
-    rejected_low_confidence = 0
-    rejected_no_premium = 0
-    top_ce_score = float(df["CE Score"].max()) if "CE Score" in df.columns and len(df) else 0.0
-    top_pe_score = float(df["PE Score"].max()) if "PE Score" in df.columns and len(df) else 0.0
-
-    for _, row in df.iterrows():
-        for side, score_col, rating_col, ltp_col in [
-            ("CE", "CE Score", "CE Rating", "ce_ltp"),
-            ("PE", "PE Score", "PE Rating", "pe_ltp"),
-        ]:
-            evaluated += 1
-            score = row[score_col]
-            if score < min_confidence:
-                rejected_low_confidence += 1
-                continue
-            ltp = row[ltp_col]
-            if ltp <= 0:
-                rejected_no_premium += 1
-                continue
-
-            entry = round(float(ltp), 2)
-            sl = round(entry * 0.85, 2)
-            t1 = round(entry * 1.15, 2)
-            t2 = round(entry * 1.30, 2)
-            t3 = round(entry * 1.50, 2)
-            risk = max(entry - sl, 0.01)
-            reward = t2 - entry
-            rr = round(reward / risk, 2) if risk > 0 else 0
-
-            reasons = []
-            if side == "CE":
-                if row.get("pe_chng_oi", 0) > 0:
-                    reasons.append("Heavy Put Writing")
-                if row.get("ce_chng_oi", 0) < 0:
-                    reasons.append("Call Short Covering")
-                if ce_vol_thresh > 0 and row.get("ce_volume", 0) >= ce_vol_thresh:
-                    reasons.append("Volume Spike")
-                if pcr > 1.1:
-                    reasons.append("Bullish PCR")
-                if support is not None and abs(row["strike_price"] - support) <= strike_gap:
-                    reasons.append("Support Confirmed")
-                if row.get("Institutional Score", 0) >= 70:
-                    reasons.append("Institution Buying")
-                if row.get("Breakout Probability", 0) >= 60:
-                    reasons.append("Breakout Setup")
-            else:
-                if row.get("ce_chng_oi", 0) > 0:
-                    reasons.append("Heavy Call Writing")
-                if row.get("pe_chng_oi", 0) < 0:
-                    reasons.append("Put Long Unwinding")
-                if pe_vol_thresh > 0 and row.get("pe_volume", 0) >= pe_vol_thresh:
-                    reasons.append("Volume Spike")
-                if pcr < 0.9:
-                    reasons.append("Bearish PCR")
-                if resistance is not None and abs(row["strike_price"] - resistance) <= strike_gap:
-                    reasons.append("Resistance Confirmed")
-                if row.get("Institutional Score", 0) >= 70:
-                    reasons.append("Institution Selling")
-                if row.get("Breakdown Probability", 0) >= 60:
-                    reasons.append("Breakdown Setup")
-            if not reasons:
-                reasons.append("OI Build-up")
-
-            side_label, side_css_key = rating_label_for_side(score, side)
-
-            signals.append({
-                "Strike": row["strike_price"], "Side": side,
-                "Signal": side_label, "Signal Key": side_css_key,
-                "Confidence": score, "Entry": entry, "SL": sl, "T1": t1, "T2": t2, "T3": t3,
-                "Risk Reward": f"1 : {rr}" if rr > 0 else "—",
-                "Reason": " · ".join(reasons), "Reasons": reasons,
-            })
-
-    signals.sort(key=lambda s: s["Confidence"], reverse=True)
-    final_signals = signals[:top_n]
-
-    if not final_signals:
-        reason = (
-            f"No strike met the {min_confidence:.0f}% confidence threshold "
-            f"(highest CE Score={top_ce_score:.1f}, highest PE Score={top_pe_score:.1f}) — "
-            f"WAIT is correct here rather than forcing a signal."
-            if rejected_low_confidence and not rejected_no_premium == evaluated
-            else "No strike had both sufficient confidence AND a tradable premium (LTP > 0) — WAIT."
-        )
-        try:
-            st.session_state["oc_signal_rejection_summary"] = {
-                "source": src_tag, "evaluated": evaluated,
-                "rejected_low_confidence": rejected_low_confidence,
-                "rejected_no_premium": rejected_no_premium,
-                "top_ce_score": top_ce_score, "top_pe_score": top_pe_score,
-                "threshold": min_confidence, "reason": reason,
-            }
-        except Exception:  # noqa: BLE001 - session_state may be unavailable outside Streamlit
-            pass
-    else:
-        try:
-            st.session_state["oc_signal_rejection_summary"] = None
-        except Exception:  # noqa: BLE001
-            pass
-
-    return final_signals
-
-
-def compute_dashboard_summary(df: pd.DataFrame, signals: list, intel: dict) -> dict:
-    if df.empty:
-        return {}
-
-    def _rr_value(sig):
-        rr_str = sig.get("Risk Reward", "—")
-        try:
-            return float(rr_str.split(":")[-1].strip())
-        except (ValueError, IndexError):
-            return 0.0
-
-    return {
-        "Top CE Buy": _safe_top(df, "CE Score"),
-        "Top PE Buy": _safe_top(df, "PE Score"),
-        "Best Breakout Strike": _safe_top(df, "Breakout Probability"),
-        "Best Breakdown Strike": _safe_top(df, "Breakdown Probability"),
-        "Highest Institutional Buying": intel.get("institution_buying", 0),
-        "Highest Institutional Selling": intel.get("institution_selling", 0),
-        "Highest Smart Money": _safe_top(df, "Smart Money Score"),
-        "Highest OI": df.loc[(df["ce_oi"] + df["pe_oi"]).idxmax()] if len(df) else None,
-        "Highest Volume": df.loc[(df["ce_volume"] + df["pe_volume"]).idxmax()] if len(df) else None,
-        "Highest Delta OI": df.loc[(df["ce_chng_oi"].abs() + df["pe_chng_oi"].abs()).idxmax()] if len(df) else None,
-        "Best Risk Reward Trade": max(signals, key=_rr_value) if signals else None,
-        "Today's Best Trade": signals[0] if signals else None,
-    }
-
-
-# ══════════════════════════════════════════════════════════════════════════
-# 5C. GAMMA BUILD-UP ANALYZER
-# ══════════════════════════════════════════════════════════════════════════
-
-GAMMA_HISTORY_KEY = "oc_gamma_history"
-GAMMA_ALERTED_KEY = "oc_gamma_alerted_thresholds"
-GAMMA_LAST_SIGNAL_KEY = "oc_gamma_last_signal"
-GAMMA_AUDIO_FIRED_KEY = "oc_gamma_audio_fired"
-
-_GAMMA_PING_WAV_B64 = (
-    "UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQAAAAA="
-)
-
-
-def _bs_gamma(spot: float, strike: float, t: float, r: float, sigma: float) -> float:
-    if t <= 0 or sigma <= 0 or spot <= 0 or strike <= 0:
-        return 0.0
-    d1 = (math.log(spot / strike) + (r + 0.5 * sigma ** 2) * t) / (sigma * math.sqrt(t))
-    return math.exp(-0.5 * d1 ** 2) / (spot * sigma * math.sqrt(2 * math.pi * t))
-
-
-def add_gamma_columns(df: pd.DataFrame, spot: float, expiry_label: str, r: float = 0.07) -> pd.DataFrame:
+def detect_institutional_smart_money(df: pd.DataFrame) -> pd.DataFrame:
+    """Flags strikes showing institutional-scale positioning: OI in the
+    top quartile combined with meaningful same-direction OI change and
+    above-median volume (i.e. size AND fresh conviction AND liquidity,
+    not just a stale large open position)."""
     d = df.copy()
-    if d.empty or not spot:
-        d["ce_gamma"] = 0.0
-        d["pe_gamma"] = 0.0
-        d["gamma"] = 0.0
+    if d.empty:
+        d["Institutional Signal"] = pd.Series(dtype=object)
+        d["Smart Money"] = pd.Series(dtype=bool)
         return d
 
-    days_to_expiry = parse_days_to_expiry(expiry_label)
-    t = max(days_to_expiry, 0.5) / 365.0
+    ce_oi_q75 = d["ce_oi"].quantile(0.75) if d["ce_oi"].max() > 0 else 0
+    pe_oi_q75 = d["pe_oi"].quantile(0.75) if d["pe_oi"].max() > 0 else 0
+    ce_vol_med = d["ce_volume"].median()
+    pe_vol_med = d["pe_volume"].median()
 
-    def _row_gamma(strike, iv_pct):
-        sigma = max(float(iv_pct), 0.0) / 100.0
-        if sigma <= 0:
-            sigma = 0.30
-        return _bs_gamma(spot, strike, t, r, sigma)
+    def _inst_signal(row) -> str:
+        ce_inst = row["ce_oi"] >= ce_oi_q75 > 0 and row["ce_chng_oi"] > 0 and row["ce_volume"] >= ce_vol_med
+        pe_inst = row["pe_oi"] >= pe_oi_q75 > 0 and row["pe_chng_oi"] > 0 and row["pe_volume"] >= pe_vol_med
+        if ce_inst and pe_inst:
+            return "Institutional Activity (Both Sides)"
+        if ce_inst:
+            return "Institutional Call Writing"
+        if pe_inst:
+            return "Institutional Put Writing"
+        return "None"
 
-    d["ce_gamma"] = d.apply(lambda row: _row_gamma(row["strike_price"], row.get("ce_iv", 0)), axis=1)
-    d["pe_gamma"] = d.apply(lambda row: _row_gamma(row["strike_price"], row.get("pe_iv", 0)), axis=1)
-    d["gamma"] = ((d["ce_gamma"] + d["pe_gamma"]) / 2).round(6)
+    d["Institutional Signal"] = d.apply(_inst_signal, axis=1)
+    d["Smart Money"] = d["Institutional Signal"] != "None"
     return d
 
 
-def _gamma_trend_label(change_pct: float) -> str:
-    if change_pct >= 30:
-        return "🚀 Explosive Increase"
-    if change_pct >= 10:
-        return "🟢 Increasing"
-    if change_pct > -10:
-        return "🟡 Stable"
-    if change_pct > -30:
-        return "🔴 Decreasing"
-    return "⚫ Flat"
+# ══════════════════════════════════════════════════════════════════════════
+# 10. INTRADAY AI — BREAKOUT / REVERSAL / TREND PROBABILITY, SCALP/SWING
+# ══════════════════════════════════════════════════════════════════════════
+
+MOMENTUM_HISTORY_KEY = "oc_momentum_history"
+MOMENTUM_HISTORY_MAX_POINTS = 30
 
 
-def _gamma_strength(change_pct: float) -> tuple:
-    a = abs(change_pct)
-    if a >= 30:
-        return "Very Strong", "strongbuy"
-    if a >= 20:
-        return "Strong", "buy"
-    if a >= 10:
-        return "Medium", "hold"
-    if a >= 3:
-        return "Weak", "sell"
-    return "Very Weak", "strongsell"
+def compute_momentum_score(spot: float, max_pain: float, pcr: float) -> float:
+    mp_component = ((spot - max_pain) / max_pain) * 100 if (max_pain and spot) else 0.0
+    return float(np.clip(((pcr - 1) * 50) + (mp_component * 0.5), -100, 100))
 
 
-def _gamma_signal(gamma_up: bool, oi_up: bool, volume_up: bool, ltp_up: bool, ltp_down: bool) -> str:
-    if gamma_up and oi_up and volume_up and ltp_up:
-        return "🟢 BUY"
-    if (not gamma_up) and oi_up and ltp_down:
-        return "🔴 SELL"
-    return "🟡 WAIT"
-
-
-def _gamma_trade_action(signal: str, strength_key: str, trend: str) -> str:
-    if signal == "🟢 BUY":
-        if "Explosive" in trend or strength_key == "strongbuy":
-            return "BUY NOW"
-        return "BUY ON DIP"
-    if signal == "🔴 SELL":
-        if strength_key in ("strongsell", "sell"):
-            return "EXIT"
-        return "SELL"
-    if strength_key in ("strongbuy", "buy"):
-        return "HOLD"
-    return "BOOK PROFIT" if strength_key in ("sell", "strongsell") else "HOLD"
-
-
-def _gamma_ai_rating(signal: str, strength_key: str) -> str:
-    if signal == "🟢 BUY" and strength_key == "strongbuy":
-        return "⭐⭐⭐⭐⭐"
-    if signal == "🟢 BUY" and strength_key in ("buy", "hold"):
-        return "⭐⭐⭐⭐"
-    if signal == "🟡 WAIT" and strength_key == "hold":
-        return "⭐⭐⭐"
-    if signal == "🔴 SELL" and strength_key in ("sell", "hold"):
-        return "⭐⭐"
-    return "⭐"
-
-
-def compute_gamma_analysis(df: pd.DataFrame, symbol: str, expiry_label: str) -> pd.DataFrame:
-    if df.empty:
-        return df
-
-    d = df.copy()
-    history = st.session_state.setdefault(GAMMA_HISTORY_KEY, {})
-    last_signal_map = st.session_state.setdefault(GAMMA_LAST_SIGNAL_KEY, {})
-    hist_key = f"{symbol}|{expiry_label}"
-    prev_strikes = history.get(hist_key, {})
-    new_strikes = {}
-
-    total_oi = (d.get("ce_oi", 0) + d.get("pe_oi", 0))
-    total_vol = (d.get("ce_volume", 0) + d.get("pe_volume", 0))
-    total_ltp = (d.get("ce_ltp", 0) + d.get("pe_ltp", 0))
-
-    gamma_change_list, gamma_pct_list, trend_list = [], [], []
-    signal_list, signal_key_list, strength_list, strength_key_list = [], [], [], []
-    action_list, rating_list = [], []
-    is_new_signal_list = []
-
-    for idx, row in d.iterrows():
-        strike = row["strike_price"]
-        cur_gamma = float(row.get("gamma", 0.0))
-        cur_oi = float(total_oi.loc[idx])
-        cur_vol = float(total_vol.loc[idx])
-        cur_ltp = float(total_ltp.loc[idx])
-
-        prev = prev_strikes.get(str(strike), {})
-        prev_gamma = prev.get("gamma", cur_gamma)
-        prev_oi = prev.get("oi", cur_oi)
-        prev_vol = prev.get("volume", cur_vol)
-        prev_ltp = prev.get("ltp", cur_ltp)
-
-        gamma_diff = cur_gamma - prev_gamma
-        gamma_pct = ((cur_gamma - prev_gamma) / prev_gamma * 100) if prev_gamma else 0.0
-        gamma_pct = float(np.clip(gamma_pct, -999, 999))
-
-        trend = _gamma_trend_label(gamma_pct)
-        gamma_up = gamma_diff > 0
-        oi_up = cur_oi > prev_oi
-        vol_up = cur_vol > prev_vol
-        ltp_up = cur_ltp > prev_ltp
-        ltp_down = cur_ltp < prev_ltp
-
-        signal = _gamma_signal(gamma_up, oi_up, vol_up, ltp_up, ltp_down)
-        strength_label, strength_key = _gamma_strength(gamma_pct)
-        action = _gamma_trade_action(signal, strength_key, trend)
-        rating = _gamma_ai_rating(signal, strength_key)
-
-        prior_signal = last_signal_map.get(f"{hist_key}|{strike}")
-        is_new_signal = signal != "🟡 WAIT" and signal != prior_signal
-        if signal != "🟡 WAIT":
-            last_signal_map[f"{hist_key}|{strike}"] = signal
-        elif prior_signal is not None and prior_signal != "🟡 WAIT":
-            last_signal_map[f"{hist_key}|{strike}"] = "🟡 WAIT"
-
-        gamma_change_list.append(gamma_diff)
-        gamma_pct_list.append(gamma_pct)
-        trend_list.append(trend)
-        signal_list.append(signal)
-        signal_key_list.append("buy" if signal == "🟢 BUY" else ("sell" if signal == "🔴 SELL" else "wait"))
-        strength_list.append(strength_label)
-        strength_key_list.append(strength_key)
-        action_list.append(action)
-        rating_list.append(rating)
-        is_new_signal_list.append(is_new_signal)
-
-        new_strikes[str(strike)] = {"gamma": cur_gamma, "oi": cur_oi, "volume": cur_vol, "ltp": cur_ltp}
-
-    d["Gamma Change"] = gamma_change_list
-    d["Gamma Change %"] = gamma_pct_list
-    d["Gamma Trend"] = trend_list
-    d["Gamma Signal"] = signal_list
-    d["Gamma Signal Key"] = signal_key_list
-    d["Gamma Strength"] = strength_list
-    d["Gamma Strength Key"] = strength_key_list
-    d["Trade Action"] = action_list
-    d["AI Rating"] = rating_list
-    d["_gamma_is_new_signal"] = is_new_signal_list
-
-    def _final_band(row):
-        strong_buy = (
-            row["Gamma Signal"] == "🟢 BUY"
-            and row["Gamma Strength Key"] in ("strongbuy", "buy")
-            and row.get("ce_chng_oi", 0) + row.get("pe_chng_oi", 0) > 0
-        )
-        strong_sell = (
-            row["Gamma Signal"] == "🔴 SELL"
-            and row["Gamma Strength Key"] in ("strongsell", "sell")
-        )
-        if strong_buy:
-            return "strongbuy"
-        if strong_sell:
-            return "strongsell"
-        if row["Gamma Signal"] == "🟢 BUY":
-            return "buy"
-        if row["Gamma Signal"] == "🔴 SELL":
-            return "sell"
-        return "hold"
-
-    d["Gamma Row Band"] = d.apply(_final_band, axis=1)
-
-    history[hist_key] = new_strikes
-    st.session_state[GAMMA_HISTORY_KEY] = history
-    st.session_state[GAMMA_LAST_SIGNAL_KEY] = last_signal_map
-
-    d = d.sort_values("Gamma Change %", ascending=False).reset_index(drop=True)
-    return d
-
-
-GAMMA_ROW_CSS = {
-    "strongbuy": "gamma-row-strongbuy",
-    "buy": "gamma-row-buy",
-    "hold": "gamma-row-hold",
-    "sell": "gamma-row-sell",
-    "strongsell": "gamma-row-strongsell",
-}
-
-
-def render_gamma_html_table(df: pd.DataFrame, top_n: int = 40) -> str:
-    cols = [
-        ("strike_price", "Strike", "{:,.0f}"),
-        ("gamma", "Gamma", "{:.5f}"),
-        ("Gamma Change", "Gamma Chg", "{:+.5f}"),
-        ("Gamma Change %", "Gamma Chg %", "{:+.1f}%"),
-        ("Gamma Trend", "Trend", None),
-        ("Gamma Signal", "Signal", None),
-        ("Gamma Strength", "Strength", None),
-        ("Trade Action", "Action", None),
-        ("AI Rating", "AI Rating", None),
-    ]
-    view = df.head(top_n)
-    rows_html = []
-    for _, row in view.iterrows():
-        band = row.get("Gamma Row Band", "hold")
-        css = GAMMA_ROW_CSS.get(band, "gamma-row-hold")
-        blink = ""
-        if band in ("strongbuy", "buy") and row.get("Gamma Change %", 0) > 0:
-            blink = " gamma-row-blink-green"
-        elif band in ("strongsell", "sell") and row.get("Gamma Change %", 0) < -15:
-            blink = " gamma-row-blink-red"
-        cells = []
-        for key, _, fmt in cols:
-            val = row.get(key, "")
-            # FIX (see FIX NOTE 6a): escape every interpolated cell value
-            # instead of dropping it into the <td> raw, so a stray
-            # '<'/'>'/'&' (or NaN) can never corrupt the table markup.
-            cells.append(f"<td>{_safe_cell(fmt.format(val) if fmt else val)}</td>")
-        rows_html.append(f'<tr class="{css}{blink}">{"".join(cells)}</tr>')
-
-    header_html = "".join(f"<th>{label}</th>" for _, label, _ in cols)
-    return f"""
-    <div style="max-height:560px; overflow-y:auto; border:1px solid #30363d; border-radius:8px;">
-    <table class="gamma-table">
-        <thead><tr>{header_html}</tr></thead>
-        <tbody>{''.join(rows_html)}</tbody>
-    </table>
-    </div>
-    """
-
-
-def fire_gamma_smart_alerts(df: pd.DataFrame, symbol: str, expiry_label: str) -> list:
-    if df.empty or "Gamma Change %" not in df.columns:
-        return []
-    alerted = st.session_state.setdefault(GAMMA_ALERTED_KEY, {})
+def update_momentum_history(symbol: str, expiry_label: str, momentum_score: float) -> None:
+    history = st.session_state.setdefault(MOMENTUM_HISTORY_KEY, {})
     key = f"{symbol}|{expiry_label}"
-    state = alerted.setdefault(key, {"10": False, "20": False, "30": False})
-
-    max_pct = float(df["Gamma Change %"].max())
-    messages = []
-    thresholds = [(30, "30", "🔥 Explosive Gamma Build-up"),
-                  (20, "20", "🚀🚀 Strong Institutional Buying"),
-                  (10, "10", "🚀 Gamma Build-up Detected")]
-    for value, tkey, msg in thresholds:
-        if max_pct >= value and not state[tkey]:
-            messages.append(msg)
-            state[tkey] = True
-        elif max_pct < value:
-            state[tkey] = False
-    alerted[key] = state
-    st.session_state[GAMMA_ALERTED_KEY] = alerted
-    return messages
+    series = history.get(key, [])
+    series.append(momentum_score)
+    if len(series) > MOMENTUM_HISTORY_MAX_POINTS:
+        series = series[-MOMENTUM_HISTORY_MAX_POINTS:]
+    history[key] = series
+    st.session_state[MOMENTUM_HISTORY_KEY] = history
 
 
-def render_gamma_tab(gdf: pd.DataFrame, symbol: str, expiry_label: str,
-                      live_mode: bool, audio_alert: bool):
-    st.markdown("##### ⚡ Advanced Gamma Build-up Analyzer")
+def compute_trend_probability(symbol: str, expiry_label: str, momentum_score: float) -> float:
+    """Trend probability derived from momentum consistency across this
+    session's refreshes (a proxy for ADX-style trend strength) combined
+    with the current momentum magnitude. Needs at least 3 refreshes of
+    history to say anything about consistency; before that, it falls
+    back to magnitude alone (scaled down to reflect low confidence)."""
+    history = st.session_state.get(MOMENTUM_HISTORY_KEY, {})
+    series = history.get(f"{symbol}|{expiry_label}", [])
+    magnitude_component = min(abs(momentum_score), 100) / 100
+    if len(series) < 3:
+        return round(magnitude_component * 50, 1)
+    same_sign = sum(1 for v in series[-5:] if np.sign(v) == np.sign(momentum_score) and v != 0)
+    consistency_component = same_sign / min(len(series), 5)
+    return round(float(np.clip((magnitude_component * 0.5 + consistency_component * 0.5) * 100, 0, 100)), 1)
 
-    badge_col, time_col, prev_col = st.columns([1, 1, 1])
-    with badge_col:
-        if live_mode:
-            st.markdown('<span class="gamma-live-badge">🔴 LIVE</span>', unsafe_allow_html=True)
-        else:
-            st.markdown('<span class="intel-label">⏸ Manual refresh</span>', unsafe_allow_html=True)
-    with time_col:
-        st.markdown(f"<span class='intel-label'>Updated</span><br>"
-                    f"<span class='intel-value' style='font-size:14px;'>{datetime.now().strftime('%H:%M:%S')}</span>",
-                    unsafe_allow_html=True)
-    with prev_col:
-        avg_gamma = gdf["gamma"].mean() if "gamma" in gdf.columns and len(gdf) else 0
-        st.markdown(f"<span class='intel-label'>Avg Gamma (this refresh)</span><br>"
-                    f"<span class='intel-value' style='font-size:14px;'>{avg_gamma:.5f}</span>",
-                    unsafe_allow_html=True)
 
-    alert_msgs = fire_gamma_smart_alerts(gdf, symbol, expiry_label)
-    for msg in alert_msgs:
-        try:
-            st.toast(msg, icon="⚡")
-        except Exception:
-            st.info(msg)
+def compute_breakout_reversal_probability(df: pd.DataFrame, spot: float, resistance: Optional[float],
+                                           support: Optional[float], iv_rank: float) -> dict[str, float]:
+    """Breakout probability rises when Call OI just above spot is thin
+    relative to the chain (resistance weakening) and IV Rank is elevated
+    (room for expansion). Reversal probability rises when the nearest
+    OI wall (support/resistance) is unusually heavy relative to the
+    chain (price is more likely to react at the wall than punch through)."""
+    if df.empty or not spot:
+        return {"breakout_probability": 0.0, "reversal_probability": 0.0}
 
-    if audio_alert and gdf.get("_gamma_is_new_signal", pd.Series(dtype=bool)).any():
-        fired = st.session_state.setdefault(GAMMA_AUDIO_FIRED_KEY, {})
-        fire_key = f"{symbol}|{expiry_label}|{datetime.now().strftime('%H:%M:%S')}"
-        if fired.get(f"{symbol}|{expiry_label}") != fire_key:
-            fired[f"{symbol}|{expiry_label}"] = fire_key
-            st.session_state[GAMMA_AUDIO_FIRED_KEY] = fired
-            st.audio(io.BytesIO(__import__("base64").b64decode(_GAMMA_PING_WAV_B64)), format="audio/wav")
+    total_oi = (df["ce_oi"] + df["pe_oi"]).sum()
+    avg_oi = total_oi / (2 * len(df)) if len(df) else 0
 
-    st.markdown("<br>", unsafe_allow_html=True)
+    resistance_oi = float(df.loc[df["strike_price"] == resistance, "ce_oi"].sum()) if resistance else 0.0
+    support_oi = float(df.loc[df["strike_price"] == support, "pe_oi"].sum()) if support else 0.0
+    nearest_wall_oi = max(resistance_oi, support_oi)
 
-    st.markdown('<div class="block-title">📋 Gamma Summary Panel</div>', unsafe_allow_html=True)
-    strong_buy_n = int((gdf["Gamma Row Band"] == "strongbuy").sum()) if "Gamma Row Band" in gdf.columns else 0
-    buy_n = int((gdf["Gamma Row Band"] == "buy").sum()) if "Gamma Row Band" in gdf.columns else 0
-    sell_n = int(gdf["Gamma Row Band"].isin(["sell", "strongsell"]).sum()) if "Gamma Row Band" in gdf.columns else 0
+    wall_thinness = 1 - min(nearest_wall_oi / (avg_oi * 4), 1.0) if avg_oi > 0 else 0.5
+    wall_heaviness = min(nearest_wall_oi / (avg_oi * 4), 1.0) if avg_oi > 0 else 0.5
 
-    top_gamma_row = gdf.loc[gdf["gamma"].idxmax()] if len(gdf) and "gamma" in gdf.columns else None
-    top_gamma_pct_row = gdf.loc[gdf["Gamma Change %"].idxmax()] if len(gdf) and "Gamma Change %" in gdf.columns else None
-    top_oi_row = gdf.loc[(gdf.get("ce_oi", 0) + gdf.get("pe_oi", 0)).idxmax()] if len(gdf) else None
-    top_vol_row = gdf.loc[(gdf.get("ce_volume", 0) + gdf.get("pe_volume", 0)).idxmax()] if len(gdf) else None
-    top_rating_row = gdf.iloc[gdf["AI Rating"].apply(len).values.argmax()] if len(gdf) and "AI Rating" in gdf.columns else None
+    breakout_prob = float(np.clip((wall_thinness * 0.6 + (iv_rank / 100) * 0.4) * 100, 0, 100))
+    reversal_prob = float(np.clip((wall_heaviness * 0.7 + (1 - iv_rank / 100) * 0.3) * 100, 0, 100))
+    return {"breakout_probability": round(breakout_prob, 1), "reversal_probability": round(reversal_prob, 1)}
 
-    def _strike_of(row):
-        try:
-            return f"{row['strike_price']:,.0f}"
-        except Exception:
-            return "—"
 
-    g1, g2, g3, g4 = st.columns(4)
-    g1.metric("Total Strong Buy Strikes", strong_buy_n)
-    g2.metric("Total Buy Strikes", buy_n)
-    g3.metric("Total Sell Strikes", sell_n)
-    g4.metric("Highest Gamma Strike", _strike_of(top_gamma_row) if top_gamma_row is not None else "—")
+def compute_scalping_swing_signal(pcr: float, momentum_score: float, trend_probability: float,
+                                   gex_dex: dict, iv_rank: float) -> dict[str, str]:
+    """Scalping/Swing signals derived purely from this refresh's option-
+    chain positioning (PCR, momentum, GEX/DEX, IV Rank) since this
+    standalone script has no broker connection and therefore no live
+    candle/tick feed to base a price-action scalp call on. Explicitly
+    labelled as an OI-positioning read, not a price-action signal —
+    always confirm with a live chart before acting."""
+    total_gex = gex_dex.get("total_gex", 0.0)
+    total_dex = gex_dex.get("total_dex", 0.0)
 
-    g5, g6, g7, g8 = st.columns(4)
-    g5.metric("Highest Gamma %", f"{top_gamma_pct_row['Gamma Change %']:+.1f}%" if top_gamma_pct_row is not None else "—")
-    g6.metric("Highest OI Strike", _strike_of(top_oi_row) if top_oi_row is not None else "—")
-    g7.metric("Highest Volume Strike", _strike_of(top_vol_row) if top_vol_row is not None else "—")
-    g8.metric("Highest AI Rating", top_rating_row["AI Rating"] if top_rating_row is not None else "—")
-
-    st.markdown("<br>", unsafe_allow_html=True)
-
-    st.markdown(render_gamma_html_table(gdf), unsafe_allow_html=True)
-    st.caption(
-        "Gamma is derived per strike via Black-Scholes from the chain's own IV (or a 30% fallback vol "
-        "on thin payloads) and compared against the previous refresh stored for this session. Rows "
-        "blink green while Gamma is rising alongside a BUY signal, and blink red while Gamma is "
-        "falling sharply (≤ −15%) alongside a SELL signal; blinking stops automatically once Gamma "
-        "stabilizes, while the last BUY/SELL signal stays visible. Strongest Gamma increase is sorted "
-        "to the top. This is a heuristic read from a single point-in-time + previous-refresh "
-        "comparison, not real tick-by-tick market data — always confirm with live price action."
+    scalp_score = (
+        (1 if momentum_score > 15 else (-1 if momentum_score < -15 else 0))
+        + (1 if total_dex > 0 else (-1 if total_dex < 0 else 0))
+        + (1 if pcr > 1.1 else (-1 if pcr < 0.9 else 0))
     )
-
-    if live_mode:
-        time.sleep(5)
-        st.rerun()
-
-
-# ══════════════════════════════════════════════════════════════════════════
-# 5D. AI SCALPING ENGINE
-# ══════════════════════════════════════════════════════════════════════════
-
-SCALP_BOS_HISTORY_KEY = "oc_scalp_last_bos_dir"
-SCALP_ALERT_KEY_PREFIX = "oc_scalp_last_fire"
-SCALP_MIN_CONFIRMATIONS = 8
-SCALP_TOTAL_CHECKS = 13
-
-
-def fetch_underlying_candles(fyers, symbol_candidates: list, resolution: str = "5",
-                              lookback_days: int = 5) -> pd.DataFrame:
-    end = datetime.now()
-    start = end - timedelta(days=lookback_days)
-    for sym in symbol_candidates:
-        req = {
-            "symbol": sym, "resolution": str(resolution), "date_format": "1",
-            "range_from": start.strftime("%Y-%m-%d"), "range_to": end.strftime("%Y-%m-%d"),
-            "cont_flag": "1",
-        }
-        try:
-            resp = fyers.history(data=req)
-        except Exception:  # noqa: BLE001 - external SDK, keep resilient
-            continue
-        if not isinstance(resp, dict) or resp.get("s") != "ok":
-            continue
-        candles = resp.get("candles", [])
-        if not candles:
-            continue
-        try:
-            cdf = pd.DataFrame(candles, columns=["time", "open", "high", "low", "close", "volume"])
-            # FIX (TIMEWRONG bug reported by user): FYERS candle timestamps are
-            # UNIX epoch seconds in UTC. pd.to_datetime(..., unit="s") alone
-            # returns naive UTC wall-clock time, which sits 5h30m BEHIND real
-            # IST market time — a genuine 09:15 AM IST candle (market open)
-            # was rendering as 03:45. Localize to UTC first, then convert to
-            # Asia/Kolkata, then drop the tz so every downstream comparison
-            # (BOS/CHOCH, prev-day high/low, gap detection, this candle
-            # frame's own "time" column) works against correct IST times.
-            cdf["time"] = (
-                pd.to_datetime(cdf["time"], unit="s", utc=True)
-                .dt.tz_convert("Asia/Kolkata")
-                .dt.tz_localize(None)
-            )
-            cdf.sort_values("time", inplace=True)
-            cdf.reset_index(drop=True, inplace=True)
-            return cdf
-        except Exception:  # noqa: BLE001
-            continue
-    return pd.DataFrame()
-
-
-def fetch_india_vix(fyers):
-    for sym in ("NSE:INDIAVIX-INDEX", "NSE:INDIA_VIX-INDEX"):
-        try:
-            resp = fyers.quotes(data={"symbols": sym})
-            v = resp.get("d", [{}])[0].get("v", {}) if isinstance(resp, dict) else {}
-            val = float(v.get("lp", 0) or 0)
-            if val > 0:
-                return val
-        except Exception:  # noqa: BLE001
-            continue
-    return None
-
-
-def _ema(series: pd.Series, n: int) -> pd.Series:
-    return series.ewm(span=n, adjust=False).mean()
-
-
-def _rsi(series: pd.Series, n: int = 14) -> pd.Series:
-    delta = series.diff()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
-    avg_gain = gain.ewm(alpha=1 / n, adjust=False).mean()
-    avg_loss = loss.ewm(alpha=1 / n, adjust=False).mean()
-    rs = avg_gain / avg_loss.replace(0, np.nan)
-    rsi = 100 - (100 / (1 + rs))
-    return rsi.fillna(50.0)
-
-
-def _macd(series: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9):
-    ema_fast, ema_slow = _ema(series, fast), _ema(series, slow)
-    macd_line = ema_fast - ema_slow
-    signal_line = _ema(macd_line, signal)
-    return macd_line, signal_line, macd_line - signal_line
-
-
-def _atr(df: pd.DataFrame, n: int = 14) -> pd.Series:
-    high, low, close = df["high"], df["low"], df["close"]
-    prev_close = close.shift(1)
-    tr = pd.concat([high - low, (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
-    return tr.ewm(alpha=1 / n, adjust=False).mean()
-
-
-def _adx(df: pd.DataFrame, n: int = 14):
-    high, low = df["high"], df["low"]
-    up_move, down_move = high.diff(), -low.diff()
-    plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
-    minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
-    atr = _atr(df, n)
-    plus_di = 100 * pd.Series(plus_dm, index=df.index).ewm(alpha=1 / n, adjust=False).mean() / atr.replace(0, np.nan)
-    minus_di = 100 * pd.Series(minus_dm, index=df.index).ewm(alpha=1 / n, adjust=False).mean() / atr.replace(0, np.nan)
-    dx = ((plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)) * 100
-    adx = dx.ewm(alpha=1 / n, adjust=False).mean()
-    return adx.fillna(0.0), plus_di.fillna(0.0), minus_di.fillna(0.0)
-
-
-def _supertrend(df: pd.DataFrame, period: int = 10, multiplier: float = 3.0):
-    atr = _atr(df, period)
-    hl2 = (df["high"] + df["low"]) / 2
-    upperband, lowerband = hl2 + multiplier * atr, hl2 - multiplier * atr
-    close = df["close"]
-    n = len(df)
-    final_upper, final_lower = upperband.copy(), lowerband.copy()
-    direction = pd.Series(1, index=df.index, dtype="int64")
-    trend = pd.Series(0.0, index=df.index, dtype="float64")
-    for i in range(n):
-        if i == 0:
-            trend.iloc[i] = final_lower.iloc[i]
-            continue
-        final_upper.iloc[i] = min(upperband.iloc[i], final_upper.iloc[i - 1]) \
-            if close.iloc[i - 1] <= final_upper.iloc[i - 1] else upperband.iloc[i]
-        final_lower.iloc[i] = max(lowerband.iloc[i], final_lower.iloc[i - 1]) \
-            if close.iloc[i - 1] >= final_lower.iloc[i - 1] else lowerband.iloc[i]
-        if close.iloc[i] > final_upper.iloc[i - 1]:
-            direction.iloc[i] = 1
-        elif close.iloc[i] < final_lower.iloc[i - 1]:
-            direction.iloc[i] = -1
-        else:
-            direction.iloc[i] = direction.iloc[i - 1]
-        trend.iloc[i] = final_lower.iloc[i] if direction.iloc[i] == 1 else final_upper.iloc[i]
-    return trend, direction
-
-
-def _vwap(df: pd.DataFrame) -> pd.Series:
-    typical = (df["high"] + df["low"] + df["close"]) / 3
-    cum_vol = df["volume"].cumsum().replace(0, np.nan)
-    return (typical * df["volume"]).cumsum() / cum_vol
-
-
-def _swing_points(df: pd.DataFrame, lookback: int = 3):
-    highs, lows = df["high"], df["low"]
-    window = lookback * 2 + 1
-    swing_high = highs == highs.rolling(window, center=True).max()
-    swing_low = lows == lows.rolling(window, center=True).min()
-    return swing_high.fillna(False), swing_low.fillna(False)
-
-
-def _detect_bos_choch(df: pd.DataFrame) -> dict:
-    if len(df) < 10:
-        return {"bos_bull": False, "bos_bear": False, "bos_label": "None", "choch_label": "None"}
-    swing_high, swing_low = _swing_points(df)
-    last_swing_high_val = df.loc[swing_high, "high"].iloc[-1] if swing_high.any() else None
-    last_swing_low_val = df.loc[swing_low, "low"].iloc[-1] if swing_low.any() else None
-    last_close = df["close"].iloc[-1]
-
-    bos_bull = last_swing_high_val is not None and last_close > last_swing_high_val
-    bos_bear = last_swing_low_val is not None and last_close < last_swing_low_val
-
-    prev_dir = st.session_state.get(SCALP_BOS_HISTORY_KEY)
-    cur_dir = "bull" if bos_bull else ("bear" if bos_bear else prev_dir)
-    choch = prev_dir is not None and cur_dir is not None and cur_dir != prev_dir and (bos_bull or bos_bear)
-    if bos_bull or bos_bear:
-        st.session_state[SCALP_BOS_HISTORY_KEY] = cur_dir
-
-    bos_label = "Bullish BOS" if bos_bull else ("Bearish BOS" if bos_bear else "None")
-    choch_label = "None"
-    if choch:
-        choch_label = "Bullish CHOCH" if cur_dir == "bull" else "Bearish CHOCH"
-    return {"bos_bull": bos_bull, "bos_bear": bos_bear, "bos_label": bos_label, "choch_label": choch_label}
-
-
-def _detect_order_block(df: pd.DataFrame):
-    if len(df) < 3:
-        return False, False, "None"
-    c = df.iloc[-3:]
-    bodies = c["close"] - c["open"]
-    bullish_ob = bool(bodies.iloc[0] < 0 and bodies.iloc[1] > 0 and bodies.iloc[2] > 0
-                      and abs(bodies.iloc[1]) > abs(bodies.iloc[0]))
-    bearish_ob = bool(bodies.iloc[0] > 0 and bodies.iloc[1] < 0 and bodies.iloc[2] < 0
-                      and abs(bodies.iloc[1]) > abs(bodies.iloc[0]))
-    label = "Bullish OB" if bullish_ob else ("Bearish OB" if bearish_ob else "None")
-    return bullish_ob, bearish_ob, label
-
-
-def _detect_fvg(df: pd.DataFrame) -> str:
-    if len(df) < 3:
-        return "None"
-    a, c = df.iloc[-3], df.iloc[-1]
-    if a["high"] < c["low"]:
-        return "Bullish FVG"
-    if a["low"] > c["high"]:
-        return "Bearish FVG"
-    return "None"
-
-
-def _detect_liquidity_sweep(df: pd.DataFrame, lookback: int = 10) -> str:
-    if len(df) < lookback + 1:
-        return "None"
-    window = df.iloc[-(lookback + 1):-1]
-    last = df.iloc[-1]
-    if last["high"] > window["high"].max() and last["close"] < window["high"].max():
-        return "Sell-side Sweep (Bearish)"
-    if last["low"] < window["low"].min() and last["close"] > window["low"].min():
-        return "Buy-side Sweep (Bullish)"
-    return "None"
-
-
-def _prev_day_high_low(df: pd.DataFrame):
-    if df.empty:
-        return None, None
-    d = df.copy()
-    d["date"] = d["time"].dt.date
-    days = sorted(d["date"].unique())
-    if len(days) < 2:
-        return None, None
-    prev_df = d[d["date"] == days[-2]]
-    return float(prev_df["high"].max()), float(prev_df["low"].min())
-
-
-def _support_resistance_from_candles(df: pd.DataFrame, lookback: int = 50):
-    if df.empty:
-        return None, None
-    recent = df.tail(lookback)
-    return float(recent["low"].min()), float(recent["high"].max())
-
-
-def compute_scalping_trend_engine(fyers, symbol_candidates: list, df: pd.DataFrame, gdf: pd.DataFrame) -> dict:
-    result = {"available": False, "buy_confirmations": [], "sell_confirmations": [],
-              "buy_count": 0, "sell_count": 0}
-
-    c5 = fetch_underlying_candles(fyers, symbol_candidates, resolution="5", lookback_days=5)
-    if c5.empty or len(c5) < 30:
-        return result
-    c15 = fetch_underlying_candles(fyers, symbol_candidates, resolution="15", lookback_days=10)
-
-    # FIX (see FIX NOTE 6b): cache key now includes the symbol so switching
-    # instruments can't show a stale candle set from a previous symbol
-    # until the Scalping tab happens to re-run for the new one.
-    cache_symbol = symbol_candidates[0] if symbol_candidates else "unknown"
-    try:
-        st.session_state["oc_scalp_candles_5"] = c5
-        st.session_state["oc_scalp_candles_15"] = c15
-        st.session_state["oc_scalp_candles_symbol"] = cache_symbol
-    except Exception:  # noqa: BLE001 - session_state may be unavailable outside Streamlit
-        pass
-
-    close5 = c5["close"]
-    ema9, ema20, ema50 = _ema(close5, 9), _ema(close5, 20), _ema(close5, 50)
-    rsi5 = _rsi(close5, 14)
-    rsi15 = _rsi(c15["close"], 14) if not c15.empty and len(c15) >= 20 else pd.Series([50.0])
-    macd_line, macd_signal, _ = _macd(close5)
-    adx, _, _ = _adx(c5, 14)
-    atr = _atr(c5, 14)
-    supertrend, st_dir = _supertrend(c5, 10, 3.0)
-    vwap = _vwap(c5)
-    vix = fetch_india_vix(fyers)
-    prev_high, prev_low = _prev_day_high_low(c5)
-    support, resistance = _support_resistance_from_candles(c5)
-    bos_info = _detect_bos_choch(c5)
-    ob_bull, ob_bear, ob_label = _detect_order_block(c5)
-    fvg_label = _detect_fvg(c5)
-    sweep_label = _detect_liquidity_sweep(c5)
-
-    last_close = float(close5.iloc[-1])
-    last_vwap = float(vwap.iloc[-1]) if not vwap.empty and pd.notna(vwap.iloc[-1]) else last_close
-    last_ema9, last_ema20, last_ema50 = float(ema9.iloc[-1]), float(ema20.iloc[-1]), float(ema50.iloc[-1])
-    last_rsi5, last_rsi15 = float(rsi5.iloc[-1]), float(rsi15.iloc[-1])
-    last_macd, last_macd_sig = float(macd_line.iloc[-1]), float(macd_signal.iloc[-1])
-    last_adx, last_atr = float(adx.iloc[-1]), float(atr.iloc[-1])
-    last_st_dir = int(st_dir.iloc[-1]) if len(st_dir) else 0
-    # FIX (see FIX NOTE 6c): guard the rolling-mean volume comparison
-    # against an all-zero / empty trailing window (pre-market or a very
-    # illiquid symbol) so this can't raise or silently divide into inf.
-    if len(c5) >= 20:
-        _recent_mean_vol = c5["volume"].tail(20).mean()
-        volume_spike = bool(_recent_mean_vol > 0 and c5["volume"].iloc[-1] > _recent_mean_vol * 1.5)
+    if scalp_score >= 2:
+        scalp_signal = "SCALP BUY CE"
+    elif scalp_score <= -2:
+        scalp_signal = "SCALP BUY PE"
     else:
-        volume_spike = False
+        scalp_signal = "WAIT"
 
-    total_ce_chng = float(df.get("ce_chng_oi", pd.Series(dtype=float)).sum())
-    total_pe_chng = float(df.get("pe_chng_oi", pd.Series(dtype=float)).sum())
-    avg_gamma_change = float(gdf["Gamma Change"].mean()) if "Gamma Change" in gdf.columns and len(gdf) else 0.0
-    ce_build = df.get("CE Build-up", pd.Series(dtype=object))
-    pe_build = df.get("PE Build-up", pd.Series(dtype=object))
-    pe_long_buildup_dominant = (pe_build == "Long Build-up (Put Writing)").sum() > (pe_build == "Long Unwinding").sum()
-    pe_long_unwinding_dominant = (pe_build == "Long Unwinding").sum() > (pe_build == "Long Build-up (Put Writing)").sum()
-    ce_short_covering_dominant = (ce_build == "Short Covering").sum() > (ce_build == "Short Build-up (Call Writing)").sum()
-    ce_short_buildup_dominant = (ce_build == "Short Build-up (Call Writing)").sum() > (ce_build == "Short Covering").sum()
-
-    buy_checks = {
-        "Price above VWAP": last_close > last_vwap,
-        "EMA9 > EMA20 > EMA50": last_ema9 > last_ema20 > last_ema50,
-        "RSI(5m) > 60": last_rsi5 > 60,
-        "MACD Bullish": last_macd > last_macd_sig,
-        "ADX > 25": last_adx > 25,
-        "PE OI increasing": total_pe_chng > 0,
-        "CE OI decreasing": total_ce_chng < 0,
-        "Positive Gamma": avg_gamma_change > 0,
-        "Long Build-up": bool(pe_long_buildup_dominant),
-        "Short Covering": bool(ce_short_covering_dominant),
-        "Bullish Order Block": ob_bull,
-        "Bullish BOS": bos_info["bos_bull"],
-        "Volume Spike": volume_spike,
-    }
-    sell_checks = {
-        "Price below VWAP": last_close < last_vwap,
-        "EMA9 < EMA20 < EMA50": last_ema9 < last_ema20 < last_ema50,
-        "RSI(5m) < 40": last_rsi5 < 40,
-        "MACD Bearish": last_macd < last_macd_sig,
-        "ADX > 25": last_adx > 25,
-        "CE OI increasing": total_ce_chng > 0,
-        "PE OI decreasing": total_pe_chng < 0,
-        "Negative Gamma": avg_gamma_change < 0,
-        "Short Build-up": bool(ce_short_buildup_dominant),
-        "Long Unwinding": bool(pe_long_unwinding_dominant),
-        "Bearish Order Block": ob_bear,
-        "Bearish BOS": bos_info["bos_bear"],
-        "Volume Spike": volume_spike,
-    }
-
-    result.update({
-        "available": True,
-        "last_close": last_close, "vwap": last_vwap,
-        "ema9": last_ema9, "ema20": last_ema20, "ema50": last_ema50,
-        "rsi5": last_rsi5, "rsi15": last_rsi15,
-        "macd": last_macd, "macd_signal": last_macd_sig,
-        "adx": last_adx, "atr": last_atr, "supertrend_dir": last_st_dir,
-        "vix": vix, "prev_high": prev_high, "prev_low": prev_low,
-        "support": support, "resistance": resistance,
-        "bos_label": bos_info["bos_label"], "choch_label": bos_info["choch_label"],
-        "order_block_label": ob_label, "fvg_label": fvg_label, "sweep_label": sweep_label,
-        "buy_checks": buy_checks, "sell_checks": sell_checks,
-        "buy_confirmations": [k for k, v in buy_checks.items() if v],
-        "sell_confirmations": [k for k, v in sell_checks.items() if v],
-        "buy_count": int(sum(buy_checks.values())),
-        "sell_count": int(sum(sell_checks.values())),
-        "candle_time": c5["time"].iloc[-1],
-    })
-    return result
-
-
-def determine_scalping_signal(buy_count: int, sell_count: int,
-                               min_confirmations: int = SCALP_MIN_CONFIRMATIONS) -> str:
-    if buy_count >= min_confirmations and buy_count > sell_count:
-        return "🟢 STRONG SCALP BUY" if buy_count >= min_confirmations + 3 else "🟢 SCALP BUY"
-    if sell_count >= min_confirmations and sell_count > buy_count:
-        return "🔴 STRONG SCALP SELL" if sell_count >= min_confirmations + 3 else "🔴 SCALP SELL"
-    return "🟡 WAIT"
-
-
-def scalping_confidence_pct(buy_count: int, sell_count: int, total_checks: int = SCALP_TOTAL_CHECKS) -> float:
-    return round(min(max(buy_count, sell_count) / total_checks, 1.0) * 100, 1)
-
-
-def confidence_stars(pct: float) -> str:
-    if pct >= 90:
-        return "★★★★★"
-    if pct >= 80:
-        return "★★★★☆"
-    if pct >= 70:
-        return "★★★☆☆"
-    return "NO TRADE"
-
-
-def compute_scalping_table(df: pd.DataFrame, gdf: pd.DataFrame, trend_engine: dict,
-                            min_confirmations: int = SCALP_MIN_CONFIRMATIONS) -> pd.DataFrame:
-    d = df.copy()
-
-    if not trend_engine.get("available") or d.empty:
-        d["AI Scalping Signal"] = "🟡 WAIT"
-        d["Confidence %"] = 0.0
-        d["Confidence Stars"] = "NO TRADE"
-        for col in ("Entry Price", "Stop Loss", "Target 1", "Target 2"):
-            d[col] = 0.0
-        d["Risk Reward"] = "—"
-        d["gamma"] = gdf["gamma"] if "gamma" in gdf.columns else 0.0
-        d["Gamma Change"] = gdf["Gamma Change"] if "Gamma Change" in gdf.columns else 0.0
-        d["Delta OI"] = d.get("ce_chng_oi", 0) - d.get("pe_chng_oi", 0)
-        d["Volume Strength"] = "—"
-        d["Long Build-up"] = d.get("PE Build-up", "—")
-        d["Short Build-up"] = d.get("CE Build-up", "—")
-        d["Order Block"] = trend_engine.get("order_block_label", "None")
-        d["BOS"] = trend_engine.get("bos_label", "None")
-        d["CHOCH"] = trend_engine.get("choch_label", "None")
-        d["Trend Strength"] = "—"
-        return d
-
-    buy_count, sell_count = trend_engine["buy_count"], trend_engine["sell_count"]
-    signal = determine_scalping_signal(buy_count, sell_count, min_confirmations)
-    confidence_pct = scalping_confidence_pct(buy_count, sell_count)
-    stars = confidence_stars(confidence_pct)
-
-    gamma_cols = gdf.set_index("strike_price")[["gamma", "Gamma Change"]] if "gamma" in gdf.columns else None
-    if gamma_cols is not None and not gamma_cols.index.duplicated().any():
-        d = d.merge(gamma_cols, on="strike_price", how="left")
+    swing_score = (
+        (1 if trend_probability > 60 and momentum_score > 0 else (-1 if trend_probability > 60 and momentum_score < 0 else 0))
+        + (1 if total_gex < 0 else 0)  # negative GEX -> moves tend to extend, favors swing continuation
+        + (1 if iv_rank < 40 else (-1 if iv_rank > 75 else 0))  # cheap IV favors buying premium for a swing
+    )
+    if swing_score >= 2:
+        swing_signal = "SWING BUY CE"
+    elif swing_score <= -2:
+        swing_signal = "SWING BUY PE"
     else:
-        d["gamma"], d["Gamma Change"] = 0.0, 0.0
-    d["gamma"] = d["gamma"].fillna(0.0)
-    d["Gamma Change"] = d["Gamma Change"].fillna(0.0)
+        swing_signal = "WAIT"
 
-    d["AI Scalping Signal"] = signal
-    d["Confidence %"] = confidence_pct
-    d["Confidence Stars"] = stars
-    d["Delta OI"] = d.get("ce_chng_oi", 0) - d.get("pe_chng_oi", 0)
-
-    total_vol = d.get("ce_volume", pd.Series(0, index=d.index)) + d.get("pe_volume", pd.Series(0, index=d.index))
-    vol_thresh_strong = total_vol.quantile(0.85) if len(total_vol) and total_vol.max() > 0 else 0
-    vol_thresh_med = total_vol.quantile(0.6) if len(total_vol) and total_vol.max() > 0 else 0
-
-    def _vol_strength(v):
-        if vol_thresh_strong > 0 and v >= vol_thresh_strong:
-            return "Strong"
-        if vol_thresh_med > 0 and v >= vol_thresh_med:
-            return "Medium"
-        return "Weak"
-
-    d["Volume Strength"] = total_vol.apply(_vol_strength)
-    d["Long Build-up"] = d.get("PE Build-up", "—")
-    d["Short Build-up"] = d.get("CE Build-up", "—")
-    d["Order Block"] = trend_engine.get("order_block_label", "None")
-    d["BOS"] = trend_engine.get("bos_label", "None")
-    d["CHOCH"] = trend_engine.get("choch_label", "None")
-    d["Trend Strength"] = "Strong" if trend_engine.get("adx", 0) > 25 else "Weak"
-
-    is_buy_type, is_sell_type = "BUY" in signal, "SELL" in signal
-
-    def _entry_row(row):
-        if is_buy_type:
-            return row.get("ce_ltp", 0)
-        if is_sell_type:
-            return row.get("pe_ltp", 0)
-        return 0.0
-
-    d["Entry Price"] = d.apply(_entry_row, axis=1).round(2)
-    d["Stop Loss"] = (d["Entry Price"] * 0.85).round(2)
-    d["Target 1"] = (d["Entry Price"] * 1.15).round(2)
-    d["Target 2"] = (d["Entry Price"] * 1.30).round(2)
-
-    def _rr(row):
-        entry, sl, t1 = row["Entry Price"], row["Stop Loss"], row["Target 1"]
-        if entry <= 0:
-            return "—"
-        risk = max(entry - sl, 0.01)
-        reward = t1 - entry
-        return f"1 : {round(reward / risk, 2)}" if risk > 0 else "—"
-
-    d["Risk Reward"] = d.apply(_rr, axis=1)
-    zero_entry_mask = d["Entry Price"] <= 0
-    d.loc[zero_entry_mask, ["Entry Price", "Stop Loss", "Target 1", "Target 2"]] = 0.0
-
-    if "gamma" in d.columns:
-        d = d.sort_values("gamma", ascending=False).reset_index(drop=True)
-    return d
-
-
-SCALP_ROW_CSS = {
-    "strongbuy": "gamma-row-strongbuy", "buy": "gamma-row-buy", "hold": "gamma-row-hold",
-    "sell": "gamma-row-sell", "strongsell": "gamma-row-strongsell",
-}
-
-
-def _scalp_band(signal: str) -> str:
-    return {
-        "🟢 STRONG SCALP BUY": "strongbuy", "🟢 SCALP BUY": "buy",
-        "🔴 STRONG SCALP SELL": "strongsell", "🔴 SCALP SELL": "sell",
-    }.get(signal, "hold")
-
-
-def render_scalping_html_table(df: pd.DataFrame, top_n: int = 40) -> str:
-    cols = [
-        ("strike_price", "Strike", "{:,.0f}"),
-        ("AI Scalping Signal", "Signal", None),
-        ("Confidence %", "Conf %", "{:.1f}%"),
-        ("Confidence Stars", "Rating", None),
-        ("Entry Price", "Entry", "{:.2f}"),
-        ("Stop Loss", "SL", "{:.2f}"),
-        ("Target 1", "T1", "{:.2f}"),
-        ("Target 2", "T2", "{:.2f}"),
-        ("Risk Reward", "RR", None),
-        ("gamma", "Gamma", "{:.5f}"),
-        ("Gamma Change", "Gamma Chg", "{:+.5f}"),
-        ("Delta OI", "Delta OI", "{:+,.0f}"),
-        ("Volume Strength", "Vol Strength", None),
-        ("Long Build-up", "Long BU", None),
-        ("Short Build-up", "Short BU", None),
-        ("Order Block", "Order Block", None),
-        ("BOS", "BOS", None),
-        ("CHOCH", "CHOCH", None),
-        ("Trend Strength", "Trend", None),
-    ]
-    view = df.head(top_n)
-    rows_html = []
-    for _, row in view.iterrows():
-        band = _scalp_band(row.get("AI Scalping Signal", "🟡 WAIT"))
-        css = SCALP_ROW_CSS.get(band, "gamma-row-hold")
-        blink = ""
-        if band == "strongbuy":
-            blink = " gamma-row-blink-green"
-        elif band == "strongsell":
-            blink = " gamma-row-blink-red"
-        cells = []
-        for key, _, fmt in cols:
-            val = row.get(key, "")
-            # FIX (FIX NOTE 6a): escape every interpolated cell value.
-            cells.append(f"<td>{_safe_cell(fmt.format(val) if fmt else val)}</td>")
-        rows_html.append(f'<tr class="{css}{blink}">{"".join(cells)}</tr>')
-    header_html = "".join(f"<th>{label}</th>" for _, label, _ in cols)
-    return f"""
-    <div style="max-height:560px; overflow-y:auto; border:1px solid #30363d; border-radius:8px;">
-    <table class="gamma-table">
-        <thead><tr>{header_html}</tr></thead>
-        <tbody>{''.join(rows_html)}</tbody>
-    </table>
-    </div>
-    """
-
-
-def fire_scalping_alert(trend_engine: dict, symbol: str, signal: str, audio_alert: bool):
-    candle_time = trend_engine.get("candle_time")
-    key = f"{SCALP_ALERT_KEY_PREFIX}|{symbol}"
-    last = st.session_state.get(key)
-    cur = (str(candle_time), signal) if candle_time is not None else None
-    if cur is None:
-        return
-    if last != cur:
-        st.session_state[key] = cur
-        if signal != "🟡 WAIT" and (last is None or last[0] == cur[0] or last[1] != signal):
-            try:
-                st.toast(f"AI Scalping: {signal}", icon="🎯")
-            except Exception:  # noqa: BLE001
-                st.info(f"AI Scalping: {signal}")
-            if audio_alert:
-                st.audio(io.BytesIO(__import__("base64").b64decode(_GAMMA_PING_WAV_B64)), format="audio/wav")
-
-
-def render_scalping_tab(scalp_df: pd.DataFrame, trend_engine: dict, symbol: str, audio_alert: bool):
-    st.markdown("##### 🎯 AI Scalping Engine — Multi-Factor Confirmation")
-
-    if not trend_engine.get("available"):
-        st.warning(
-            "Historical candle data isn't available right now (market closed, a plan without "
-            "history access, or the FYERS history call failed for every symbol variant tried). "
-            "The Scalping Engine needs 5m/15m candles for EMA/RSI/MACD/ADX/Supertrend and stays "
-            "at 🟡 WAIT until that data is available — it will never force a BUY/SELL without it."
-        )
-        return
-
-    signal = scalp_df["AI Scalping Signal"].iloc[0] if len(scalp_df) else "🟡 WAIT"
-    band = _scalp_band(signal)
-    blink_class = "gamma-row-blink-green" if band == "strongbuy" else (
-        "gamma-row-blink-red" if band == "strongsell" else "")
-
-    fire_scalping_alert(trend_engine, symbol, signal, audio_alert)
-
-    st.markdown(
-        f"""<div class="intel-card {blink_class}" style="text-align:center;">
-        <div class="intel-label">Overall Scalping Signal</div>
-        <div class="intel-value" style="font-size:26px;">{signal}</div>
-        <div style="color:#8b949e;font-size:12px;margin-top:4px;">
-            Confidence {scalp_df['Confidence %'].iloc[0]:.1f}%  ·  {scalp_df['Confidence Stars'].iloc[0]}
-            &nbsp;|&nbsp; BUY confirmations {trend_engine['buy_count']}/{SCALP_TOTAL_CHECKS}
-            &nbsp;|&nbsp; SELL confirmations {trend_engine['sell_count']}/{SCALP_TOTAL_CHECKS}
-        </div>
-        </div>""",
-        unsafe_allow_html=True,
-    )
-
-    st.markdown("<br>", unsafe_allow_html=True)
-    i1, i2, i3, i4 = st.columns(4)
-    i1.metric("EMA 9 / 20 / 50", f"{trend_engine['ema9']:.1f} / {trend_engine['ema20']:.1f} / {trend_engine['ema50']:.1f}")
-    i2.metric("VWAP", f"{trend_engine['vwap']:.1f}")
-    i3.metric("RSI (5m / 15m)", f"{trend_engine['rsi5']:.1f} / {trend_engine['rsi15']:.1f}")
-    i4.metric("ADX", f"{trend_engine['adx']:.1f}")
-
-    i5, i6, i7, i8 = st.columns(4)
-    i5.metric("MACD / Signal", f"{trend_engine['macd']:.2f} / {trend_engine['macd_signal']:.2f}")
-    i6.metric("ATR", f"{trend_engine['atr']:.2f}")
-    i7.metric("Supertrend", "🟢 Bullish" if trend_engine["supertrend_dir"] == 1 else "🔴 Bearish")
-    i8.metric("India VIX", f"{trend_engine['vix']:.2f}" if trend_engine.get("vix") else "—")
-
-    i9, i10, i11, i12 = st.columns(4)
-    i9.metric("Prev Day High / Low",
-              f"{trend_engine['prev_high']:,.0f} / {trend_engine['prev_low']:,.0f}" if trend_engine.get("prev_high") else "—")
-    i10.metric("Support / Resistance",
-               f"{trend_engine['support']:,.0f} / {trend_engine['resistance']:,.0f}" if trend_engine.get("support") else "—")
-    i11.metric("Order Block / FVG", f"{trend_engine['order_block_label']} / {trend_engine['fvg_label']}")
-    i12.metric("BOS / CHOCH", f"{trend_engine['bos_label']} / {trend_engine['choch_label']}")
-
-    st.markdown("<br>", unsafe_allow_html=True)
-    conf_col1, conf_col2 = st.columns(2)
-    with conf_col1:
-        st.markdown("**🟢 BUY confirmations met**")
-        if trend_engine["buy_confirmations"]:
-            st.markdown("\n".join(f"- {c}" for c in trend_engine["buy_confirmations"]))
-        else:
-            st.caption("None currently met.")
-    with conf_col2:
-        st.markdown("**🔴 SELL confirmations met**")
-        if trend_engine["sell_confirmations"]:
-            st.markdown("\n".join(f"- {c}" for c in trend_engine["sell_confirmations"]))
-        else:
-            st.caption("None currently met.")
-
-    st.markdown("<br>", unsafe_allow_html=True)
-    st.markdown('<div class="block-title">📋 AI Scalping Table (per strike)</div>', unsafe_allow_html=True)
-    st.markdown(render_scalping_html_table(scalp_df), unsafe_allow_html=True)
-    st.caption(
-        f"A BUY/SELL Scalping Signal requires at least {SCALP_MIN_CONFIRMATIONS} of {SCALP_TOTAL_CHECKS} "
-        "confirmations in the same direction (VWAP, EMA alignment, RSI, MACD, ADX, CE/PE OI direction, "
-        "Gamma direction, Build-up/Covering/Unwinding, Order Block, BOS, Volume Spike); otherwise it "
-        "stays at 🟡 WAIT. Confidence % and the ★ rating are scored independently against the "
-        f"{SCALP_TOTAL_CHECKS}-point checklist and can sit below the signal's own confirmation bar — "
-        "treat a 'NO TRADE' star rating as a caution flag even when a Scalp signal is showing. Order "
-        "Block / FVG / Liquidity Sweep / BOS / CHOCH are simplified heuristic pattern proxies from "
-        "FYERS candle data, not a certified SMC engine. This is a positioning read, not financial "
-        "advice — always confirm with live price action and manage your own risk."
-    )
+    return {"scalping_signal": scalp_signal, "swing_signal": swing_signal}
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# 5H. 15-MINUTE VOLUME & SWING TOP/BOTTOM ANALYZER  (new — user-requested)
+# 11. CHARTS  (Plotly)
 # ══════════════════════════════════════════════════════════════════════════
-#
-# Reuses fetch_underlying_candles() (resolution="15") and the same
-# _swing_points() detector already used by the AI Scalping Engine's
-# BOS/CHOCH logic (section 5D), so "Top"/"Bottom" here means exactly the
-# same thing as a swing high/low everywhere else in this file — no new
-# detection rule is introduced. Volume bars are colored green when the
-# candle closed up and red when it closed down, matching the OI chart's
-# color convention (section 7).
 
-def detect_swing_top_bottom(c15: pd.DataFrame, lookback: int = 3) -> pd.DataFrame:
-    """Adds 'Swing Top' / 'Swing Bottom' boolean columns to a 15m candle
-    frame using the same swing-point rule as _detect_bos_choch() (a
-    centered rolling max/min over `lookback` bars each side)."""
-    if c15 is None or c15.empty or len(c15) < (lookback * 2 + 1):
-        d = c15.copy() if c15 is not None else pd.DataFrame()
-        if not d.empty:
-            d["Swing Top"] = False
-            d["Swing Bottom"] = False
-        return d
-    d = c15.copy()
-    swing_high, swing_low = _swing_points(d, lookback=lookback)
-    d["Swing Top"] = swing_high
-    d["Swing Bottom"] = swing_low
-    return d
-
-
-def render_volume_swing_chart(c15: pd.DataFrame) -> go.Figure:
-    """15-min volume bars (green=up candle, red=down candle) with the
-    most recent swing Top / Bottom candles marked on a secondary price
-    line, so the volume context behind each top/bottom is visible."""
-    fig = make_subplots(specs=[[{"secondary_y": True}]])
-    if c15 is None or c15.empty:
-        fig.add_annotation(text="No 15m candle data available — enable the AI Scalping "
-                                 "Engine in the sidebar so candles are fetched this session.",
-                            xref="paper", yref="paper", x=0.5, y=0.5,
-                            font=dict(color="#8b949e"), showarrow=False)
-        fig.update_layout(paper_bgcolor="#0d1117", plot_bgcolor="#0d1117", height=460)
-        return fig
-
-    colors = ["#3fb950" if c >= o else "#f85149" for o, c in zip(c15["open"], c15["close"])]
-    fig.add_trace(go.Bar(x=c15["time"], y=c15["volume"], marker_color=colors,
-                          name="Volume", opacity=0.85), secondary_y=False)
-    fig.add_trace(go.Scatter(x=c15["time"], y=c15["close"], mode="lines",
-                              line=dict(color="#58a6ff", width=1.3), name="Close"),
-                  secondary_y=True)
-
-    tops = c15[c15.get("Swing Top", False) == True]     # noqa: E712
-    bottoms = c15[c15.get("Swing Bottom", False) == True]  # noqa: E712
-    if not tops.empty:
-        fig.add_trace(go.Scatter(x=tops["time"], y=tops["high"], mode="markers+text",
-                                  marker=dict(symbol="triangle-down", size=11, color="#f85149"),
-                                  text=["Top"] * len(tops), textposition="top center",
-                                  textfont=dict(color="#f85149", size=10), name="Swing Top"),
-                      secondary_y=True)
-    if not bottoms.empty:
-        fig.add_trace(go.Scatter(x=bottoms["time"], y=bottoms["low"], mode="markers+text",
-                                  marker=dict(symbol="triangle-up", size=11, color="#3fb950"),
-                                  text=["Bottom"] * len(bottoms), textposition="bottom center",
-                                  textfont=dict(color="#3fb950", size=10), name="Swing Bottom"),
-                      secondary_y=True)
-
+def _plotly_dark_layout(fig: go.Figure, height: int = 420, title: str = "") -> go.Figure:
     fig.update_layout(
-        paper_bgcolor="#0d1117", plot_bgcolor="#0d1117",
-        font=dict(color="#8b949e", family="Courier New"),
-        height=460, margin=dict(l=10, r=10, t=30, b=10),
-        legend=dict(bgcolor="#161b22", bordercolor="#30363d", borderwidth=1, orientation="h", y=1.08),
-        xaxis=dict(showgrid=True, gridcolor="#21262d", title="Time (15m)"),
-        bargap=0.15,
+        paper_bgcolor=DARK_BG, plot_bgcolor=DARK_BG,
+        font=dict(color=TEXT_MUTED, family="Courier New"),
+        height=height, margin=dict(l=10, r=10, t=40 if title else 10, b=10),
+        title=dict(text=title, font=dict(color=TEXT_MAIN, size=14)) if title else None,
+        legend=dict(bgcolor=PANEL_BG, bordercolor=BORDER_COLOR, borderwidth=1),
     )
-    fig.update_yaxes(title_text="Volume", showgrid=False, secondary_y=False)
-    fig.update_yaxes(title_text="Price", showgrid=True, gridcolor="#21262d", secondary_y=True)
     return fig
 
 
-def render_volume_swing_tab(fyers, symbol_candidates: list, symbol: str):
-    """Dashboard tab: 15-min Volume + Swing Top/Bottom identifier."""
-    st.markdown("##### 📊 15-Minute Volume & Swing Top/Bottom")
-
-    # FIX-consistent with FIX NOTE 6b: reuse the session's cached 15m
-    # candles only if they belong to THIS symbol; otherwise fetch fresh
-    # so this tab can never show a stale instrument's candles.
-    cached_symbol = st.session_state.get("oc_scalp_candles_symbol")
-    c15 = st.session_state.get("oc_scalp_candles_15")
-    current_symbol = symbol_candidates[0] if symbol_candidates else None
-    if c15 is None or cached_symbol != current_symbol:
-        with st.spinner("Fetching 15-minute candles …"):
-            c15 = fetch_underlying_candles(fyers, symbol_candidates, resolution="15", lookback_days=10)
-
-    if c15 is None or c15.empty:
-        st.warning(
-            "No 15-minute candle data available right now (market closed, a plan without "
-            "history access, or the FYERS history call failed for every symbol variant "
-            "tried). Try again during market hours, or enable the AI Scalping Engine in "
-            "the sidebar first."
-        )
-        return
-
-    c15 = detect_swing_top_bottom(c15, lookback=3)
-    tops = c15[c15["Swing Top"] == True]      # noqa: E712
-    bottoms = c15[c15["Swing Bottom"] == True]  # noqa: E712
-
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Candles Loaded", len(c15))
-    m2.metric("Swing Tops Found", len(tops))
-    m3.metric("Swing Bottoms Found", len(bottoms))
-    last_top = tops.iloc[-1] if not tops.empty else None
-    last_bottom = bottoms.iloc[-1] if not bottoms.empty else None
-    latest_label = "—"
-    if last_top is not None and last_bottom is not None:
-        latest_label = "🔴 Top" if last_top["time"] > last_bottom["time"] else "🟢 Bottom"
-    elif last_top is not None:
-        latest_label = "🔴 Top"
-    elif last_bottom is not None:
-        latest_label = "🟢 Bottom"
-    m4.metric("Most Recent Swing", latest_label)
-
-    st.plotly_chart(render_volume_swing_chart(c15), use_container_width=True,
-                     config={"displayModeBar": False})
-
-    col_t, col_b = st.columns(2)
-    with col_t:
-        st.markdown('<span class="swing-top-badge">🔴 Recent Swing Tops</span>', unsafe_allow_html=True)
-        if not tops.empty:
-            view = tops.tail(8)[["time", "high", "volume"]].iloc[::-1].reset_index(drop=True)
-            view.columns = ["Time", "Price (High)", "Volume"]
-            st.dataframe(view, use_container_width=True, height=260)
-        else:
-            st.caption("No swing tops detected yet in this candle window.")
-    with col_b:
-        st.markdown('<span class="swing-bottom-badge">🟢 Recent Swing Bottoms</span>', unsafe_allow_html=True)
-        if not bottoms.empty:
-            view = bottoms.tail(8)[["time", "low", "volume"]].iloc[::-1].reset_index(drop=True)
-            view.columns = ["Time", "Price (Low)", "Volume"]
-            st.dataframe(view, use_container_width=True, height=260)
-        else:
-            st.caption("No swing bottoms detected yet in this candle window.")
-
-    st.caption(
-        "A 'Top' / 'Bottom' is a 15-minute swing high/low: the candle's high (or low) is the "
-        "highest (lowest) among the 3 candles on either side of it — the identical rule the "
-        "AI Scalping Engine's BOS/CHOCH detector already uses on 5m candles, applied here to "
-        "15m for a slower, less noisy read. Volume bars are green on up-close candles and red "
-        "on down-close candles. This is a structural pattern read, not a prediction — always "
-        "confirm with live price action."
-    )
-
-
-# ══════════════════════════════════════════════════════════════════════════
-# 6. MARKET INTELLIGENCE
-# ══════════════════════════════════════════════════════════════════════════
-
-def compute_market_intelligence(df: pd.DataFrame, spot_price: float, max_pain: float, pcr: float) -> dict:
+def chart_oi_bars(df: pd.DataFrame, max_pain: float) -> go.Figure:
+    fig = make_subplots(rows=1, cols=2, subplot_titles=("Call OI (CE)", "Put OI (PE)"),
+                         shared_yaxes=True, horizontal_spacing=0.04)
     if df.empty:
-        return {}
-
-    mp_component = 0.0
-    if max_pain:
-        mp_component = ((spot_price - max_pain) / max_pain) * 100 if spot_price else 0.0
-    momentum_score = float(np.clip(((pcr - 1) * 50) + (mp_component * 0.5), -100, 100))
-
-    if momentum_score > 20:
-        trend = "🟢 Bullish"
-    elif momentum_score < -20:
-        trend = "🔴 Bearish"
-    else:
-        trend = "🟡 Sideways"
-
-    total_ce_oi, total_pe_oi = df["ce_oi"].sum(), df["pe_oi"].sum()
-    high_oi_thresh_ce = df["ce_oi"].quantile(0.75) if len(df) else 0
-    high_oi_thresh_pe = df["pe_oi"].quantile(0.75) if len(df) else 0
-
-    institution_buying = df.loc[df["pe_oi"] >= high_oi_thresh_pe, "pe_chng_oi"].clip(lower=0).sum()
-    institution_selling = df.loc[df["ce_oi"] >= high_oi_thresh_ce, "ce_chng_oi"].clip(lower=0).sum()
-
-    call_writers_activity = df["ce_chng_oi"].clip(lower=0).sum()
-    put_writers_activity = df["pe_chng_oi"].clip(lower=0).sum()
-    call_buyers_activity = (-df["ce_chng_oi"].clip(upper=0)).sum()
-    put_buyers_activity = (-df["pe_chng_oi"].clip(upper=0)).sum()
-
-    highest_volume_strike = df.loc[(df["ce_volume"] + df["pe_volume"]).idxmax(), "strike_price"] if len(df) else None
-    highest_oi_strike = df.loc[(df["ce_oi"] + df["pe_oi"]).idxmax(), "strike_price"] if len(df) else None
-    highest_delta_oi_strike = df.loc[(df["ce_chng_oi"].abs() + df["pe_chng_oi"].abs()).idxmax(), "strike_price"] if len(df) else None
-
-    support = df.loc[df["pe_oi"].idxmax(), "strike_price"] if len(df) else None
-    resistance = df.loc[df["ce_oi"].idxmax(), "strike_price"] if len(df) else None
-
-    breakout_prob_avg = df["Breakout Probability"].max() if "Breakout Probability" in df.columns else 0
-    breakdown_prob_avg = df["Breakdown Probability"].max() if "Breakdown Probability" in df.columns else 0
-
-    return {
-        "momentum_score": momentum_score,
-        "trend": trend,
-        "institution_buying": institution_buying,
-        "institution_selling": institution_selling,
-        "call_writers_activity": call_writers_activity,
-        "put_writers_activity": put_writers_activity,
-        "call_buyers_activity": call_buyers_activity,
-        "put_buyers_activity": put_buyers_activity,
-        "highest_volume_strike": highest_volume_strike,
-        "highest_oi_strike": highest_oi_strike,
-        "highest_delta_oi_strike": highest_delta_oi_strike,
-        "support": support,
-        "resistance": resistance,
-        "breakout_probability": breakout_prob_avg,
-        "breakdown_probability": breakdown_prob_avg,
-        "total_ce_oi": total_ce_oi,
-        "total_pe_oi": total_pe_oi,
-    }
-
-
-def detect_oi_shift(symbol: str, support, resistance) -> list:
-    notes = []
-    history = st.session_state.setdefault("oc_prev_levels", {})
-    prev = history.get(symbol)
-    if prev and support is not None and resistance is not None:
-        if prev.get("support") is not None and support != prev["support"]:
-            direction = "up" if support > prev["support"] else "down"
-            notes.append(f"🛡️ Support shifted {direction}: {prev['support']:,.0f} → {support:,.0f}")
-        if prev.get("resistance") is not None and resistance != prev["resistance"]:
-            direction = "up" if resistance > prev["resistance"] else "down"
-            notes.append(f"🧱 Resistance shifted {direction}: {prev['resistance']:,.0f} → {resistance:,.0f}")
-    history[symbol] = {"support": support, "resistance": resistance}
-    return notes
-
-
-# ══════════════════════════════════════════════════════════════════════════
-# 7. CHARTS
-# ══════════════════════════════════════════════════════════════════════════
-
-def oi_bar_chart(df: pd.DataFrame, max_pain: float) -> go.Figure:
-    fig = make_subplots(
-        rows=1, cols=2, subplot_titles=("Call OI  (CE)", "Put OI  (PE)"),
-        shared_yaxes=True, horizontal_spacing=0.04,
-    )
-    max_oi = max(df["ce_oi"].max(), df["pe_oi"].max()) if len(df) else 1
+        return _plotly_dark_layout(fig)
+    max_oi = max(df["ce_oi"].max(), df["pe_oi"].max(), 1)
     strikes_sorted = df["strike_price"].sort_values().unique()
-    strike_gap = (strikes_sorted[1] - strikes_sorted[0]) if len(strikes_sorted) > 1 else 1
+    gap = (strikes_sorted[1] - strikes_sorted[0]) if len(strikes_sorted) > 1 else 1
 
     fig.add_trace(go.Bar(
         x=-df["ce_oi"], y=df["strike_price"], orientation="h",
-        marker_color=["#1a7f37" if abs(s - max_pain) < strike_gap / 2 else "#238636" for s in df["strike_price"]],
-        name="CE OI", showlegend=False, customdata=df["ce_oi"],
-        hovertemplate="Strike %{y}<br>CE OI: %{customdata:,}<extra></extra>",
+        marker_color=[GREEN if abs(s - max_pain) < gap / 2 else "#238636" for s in df["strike_price"]],
+        name="CE OI", showlegend=False,
+        hovertemplate="Strike %{y}<br>CE OI: %{customdata:,}<extra></extra>", customdata=df["ce_oi"],
     ), row=1, col=1)
-
     fig.add_trace(go.Bar(
         x=df["pe_oi"], y=df["strike_price"], orientation="h",
-        marker_color=["#b91c1c" if abs(s - max_pain) < strike_gap / 2 else "#da3633" for s in df["strike_price"]],
+        marker_color=[RED if abs(s - max_pain) < gap / 2 else "#da3633" for s in df["strike_price"]],
         name="PE OI", showlegend=False,
         hovertemplate="Strike %{y}<br>PE OI: %{x:,}<extra></extra>",
     ), row=1, col=2)
-
-    for col in [1, 2]:
-        fig.add_hline(y=max_pain, line_dash="dot", line_color="#f0c814",
-                      annotation_text=f"Max Pain {max_pain:,.0f}",
-                      annotation_font_color="#f0c814", row=1, col=col)
-
+    for col in (1, 2):
+        fig.add_hline(y=max_pain, line_dash="dot", line_color=AMBER,
+                      annotation_text=f"Max Pain {max_pain:,.0f}", annotation_font_color=AMBER, row=1, col=col)
     fig.update_layout(
-        paper_bgcolor="#0d1117", plot_bgcolor="#0d1117",
-        font=dict(color="#8b949e", family="Courier New"),
-        height=500, margin=dict(l=10, r=10, t=40, b=10),
-        xaxis=dict(showticklabels=False, zeroline=False, showgrid=False, range=[-max_oi * 1.1, 0]),
-        xaxis2=dict(showticklabels=False, zeroline=False, showgrid=False, range=[0, max_oi * 1.1]),
-        yaxis=dict(showgrid=True, gridcolor="#21262d", tickfont=dict(color="#e6edf3", size=11)),
+        xaxis=dict(showticklabels=False, showgrid=False, range=[-max_oi * 1.1, 0]),
+        xaxis2=dict(showticklabels=False, showgrid=False, range=[0, max_oi * 1.1]),
+        yaxis=dict(showgrid=True, gridcolor=BORDER_COLOR, tickfont=dict(color=TEXT_MAIN, size=11)),
     )
-    fig.update_annotations(font_color="#8b949e")
-    return fig
+    fig.update_annotations(font_color=TEXT_MUTED)
+    return _plotly_dark_layout(fig, height=480)
 
 
-def pcr_gauge(pcr: float) -> go.Figure:
+def chart_iv_skew(df: pd.DataFrame) -> go.Figure:
+    fig = go.Figure()
+    if not df.empty:
+        fig.add_trace(go.Scatter(x=df["strike_price"], y=df["ce_iv"], mode="lines+markers",
+                                  name="CE IV", line=dict(color=GREEN, width=2)))
+        fig.add_trace(go.Scatter(x=df["strike_price"], y=df["pe_iv"], mode="lines+markers",
+                                  name="PE IV", line=dict(color=RED, width=2)))
+    fig.update_layout(xaxis=dict(title="Strike", showgrid=True, gridcolor=BORDER_COLOR),
+                       yaxis=dict(title="IV %", showgrid=True, gridcolor=BORDER_COLOR))
+    return _plotly_dark_layout(fig, height=320, title="Implied Volatility Skew")
+
+
+def chart_greeks(df: pd.DataFrame, greek: str) -> go.Figure:
+    fig = go.Figure()
+    col_ce, col_pe = f"ce_{greek}", f"pe_{greek}"
+    if not df.empty and col_ce in df.columns:
+        fig.add_trace(go.Scatter(x=df["strike_price"], y=df[col_ce], mode="lines+markers",
+                                  name=f"CE {greek.title()}", line=dict(color=GREEN, width=2)))
+        fig.add_trace(go.Scatter(x=df["strike_price"], y=df[col_pe], mode="lines+markers",
+                                  name=f"PE {greek.title()}", line=dict(color=RED, width=2)))
+    fig.update_layout(xaxis=dict(title="Strike", showgrid=True, gridcolor=BORDER_COLOR),
+                       yaxis=dict(title=greek.title(), showgrid=True, gridcolor=BORDER_COLOR))
+    return _plotly_dark_layout(fig, height=300, title=f"{greek.title()} by Strike")
+
+
+def chart_gex_by_strike(gex_data: dict) -> go.Figure:
+    fig = go.Figure()
+    by_strike = gex_data.get("by_strike", pd.DataFrame())
+    if not by_strike.empty:
+        colors = [GREEN if v >= 0 else RED for v in by_strike["gex"]]
+        fig.add_trace(go.Bar(x=by_strike["strike_price"], y=by_strike["gex"], marker_color=colors, name="GEX"))
+    fig.update_layout(xaxis=dict(title="Strike", showgrid=True, gridcolor=BORDER_COLOR),
+                       yaxis=dict(title="Gamma Exposure", showgrid=True, gridcolor=BORDER_COLOR))
+    return _plotly_dark_layout(fig, height=320, title="Gamma Exposure (GEX) by Strike")
+
+
+def gauge_pcr(pcr: float) -> go.Figure:
     fig = go.Figure(go.Indicator(
         mode="gauge+number", value=pcr,
-        number={"font": {"color": "#e6edf3", "size": 36, "family": "Courier New"}},
+        number={"font": {"color": TEXT_MAIN, "size": 32, "family": "Courier New"}},
         gauge={
-            "axis": {"range": [0, 3], "tickcolor": "#8b949e", "tickfont": {"color": "#8b949e"}},
-            "bar": {"color": "#58a6ff", "thickness": 0.25},
-            "bgcolor": "#161b22", "borderwidth": 0,
-            "steps": [
-                {"range": [0, 0.7], "color": "#3b0d1a"},
-                {"range": [0.7, 1.3], "color": "#1c2128"},
-                {"range": [1.3, 3.0], "color": "#0d3b2e"},
-            ],
-            "threshold": {"line": {"color": "#f0c814", "width": 3}, "value": pcr},
+            "axis": {"range": [0, 3], "tickcolor": TEXT_MUTED, "tickfont": {"color": TEXT_MUTED}},
+            "bar": {"color": BLUE, "thickness": 0.25}, "bgcolor": PANEL_BG, "borderwidth": 0,
+            "steps": [{"range": [0, 0.7], "color": "#3b0d1a"}, {"range": [0.7, 1.3], "color": "#1c2128"},
+                      {"range": [1.3, 3.0], "color": "#0d3b2e"}],
+            "threshold": {"line": {"color": AMBER, "width": 3}, "value": pcr},
         },
-        title={"text": "PUT/CALL RATIO", "font": {"color": "#8b949e", "size": 12}},
-        domain={"x": [0, 1], "y": [0, 1]},
+        title={"text": "PUT / CALL RATIO", "font": {"color": TEXT_MUTED, "size": 12}},
     ))
-    fig.update_layout(paper_bgcolor="#0d1117", font=dict(color="#8b949e"),
-                       height=220, margin=dict(l=20, r=20, t=30, b=0))
-    return fig
+    return _plotly_dark_layout(fig, height=220)
 
 
-def momentum_gauge(momentum_score: float) -> go.Figure:
+def gauge_momentum(score: float) -> go.Figure:
     fig = go.Figure(go.Indicator(
-        mode="gauge+number", value=momentum_score,
-        number={"font": {"color": "#e6edf3", "size": 32, "family": "Courier New"}, "suffix": ""},
+        mode="gauge+number", value=score,
+        number={"font": {"color": TEXT_MAIN, "size": 30, "family": "Courier New"}},
         gauge={
-            "axis": {"range": [-100, 100], "tickcolor": "#8b949e", "tickfont": {"color": "#8b949e"}},
-            "bar": {"color": "#58a6ff", "thickness": 0.25},
-            "bgcolor": "#161b22", "borderwidth": 0,
-            "steps": [
-                {"range": [-100, -20], "color": "#3b0d1a"},
-                {"range": [-20, 20], "color": "#1c2128"},
-                {"range": [20, 100], "color": "#0d3b2e"},
-            ],
-            "threshold": {"line": {"color": "#f0c814", "width": 3}, "value": momentum_score},
+            "axis": {"range": [-100, 100], "tickcolor": TEXT_MUTED, "tickfont": {"color": TEXT_MUTED}},
+            "bar": {"color": BLUE, "thickness": 0.25}, "bgcolor": PANEL_BG, "borderwidth": 0,
+            "steps": [{"range": [-100, -20], "color": "#3b0d1a"}, {"range": [-20, 20], "color": "#1c2128"},
+                      {"range": [20, 100], "color": "#0d3b2e"}],
+            "threshold": {"line": {"color": AMBER, "width": 3}, "value": score},
         },
-        title={"text": "MOMENTUM METER", "font": {"color": "#8b949e", "size": 12}},
-        domain={"x": [0, 1], "y": [0, 1]},
+        title={"text": "MOMENTUM SCORE", "font": {"color": TEXT_MUTED, "size": 12}},
     ))
-    fig.update_layout(paper_bgcolor="#0d1117", font=dict(color="#8b949e"),
-                       height=220, margin=dict(l=20, r=20, t=30, b=0))
-    return fig
-
-
-def iv_chart(df: pd.DataFrame) -> go.Figure:
-    has_ce_iv = "ce_iv" in df.columns
-    has_pe_iv = "pe_iv" in df.columns
-    fig = go.Figure()
-    if has_ce_iv:
-        fig.add_trace(go.Scatter(x=df["strike_price"], y=df["ce_iv"], mode="lines+markers",
-                                  name="CE IV", line=dict(color="#238636", width=2), marker=dict(size=5)))
-    if has_pe_iv:
-        fig.add_trace(go.Scatter(x=df["strike_price"], y=df["pe_iv"], mode="lines+markers",
-                                  name="PE IV", line=dict(color="#da3633", width=2), marker=dict(size=5)))
-    if not has_ce_iv and not has_pe_iv:
-        fig.add_annotation(text="IV data not available from this API response",
-                            xref="paper", yref="paper", x=0.5, y=0.5,
-                            font=dict(color="#8b949e"), showarrow=False)
-    fig.update_layout(
-        paper_bgcolor="#0d1117", plot_bgcolor="#0d1117",
-        font=dict(color="#8b949e", family="Courier New"),
-        height=280, margin=dict(l=10, r=10, t=10, b=30),
-        xaxis=dict(showgrid=True, gridcolor="#21262d", title="Strike"),
-        yaxis=dict(showgrid=True, gridcolor="#21262d", title="IV %"),
-        legend=dict(bgcolor="#161b22", bordercolor="#30363d", borderwidth=1),
-    )
-    return fig
-
-
-def style_chain_table(df: pd.DataFrame) -> pd.DataFrame:
-    cols = ["ce_oi", "ce_chng_oi", "ce_volume", "ce_ltp", "CE Bias", "strike_price",
-            "PE Bias", "pe_ltp", "pe_volume", "pe_chng_oi", "pe_oi", "Strike Signal", "Big Move"]
-    new_signal_cols = [
-        "BUY CE", "SELL CE", "CE Confidence", "CE Stars", "CE Reason",
-        "BUY PE", "SELL PE", "PE Confidence", "PE Stars", "PE Reason",
-    ]
-    available = [c for c in cols if c in df.columns] + [c for c in new_signal_cols if c in df.columns]
-    out = df[available].copy()
-    rename = {
-        "ce_oi": "CE OI", "ce_chng_oi": "CE ΔOI", "ce_volume": "CE Vol", "ce_ltp": "CE LTP",
-        "strike_price": "Strike ⚡", "pe_ltp": "PE LTP", "pe_volume": "PE Vol",
-        "pe_chng_oi": "PE ΔOI", "pe_oi": "PE OI",
-    }
-    out.rename(columns={k: v for k, v in rename.items() if k in out.columns}, inplace=True)
-    return out
-
-
-def _oi_change_color(val, heavy_thresh: float) -> str:
-    try:
-        v = float(val)
-    except (TypeError, ValueError):
-        return "color:#e6edf3;"
-    if v == 0:
-        return "color:#8b949e;"
-    is_large = heavy_thresh > 0 and abs(v) >= heavy_thresh
-    if v > 0:
-        return "color:#0d3b2e;font-weight:700;background-color:#3fb950;" if is_large else "color:#3fb950;"
-    return "color:#3b0d1a;font-weight:700;background-color:#f85149;" if is_large else "color:#f85149;"
-
-
-def _ce_pe_signal_cell_color(val: str) -> str:
-    v = str(val)
-    if v.startswith("✅ BUY"):
-        return "color:#3fb950;font-weight:700;"
-    if v.startswith("🔻 SELL"):
-        return "color:#f85149;font-weight:700;"
-    return "color:#8b949e;"
-
-
-def _oi_bar_pct(val, max_val) -> float:
-    try:
-        v = float(val)
-    except (TypeError, ValueError):
-        return 0.0
-    return max(0.0, min(100.0, (v / max_val) * 100)) if max_val > 0 else 0.0
-
-
-def render_chain_table_html(df: pd.DataFrame, top_n: int = 500) -> str:
-    display_df = style_chain_table(df)
-    view = display_df.head(top_n)
-
-    heavy_ce = df["ce_chng_oi"].abs().quantile(0.80) if "ce_chng_oi" in df.columns and (df["ce_chng_oi"] != 0).any() else 0
-    heavy_pe = df["pe_chng_oi"].abs().quantile(0.80) if "pe_chng_oi" in df.columns and (df["pe_chng_oi"] != 0).any() else 0
-    max_ce_oi = view["CE OI"].max() if "CE OI" in view.columns and len(view) else 0
-    max_pe_oi = view["PE OI"].max() if "PE OI" in view.columns and len(view) else 0
-
-    numeric_fmt = {
-        "CE OI": "{:,.0f}", "CE ΔOI": "{:+,.0f}", "CE Vol": "{:,.0f}", "CE LTP": "{:.2f}",
-        "Strike ⚡": "{:,.0f}", "PE LTP": "{:.2f}", "PE Vol": "{:,.0f}", "PE ΔOI": "{:+,.0f}",
-        "PE OI": "{:,.0f}", "CE Confidence": "{:.1f}%", "PE Confidence": "{:.1f}%",
-    }
-
-    header_html = "".join(f"<th>{col}</th>" for col in view.columns)
-    rows_html = []
-    for _, row in view.iterrows():
-        cells = []
-        for col in view.columns:
-            val = row[col]
-            fmt = numeric_fmt.get(col)
-            display_val = fmt.format(val) if fmt and pd.notna(val) else ("" if pd.isna(val) else val)
-            style = ""
-            if col == "CE ΔOI":
-                style = _oi_change_color(val, heavy_ce)
-            elif col == "PE ΔOI":
-                style = _oi_change_color(val, heavy_pe)
-            elif col in ("BUY CE", "SELL CE", "BUY PE", "SELL PE"):
-                style = _ce_pe_signal_cell_color(val)
-            elif col == "CE OI" and max_ce_oi > 0:
-                pct = _oi_bar_pct(val, max_ce_oi)
-                style = f"background:linear-gradient(90deg, rgba(63,185,80,{0.10 + pct/250:.2f}) {pct:.0f}%, transparent {pct:.0f}%);"
-            elif col == "PE OI" and max_pe_oi > 0:
-                pct = _oi_bar_pct(val, max_pe_oi)
-                style = f"background:linear-gradient(90deg, rgba(63,185,80,{0.10 + pct/250:.2f}) {pct:.0f}%, transparent {pct:.0f}%);"
-            # FIX (FIX NOTE 6a): escape the interpolated cell value.
-            cells.append(f'<td style="{style}">{_safe_cell(display_val)}</td>')
-        rows_html.append(f"<tr>{''.join(cells)}</tr>")
-
-    return f"""
-    <div style="max-height:560px; overflow-y:auto; border:1px solid #30363d; border-radius:8px;">
-    <table class="gamma-table">
-        <thead><tr>{header_html}</tr></thead>
-        <tbody>{''.join(rows_html)}</tbody>
-    </table>
-    </div>
-    """
-
-
-def style_big_move_table(df: pd.DataFrame) -> pd.DataFrame:
-    cols = ["strike_price", "CE Score", "PE Score", "Overall Score", "BUY Probability",
-            "SELL Probability", "Breakout Probability", "Breakdown Probability",
-            "Institutional Score", "Smart Money Score", "Final Signal"]
-    available = [c for c in cols if c in df.columns]
-    out = df[available].copy()
-    out.rename(columns={
-        "strike_price": "Strike ⚡",
-        "Breakout Probability": "Breakout %",
-        "Breakdown Probability": "Breakdown %",
-        "Institutional Score": "Institution Score",
-    }, inplace=True)
-    sort_col = "Overall Score" if "Overall Score" in out.columns else out.columns[0]
-    return out.sort_values(sort_col, ascending=False).reset_index(drop=True)
-
-
-def style_ce_pe_analysis_table(df: pd.DataFrame) -> pd.DataFrame:
-    cols = [
-        "strike_price",
-        "CE Score", "PE Score",
-        "CE BUY Probability", "PE BUY Probability",
-        "CE SELL Probability", "PE SELL Probability",
-        "CE Entry", "PE Entry",
-        "CE SL", "PE SL",
-        "CE Target 1", "PE Target 1",
-        "CE Target 2", "PE Target 2",
-        "CE Target 3", "PE Target 3",
-        "Confidence %",
-        "Institutional Buying", "Institutional Selling",
-        "Smart Money Activity",
-        "Breakout Probability", "Breakdown Probability",
-        "Final Recommendation",
-    ]
-    available = [c for c in cols if c in df.columns]
-    out = df[available].copy()
-    out.rename(columns={
-        "strike_price": "Strike ⚡",
-        "CE Score": "CE AI Score", "PE Score": "PE AI Score",
-        "Breakout Probability": "Breakout Probability %",
-        "Breakdown Probability": "Breakdown Probability %",
-    }, inplace=True)
-    sort_col = "Confidence %" if "Confidence %" in out.columns else out.columns[0]
-    return out.sort_values(sort_col, ascending=False).reset_index(drop=True)
-
-
-def style_trade_signals_table(signals: list) -> pd.DataFrame:
-    if not signals:
-        return pd.DataFrame()
-    df = pd.DataFrame(signals)
-    df.drop(columns=[c for c in ("Signal Key", "Reasons") if c in df.columns], inplace=True)
-    df.rename(columns={"Side": "CE/PE"}, inplace=True)
-    return df
-
-
-def _bigmove_row_style(row):
-    signal = str(row.get("Final Signal", row.get("Final Recommendation", ""))).upper()
-    if "STRONG" in signal and "BUY" in signal:
-        color = "background-color:#0d3b2e;color:#3fb950;"
-    elif "BUY" in signal:
-        color = "background-color:#123524;color:#7ee787;"
-    elif "HOLD" in signal:
-        color = "background-color:#1c2128;color:#d29922;"
-    elif "AVOID" in signal:
-        color = "background-color:#2b1a05;color:#e8823a;"
-    else:
-        color = "background-color:#161b22;color:#8b949e;"
-    return color
-
-
-def render_row_colored_table_html(df: pd.DataFrame, numeric_fmt: dict = None, top_n: int = 500) -> str:
-    numeric_fmt = numeric_fmt or {}
-    view = df.head(top_n)
-    header_html = "".join(f"<th>{col}</th>" for col in view.columns)
-    rows_html = []
-    for _, row in view.iterrows():
-        row_style = _bigmove_row_style(row)
-        cells = []
-        for col in view.columns:
-            val = row[col]
-            fmt = numeric_fmt.get(col)
-            display_val = fmt.format(val) if fmt and pd.notna(val) else ("" if pd.isna(val) else val)
-            # FIX (FIX NOTE 6a): escape the interpolated cell value.
-            cells.append(f"<td>{_safe_cell(display_val)}</td>")
-        rows_html.append(f'<tr style="{row_style}">{"".join(cells)}</tr>')
-    return f"""
-    <div style="max-height:560px; overflow-y:auto; border:1px solid #30363d; border-radius:8px;">
-    <table class="gamma-table">
-        <thead><tr>{header_html}</tr></thead>
-        <tbody>{''.join(rows_html)}</tbody>
-    </table>
-    </div>
-    """
+    return _plotly_dark_layout(fig, height=220)
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# 8. EXCEL EXPORT
+# 12. STYLED / HEATMAPPED CHAIN TABLE  (HTML render — full control over
+#     color coding without relying on pandas Styler + Streamlit quirks)
+# ══════════════════════════════════════════════════════════════════════════
+
+_TABLE_CSS = f"""
+<style>
+.oc-table-wrap {{ max-height: 620px; overflow-y: auto; border: 1px solid {BORDER_COLOR}; border-radius: 8px; }}
+.oc-table {{ width: 100%; border-collapse: collapse; font-family: 'Courier New', monospace; font-size: 12.5px; }}
+.oc-table th {{ background: #1F4E78; color: #ffffff; padding: 8px 10px; text-align: center;
+                position: sticky; top: 0; font-size: 11px; text-transform: uppercase; letter-spacing: .04em; }}
+.oc-table td {{ padding: 6px 9px; text-align: center; border-bottom: 1px solid #21262d; color: {TEXT_MAIN}; white-space: nowrap; }}
+.oc-atm-row td {{ background-color: #1c2128 !important; font-weight: 700; }}
+</style>
+"""
+
+
+def _safe_cell(val: Any) -> str:
+    """HTML-escapes a value before it is interpolated into a raw <td>,
+    guarding against any stray '<'/'>'/'&' in a string field and against
+    NaN rendering as the literal text 'nan'."""
+    if val is None:
+        return ""
+    try:
+        if isinstance(val, float) and math.isnan(val):
+            return ""
+    except (TypeError, ValueError):
+        pass
+    s = str(val)
+    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+
+
+def _oi_cell_style(val: float, heavy_thresh: float, max_val: float) -> str:
+    if max_val <= 0:
+        return f"color:{TEXT_MUTED};"
+    pct = max(0.0, min(100.0, (val / max_val) * 100))
+    intensity = 0.10 + pct / 250
+    is_heavy = heavy_thresh > 0 and val >= heavy_thresh
+    bg = f"background:linear-gradient(90deg, rgba(63,185,80,{intensity:.2f}) {pct:.0f}%, transparent {pct:.0f}%);"
+    weight = "font-weight:700;" if is_heavy else ""
+    return bg + weight
+
+
+def _oi_change_cell_style(val: float, heavy_thresh: float) -> str:
+    if val == 0:
+        return f"color:{TEXT_MUTED};"
+    is_large = heavy_thresh > 0 and abs(val) >= heavy_thresh
+    if val > 0:
+        return f"color:#0d3b2e;font-weight:700;background-color:{GREEN};" if is_large else f"color:{GREEN};"
+    return f"color:#3b0d1a;font-weight:700;background-color:{RED};" if is_large else f"color:{RED};"
+
+
+def _signal_cell_style(val: str) -> str:
+    v = str(val).upper()
+    if "BUY CE" in v or "STRONG BUY" in v:
+        return f"color:{GREEN};font-weight:700;"
+    if "BUY PE" in v or "SELL" in v:
+        return f"color:{RED};font-weight:700;"
+    if "HOLD" in v or "WAIT" in v:
+        return f"color:{AMBER};font-weight:700;"
+    return f"color:{TEXT_MUTED};"
+
+
+def render_chain_table_html(df: pd.DataFrame, show_greeks: bool, top_n: int = 400) -> str:
+    if df.empty:
+        return _TABLE_CSS + "<div style='color:#8b949e;padding:12px;'>No rows to display.</div>"
+
+    base_cols = [
+        ("ce_oi", "CE OI"), ("ce_chng_oi", "CE ΔOI"), ("ce_oi_change_pct", "CE ΔOI%"),
+        ("ce_volume", "CE Vol"), ("ce_iv", "CE IV"), ("ce_ltp", "CE LTP"),
+        ("ce_bid", "CE Bid"), ("ce_ask", "CE Ask"),
+    ]
+    greek_ce_cols = [("ce_delta", "CE Δ"), ("ce_gamma", "CE Γ"), ("ce_theta", "CE Θ"), ("ce_vega", "CE V")]
+    mid_cols = [("strike_price", "STRIKE"), ("CE Buildup", "CE Build"), ("PE Buildup", "PE Build"),
+                ("AI Signal", "AI Signal")]
+    greek_pe_cols = [("pe_delta", "PE Δ"), ("pe_gamma", "PE Γ"), ("pe_theta", "PE Θ"), ("pe_vega", "PE V")]
+    pe_cols = [
+        ("pe_bid", "PE Bid"), ("pe_ask", "PE Ask"), ("pe_ltp", "PE LTP"), ("pe_iv", "PE IV"),
+        ("pe_volume", "PE Vol"), ("pe_oi_change_pct", "PE ΔOI%"), ("pe_chng_oi", "PE ΔOI"), ("pe_oi", "PE OI"),
+    ]
+
+    cols = base_cols + (greek_ce_cols if show_greeks else []) + mid_cols + \
+        (greek_pe_cols if show_greeks else []) + pe_cols
+    cols = [(k, label) for k, label in cols if k in df.columns]
+
+    fmt = {
+        "ce_oi": "{:,.0f}", "ce_chng_oi": "{:+,.0f}", "ce_oi_change_pct": "{:+.1f}%",
+        "ce_volume": "{:,.0f}", "ce_iv": "{:.1f}", "ce_ltp": "{:.2f}", "ce_bid": "{:.2f}", "ce_ask": "{:.2f}",
+        "ce_delta": "{:.3f}", "ce_gamma": "{:.5f}", "ce_theta": "{:.3f}", "ce_vega": "{:.3f}",
+        "strike_price": "{:,.0f}",
+        "pe_delta": "{:.3f}", "pe_gamma": "{:.5f}", "pe_theta": "{:.3f}", "pe_vega": "{:.3f}",
+        "pe_bid": "{:.2f}", "pe_ask": "{:.2f}", "pe_ltp": "{:.2f}", "pe_iv": "{:.1f}",
+        "pe_volume": "{:,.0f}", "pe_oi_change_pct": "{:+.1f}%", "pe_chng_oi": "{:+,.0f}", "pe_oi": "{:,.0f}",
+    }
+
+    heavy_ce_oi = df["ce_oi"].quantile(0.80) if df["ce_oi"].max() > 0 else 0
+    heavy_pe_oi = df["pe_oi"].quantile(0.80) if df["pe_oi"].max() > 0 else 0
+    heavy_ce_chng = df["ce_chng_oi"].abs().quantile(0.80) if (df["ce_chng_oi"] != 0).any() else 0
+    heavy_pe_chng = df["pe_chng_oi"].abs().quantile(0.80) if (df["pe_chng_oi"] != 0).any() else 0
+    max_ce_oi, max_pe_oi = df["ce_oi"].max(), df["pe_oi"].max()
+
+    view = df.head(top_n)
+    header_html = "".join(f"<th>{label}</th>" for _, label in cols)
+    rows_html = []
+    for _, row in view.iterrows():
+        is_atm = bool(row.get("ATM", False))
+        cells = []
+        for key, _ in cols:
+            val = row.get(key, "")
+            spec = fmt.get(key)
+            display_val = spec.format(val) if spec and pd.notna(val) else ("" if pd.isna(val) else val)
+            style = ""
+            if key == "ce_oi":
+                style = _oi_cell_style(val, heavy_ce_oi, max_ce_oi)
+            elif key == "pe_oi":
+                style = _oi_cell_style(val, heavy_pe_oi, max_pe_oi)
+            elif key == "ce_chng_oi":
+                style = _oi_change_cell_style(val, heavy_ce_chng)
+            elif key == "pe_chng_oi":
+                style = _oi_change_cell_style(val, heavy_pe_chng)
+            elif key == "AI Signal":
+                style = _signal_cell_style(val)
+            cells.append(f'<td style="{style}">{_safe_cell(display_val)}</td>')
+        row_class = "oc-atm-row" if is_atm else ""
+        rows_html.append(f'<tr class="{row_class}">{"".join(cells)}</tr>')
+
+    return (
+        _TABLE_CSS
+        + f'<div class="oc-table-wrap"><table class="oc-table"><thead><tr>{header_html}</tr></thead>'
+        + f'<tbody>{"".join(rows_html)}</tbody></table></div>'
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 13. REPORT EXPORT — EXCEL (openpyxl, conditional formatting) + CSV
 # ══════════════════════════════════════════════════════════════════════════
 
 FILL_HEADER = PatternFill(start_color="1F4E78", end_color="1F4E78", fill_type="solid")
-FILL_STRONGBUY = PatternFill(start_color="A9D18E", end_color="A9D18E", fill_type="solid")
-FILL_BUY = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
-FILL_HOLD = PatternFill(start_color="FFEB9C", end_color="FFEB9C", fill_type="solid")
-FILL_AVOID = PatternFill(start_color="FFD966", end_color="FFD966", fill_type="solid")
-FILL_IGNORE = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
-FILL_SELL = FILL_IGNORE
-FILL_WAIT = FILL_HOLD
+FILL_GREEN = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
+FILL_RED = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
+FILL_AMBER = PatternFill(start_color="FFEB9C", end_color="FFEB9C", fill_type="solid")
 FONT_HEADER = Font(color="FFFFFF", bold=True, size=11)
 THIN_BORDER = Border(*(Side(style="thin", color="30363D"),) * 4)
 
 
-def _style_header_row(ws, row_idx: int = 1):
+def _style_header_row(ws, row_idx: int = 1) -> None:
     for cell in ws[row_idx]:
         cell.fill = FILL_HEADER
         cell.font = FONT_HEADER
@@ -3168,44 +1493,20 @@ def _style_header_row(ws, row_idx: int = 1):
         cell.border = THIN_BORDER
 
 
-def _autosize_columns(ws):
+def _autosize_columns(ws) -> None:
     for col_cells in ws.columns:
         length = max((len(str(c.value)) if c.value is not None else 0) for c in col_cells)
         col_letter = get_column_letter(col_cells[0].column)
         ws.column_dimensions[col_letter].width = min(max(length + 3, 10), 40)
 
 
-def _apply_borders(ws):
+def _apply_borders(ws) -> None:
     for row in ws.iter_rows():
         for cell in row:
             cell.border = THIN_BORDER
 
 
-def _color_signal_cells(ws, header_row_values: list, start_row: int = 2):
-    target_cols = [
-        idx + 1 for idx, h in enumerate(header_row_values)
-        if h and any(k in str(h) for k in ("Signal", "Bias", "Build-up", "Label", "Rating", "Recommendation"))
-    ]
-    for row in ws.iter_rows(min_row=start_row):
-        for col_idx in target_cols:
-            cell = row[col_idx - 1]
-            val = str(cell.value or "").upper()
-            fill = None
-            if "STRONG BUY" in val or "EXPLOSIVE" in val or "LONG BUILD-UP" in val or "BULLISH" in val:
-                fill = FILL_STRONGBUY
-            elif "BUY" in val or "STRONG MOVE" in val:
-                fill = FILL_BUY
-            elif "HOLD" in val or "NEUTRAL" in val or "WATCH" in val or "FLAT" in val or "WAIT" in val:
-                fill = FILL_HOLD
-            elif "AVOID" in val or "SHORT BUILD-UP" in val or "BEARISH" in val:
-                fill = FILL_AVOID
-            elif "IGNORE" in val or "SELL" in val:
-                fill = FILL_IGNORE
-            if fill:
-                cell.fill = fill
-
-
-def _write_dataframe(ws, df: pd.DataFrame, start_row: int = 1):
+def _write_dataframe(ws, df: pd.DataFrame, start_row: int = 1) -> None:
     for j, col_name in enumerate(df.columns, start=1):
         ws.cell(row=start_row, column=j, value=str(col_name))
     for i, (_, row) in enumerate(df.iterrows(), start=start_row + 1):
@@ -3213,37 +1514,61 @@ def _write_dataframe(ws, df: pd.DataFrame, start_row: int = 1):
             if isinstance(val, (np.integer,)):
                 val = int(val)
             elif isinstance(val, (np.floating,)):
-                val = float(val)
+                val = float(val) if not math.isnan(val) else None
+            elif isinstance(val, (np.bool_,)):
+                val = bool(val)
             ws.cell(row=i, column=j, value=val)
-    header_values = list(df.columns)
     _style_header_row(ws, start_row)
     ws.freeze_panes = ws.cell(row=start_row + 1, column=1).coordinate
     ws.auto_filter.ref = ws.dimensions
-    _color_signal_cells(ws, header_values, start_row=start_row + 1)
+    _conditional_color_signal_columns(ws, list(df.columns), start_row=start_row + 1)
     _apply_borders(ws)
     _autosize_columns(ws)
 
 
-def build_excel_report(df: pd.DataFrame, spot_price: float, atm_strike: float, pcr: float,
-                        max_pain: float, support, resistance, symbol: str, expiry_label: str,
-                        signals: list) -> io.BytesIO:
+def _conditional_color_signal_columns(ws, header_values: list, start_row: int) -> None:
+    target_cols = [
+        idx + 1 for idx, h in enumerate(header_values)
+        if h and any(k in str(h) for k in ("Signal", "Buildup", "Institutional", "Smart Money"))
+    ]
+    for row in ws.iter_rows(min_row=start_row):
+        for col_idx in target_cols:
+            cell = row[col_idx - 1]
+            val = str(cell.value or "").upper()
+            fill = None
+            if "BUY CE" in val or "LONG BUILDUP" in val or "INSTITUTIONAL" in val or "TRUE" in val:
+                fill = FILL_GREEN
+            elif "BUY PE" in val or "SHORT BUILDUP" in val:
+                fill = FILL_RED
+            elif "HOLD" in val or "WAIT" in val or "FLAT" in val:
+                fill = FILL_AMBER
+            if fill:
+                cell.fill = fill
+
+
+def export_excel_report(df: pd.DataFrame, meta: dict, pcr: float, max_pain: float,
+                         support: Optional[float], resistance: Optional[float],
+                         symbol: str, expiry_label: str, iv_rank: float,
+                         iv_percentile: float, gex_dex: dict) -> io.BytesIO:
+    """Builds a multi-sheet Excel report: Summary, Option Chain, AI Signals,
+    Greeks — fully formatted (colored headers, conditional fills, auto
+    column width, freeze panes, borders, auto-filter)."""
     wb = Workbook()
 
     ws_summary = wb.active
     ws_summary.title = "Summary"
     summary_rows = [
-        ("Symbol", symbol),
-        ("Expiry", expiry_label),
+        ("Symbol", symbol), ("Expiry", expiry_label),
         ("Generated At", datetime.now().strftime("%d-%b-%Y %H:%M:%S")),
-        ("Spot Price", round(spot_price, 2) if spot_price else "—"),
-        ("ATM Strike", atm_strike),
-        ("PCR", round(pcr, 3)),
-        ("Max Pain", max_pain),
-        ("Support (Max PE OI)", support),
-        ("Resistance (Max CE OI)", resistance),
+        ("Spot Price", round(meta.get("spot_price", 0.0), 2)),
+        ("PCR", pcr), ("Max Pain", max_pain),
+        ("Support (Max PE OI)", support), ("Resistance (Max CE OI)", resistance),
+        ("IV Rank", iv_rank), ("IV Percentile", iv_percentile),
+        ("Total GEX", round(gex_dex.get("total_gex", 0.0), 2)),
+        ("Total DEX", round(gex_dex.get("total_dex", 0.0), 2)),
+        ("Gamma Flip Strike", gex_dex.get("gamma_flip")),
         ("Total CE OI", int(df["ce_oi"].sum()) if not df.empty else 0),
         ("Total PE OI", int(df["pe_oi"].sum()) if not df.empty else 0),
-        ("AI Trade Signals Generated", len(signals)),
     ]
     ws_summary.cell(row=1, column=1, value="Metric")
     ws_summary.cell(row=1, column=2, value="Value")
@@ -3255,22 +1580,31 @@ def build_excel_report(df: pd.DataFrame, spot_price: float, atm_strike: float, p
     _apply_borders(ws_summary)
     _autosize_columns(ws_summary)
 
-    ws_chain = wb.create_sheet("Chain Table")
-    _write_dataframe(ws_chain, style_chain_table(df))
+    ws_chain = wb.create_sheet("Option Chain")
+    chain_export_cols = [c for c in [
+        "strike_price", "ce_oi", "ce_chng_oi", "ce_oi_change_pct", "ce_volume", "ce_iv", "ce_ltp",
+        "ce_bid", "ce_ask", "CE Buildup", "CE Moneyness", "AI Signal", "AI Confidence %",
+        "Institutional Signal", "Smart Money", "PE Moneyness", "PE Buildup",
+        "pe_bid", "pe_ask", "pe_ltp", "pe_iv", "pe_volume", "pe_oi_change_pct", "pe_chng_oi", "pe_oi",
+    ] if c in df.columns]
+    _write_dataframe(ws_chain, df[chain_export_cols])
 
-    ws_bigmove = wb.create_sheet("Big Move Ready")
-    _write_dataframe(ws_bigmove, style_ce_pe_analysis_table(df))
+    ws_greeks = wb.create_sheet("Greeks")
+    greek_cols = [c for c in [
+        "strike_price", "ce_delta", "ce_gamma", "ce_theta", "ce_vega",
+        "pe_delta", "pe_gamma", "pe_theta", "pe_vega",
+    ] if c in df.columns]
+    if greek_cols:
+        _write_dataframe(ws_greeks, df[greek_cols])
 
-    ws_bigmove_legacy = wb.create_sheet("Big Move (Legacy)")
-    _write_dataframe(ws_bigmove_legacy, style_big_move_table(df))
-
-    ws_signals = wb.create_sheet("AI Trade Signals")
-    sig_df = style_trade_signals_table(signals)
-    if not sig_df.empty:
+    ws_signals = wb.create_sheet("AI Signals")
+    signal_cols = [c for c in [
+        "strike_price", "AI Signal", "AI Confidence %", "CE Score", "PE Score",
+        "Institutional Signal", "Smart Money",
+    ] if c in df.columns]
+    if signal_cols:
+        sig_df = df[signal_cols].sort_values("AI Confidence %", ascending=False) if "AI Confidence %" in df.columns else df[signal_cols]
         _write_dataframe(ws_signals, sig_df)
-    else:
-        ws_signals.cell(row=1, column=1, value="No signals met the confidence threshold")
-        _style_header_row(ws_signals, 1)
 
     buffer = io.BytesIO()
     wb.save(buffer)
@@ -3278,1238 +1612,442 @@ def build_excel_report(df: pd.DataFrame, spot_price: float, atm_strike: float, p
     return buffer
 
 
+def export_csv_bytes(df: pd.DataFrame) -> bytes:
+    return df.to_csv(index=False).encode("utf-8")
+
+
 # ══════════════════════════════════════════════════════════════════════════
-# 5E. AI MARKET INTELLIGENCE BRIDGE  (analyze_market() — always invoked,
-#     for BOTH FYERS and NSE, with no source-based bypass)
+# 14. STREAMLIT UI — PAGE CONFIG, CSS, SUMMARY CARDS
 # ══════════════════════════════════════════════════════════════════════════
 
-def run_external_ai_market_analysis(df: pd.DataFrame, spot_price: float, atm_strike: float,
-                                     pcr: float, max_pain: float, symbol: str, expiry_label: str,
-                                     source: str) -> dict:
-    """Always-executed, fault-tolerant call into analyze_market()."""
-    logger.info(
-        "Stage: AI Market Intelligence — invoking analyze_market() (source=%s, symbol=%s, expiry=%s)",
-        source, symbol, expiry_label,
-    )
-
-    if spot_price is None:
-        spot_price = float(df["strike_price"].median()) if df is not None and not df.empty else 0.0
-        logger.warning("AI Market Intelligence — spot_price was None; using chain-median fallback %.2f", spot_price)
-    if atm_strike is None:
-        ref = spot_price if spot_price else (
-            float(df["strike_price"].median()) if df is not None and not df.empty else 0.0)
-        atm_strike = (
-            float(df.iloc[(df["strike_price"] - ref).abs().argsort().iloc[0]]["strike_price"])
-            if df is not None and not df.empty else 0.0
-        )
-        logger.warning("AI Market Intelligence — atm_strike was None; using nearest-strike fallback %.2f", atm_strike)
-    if max_pain is None:
-        max_pain = calculate_max_pain(df) if df is not None and not df.empty else 0.0
-        logger.warning("AI Market Intelligence — max_pain was None; recomputed fallback %.2f", max_pain)
-    if pcr is None:
-        if df is not None and not df.empty:
-            total_ce, total_pe = df["ce_oi"].sum(), df["pe_oi"].sum()
-            pcr = float(total_pe / total_ce) if total_ce > 0 else 1.0
-        else:
-            pcr = 1.0
-        logger.warning("AI Market Intelligence — pcr was None; recomputed fallback %.3f", pcr)
-
+def _configure_page() -> None:
+    """Guarded: set_page_config() must be Streamlit's first command and
+    can only run once per session. Caught and logged rather than raising,
+    so importing this module from another app.py doesn't crash it."""
     try:
-        result = analyze_market(
-            df, spot_price=spot_price, atm_strike=atm_strike, max_pain=max_pain,
-            pcr=pcr, expiry_label=expiry_label,
-        )
-        logger.info("Stage: AI Market Intelligence — analyze_market() completed (source=%s)", source)
-        return {"available": True, "result": result, "reason": None}
-    except TypeError as e:
-        try:
-            result = analyze_market(
-                df, spot_price=spot_price, atm_strike=atm_strike, max_pain=max_pain,
-                pcr=pcr, expiry_label=expiry_label,
-            )
-            logger.info(
-                "Stage: AI Market Intelligence — analyze_market() completed via fallback "
-                "call (source=%s)", source,
-            )
-            return {"available": True, "result": result, "reason": None}
-        except Exception as e2:  # noqa: BLE001
-            reason = f"analyze_market() signature mismatch: {e2}"
-            logger.error("Stage: AI Market Intelligence — %s (source=%s, initial error=%s)", reason, source, e)
-            return {"available": False, "result": None, "reason": reason}
-    except Exception as e:  # noqa: BLE001 - external module must never crash the dashboard
-        reason = str(e)
-        logger.error("Stage: AI Market Intelligence — analyze_market() raised an exception (source=%s): %s", source, e)
-        return {"available": False, "result": None, "reason": reason}
-
-
-# ══════════════════════════════════════════════════════════════════════════
-# 5F. CE/PE INSTITUTIONAL BUY & SELL SIGNAL ENGINE  (additive)
-# ══════════════════════════════════════════════════════════════════════════
-
-CE_PE_SIGNAL_MIN_CONFIDENCE = 60.0
-CE_PE_SIGNAL_MIN_TRUE_FRACTION = 0.55
-
-
-def _ce_pe_signal_stars(confidence_pct: float) -> str:
-    if confidence_pct >= 90:
-        return "★★★★★"
-    if confidence_pct >= 75:
-        return "★★★★☆"
-    if confidence_pct >= 60:
-        return "★★★☆☆"
-    if confidence_pct >= 45:
-        return "★★☆☆☆"
-    return "★☆☆☆☆"
-
-
-def _ce_pe_levels(entry: float, is_sell: bool):
-    if entry <= 0:
-        return 0.0, 0.0, 0.0
-    if is_sell:
-        sl = round(entry * 1.20, 2)
-        target = round(entry * 0.70, 2)
-    else:
-        sl = round(entry * 0.85, 2)
-        target = round(entry * 1.30, 2)
-    risk = abs(entry - sl)
-    reward = abs(target - entry)
-    rr = round(reward / risk, 2) if risk > 0 else 0.0
-    return sl, target, rr
-
-
-def compute_ce_pe_trade_signals(df: pd.DataFrame, spot_price: float, max_pain: float, pcr: float,
-                                 atm_strike: float, support, resistance,
-                                 trend_engine: dict = None, gdf: pd.DataFrame = None) -> pd.DataFrame:
-    if df.empty:
-        return df
-    d = df.copy()
-
-    has_trend = bool(trend_engine and trend_engine.get("available"))
-    if has_trend:
-        last_close, vwap = trend_engine.get("last_close"), trend_engine.get("vwap")
-        ema9, ema20, ema50 = trend_engine.get("ema9"), trend_engine.get("ema20"), trend_engine.get("ema50")
-        rsi5 = trend_engine.get("rsi5", 50.0)
-        macd_val, macd_sig = trend_engine.get("macd", 0.0), trend_engine.get("macd_signal", 0.0)
-        bos_label = trend_engine.get("bos_label", "None")
-        volume_spike = ("Volume Spike" in trend_engine.get("buy_confirmations", [])
-                         or "Volume Spike" in trend_engine.get("sell_confirmations", []))
-        price_above_vwap = last_close is not None and vwap is not None and last_close > vwap
-        price_below_vwap = last_close is not None and vwap is not None and last_close < vwap
-        above_ema20_50 = (last_close is not None and ema20 is not None and ema50 is not None
-                          and last_close > ema20 and last_close > ema50)
-        below_ema20_50 = (last_close is not None and ema20 is not None and ema50 is not None
-                          and last_close < ema20 and last_close < ema50)
-        bullish_structure = bos_label == "Bullish BOS"
-        bearish_structure = bos_label == "Bearish BOS"
-        bullish_candle_proxy = macd_val > macd_sig
-        bearish_candle_proxy = macd_val < macd_sig
-        rsi_overbought = rsi5 > 70
-        rsi_oversold = rsi5 < 30
-    else:
-        price_above_vwap = price_below_vwap = None
-        above_ema20_50 = below_ema20_50 = None
-        bullish_structure = bearish_structure = None
-        bullish_candle_proxy = bearish_candle_proxy = None
-        rsi_overbought = rsi_oversold = None
-        volume_spike = None
-
-    gamma_map = None
-    if gdf is not None and not gdf.empty and "Gamma Change" in gdf.columns:
-        gamma_map = gdf.set_index("strike_price")["Gamma Change"].to_dict()
-
-    heavy_ce_oi = df["ce_oi"].quantile(0.80) if df["ce_oi"].max() > 0 else 0
-    heavy_pe_oi = df["pe_oi"].quantile(0.80) if df["pe_oi"].max() > 0 else 0
-    heavy_ce_chng = df["ce_chng_oi"].clip(lower=0).quantile(0.80) if (df["ce_chng_oi"] > 0).any() else 0
-    heavy_pe_chng = df["pe_chng_oi"].clip(lower=0).quantile(0.80) if (df["pe_chng_oi"] > 0).any() else 0
-    high_ce_vol = df["ce_volume"].quantile(0.75) if df["ce_volume"].max() > 0 else 0
-    high_pe_vol = df["pe_volume"].quantile(0.75) if df["pe_volume"].max() > 0 else 0
-    avg_ce_iv = df.loc[df["ce_iv"] > 0, "ce_iv"].mean() if (df["ce_iv"] > 0).any() else 0
-    avg_pe_iv = df.loc[df["pe_iv"] > 0, "pe_iv"].mean() if (df["pe_iv"] > 0).any() else 0
-
-    ref = spot_price if spot_price else (atm_strike if atm_strike else float(df["strike_price"].median()))
-    strike_gap = df["strike_price"].sort_values().diff().dropna().median() if len(df) > 1 else 1.0
-
-    buy_ce_col, sell_ce_col, buy_pe_col, sell_pe_col = [], [], [], []
-    ce_conf_col, pe_conf_col = [], []
-    ce_reason_col, pe_reason_col = [], []
-    ce_stars_col, pe_stars_col = [], []
-    ce_risk_col, pe_risk_col = [], []
-    ce_sl_col, ce_target_col, ce_rr_col, ce_prob_col = [], [], [], []
-    pe_sl_col, pe_target_col, pe_rr_col, pe_prob_col = [], [], [], []
-
-    for _, row in d.iterrows():
-        strike = row["strike_price"]
-        ce_oi, pe_oi = row.get("ce_oi", 0), row.get("pe_oi", 0)
-        ce_chng, pe_chng = row.get("ce_chng_oi", 0), row.get("pe_chng_oi", 0)
-        ce_vol, pe_vol = row.get("ce_volume", 0), row.get("pe_volume", 0)
-        ce_iv, pe_iv = row.get("ce_iv", 0), row.get("pe_iv", 0)
-        ce_ltp, pe_ltp = row.get("ce_ltp", 0), row.get("pe_ltp", 0)
-        inst_buying = row.get("Institutional Buying", 0)
-        inst_selling = row.get("Institutional Selling", 0)
-        gamma_chg = gamma_map.get(strike, 0.0) if gamma_map else None
-
-        near_resistance = resistance is not None and abs(strike - resistance) <= strike_gap
-        near_support = support is not None and abs(strike - support) <= strike_gap
-        no_nearby_resistance = resistance is None or strike < resistance - strike_gap
-
-        buy_ce_conds = {
-            "PE Writing": pe_chng > 0 and heavy_pe_chng > 0 and pe_chng >= heavy_pe_chng * 0.5,
-            "CE Unwinding": ce_chng < 0,
-            "PCR Rising (>1.0)": pcr > 1.0,
-            "Price above VWAP": bool(price_above_vwap) if has_trend else False,
-            "Above EMA20 & EMA50": bool(above_ema20_50) if has_trend else False,
-            "Bullish Market Structure": bool(bullish_structure) if has_trend else False,
-            "Bullish Candle (MACD proxy)": bool(bullish_candle_proxy) if has_trend else False,
-            "Volume Expansion": bool(volume_spike) if has_trend else (ce_vol >= high_ce_vol > 0),
-            "Positive Gamma (Delta proxy)": (gamma_chg is not None and gamma_chg > 0),
-            "Stable IV": avg_ce_iv > 0 and 0 < ce_iv <= avg_ce_iv * 1.1,
-            "Max Pain below Spot": bool(max_pain and spot_price and spot_price > max_pain),
-            "Support Holding": (support is None) or (spot_price is not None and spot_price >= support),
-            "No nearby Resistance": no_nearby_resistance,
-            "Smart Money Buying": inst_buying >= 60,
-        }
-        sell_ce_conds = {
-            "CE Long Build-up (Call Writing)": heavy_ce_chng > 0 and ce_chng >= heavy_ce_chng,
-            "Resistance Rejection": near_resistance or (heavy_ce_oi > 0 and ce_oi >= heavy_ce_oi),
-            "Bearish Structure": bool(bearish_structure) if has_trend else True,
-            "RSI Overbought": bool(rsi_overbought) if has_trend else True,
-            "MACD Bearish": bool(bearish_candle_proxy) if has_trend else True,
-            "Volume Selling": ce_vol >= high_ce_vol > 0,
-            "IV Expansion": avg_ce_iv > 0 and ce_iv >= avg_ce_iv * 1.1,
-            "OI Resistance": heavy_ce_oi > 0 and ce_oi >= heavy_ce_oi,
-            "Institutional Exit": inst_selling >= 60,
-        }
-        buy_pe_conds = {
-            "CE Writing": ce_chng > 0 and heavy_ce_chng > 0 and ce_chng >= heavy_ce_chng * 0.5,
-            "PE Unwinding": pe_chng < 0,
-            "Price below VWAP": bool(price_below_vwap) if has_trend else False,
-            "EMA Breakdown": bool(below_ema20_50) if has_trend else False,
-            "Bearish Candle (MACD proxy)": bool(bearish_candle_proxy) if has_trend else False,
-            "Breakdown Confirmed (Structure)": bool(bearish_structure) if has_trend else False,
-            "Volume Expansion": bool(volume_spike) if has_trend else (pe_vol >= high_pe_vol > 0),
-            "Negative Gamma (Delta proxy)": (gamma_chg is not None and gamma_chg < 0),
-            "Max Pain above Spot": bool(max_pain and spot_price and spot_price < max_pain),
-            "Institutional Selling": inst_selling >= 60,
-        }
-        sell_pe_conds = {
-            "PE Long Build-up (Put Writing)": heavy_pe_chng > 0 and pe_chng >= heavy_pe_chng,
-            "Support Holding": near_support or (heavy_pe_oi > 0 and pe_oi >= heavy_pe_oi),
-            "Bullish Reversal (Structure)": bool(bullish_structure) if has_trend else True,
-            "RSI Oversold": bool(rsi_oversold) if has_trend else True,
-            "IV Crush": avg_pe_iv > 0 and 0 < pe_iv <= avg_pe_iv * 0.9,
-            "Institutional Buying": inst_buying >= 60,
-        }
-
-        def _score(conds: dict, require_all_available: bool) -> float:
-            if require_all_available and not has_trend:
-                return 0.0
-            vals = list(conds.values())
-            return (sum(1 for v in vals if v) / len(vals)) * 100 if vals else 0.0
-
-        ce_buy_conf = _score(buy_ce_conds, require_all_available=True)
-        ce_sell_conf = _score(sell_ce_conds, require_all_available=False)
-        pe_buy_conf = _score(buy_pe_conds, require_all_available=True)
-        pe_sell_conf = _score(sell_pe_conds, require_all_available=False)
-
-        def _passes(conds, conf, require_trend):
-            if require_trend and not has_trend:
-                return False
-            frac_true = sum(1 for v in conds.values() if v) / len(conds)
-            return conf >= CE_PE_SIGNAL_MIN_CONFIDENCE and frac_true >= CE_PE_SIGNAL_MIN_TRUE_FRACTION
-
-        ce_buy_ok = _passes(buy_ce_conds, ce_buy_conf, require_trend=True)
-        ce_sell_ok = _passes(sell_ce_conds, ce_sell_conf, require_trend=False)
-        pe_buy_ok = _passes(buy_pe_conds, pe_buy_conf, require_trend=True)
-        pe_sell_ok = _passes(sell_pe_conds, pe_sell_conf, require_trend=False)
-
-        ce_sl = ce_target = ce_rr = 0.0
-        if ce_buy_ok and (not ce_sell_ok or ce_buy_conf >= ce_sell_conf):
-            buy_ce, sell_ce = "✅ BUY CE", "—"
-            ce_conf, ce_reason_src = ce_buy_conf, buy_ce_conds
-            ce_sl, ce_target, ce_rr = _ce_pe_levels(float(ce_ltp or 0), is_sell=False)
-        elif ce_sell_ok:
-            buy_ce, sell_ce = "—", "🔻 SELL CE"
-            ce_conf, ce_reason_src = ce_sell_conf, sell_ce_conds
-            ce_sl, ce_target, ce_rr = _ce_pe_levels(float(ce_ltp or 0), is_sell=True)
-        else:
-            buy_ce, sell_ce = "NO TRADE", "NO TRADE"
-            ce_conf = max(ce_buy_conf, ce_sell_conf)
-            ce_reason_src = buy_ce_conds if ce_buy_conf >= ce_sell_conf else sell_ce_conds
-
-        pe_sl = pe_target = pe_rr = 0.0
-        if pe_buy_ok and (not pe_sell_ok or pe_buy_conf >= pe_sell_conf):
-            buy_pe, sell_pe = "✅ BUY PE", "—"
-            pe_conf, pe_reason_src = pe_buy_conf, buy_pe_conds
-            pe_sl, pe_target, pe_rr = _ce_pe_levels(float(pe_ltp or 0), is_sell=False)
-        elif pe_sell_ok:
-            buy_pe, sell_pe = "—", "🔻 SELL PE"
-            pe_conf, pe_reason_src = pe_sell_conf, sell_pe_conds
-            pe_sl, pe_target, pe_rr = _ce_pe_levels(float(pe_ltp or 0), is_sell=True)
-        else:
-            buy_pe, sell_pe = "NO TRADE", "NO TRADE"
-            pe_conf = max(pe_buy_conf, pe_sell_conf)
-            pe_reason_src = buy_pe_conds if pe_buy_conf >= pe_sell_conf else sell_pe_conds
-
-        if buy_ce not in ("NO TRADE",) or sell_ce not in ("NO TRADE",):
-            if ce_rr < 1.5:
-                buy_ce, sell_ce, ce_conf = "NO TRADE", "NO TRADE", min(ce_conf, CE_PE_SIGNAL_MIN_CONFIDENCE - 1)
-        if buy_pe not in ("NO TRADE",) or sell_pe not in ("NO TRADE",):
-            if pe_rr < 1.5:
-                buy_pe, sell_pe, pe_conf = "NO TRADE", "NO TRADE", min(pe_conf, CE_PE_SIGNAL_MIN_CONFIDENCE - 1)
-
-        ce_reason = " · ".join(k for k, v in ce_reason_src.items() if v) or "No conditions met"
-        pe_reason = " · ".join(k for k, v in pe_reason_src.items() if v) or "No conditions met"
-        if not has_trend and (buy_ce == "NO TRADE" and buy_pe == "NO TRADE"):
-            note = "Enable the AI Scalping Engine (candle fetch) for trend-confirmed BUY signals"
-            ce_reason = f"{ce_reason} · {note}" if ce_reason != "No conditions met" else note
-            pe_reason = f"{pe_reason} · {note}" if pe_reason != "No conditions met" else note
-
-        buy_ce_col.append(buy_ce); sell_ce_col.append(sell_ce)
-        buy_pe_col.append(buy_pe); sell_pe_col.append(sell_pe)
-        ce_conf_col.append(round(ce_conf, 1)); pe_conf_col.append(round(pe_conf, 1))
-        ce_reason_col.append(ce_reason); pe_reason_col.append(pe_reason)
-        ce_stars_col.append(_ce_pe_signal_stars(ce_conf) if buy_ce != "NO TRADE" or sell_ce != "NO TRADE" else "—")
-        pe_stars_col.append(_ce_pe_signal_stars(pe_conf) if buy_pe != "NO TRADE" or sell_pe != "NO TRADE" else "—")
-        ce_risk_col.append(_risk_level_from_confidence(ce_conf))
-        pe_risk_col.append(_risk_level_from_confidence(pe_conf))
-        ce_sl_col.append(ce_sl); ce_target_col.append(ce_target); ce_rr_col.append(ce_rr); ce_prob_col.append(round(ce_conf, 1))
-        pe_sl_col.append(pe_sl); pe_target_col.append(pe_target); pe_rr_col.append(pe_rr); pe_prob_col.append(round(pe_conf, 1))
-
-    d["BUY CE"], d["SELL CE"], d["BUY PE"], d["SELL PE"] = buy_ce_col, sell_ce_col, buy_pe_col, sell_pe_col
-    d["CE Confidence"], d["PE Confidence"] = ce_conf_col, pe_conf_col
-    d["CE Reason"], d["PE Reason"] = ce_reason_col, pe_reason_col
-    d["CE Stars"], d["PE Stars"] = ce_stars_col, pe_stars_col
-    d["CE Risk Level"], d["PE Risk Level"] = ce_risk_col, pe_risk_col
-    d["CE Stop Loss"], d["CE Target"], d["CE Risk Reward"], d["CE Probability"] = ce_sl_col, ce_target_col, ce_rr_col, ce_prob_col
-    d["PE Stop Loss"], d["PE Target"], d["PE Risk Reward"], d["PE Probability"] = pe_sl_col, pe_target_col, pe_rr_col, pe_prob_col
-    return d
-
-
-def _risk_level_from_confidence(conf: float) -> str:
-    if conf >= 85:
-        return "Low"
-    if conf >= 70:
-        return "Moderate"
-    if conf >= 55:
-        return "Elevated"
-    return "High"
-
-
-# ══════════════════════════════════════════════════════════════════════════
-# 5G. INSTITUTIONAL AI VALIDATION ENGINE
-# ══════════════════════════════════════════════════════════════════════════
-
-INSTITUTIONAL_SCORE_WEIGHTS = {
-    "trend": 20, "option_chain": 20, "oi_buildup": 15, "pcr": 10,
-    "max_pain": 10, "volume": 10, "momentum": 5, "price_action": 5,
-    "smart_money": 5,
-}
-INSTITUTIONAL_MIN_CONFIDENCE = 40.0
-INSTITUTIONAL_MIN_RISK_REWARD = 2.0
-
-
-def _institutional_confidence_band(pct: float) -> tuple:
-    if pct >= 90:
-        return "★★★★★ Institutional Strong", "strongbuy"
-    if pct >= 80:
-        return "★★★★ Very Strong", "buy"
-    if pct >= 70:
-        return "★★★ Strong", "buy"
-    if pct >= 55:
-        return "★★ Moderate", "hold"
-    if pct >= 40:
-        return "★ Speculative", "avoid"
-    return "WAIT", "wait"
-
-
-def _detect_candle_pattern(c5: pd.DataFrame) -> str:
-    if c5 is None or len(c5) < 2:
-        return "Unknown"
-    last, prev = c5.iloc[-1], c5.iloc[-2]
-    body = abs(last["close"] - last["open"])
-    rng = max(last["high"] - last["low"], 1e-9)
-    if body / rng < 0.1:
-        return "Doji"
-    if last["high"] <= prev["high"] and last["low"] >= prev["low"]:
-        return "Inside Bar"
-    if last["high"] >= prev["high"] and last["low"] <= prev["low"]:
-        return "Outside Bar"
-    if last["close"] > last["open"] and body / rng > 0.6:
-        return "Strong Bull Candle"
-    if last["close"] < last["open"] and body / rng > 0.6:
-        return "Strong Bear Candle"
-    return "Normal"
-
-
-def _market_structure_label(c5: pd.DataFrame, lookback: int = 30) -> str:
-    if c5 is None or len(c5) < lookback:
-        return "Unclear"
-    window = c5.tail(lookback)
-    swing_high, swing_low = _swing_points(window)
-    highs = window.loc[swing_high, "high"]
-    lows = window.loc[swing_low, "low"]
-    if len(highs) >= 2 and len(lows) >= 2:
-        hh, hl = highs.iloc[-1] > highs.iloc[-2], lows.iloc[-1] > lows.iloc[-2]
-        lh, ll = highs.iloc[-1] < highs.iloc[-2], lows.iloc[-1] < lows.iloc[-2]
-        if hh and hl:
-            return "HH/HL (Bullish Structure)"
-        if lh and ll:
-            return "LH/LL (Bearish Structure)"
-    return "Mixed Structure"
-
-
-def _relative_volume(c5: pd.DataFrame, window: int = 20):
-    if c5 is None or len(c5) < window + 1:
-        return None
-    avg = c5["volume"].tail(window + 1).iloc[:-1].mean()
-    cur = c5["volume"].iloc[-1]
-    return float(cur / avg) if avg > 0 else None
-
-
-def _market_quality_flags(c5: pd.DataFrame) -> list:
-    flags = []
-    if c5 is None or c5.empty or len(c5) < 20:
-        flags.append("Insufficient candle history")
-        return flags
-    adx_series, _, _ = _adx(c5, 14)
-    if len(adx_series) and adx_series.iloc[-1] < 15:
-        flags.append("Sideways Market (ADX low)")
-    rel_vol = _relative_volume(c5)
-    if rel_vol is not None and rel_vol < 0.5:
-        flags.append("Low Liquidity (weak relative volume)")
-    try:
-        d = c5.copy()
-        d["date"] = d["time"].dt.date
-        days = sorted(d["date"].unique())
-        if len(days) >= 2:
-            today_open = d[d["date"] == days[-1]]["open"].iloc[0]
-            prev_close = d[d["date"] == days[-2]]["close"].iloc[-1]
-            gap_pct = ((today_open - prev_close) / prev_close) * 100 if prev_close else 0.0
-            if gap_pct > 0.5:
-                flags.append(f"Gap-up Trap risk (+{gap_pct:.2f}%)")
-            elif gap_pct < -0.5:
-                flags.append(f"Gap-down Trap risk ({gap_pct:.2f}%)")
-    except Exception:  # noqa: BLE001 - market-quality flags must never crash the pipeline
-        pass
-    return flags
-
-
-def compute_institutional_signals(df: pd.DataFrame, trend_engine: dict, c5: pd.DataFrame,
-                                   pcr: float, max_pain: float, spot_price: float,
-                                   atm_strike: float, support, resistance,
-                                   min_confidence: float = INSTITUTIONAL_MIN_CONFIDENCE,
-                                   top_n: int = 15, source: str = "") -> tuple:
-    if df is None or df.empty:
-        return [], {"source": source, "evaluated": 0, "reason": "Option chain is empty."}
-
-    has_trend = bool(trend_engine and trend_engine.get("available"))
-    market_flags = _market_quality_flags(c5) if has_trend else ["No candle data available"]
-    candle_pattern = _detect_candle_pattern(c5) if has_trend else "Unknown"
-    structure_label = _market_structure_label(c5) if has_trend else "Unclear"
-    rel_vol = _relative_volume(c5) if has_trend else None
-
-    ema200 = None
-    if has_trend and c5 is not None and len(c5) >= 200:
-        ema200 = float(_ema(c5["close"], 200).iloc[-1])
-
-    last_close = trend_engine.get("last_close") if has_trend else None
-    vwap = trend_engine.get("vwap") if has_trend else None
-    ema9 = trend_engine.get("ema9") if has_trend else None
-    ema20 = trend_engine.get("ema20") if has_trend else None
-    ema50 = trend_engine.get("ema50") if has_trend else None
-    rsi5 = trend_engine.get("rsi5") if has_trend else None
-    macd_v = trend_engine.get("macd") if has_trend else None
-    macd_s = trend_engine.get("macd_signal") if has_trend else None
-    adx_v = trend_engine.get("adx") if has_trend else None
-    atr_v = trend_engine.get("atr") if has_trend else None
-
-    trend_bullish = trend_bearish = False
-    if has_trend and None not in (last_close, vwap, ema9, ema20, ema50):
-        trend_bullish = (
-            last_close > vwap and ema9 > ema20 > ema50
-            and (ema200 is None or last_close > ema200)
-            and "HH/HL" in structure_label
-        )
-        trend_bearish = (
-            last_close < vwap and ema9 < ema20 < ema50
-            and (ema200 is None or last_close < ema200)
-            and "LH/LL" in structure_label
-        )
-
-    ce_vol_thresh = df["ce_volume"].quantile(0.75) if df["ce_volume"].max() > 0 else 0
-    pe_vol_thresh = df["pe_volume"].quantile(0.75) if df["pe_volume"].max() > 0 else 0
-    strike_gap = df["strike_price"].sort_values().diff().dropna().median() if len(df) > 1 else 1.0
-    market_quality_blocked = any("Sideways" in f or "Low Liquidity" in f for f in market_flags)
-
-    signals = []
-    evaluated = 0
-    rejections = defaultdict(int)
-
-    for _, row in df.iterrows():
-        strike = row["strike_price"]
-        for side, ltp_col, vol_col in [("CE", "ce_ltp", "ce_volume"), ("PE", "pe_ltp", "pe_volume")]:
-            evaluated += 1
-            is_bull_side = side == "CE"
-            ltp = row.get(ltp_col, 0)
-            if ltp <= 0:
-                rejections["no_premium"] += 1
-                continue
-
-            if not has_trend:
-                rejections["no_candle_data"] += 1
-                continue
-            trend_ok = trend_bullish if is_bull_side else trend_bearish
-            if not trend_ok:
-                rejections["trend_disagree"] += 1
-                continue
-
-            ce_build, pe_build = row.get("CE Build-up", ""), row.get("PE Build-up", "")
-            oc_support_bull = pe_build == "Long Build-up (Put Writing)" or ce_build == "Short Covering"
-            oc_support_bear = ce_build == "Short Build-up (Call Writing)" or pe_build == "Long Unwinding"
-            if oc_support_bull and oc_support_bear:
-                rejections["option_chain_mixed"] += 1
-                continue
-            oc_ok = oc_support_bull if is_bull_side else oc_support_bear
-            if not oc_ok:
-                rejections["option_chain_disagree"] += 1
-                continue
-
-            mp_confidence_delta = 0.0
-            if max_pain and spot_price:
-                if is_bull_side and spot_price < max_pain and strike > spot_price:
-                    mp_confidence_delta = -3.0
-                elif (not is_bull_side) and spot_price > max_pain and strike < spot_price:
-                    mp_confidence_delta = -3.0
-
-            vol_ok = row.get(vol_col, 0) >= (ce_vol_thresh if is_bull_side else pe_vol_thresh) > 0
-            rel_vol_ok = rel_vol is not None and rel_vol >= 1.0
-            volume_score_frac = (1.0 if vol_ok else 0.4) * (1.0 if rel_vol_ok else 0.6)
-
-            if candle_pattern == "Doji":
-                rejections["indecision_candle"] += 1
-                continue
-            price_action_ok = candle_pattern in (
-                ("Strong Bull Candle", "Outside Bar") if is_bull_side else ("Strong Bear Candle", "Outside Bar")
-            )
-
-            inst_buy, inst_sell = row.get("Institutional Buying", 0), row.get("Institutional Selling", 0)
-            smart_money_ok = inst_buy >= 55 if is_bull_side else inst_sell >= 55
-            if not smart_money_ok:
-                rejections["smart_money_disagree"] += 1
-                continue
-
-            if is_bull_side and resistance is not None and strike >= resistance and abs(strike - resistance) <= strike_gap:
-                rejections["against_resistance"] += 1
-                continue
-            if (not is_bull_side) and support is not None and strike <= support and abs(strike - support) <= strike_gap:
-                rejections["against_support"] += 1
-                continue
-
-            atr_ok = atr_v is not None and atr_v > 0
-            if not atr_ok:
-                rejections["atr_too_low"] += 1
-                continue
-
-            if None in (rsi5, macd_v, macd_s, adx_v):
-                rejections["momentum_unavailable"] += 1
-                continue
-            momentum_ok = (
-                (rsi5 > 55 and macd_v > macd_s and adx_v > 20) if is_bull_side
-                else (rsi5 < 45 and macd_v < macd_s and adx_v > 20)
-            )
-            if not momentum_ok:
-                rejections["momentum_disagree"] += 1
-                continue
-
-            if market_quality_blocked:
-                rejections["market_quality_filter"] += 1
-                continue
-
-            w = INSTITUTIONAL_SCORE_WEIGHTS
-            pcr_ok = (pcr > 1.05) if is_bull_side else (pcr < 0.95)
-            score = (
-                w["trend"] * 1.0
-                + w["option_chain"] * 1.0
-                + w["oi_buildup"] * 1.0
-                + w["pcr"] * (1.0 if pcr_ok else 0.5)
-                + w["max_pain"] * 1.0 + mp_confidence_delta
-                + w["volume"] * volume_score_frac
-                + w["momentum"] * 1.0
-                + w["price_action"] * (1.0 if price_action_ok else 0.4)
-                + w["smart_money"] * 1.0
-            )
-            score = float(np.clip(score, 0, 100))
-
-            if score < min_confidence:
-                rejections["low_confidence"] += 1
-                continue
-
-            entry = round(float(ltp), 2)
-            if is_bull_side:
-                sl, t1, t2, t3 = round(entry * 0.85, 2), round(entry * 1.15, 2), round(entry * 1.30, 2), round(entry * 1.50, 2)
-            else:
-                sl, t1, t2, t3 = round(entry * 1.15, 2), round(entry * 0.85, 2), round(entry * 0.70, 2), round(entry * 0.50, 2)
-            risk = max(abs(entry - sl), 0.01)
-            reward = abs(t2 - entry)
-            rr = round(reward / risk, 2) if risk > 0 else 0.0
-            if rr < INSTITUTIONAL_MIN_RISK_REWARD:
-                rejections["poor_risk_reward"] += 1
-                continue
-
-            label, key = _institutional_confidence_band(score)
-            direction = "BUY" if is_bull_side else "SELL"
-            oi_buildup_label = ce_build if is_bull_side else pe_build
-            smart_money_label = "Institutional Buying" if is_bull_side else "Institutional Selling"
-            ema_align_label = "EMA9 > EMA20 > EMA50" if is_bull_side else "EMA9 < EMA20 < EMA50"
-            if ema200 is not None:
-                ema_align_label += f" & {'above' if is_bull_side else 'below'} EMA200"
-
-            reasons = [
-                f"Trend: {'Bullish' if is_bull_side else 'Bearish'} — {structure_label}",
-                f"EMA Alignment: {ema_align_label}",
-                f"VWAP Position: Price {'above' if is_bull_side else 'below'} VWAP",
-                f"PCR {pcr:.2f} ({'supportive' if pcr_ok else 'neutral/against'})",
-                f"Max Pain {max_pain:,.0f}" + (" (headwind — confidence trimmed)" if mp_confidence_delta < 0 else " (no conflict)"),
-                f"OI Build-up: {oi_buildup_label}",
-                f"Call Writing / Put Writing: {ce_build} / {pe_build}",
-                f"Support {support:,.0f} / Resistance {resistance:,.0f}" if (support and resistance) else "Support/Resistance: unavailable",
-                f"Volume: {'Confirmed' if vol_ok else 'Weak'}" + (f", RelVol {rel_vol:.2f}x" if rel_vol is not None else ""),
-                f"ATR: Expansion ({atr_v:.2f})",
-                f"Momentum: RSI {rsi5:.0f}, MACD {'Bullish' if macd_v > macd_s else 'Bearish'}, ADX {adx_v:.0f}",
-                f"Smart Money: {smart_money_label} ({(inst_buy if is_bull_side else inst_sell):.0f})",
-                f"Price Action: {candle_pattern}",
-                f"Risk Level: {_risk_level_from_confidence(score)}",
-                f"Final Score {score:.1f}% — {label}",
-            ]
-
-            signals.append({
-                "Strike": strike, "Side": side, "Signal": f"{direction} · {label}",
-                "Signal Key": key, "Confidence": round(score, 1),
-                "AI Signal": direction, "AI Confidence %": round(score, 1),
-                "Signal Strength": label, "Trend": structure_label,
-                "Market Bias": "Bullish" if is_bull_side else "Bearish",
-                "PCR": round(pcr, 3), "Max Pain": max_pain,
-                "OI Build-up": oi_buildup_label, "Smart Money": smart_money_label,
-                "Volume": "Confirmed" if vol_ok else "Weak", "Momentum": "Confirmed",
-                "Risk": _risk_level_from_confidence(score),
-                "Entry": entry, "SL": sl, "T1": t1, "T2": t2, "T3": t3,
-                "Risk Reward": f"1 : {rr}",
-                "Reason": " · ".join(reasons), "Reasons": reasons,
-            })
-
-    signals.sort(key=lambda s: s["Confidence"], reverse=True)
-    final_signals = signals[:top_n]
-
-    rejection_summary = None
-    if not final_signals:
-        if not has_trend:
-            reason = (
-                "No candle/trend data available yet, so trend, EMA alignment, VWAP position, and "
-                "price-action can't be confirmed — the Institutional AI Validation Engine requires "
-                "ALL validations to agree before it will emit a BUY/SELL. Enable 'AI Scalping Engine' "
-                "in the sidebar (it fetches the same 5m/15m candles this engine reuses) so this tab "
-                "can move past WAIT."
-            )
-        else:
-            reason = (
-                "No strike passed every institutional validation check (trend + option chain + "
-                "max pain + volume + price action + smart money + support/resistance + ATR + "
-                "momentum, plus confidence ≥ 80% and risk:reward ≥ 1:2) — WAIT is the correct call "
-                "rather than forcing a trade."
-            )
-        rejection_summary = {
-            "source": source, "evaluated": evaluated, "breakdown": dict(rejections),
-            "market_flags": market_flags, "threshold": min_confidence, "reason": reason,
-        }
-    return final_signals, rejection_summary
-
-
-# ══════════════════════════════════════════════════════════════════════════
-# 9. MAIN DASHBOARD
-# ══════════════════════════════════════════════════════════════════════════
-
-def show_option_chain(fyers):
-    st.markdown("## 📊 Master Options Chain Dashboard")
-
-    with st.sidebar:
-        st.markdown("### ⚙️ Configuration")
-        option_type = st.radio("Instrument Type", ["Indices", "F&O Stocks"], key="instr_type_radio")
-        is_stock = option_type == "F&O Stocks"
-
-        if not is_stock:
-            selected_key = st.selectbox("Index", list(INDEX_SYMBOL_CANDIDATES.keys()))
-            symbol_candidates = INDEX_SYMBOL_CANDIDATES[selected_key]
-            symbol_key = selected_key
-        else:
-            stock = st.text_input("Stock Symbol (e.g. RELIANCE, TCS, INFY, SBIN, ICICIBANK, HDFCBANK)", "RELIANCE")
-            symbol_candidates = get_stock_symbol_candidates(stock)
-            symbol_key = symbol_candidates[0]
-
-        if st.session_state.get("oc_current_symbol_key") != symbol_key:
-            st.session_state["oc_current_symbol_key"] = symbol_key
-            st.session_state["oc_expiry_list"] = []
-            st.session_state["oc_raw_expiry_payload"] = []
-            st.session_state.pop("oc_df", None)
-            with st.spinner("Loading expiry dates …"):
-                expiry_list, _used, raw_payload = fetch_expiry_list(fyers, symbol_candidates)
-            st.session_state["oc_expiry_list"] = expiry_list
-            st.session_state["oc_raw_expiry_payload"] = raw_payload
-
-        max_strikes = 20 if is_stock else 30
-        strike_count = st.slider("Strikes Around ATM", 5, max_strikes, min(20, max_strikes), step=5)
-
-        expiry_options = st.session_state.get("oc_expiry_list", [])
-        raw_expiry_payload = st.session_state.get("oc_raw_expiry_payload", [])
-
-        with st.expander("🔍 Raw FYERS Expiry Response (debug/inspection)", expanded=False):
-            st.markdown(f"**Number of expiries returned by API:** {len(raw_expiry_payload)}")
-            if len(raw_expiry_payload) == 1:
-                st.warning("Only one expiry is available from FYERS API.")
-            elif len(raw_expiry_payload) == 0:
-                st.caption("No expiry data returned yet — select an instrument or click Retry below.")
-            st.markdown("**Raw `expiryData` payload (exactly as received):**")
-            st.json(raw_expiry_payload if raw_expiry_payload else {})
-            st.markdown("**Parsed expiry list (label, timestamp) — every expiry above, unfiltered:**")
-            st.write(expiry_options if expiry_options else "—")
-
-        if expiry_options:
-            tagged = classify_expiries(expiry_options)
-            display_labels = [f"{label}  ·  {tag}" for label, ts, tag in tagged]
-            label_to_ts = {f"{label}  ·  {tag}": ts for label, ts, tag in tagged}
-            label_to_plain = {f"{label}  ·  {tag}": label for label, ts, tag in tagged}
-            selected_display = st.selectbox(
-                "Expiry (Weekly / Monthly — nearest selected by default)", display_labels, index=0
-            )
-            expiry_timestamp = label_to_ts.get(selected_display, "")
-            selected_expiry_label = label_to_plain.get(selected_display, "")
-
-            if len(expiry_options) == 1:
-                st.info("Only one expiry is available from FYERS API.")
-
-            has_weekly = any(tag == "Weekly" for _, _, tag in tagged)
-            if not has_weekly:
-                st.warning("Weekly expiries are not available from the FYERS API for this instrument.")
-
-            st.caption(
-                f"Selected expiry: **{selected_expiry_label}**  |  "
-                f"API request expiry (timestamp sent to FYERS): **{expiry_timestamp or '—'}**"
-            )
-        else:
-            st.caption("⏳ Fetching available expiry dates for this instrument …")
-            expiry_timestamp = ""
-            selected_expiry_label = ""
-            if st.button("🔁 Retry Loading Expiry List"):
-                with st.spinner("Loading expiry dates …"):
-                    expiry_list, _used, raw_payload = fetch_expiry_list(fyers, symbol_candidates)
-                st.session_state["oc_expiry_list"] = expiry_list
-                st.session_state["oc_raw_expiry_payload"] = raw_payload
-                st.rerun()
-
-        ai_min_conf = st.slider("AI Min Confidence % (Trade Signals)", 40, 99, 40, step=1,
-                                 help="The Institutional AI Validation Engine never emits a BUY/SELL "
-                                      "below 40% confidence, so the floor here is fixed at 40. Raise it "
-                                      "to only see higher-conviction (★★★★/★★★★★) signals.")
-        debug_mode = st.checkbox("Show raw API response (debug)", value=False)
-        st.divider()
-        fetch_btn = st.button("🔄 Fetch Live Data", use_container_width=True, type="primary")
-
-        st.divider()
-        st.markdown("### ⚡ Gamma Build-up Analyzer")
-        gamma_live_mode = st.checkbox(
-            "Enable Live Gamma Auto-Refresh (5s)", value=False, key="oc_gamma_live_mode",
-            help="When enabled, the Gamma Build-up tab re-runs every 5 seconds so Gamma Change / "
-                 "Trend / Signal are compared against the previous refresh.",
-        )
-        gamma_audio_alert = st.checkbox("🔔 Audio ping on new Gamma signal", value=False, key="oc_gamma_audio")
-
-        st.divider()
-        st.markdown("### 🎯 AI Scalping Engine")
-        scalping_enabled = st.checkbox(
-            "Enable AI Scalping Engine (fetches 5m/15m candles)", value=False, key="oc_scalping_enabled",
-            help="Multi-factor confirmation engine (EMA/VWAP/RSI/MACD/ADX/Supertrend + chain OI/Gamma). "
-                 "Off by default since it makes extra FYERS history/quote API calls. The same candle "
-                 "data also powers the Institutional AI Validation Engine and the 15m Volume & Swing "
-                 "tab — leave this on if you want those tabs off WAIT / fetching fresh each time.",
-        )
-        scalping_audio_alert = st.checkbox("🔔 Audio ping on new Scalping signal", value=False, key="oc_scalping_audio")
-
-        st.divider()
-        st.markdown("### 🛰️ Data Source")
-        st.caption(
-            "FYERS is always tried first. If FYERS is unreachable, times out, fails auth, or returns "
-            "an incomplete/invalid Option Chain, the dashboard automatically switches to the **NSE** "
-            "public Option Chain as a backup — transparently, with no action needed from you."
-        )
-
-    if fetch_btn:
-        with st.spinner("Fetching Option Chain (FYERS primary, NSE automatic fallback) …"):
-            fetch_result = get_option_chain_data(
-                fyers=fyers, symbol_candidates=symbol_candidates, strike_count=strike_count,
-                expiry_timestamp=expiry_timestamp, expiry_options=expiry_options,
-                symbol_key=symbol_key, is_stock=is_stock,
-                stock_name=(stock if is_stock else ""), selected_expiry_label=selected_expiry_label,
-                debug_mode=debug_mode,
-            )
-
-        if debug_mode:
-            st.write("**Symbols tried (FYERS):**", fetch_result.get("attempts", []))
-            st.write("**Data source used:**", fetch_result.get("source"))
-            if fetch_result.get("error"):
-                st.write("**Fallback / error detail:**", fetch_result["error"])
-
-        source = fetch_result.get("source")
-        fetched_df = fetch_result.get("df")
-
-        if source == "NONE" or fetched_df is None or fetched_df.empty:
-            st.error(
-                "⚠️ Could not fetch Option Chain data from either FYERS or NSE. "
-                f"{fetch_result.get('error') or 'Both sources failed or returned no usable data.'} "
-                "Please check your FYERS connection/token, your network access to NSE, or try again "
-                "in a moment."
-            )
-            return
-
-        if source == "NSE":
-            st.warning(
-                "⚠️ FYERS Option Chain was unavailable — automatically switched to the **NSE Option "
-                "Chain** as a backup data source. Every calculation below (PCR, Max Pain, AI Engine, "
-                "Gamma, Scalping, Excel export, etc.) runs exactly as usual on NSE data."
-            )
-
-        used_symbol = fetch_result.get("symbol", "")
-        spot_price = fetch_result.get("spot_price", 0.0)
-        selected_expiry_label = fetch_result.get("expiry_label", selected_expiry_label)
-        expiry_timestamp = fetch_result.get("expiry_timestamp", expiry_timestamp)
-
-        new_raw_payload = fetch_result.get("raw_expiry_payload") or []
-        new_expiry_list = fetch_result.get("expiry_list") or []
-        if source == "FYERS":
-            if new_expiry_list:
-                st.session_state["oc_expiry_list"] = new_expiry_list
-            if new_raw_payload:
-                st.session_state["oc_raw_expiry_payload"] = new_raw_payload
-
-        df = compute_strike_bias(fetched_df)
-        df = add_iv_columns(df, spot_price, selected_expiry_label)
-
-        st.session_state["oc_df"] = df
-        st.session_state["oc_spot"] = spot_price
-        st.session_state["oc_symbol"] = used_symbol
-        st.session_state["oc_expiry_label"] = selected_expiry_label
-        st.session_state["oc_expiry_timestamp"] = expiry_timestamp
-        st.session_state["oc_ai_min_conf"] = ai_min_conf
-        st.session_state["oc_data_source"] = source
-
-    if "oc_df" not in st.session_state:
-        st.info("👈 Choose an instrument in the sidebar and click **Fetch Live Data**.")
-        return
-
-    df = st.session_state["oc_df"]
-    spot_price = st.session_state["oc_spot"]
-    symbol = st.session_state.get("oc_symbol", "")
-    expiry_label = st.session_state.get("oc_expiry_label", "")
-    request_expiry_ts = st.session_state.get("oc_expiry_timestamp", "")
-    ai_min_conf = st.session_state.get("oc_ai_min_conf", ai_min_conf)
-    data_source = st.session_state.get("oc_data_source", "FYERS")
-
-    if df.empty:
-        st.warning("No strikes available in the current chain snapshot.")
-        return
-
-    exp_i1, exp_i2, exp_i3, exp_i4 = st.columns(4)
-    exp_i1.metric("Expiries Returned by API", len(st.session_state.get("oc_raw_expiry_payload", [])))
-    exp_i2.metric("Selected Expiry", expiry_label or "—")
-    exp_i3.metric("API Request Expiry (ts)", request_expiry_ts or "—")
-    exp_i4.metric("Symbol Used", symbol or "—")
-
-    source_badge = "🟢 FYERS (Primary)" if data_source == "FYERS" else "🟡 NSE (Automatic Fallback)"
-    st.caption(f"📡 **Data Source:** {source_badge}")
-
-    if len(st.session_state.get("oc_raw_expiry_payload", [])) == 1:
-        st.info("Only one expiry is available from FYERS API.")
-    else:
-        _tagged_now = classify_expiries(st.session_state.get("oc_expiry_list", []))
-        if _tagged_now and not any(tag == "Weekly" for _, _, tag in _tagged_now):
-            st.warning("Weekly expiries are not available from the FYERS API for this instrument.")
-
-    total_ce = df["ce_oi"].sum()
-    total_pe = df["pe_oi"].sum()
-    pcr = total_pe / total_ce if total_ce > 0 else 0
-    max_pain = calculate_max_pain(df)
-
-    if spot_price:
-        atm_strike = df.iloc[(df["strike_price"] - spot_price).abs().argsort().iloc[:1]]["strike_price"].values[0]
-    else:
-        atm_strike = df["strike_price"].median()
-
-    logger.info("Stage: AI Engine — running CE/PE scoring pipeline (source=%s, symbol=%s)", data_source, symbol)
-    df = compute_big_move_scores(df, spot_price, max_pain, pcr, atm_strike)
-    intel = compute_market_intelligence(df, spot_price, max_pain, pcr)
-    df = compute_ai_engine(df, spot_price, atm_strike, max_pain, pcr)
-
-    cached_trend_engine = st.session_state.get("oc_scalp_trend_engine")
-    cached_candles_5 = st.session_state.get("oc_scalp_candles_5")
-    signals, rejection_summary = compute_institutional_signals(
-        df, cached_trend_engine, cached_candles_5, pcr, max_pain, spot_price, atm_strike,
-        intel.get("support"), intel.get("resistance"),
-        min_confidence=max(ai_min_conf, INSTITUTIONAL_MIN_CONFIDENCE), top_n=15, source=data_source,
-    )
-    st.session_state["oc_signal_rejection_summary"] = rejection_summary
-
-    ai_market_analysis = run_external_ai_market_analysis(
-        df, spot_price, atm_strike, pcr, max_pain, symbol, expiry_label, data_source
-    )
-    st.session_state["oc_ai_market_analysis"] = ai_market_analysis
-
-    gdf = add_gamma_columns(df, spot_price, expiry_label)
-    gdf = compute_gamma_analysis(gdf, symbol, expiry_label)
-
-    df = compute_ce_pe_trade_signals(
-        df, spot_price=spot_price, max_pain=max_pain, pcr=pcr, atm_strike=atm_strike,
-        support=intel.get("support"), resistance=intel.get("resistance"),
-        trend_engine=cached_trend_engine, gdf=gdf,
-    )
-
-    c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("Spot Price", f"₹{spot_price:,.2f}" if spot_price else "—")
-    c2.metric("ATM Strike", f"₹{atm_strike:,.0f}")
-    c3.metric("Total CE OI", f"{total_ce/1e5:.1f}L")
-    c4.metric("Total PE OI", f"{total_pe/1e5:.1f}L")
-    c5.metric("Max Pain", f"₹{max_pain:,.0f}")
-
-    st.markdown("<br>", unsafe_allow_html=True)
-
-    big_moves = detect_big_moves(df)
-    if big_moves:
-        st.markdown("**⚡ Big Move Alerts — Unusual OI Activity**")
-        for alert in big_moves[:5]:
-            badge = "🟢 BUY" if alert["direction"] == "BUY" else "🔴 SELL"
-            box = st.success if alert["direction"] == "BUY" else st.error
-            box(f"{badge} · Strike **{alert['strike']:,.0f}** ({alert['side']}) · "
-                f"ΔOI {alert['oi_change']:+,.0f} — {alert['note']}")
-        st.caption(
-            "Based on unusual open-interest change (top percentile of ΔOI across strikes). "
-            "This is a positioning signal, not financial advice — confirm with price action before acting."
-        )
-    st.markdown("<br>", unsafe_allow_html=True)
-
-    shift_notes = detect_oi_shift(symbol, intel.get("support"), intel.get("resistance"))
-    if shift_notes:
-        for note in shift_notes:
-            st.info(note)
-
-    sig_col, gauge_col = st.columns([1, 1])
-    with sig_col:
-        st.markdown("**Market Sentiment**")
-        st.markdown(pcr_signal(pcr), unsafe_allow_html=True)
-        st.markdown(f"<br>PCR = **{pcr:.3f}**  |  Max Pain = **{max_pain:,.0f}**", unsafe_allow_html=True)
-        st.markdown(f"🛡️ Support (max PE OI): **{intel.get('support', 0):,.0f}**")
-        st.markdown(f"🧱 Resistance (max CE OI): **{intel.get('resistance', 0):,.0f}**")
-    with gauge_col:
-        st.plotly_chart(pcr_gauge(pcr), use_container_width=True, config={"displayModeBar": False})
-
-    st.divider()
-
-    st.markdown('<div class="block-title">📡 Market Intelligence</div>', unsafe_allow_html=True)
-    mi1, mi2 = st.columns([1, 1])
-    with mi1:
-        st.markdown(
-            f"""<div class="intel-card"><div class="intel-label">Market Trend</div>
-            <div class="intel-value">{intel.get('trend', '—')}</div></div>""",
-            unsafe_allow_html=True,
-        )
-        st.markdown(
-            f"""<div class="intel-card"><div class="intel-label">Institution Buying vs Selling</div>
-            <div class="intel-value">🟢 {intel.get('institution_buying', 0):,.0f}
-            &nbsp;/&nbsp; 🔴 {intel.get('institution_selling', 0):,.0f}</div></div>""",
-            unsafe_allow_html=True,
-        )
-        st.markdown(
-            f"""<div class="intel-card"><div class="intel-label">Option Writers vs Buyers Activity</div>
-            <div class="intel-value">Writers: {intel.get('call_writers_activity',0)+intel.get('put_writers_activity',0):,.0f}
-            &nbsp;|&nbsp; Buyers: {intel.get('call_buyers_activity',0)+intel.get('put_buyers_activity',0):,.0f}</div></div>""",
-            unsafe_allow_html=True,
-        )
-        st.markdown(
-            f"""<div class="intel-card"><div class="intel-label">Breakout / Breakdown Probability</div>
-            <div class="intel-value">🚀 {intel.get('breakout_probability',0):.0f}%
-            &nbsp;/&nbsp; 📉 {intel.get('breakdown_probability',0):.0f}%</div></div>""",
-            unsafe_allow_html=True,
-        )
-    with mi2:
-        st.plotly_chart(momentum_gauge(intel.get("momentum_score", 0)), use_container_width=True,
-                         config={"displayModeBar": False})
-        st.markdown(
-            f"""<div class="intel-card"><div class="intel-label">Highest Volume / OI / ΔOI Strike</div>
-            <div class="intel-value">Vol: {intel.get('highest_volume_strike', 0):,.0f} &nbsp;|&nbsp;
-            OI: {intel.get('highest_oi_strike', 0):,.0f} &nbsp;|&nbsp;
-            ΔOI: {intel.get('highest_delta_oi_strike', 0):,.0f}</div></div>""",
-            unsafe_allow_html=True,
-        )
-    st.caption(
-        "Momentum, institutional flow, and writers/buyers activity are derived from the current chain "
-        "snapshot (OI, ΔOI, volume, PCR, spot-vs-max-pain) — not from a historical time series, since "
-        "the option chain endpoint returns only a point-in-time view."
-    )
-
-    st.divider()
-
-    st.markdown('<div class="block-title">📈 Dashboard Summary</div>', unsafe_allow_html=True)
-    summary2 = compute_dashboard_summary(df, signals, intel)
-
-    def _fmt_strike_row(row):
-        if row is None:
-            return "—"
-        try:
-            return f"{row['strike_price']:,.0f}"
-        except Exception:
-            return "—"
-
-    def _fmt_num(v):
-        try:
-            return f"{v:,.0f}"
-        except (TypeError, ValueError):
-            return "—"
-
-    def _fmt_trade(sig):
-        if not sig:
-            return "—"
-        return f"{sig['Strike']:,.0f} {sig['Side']} ({sig['Confidence']:.0f}%)"
-
-    d1, d2, d3, d4 = st.columns(4)
-    d1.metric("Top CE Buy", _fmt_strike_row(summary2.get("Top CE Buy")))
-    d2.metric("Top PE Buy", _fmt_strike_row(summary2.get("Top PE Buy")))
-    d3.metric("Best Breakout Strike", _fmt_strike_row(summary2.get("Best Breakout Strike")))
-    d4.metric("Best Breakdown Strike", _fmt_strike_row(summary2.get("Best Breakdown Strike")))
-
-    d5, d6, d7, d8 = st.columns(4)
-    d5.metric("Highest Institutional Buying", _fmt_num(summary2.get("Highest Institutional Buying")))
-    d6.metric("Highest Institutional Selling", _fmt_num(summary2.get("Highest Institutional Selling")))
-    d7.metric("Highest Smart Money", _fmt_strike_row(summary2.get("Highest Smart Money")))
-    d8.metric("Highest OI", _fmt_strike_row(summary2.get("Highest OI")))
-
-    d9, d10, d11, d12 = st.columns(4)
-    d9.metric("Highest Volume", _fmt_strike_row(summary2.get("Highest Volume")))
-    d10.metric("Highest Delta OI", _fmt_strike_row(summary2.get("Highest Delta OI")))
-    d11.metric("Best Risk/Reward Trade", _fmt_trade(summary2.get("Best Risk Reward Trade")))
-    d12.metric("Today's Best Trade", _fmt_trade(summary2.get("Today's Best Trade")))
-
-    with st.expander("🧠 AI Market Intelligence (analyze_market)", expanded=False):
-        ai_market = st.session_state.get("oc_ai_market_analysis") or {}
-        st.caption(f"Data source for this analysis: **{data_source}**")
-        if ai_market.get("available"):
-            st.write(ai_market.get("result"))
-        else:
-            st.info(
-                f"External AI market analysis is unavailable right now: "
-                f"{ai_market.get('reason') or 'analyze_market() did not return a result.'} "
-                "This does not affect the CE/PE AI Engine, PCR, Max Pain, or trade signals above — "
-                "those are computed independently and remain fully available."
-            )
-
-    st.divider()
-
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs(
-        ["📋 Chain Table", "📊 OI Analysis", "📈 IV Skew", "🔥 Big Move Ready",
-         "🤖 AI Trade Signals", "⚡ Gamma Build-up", "🎯 AI Scalping Engine",
-         "📊 15m Volume & Swing"]
-    )
-
-    with tab1:
-        flagged = df[df["Big Move"] == "🚨 Big Move"] if "Big Move" in df.columns else pd.DataFrame()
-        if not flagged.empty:
-            buy_strikes = flagged[flagged["Strike Signal"] == "🟢 BUY"]["strike_price"].tolist()
-            sell_strikes = flagged[flagged["Strike Signal"] == "🔴 SELL"]["strike_price"].tolist()
-            parts = []
-            if buy_strikes:
-                parts.append(f"🟢 **Buy-side build-up:** {', '.join(f'{s:,.0f}' for s in buy_strikes)}")
-            if sell_strikes:
-                parts.append(f"🔴 **Sell-side build-up:** {', '.join(f'{s:,.0f}' for s in sell_strikes)}")
-            if parts:
-                st.markdown("🚨 **Big OI moves detected** — " + "  |  ".join(parts))
-
-        st.markdown(render_chain_table_html(df), unsafe_allow_html=True)
-        st.caption(
-            "CE ΔOI / PE ΔOI: green = OI increasing, red = OI decreasing, grey = unchanged, filled "
-            "dark green/red = a 'large' build-up or unwinding (top 20% of today's ΔOI moves on that "
-            "side). BUY CE / SELL CE / BUY PE / SELL PE only ever show a real signal after passing "
-            "every institutional-confirmation check for that side — otherwise the cell reads NO TRADE."
-        )
-
-        if debug_mode:
-            with st.expander("🔍 OI Change Audit (debug) — Current OI vs Previous OI vs Displayed ΔOI", expanded=False):
-                audit_df = audit_oi_change(df, symbol, expiry_label)
-                if not audit_df.empty:
-                    st.dataframe(audit_df, use_container_width=True, height=360)
-                else:
-                    st.caption("No data available for the audit table yet.")
-
-    with tab2:
-        st.markdown("##### Open Interest — Calls vs Puts")
-        st.plotly_chart(oi_bar_chart(df, max_pain), use_container_width=True, config={"displayModeBar": False})
-
-        col_a, col_b = st.columns(2)
-        with col_a:
-            st.markdown("**Top 5 CE OI Strikes**")
-            top5_ce = df.nlargest(5, "ce_oi")[["strike_price", "ce_oi", "ce_ltp"]].reset_index(drop=True)
-            top5_ce["ce_oi"] = top5_ce["ce_oi"].map("{:,.0f}".format)
-            top5_ce["ce_ltp"] = top5_ce["ce_ltp"].map("{:.2f}".format)
-            st.dataframe(top5_ce, use_container_width=True, height=215)
-        with col_b:
-            st.markdown("**Top 5 PE OI Strikes**")
-            top5_pe = df.nlargest(5, "pe_oi")[["strike_price", "pe_oi", "pe_ltp"]].reset_index(drop=True)
-            top5_pe["pe_oi"] = top5_pe["pe_oi"].map("{:,.0f}".format)
-            top5_pe["pe_ltp"] = top5_pe["pe_ltp"].map("{:.2f}".format)
-            st.dataframe(top5_pe, use_container_width=True, height=215)
-
-        st.markdown("**OI Build-up Classification**")
-        buildup_view = df[["strike_price", "CE Build-up", "PE Build-up"]].rename(
-            columns={"strike_price": "Strike"})
-        st.dataframe(buildup_view, use_container_width=True, height=260)
-        st.caption(
-            "Long Build-up = fresh Put writing (bullish) · Short Build-up = fresh Call writing (bearish) · "
-            "Short Covering = Call OI unwinding · Long Unwinding = Put OI unwinding."
-        )
-
-    with tab3:
-        st.markdown("##### Implied Volatility Skew")
-        st.plotly_chart(iv_chart(df), use_container_width=True, config={"displayModeBar": False})
-
-    with tab4:
-        st.markdown("##### 🔥 Big Move Ready Strike Engine")
-        s1, s2, s3, s4 = st.columns(4)
-        top_ce_row = _safe_top(df, "CE Score")
-        top_pe_row = _safe_top(df, "PE Score")
-        s1.metric("Top CE Score Strike", _fmt_strike_row(top_ce_row))
-        s2.metric("Top PE Score Strike", _fmt_strike_row(top_pe_row))
-        s3.metric("Best Breakout Strike", _fmt_strike_row(summary2.get("Best Breakout Strike")))
-        s4.metric("Best Breakdown Strike", _fmt_strike_row(summary2.get("Best Breakdown Strike")))
-
-        st.markdown("<br>", unsafe_allow_html=True)
-        ce_pe_table = style_ce_pe_analysis_table(df)
-        numeric_ce_pe_cols = [c for c in ce_pe_table.select_dtypes("number").columns if c != "Strike ⚡"]
-        ce_pe_fmt = {c: "{:,.1f}" for c in numeric_ce_pe_cols}
-        ce_pe_fmt["Strike ⚡"] = "{:,.0f}"
-        st.markdown(render_row_colored_table_html(ce_pe_table, numeric_fmt=ce_pe_fmt), unsafe_allow_html=True)
-
-        with st.expander("Legacy combined Big Move Table (Overall Score view)"):
-            bm_table = style_big_move_table(df)
-            numeric_bm_cols = [c for c in bm_table.select_dtypes("number").columns if c != "Strike ⚡"]
-            bm_fmt = {c: "{:,.1f}" for c in numeric_bm_cols}
-            bm_fmt["Strike ⚡"] = "{:,.0f}"
-            st.markdown(render_row_colored_table_html(bm_table, numeric_fmt=bm_fmt), unsafe_allow_html=True)
-
-    with tab5:
-        st.markdown("##### 🤖 Institutional AI Validation Engine — High Confidence Only")
-        st.caption(
-            f"Showing strikes with AI Confidence ≥ {max(ai_min_conf, INSTITUTIONAL_MIN_CONFIDENCE):.0f}% "
-            "that passed every validation category. The confidence floor here can't go below 40%."
-        )
-
-        if not signals:
-            rejection = st.session_state.get("oc_signal_rejection_summary") or {}
-            if rejection.get("reason"):
-                flags = rejection.get("market_flags") or []
-                flags_txt = f" Market quality flags: {', '.join(flags)}." if flags else ""
-                st.info(
-                    f"WAIT — {rejection['reason']} "
-                    f"(evaluated {rejection.get('evaluated', 0)} CE/PE combinations, source: "
-                    f"{rejection.get('source', data_source)}).{flags_txt}"
-                )
-            else:
-                st.info("No strikes currently meet every institutional validation check.")
-        else:
-            for sig in signals:
-                css_class = RATING_CSS_CLASS.get(sig.get("Signal Key", "ignore"), "rating-ignore")
-                reasons_list = sig.get("Reasons") or [r.strip() for r in sig.get("Reason", "").split("·") if r.strip()]
-                reasons_html = "".join(f"<li>{_safe_cell(r)}</li>" for r in reasons_list)
-
-                st.markdown(f"""
-                <div class="intel-card">
-                  <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;">
-                    <div><b style="color:#e6edf3;">{sig['Strike']:,.0f} {sig['Side']}</b>
-                      &nbsp; <span class="{css_class}">{_safe_cell(sig['Signal'])}</span></div>
-                    <div class="intel-label">Confidence
-                      <span style="color:#e6edf3;font-weight:700;font-size:15px;">{sig['Confidence']:.0f}%</span></div>
-                  </div>
-                  <div style="margin-top:10px;font-family:'Courier New',monospace;color:#e6edf3;font-size:14px;">
-                    Entry <b>{sig['Entry']}</b> &nbsp;|&nbsp; Stop Loss <b>{sig['SL']}</b> &nbsp;|&nbsp;
-                    Target 1 {sig['T1']} &nbsp; Target 2 {sig['T2']} &nbsp; Target 3 {sig['T3']}
-                    &nbsp;|&nbsp; RR {sig['Risk Reward']}
-                  </div>
-                  <div style="margin-top:8px;color:#8b949e;font-size:12px;">
-                    Reason:
-                    <ul style="margin:4px 0 0 18px;padding:0;">{reasons_html}</ul>
-                  </div>
-                </div>
-                """, unsafe_allow_html=True)
-
-            st.markdown("<br>", unsafe_allow_html=True)
-            st.markdown("**All Qualifying Signals**")
-            sig_table = style_trade_signals_table(signals)
-            st.dataframe(sig_table, use_container_width=True, height=360)
-
-        st.caption(
-            "Institutional AI Validation Engine: a BUY/SELL only fires once Trend, Option Chain, Max "
-            "Pain, Volume, Price Action, Smart Money, Support/Resistance, ATR, and Momentum ALL agree — "
-            "any disagreement, or missing candle data, forces WAIT. This is a positioning read, not "
-            "financial advice — always confirm with live price action and manage your own risk."
-        )
-
-    with tab6:
-        render_gamma_tab(gdf, symbol, expiry_label, gamma_live_mode, gamma_audio_alert)
-
-    with tab7:
-        if scalping_enabled:
-            with st.spinner("Fetching 5m/15m candles & India VIX for the AI Scalping Engine …"):
-                trend_engine = compute_scalping_trend_engine(fyers, symbol_candidates, df, gdf)
-                st.session_state["oc_scalp_trend_engine"] = trend_engine
-            scalp_df = compute_scalping_table(df, gdf, trend_engine)
-            render_scalping_tab(scalp_df, trend_engine, symbol, scalping_audio_alert)
-        else:
-            st.info(
-                "🎯 The AI Scalping Engine is off. Enable **'Enable AI Scalping Engine'** in the "
-                "sidebar to fetch 5m/15m candles and India VIX and compute the 13-point BUY/SELL "
-                "confirmation checklist. The same candle data also feeds the Institutional AI "
-                "Validation Engine and the 15m Volume & Swing tab."
-            )
-
-    with tab8:
-        render_volume_swing_tab(fyers, symbol_candidates, symbol)
-
-    st.divider()
-    st.markdown('<div class="block-title">📥 Export</div>', unsafe_allow_html=True)
-    try:
-        excel_buffer = build_excel_report(
-            df, spot_price, atm_strike, pcr, max_pain,
-            intel.get("support"), intel.get("resistance"), symbol, expiry_label, signals,
-        )
-        st.download_button(
-            "⬇️ Download Excel Report",
-            data=excel_buffer,
-            file_name=f"options_chain_{symbol.replace(':', '_')}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True,
+        st.set_page_config(
+            page_title="NSE Options Chain Dashboard", page_icon="📊",
+            layout="wide", initial_sidebar_state="expanded",
         )
     except Exception as e:  # noqa: BLE001
-        st.error(f"Could not build Excel report: {e}")
+        logger.warning("st.set_page_config() skipped (not first Streamlit command): %s", e)
+
+
+def _inject_css() -> None:
+    st.markdown(f"""
+    <style>
+    .stApp {{ background-color: {DARK_BG}; }}
+    section[data-testid="stSidebar"] {{ background-color: {PANEL_BG}; border-right: 1px solid {BORDER_COLOR}; }}
+    div[data-testid="metric-container"] {{
+        background: {PANEL_BG}; border: 1px solid {BORDER_COLOR}; border-radius: 8px; padding: 14px 18px;
+    }}
+    div[data-testid="metric-container"] label {{ color: {TEXT_MUTED} !important; font-size: 12px;
+        text-transform: uppercase; letter-spacing: 0.08em; }}
+    div[data-testid="metric-container"] div[data-testid="stMetricValue"] {{
+        color: {TEXT_MAIN} !important; font-size: 21px; font-weight: 700; font-family: 'Courier New', monospace; }}
+    h1, h2, h3 {{ color: {TEXT_MAIN} !important; }}
+    .block-title {{ color: {BLUE}; font-size: 13px; font-weight: 600; text-transform: uppercase;
+        letter-spacing: 0.1em; margin-bottom: 8px; }}
+    button[data-baseweb="tab"] {{ color: {TEXT_MUTED} !important; }}
+    button[data-baseweb="tab"][aria-selected="true"] {{ color: {BLUE} !important; border-bottom: 2px solid {BLUE}; }}
+    hr {{ border-color: {BORDER_COLOR}; }}
+    .intel-card {{ background: {PANEL_BG}; border: 1px solid {BORDER_COLOR}; border-radius: 8px;
+        padding: 14px 16px; margin-bottom: 8px; }}
+    .intel-label {{ color: {TEXT_MUTED}; font-size: 11px; text-transform: uppercase; letter-spacing: .08em; }}
+    .intel-value {{ color: {TEXT_MAIN}; font-size: 20px; font-weight: 700; font-family: 'Courier New', monospace; }}
+    </style>
+    """, unsafe_allow_html=True)
+
+
+def _pcr_sentiment_badge(pcr: float) -> str:
+    if pcr > 1.3:
+        return f'<span style="color:{GREEN};font-weight:700;">🟢 Bullish (High PCR)</span>'
+    if pcr < 0.7:
+        return f'<span style="color:{RED};font-weight:700;">🔴 Bearish (Low PCR)</span>'
+    return f'<span style="color:{AMBER};font-weight:700;">🟡 Neutral</span>'
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# 10. ENTRY POINT
+# 15. MAIN DASHBOARD
 # ══════════════════════════════════════════════════════════════════════════
-#
-# This module exposes show_option_chain(fyers) as its main entry point.
-# `fyers` must be an already-authenticated FYERS API v3 client instance
-# (from the `fyers-apiv3` package), e.g.:
-#
-#     from fyers_apiv3 import fyersModel
-#     fyers = fyersModel.FyersModel(
-#         client_id="YOUR-APP-ID",
-#         token="YOUR-ACCESS-TOKEN",
-#         is_async=False,
-#         log_path="",
-#     )
-#     show_option_chain(fyers)
-#
-# Run this file with:  streamlit run fyers_options_chain_dashboard.py
+
+def _sidebar_config() -> dict:
+    with st.sidebar:
+        st.markdown("### ⚙️ Configuration")
+        instrument_type = st.radio("Instrument Type", ["Index", "F&O Stock"], key="oc_instr_type")
+        is_index = instrument_type == "Index"
+
+        if is_index:
+            symbol = st.selectbox("Index", list(INDEX_SYMBOLS.keys()), key="oc_index_select")
+        else:
+            raw_symbol = st.text_input(
+                "Stock Symbol (e.g. RELIANCE, TCS, INFY, SBIN, HDFCBANK)", "RELIANCE", key="oc_stock_input"
+            )
+            symbol = normalize_stock_symbol(raw_symbol)
+
+        strike_count = st.slider("Strikes Around ATM", 5, 40, 15, step=5, key="oc_strike_count")
+        show_greeks = st.checkbox("Show Greeks columns in chain table", value=True, key="oc_show_greeks")
+        min_ai_conf = st.slider("Min AI Confidence % (signals list)", 0, 100, 55, step=5, key="oc_min_ai_conf")
+        strike_search = st.number_input(
+            "Search / highlight a specific strike (0 = off)", min_value=0, value=0, step=50, key="oc_strike_search"
+        )
+
+        default_lot = DEFAULT_LOT_SIZES.get(symbol, DEFAULT_LOT_SIZES["_STOCK_DEFAULT"])
+        lot_size = st.number_input(
+            "Lot Size (used for GEX/DEX — verify against current NSE circular)",
+            min_value=1, value=default_lot, step=1, key="oc_lot_size",
+        )
+
+        st.divider()
+        st.markdown("### 🔄 Auto Refresh")
+        auto_refresh = st.checkbox("Enable auto-refresh", value=False, key="oc_auto_refresh")
+        refresh_secs = st.slider("Refresh interval (seconds)", 10, 120, 20, step=5, key="oc_refresh_secs",
+                                  disabled=not auto_refresh)
+
+        st.divider()
+        debug_mode = st.checkbox("Show raw API debug info", value=False, key="oc_debug_mode")
+        fetch_clicked = st.button("🔄 Fetch Live Data", use_container_width=True, type="primary")
+
+    return {
+        "is_index": is_index, "symbol": symbol, "strike_count": strike_count,
+        "show_greeks": show_greeks, "min_ai_conf": min_ai_conf, "strike_search": strike_search,
+        "lot_size": lot_size, "auto_refresh": auto_refresh, "refresh_secs": refresh_secs,
+        "debug_mode": debug_mode, "fetch_clicked": fetch_clicked,
+    }
+
+
+def _do_fetch_and_process(cfg: dict, fyers: Any = None) -> Optional[dict]:
+    """Runs the full fetch -> parse -> validate -> analytics pipeline.
+    Returns None (after showing an st.error) on unrecoverable failure so
+    the caller can bail out cleanly; otherwise returns a dict bundling
+    every computed artifact the UI needs. Uses fetch_chain_unified(),
+    which tries FYERS first (when a client is supplied) and NSE as a
+    fallback."""
+    preferred_expiry = st.session_state.get("oc_selected_expiry", "")
+    stock_name = cfg["symbol"] if not cfg["is_index"] else ""
+    fetch_result = fetch_chain_unified(
+        fyers, cfg["symbol"], cfg["is_index"], stock_name, preferred_expiry, cfg["strike_count"],
+    )
+    if cfg["debug_mode"]:
+        st.write("**Fetch result (ok/source/error):**", fetch_result.get("ok"),
+                  fetch_result.get("source"), fetch_result.get("error"))
+
+    if not fetch_result.get("ok"):
+        st.error(
+            f"⚠️ Could not fetch the option chain for **{cfg['symbol']}**: "
+            f"{fetch_result.get('error') or 'Unknown error.'} "
+            "If you're deployed on a cloud host, this is almost always NSE blocking the request "
+            "(its site blocks most datacenter/cloud IPs) — connect a FYERS client to `show_option_chain(fyers)` "
+            "for a reliable cloud-hosted data source, or run locally where NSE access works directly."
+        )
+        return None
+
+    df_all: pd.DataFrame = fetch_result["df"]
+    meta: dict = fetch_result["meta"]
+    data_source: str = fetch_result.get("source", "UNKNOWN")
+
+    if not validate_chain_df(df_all):
+        st.error(
+            f"⚠️ Received a response for **{cfg['symbol']}**, but it did not contain a usable "
+            "option chain (missing strikes/LTP/OI). This can happen right after market open or for "
+            "an illiquid stock with no active option series. Please try again shortly."
+        )
+        return None
+
+    spot = meta["spot_price"]
+    df = filter_strikes_around_atm(df_all, spot, cfg["strike_count"])
+    if df.empty:
+        df = df_all
+
+    expiry_label = meta["selected_expiry"]
+    atm_strike = float(df.iloc[(df["strike_price"] - spot).abs().argsort().iloc[0]]["strike_price"]) if spot else \
+        float(df["strike_price"].median())
+
+    df = add_greeks_columns(df, spot, expiry_label)
+    df = classify_buildup(df)
+    df = classify_moneyness(df, spot)
+    df = compute_ai_scores(df, spot, atm_strike, calc_max_pain(df), calc_pcr(df))
+    df = detect_institutional_smart_money(df)
+
+    pcr = calc_pcr(df)
+    max_pain = calc_max_pain(df)
+    support, resistance = calc_support_resistance(df)
+    max_oi = calc_max_oi(df)
+
+    atm_iv = _atm_iv(df, spot)
+    update_iv_history(cfg["symbol"], expiry_label, atm_iv)
+    iv_rank, iv_percentile = compute_iv_rank_percentile(cfg["symbol"], expiry_label, atm_iv)
+
+    gex_dex = compute_gex_dex(df, spot, cfg["lot_size"])
+
+    momentum_score = compute_momentum_score(spot, max_pain, pcr)
+    update_momentum_history(cfg["symbol"], expiry_label, momentum_score)
+    trend_probability = compute_trend_probability(cfg["symbol"], expiry_label, momentum_score)
+    breakout_reversal = compute_breakout_reversal_probability(df, spot, resistance, support, iv_rank)
+    scalp_swing = compute_scalping_swing_signal(pcr, momentum_score, trend_probability, gex_dex, iv_rank)
+    oi_shift_notes = detect_oi_shift(cfg["symbol"], expiry_label, support, resistance)
+
+    return {
+        "df": df, "meta": meta, "spot": spot, "atm_strike": atm_strike, "expiry_label": expiry_label,
+        "pcr": pcr, "max_pain": max_pain, "support": support, "resistance": resistance, "max_oi": max_oi,
+        "atm_iv": atm_iv, "iv_rank": iv_rank, "iv_percentile": iv_percentile, "gex_dex": gex_dex,
+        "momentum_score": momentum_score, "trend_probability": trend_probability,
+        "breakout_reversal": breakout_reversal, "scalp_swing": scalp_swing,
+        "oi_shift_notes": oi_shift_notes, "data_source": data_source,
+    }
+
+
+def _render_summary_cards(state: dict) -> None:
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Spot Price", f"₹{state['spot']:,.2f}" if state["spot"] else "—")
+    c2.metric("ATM Strike", f"₹{state['atm_strike']:,.0f}")
+    c3.metric("PCR", f"{state['pcr']:.3f}")
+    c4.metric("Max Pain", f"₹{state['max_pain']:,.0f}")
+    c5.metric("IV Rank / %ile", f"{state['iv_rank']:.0f} / {state['iv_percentile']:.0f}")
+
+    c6, c7, c8, c9, c10 = st.columns(5)
+    c6.metric("Support (Max PE OI)", f"₹{state['support']:,.0f}" if state["support"] else "—")
+    c7.metric("Resistance (Max CE OI)", f"₹{state['resistance']:,.0f}" if state["resistance"] else "—")
+    c8.metric("Total GEX", f"{state['gex_dex'].get('total_gex', 0):,.0f}")
+    c9.metric("Total DEX", f"{state['gex_dex'].get('total_dex', 0):,.0f}")
+    c10.metric("Momentum Score", f"{state['momentum_score']:+.1f}")
+
+
+def _render_ai_signal_cards(state: dict, min_conf: float) -> None:
+    df = state["df"]
+    qualifying = df[df["AI Confidence %"] >= min_conf].sort_values("AI Confidence %", ascending=False)
+    if qualifying.empty:
+        st.info(
+            f"No strikes currently meet the {min_conf:.0f}% AI confidence threshold. "
+            "Lower the threshold in the sidebar or wait for the next refresh."
+        )
+        return
+    for _, row in qualifying.head(15).iterrows():
+        signal = row["AI Signal"]
+        color = GREEN if "CE" in signal else (RED if "PE" in signal else AMBER)
+        st.markdown(f"""
+        <div class="intel-card">
+          <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;">
+            <div><b style="color:{TEXT_MAIN};">{row['strike_price']:,.0f}</b>
+              &nbsp; <span style="color:{color};font-weight:700;">{_safe_cell(signal)}</span></div>
+            <div class="intel-label">Confidence
+              <span style="color:{TEXT_MAIN};font-weight:700;font-size:15px;">{row['AI Confidence %']:.0f}%</span></div>
+          </div>
+          <div style="margin-top:8px;color:{TEXT_MUTED};font-size:12px;">
+            CE Score {row['CE Score']:.1f} &nbsp;|&nbsp; PE Score {row['PE Score']:.1f}
+            &nbsp;|&nbsp; {_safe_cell(row.get('Institutional Signal', 'None'))}
+            &nbsp;|&nbsp; CE {_safe_cell(row.get('CE Buildup', ''))} / PE {_safe_cell(row.get('PE Buildup', ''))}
+          </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+
+def run_dashboard(fyers: Any = None) -> None:
+    _configure_page()
+    _inject_css()
+    st.markdown("## 📊 Options Chain Dashboard — AI Engine")
+
+    cfg = _sidebar_config()
+
+    if cfg["symbol"] != st.session_state.get("oc_last_symbol"):
+        st.session_state["oc_last_symbol"] = cfg["symbol"]
+        st.session_state.pop("oc_state", None)
+        st.session_state.pop("oc_selected_expiry", None)
+
+    if cfg["fetch_clicked"] or cfg["auto_refresh"]:
+        source_label = "FYERS" if fyers is not None else "NSE"
+        with st.spinner(f"Fetching live option chain for {cfg['symbol']} (trying {source_label} first) …"):
+            result = _do_fetch_and_process(cfg, fyers)
+        if result is not None:
+            st.session_state["oc_state"] = result
+            st.session_state["oc_selected_expiry"] = result["expiry_label"]
+
+    state = st.session_state.get("oc_state")
+    if state is None:
+        st.info("👈 Choose an instrument in the sidebar and click **Fetch Live Data** to begin.")
+        return
+
+    df: pd.DataFrame = state["df"]
+    meta = state["meta"]
+
+    expiry_options = meta.get("expiry_dates", [])
+    if expiry_options:
+        current = state["expiry_label"] if state["expiry_label"] in expiry_options else expiry_options[0]
+        selected = st.selectbox(
+            "Expiry", expiry_options, index=expiry_options.index(current), key="oc_expiry_selectbox"
+        )
+        if selected != st.session_state.get("oc_selected_expiry"):
+            st.session_state["oc_selected_expiry"] = selected
+            with st.spinner("Reloading chain for selected expiry …"):
+                refreshed = _do_fetch_and_process(cfg, fyers)
+            if refreshed is not None:
+                st.session_state["oc_state"] = refreshed
+                state = refreshed
+                df = state["df"]
+
+    if cfg["debug_mode"]:
+        with st.expander("🔍 Debug info", expanded=False):
+            st.write("Rows seen / parsed:", meta.get("total_rows_seen"), "/", meta.get("rows_parsed"))
+            st.write("Expiry dates from API:", expiry_options)
+            st.dataframe(df.head(5), use_container_width=True)
+
+    _render_summary_cards(state)
+    source = state.get("data_source", "UNKNOWN")
+    source_badge = "🟢 FYERS" if source == "FYERS" else ("🟡 NSE (fallback)" if source == "NSE" else "⚪ Unknown")
+    st.caption(f"📡 Data source this refresh: **{source_badge}**")
+    st.markdown(f"📡 Sentiment: {_pcr_sentiment_badge(state['pcr'])}", unsafe_allow_html=True)
+
+    for note in state.get("oi_shift_notes", []):
+        st.info(f"🔀 OI Shift — {note}")
+
+    if cfg["strike_search"]:
+        match = df[df["strike_price"] == cfg["strike_search"]]
+        if not match.empty:
+            r = match.iloc[0]
+            st.success(
+                f"🔎 Strike {cfg['strike_search']:,.0f} — CE LTP {r['ce_ltp']:.2f} (OI {r['ce_oi']:,.0f}) | "
+                f"PE LTP {r['pe_ltp']:.2f} (OI {r['pe_oi']:,.0f}) | AI Signal: {r['AI Signal']}"
+            )
+        else:
+            st.warning(f"Strike {cfg['strike_search']:,.0f} is not in the currently loaded strike range.")
+
+    st.divider()
+
+    tab_chain, tab_charts, tab_greeks, tab_ai, tab_gex, tab_export = st.tabs([
+        "📋 Option Chain", "📈 Charts", "🧮 Greeks", "🤖 AI Signals",
+        "⚡ GEX / DEX", "📥 Export",
+    ])
+
+    with tab_chain:
+        st.markdown(render_chain_table_html(df, cfg["show_greeks"]), unsafe_allow_html=True)
+        st.caption(
+            "CE/PE OI cells are heat-shaded relative to the heaviest OI strike in this view. "
+            "ΔOI cells are green (OI rising) or red (OI falling), with a solid fill marking the "
+            "top-20% largest moves. Buildup labels use each option's own price-change vs OI-change "
+            "matrix (Long/Short Buildup, Long Unwinding, Short Covering)."
+        )
+
+    with tab_charts:
+        st.plotly_chart(chart_oi_bars(df, state["max_pain"]), use_container_width=True,
+                         config={"displayModeBar": False})
+        col_a, col_b = st.columns(2)
+        with col_a:
+            st.plotly_chart(gauge_pcr(state["pcr"]), use_container_width=True, config={"displayModeBar": False})
+        with col_b:
+            st.plotly_chart(gauge_momentum(state["momentum_score"]), use_container_width=True,
+                             config={"displayModeBar": False})
+        st.plotly_chart(chart_iv_skew(df), use_container_width=True, config={"displayModeBar": False})
+
+    with tab_greeks:
+        g1, g2 = st.columns(2)
+        with g1:
+            st.plotly_chart(chart_greeks(df, "delta"), use_container_width=True, config={"displayModeBar": False})
+            st.plotly_chart(chart_greeks(df, "theta"), use_container_width=True, config={"displayModeBar": False})
+        with g2:
+            st.plotly_chart(chart_greeks(df, "gamma"), use_container_width=True, config={"displayModeBar": False})
+            st.plotly_chart(chart_greeks(df, "vega"), use_container_width=True, config={"displayModeBar": False})
+        st.caption(
+            "Greeks are Black-Scholes values computed from each strike's own NSE-supplied IV, "
+            f"time-to-expiry from '{state['expiry_label']}', and a {RISK_FREE_RATE*100:.0f}% risk-free "
+            "rate. Strikes with no traded IV (illiquid) show zero Greeks rather than an assumed value."
+        )
+
+    with tab_ai:
+        st.markdown('<div class="block-title">🤖 AI Trade Signals</div>', unsafe_allow_html=True)
+        _render_ai_signal_cards(state, cfg["min_ai_conf"])
+
+        st.markdown("<br>", unsafe_allow_html=True)
+        st.markdown('<div class="block-title">📈 Intraday Probabilities</div>', unsafe_allow_html=True)
+        p1, p2, p3 = st.columns(3)
+        p1.metric("Breakout Probability", f"{state['breakout_reversal']['breakout_probability']:.0f}%")
+        p2.metric("Reversal Probability", f"{state['breakout_reversal']['reversal_probability']:.0f}%")
+        p3.metric("Trend Probability", f"{state['trend_probability']:.0f}%")
+
+        p4, p5 = st.columns(2)
+        p4.metric("Scalping Signal", state["scalp_swing"]["scalping_signal"])
+        p5.metric("Swing Signal", state["scalp_swing"]["swing_signal"])
+        st.caption(
+            "Scalping/Swing signals are derived purely from this refresh's option-chain positioning "
+            "(PCR, momentum, GEX/DEX, IV Rank) — this standalone script has no broker/candle feed, so "
+            "these are OI-positioning reads, not price-action signals. Always confirm with a live "
+            "chart before acting. This is not financial advice."
+        )
+
+    with tab_gex:
+        e1, e2, e3 = st.columns(3)
+        e1.metric("Total Gamma Exposure", f"{state['gex_dex'].get('total_gex', 0):,.0f}")
+        e2.metric("Total Delta Exposure", f"{state['gex_dex'].get('total_dex', 0):,.0f}")
+        gf = state["gex_dex"].get("gamma_flip")
+        e3.metric("Gamma Flip Strike (approx.)", f"{gf:,.0f}" if gf else "—")
+        st.plotly_chart(chart_gex_by_strike(state["gex_dex"]), use_container_width=True,
+                         config={"displayModeBar": False})
+        st.caption(
+            "GEX/DEX use the standard retail dealer-short approximation: "
+            "GEX = (CE Gamma·CE OI − PE Gamma·PE OI)·Spot²·0.01·LotSize, "
+            "DEX = (CE Delta·CE OI + PE Delta·PE OI)·Spot·LotSize. "
+            "Verify the lot size in the sidebar against the current NSE circular before relying on "
+            "the absolute magnitude — the sign and relative shape are the more robust read."
+        )
+
+    with tab_export:
+        st.markdown('<div class="block-title">📥 Export Reports</div>', unsafe_allow_html=True)
+        col_x, col_y = st.columns(2)
+        with col_x:
+            try:
+                excel_buf = export_excel_report(
+                    df, meta, state["pcr"], state["max_pain"], state["support"], state["resistance"],
+                    cfg["symbol"], state["expiry_label"], state["iv_rank"], state["iv_percentile"],
+                    state["gex_dex"],
+                )
+                st.download_button(
+                    "⬇️ Download Excel Report", data=excel_buf,
+                    file_name=f"option_chain_{cfg['symbol']}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True,
+                )
+            except Exception as e:  # noqa: BLE001
+                st.error(f"Could not build Excel report: {e}")
+        with col_y:
+            try:
+                csv_bytes = export_csv_bytes(df)
+                st.download_button(
+                    "⬇️ Download CSV", data=csv_bytes,
+                    file_name=f"option_chain_{cfg['symbol']}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                    mime="text/csv", use_container_width=True,
+                )
+            except Exception as e:  # noqa: BLE001
+                st.error(f"Could not build CSV export: {e}")
+
+    st.caption(
+        f"Data source: NSE India public option-chain API · Last fetched: "
+        f"{meta.get('fetched_at', datetime.now()).strftime('%H:%M:%S')} · "
+        "Educational/analytical tool — not financial advice."
+    )
+
+    if cfg["auto_refresh"]:
+        time.sleep(cfg["refresh_secs"])
+        st.rerun()
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 16. ENTRY POINT / HOSTING-APP COMPATIBILITY SHIM
+# ══════════════════════════════════════════════════════════════════════════
+
+def show_option_chain(fyers: Any = None) -> None:
+    """Entry point for hosting apps (e.g. app.py) that call
+    `from option_chain import show_option_chain` and invoke it as
+    `show_option_chain(fyers)`. When `fyers` is an authenticated
+    fyers-apiv3 client, it is used as the PRIMARY data source (reliable
+    from any host, including cloud deployments). If `fyers` is None, or
+    a FYERS call fails, this module automatically falls back to NSE's
+    public option-chain API — which only works reliably when NOT running
+    behind a cloud/datacenter IP, since NSE blocks most of those."""
+    if fyers is not None:
+        logger.info("show_option_chain() received a FYERS client — using it as the primary data source.")
+    else:
+        logger.info("show_option_chain() received no FYERS client — using NSE directly (local-network only).")
+    run_dashboard(fyers)
+
+
+if __name__ == "__main__":
+    run_dashboard()
