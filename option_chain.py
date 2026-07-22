@@ -1717,8 +1717,27 @@ def run_dashboard() -> None:
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# 16. ENTRY POINT
+# 16. ENTRY POINT / HOSTING-APP COMPATIBILITY SHIM
 # ══════════════════════════════════════════════════════════════════════════
+
+def show_option_chain(fyers: Any = None) -> None:
+    """Compatibility entry point for hosting apps (e.g. app.py) that call
+    `from option_chain import show_option_chain` and invoke it as
+    `show_option_chain(fyers)`. This dashboard fetches directly from
+    NSE's public option-chain API and does not require a broker
+    connection, so `fyers` is accepted for signature compatibility but
+    is intentionally unused. Passing None (or nothing) works exactly
+    the same as passing an authenticated FYERS client — it is simply
+    ignored — so no changes are required in app.py."""
+    if fyers is not None:
+        logger.info(
+            "show_option_chain() received a `fyers` client, but this module "
+            "fetches directly from NSE's public API and does not use a "
+            "broker connection — the fyers argument is accepted only for "
+            "backward compatibility with the hosting app's import signature."
+        )
+    run_dashboard()
+
 
 if __name__ == "__main__":
     run_dashboard()
