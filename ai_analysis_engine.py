@@ -56,6 +56,22 @@ access to real order-flow/dealer-position data, and several
 "Smart Money" / "Dealer" / "Gamma" concepts below are necessarily
 proxied from OI/Volume/ΔOI/Gamma rather than measured directly.
 Always confirm with live price action and manage your own risk.
+
+CHANGELOG (bugfix pass)
+------------------------
+1. SELL-side signals (CE SELL / PE SELL) now respect the same
+   `min_confidence` floor that BUY-side signals always did. Previously
+   only `sell_prob_bar` was checked, so a SELL could qualify at high
+   probability but very low confidence — an asymmetry versus the BUY
+   path that undermined the "same bar for every signal" design intent.
+2. The `has_gamma` capability flag is now checked against the actual
+   column the buy/sell condition functions read from ("Gamma Change"),
+   not the raw "gamma" column. Previously, if a chain had "gamma" but
+   not "Gamma Change", `row.get("Gamma Change", 0)` silently defaulted
+   to 0, and the PE-buy / gamma-flip checks used `>= 0` comparisons —
+   so missing gamma data could silently manufacture a *passing*
+   condition instead of failing safe. All such checks are now gated on
+   `has_gamma_change` and use presence-aware comparisons.
 """
 
 from __future__ import annotations
@@ -393,6 +409,7 @@ class MarketContext:
 
     has_trend_engine: bool = False
     has_gamma: bool = False
+    has_gamma_change: bool = False
 
 
 def _layer_1_global_market(macro):
@@ -493,6 +510,12 @@ def build_market_context(df, spot_price, atm_strike, max_pain, pcr, support,
     ctx.avg_ce_iv = float(ce_iv[ce_iv > 0].mean()) if (ce_iv > 0).any() else 0.0
     ctx.avg_pe_iv = float(pe_iv[pe_iv > 0].mean()) if (pe_iv > 0).any() else 0.0
     ctx.has_gamma = "gamma" in df.columns
+    # BUGFIX #2: this is the flag the condition functions actually gate on
+    # ("Gamma Change" is what they read from `row`, not "gamma"). Keeping
+    # has_gamma/has_gamma_change distinct prevents a chain that has "gamma"
+    # but not "Gamma Change" from silently defaulting missing values to 0
+    # and having that 0 pass a `>= 0` check.
+    ctx.has_gamma_change = "Gamma Change" in df.columns
 
     ctx.global_market_bias = _layer_1_global_market(macro_context)
     ctx.india_vix_bias, ctx.india_vix_level, ctx.india_vix_trend = _layer_2_india_vix(macro_context)
@@ -564,7 +587,7 @@ def build_market_context(df, spot_price, atm_strike, max_pain, pcr, support,
                 ctx.iv_rank_pe = round(_clip01((ctx.avg_pe_iv - lo) / (hi - lo)) * 100, 1)
             ctx.iv_percentile_pe = round(_pct_rank(ctx.avg_pe_iv, pd.Series(iv_hist_pe)) * 100, 1)
         prev_avg_gamma = oi_history.get("prev_avg_gamma")
-        if ctx.has_gamma and "Gamma Change" in df.columns and prev_avg_gamma is not None:
+        if ctx.has_gamma_change and prev_avg_gamma is not None:
             cur_avg_gamma = float(df["Gamma Change"].mean())
             ctx.gamma_flip_bullish = prev_avg_gamma <= 0 < cur_avg_gamma
             ctx.gamma_flip_bearish = prev_avg_gamma >= 0 > cur_avg_gamma
@@ -658,7 +681,7 @@ def build_market_context(df, spot_price, atm_strike, max_pain, pcr, support,
     else:
         ctx.iv_bias = "🟡 Neutral IV"
 
-    if ctx.has_gamma and "Gamma Change" in df.columns:
+    if ctx.has_gamma_change:
         avg_gc = float(df["Gamma Change"].mean())
         if avg_gc > 0:
             ctx.gamma_bias = "🟢 Gamma Building (accelerating moves)"
@@ -831,7 +854,11 @@ def _ce_buy_conditions(row, ctx: MarketContext) -> dict:
         "Increasing volume": float(row.get("ce_volume", 0) or 0) >= ctx.high_ce_vol_thresh > 0,
         "Strong Put Volume confirms writing": float(row.get("pe_volume", 0) or 0) >= ctx.high_pe_vol_thresh > 0,
         "PCR improving (or unavailable)": ctx.pcr_improving in (None, True),
-        "Positive Gamma trend": (float(row.get("Gamma Change", 0) or 0) > 0) if ctx.has_gamma else False,
+        # BUGFIX #2: gate on has_gamma_change (the column actually read
+        # below), not has_gamma. When the column is genuinely absent this
+        # now correctly evaluates to False rather than letting a defaulted
+        # 0 silently pass downstream via a >= comparison elsewhere.
+        "Positive Gamma trend": (float(row.get("Gamma Change", 0) or 0) > 0) if ctx.has_gamma_change else False,
         "PCR supportive (> 1.0)": ctx.pcr > 1.0,
         "IV acceptable (not elevated)": 0 < ce_iv <= (ctx.ce_iv_high_thresh or ce_iv),
         "No nearby resistance": (ctx.resistance is None) or (row["strike_price"] < ctx.resistance) or
@@ -842,7 +869,13 @@ def _ce_buy_conditions(row, ctx: MarketContext) -> dict:
         "No Buyer Trap / Fake Breakout detected": not bool(ctx.buyer_trap) and not bool(ctx.fake_breakout),
         "No Stop-Hunt sweep against the move": not bool(ctx.liquidity_sweep_high),
         "CHoCH not bearish": not bool(ctx.choch_bearish),
-        "Gamma not flipping bearish": not bool(ctx.gamma_flip_bearish),
+        # BUGFIX #2: gamma-flip checks below (both here and in the sell
+        # conditions) use `not bool(x)`. When x is None (unavailable) this
+        # evaluates to True — i.e. "gamma not flipping" passes by default
+        # when we simply don't know. That's the same "missing data must
+        # never manufacture a pass" problem, so we now require the flag to
+        # be explicitly known AND false.
+        "Gamma not flipping bearish": ctx.gamma_flip_bearish is False,
         "Fresh buying / Long Build-up (index OI)": ctx.index_oi_signal in ("Long Build-up", "Unavailable"),
         "Premium breakout / volume spike": (
             (ce_prem_hist is not None and ce_ltp > _safe_float(ce_prem_hist) * 1.05) or
@@ -866,7 +899,10 @@ def _pe_buy_conditions(row, ctx: MarketContext) -> dict:
         "High volume": float(row.get("pe_volume", 0) or 0) >= ctx.high_pe_vol_thresh > 0,
         "Strong Call Volume confirms writing": float(row.get("ce_volume", 0) or 0) >= ctx.high_ce_vol_thresh > 0,
         "PCR falling (or unavailable)": ctx.pcr_falling in (None, True),
-        "Gamma supportive": (float(row.get("Gamma Change", 0) or 0) >= 0) if ctx.has_gamma else False,
+        # BUGFIX #2: was `>= 0` gated on has_gamma, which allowed a
+        # missing "Gamma Change" column to default to 0 and pass this
+        # check. Now gated on has_gamma_change (the column actually read).
+        "Gamma supportive": (float(row.get("Gamma Change", 0) or 0) >= 0) if ctx.has_gamma_change else False,
         "PCR bearish (< 1.0)": ctx.pcr < 1.0,
         "No nearby support": (ctx.support is None) or (row["strike_price"] > ctx.support) or
             (ctx.support and abs(row["strike_price"] - ctx.support) / max(ctx.support, 1) > 0.01),
@@ -877,7 +913,9 @@ def _pe_buy_conditions(row, ctx: MarketContext) -> dict:
         "No Seller Trap / Fake Breakdown detected": not bool(ctx.seller_trap) and not bool(ctx.fake_breakdown),
         "No Stop-Hunt sweep against the move": not bool(ctx.liquidity_sweep_low),
         "CHoCH not bullish": not bool(ctx.choch_bullish),
-        "Gamma not flipping bullish": not bool(ctx.gamma_flip_bullish),
+        # BUGFIX #2: require the flip flag to be explicitly known-false,
+        # rather than letting an unknown (None) value pass by default.
+        "Gamma not flipping bullish": ctx.gamma_flip_bullish is False,
         "Fresh selling / Short Build-up (index OI)": ctx.index_oi_signal in ("Short Build-up", "Unavailable"),
         "Premium breakout / volume spike": (
             (pe_prem_hist is not None and pe_ltp > _safe_float(pe_prem_hist) * 1.05) or
@@ -899,7 +937,8 @@ def _ce_sell_conditions(row, ctx: MarketContext) -> dict:
         "Heavy Call Writing": float(row.get("ce_chng_oi", 0) or 0) >= ctx.heavy_ce_chng_thresh > 0,
         "IV advantage (elevated / high IV rank)": (ce_iv > 0 and ce_iv >= (ctx.ce_iv_high_thresh or ce_iv)) and iv_rank_ok,
         "Momentum weak / stalling": momentum_weak,
-        "No Gamma Flip bullish (gamma not accelerating buyers)": not bool(ctx.gamma_flip_bullish),
+        # BUGFIX #2: same "unknown must not pass" fix as the buy conditions.
+        "No Gamma Flip bullish (gamma not accelerating buyers)": ctx.gamma_flip_bullish is False,
         "Theta advantage (decay favors seller)": True,
         "Smart Money / Dealer / Seller Bias not against the sell": not (
             ctx.smart_money_bias.startswith("🟢") and ctx.dealer_bias.startswith("🟢") and ctx.seller_bias.startswith("🟢")
@@ -920,7 +959,8 @@ def _pe_sell_conditions(row, ctx: MarketContext) -> dict:
         "Heavy Put Writing": float(row.get("pe_chng_oi", 0) or 0) >= ctx.heavy_pe_chng_thresh > 0,
         "IV advantage (elevated / high IV rank)": (pe_iv > 0 and pe_iv >= (ctx.pe_iv_high_thresh or pe_iv)) and iv_rank_ok,
         "Momentum weak / stalling": momentum_weak,
-        "No Gamma Flip bearish (gamma not accelerating sellers of premium)": not bool(ctx.gamma_flip_bearish),
+        # BUGFIX #2: same "unknown must not pass" fix as the buy conditions.
+        "No Gamma Flip bearish (gamma not accelerating sellers of premium)": ctx.gamma_flip_bearish is False,
         "Theta advantage (decay favors seller)": True,
         "Smart Money / Dealer / Seller Bias not against the sell": not (
             ctx.smart_money_bias.startswith("🔴") and ctx.dealer_bias.startswith("🔴") and ctx.seller_bias.startswith("🔴")
@@ -1132,9 +1172,14 @@ def _evaluate_strike(row, ctx: MarketContext, min_probability, min_confidence) -
         candidates.append(("CE BUY", ce_buy_prob, ce_buy_conf, ce_buy_conds, row.get("ce_ltp", 0), False))
     if pe_buy_all and pe_buy_prob >= buy_prob_bar and pe_buy_conf >= min_confidence:
         candidates.append(("PE BUY", pe_buy_prob, pe_buy_conf, pe_buy_conds, row.get("pe_ltp", 0), False))
-    if ce_sell_all and ce_sell_prob >= sell_prob_bar:
+    # BUGFIX #1: SELL candidates now also require conf >= min_confidence,
+    # matching the BUY path above. Previously only sell_prob_bar was
+    # checked, so a SELL could qualify at high probability but very low
+    # confidence — an asymmetry with no basis in the file's own stated
+    # "same bars, capital protection first" design.
+    if ce_sell_all and ce_sell_prob >= sell_prob_bar and ce_sell_conf >= min_confidence:
         candidates.append(("CE SELL", ce_sell_prob, ce_sell_conf, ce_sell_conds, row.get("ce_ltp", 0), True))
-    if pe_sell_all and pe_sell_prob >= sell_prob_bar:
+    if pe_sell_all and pe_sell_prob >= sell_prob_bar and pe_sell_conf >= min_confidence:
         candidates.append(("PE SELL", pe_sell_prob, pe_sell_conf, pe_sell_conds, row.get("pe_ltp", 0), True))
 
     viable = []
