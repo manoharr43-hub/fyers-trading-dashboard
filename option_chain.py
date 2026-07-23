@@ -82,7 +82,13 @@ INDEX_SYMBOLS: dict[str, str] = {
     "BANKNIFTY": "BANKNIFTY",
     "FINNIFTY": "FINNIFTY",
     "MIDCPNIFTY": "MIDCPNIFTY",
+    "SENSEX": "SENSEX",
 }
+
+# NSE's public option-chain-indices endpoint only serves NSE-listed
+# indices. SENSEX (and BANKEX) are BSE-listed, so the NSE fallback path
+# cannot serve them at all — FYERS is required for these.
+NSE_UNSUPPORTED_INDICES: set[str] = {"SENSEX", "BANKEX"}
 
 # Default lot sizes used only as a starting point for GEX/DEX & notional
 # calculations. NSE revises lot sizes periodically (quarterly review), so
@@ -92,6 +98,8 @@ DEFAULT_LOT_SIZES: dict[str, int] = {
     "BANKNIFTY": 15,
     "FINNIFTY": 25,
     "MIDCPNIFTY": 50,
+    "SENSEX": 10,
+    "BANKEX": 15,
     "_STOCK_DEFAULT": 1,
 }
 
@@ -597,6 +605,8 @@ FYERS_INDEX_SYMBOL_CANDIDATES: dict[str, list[str]] = {
     "BANKNIFTY": ["NSE:NIFTYBANK-INDEX", "NSE:BANKNIFTY-INDEX"],
     "FINNIFTY": ["NSE:FINNIFTY-INDEX"],
     "MIDCPNIFTY": ["NSE:MIDCPNIFTY-INDEX", "NSE:MIDCAPNIFTY-INDEX"],
+    "SENSEX": ["BSE:SENSEX-INDEX", "BSE:SENSEX-INDEX50"],
+    "BANKEX": ["BSE:BANKEX-INDEX"],
 }
 
 
@@ -859,6 +869,14 @@ def fetch_chain_unified(fyers: Any, symbol_key: str, is_index: bool, stock_name:
             return result
         fyers_error = result.get("error")
         logger.warning("FYERS fetch failed, falling back to NSE: %s", fyers_error)
+
+    if is_index and symbol_key in NSE_UNSUPPORTED_INDICES:
+        error = (
+            f"{symbol_key} is BSE-listed and NSE's public option-chain API does not serve it — "
+            "a FYERS (or other BSE-capable) client is required for this index."
+        )
+        combined = f"FYERS: {fyers_error} | {error}" if fyers_error else error
+        return {"ok": False, "df": pd.DataFrame(), "meta": {}, "error": combined, "source": "NONE"}
 
     nse_symbol = symbol_key if is_index else normalize_stock_symbol(stock_name)
     raw_result = fetch_option_chain_raw(nse_symbol, is_index)
@@ -1679,6 +1697,11 @@ def _sidebar_config() -> dict:
 
         if is_index:
             symbol = st.selectbox("Index", list(INDEX_SYMBOLS.keys()), key="oc_index_select")
+            if symbol in NSE_UNSUPPORTED_INDICES:
+                st.caption(
+                    f"ℹ️ {symbol} is BSE-listed — requires a connected FYERS client "
+                    "(NSE's public API can't serve this index)."
+                )
         else:
             raw_symbol = st.text_input(
                 "Stock Symbol (e.g. RELIANCE, TCS, INFY, SBIN, HDFCBANK)", "RELIANCE", key="oc_stock_input"
