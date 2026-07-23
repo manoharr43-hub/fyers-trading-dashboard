@@ -1711,9 +1711,13 @@ def _sidebar_config() -> dict:
         strike_count = st.slider("Strikes Around ATM", 5, 40, 15, step=5, key="oc_strike_count")
         show_greeks = st.checkbox("Show Greeks columns in chain table", value=True, key="oc_show_greeks")
         min_ai_conf = st.slider("Min AI Confidence % (signals list)", 0, 100, 55, step=5, key="oc_min_ai_conf")
-        strike_search = st.number_input(
-            "Search / highlight a specific strike (0 = off)", min_value=0, value=0, step=50, key="oc_strike_search"
-        )
+        strike_search_raw = st.text_input("Strike Price ఇవ్వండి", value="", key="oc_strike_search")
+        strike_search = 0.0
+        if strike_search_raw.strip():
+            try:
+                strike_search = float(strike_search_raw.strip())
+            except ValueError:
+                st.caption("⚠️ Enter a valid numeric strike price (e.g. 25000).")
 
         default_lot = DEFAULT_LOT_SIZES.get(symbol, DEFAULT_LOT_SIZES["_STOCK_DEFAULT"])
         lot_size = st.number_input(
@@ -1924,7 +1928,7 @@ def run_dashboard(fyers: Any = None) -> None:
         st.info(f"🔀 OI Shift — {note}")
 
     if cfg["strike_search"]:
-        match = df[df["strike_price"] == cfg["strike_search"]]
+        match = df[(df["strike_price"] - cfg["strike_search"]).abs() < 0.5]
         if not match.empty:
             r = match.iloc[0]
             st.success(
