@@ -3,68 +3,6 @@ ai_market_intelligence.py
 ==============================================================================
 Standalone AI-powered "Market Intelligence" dashboard module for a FYERS
 Streamlit trading dashboard.
-
-DESIGN CONTRACT
---------------------------------------------------------------------------
-This module is fully self-contained. It does NOT import, modify, or depend
-on scanner.py, option_chain.py, app.py, market.py, or trading.py, and it
-never touches any existing BUY/SELL signal logic. It exposes exactly one
-public function:
-
-    show_ai_market_intelligence(fyers)
-
-which can be safely called from market.py, e.g.:
-
-    from ai_market_intelligence import show_ai_market_intelligence
-    show_ai_market_intelligence(fyers)
-
-Every external call (FYERS API, RSS feeds, NSE endpoints) is wrapped in
-try/except and retried, so a single bad response never crashes the
-dashboard - failing sections show "Data Not Available" while the rest of
-the app keeps working.
-
-Reliability notes (v2):
-- Every FYERS response is validated (`_is_valid_response`) before use.
-- Failed API calls are retried with backoff (`_retry_call`).
-- Live quotes and live option-chain data are NEVER cached (re-fetched on
-  every rerun / auto-refresh tick). Only historical OHLCV candles and the
-  RSS news feed are cached.
-- The dashboard auto-refreshes every 30 seconds.
-- Missing/invalid values render as "Data Not Available" instead of blanks.
-- AI Market Direction is now computed from a broad, weighted multi-factor
-  model (trend, option chain, SMC, news, institutional flow, momentum,
-  volume) instead of any single indicator. BUY/SELL are only ever shown
-  when the weighted Bullish/Bearish score exceeds 80% AND multiple
-  independent factors confirm the same direction - otherwise the engine
-  reports WAIT.
-
-Reliability notes (v3 - Greeks / Global Markets / True Breadth):
-- Added a real Options Greeks engine (Delta, Theta, Vega, IV, IV Rank,
-  IV Percentile, Delta Exposure) sourced from FYERS option-chain greeks
-  where available. IV history is cached locally (session-scoped) purely
-  to derive IV Rank/Percentile; no external IV data source is invented.
-- Added a Global Markets panel (Gift Nifty, USDINR, Crude, Gold, US
-  Futures, Asian Markets, European Markets). FYERS symbols are used
-  first; anything FYERS cannot serve (Gift Nifty / US / Asian / European
-  indices) falls back to a best-effort public quote lookup, and shows
-  "Data Not Available" rather than a guess if that also fails.
-- Added a True Market Breadth engine (Advances/Declines across NIFTY 50
-  constituents, Top Gainers/Losers, Volume Leaders, Sector Rotation via
-  NSE sector indices, Heavyweight Contribution) alongside the original
-  6-index proxy breadth count (kept as "Legacy Breadth" on the AI
-  Dashboard tab for backward compatibility).
-- These new factors (Greeks, Global Markets, True Breadth) are wired into
-  the multi-factor AI Direction engine as confidence modifiers per the
-  "professional rules" in the spec (e.g. Option Chain vs Greeks
-  disagreement, Futures vs Spot disagreement, Global risk-off
-  environment) WITHOUT changing the original 7-factor weighting, so the
-  existing BUY/SELL/WAIT behavior for the original factors is preserved.
-
-Dependencies: streamlit, pandas, numpy, requests, feedparser,
-streamlit-autorefresh (optional - degrades gracefully if not installed).
-
-Python: 3.11
-==============================================================================
 """
 
 from __future__ import annotations
@@ -87,16 +25,10 @@ except Exception:  # pragma: no cover - optional dependency
     _HAS_AUTOREFRESH = False
 
 
-# ==============================================================================
-# 1. CONFIGURATION & CONSTANTS
-# ==============================================================================
-
-REFRESH_INTERVAL_MS: int = 30_000  # Auto Refresh every 30 seconds
-
+REFRESH_INTERVAL_MS: int = 30_000
 DATA_NA: str = "Data Not Available"
 LOADING_MSG: str = "Loading..."
 FETCHING_MSG: str = "Fetching..."
-
 DEFAULT_RETRIES: int = 2
 RETRY_DELAY_SECONDS: float = 0.35
 
@@ -162,7 +94,6 @@ KNOWN_STOCK_TOKENS: List[str] = [
     "KOTAK", "HCLTECH", "SUNPHARMA", "TITAN",
 ]
 
-# Weights for the multi-factor AI Market Direction engine. Must sum to 1.0.
 DIRECTION_WEIGHTS: Dict[str, float] = {
     "trend": 0.25,
     "option_chain": 0.20,
@@ -174,15 +105,8 @@ DIRECTION_WEIGHTS: Dict[str, float] = {
 }
 
 BUY_SELL_SCORE_THRESHOLD: float = 80.0
-MIN_CONFIRMATIONS_REQUIRED: int = 4  # out of 6 directional factors (excludes volume)
+MIN_CONFIRMATIONS_REQUIRED: int = 4
 
-# ------------------------------------------------------------------------
-# NEW (v3): NIFTY 50 constituents (approximate free-float weights) used for
-# True Market Breadth, Top Gainers/Losers, Volume Leaders, and Heavyweight
-# Contribution. Weights are indicative (rounded, publicly-known approximate
-# NIFTY50 index weights) - used only to rank "heavyweight contribution",
-# never claimed as an official index-provider weight.
-# ------------------------------------------------------------------------
 NIFTY50_CONSTITUENTS: Dict[str, float] = {
     "NSE:RELIANCE-EQ": 9.5, "NSE:HDFCBANK-EQ": 12.5, "NSE:ICICIBANK-EQ": 8.5,
     "NSE:INFY-EQ": 5.5, "NSE:TCS-EQ": 4.0, "NSE:BHARTIARTL-EQ": 4.5,
@@ -203,8 +127,6 @@ NIFTY50_CONSTITUENTS: Dict[str, float] = {
     "NSE:LTIM-EQ": 0.6, "NSE:ADANIPORTS-EQ": 0.7,
 }
 
-# NSE sector indices used for Sector Rotation (best-effort FYERS symbols;
-# falls back to Data Not Available per-sector if a symbol is not servable).
 SECTOR_INDICES: Dict[str, str] = {
     "NIFTY BANK": "NSE:NIFTYBANK-INDEX",
     "NIFTY IT": "NSE:NIFTYIT-INDEX",
@@ -218,17 +140,12 @@ SECTOR_INDICES: Dict[str, str] = {
     "NIFTY FIN SERVICE": "NSE:FINNIFTY-INDEX",
 }
 
-# Global market symbols. FYERS-servable ones use FYERS symbols; anything
-# FYERS does not provide (US/Asian/European indices, Gift Nifty) is looked
-# up via a best-effort public quote endpoint and degrades to Data Not
-# Available if that also fails - it is never invented.
 GLOBAL_FYERS_SYMBOLS: Dict[str, str] = {
     "USDINR": "NSE:USDINR-INDEX",
     "Crude Oil (MCX)": "MCX:CRUDEOIL25AUGFUT",
     "Gold (MCX)": "MCX:GOLD25AUGFUT",
 }
 
-# Yahoo Finance tickers for indices FYERS cannot serve. Best-effort only.
 GLOBAL_EXTERNAL_SYMBOLS: Dict[str, str] = {
     "Gift Nifty / SGX Nifty": "NIFTY_F1.NS",
     "Dow Futures": "YM=F",
@@ -240,15 +157,10 @@ GLOBAL_EXTERNAL_SYMBOLS: Dict[str, str] = {
     "DAX": "^GDAXI",
 }
 
-IV_HISTORY_LOOKBACK_DAYS: int = 252  # for IV Rank / IV Percentile
+IV_HISTORY_LOOKBACK_DAYS: int = 252
 
-
-# ==============================================================================
-# 2. GENERIC HELPERS / SAFE EXECUTION / RETRY / VALIDATION
-# ==============================================================================
 
 def _safe_call(fn, *args: Any, default: Any = None, **kwargs: Any) -> Any:
-    """Execute fn(*args, **kwargs) and swallow all exceptions, returning `default` on failure."""
     try:
         return fn(*args, **kwargs)
     except Exception:
@@ -256,7 +168,6 @@ def _safe_call(fn, *args: Any, default: Any = None, **kwargs: Any) -> Any:
 
 
 def _render_safely(section_name: str, fn, *args: Any, **kwargs: Any) -> None:
-    """Render a dashboard section without ever letting it crash the whole app."""
     try:
         fn(*args, **kwargs)
     except Exception as exc:  # noqa: BLE001 - intentional catch-all for UI resilience
@@ -266,7 +177,6 @@ def _render_safely(section_name: str, fn, *args: Any, **kwargs: Any) -> None:
 
 def _retry_call(fn, *args: Any, retries: int = DEFAULT_RETRIES, delay: float = RETRY_DELAY_SECONDS,
                  default: Any = None, **kwargs: Any) -> Any:
-    """Call fn(*args, **kwargs), retrying on exception or falsy/None result."""
     last_result = default
     for attempt in range(retries + 1):
         try:
@@ -282,7 +192,6 @@ def _retry_call(fn, *args: Any, retries: int = DEFAULT_RETRIES, delay: float = R
 
 
 def _is_valid_response(resp: Any) -> bool:
-    """Validate a FYERS API response before it is ever used."""
     try:
         return isinstance(resp, dict) and resp.get("s") == "ok"
     except Exception:
@@ -290,7 +199,6 @@ def _is_valid_response(resp: Any) -> bool:
 
 
 def _fmt_num(value: Any, decimals: int = 2, suffix: str = "") -> str:
-    """Format a numeric value, or return DATA_NA if missing/invalid."""
     try:
         if value is None:
             return DATA_NA
@@ -326,18 +234,11 @@ def _trend_color(trend: str) -> str:
     return {"UP": "🟢", "DOWN": "🔴", "FLAT": "🟡", "NA": "⚪"}.get(trend, "⚪")
 
 
-# ==============================================================================
-# 3. TECHNICAL INDICATORS (independent implementation - EMA, RSI, MACD, ADX,
-#    ATR, VWAP, Support/Resistance, Supertrend)
-# ==============================================================================
-
 def ema(series: pd.Series, period: int) -> pd.Series:
-    """Exponential Moving Average."""
     return series.ewm(span=period, adjust=False).mean()
 
 
 def rsi(series: pd.Series, period: int = 14) -> pd.Series:
-    """Relative Strength Index (Wilder smoothing)."""
     delta = series.diff()
     gain = delta.clip(lower=0)
     loss = -delta.clip(upper=0)
@@ -349,7 +250,6 @@ def rsi(series: pd.Series, period: int = 14) -> pd.Series:
 
 
 def macd(series: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9) -> Tuple[pd.Series, pd.Series, pd.Series]:
-    """MACD line, signal line, and histogram."""
     ema_fast = ema(series, fast)
     ema_slow = ema(series, slow)
     macd_line = ema_fast - ema_slow
@@ -367,13 +267,11 @@ def _true_range(df: pd.DataFrame) -> pd.Series:
 
 
 def atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
-    """Average True Range."""
     tr = _true_range(df)
     return tr.ewm(alpha=1 / period, adjust=False).mean()
 
 
 def adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
-    """Average Directional Index."""
     high, low = df["high"], df["low"]
     tr = _true_range(df)
     atr_val = tr.ewm(alpha=1 / period, adjust=False).mean()
@@ -391,7 +289,6 @@ def adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
 
 
 def vwap(df: pd.DataFrame) -> pd.Series:
-    """Volume Weighted Average Price (session cumulative)."""
     typical_price = (df["high"] + df["low"] + df["close"]) / 3
     cum_vol = df["volume"].cumsum().replace(0, np.nan)
     cum_tp_vol = (typical_price * df["volume"]).cumsum()
@@ -399,17 +296,11 @@ def vwap(df: pd.DataFrame) -> pd.Series:
 
 
 def support_resistance(df: pd.DataFrame, window: int = 20) -> Tuple[float, float]:
-    """Simple rolling-window support/resistance."""
     recent = df.tail(window)
     return float(recent["low"].min()), float(recent["high"].max())
 
 
 def supertrend(df: pd.DataFrame, period: int = 10, multiplier: float = 3.0) -> Tuple[pd.Series, pd.Series]:
-    """
-    Supertrend indicator.
-    Returns (supertrend_line, direction) where direction is +1 (uptrend) or
-    -1 (downtrend) for each candle.
-    """
     try:
         atr_val = atr(df, period)
         hl2 = (df["high"] + df["low"]) / 2
@@ -456,15 +347,7 @@ def supertrend(df: pd.DataFrame, period: int = 10, multiplier: float = 3.0) -> T
         return empty, empty
 
 
-# ==============================================================================
-# 4. FYERS DATA ACCESS LAYER (quotes, history, option chain)
-#    Live data (quotes / option chain) is NEVER cached. Only historical
-#    OHLCV candles are cached, since they don't change once a candle closes.
-# ==============================================================================
-
 def fetch_quote(_fyers: Any, symbol: str, retries: int = DEFAULT_RETRIES) -> Optional[Dict[str, Any]]:
-    """Fetch a single LIVE quote from FYERS (never cached). Returns None on failure."""
-
     def _do() -> Optional[Dict[str, Any]]:
         resp = _fyers.quotes({"symbols": symbol})
         if _is_valid_response(resp) and resp.get("d"):
@@ -477,18 +360,11 @@ def fetch_quote(_fyers: Any, symbol: str, retries: int = DEFAULT_RETRIES) -> Opt
 
 
 def fetch_quotes_batch(_fyers: Any, symbols: List[str], retries: int = DEFAULT_RETRIES) -> Dict[str, Dict[str, Any]]:
-    """
-    Fetch multiple LIVE quotes in as few FYERS calls as possible (FYERS
-    accepts a comma-separated symbol list in a single `quotes` call).
-    Never cached. Returns a dict keyed by symbol; symbols that fail to
-    resolve are simply omitted (caller should treat missing keys as
-    Data Not Available).
-    """
     out: Dict[str, Dict[str, Any]] = {}
     if not symbols:
         return out
 
-    chunk_size = 50  # conservative batch size for FYERS quotes endpoint
+    chunk_size = 50
     for i in range(0, len(symbols), chunk_size):
         chunk = symbols[i:i + chunk_size]
 
@@ -512,8 +388,6 @@ def fetch_quotes_batch(_fyers: Any, symbols: List[str], retries: int = DEFAULT_R
 
 def fetch_history(_fyers: Any, symbol: str, resolution: str = "15", days: int = 30,
                    retries: int = DEFAULT_RETRIES) -> Optional[pd.DataFrame]:
-    """Fetch OHLCV candles from FYERS history API (historical data). Returns None on failure."""
-
     def _do() -> Optional[pd.DataFrame]:
         to_date = dt.date.today()
         from_date = to_date - dt.timedelta(days=days)
@@ -538,12 +412,10 @@ def fetch_history(_fyers: Any, symbol: str, resolution: str = "15", days: int = 
 
 @st.cache_data(ttl=120, show_spinner=False)
 def fetch_history_cached(_fyers: Any, symbol: str, resolution: str, days: int) -> Optional[pd.DataFrame]:
-    """Cached wrapper - historical candles only (safe to cache briefly)."""
     return fetch_history(_fyers, symbol, resolution, days)
 
 
 def _compute_max_pain(option_chain: List[Dict[str, Any]]) -> Optional[float]:
-    """Compute the Max Pain strike from a raw options-chain list."""
     try:
         strikes: Dict[float, Dict[str, float]] = {}
         for o in option_chain:
@@ -578,7 +450,6 @@ _EMPTY_OPTION_CHAIN_METRICS: Dict[str, Any] = {
     "pcr": None, "total_oi": None, "ce_oi": None, "pe_oi": None,
     "put_writing": None, "call_writing": None, "oi_change_pct": None,
     "max_pain": None, "gamma_exposure": None, "delta_oi": None,
-    # NEW (v3) Greeks Engine fields:
     "avg_call_delta": None, "avg_put_delta": None, "avg_theta": None,
     "avg_vega": None, "atm_iv": None, "iv_rank": None, "iv_percentile": None,
     "delta_exposure": None, "atm_strike": None, "chain_detail": None,
@@ -586,17 +457,6 @@ _EMPTY_OPTION_CHAIN_METRICS: Dict[str, Any] = {
 
 
 def fetch_option_chain_data(_fyers: Any, symbol: str, retries: int = DEFAULT_RETRIES) -> Dict[str, Any]:
-    """
-    Fetch LIVE option-chain analytics (never cached): PCR, total/CE/PE OI,
-    OI change %, Max Pain, put/call writing activity, gamma exposure,
-    delta-OI (PE OI - CE OI, a directional-flow proxy), and (v3) a full
-    Greeks snapshot: average Call/Put Delta, Theta, Vega, ATM IV, IV Rank,
-    IV Percentile, Delta Exposure, ATM strike, and a per-strike ATM/ITM/OTM
-    classification table.
-    Always returns a fully-keyed dict; missing fields are None (never
-    invented) so the UI can show "Data Not Available" where appropriate.
-    """
-
     def _do() -> Optional[Dict[str, Any]]:
         resp = _fyers.optionchain({"symbol": symbol, "strikecount": 10, "timestamp": ""})
         if not _is_valid_response(resp):
@@ -619,8 +479,15 @@ def fetch_option_chain_data(_fyers: Any, symbol: str, retries: int = DEFAULT_RET
         put_writing = "Active" if put_oi > call_oi else "Weak"
         call_writing = "Active" if call_oi > put_oi else "Weak"
 
-        put_oi_chg = sum(float(o.get("oich", o.get("oi_change", 0)) or 0) for o in chain if o.get("option_type") == "PE")
-        call_oi_chg = sum(float(o.get("oich", o.get("oi_change", 0)) or 0) for o in chain if o.get("option_type") == "CE")
+        def _clean_num(v: Any) -> float:
+            try:
+                v = float(v)
+            except (TypeError, ValueError):
+                return 0.0
+            return 0.0 if np.isnan(v) or np.isinf(v) else v
+
+        put_oi_chg = sum(_clean_num(o.get("oich", o.get("oi_change", 0))) for o in chain if o.get("option_type") == "PE")
+        call_oi_chg = sum(_clean_num(o.get("oich", o.get("oi_change", 0))) for o in chain if o.get("option_type") == "CE")
         oi_change_pct = None
         if total_oi:
             try:
@@ -630,9 +497,6 @@ def fetch_option_chain_data(_fyers: Any, symbol: str, retries: int = DEFAULT_RET
 
         max_pain = _compute_max_pain(chain)
 
-        # ---- Greeks Engine (v3) --------------------------------------
-        # Determine ATM strike (closest strike to spot; falls back to the
-        # strike with the highest combined OI if spot is unavailable).
         atm_strike = None
         try:
             strikes_available = sorted({float(o["strike_price"]) for o in chain if o.get("strike_price") is not None})
@@ -725,17 +589,6 @@ def fetch_option_chain_data(_fyers: Any, symbol: str, retries: int = DEFAULT_RET
 
 
 def _compute_iv_rank_percentile(symbol: str, current_iv: Optional[float]) -> Tuple[Optional[float], Optional[float]]:
-    """
-    IV Rank / IV Percentile over the session's observed ATM-IV history for
-    this symbol. This is intentionally SESSION-SCOPED (stored in
-    st.session_state) rather than backed by an invented long-run IV
-    history - there is no independent historical-IV data source wired into
-    this module, so per the "never invent data" rule we only rank IV
-    against what has actually been observed live in this session. Once
-    enough observations accumulate this becomes a meaningful intraday IV
-    Rank/Percentile; early in a session (few observations) it will
-    naturally sit near 50 and should be read with that caveat.
-    """
     try:
         if current_iv is None:
             return None, None
@@ -757,7 +610,6 @@ def _compute_iv_rank_percentile(symbol: str, current_iv: Optional[float]) -> Tup
 
 
 def get_market_summary(_fyers: Any, symbols: Dict[str, str]) -> pd.DataFrame:
-    """Build the LIVE market-summary table (Section 2). Never cached."""
     rows: List[Dict[str, Any]] = []
     for name, sym in symbols.items():
         q = fetch_quote(_fyers, sym)
@@ -788,8 +640,6 @@ def get_market_summary(_fyers: Any, symbols: Dict[str, str]) -> pd.DataFrame:
 
 
 def _current_month_future_symbol(underlying: str) -> str:
-    """Best-effort construction of the near-month futures symbol.
-    NOTE: adjust the naming convention here if your FYERS contract master differs."""
     today = dt.date.today()
     exch = "BSE" if underlying == "SENSEX" else "NSE"
     month_code = today.strftime("%b").upper()
@@ -798,15 +648,6 @@ def _current_month_future_symbol(underlying: str) -> str:
 
 
 def fetch_futures_oi_nse_fallback(underlying: str, retries: int = 1) -> Optional[Dict[str, Any]]:
-    """
-    NSE fallback for futures OI when FYERS does not return it on the quote.
-    Per spec: "If Future OI is unavailable from FYERS, automatically use
-    NSE Futures data. Never display Data Not Available without trying
-    alternate sources." This hits NSE's public quote-derivative endpoint;
-    if that also fails, the caller still falls back to Data Not Available
-    (we never invent an OI figure).
-    """
-
     def _do() -> Optional[Dict[str, Any]]:
         headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
         session = requests.Session()
@@ -821,7 +662,6 @@ def fetch_futures_oi_nse_fallback(underlying: str, retries: int = 1) -> Optional
         stocks = data.get("stocks", [])
         if not stocks:
             return None
-        # First entry is typically the near-month future.
         near = stocks[0].get("marketDeets", {}) or stocks[0].get("metadata", {})
         oi = near.get("openInterest") or stocks[0].get("metadata", {}).get("openInterest")
         oi_chg_pct = near.get("changeinOpenInterest") or 0.0
@@ -832,12 +672,7 @@ def fetch_futures_oi_nse_fallback(underlying: str, retries: int = 1) -> Optional
     return _retry_call(_do, retries=retries, default=None)
 
 
-# ==============================================================================
-# 5. SMART MONEY CONCEPTS (SMC) ENGINE
-# ==============================================================================
-
 def _find_swings(df: pd.DataFrame, left: int = 3, right: int = 3) -> Tuple[List[int], List[int]]:
-    """Fractal-style swing high/low detection."""
     highs, lows = [], []
     h, l = df["high"].values, df["low"].values
     n = len(df)
@@ -852,7 +687,6 @@ def _find_swings(df: pd.DataFrame, left: int = 3, right: int = 3) -> Tuple[List[
 
 
 def compute_smc(df: pd.DataFrame) -> Dict[str, Any]:
-    """Compute a snapshot of Smart Money Concepts for the latest candles (Section 10)."""
     result: Dict[str, Any] = {
         "swing_high": None, "swing_low": None, "bos": "NONE", "choch": "NONE",
         "order_block": "NONE", "breaker_block": "NONE", "mitigation_block": "NONE",
@@ -876,7 +710,6 @@ def compute_smc(df: pd.DataFrame) -> Dict[str, Any]:
         close = float(df["close"].iloc[-1])
         prev_trend_up = df["close"].iloc[-1] > df["close"].iloc[-10] if len(df) >= 10 else True
 
-        # Break of Structure / Change of Character
         if close > last_swing_high:
             result["bos"] = "BULLISH BOS" if prev_trend_up else "NONE"
             result["choch"] = "BULLISH CHOCH" if not prev_trend_up else "NONE"
@@ -884,7 +717,6 @@ def compute_smc(df: pd.DataFrame) -> Dict[str, Any]:
             result["bos"] = "BEARISH BOS" if not prev_trend_up else "NONE"
             result["choch"] = "BEARISH CHOCH" if prev_trend_up else "NONE"
 
-        # Order Block: last opposite candle preceding the break
         if close > last_swing_high:
             down_candles = df[df["close"] < df["open"]].tail(1)
             if not down_candles.empty:
@@ -896,7 +728,6 @@ def compute_smc(df: pd.DataFrame) -> Dict[str, Any]:
                 result["order_block"] = f"Bearish OB @ {up_candles['high'].iloc[-1]:.2f}"
                 result["supply_zone"] = f"{up_candles['low'].iloc[-1]:.2f} - {up_candles['high'].iloc[-1]:.2f}"
 
-        # Fair Value Gap (3-candle imbalance) on the most recent candles
         if len(df) >= 3:
             c1, c3 = df.iloc[-3], df.iloc[-1]
             if c1["high"] < c3["low"]:
@@ -904,14 +735,12 @@ def compute_smc(df: pd.DataFrame) -> Dict[str, Any]:
             elif c1["low"] > c3["high"]:
                 result["fvg"] = f"Bearish FVG {c3['high']:.2f}-{c1['low']:.2f}"
 
-        # Liquidity sweep: wick beyond a swing point followed by a close back inside
         last_candle = df.iloc[-1]
         if last_candle["high"] > last_swing_high and last_candle["close"] < last_swing_high:
             result["liquidity_sweep"] = "Sell-side sweep of swing high"
         elif last_candle["low"] < last_swing_low and last_candle["close"] > last_swing_low:
             result["liquidity_sweep"] = "Buy-side sweep of swing low"
 
-        # Equal highs / equal lows (tolerance ~0.15%)
         if len(highs_idx) >= 2:
             h1, h2 = df["high"].iloc[highs_idx[-1]], df["high"].iloc[highs_idx[-2]]
             if h2 and abs(h1 - h2) / h2 < 0.0015:
@@ -923,18 +752,15 @@ def compute_smc(df: pd.DataFrame) -> Dict[str, Any]:
         if result["equal_high"] or result["equal_low"]:
             result["liquidity_pool"] = "Equal highs/lows liquidity pool detected"
 
-        # Breaker / Mitigation block (simplified heuristic)
         if result["bos"] != "NONE" and result["order_block"] != "NONE":
             result["breaker_block"] = "Potential breaker block at former order block"
             result["mitigation_block"] = "Mitigation zone active near order block"
 
-        # CISD (Change in State of Delivery) - simplified confirmation marker
         if result["liquidity_sweep"] != "NONE":
             bullish_confirm = (last_candle["close"] - last_candle["open"]) > 0
             expects_bullish = "Buy" in result["liquidity_sweep"]
             result["cisd"] = "CISD confirmed" if bullish_confirm == expects_bullish else "Pending"
 
-        # Premium / Discount zone (50% of swing range)
         rng = last_swing_high - last_swing_low
         if rng > 0:
             midpoint = last_swing_low + rng * 0.5
@@ -943,10 +769,6 @@ def compute_smc(df: pd.DataFrame) -> Dict[str, Any]:
         pass
     return result
 
-
-# ==============================================================================
-# 6. NEWS ENGINE (fetch + sentiment + impact classification)
-# ==============================================================================
 
 def _classify_sentiment(text: str) -> Tuple[str, float]:
     text_l = text.lower()
@@ -983,7 +805,6 @@ def _affected_assets(text: str) -> Tuple[str, List[str]]:
 
 @st.cache_data(ttl=180, show_spinner=False)
 def fetch_all_news(max_per_source: int = 6) -> pd.DataFrame:
-    """Download and analyze the latest news headlines (Sections 4 & 5). Safe to cache briefly."""
     rows: List[Dict[str, Any]] = []
     for source, url in NEWS_FEEDS.items():
         try:
@@ -1021,14 +842,8 @@ def fetch_all_news(max_per_source: int = 6) -> pd.DataFrame:
     return pd.DataFrame(rows, columns=columns) if rows else pd.DataFrame(columns=columns)
 
 
-# ==============================================================================
-# 7. FII / DII ENGINE
-# ==============================================================================
-
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_fii_dii() -> Optional[Dict[str, float]]:
-    """Attempt to auto-fetch FII/DII activity. Returns None if unavailable (manual entry fallback)."""
-
     def _do() -> Optional[Dict[str, float]]:
         headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
         session = requests.Session()
@@ -1050,11 +865,13 @@ def fetch_fii_dii() -> Optional[Dict[str, float]]:
     return _retry_call(_do, retries=1, default=None)
 
 
-# ==============================================================================
-# 8. FUTURES ANALYSIS ENGINE
-# ==============================================================================
-
 def classify_futures_buildup(price_change_pct: float, oi_change_pct: float) -> str:
+    price_change_pct = price_change_pct if price_change_pct is not None else 0.0
+    oi_change_pct = oi_change_pct if oi_change_pct is not None else 0.0
+    if isinstance(price_change_pct, float) and np.isnan(price_change_pct):
+        price_change_pct = 0.0
+    if isinstance(oi_change_pct, float) and np.isnan(oi_change_pct):
+        oi_change_pct = 0.0
     if price_change_pct > 0 and oi_change_pct > 0:
         return "Long Build Up"
     if price_change_pct < 0 and oi_change_pct > 0:
@@ -1066,20 +883,8 @@ def classify_futures_buildup(price_change_pct: float, oi_change_pct: float) -> s
     return "Neutral"
 
 
-# ==============================================================================
-# 8b. GLOBAL MARKETS ENGINE (NEW v3)
-# ==============================================================================
-# FYERS-servable instruments (USDINR, MCX Crude/Gold) use the same
-# never-cached quote path as everything else live. Instruments FYERS does
-# not serve (Gift Nifty, US/Asian/European indices) fall back to a
-# best-effort public quote lookup (Yahoo Finance's public quote endpoint,
-# no key required) and show Data Not Available if that also fails - never
-# invented.
-
 @st.cache_data(ttl=20, show_spinner=False)
 def _fetch_external_quote_cached(ticker: str) -> Optional[Dict[str, float]]:
-    """Very short-lived cache (20s) for external global-market lookups, so a
-    single slow/failed provider doesn't hammer the network on every rerun."""
     return _fetch_external_quote(ticker)
 
 
@@ -1107,10 +912,6 @@ def _fetch_external_quote(ticker: str) -> Optional[Dict[str, float]]:
 
 
 def get_global_markets_summary(_fyers: Any) -> pd.DataFrame:
-    """Build the Global Markets table: USDINR, Crude, Gold (via FYERS) plus
-    Gift Nifty, US Futures, Asian Markets, European Markets (best-effort
-    external lookup). Never raises; missing instruments show Data Not
-    Available rather than being invented."""
     rows: List[Dict[str, Any]] = []
 
     for name, sym in GLOBAL_FYERS_SYMBOLS.items():
@@ -1138,13 +939,6 @@ def get_global_markets_summary(_fyers: Any) -> pd.DataFrame:
 
 
 def score_global_markets(global_df: Optional[pd.DataFrame]) -> float:
-    """
-    Global-market risk sentiment factor (-100..100). Averages the
-    available Change % across US futures / Asian / European markets as a
-    simple 'risk-on vs risk-off' proxy for the overnight/global backdrop.
-    Returns 0.0 (neutral / no confirmation either way) if no global data
-    could be resolved, rather than guessing.
-    """
     try:
         if global_df is None or global_df.empty:
             return 0.0
@@ -1161,22 +955,7 @@ def score_global_markets(global_df: Optional[pd.DataFrame]) -> float:
         return 0.0
 
 
-# ==============================================================================
-# 8c. TRUE MARKET BREADTH ENGINE (NEW v3)
-# ==============================================================================
-# Replaces the old 6-index proxy count with genuine Advance/Decline,
-# Top Gainers/Losers, Volume Leaders, Sector Rotation, and Heavyweight
-# Contribution computed across the actual NIFTY 50 constituents.
-
 def compute_true_market_breadth(_fyers: Any) -> Dict[str, Any]:
-    """
-    Fetch live quotes for the NIFTY 50 constituents in batch and derive:
-    advances/declines/unchanged, top 5 gainers/losers, top 5 volume
-    leaders, and each stock's approximate index-point contribution
-    (weight x change %) ranked to show heavyweight contribution.
-    Returns a fully-keyed dict; on total failure every field is empty /
-    None so the UI shows Data Not Available instead of guessing.
-    """
     empty: Dict[str, Any] = {
         "advances": None, "declines": None, "unchanged": None,
         "top_gainers": pd.DataFrame(), "top_losers": pd.DataFrame(),
@@ -1227,7 +1006,6 @@ def compute_true_market_breadth(_fyers: Any) -> Dict[str, Any]:
 
 
 def get_sector_rotation(_fyers: Any) -> pd.DataFrame:
-    """Live Change % for each NSE sector index, ranked for Sector Rotation."""
     rows: List[Dict[str, Any]] = []
     for name, sym in SECTOR_INDICES.items():
         q = _safe_call(fetch_quote, _fyers, sym, default=None)
@@ -1243,7 +1021,6 @@ def get_sector_rotation(_fyers: Any) -> pd.DataFrame:
 
 
 def score_true_breadth(breadth: Dict[str, Any]) -> float:
-    """True-breadth factor (-100..100) from Advances vs Declines."""
     try:
         adv, dec = breadth.get("advances"), breadth.get("declines")
         if adv is None or dec is None or (adv + dec) == 0:
@@ -1253,28 +1030,8 @@ def score_true_breadth(breadth: Dict[str, Any]) -> float:
         return 0.0
 
 
-# ==============================================================================
-# 9. MULTI-FACTOR AI MARKET DIRECTION ENGINE
-# ==============================================================================
-# Replaces any single-indicator direction call. Every factor below is scored
-# on a -100 (fully bearish) .. +100 (fully bullish) scale, then combined
-# using the weights in DIRECTION_WEIGHTS. A separate Bullish Score and
-# Bearish Score (each 0-100%) are then derived so that BUY/SELL can require
-# a strict >80% conviction plus multi-factor confirmation, per policy.
-#
-# NOTE (v3): The original 7 factors and DIRECTION_WEIGHTS are UNCHANGED, so
-# existing BUY/SELL/WAIT behavior for those factors is identical to before.
-# Greeks, Global Markets, and True Breadth are new, independent factors
-# that are surfaced on their own tabs and folded in ONLY as confidence
-# modifiers via apply_professional_rules() below (per the spec's
-# "professional rules": disagreement between data sources reduces
-# confidence or forces WAIT) - they never silently change what would have
-# been a BUY/SELL/WAIT verdict into the opposite verdict.
-# ==============================================================================
-
 def score_trend(close: float, e20: float, e50: float, e200: Optional[float],
                  vwap_val: float, adx_val: float, supertrend_dir: Optional[int]) -> float:
-    """Trend factor: EMA stack, EMA200 bias, VWAP position, Supertrend, ADX strength."""
     try:
         score, count = 0.0, 0
         if not np.isnan(e20) and not np.isnan(e50):
@@ -1305,7 +1062,6 @@ def score_trend(close: float, e20: float, e50: float, e200: Optional[float],
 def score_option_chain(pcr: Optional[float], oi_change_pct: Optional[float],
                         spot: Optional[float], max_pain: Optional[float],
                         put_writing: Optional[str], call_writing: Optional[str]) -> float:
-    """Option-chain factor: PCR, OI build-up, writer activity, Max Pain pull."""
     try:
         score, count = 0.0, 0
         if pcr is not None:
@@ -1335,7 +1091,6 @@ def score_option_chain(pcr: Optional[float], oi_change_pct: Optional[float],
 
 
 def score_smc(smc: Dict[str, Any]) -> float:
-    """Smart Money Concepts factor: BOS/CHOCH, premium/discount zone, liquidity sweep."""
     try:
         score = 0.0
         bos = smc.get("bos", "")
@@ -1354,16 +1109,15 @@ def score_smc(smc: Dict[str, Any]) -> float:
             score -= 20.0
         sweep = smc.get("liquidity_sweep", "")
         if sweep.startswith("Sell-side"):
-            score -= 15.0  # rejection from above a swing high -> bearish
+            score -= 15.0
         elif sweep.startswith("Buy-side"):
-            score += 15.0  # rejection from below a swing low -> bullish
+            score += 15.0
         return max(-100.0, min(100.0, score))
     except Exception:
         return 0.0
 
 
 def score_news(news_df: Optional[pd.DataFrame]) -> float:
-    """News-sentiment factor."""
     try:
         if news_df is None or news_df.empty:
             return 0.0
@@ -1377,7 +1131,6 @@ def score_news(news_df: Optional[pd.DataFrame]) -> float:
 
 def score_institutional(fii_dii_net: Optional[float], buildup: Optional[str],
                          rel_vol: Optional[float], bullish_candle: bool) -> float:
-    """Institutional-activity factor: FII/DII net flow, futures build-up, volume-confirmed direction."""
     try:
         score, count = 0.0, 0
         if fii_dii_net is not None:
@@ -1399,7 +1152,6 @@ def score_institutional(fii_dii_net: Optional[float], buildup: Optional[str],
 
 
 def score_momentum(rsi_val: float, macd_hist: float) -> float:
-    """Momentum factor: RSI displacement from midline + MACD histogram."""
     try:
         rsi_score = (rsi_val - 50.0) / 50.0 * 100.0
         macd_score = max(-100.0, min(100.0, macd_hist * 1000.0))
@@ -1409,7 +1161,6 @@ def score_momentum(rsi_val: float, macd_hist: float) -> float:
 
 
 def score_volume(rel_vol: Optional[float], bullish_candle: bool) -> float:
-    """Volume factor: relative volume spike direction."""
     try:
         if rel_vol is None:
             return 0.0
@@ -1420,26 +1171,16 @@ def score_volume(rel_vol: Optional[float], bullish_candle: bool) -> float:
 
 
 def score_greeks(option_chain: Dict[str, Any]) -> float:
-    """
-    NEW (v3) Greeks factor (-100..100, informational - not part of
-    DIRECTION_WEIGHTS): call/put delta skew plus IV Rank extremes.
-    A call-delta-heavy book (more aggregate delta on the call side than
-    puts) reads bullish; sustained low IV Rank favors premium buying language
-    (informational only, not itself directional) so it is weighted lightly.
-    """
     try:
         call_delta = option_chain.get("avg_call_delta")
         put_delta = option_chain.get("avg_put_delta")
         iv_rank = option_chain.get("iv_rank")
         score, count = 0.0, 0
         if call_delta is not None and put_delta is not None:
-            # call_delta in [0,1], put_delta in [-1,0] typically
-            skew = call_delta + put_delta  # >0 => call-side heavier => bullish
+            skew = call_delta + put_delta
             score += max(-100.0, min(100.0, skew * 150.0))
             count += 1
         if iv_rank is not None:
-            # Extremely high IV rank slightly favors mean-reversion caution
-            # (small, deliberately weak contribution - informational only).
             score += max(-15.0, min(15.0, (50.0 - iv_rank) * 0.3))
             count += 1
         return max(-100.0, min(100.0, score / count if count else 0.0))
@@ -1458,13 +1199,6 @@ def compute_weighted_direction(
     vix_value: Optional[float] = None,
     atr_pct: Optional[float] = None,
 ) -> Dict[str, Any]:
-    """
-    Aggregate all seven weighted factors into a full AI Market Direction
-    verdict: Bullish Score, Bearish Score, direction label (Strong
-    Bullish/Bullish/Neutral/Bearish/Strong Bearish), confidence, probability
-    up/down, market strength, risk %, opportunity %, and a strict
-    BUY/SELL/WAIT recommendation.
-    """
     try:
         raw = {
             "trend": trend_score, "option_chain": option_chain_score, "smc": smc_score,
@@ -1550,23 +1284,6 @@ def apply_professional_rules(
     option_chain_vs_futures_agree: Optional[bool],
     greeks_vs_oi_agree: Optional[bool],
 ) -> Dict[str, Any]:
-    """
-    NEW (v3): Apply the spec's "Professional Rules" (Step 12) as
-    post-hoc confidence modifiers on top of the existing 7-factor verdict,
-    WITHOUT re-weighting or overturning it into the opposite direction:
-
-      - If Futures and Spot disagree -> reduce confidence.
-      - If Option Chain disagrees with Futures -> force WAIT.
-      - If Greeks disagree with OI -> force WAIT.
-      - A strongly risk-off Global Markets backdrop or negative True
-        Breadth alongside a BUY (or the mirror image for SELL) also
-        reduces confidence, since the spec calls for comparing Spot,
-        Futures, Option Chain, Greeks, FII/DII, Breadth, and Global
-        Markets before concluding.
-
-    Any unknown (None) agreement flag is treated as "insufficient data to
-    check" and is skipped rather than assumed to agree or disagree.
-    """
     out = dict(direction)
     notes: List[str] = list(out.get("professional_notes", []))
     confidence = out.get("confidence", 50.0)
@@ -1605,7 +1322,6 @@ def apply_professional_rules(
 
 @dataclass
 class InstrumentSignals:
-    """Bundle of everything needed to score one instrument (index/stock/future)."""
     close: float
     e20: float
     e50: float
@@ -1631,7 +1347,6 @@ def evaluate_instrument_direction(
     fii_dii_net: Optional[float],
     vix_value: Optional[float],
 ) -> Dict[str, Any]:
-    """Run every factor scorer for one instrument and produce the final AI verdict."""
     trend_s = score_trend(signals.close, signals.e20, signals.e50, signals.e200,
                            signals.vwap_val, signals.adx_val, signals.supertrend_dir)
     oc_s = score_option_chain(
@@ -1660,18 +1375,10 @@ def evaluate_instrument_direction(
 
 
 def check_agreement(a_direction_positive: Optional[bool], b_direction_positive: Optional[bool]) -> Optional[bool]:
-    """Helper: compare two directional booleans; None if either is unknown."""
     if a_direction_positive is None or b_direction_positive is None:
         return None
     return a_direction_positive == b_direction_positive
 
-
-# ==============================================================================
-# LEGACY BREADTH SCORE (kept for backward compatibility on the AI Dashboard
-# tab - a simple count of the 6 tracked indices' Change% sign. Superseded
-# by compute_true_market_breadth(), which scans the actual NIFTY 50
-# constituents for genuine Advance/Decline breadth.)
-# ==============================================================================
 
 def compute_market_breadth(market_df: pd.DataFrame) -> Dict[str, int]:
     try:
@@ -1685,7 +1392,6 @@ def compute_market_breadth(market_df: pd.DataFrame) -> Dict[str, int]:
 
 
 def classify_vix(vix_value: float) -> Dict[str, Any]:
-    """Classify India VIX regime and suggest risk / position sizing (Section 3)."""
     try:
         if vix_value < 12:
             regime, risk, confidence, size = "Low Volatility", 20, 85, "Large (75-100% of normal size)"
@@ -1700,16 +1406,7 @@ def classify_vix(vix_value: float) -> Dict[str, Any]:
         return {"regime": "Unknown", "risk_pct": 50, "confidence_pct": 50, "position_size": "Normal"}
 
 
-# ==============================================================================
-# 10. SHARED INSTRUMENT ANALYSIS HELPER
-# ==============================================================================
-
 def _analyze_instrument(fyers: Any, symbol: str) -> Optional[Dict[str, Any]]:
-    """
-    Fetch history + compute every indicator/SMC/option-chain field needed for
-    both the Index/Stock views and the AI Direction engine. Returns None if
-    historical data is unavailable (caller shows DATA_NA).
-    """
     df = fetch_history_cached(fyers, symbol, "15", 30)
     if df is None or df.empty or len(df) < 5:
         return None
@@ -1733,7 +1430,11 @@ def _analyze_instrument(fyers: Any, symbol: str) -> Optional[Dict[str, Any]]:
     bullish_candle = close > open_
 
     avg_vol = df["volume"].tail(20).mean()
-    rel_vol = round(float(df["volume"].iloc[-1] / avg_vol), 2) if avg_vol else None
+    rel_vol = (
+        round(float(df["volume"].iloc[-1] / avg_vol), 2)
+        if avg_vol and not np.isnan(avg_vol)
+        else None
+    )
 
     smc = compute_smc(df)
     option_chain = _safe_call(fetch_option_chain_data, fyers, symbol, default=dict(_EMPTY_OPTION_CHAIN_METRICS))
@@ -1749,12 +1450,7 @@ def _analyze_instrument(fyers: Any, symbol: str) -> Optional[Dict[str, Any]]:
     }
 
 
-# ==============================================================================
-# 11. UI RENDER FUNCTIONS
-# ==============================================================================
-
 def render_ai_dashboard(direction: Dict[str, Any], breadth: Dict[str, int], true_breadth: Dict[str, Any]) -> None:
-    """Section 1: AI Dashboard - overall AI Market Direction."""
     st.subheader("🧠 AI Dashboard")
 
     status_emoji = {
@@ -1827,7 +1523,6 @@ def render_ai_dashboard(direction: Dict[str, Any], breadth: Dict[str, int], true
 
 
 def render_market_summary(market_df: pd.DataFrame) -> None:
-    """Section 2: Market Summary."""
     st.subheader("📊 Market Summary (Live)")
     if market_df.empty:
         st.warning(DATA_NA)
@@ -1849,7 +1544,6 @@ def render_market_summary(market_df: pd.DataFrame) -> None:
 
 
 def render_vix_analysis(vix_value: Optional[float]) -> None:
-    """Section 3: India VIX Analysis."""
     st.subheader("📈 India VIX Analysis")
     if vix_value is None:
         st.warning(DATA_NA)
@@ -1864,7 +1558,6 @@ def render_vix_analysis(vix_value: Optional[float]) -> None:
 
 
 def render_live_news(news_df: pd.DataFrame) -> None:
-    """Section 4: Live News."""
     st.subheader("📰 Live News")
     if news_df.empty:
         st.warning(DATA_NA)
@@ -1876,7 +1569,6 @@ def render_live_news(news_df: pd.DataFrame) -> None:
 
 
 def render_ai_news_analysis(news_df: pd.DataFrame) -> None:
-    """Section 5: AI News Analysis."""
     st.subheader("🤖 AI News Analysis")
     if news_df.empty:
         st.warning(DATA_NA)
@@ -1902,7 +1594,6 @@ def render_ai_news_analysis(news_df: pd.DataFrame) -> None:
 
 
 def render_fii_dii() -> Dict[str, float]:
-    """Section 6: FII / DII. Returns the effective data dict (live or manual)."""
     st.subheader("🏦 FII / DII Activity")
     data = fetch_fii_dii()
     if data is None:
@@ -1938,7 +1629,6 @@ def render_fii_dii() -> Dict[str, float]:
 
 
 def render_index_analysis(fyers: Any) -> None:
-    """Section 7: Index Analysis."""
     st.subheader("📐 Index Analysis")
     for name, symbol in INDEX_SYMBOLS.items():
         if name == "INDIA VIX":
@@ -1992,7 +1682,6 @@ def render_index_analysis(fyers: Any) -> None:
 
 
 def render_futures_analysis(fyers: Any) -> None:
-    """Section 8: Futures Analysis."""
     st.subheader("📉 Futures Analysis")
     for label, underlying in FUTURES_UNDERLYINGS.items():
         with st.expander(label, expanded=False):
@@ -2009,8 +1698,6 @@ def render_futures_analysis(fyers: Any) -> None:
                 oi_source = "FYERS"
 
                 if oi is None or oi_change_pct is None:
-                    # Per spec: never show Data Not Available without trying
-                    # an alternate source first.
                     fallback = _safe_call(fetch_futures_oi_nse_fallback, underlying, default=None)
                     if fallback:
                         oi = fallback.get("oi") if oi is None else oi
@@ -2049,7 +1736,6 @@ def render_futures_analysis(fyers: Any) -> None:
 
 
 def render_stock_analysis(fyers: Any) -> None:
-    """Section 9: Stock Analysis (watchlist)."""
     st.subheader("📌 Stock Analysis (Watchlist)")
     if "ai_watchlist" not in st.session_state:
         st.session_state.ai_watchlist = list(WATCHLIST_DEFAULT)
@@ -2124,7 +1810,6 @@ def render_stock_analysis(fyers: Any) -> None:
 
 
 def render_smc_section(fyers: Any) -> None:
-    """Section 10: Smart Money Concepts."""
     st.subheader("🧩 Smart Money Concepts (SMC)")
     watchlist = st.session_state.get("ai_watchlist", WATCHLIST_DEFAULT)
     options = [v for k, v in INDEX_SYMBOLS.items() if k != "INDIA VIX"] + list(watchlist)
@@ -2161,7 +1846,6 @@ def render_smc_section(fyers: Any) -> None:
 
 
 def render_greeks_section(fyers: Any) -> None:
-    """NEW (v3) Section: Options Greeks Engine."""
     st.subheader("🧮 Options Greeks Engine")
     options = [v for k, v in INDEX_SYMBOLS.items() if k != "INDIA VIX"]
     selected = st.selectbox("Select instrument for Greeks analysis", options, key="greeks_symbol_select")
@@ -2221,7 +1905,6 @@ def render_greeks_section(fyers: Any) -> None:
 
 
 def render_global_markets(fyers: Any) -> pd.DataFrame:
-    """NEW (v3) Section: Global Markets. Returns the fetched DataFrame for reuse in scoring."""
     st.subheader("🌍 Global Markets")
     with st.spinner(f"{FETCHING_MSG} global market data..."):
         global_df = _safe_call(get_global_markets_summary, fyers, default=pd.DataFrame())
@@ -2245,7 +1928,6 @@ def render_global_markets(fyers: Any) -> pd.DataFrame:
 
 
 def render_true_breadth_section(fyers: Any) -> Dict[str, Any]:
-    """NEW (v3) Section: True Market Breadth. Returns the breadth dict for reuse in scoring."""
     st.subheader("📊 True Market Breadth (NIFTY 50)")
     with st.spinner(f"{FETCHING_MSG} market breadth..."):
         breadth = _safe_call(compute_true_market_breadth, fyers, default={})
@@ -2300,7 +1982,6 @@ def render_true_breadth_section(fyers: Any) -> Dict[str, Any]:
 def render_ai_prediction_section(fyers: Any, news_df: pd.DataFrame, fii_dii_net: float,
                                   vix_value: Optional[float], global_df: Optional[pd.DataFrame],
                                   true_breadth: Optional[Dict[str, Any]]) -> None:
-    """Section 11: AI Prediction - full multi-factor confirmation engine."""
     st.subheader("🎯 AI Prediction")
     watchlist = st.session_state.get("ai_watchlist", WATCHLIST_DEFAULT)
     options = [v for k, v in INDEX_SYMBOLS.items() if k != "INDIA VIX"] + list(watchlist)
@@ -2313,7 +1994,6 @@ def render_ai_prediction_section(fyers: Any, news_df: pd.DataFrame, fii_dii_net:
         return
 
     try:
-        avg_vol = a["df"]["volume"].tail(20).mean()
         rel_vol = a["rel_vol"]
         oi_change_pct = a["option_chain"].get("oi_change_pct") or 0.0
         price_change_pct_now = (
@@ -2330,7 +2010,6 @@ def render_ai_prediction_section(fyers: Any, news_df: pd.DataFrame, fii_dii_net:
         )
         direction = evaluate_instrument_direction(signals, news_df, fii_dii_net, vix_value)
 
-        # --- Professional cross-checks (v3) ---------------------------
         greeks_s = score_greeks(a["option_chain"])
         global_s = score_global_markets(global_df)
         breadth_s = score_true_breadth(true_breadth or {})
@@ -2359,7 +2038,7 @@ def render_ai_prediction_section(fyers: Any, news_df: pd.DataFrame, fii_dii_net:
         oi_positive = None
         delta_oi = a["option_chain"].get("delta_oi")
         if delta_oi is not None:
-            oi_positive = delta_oi < 0  # more Call OI than Put OI -> resistance-side heavy -> treat >CE as bearish bias proxy is debatable; use put_writing instead
+            oi_positive = delta_oi < 0
         greeks_vs_oi_agree = check_agreement(greeks_positive, oi_positive)
 
         direction = apply_professional_rules(
@@ -2427,23 +2106,7 @@ def render_ai_prediction_section(fyers: Any, news_df: pd.DataFrame, fii_dii_net:
         st.warning(f"Unable to generate AI prediction for {selected} ({exc}). {DATA_NA}")
 
 
-# ==============================================================================
-# 12. MAIN ENTRY POINT
-# ==============================================================================
-
 def show_ai_market_intelligence(fyers: Any) -> None:
-    """
-    Public entry point. Renders the complete AI Market Intelligence dashboard.
-
-    Call this from market.py:
-
-        from ai_market_intelligence import show_ai_market_intelligence
-        show_ai_market_intelligence(fyers)
-
-    This function is fully self-contained, never raises, and does not modify
-    scanner.py, option_chain.py, app.py, market.py, trading.py, or any
-    existing BUY/SELL signal logic.
-    """
     st.markdown("## 🧠 AI Market Intelligence")
     st.caption(f"Last updated: {dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} · Auto-refresh: 30s")
 
@@ -2469,7 +2132,7 @@ def show_ai_market_intelligence(fyers: Any) -> None:
     if fii_dii_data:
         fii_dii_net = (fii_dii_data["fii_buy"] - fii_dii_data["fii_sell"]) - (fii_dii_data["dii_buy"] - fii_dii_data["dii_sell"])
 
-    breadth = compute_market_breadth(market_df)  # legacy 6-index proxy (kept for compatibility)
+    breadth = compute_market_breadth(market_df)
 
     with st.spinner(f"{FETCHING_MSG} global markets..."):
         global_df = _safe_call(get_global_markets_summary, fyers, default=pd.DataFrame())
@@ -2477,9 +2140,6 @@ def show_ai_market_intelligence(fyers: Any) -> None:
     with st.spinner(f"{FETCHING_MSG} true market breadth..."):
         true_breadth = _safe_call(compute_true_market_breadth, fyers, default={})
 
-    # Overall AI Market Direction: NIFTY is used as the primary composite
-    # instrument (all seven weighted factors), which is far more reliable
-    # than any single indicator such as PCR, News, or OI alone.
     with st.spinner(f"{FETCHING_MSG} AI direction inputs..."):
         nifty_analysis = _analyze_instrument(fyers, INDEX_SYMBOLS["NIFTY"])
 
