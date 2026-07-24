@@ -1,0 +1,764 @@
+"""
+================================================================================
+ fno_engine.py
+ Broker-agnostic core of the F&O TOP MOVERS BUY/SELL ENGINE.
+
+ This module contains no data-fetching / no broker calls. It only takes
+ OHLCV DataFrames and a normalized option-chain structure and turns them
+ into indicators, Smart Money Concepts structure, scores, probabilities
+ and a full equity + options trade plan. Any broker adapter (Fyers,
+ yfinance, Zerodha, etc.) can feed this engine as long as it supplies
+ a DataFrame with columns [Open, High, Low, Close, Volume] indexed by
+ date, and (optionally) a normalized option chain via
+ `normalize_option_chain_generic`.
+
+ HONEST DATA DISCLAIMER: "Institutional Score" / "Smart Money Score" /
+ "Delivery Score" are computed from public price, volume and OI proxies,
+ not from certified institutional order-flow data (which is not publicly
+ available in real time). This is a research/decision-support tool, not
+ investment advice.
+================================================================================
+"""
+
+from __future__ import annotations
+
+import math
+import datetime as dt
+from dataclasses import dataclass
+from typing import Optional
+
+import numpy as np
+import pandas as pd
+
+try:
+    from scipy.stats import norm
+    SCIPY_AVAILABLE = True
+except Exception:
+    SCIPY_AVAILABLE = False
+
+RISK_FREE_RATE = 0.065
+DEFAULT_LOT_SIZE_NOTIONAL = 500000
+
+KNOWN_LOT_SIZES = {
+    "RELIANCE": 500, "TCS": 175, "HDFCBANK": 550, "INFY": 400,
+    "ICICIBANK": 700, "SBIN": 1500, "AXISBANK": 625, "KOTAKBANK": 400,
+    "HINDUNILVR": 300, "ITC": 1600, "BHARTIARTL": 475, "LT": 275,
+    "BAJFINANCE": 125, "BAJAJFINSV": 500, "ASIANPAINT": 200,
+    "MARUTI": 100, "TITAN": 375, "SUNPHARMA": 700, "ULTRACEMCO": 100,
+    "NESTLEIND": 250, "WIPRO": 3000, "HCLTECH": 700, "TECHM": 600,
+    "ADANIENT": 250, "ADANIPORTS": 800, "TATASTEEL": 4250,
+    "TATAMOTORS": 1425, "JSWSTEEL": 1350, "HINDALCO": 1400,
+    "COALINDIA": 2100, "NTPC": 3000, "POWERGRID": 2700, "ONGC": 3850,
+    "BPCL": 1800, "GRASIM": 475, "CIPLA": 650, "DRREDDY": 125,
+    "APOLLOHOSP": 125, "EICHERMOT": 175, "HEROMOTOCO": 300,
+    "M&M": 350, "SBILIFE": 750, "HDFCLIFE": 1100, "DLF": 1650,
+    "INDIGO": 300, "ZOMATO": 3425, "PAYTM": 800, "TRENT": 100,
+    "DMART": 200, "INDUSINDBK": 700, "FEDERALBNK": 5000, "PNB": 8000,
+    "BANKBARODA": 2925, "CANBK": 6750, "SAIL": 6500, "VEDL": 1600,
+    "GAIL": 3450, "TATAPOWER": 2850,
+}
+
+
+# ============================================================================
+# SAFE UTILITIES
+# ============================================================================
+
+def safe_float(x, default: float = 0.0) -> float:
+    try:
+        if x is None:
+            return default
+        f = float(x)
+        if math.isnan(f) or math.isinf(f):
+            return default
+        return f
+    except Exception:
+        return default
+
+
+def safe_round(x, digits: int = 2, default: float = 0.0) -> float:
+    return round(safe_float(x, default), digits)
+
+
+def clip(x: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, x))
+
+
+def pct(part: float, whole: float, default: float = 0.0) -> float:
+    whole = safe_float(whole)
+    if whole == 0:
+        return default
+    return safe_float(part) / whole * 100.0
+
+
+def is_nan(x) -> bool:
+    try:
+        return math.isnan(float(x))
+    except Exception:
+        return False
+
+
+# ============================================================================
+# TECHNICAL INDICATORS
+# ============================================================================
+
+def ema(series: pd.Series, span: int) -> pd.Series:
+    return series.ewm(span=span, adjust=False).mean()
+
+
+def rsi(series: pd.Series, period: int = 14) -> pd.Series:
+    delta = series.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.ewm(alpha=1 / period, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1 / period, adjust=False).mean()
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    out = 100 - (100 / (1 + rs))
+    return out.fillna(50)
+
+
+def macd(series: pd.Series, fast=12, slow=26, signal=9):
+    macd_line = ema(series, fast) - ema(series, slow)
+    signal_line = ema(macd_line, signal)
+    hist = macd_line - signal_line
+    return macd_line, signal_line, hist
+
+
+def atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    high, low, close = df["High"], df["Low"], df["Close"]
+    prev_close = close.shift(1)
+    tr = pd.concat([
+        (high - low),
+        (high - prev_close).abs(),
+        (low - prev_close).abs(),
+    ], axis=1).max(axis=1)
+    return tr.ewm(alpha=1 / period, adjust=False).mean()
+
+
+def supertrend(df: pd.DataFrame, period: int = 10, multiplier: float = 3.0):
+    hl2 = (df["High"] + df["Low"]) / 2
+    atr_val = atr(df, period)
+    upperband = hl2 + multiplier * atr_val
+    lowerband = hl2 - multiplier * atr_val
+    st_line = pd.Series(index=df.index, dtype=float)
+    direction = pd.Series(index=df.index, dtype=int)
+    st_line.iloc[0] = upperband.iloc[0]
+    direction.iloc[0] = 1
+    for i in range(1, len(df)):
+        close = df["Close"].iloc[i]
+        if close > upperband.iloc[i - 1]:
+            direction.iloc[i] = 1
+        elif close < lowerband.iloc[i - 1]:
+            direction.iloc[i] = -1
+        else:
+            direction.iloc[i] = direction.iloc[i - 1]
+            if direction.iloc[i] == 1 and lowerband.iloc[i] < lowerband.iloc[i - 1]:
+                lowerband.iloc[i] = lowerband.iloc[i - 1]
+            if direction.iloc[i] == -1 and upperband.iloc[i] > upperband.iloc[i - 1]:
+                upperband.iloc[i] = upperband.iloc[i - 1]
+        st_line.iloc[i] = lowerband.iloc[i] if direction.iloc[i] == 1 else upperband.iloc[i]
+    return st_line, direction
+
+
+def adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    high, low = df["High"], df["Low"]
+    up_move = high.diff()
+    down_move = -low.diff()
+    plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
+    minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
+    tr = atr(df, period)
+    plus_di = 100 * pd.Series(plus_dm, index=df.index).ewm(alpha=1 / period, adjust=False).mean() / tr.replace(0, np.nan)
+    minus_di = 100 * pd.Series(minus_dm, index=df.index).ewm(alpha=1 / period, adjust=False).mean() / tr.replace(0, np.nan)
+    dx = (abs(plus_di - minus_di) / (plus_di + minus_di).replace(0, np.nan)) * 100
+    return dx.ewm(alpha=1 / period, adjust=False).mean().fillna(0)
+
+
+def bollinger_bands(series: pd.Series, period: int = 20, std_mult: float = 2.0):
+    mid = series.rolling(period).mean()
+    std = series.rolling(period).std()
+    return mid + std_mult * std, mid, mid - std_mult * std
+
+
+def vwap(df: pd.DataFrame) -> pd.Series:
+    typical = (df["High"] + df["Low"] + df["Close"]) / 3
+    cum_vol = df["Volume"].cumsum().replace(0, np.nan)
+    return (typical * df["Volume"]).cumsum() / cum_vol
+
+
+def relative_volume(df: pd.DataFrame, lookback: int = 20) -> float:
+    if len(df) < lookback + 1:
+        return 1.0
+    avg_vol = df["Volume"].tail(lookback + 1).iloc[:-1].mean()
+    last_vol = df["Volume"].iloc[-1]
+    if avg_vol == 0 or np.isnan(avg_vol):
+        return 1.0
+    return safe_float(last_vol / avg_vol, 1.0)
+
+
+def realized_volatility_annualized_pct(df: pd.DataFrame, lookback: int = 20) -> float:
+    """Close-to-close annualized realized volatility, used as an IV proxy
+    when the broker's option chain does not supply implied volatility."""
+    try:
+        rets = df["Close"].pct_change().tail(lookback).dropna()
+        if len(rets) < 5:
+            return float("nan")
+        return safe_round(rets.std() * math.sqrt(252) * 100, 2)
+    except Exception:
+        return float("nan")
+
+
+def delivery_proxy_pct(df: pd.DataFrame, lookback: int = 20) -> float:
+    """Volume-steadiness based delivery-participation proxy (0-100). Not
+    the official NSE delivery %, which is not exposed by broker trading
+    APIs; this proxy rewards steady (less speculative/intraday-spiky)
+    volume as a stand-in for higher delivery-based participation."""
+    try:
+        vol = df["Volume"].tail(lookback)
+        if vol.empty or vol.mean() == 0:
+            return float("nan")
+        cv = safe_float(vol.std() / vol.mean(), 1.0)
+        return round(clip(70 - cv * 40, 15, 85), 2)
+    except Exception:
+        return float("nan")
+
+
+# ============================================================================
+# SMART MONEY CONCEPTS (SMC)
+# ============================================================================
+
+def find_swing_points(df: pd.DataFrame, window: int = 3):
+    highs, lows = df["High"], df["Low"]
+    swing_high_idx, swing_low_idx = [], []
+    for i in range(window, len(df) - window):
+        seg_h = highs.iloc[i - window:i + window + 1]
+        seg_l = lows.iloc[i - window:i + window + 1]
+        if highs.iloc[i] == seg_h.max():
+            swing_high_idx.append(i)
+        if lows.iloc[i] == seg_l.min():
+            swing_low_idx.append(i)
+    return swing_high_idx, swing_low_idx
+
+
+def market_structure_analysis(df: pd.DataFrame) -> dict:
+    result = {
+        "structure": "Sideways", "bos": "None", "choch": "None",
+        "order_block": "None", "breaker_block": "None", "fvg": "None",
+        "liquidity_sweep": "None",
+    }
+    try:
+        sh_idx, sl_idx = find_swing_points(df, window=3)
+        if len(sh_idx) < 2 or len(sl_idx) < 2:
+            return result
+
+        recent_highs = [df["High"].iloc[i] for i in sh_idx[-3:]]
+        recent_lows = [df["Low"].iloc[i] for i in sl_idx[-3:]]
+
+        higher_highs = len(recent_highs) >= 2 and recent_highs[-1] > recent_highs[-2]
+        higher_lows = len(recent_lows) >= 2 and recent_lows[-1] > recent_lows[-2]
+        lower_highs = len(recent_highs) >= 2 and recent_highs[-1] < recent_highs[-2]
+        lower_lows = len(recent_lows) >= 2 and recent_lows[-1] < recent_lows[-2]
+
+        if higher_highs and higher_lows:
+            result["structure"] = "Bullish"
+        elif lower_highs and lower_lows:
+            result["structure"] = "Bearish"
+
+        last_close = df["Close"].iloc[-1]
+        last_sh = df["High"].iloc[sh_idx[-1]]
+        last_sl = df["Low"].iloc[sl_idx[-1]]
+
+        if result["structure"] == "Bullish" and last_close > last_sh:
+            result["bos"] = "Bullish BOS"
+        elif result["structure"] == "Bearish" and last_close < last_sl:
+            result["bos"] = "Bearish BOS"
+
+        if result["structure"] == "Bullish" and last_close < last_sl:
+            result["choch"] = "Bearish CHOCH"
+        elif result["structure"] == "Bearish" and last_close > last_sh:
+            result["choch"] = "Bullish CHOCH"
+
+        closes, opens = df["Close"], df["Open"]
+        atr_series = atr(df)
+        ob_type, ob_level = "None", None
+        for i in range(len(df) - 2, max(len(df) - 25, 5), -1):
+            bullish_impulse = closes.iloc[i + 1] > opens.iloc[i + 1] and \
+                (closes.iloc[i + 1] - opens.iloc[i + 1]) > atr_series.iloc[i + 1] * 0.8
+            bearish_impulse = closes.iloc[i + 1] < opens.iloc[i + 1] and \
+                (opens.iloc[i + 1] - closes.iloc[i + 1]) > atr_series.iloc[i + 1] * 0.8
+            if bullish_impulse and closes.iloc[i] < opens.iloc[i]:
+                ob_type, ob_level = "Bullish OB", df["Low"].iloc[i]
+                break
+            if bearish_impulse and closes.iloc[i] > opens.iloc[i]:
+                ob_type, ob_level = "Bearish OB", df["High"].iloc[i]
+                break
+        if ob_level is not None:
+            result["order_block"] = f"{ob_type} @ {safe_round(ob_level)}"
+
+        if result["choch"] != "None" and ob_level is not None:
+            breaker_type = "Bullish Breaker" if "Bullish" in result["choch"] else "Bearish Breaker"
+            result["breaker_block"] = f"{breaker_type} @ {safe_round(ob_level)}"
+
+        for i in range(len(df) - 3, max(len(df) - 12, 0), -1):
+            c1_high, c1_low = df["High"].iloc[i], df["Low"].iloc[i]
+            c3_high, c3_low = df["High"].iloc[i + 2], df["Low"].iloc[i + 2]
+            if c1_high < c3_low:
+                result["fvg"] = f"Bullish FVG {safe_round(c1_high)}-{safe_round(c3_low)}"
+                break
+            if c1_low > c3_high:
+                result["fvg"] = f"Bearish FVG {safe_round(c3_high)}-{safe_round(c1_low)}"
+                break
+
+        last_bar = df.iloc[-1]
+        if len(sh_idx) >= 1 and last_bar["High"] > df["High"].iloc[sh_idx[-1]] and last_bar["Close"] < df["High"].iloc[sh_idx[-1]]:
+            result["liquidity_sweep"] = "Sell-side Sweep (High swept)"
+        elif len(sl_idx) >= 1 and last_bar["Low"] < df["Low"].iloc[sl_idx[-1]] and last_bar["Close"] > df["Low"].iloc[sl_idx[-1]]:
+            result["liquidity_sweep"] = "Buy-side Sweep (Low swept)"
+    except Exception:
+        pass
+    return result
+
+
+# ============================================================================
+# OPTION-CHAIN ANALYTICS (broker-agnostic: consumes a normalized structure)
+# ============================================================================
+
+def normalize_option_chain_generic(rows: list, spot: float, expiry: str) -> dict:
+    """
+    `rows` must be a list of dicts, each with keys:
+        strike (float), ce_oi, pe_oi, ce_oi_chg, pe_oi_chg,
+        ce_iv (float or NaN), pe_iv (float or NaN),
+        ce_ltp (float or NaN), pe_ltp (float or NaN)
+    Returns the full analytics dict used downstream by scoring/trade-plan.
+    Safe for empty/partial input.
+    """
+    result = {
+        "available": False, "pcr": float("nan"), "ce_oi_total": float("nan"),
+        "pe_oi_total": float("nan"), "oi_change_ce": float("nan"),
+        "oi_change_pe": float("nan"), "avg_iv": float("nan"),
+        "max_pain": float("nan"), "atm_strike": float("nan"),
+        "itm_strike": float("nan"), "otm_strike": float("nan"),
+        "best_expiry": expiry or "N/A", "ce_ltp_atm": float("nan"),
+        "pe_ltp_atm": float("nan"), "writers_bias": "Unknown",
+    }
+    if not rows:
+        return result
+    try:
+        strikes = sorted(set(safe_float(r["strike"]) for r in rows if safe_float(r.get("strike"), -1) > 0))
+        if not strikes:
+            return result
+
+        atm_strike = min(strikes, key=lambda s: abs(s - spot))
+        step = min([abs(strikes[i + 1] - strikes[i]) for i in range(len(strikes) - 1)], default=50) if len(strikes) > 1 else 50
+        itm_strike = atm_strike - step
+        otm_strike = atm_strike + step
+
+        ce_oi_total = pe_oi_total = ce_oi_chg = pe_oi_chg = 0.0
+        iv_values = []
+        pain_by_strike = {}
+
+        for target_strike in strikes:
+            total_loss = 0.0
+            for r in rows:
+                strike = safe_float(r.get("strike"))
+                ce_oi = safe_float(r.get("ce_oi"))
+                pe_oi = safe_float(r.get("pe_oi"))
+                total_loss += max(target_strike - strike, 0) * ce_oi
+                total_loss += max(strike - target_strike, 0) * pe_oi
+            pain_by_strike[target_strike] = total_loss
+        max_pain = min(pain_by_strike, key=pain_by_strike.get) if pain_by_strike else float("nan")
+
+        ce_ltp_atm = pe_ltp_atm = float("nan")
+        for r in rows:
+            ce_oi_total += safe_float(r.get("ce_oi"))
+            pe_oi_total += safe_float(r.get("pe_oi"))
+            ce_oi_chg += safe_float(r.get("ce_oi_chg"))
+            pe_oi_chg += safe_float(r.get("pe_oi_chg"))
+            if safe_float(r.get("ce_iv"), 0) > 0:
+                iv_values.append(safe_float(r.get("ce_iv")))
+            if safe_float(r.get("pe_iv"), 0) > 0:
+                iv_values.append(safe_float(r.get("pe_iv")))
+            if safe_float(r.get("strike")) == atm_strike:
+                ce_ltp_atm = safe_float(r.get("ce_ltp"), float("nan"))
+                pe_ltp_atm = safe_float(r.get("pe_ltp"), float("nan"))
+
+        pcr = safe_float(pe_oi_total) / ce_oi_total if ce_oi_total else float("nan")
+
+        if ce_oi_chg > pe_oi_chg * 1.2:
+            writers_bias = "Bearish (Call writers active)"
+        elif pe_oi_chg > ce_oi_chg * 1.2:
+            writers_bias = "Bullish (Put writers active)"
+        else:
+            writers_bias = "Neutral"
+
+        result.update(
+            available=True, pcr=safe_round(pcr, 3),
+            ce_oi_total=ce_oi_total, pe_oi_total=pe_oi_total,
+            oi_change_ce=ce_oi_chg, oi_change_pe=pe_oi_chg,
+            avg_iv=safe_round(np.mean(iv_values), 2) if iv_values else float("nan"),
+            max_pain=safe_float(max_pain), atm_strike=atm_strike,
+            itm_strike=itm_strike, otm_strike=otm_strike,
+            ce_ltp_atm=ce_ltp_atm, pe_ltp_atm=pe_ltp_atm,
+            writers_bias=writers_bias,
+        )
+    except Exception:
+        pass
+    return result
+
+
+def days_to_expiry(expiry_str: str) -> float:
+    """Accepts common date formats (DD-MM-YYYY, DD-Mon-YYYY, YYYY-MM-DD) or
+    a unix timestamp string; defaults to 7 days if unparsable."""
+    if not expiry_str or expiry_str == "N/A":
+        return 7.0
+    for fmt in ("%d-%m-%Y", "%d-%b-%Y", "%Y-%m-%d"):
+        try:
+            exp_date = dt.datetime.strptime(expiry_str, fmt).date()
+            return max((exp_date - dt.date.today()).days, 1)
+        except Exception:
+            continue
+    try:
+        exp_date = dt.datetime.fromtimestamp(int(expiry_str)).date()
+        return max((exp_date - dt.date.today()).days, 1)
+    except Exception:
+        return 7.0
+
+
+def black_scholes_greeks(spot, strike, t_years, iv_pct, r=RISK_FREE_RATE, opt_type="CE"):
+    out = {"delta": 0.0, "gamma": 0.0, "theta": 0.0, "vega": 0.0}
+    try:
+        iv = iv_pct / 100.0
+        if not SCIPY_AVAILABLE or spot <= 0 or strike <= 0 or t_years <= 0 or iv <= 0:
+            return out
+        d1 = (math.log(spot / strike) + (r + 0.5 * iv ** 2) * t_years) / (iv * math.sqrt(t_years))
+        d2 = d1 - iv * math.sqrt(t_years)
+        pdf_d1 = norm.pdf(d1)
+        if opt_type == "CE":
+            delta = norm.cdf(d1)
+            theta = (-(spot * pdf_d1 * iv) / (2 * math.sqrt(t_years))
+                     - r * strike * math.exp(-r * t_years) * norm.cdf(d2)) / 365
+        else:
+            delta = norm.cdf(d1) - 1
+            theta = (-(spot * pdf_d1 * iv) / (2 * math.sqrt(t_years))
+                     + r * strike * math.exp(-r * t_years) * norm.cdf(-d2)) / 365
+        gamma = pdf_d1 / (spot * iv * math.sqrt(t_years))
+        vega = spot * pdf_d1 * math.sqrt(t_years) / 100
+        out.update(delta=safe_round(delta, 4), gamma=safe_round(gamma, 5),
+                    theta=safe_round(theta, 3), vega=safe_round(vega, 3))
+    except Exception:
+        pass
+    return out
+
+
+def black_scholes_price(spot, strike, t_years, iv_pct, r=RISK_FREE_RATE, opt_type="CE") -> float:
+    try:
+        sigma = iv_pct / 100.0
+        if not SCIPY_AVAILABLE or spot <= 0 or t_years <= 0 or sigma <= 0:
+            return float("nan")
+        d1 = (math.log(spot / strike) + (r + 0.5 * sigma ** 2) * t_years) / (sigma * math.sqrt(t_years))
+        d2 = d1 - sigma * math.sqrt(t_years)
+        if opt_type == "CE":
+            price = spot * norm.cdf(d1) - strike * math.exp(-r * t_years) * norm.cdf(d2)
+        else:
+            price = strike * math.exp(-r * t_years) * norm.cdf(-d2) - spot * norm.cdf(-d1)
+        return max(price, 0.05)
+    except Exception:
+        return float("nan")
+
+
+# ============================================================================
+# FEATURES / SCORING
+# ============================================================================
+
+def build_feature_row(df: pd.DataFrame) -> dict:
+    close = df["Close"]
+    feat = {}
+    feat["ema20"] = safe_float(ema(close, 20).iloc[-1])
+    feat["ema50"] = safe_float(ema(close, 50).iloc[-1])
+    feat["ema200"] = safe_float(ema(close, 200).iloc[-1]) if len(df) >= 200 else safe_float(ema(close, min(len(df) - 1, 100)).iloc[-1])
+    feat["rsi"] = safe_float(rsi(close).iloc[-1], 50)
+    macd_line, signal_line, hist = macd(close)
+    feat["macd"] = safe_float(macd_line.iloc[-1])
+    feat["macd_signal"] = safe_float(signal_line.iloc[-1])
+    feat["macd_hist"] = safe_float(hist.iloc[-1])
+    feat["atr"] = safe_float(atr(df).iloc[-1])
+    st_line, st_dir = supertrend(df)
+    feat["supertrend_dir"] = int(st_dir.iloc[-1]) if not pd.isna(st_dir.iloc[-1]) else 0
+    feat["supertrend_val"] = safe_float(st_line.iloc[-1])
+    feat["adx"] = safe_float(adx(df).iloc[-1])
+    bb_u, bb_m, bb_l = bollinger_bands(close)
+    feat["bb_upper"] = safe_float(bb_u.iloc[-1])
+    feat["bb_lower"] = safe_float(bb_l.iloc[-1])
+    feat["bb_mid"] = safe_float(bb_m.iloc[-1])
+    feat["vwap"] = safe_float(vwap(df).iloc[-1])
+    feat["rel_vol"] = relative_volume(df)
+    feat["close"] = safe_float(close.iloc[-1])
+    feat["prev_close"] = safe_float(close.iloc[-2]) if len(df) > 1 else feat["close"]
+    feat["day_change_pct"] = pct(feat["close"] - feat["prev_close"], feat["prev_close"])
+    feat["realized_vol_pct"] = realized_volatility_annualized_pct(df)
+    return feat
+
+
+def momentum_score(feat: dict) -> float:
+    score = 50.0
+    score += clip((feat["rsi"] - 50) * 0.8, -25, 25)
+    score += 15 if feat["macd_hist"] > 0 else -15
+    score += 10 if feat["close"] > feat["ema20"] > feat["ema50"] else (-10 if feat["close"] < feat["ema20"] < feat["ema50"] else 0)
+    return clip(score, 0, 100)
+
+
+def volume_score(feat: dict) -> float:
+    rv = feat["rel_vol"]
+    if rv >= 2.5:
+        base = 95
+    elif rv >= 1.8:
+        base = 85
+    elif rv >= 1.3:
+        base = 72
+    elif rv >= 0.9:
+        base = 55
+    else:
+        base = 35
+    return clip(base, 0, 100)
+
+
+def delivery_score(delivery_pct: float) -> float:
+    if is_nan(delivery_pct):
+        return 50.0
+    return clip(delivery_pct * 1.1, 0, 100)
+
+
+def oi_score(opt: dict, direction_hint: int) -> float:
+    if not opt["available"]:
+        return 50.0
+    ce_chg, pe_chg = safe_float(opt["oi_change_ce"]), safe_float(opt["oi_change_pe"])
+    total = abs(ce_chg) + abs(pe_chg)
+    if total == 0:
+        return 50.0
+    bias = (pe_chg - ce_chg) if direction_hint >= 0 else (ce_chg - pe_chg)
+    return clip(50 + (bias / total) * 50, 0, 100)
+
+
+def pcr_score(pcr_val: float) -> float:
+    if is_nan(pcr_val):
+        return 50.0
+    if pcr_val >= 1.5:
+        return 80
+    if pcr_val >= 1.2:
+        return 68
+    if pcr_val >= 0.9:
+        return 55
+    if pcr_val >= 0.7:
+        return 42
+    return 25
+
+
+def iv_score(avg_iv: float, india_vix: float) -> float:
+    if is_nan(avg_iv):
+        return 50.0
+    ref = india_vix if not is_nan(india_vix) else 15.0
+    diff = avg_iv - ref
+    return clip(60 - diff * 1.5, 10, 90)
+
+
+def smart_money_score(delivery_s: float, rel_vol: float, oi_s: float, structure: str) -> float:
+    struct_bonus = 15 if structure == "Bullish" else (-15 if structure == "Bearish" else 0)
+    rv_component = clip((rel_vol - 1) * 20, -20, 20)
+    return clip(0.4 * delivery_s + 0.3 * oi_s + 25 + rv_component * 0.3 + struct_bonus, 0, 100)
+
+
+def sector_index_strength(symbol_change_pct: float, index_change_pct: float) -> float:
+    rs = symbol_change_pct - index_change_pct
+    return clip(50 + rs * 8, 0, 100)
+
+
+def market_context_score(india_vix: float, index_change_pct: float, fii_net: float, dii_net: float) -> float:
+    """A single market-wide bias (0-100, 50=neutral) folding in India VIX
+    level/direction context and FII/DII net flow when available. Applied
+    equally to every symbol as a broad-market tailwind/headwind."""
+    score = 50.0
+    if not is_nan(india_vix):
+        if india_vix >= 22:
+            score -= 8
+        elif india_vix <= 12:
+            score += 5
+    score += clip(index_change_pct * 4, -12, 12)
+    if not is_nan(fii_net) and not is_nan(dii_net):
+        net = fii_net + dii_net
+        score += clip(net / 500.0, -10, 10)  # net in Rs crore, softly scaled
+    return clip(score, 0, 100)
+
+
+def xgb_probability(history_df: pd.DataFrame):
+    """Trains a tiny per-symbol XGBoost classifier (label = next-day
+    up/down) on rolling history and returns P(up) for the latest bar.
+    Returns None if xgboost is unavailable or there isn't enough data --
+    caller must fall back to the rule-based ensemble in that case."""
+    try:
+        import xgboost as xgb
+    except Exception:
+        return None
+    if history_df is None or len(history_df) < 120:
+        return None
+    try:
+        df = history_df.copy()
+        df["ema20"] = ema(df["Close"], 20)
+        df["ema50"] = ema(df["Close"], 50)
+        df["rsi"] = rsi(df["Close"])
+        _, _, hist = macd(df["Close"])
+        df["macd_hist"] = hist
+        df["atr"] = atr(df)
+        df["adx"] = adx(df)
+        df["rel_vol"] = df["Volume"] / df["Volume"].rolling(20).mean()
+        df["ret1"] = df["Close"].pct_change()
+        df["target"] = (df["Close"].shift(-1) > df["Close"]).astype(int)
+
+        feature_cols = ["ema20", "ema50", "rsi", "macd_hist", "atr", "adx", "rel_vol", "ret1"]
+        model_df = df[feature_cols + ["target"]].dropna()
+        if len(model_df) < 60:
+            return None
+
+        X_train = model_df[feature_cols].iloc[:-1]
+        y_train = model_df["target"].iloc[:-1]
+        X_last = model_df[feature_cols].iloc[[-1]]
+
+        clf = xgb.XGBClassifier(
+            n_estimators=80, max_depth=3, learning_rate=0.08,
+            subsample=0.8, colsample_bytree=0.8, eval_metric="logloss",
+            verbosity=0,
+        )
+        clf.fit(X_train, y_train)
+        return safe_float(clf.predict_proba(X_last)[0][1], 0.5)
+    except Exception:
+        return None
+
+
+def classify_direction(confidence_bull: float) -> str:
+    if confidence_bull >= 90:
+        return "Strong Bullish"
+    if confidence_bull >= 80:
+        return "Bullish"
+    if confidence_bull >= 60:
+        return "Neutral"
+    if confidence_bull >= 40:
+        return "Bearish"
+    return "Strong Bearish"
+
+
+def trend_label(structure: str, feat: dict) -> str:
+    if structure in ("Bullish", "Bearish"):
+        return structure
+    if feat["adx"] < 18:
+        return "Sideways"
+    return "Bullish" if feat["close"] > feat["ema50"] else "Bearish"
+
+
+# ============================================================================
+# TRADE PLAN
+# ============================================================================
+
+def lot_size_for(symbol: str, spot: float) -> int:
+    if symbol in KNOWN_LOT_SIZES:
+        return KNOWN_LOT_SIZES[symbol]
+    if spot <= 0:
+        return 1
+    return max(int(round(DEFAULT_LOT_SIZE_NOTIONAL / spot / 25) * 25), 25)
+
+
+def option_strike_step(spot: float) -> float:
+    if spot < 250:
+        return 5
+    if spot < 1000:
+        return 10
+    if spot < 3000:
+        return 25
+    return 50
+
+
+@dataclass
+class TradePlan:
+    entry: float = 0.0
+    stop_loss: float = 0.0
+    target1: float = 0.0
+    target2: float = 0.0
+    target3: float = 0.0
+    rr: float = 0.0
+    expected_move_pct: float = 0.0
+    expected_points: float = 0.0
+    ce_strike: float = 0.0
+    pe_strike: float = 0.0
+    ce_entry: float = 0.0
+    ce_sl: float = 0.0
+    ce_target: float = 0.0
+    pe_entry: float = 0.0
+    pe_sl: float = 0.0
+    pe_target: float = 0.0
+    qty: int = 0
+    capital: float = 0.0
+    roi: float = 0.0
+
+
+def build_trade_plan(spot: float, atr_val: float, direction: str, confidence: float,
+                      opt: dict, iv_ref: float, symbol: str, capital: float,
+                      risk_pct: float) -> TradePlan:
+    plan = TradePlan()
+    atr_val = atr_val if atr_val > 0 else spot * 0.015
+
+    if direction in ("Strong Bullish", "Bullish"):
+        plan.entry = spot
+        plan.stop_loss = spot - 1.2 * atr_val
+        plan.target1 = spot + 1.0 * atr_val
+        plan.target2 = spot + 1.8 * atr_val
+        plan.target3 = spot + 2.8 * atr_val
+    elif direction in ("Strong Bearish", "Bearish"):
+        plan.entry = spot
+        plan.stop_loss = spot + 1.2 * atr_val
+        plan.target1 = spot - 1.0 * atr_val
+        plan.target2 = spot - 1.8 * atr_val
+        plan.target3 = spot - 2.8 * atr_val
+    else:
+        plan.entry = spot
+        plan.stop_loss = spot - 1.0 * atr_val
+        plan.target1 = spot + 0.6 * atr_val
+        plan.target2 = spot + 1.0 * atr_val
+        plan.target3 = spot + 1.4 * atr_val
+
+    risk = abs(plan.entry - plan.stop_loss)
+    reward = abs(plan.target2 - plan.entry)
+    plan.rr = safe_round(reward / risk, 2) if risk > 0 else 0.0
+    plan.expected_move_pct = safe_round(pct(plan.target2 - plan.entry, plan.entry), 2)
+    plan.expected_points = safe_round(plan.target2 - plan.entry, 2)
+
+    step = option_strike_step(spot)
+    atm = round(spot / step) * step
+    is_bullish = direction in ("Strong Bullish", "Bullish")
+    plan.ce_strike = atm if is_bullish else atm + step
+    plan.pe_strike = atm if not is_bullish else atm - step
+
+    expiry_str = opt.get("best_expiry", "N/A") if opt else "N/A"
+    dte = days_to_expiry(expiry_str)
+    t_years = dte / 365.0
+    iv_used = iv_ref if not is_nan(iv_ref) and iv_ref > 0 else 22.0
+
+    ce_ltp = opt.get("ce_ltp_atm") if opt else float("nan")
+    pe_ltp = opt.get("pe_ltp_atm") if opt else float("nan")
+
+    ce_theo = ce_ltp if not is_nan(safe_float(ce_ltp, float("nan"))) else black_scholes_price(spot, plan.ce_strike, t_years, iv_used, opt_type="CE")
+    pe_theo = pe_ltp if not is_nan(safe_float(pe_ltp, float("nan"))) else black_scholes_price(spot, plan.pe_strike, t_years, iv_used, opt_type="PE")
+    ce_theo = safe_float(ce_theo, spot * 0.02)
+    pe_theo = safe_float(pe_theo, spot * 0.02)
+
+    plan.ce_entry = safe_round(ce_theo, 2)
+    plan.ce_sl = safe_round(ce_theo * 0.55, 2)
+    plan.ce_target = safe_round(ce_theo * (1.7 if confidence >= 80 else 1.4), 2)
+
+    plan.pe_entry = safe_round(pe_theo, 2)
+    plan.pe_sl = safe_round(pe_theo * 0.55, 2)
+    plan.pe_target = safe_round(pe_theo * (1.7 if confidence >= 80 else 1.4), 2)
+
+    lot = lot_size_for(symbol, spot)
+    risk_amount = capital * (risk_pct / 100.0)
+    qty_by_risk = int(risk_amount / risk) if risk > 0 else lot
+    plan.qty = max(lot, (qty_by_risk // lot) * lot) if qty_by_risk >= lot else lot
+    plan.capital = safe_round(plan.qty * plan.entry, 2)
+    plan.roi = safe_round(pct(plan.qty * (plan.target2 - plan.entry), plan.capital), 2) if plan.capital else 0.0
+
+    return plan
