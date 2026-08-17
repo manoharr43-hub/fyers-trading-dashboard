@@ -33,7 +33,7 @@ except Exception:
     IST = timezone(timedelta(hours=5, minutes=30))
 
 # ════════════════════════════════════════════════════════════════════════════════
-# CONSTANTS (ORIGINAL + NEW)
+# CONSTANTS
 # ════════════════════════════════════════════════════════════════════════════════
 DATE_FROM = (datetime.today() - timedelta(days=365)).strftime("%Y-%m-%d")
 DATE_TO = datetime.today().strftime("%Y-%m-%d")
@@ -42,13 +42,9 @@ NIFTY_BENCHMARK_SYMBOL = "NSE:NIFTY50-INDEX"
 MAX_WORKERS = 8
 BATCH_SIZE = 50
 BATCH_PAUSE_SECONDS = 1.0
-DEFAULT_SCAN_STOCKS = 2300
-FYERS_APP_ID = os.environ.get("FYERS_APP_ID", "")
-OPTIONS_STRIKE_COUNT = 10
-OPTIONS_HTTP_TIMEOUT = 15
 
 # ════════════════════════════════════════════════════════════════════════════════
-# 15-MIN REVERSAL SCANNER CONSTANTS (ORIGINAL)
+# 15-MIN REVERSAL SCANNER CONSTANTS
 # ════════════════════════════════════════════════════════════════════════════════
 REVERSAL_RESOLUTION = "15"
 REVERSAL_LOOKBACK_DAYS = 5
@@ -59,24 +55,14 @@ REVERSAL_MIN_MOVE_PCT = 0.015
 REVERSAL_CUSTOM_ABS = 0.05
 
 # ════════════════════════════════════════════════════════════════════════════════
-# VOLUME BIG MOVEMENT CONSTANTS (ORIGINAL)
+# VOLUME BIG MOVEMENT CONSTANTS
 # ════════════════════════════════════════════════════════════════════════════════
 VOL_BIGMOVE_MIN_RVOL = 2.5
 VOL_BIGMOVE_MIN_BODY_PCT = 0.8
 VOL_BIGMOVE_LOOKBACK = 20
 
 # ════════════════════════════════════════════════════════════════════════════════
-# MULTI-TIMEFRAME CONSTANTS (NEW)
-# ════════════════════════════════════════════════════════════════════════════════
-SWING_LOOKBACK_PERIODS = 20
-EMA_PERIODS = [9, 21, 50, 200]
-VWAP_LOOKBACK = 20
-MSS_MIN_CONFIRMATION = 1  # Minimum candles to confirm MSS
-STRUCTURE_TIMEFRAMES = ["5", "15", "60"]  # 5M, 15M, 1H
-MASTER_SIGNAL_LOOKBACK_DAYS = 10
-
-# ════════════════════════════════════════════════════════════════════════════════
-# LOGGING & UTILITIES (ORIGINAL)
+# LOGGING & UTILITIES
 # ════════════════════════════════════════════════════════════════════════════════
 def _now_ist() -> datetime:
     return datetime.now(IST)
@@ -86,7 +72,7 @@ def _ensure_app_folders() -> None:
         os.makedirs(folder, exist_ok=True)
 
 _ensure_app_folders()
-logger = logging.getLogger("nse_scanner_v15")
+logger = logging.getLogger("nse_scanner_v14")
 logger.setLevel(logging.INFO)
 
 def _candle_signal_timestamp(df, is_daily: bool = False) -> Tuple[str, str]:
@@ -130,136 +116,9 @@ def _last_valid_atr(df, period: int = 14) -> float:
     return float(val)
 
 # ════════════════════════════════════════════════════════════════════════════════
-# NEW INDICATORS (MULTI-TIMEFRAME)
-# ════════════════════════════════════════════════════════════════════════════════
-def calculate_vwap(df) -> pd.Series:
-    """Calculate VWAP (Volume Weighted Average Price)"""
-    if "Volume" not in df.columns or len(df) == 0:
-        return pd.Series([np.nan] * len(df), index=df.index)
-    
-    high = df["High"].astype(float)
-    low = df["Low"].astype(float)
-    close = df["Close"].astype(float)
-    volume = df["Volume"].astype(float)
-    
-    typical_price = (high + low + close) / 3
-    vwap = (typical_price * volume).cumsum() / volume.cumsum()
-    return vwap.fillna(method="ffill").fillna(close)
-
-def calculate_ema(close, period: int = 9) -> pd.Series:
-    """Calculate EMA"""
-    return close.ewm(span=period, adjust=False).mean()
-
-def find_swing_highs_lows(df, lookback: int = SWING_LOOKBACK_PERIODS) -> Dict[str, Any]:
-    """Return the latest confirmed swing high/low using only CLOSED candles.
-
-    A pivot needs two closed candles on both sides. The current/unclosed candle is
-    never used as a confirmed swing. This keeps CHoCH/MSS non-repainting.
-    """
-    empty = {"swing_high": None, "swing_high_idx": None,
-             "swing_high_bars_ago": None, "swing_low": None,
-             "swing_low_idx": None, "swing_low_bars_ago": None}
-    if df is None or len(df) < 7:
-        return empty
-    d = df.tail(max(lookback, 7)).reset_index(drop=True).copy()
-    highs, lows = d["High"].astype(float).to_numpy(), d["Low"].astype(float).to_numpy()
-    pivot_highs, pivot_lows = [], []
-    for i in range(2, len(d) - 2):
-        if highs[i] > highs[i-1] and highs[i] >= highs[i-2] and highs[i] > highs[i+1] and highs[i] >= highs[i+2]:
-            pivot_highs.append(i)
-        if lows[i] < lows[i-1] and lows[i] <= lows[i-2] and lows[i] < lows[i+1] and lows[i] <= lows[i+2]:
-            pivot_lows.append(i)
-    if pivot_highs:
-        i = pivot_highs[-1]
-        empty.update(swing_high=float(highs[i]), swing_high_idx=int(i), swing_high_bars_ago=int(len(d)-1-i))
-    if pivot_lows:
-        i = pivot_lows[-1]
-        empty.update(swing_low=float(lows[i]), swing_low_idx=int(i), swing_low_bars_ago=int(len(d)-1-i))
-    return empty
-
-
-def _confirmed_pivots(df, left: int = 2, right: int = 2):
-    """Return confirmed pivot highs/lows. The final `right` candles are excluded."""
-    if df is None or len(df) < left + right + 3:
-        return [], []
-    d = df.reset_index(drop=True)
-    highs, lows = d["High"].astype(float).to_numpy(), d["Low"].astype(float).to_numpy()
-    ph, pl = [], []
-    for i in range(left, len(d) - right):
-        if highs[i] >= max(highs[i-left:i]) and highs[i] > max(highs[i+1:i+right+1]):
-            ph.append((i, float(highs[i])))
-        if lows[i] <= min(lows[i-left:i]) and lows[i] < min(lows[i+1:i+right+1]):
-            pl.append((i, float(lows[i])))
-    return ph, pl
-
-
-def detect_structure(df) -> Dict[str, Any]:
-    """Detect HH/HL/LH/LL from confirmed pivots only."""
-    ph, pl = _confirmed_pivots(df)
-    result = {"type":"UNKNOWN", "trend":"NEUTRAL", "current_high":None,
-              "current_low":None, "prev_high":None, "prev_low":None}
-    if len(ph) >= 2:
-        result["prev_high"], result["current_high"] = ph[-2][1], ph[-1][1]
-    if len(pl) >= 2:
-        result["prev_low"], result["current_low"] = pl[-2][1], pl[-1][1]
-    if len(ph) >= 2 and len(pl) >= 2:
-        hh = ph[-1][1] > ph[-2][1]
-        hl = pl[-1][1] > pl[-2][1]
-        lh = ph[-1][1] < ph[-2][1]
-        ll = pl[-1][1] < pl[-2][1]
-        if hh and hl:
-            result["type"], result["trend"] = "HH/HL", "BULLISH"
-        elif lh and ll:
-            result["type"], result["trend"] = "LH/LL", "BEARISH"
-        elif hh:
-            result["type"], result["trend"] = "HH", "BULLISH"
-        elif ll:
-            result["type"], result["trend"] = "LL", "BEARISH"
-        elif hl:
-            result["type"], result["trend"] = "HL", "BULLISH"
-        elif lh:
-            result["type"], result["trend"] = "LH", "BEARISH"
-    return result
-
-
-def detect_choch(df) -> Dict[str, Any]:
-    """Confirmed CHoCH: close breaks the last confirmed opposing swing."""
-    ph, pl = _confirmed_pivots(df)
-    out = {"bullish_choch":False, "bearish_choch":False, "choch_price":None,
-           "choch_type":"NONE", "confirmation":"NONE"}
-    if len(ph) < 2 or len(pl) < 2 or len(df) < 10:
-        out["confirmation"] = "PENDING"
-        return out
-    close = float(df["Close"].iloc[-1])
-    # Prior bearish sequence: lower high + lower low, then close above latest LH.
-    bearish_structure = ph[-1][1] < ph[-2][1] and pl[-1][1] < pl[-2][1]
-    bullish_structure = ph[-1][1] > ph[-2][1] and pl[-1][1] > pl[-2][1]
-    if bearish_structure and close > ph[-1][1]:
-        out.update(bullish_choch=True, choch_price=ph[-1][1], choch_type="BULLISH_CHoCH", confirmation="CONFIRMED")
-    elif bullish_structure and close < pl[-1][1]:
-        out.update(bearish_choch=True, choch_price=pl[-1][1], choch_type="BEARISH_CHoCH", confirmation="CONFIRMED")
-    return out
-
-
-def detect_mss(df) -> Dict[str, Any]:
-    """Confirmed Market Structure Shift using a close beyond a confirmed pivot."""
-    ph, pl = _confirmed_pivots(df)
-    out = {"bullish_mss":False, "bearish_mss":False, "mss_type":"NONE", "confirmation":"NONE"}
-    if len(ph) < 2 or len(pl) < 2 or len(df) < 10:
-        out["confirmation"] = "PENDING"
-        return out
-    close = float(df["Close"].iloc[-1])
-    if ph[-1][1] < ph[-2][1] and pl[-1][1] < pl[-2][1] and close > ph[-1][1]:
-        out.update(bullish_mss=True, mss_type="BULLISH_MSS", confirmation="CONFIRMED")
-    elif ph[-1][1] > ph[-2][1] and pl[-1][1] > pl[-2][1] and close < pl[-1][1]:
-        out.update(bearish_mss=True, mss_type="BEARISH_MSS", confirmation="CONFIRMED")
-    return out
-
-# ════════════════════════════════════════════════════════════════════════════════
-# SYMBOL LOADING (RETAINED WITH ENHANCEMENT FOR F&O)
+# SYMBOL LOADING (RETAINED)
 # ════════════════════════════════════════════════════════════════════════════════
 _VALID_EQ_SYMBOL_RE = re.compile(r"^NSE:[A-Z0-9&\-]+-EQ$")
-_FO_EQUITY_PATTERN = re.compile(r"^NSE:[A-Z0-9&\-]+-EQ$")  # Same pattern, will filter separately
 
 def _validate_symbols(symbols) -> List[str]:
     seen = set()
@@ -308,49 +167,6 @@ def load_nse_equity_symbols() -> List[str]:
             symbols.append(sym)
     return sorted(set(_validate_symbols(symbols)))
 
-@st.cache_data(ttl=60 * 60 * 12)
-def load_fo_stocks() -> List[str]:
-    """
-    Load F&O eligible stocks from Fyers or NSE.
-    For now, filter from the NSE equity list based on known F&O stocks.
-    """
-    try:
-        # Try to fetch F&O list from NSE data
-        resp = requests.get("https://public.fyers.in/sym_details/NSE_FO.csv", timeout=20)
-        resp.raise_for_status()
-        
-        lines = [ln for ln in resp.text.strip().split("\n") if ln.strip()]
-        if not lines:
-            return []
-        
-        sample = lines[:min(500, len(lines))]
-        split_sample = [ln.split(",") for ln in sample]
-        max_cols = max((len(p) for p in split_sample), default=0)
-        best_col, best_hits = None, 0
-        
-        for col_idx in range(max_cols):
-            hits = sum(1 for parts in split_sample if len(parts) > col_idx and parts[col_idx].strip().endswith("-EQ"))
-            if hits > best_hits:
-                best_col, best_hits = col_idx, hits
-        
-        if best_col is None or best_hits == 0:
-            return []
-        
-        fo_stocks = []
-        for line in lines:
-            parts = line.split(",")
-            if len(parts) <= best_col:
-                continue
-            sym = parts[best_col].strip()
-            if sym.endswith("-EQ"):
-                fo_stocks.append(sym)
-        
-        return sorted(set(_validate_symbols(fo_stocks)))
-    
-    except Exception as e:
-        # Fallback: return empty list if F&O data unavailable
-        return []
-
 # ════════════════════════════════════════════════════════════════════════════════
 # SAFE HISTORY FETCH (RETAINED)
 # ════════════════════════════════════════════════════════════════════════════════
@@ -396,7 +212,7 @@ def _safe_history(fyers, params: dict, max_retries: int = _HISTORY_MAX_RETRIES, 
     return None, f"{symbol}: {last_err} (after {max_retries} attempts)"
 
 # ════════════════════════════════════════════════════════════════════════════════
-# SCAN STATS (ORIGINAL)
+# SCAN STATS
 # ════════════════════════════════════════════════════════════════════════════════
 class ScanStats:
     def __init__(self, total: int):
@@ -430,740 +246,13 @@ def _display_scan_summary(stats: "ScanStats") -> None:
     c6.metric("Scan Time", f"{stats.elapsed_seconds:.1f}s")
 
 # ════════════════════════════════════════════════════════════════════════════════
-# TIMEFRAME DATA FETCHER (NEW)
-# ════════════════════════════════════════════════════════════════════════════════
-def _fetch_timeframe_data(fyers, symbol, resolution: str, lookback_days: int = 30) -> Optional[pd.DataFrame]:
-    """
-    Fetch OHLCV data for a specific timeframe.
-    Returns cleaned DataFrame or None if failed.
-    Ensures no data contamination between timeframes.
-    """
-    date_from = (datetime.today() - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
-    date_to = datetime.today().strftime("%Y-%m-%d")
-    
-    resp, err = _safe_history(fyers, {
-        "symbol": symbol,
-        "resolution": resolution,
-        "date_format": "1",
-        "range_from": date_from,
-        "range_to": date_to,
-        "cont_flag": "1",
-    })
-    
-    if err or not resp:
-        return None
-    
-    candles = resp.get("candles")
-    if not candles or len(candles) < 10:
-        return None
-    
-    try:
-        df = pd.DataFrame(candles, columns=["Time", "Open", "High", "Low", "Close", "Volume"])
-        df["Time"] = pd.to_datetime(df["Time"], unit="s", utc=True).dt.tz_convert("Asia/Kolkata")
-        df[["Open", "High", "Low", "Close", "Volume"]] = df[["Open", "High", "Low", "Close", "Volume"]].apply(pd.to_numeric, errors="coerce")
-        df = df.dropna(subset=["Open", "High", "Low", "Close"]).sort_values("Time").reset_index(drop=True)
-        
-        if len(df) < 10:
-            return None
-        
-        # Remove unclosed candle (last candle less than resolution old)
-        if len(df) > 1:
-            last_time = df["Time"].iloc[-1]
-            candle_age = (_now_ist() - last_time).total_seconds() / 60
-            res_minutes = int(resolution)
-            if candle_age < res_minutes + 1:  # Unclosed candle
-                df = df.iloc[:-1].reset_index(drop=True)
-        
-        if len(df) < 10:
-            return None
-        
-        return df
-    
-    except Exception as e:
-        return None
-
-# ════════════════════════════════════════════════════════════════════════════════
-# TIMEFRAME ANALYSIS ENGINE (NEW)
-# ════════════════════════════════════════════════════════════════════════════════
-def analyze_timeframe(fyers, symbol: str, resolution: str) -> Dict[str, Any]:
-    """
-    Analyze a specific timeframe.
-    Returns comprehensive structure, CHoCH, MSS, and indicator data.
-    """
-    df = _fetch_timeframe_data(fyers, symbol, resolution, lookback_days=30)
-    
-    if df is None or len(df) < 10:
-        return {
-            "timeframe": resolution,
-            "status": "DATA_UNAVAILABLE",
-            "data": None,
-        }
-    
-    try:
-        # Calculate indicators
-        rsi = calculate_rsi(df["Close"])
-        macd_line, macd_sig, macd_hist = calculate_macd(df["Close"])
-        atr = calculate_atr(df)
-        vwap = calculate_vwap(df)
-        ema9 = calculate_ema(df["Close"], 9)
-        ema21 = calculate_ema(df["Close"], 21)
-        ema50 = calculate_ema(df["Close"], 50)
-        ema200 = calculate_ema(df["Close"], 200)
-        
-        # Structure analysis
-        structure = detect_structure(df)
-        choch = detect_choch(df)
-        mss = detect_mss(df)
-        swings = find_swing_highs_lows(df)
-        
-        # Volume analysis
-        vol_avg20 = float(df["Volume"].tail(20).mean()) if "Volume" in df.columns else 0
-        last_vol = float(df["Volume"].iloc[-1]) if "Volume" in df.columns else 0
-        rvol = round(last_vol / vol_avg20, 2) if vol_avg20 > 0 else 0.0
-        
-        # Price levels
-        last_close = float(df["Close"].iloc[-1])
-        last_high = float(df["High"].iloc[-1])
-        last_low = float(df["Low"].iloc[-1])
-        last_open = float(df["Open"].iloc[-1])
-        
-        # Trend determination
-        ema_trend = "BULLISH" if ema9.iloc[-1] > ema21.iloc[-1] > ema50.iloc[-1] else "BEARISH" if ema9.iloc[-1] < ema21.iloc[-1] < ema50.iloc[-1] else "NEUTRAL"
-        
-        rsi_val = float(rsi.iloc[-1])
-        rsi_overbought = rsi_val > 70
-        rsi_oversold = rsi_val < 30
-        
-        macd_bullish = macd_line.iloc[-1] > macd_sig.iloc[-1]
-        
-        return {
-            "timeframe": resolution,
-            "status": "OK",
-            "data": {
-                "last_close": last_close,
-                "last_high": last_high,
-                "last_low": last_low,
-                "last_open": last_open,
-                "structure_type": structure["type"],
-                "structure_trend": structure["trend"],
-                "current_high": structure["current_high"],
-                "current_low": structure["current_low"],
-                "prev_high": structure["prev_high"],
-                "prev_low": structure["prev_low"],
-                "bullish_choch": choch["bullish_choch"],
-                "bearish_choch": choch["bearish_choch"],
-                "choch_price": choch["choch_price"],
-                "choch_type": choch["choch_type"],
-                "bullish_mss": mss["bullish_mss"],
-                "bearish_mss": mss["bearish_mss"],
-                "mss_type": mss["mss_type"],
-                "swing_high": swings["swing_high"],
-                "swing_low": swings["swing_low"],
-                "swing_high_bars_ago": swings["swing_high_bars_ago"],
-                "swing_low_bars_ago": swings["swing_low_bars_ago"],
-                "vwap": float(vwap.iloc[-1]) if len(vwap) > 0 else None,
-                "ema9": float(ema9.iloc[-1]) if len(ema9) > 0 else None,
-                "ema21": float(ema21.iloc[-1]) if len(ema21) > 0 else None,
-                "ema50": float(ema50.iloc[-1]) if len(ema50) > 0 else None,
-                "ema200": float(ema200.iloc[-1]) if len(ema200) > 0 else None,
-                "ema_trend": ema_trend,
-                "rsi": round(rsi_val, 1),
-                "rsi_overbought": rsi_overbought,
-                "rsi_oversold": rsi_oversold,
-                "macd_bullish": macd_bullish,
-                "macd_value": round(float(macd_line.iloc[-1]), 4),
-                "rvol": rvol,
-                "atr": round(float(atr.iloc[-1]), 2),
-            },
-            "df": df,  # Store dataframe for reference
-        }
-    
-    except Exception as e:
-        return {
-            "timeframe": resolution,
-            "status": "ERROR",
-            "error": str(e),
-            "data": None,
-        }
-
-# ════════════════════════════════════════════════════════════════════════════════
-# OPTIONS CHAIN ANALYSIS (NEW)
-# ════════════════════════════════════════════════════════════════════════════════
-def _fyers_optionchain_request(fyers, symbol: str, strikecount: int = OPTIONS_STRIKE_COUNT, timestamp: str = "", greeks: bool = True):
-    """Call FYERS v3 option-chain endpoint directly, with SDK fallback."""
-    app_id = getattr(fyers, "client_id", None) or FYERS_APP_ID
-    token = getattr(fyers, "token", None) or os.environ.get("FYERS_ACCESS_TOKEN", "")
-    if app_id and token:
-        headers = {"Authorization": f"{app_id}:{token}"}
-        params = {"symbol": symbol, "strikecount": min(int(strikecount), 50), "greeks": "1" if greeks else "0"}
-        if timestamp:
-            params["timestamp"] = str(timestamp)
-        r = requests.get("https://api-t1.fyers.in/data/options-chain-v3", headers=headers, params=params, timeout=OPTIONS_HTTP_TIMEOUT)
-        r.raise_for_status()
-        return r.json()
-    # Some newer SDK clients expose option_chain instead of optionchain.
-    fn = getattr(fyers, "option_chain", None) or getattr(fyers, "optionchain", None)
-    if fn:
-        try:
-            return fn(symbol=symbol, strikecount=min(int(strikecount), 50), timestamp=timestamp, greeks=greeks)
-        except TypeError:
-            return fn(data={"symbol":symbol, "strikecount":min(int(strikecount),50), "timestamp":timestamp, "greeks":greeks})
-    raise RuntimeError("FYERS option-chain API is not available; set FYERS_APP_ID and FYERS_ACCESS_TOKEN or use a compatible FYERS client")
-
-
-def _calculate_max_pain(chain_rows):
-    strikes = sorted({float(x.get("strike_price")) for x in chain_rows if x.get("option_type") in ("CE", "PE") and x.get("strike_price") not in (None, -1)})
-    if not strikes:
-        return None
-    ce = {(float(x.get("strike_price")), float(x.get("oi",0) or 0)) for x in chain_rows if x.get("option_type") == "CE"}
-    pe = {(float(x.get("strike_price")), float(x.get("oi",0) or 0)) for x in chain_rows if x.get("option_type") == "PE"}
-    ce_map, pe_map = dict(ce), dict(pe)
-    pains = {}
-    for settle in strikes:
-        pain = sum(max(settle-k,0)*oi for k,oi in ce_map.items()) + sum(max(k-settle,0)*oi for k,oi in pe_map.items())
-        pains[settle] = pain
-    return min(pains, key=pains.get) if pains else None
-
-
-def fetch_options_chain_data(fyers, symbol: str, expiry_timestamp: str = "") -> Dict[str, Any]:
-    """Fetch live FYERS v3 options chain; never fabricate missing data."""
-    empty = {"status":"DATA_UNAVAILABLE", "message":"No live option-chain data", "expiry":None, "spot":None,
-             "atm_strike":None, "ce_oi":None, "pe_oi":None, "ce_oi_change":None, "pe_oi_change":None,
-             "pcr":None, "max_pain":None, "ce_volume":None, "pe_volume":None, "call_writing":False,
-             "put_writing":False, "call_unwinding":False, "put_unwinding":False, "options_bias":"NEUTRAL", "chain":[], "expiry_data":[]}
-    try:
-        resp = _fyers_optionchain_request(fyers, symbol, timestamp=expiry_timestamp)
-        if not isinstance(resp, dict) or resp.get("s") not in (None, "ok"):
-            empty["message"] = str(resp.get("message", "Option-chain request failed")) if isinstance(resp, dict) else "Invalid response"
-            return empty
-        data = resp.get("data", resp)
-        chain = data.get("optionsChain") or []
-        expiry_data = data.get("expiryData") or []
-        # If caller did not select expiry, use the nearest available expiry and refetch.
-        if not expiry_timestamp and expiry_data:
-            nearest = expiry_data[0]
-            expiry_timestamp = str(nearest.get("expiry", ""))
-            if expiry_timestamp:
-                resp = _fyers_optionchain_request(fyers, symbol, timestamp=expiry_timestamp)
-                data = resp.get("data", resp) if isinstance(resp, dict) else {}
-                chain = data.get("optionsChain") or chain
-        spot_row = next((x for x in chain if x.get("option_type", "") == ""), None)
-        spot = float(spot_row.get("ltp")) if spot_row and spot_row.get("ltp") is not None else None
-        legs = [x for x in chain if x.get("option_type") in ("CE","PE") and x.get("strike_price") not in (None,-1)]
-        strikes = sorted({float(x["strike_price"]) for x in legs})
-        atm = min(strikes, key=lambda k: abs(k-spot)) if strikes and spot is not None else None
-        call_oi = float(data.get("callOi", 0) or 0); put_oi = float(data.get("putOi", 0) or 0)
-        call_chg = sum(float(x.get("oich",0) or 0) for x in legs if x.get("option_type")=="CE")
-        put_chg = sum(float(x.get("oich",0) or 0) for x in legs if x.get("option_type")=="PE")
-        ce_vol = sum(float(x.get("volume",0) or 0) for x in legs if x.get("option_type")=="CE")
-        pe_vol = sum(float(x.get("volume",0) or 0) for x in legs if x.get("option_type")=="PE")
-        near = [x for x in legs if atm is not None and abs(float(x["strike_price"])-atm) <= max((strikes[1]-strikes[0]) if len(strikes)>1 else 1, 1)*3]
-        ce_writing = sum(1 for x in near if x.get("option_type")=="CE" and float(x.get("oich",0) or 0)>0 and float(x.get("ltpch",0) or 0)<0)
-        pe_writing = sum(1 for x in near if x.get("option_type")=="PE" and float(x.get("oich",0) or 0)>0 and float(x.get("ltpch",0) or 0)<0)
-        ce_unwind = sum(1 for x in near if x.get("option_type")=="CE" and float(x.get("oich",0) or 0)<0 and float(x.get("ltpch",0) or 0)>0)
-        pe_unwind = sum(1 for x in near if x.get("option_type")=="PE" and float(x.get("oich",0) or 0)<0 and float(x.get("ltpch",0) or 0)>0)
-        pcr = put_oi/call_oi if call_oi > 0 else None
-        # Options bias is intentionally conservative: OI + OI-change + PCR agreement.
-        bull = (pcr is not None and pcr >= 1.05) or pe_writing > ce_writing
-        bear = (pcr is not None and pcr <= 0.80) or ce_writing > pe_writing
-        if bull and not bear: bias = "BULLISH"
-        elif bear and not bull: bias = "BEARISH"
-        else: bias = "NEUTRAL"
-        return {"status":"OK", "message":"Live FYERS option chain", "expiry": expiry_timestamp or (expiry_data[0].get("date") if expiry_data else None),
-                "spot":spot, "atm_strike":atm, "ce_oi":call_oi, "pe_oi":put_oi, "ce_oi_change":call_chg,
-                "pe_oi_change":put_chg, "pcr":round(pcr,2) if pcr is not None else None,
-                "max_pain":_calculate_max_pain(legs), "ce_volume":ce_vol, "pe_volume":pe_vol,
-                "call_writing":ce_writing>0, "put_writing":pe_writing>0, "call_unwinding":ce_unwind>0,
-                "put_unwinding":pe_unwind>0, "options_bias":bias, "chain":legs, "expiry_data":expiry_data}
-    except Exception as e:
-        empty["status"] = "ERROR"; empty["message"] = str(e)[:180]
-        return empty
-
-# ════════════════════════════════════════════════════════════════════════════════
-# MASTER SIGNAL ENGINE (NEW)
-# ════════════════════════════════════════════════════════════════════════════════
-def calculate_master_signal(symbol: str, analysis_5m: Dict, analysis_15m: Dict, analysis_1h: Dict, options_data: Dict) -> Dict[str, Any]:
-    """
-    Calculate master signal using weighted scoring from multi-timeframe analysis.
-    
-    Weighting:
-    - 5M: 20%
-    - 15M: 25%
-    - 1H: 25%
-    - Options: 20%
-    - Volume: 10%
-    
-    Returns: {
-        'final_signal': 'STRONG BUY'|'BUY'|'NEUTRAL'|'SELL'|'STRONG SELL',
-        'confidence': float (0-100),
-        'entry': float,
-        'stop_loss': float,
-        'target1': float,
-        'target2': float,
-        'rr_ratio': float,
-        'scores': dict,
-        'reasons': list,
-    }
-    """
-    reasons = []
-    scores = {
-        "5m_score": 0,
-        "15m_score": 0,
-        "1h_score": 0,
-        "options_score": 50,  # Neutral if unavailable
-        "volume_score": 50,   # Neutral if unavailable
-    }
-    
-    # ════════════════════════════════════════════════════════════════════════════
-    # 5M ANALYSIS
-    # ════════════════════════════════════════════════════════════════════════════
-    if analysis_5m.get("status") == "OK" and analysis_5m.get("data"):
-        data_5m = analysis_5m["data"]
-        
-        score_5m = 50  # Start neutral
-        
-        # Structure
-        if data_5m["structure_trend"] == "BULLISH":
-            score_5m += 15
-            reasons.append("5M: Bullish structure")
-        elif data_5m["structure_trend"] == "BEARISH":
-            score_5m -= 15
-            reasons.append("5M: Bearish structure")
-        
-        # CHoCH
-        if data_5m["bullish_choch"]:
-            score_5m += 10
-            reasons.append("5M: Bullish CHoCH")
-        elif data_5m["bearish_choch"]:
-            score_5m -= 10
-            reasons.append("5M: Bearish CHoCH")
-        
-        # MSS
-        if data_5m["bullish_mss"]:
-            score_5m += 10
-            reasons.append("5M: Bullish MSS")
-        elif data_5m["bearish_mss"]:
-            score_5m -= 10
-            reasons.append("5M: Bearish MSS")
-        
-        # EMA
-        if data_5m["ema_trend"] == "BULLISH":
-            score_5m += 5
-        elif data_5m["ema_trend"] == "BEARISH":
-            score_5m -= 5
-        
-        # RSI
-        if data_5m["rsi"] > 60:
-            score_5m += 3
-        elif data_5m["rsi"] < 40:
-            score_5m -= 3
-        
-        # MACD
-        if data_5m["macd_bullish"]:
-            score_5m += 3
-        else:
-            score_5m -= 3
-        
-        # Volume
-        if data_5m["rvol"] > 1.5:
-            score_5m += 2
-        
-        score_5m = max(0, min(100, score_5m))
-        scores["5m_score"] = score_5m
-    
-    # ════════════════════════════════════════════════════════════════════════════
-    # 15M ANALYSIS
-    # ════════════════════════════════════════════════════════════════════════════
-    if analysis_15m.get("status") == "OK" and analysis_15m.get("data"):
-        data_15m = analysis_15m["data"]
-        
-        score_15m = 50
-        
-        if data_15m["structure_trend"] == "BULLISH":
-            score_15m += 15
-            reasons.append("15M: Bullish structure")
-        elif data_15m["structure_trend"] == "BEARISH":
-            score_15m -= 15
-            reasons.append("15M: Bearish structure")
-        
-        if data_15m["bullish_choch"]:
-            score_15m += 10
-            reasons.append("15M: Bullish CHoCH")
-        elif data_15m["bearish_choch"]:
-            score_15m -= 10
-            reasons.append("15M: Bearish CHoCH")
-        
-        if data_15m["bullish_mss"]:
-            score_15m += 10
-            reasons.append("15M: Bullish MSS")
-        elif data_15m["bearish_mss"]:
-            score_15m -= 10
-            reasons.append("15M: Bearish MSS")
-        
-        if data_15m["ema_trend"] == "BULLISH":
-            score_15m += 5
-        elif data_15m["ema_trend"] == "BEARISH":
-            score_15m -= 5
-        
-        if data_15m["rsi"] > 60:
-            score_15m += 3
-        elif data_15m["rsi"] < 40:
-            score_15m -= 3
-        
-        if data_15m["macd_bullish"]:
-            score_15m += 3
-        else:
-            score_15m -= 3
-        
-        if data_15m["rvol"] > 1.5:
-            score_15m += 2
-        
-        score_15m = max(0, min(100, score_15m))
-        scores["15m_score"] = score_15m
-    
-    # ════════════════════════════════════════════════════════════════════════════
-    # 1H ANALYSIS
-    # ════════════════════════════════════════════════════════════════════════════
-    if analysis_1h.get("status") == "OK" and analysis_1h.get("data"):
-        data_1h = analysis_1h["data"]
-        
-        score_1h = 50
-        
-        if data_1h["structure_trend"] == "BULLISH":
-            score_1h += 15
-            reasons.append("1H: Bullish trend")
-        elif data_1h["structure_trend"] == "BEARISH":
-            score_1h -= 15
-            reasons.append("1H: Bearish trend")
-        
-        if data_1h["bullish_choch"]:
-            score_1h += 10
-            reasons.append("1H: Bullish CHoCH")
-        elif data_1h["bearish_choch"]:
-            score_1h -= 10
-            reasons.append("1H: Bearish CHoCH")
-        
-        if data_1h["bullish_mss"]:
-            score_1h += 10
-            reasons.append("1H: Bullish MSS")
-        elif data_1h["bearish_mss"]:
-            score_1h -= 10
-            reasons.append("1H: Bearish MSS")
-        
-        if data_1h["ema_trend"] == "BULLISH":
-            score_1h += 5
-        elif data_1h["ema_trend"] == "BEARISH":
-            score_1h -= 5
-        
-        if data_1h["rvol"] > 1.5:
-            score_1h += 2
-        
-        score_1h = max(0, min(100, score_1h))
-        scores["1h_score"] = score_1h
-    
-    # Options confirmation (20%)
-    opt_bias = options_data.get("options_bias", "NEUTRAL") if isinstance(options_data, dict) else "NEUTRAL"
-    if opt_bias == "BULLISH":
-        scores["options_score"] = 80; reasons.append("Options: Bullish bias")
-    elif opt_bias == "BEARISH":
-        scores["options_score"] = 20; reasons.append("Options: Bearish bias")
-    else:
-        scores["options_score"] = 50
-
-    # Volume/flow confirmation (10%) from 5M RVOL and VWAP.
-    if analysis_5m.get("status") == "OK" and analysis_5m.get("data"):
-        d5 = analysis_5m["data"]
-        vol_score = 50
-        if d5.get("rvol", 0) >= 2.0: vol_score += 15
-        elif d5.get("rvol", 0) >= 1.5: vol_score += 8
-        if d5.get("last_close", 0) > d5.get("vwap", 0): vol_score += 10
-        elif d5.get("last_close", 0) < d5.get("vwap", 0): vol_score -= 10
-        scores["volume_score"] = max(0, min(100, vol_score))
-
-    # ════════════════════════════════════════════════════════════════════════════
-    # WEIGHTED CALCULATION
-    # ════════════════════════════════════════════════════════════════════════════
-    total_score = (scores["5m_score"] * 0.20 + scores["15m_score"] * 0.25 +
-                   scores["1h_score"] * 0.25 + scores["options_score"] * 0.20 +
-                   scores["volume_score"] * 0.10)
-
-    # Explicit timeframe conflict guard.
-    tf_scores = [scores["5m_score"], scores["15m_score"], scores["1h_score"]]
-    bullish_tfs = sum(x >= 60 for x in tf_scores)
-    bearish_tfs = sum(x <= 40 for x in tf_scores)
-    hard_conflict = bullish_tfs > 0 and bearish_tfs > 0
-
-    confidence = round(abs(total_score - 50) * 2, 1)
-    confidence = max(0, min(100, confidence))
-
-    if hard_conflict and max(tf_scores) - min(tf_scores) >= 20:
-        final_signal = "NEUTRAL / WAIT"
-        confidence = min(confidence, 55.0)
-        reasons.append("Multi-timeframe conflict: WAIT")
-    elif total_score >= 72:
-        final_signal = "STRONG BUY"
-    elif total_score >= 60:
-        final_signal = "BUY"
-    elif total_score <= 28:
-        final_signal = "STRONG SELL"
-    elif total_score <= 40:
-        final_signal = "SELL"
-    else:
-        final_signal = "NEUTRAL / WAIT"
-    
-    # Calculate Entry/SL/Targets
-    if analysis_5m.get("status") == "OK" and analysis_5m.get("data"):
-        data_5m = analysis_5m["data"]
-        entry = round(data_5m["last_close"], 2)
-        atr_5m = data_5m["atr"]
-        
-        if "BUY" in final_signal:
-            sl = round(data_5m["swing_low"] - atr_5m * 0.5, 2)
-            t1 = round(entry + atr_5m * 1.5, 2)
-            t2 = round(entry + atr_5m * 2.5, 2)
-        else:
-            sl = round(data_5m["swing_high"] + atr_5m * 0.5, 2)
-            t1 = round(entry - atr_5m * 1.5, 2)
-            t2 = round(entry - atr_5m * 2.5, 2)
-        
-        risk = abs(entry - sl)
-        reward = abs(t1 - entry)
-        rr_ratio = round(reward / risk, 2) if risk > 0 else 0.0
-    else:
-        entry, sl, t1, t2, rr_ratio = None, None, None, None, None
-    
-    return {
-        "final_signal": final_signal,
-        "confidence": confidence,
-        "entry": entry,
-        "stop_loss": sl,
-        "target1": t1,
-        "target2": t2,
-        "rr_ratio": rr_ratio,
-        "scores": scores,
-        "reasons": reasons,
-    }
-
-# ════════════════════════════════════════════════════════════════════════════════
-# MASTER SIGNAL SCANNER WORKER (NEW)
-# ════════════════════════════════════════════════════════════════════════════════
-def _fetch_master_signal(fyers, symbol: str, fo_set=None):
-    """Worker for master signal scanner."""
-    stock_ticker = symbol.replace("NSE:", "").replace("-EQ", "") if isinstance(symbol, str) else str(symbol)
-    
-    if not isinstance(symbol, str) or not _VALID_EQ_SYMBOL_RE.match(symbol):
-        return None, f"{symbol}: invalid format"
-    
-    try:
-        # Fetch all timeframes
-        analysis_5m = analyze_timeframe(fyers, symbol, "5")
-        analysis_15m = analyze_timeframe(fyers, symbol, "15")
-        analysis_1h = analyze_timeframe(fyers, symbol, "60")
-        
-        # All timeframes unavailable
-        if all(a.get("status") != "OK" for a in [analysis_5m, analysis_15m, analysis_1h]):
-            return None, None
-        
-        # Options are queried only for F&O-enabled equities to avoid cross-segment
-        # contamination and unnecessary API traffic across the 2300-stock universe.
-        is_fo = symbol in (fo_set or set())
-        options_data = fetch_options_chain_data(fyers, symbol) if is_fo else {"status":"DATA_UNAVAILABLE", "options_bias":"NEUTRAL", "message":"Not F&O eligible"}
-        
-        # Calculate master signal
-        master = calculate_master_signal(symbol, analysis_5m, analysis_15m, analysis_1h, options_data)
-        
-        # Get LTP from 5M data
-        ltp = None
-        for analysis in [analysis_5m, analysis_15m, analysis_1h]:
-            if analysis.get("status") == "OK" and analysis.get("data"):
-                ltp = analysis["data"]["last_close"]
-                break
-        
-        if ltp is None:
-            return None, None
-        
-        # Build result
-        data_5m = analysis_5m.get("data") if analysis_5m.get("status") == "OK" else {}
-        data_15m = analysis_15m.get("data") if analysis_15m.get("status") == "OK" else {}
-        data_1h = analysis_1h.get("data") if analysis_1h.get("status") == "OK" else {}
-        
-        return {
-            "Stock": stock_ticker,
-            "LTP": ltp,
-            "5M Trend": data_5m.get("structure_trend", "N/A"),
-            "15M Trend": data_15m.get("structure_trend", "N/A"),
-            "1H Trend": data_1h.get("structure_trend", "N/A"),
-            "5M Structure": data_5m.get("structure_type", "N/A"),
-            "15M Structure": data_15m.get("structure_type", "N/A"),
-            "1H Structure": data_1h.get("structure_type", "N/A"),
-            "5M CHoCH": "✅" if data_5m.get("bullish_choch") else "❌" if data_5m.get("bearish_choch") else "−",
-            "15M CHoCH": "✅" if data_15m.get("bullish_choch") else "❌" if data_15m.get("bearish_choch") else "−",
-            "1H CHoCH": "✅" if data_1h.get("bullish_choch") else "❌" if data_1h.get("bearish_choch") else "−",
-            "5M MSS": "✅" if data_5m.get("bullish_mss") else "❌" if data_5m.get("bearish_mss") else "−",
-            "15M MSS": "✅" if data_15m.get("bullish_mss") else "❌" if data_15m.get("bearish_mss") else "−",
-            "1H MSS": "✅" if data_1h.get("bullish_mss") else "❌" if data_1h.get("bearish_mss") else "−",
-            "VWAP": round(data_5m.get("vwap", 0), 2) if data_5m.get("vwap") else "N/A",
-            "EMA Trend": data_5m.get("ema_trend", "N/A"),
-            "RSI": round(data_5m.get("rsi", 50), 1),
-            "MACD": "🟢" if data_5m.get("macd_bullish") else "🔴",
-            "RVOL": data_5m.get("rvol", 0),
-            "CE OI": options_data.get("ce_oi", "N/A"),
-            "PE OI": options_data.get("pe_oi", "N/A"),
-            "PCR": options_data.get("pcr", "N/A"),
-            "Max Pain": options_data.get("max_pain", "N/A"),
-            "Options Bias": options_data.get("options_bias", "NEUTRAL"),
-            "Final Signal": master["final_signal"],
-            "Confidence %": master["confidence"],
-            "Entry": master["entry"],
-            "Stop Loss": master["stop_loss"],
-            "Target 1": master["target1"],
-            "Target 2": master["target2"],
-            "Risk:Reward": master["rr_ratio"],
-            "Signal Reason": " | ".join(master["reasons"][:2]) if master["reasons"] else "Multi-timeframe analysis",
-        }, None
-    
-    except Exception as e:
-        return None, f"{symbol}: analysis error ({type(e).__name__}: {str(e)[:50]})"
-
-def run_master_signal_scan(fyers, symbols, fo_symbols=None):
-    """Threaded scan for master signals."""
-    symbols = _validate_symbols(symbols)
-    fo_set = set(_validate_symbols(fo_symbols or []))
-    results, errors = [], []
-    stats = ScanStats(total=len(symbols))
-    progress = st.progress(0.0, text=f"Scanning Master Signals 0 / {len(symbols)}")
-    done = 0
-    
-    for i in range(0, len(symbols), BATCH_SIZE):
-        batch = symbols[i:i + BATCH_SIZE]
-        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            futures = {executor.submit(_fetch_master_signal, fyers, s, fo_set): s for s in batch}
-            for future in as_completed(futures):
-                try:
-                    res, err = future.result()
-                except Exception as e:
-                    res, err = None, f"{futures[future]}: worker error ({type(e).__name__})"
-                
-                if res:
-                    results.append(res)
-                if err:
-                    errors.append(err)
-                stats.record(has_result=bool(res), has_error=bool(err))
-                done += 1
-                progress.progress(done / max(len(symbols), 1), text=f"Scanning Master Signals {done} / {len(symbols)}")
-        
-        if i + BATCH_SIZE < len(symbols):
-            time.sleep(BATCH_PAUSE_SECONDS)
-    
-    progress.empty()
-    gc.collect()
-    return results, errors, stats
-
-# ════════════════════════════════════════════════════════════════════════════════
-# F&O SCANNER WORKER (NEW)
-# ════════════════════════════════════════════════════════════════════════════════
-def _fetch_fo_signal(fyers, symbol):
-    """Worker for F&O scanner."""
-    stock_ticker = symbol.replace("NSE:", "").replace("-EQ", "")
-    
-    if not isinstance(symbol, str) or not _VALID_EQ_SYMBOL_RE.match(symbol):
-        return None, f"{symbol}: invalid format"
-    
-    try:
-        # Use 15-minute data for F&O analysis
-        df = _fetch_timeframe_data(fyers, symbol, "15", lookback_days=10)
-        
-        if df is None or len(df) < 20:
-            return None, None
-        
-        last_close = float(df["Close"].iloc[-1])
-        atr = _last_valid_atr(df)
-        
-        rsi = calculate_rsi(df["Close"])
-        rsi_val = float(rsi.iloc[-1])
-        
-        macd_line, macd_sig, _ = calculate_macd(df["Close"])
-        macd_bullish = bool(macd_line.iloc[-1] > macd_sig.iloc[-1])
-        
-        structure = detect_structure(df)
-        vol_avg = float(df["Volume"].tail(10).mean())
-        last_vol = float(df["Volume"].iloc[-1])
-        rvol = round(last_vol / vol_avg, 2) if vol_avg > 0 else 0.0
-        
-        # Determine F&O signal
-        trend = structure["trend"]
-        is_bullish = trend == "BULLISH"
-        
-        entry = round(last_close, 2)
-        sl = round(entry - 2.0 * atr, 2) if is_bullish else round(entry + 2.0 * atr, 2)
-        t1 = round(entry + 1.5 * atr, 2) if is_bullish else round(entry - 1.5 * atr, 2)
-        
-        risk = abs(entry - sl)
-        reward = abs(t1 - entry)
-        rr_ratio = round(reward / risk, 2) if risk > 0 else 0.0
-        
-        signal_date, signal_time = _candle_signal_timestamp(df, is_daily=False)
-        
-        confidence = min(95.0, max(35.0, 50 + abs(rsi_val - 50) * 0.5 + rvol * 8 + rr_ratio * 5))
-        
-        return {
-            "Signal Date": signal_date,
-            "Signal Time": signal_time,
-            "Stock": stock_ticker,
-            "LTP": entry,
-            "Trend": "🟢 BULLISH" if is_bullish else "🔴 BEARISH",
-            "Entry": entry,
-            "Stop Loss": sl,
-            "Target 1": t1,
-            "Risk:Reward": rr_ratio,
-            "RSI": round(rsi_val, 1),
-            "MACD": "🟢 Bullish" if macd_bullish else "🔴 Bearish",
-            "RVOL": rvol,
-            "Confidence %": round(confidence, 1),
-            "Reason": f"F&O {trend} trend with {rvol}x volume",
-        }, None
-    
-    except Exception as e:
-        return None, f"{symbol}: analysis error ({type(e).__name__})"
-
-def run_fo_scanner(fyers, symbols):
-    """Threaded scan for F&O stocks."""
-    symbols = _validate_symbols(symbols)
-    results, errors = [], []
-    stats = ScanStats(total=len(symbols))
-    progress = st.progress(0.0, text=f"Scanning F&O Stocks 0 / {len(symbols)}")
-    done = 0
-    
-    for i in range(0, len(symbols), BATCH_SIZE):
-        batch = symbols[i:i + BATCH_SIZE]
-        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            futures = {executor.submit(_fetch_fo_signal, fyers, s): s for s in batch}
-            for future in as_completed(futures):
-                try:
-                    res, err = future.result()
-                except Exception as e:
-                    res, err = None, f"{futures[future]}: worker error ({type(e).__name__})"
-                
-                if res:
-                    results.append(res)
-                if err:
-                    errors.append(err)
-                stats.record(has_result=bool(res), has_error=bool(err))
-                done += 1
-                progress.progress(done / max(len(symbols), 1), text=f"Scanning F&O Stocks {done} / {len(symbols)}")
-        
-        if i + BATCH_SIZE < len(symbols):
-            time.sleep(BATCH_PAUSE_SECONDS)
-    
-    progress.empty()
-    gc.collect()
-    return results, errors, stats
-
-# ════════════════════════════════════════════════════════════════════════════════
-# 15-MIN REVERSAL SCANNER (ORIGINAL - PRESERVED)
+# 15-MINUTE REVERSAL SCANNER ENGINE
 # ════════════════════════════════════════════════════════════════════════════════
 def _detect_reversal_zone(df):
-    """Original reversal detection logic - PRESERVED"""
+    """
+    Detect swing reversal zones on 15-min candles using ATR-based logic
+    similar to the Pine Script indicator. Returns zone info.
+    """
     if len(df) < 30:
         return {"type": "NONE", "price": None, "strength": None}
     
@@ -1178,14 +267,16 @@ def _detect_reversal_zone(df):
         REVERSAL_ATR_MULTIPLIER * atr_val
     )
     
+    # Simple swing detection: find recent pivot high/low
     lookback = 20
     recent = d.tail(lookback)
     recent_high = float(recent["High"].max())
     recent_low = float(recent["Low"].min())
     last_close = float(close.iloc[-1])
     
+    # Bearish pressure near high = potential reversal down
     if abs(recent_high - last_close) < reversal_threshold * 1.5:
-        if close.iloc[-1] < close.iloc[-2]:
+        if close.iloc[-1] < close.iloc[-2]:  # Confirmed bearish candle
             return {
                 "type": "SELL",
                 "price": round(recent_high, 2),
@@ -1193,8 +284,9 @@ def _detect_reversal_zone(df):
                 "distance_pct": round(abs(recent_high - last_close) / recent_high * 100, 2),
             }
     
+    # Bullish pressure near low = potential reversal up
     if abs(last_close - recent_low) < reversal_threshold * 1.5:
-        if close.iloc[-1] > close.iloc[-2]:
+        if close.iloc[-1] > close.iloc[-2]:  # Confirmed bullish candle
             return {
                 "type": "BUY",
                 "price": round(recent_low, 2),
@@ -1205,7 +297,7 @@ def _detect_reversal_zone(df):
     return {"type": "NONE", "price": None, "strength": None}
 
 def _fetch_15min_reversal_signal(fyers, symbol):
-    """Original 15-min reversal worker - PRESERVED"""
+    """Worker for 15-min reversal scanner."""
     stock_ticker = symbol.replace("NSE:", "").replace("-EQ", "") if isinstance(symbol, str) else str(symbol)
     
     if not isinstance(symbol, str) or not _VALID_EQ_SYMBOL_RE.match(symbol):
@@ -1239,11 +331,12 @@ def _fetch_15min_reversal_signal(fyers, symbol):
         if len(df) < 30:
             return None, None
         
+        # Remove unclosed candle
         if len(df) > 0:
             last_time = df["Time"].iloc[-1]
             candle_age = (_now_ist() - last_time).total_seconds() / 60
-            if candle_age < REVERSAL_LOOKBACK_DAYS * 1440:
-                if candle_age < 15:
+            if candle_age < REVERSAL_LOOKBACK_DAYS * 1440:  # Still in current period
+                if candle_age < 15:  # Probably unclosed
                     df = df.iloc[:-1].reset_index(drop=True)
         
         if len(df) < 30:
@@ -1301,7 +394,7 @@ def _fetch_15min_reversal_signal(fyers, symbol):
         return None, f"{symbol}: analysis error ({type(e).__name__})"
 
 def run_15min_reversal_scan(fyers, symbols):
-    """Original 15-min reversal scan - PRESERVED"""
+    """Threaded scan for 15-min reversal signals."""
     symbols = _validate_symbols(symbols)
     results, errors = [], []
     stats = ScanStats(total=len(symbols))
@@ -1334,10 +427,13 @@ def run_15min_reversal_scan(fyers, symbols):
     return results, errors, stats
 
 # ════════════════════════════════════════════════════════════════════════════════
-# VOLUME BIG MOVEMENT SCANNER (ORIGINAL - PRESERVED)
+# VOLUME BIG MOVEMENT SCANNER
 # ════════════════════════════════════════════════════════════════════════════════
 def _detect_volume_big_move(df):
-    """Original volume detection - PRESERVED"""
+    """
+    Detect big volume-driven moves on daily candles.
+    Returns: type ("BIG_UP", "BIG_DOWN", "NONE"), confidence score
+    """
     if len(df) < VOL_BIGMOVE_LOOKBACK:
         return "NONE", 0.0
     
@@ -1359,10 +455,12 @@ def _detect_volume_big_move(df):
     
     atr = _last_valid_atr(df)
     
+    # Big move up
     if float(last["Close"]) > float(last["Open"]) and body > atr * 0.6:
         confidence = min(95.0, 40 + (body_pct * 5) + (rvol * 8))
         return "BIG_UP", confidence
     
+    # Big move down
     if float(last["Close"]) < float(last["Open"]) and body > atr * 0.6:
         confidence = min(95.0, 40 + (body_pct * 5) + (rvol * 8))
         return "BIG_DOWN", confidence
@@ -1370,7 +468,7 @@ def _detect_volume_big_move(df):
     return "NONE", 0.0
 
 def _fetch_volume_big_move_signal(fyers, symbol):
-    """Original volume big move worker - PRESERVED"""
+    """Worker for volume big movement scanner."""
     stock_ticker = symbol.replace("NSE:", "").replace("-EQ", "") if isinstance(symbol, str) else str(symbol)
     
     if not isinstance(symbol, str) or not _VALID_EQ_SYMBOL_RE.match(symbol):
@@ -1452,7 +550,7 @@ def _fetch_volume_big_move_signal(fyers, symbol):
         return None, f"{symbol}: analysis error ({type(e).__name__})"
 
 def run_volume_big_move_scan(fyers, symbols):
-    """Original volume big move scan - PRESERVED"""
+    """Threaded scan for volume big movement signals."""
     symbols = _validate_symbols(symbols)
     results, errors = [], []
     stats = ScanStats(total=len(symbols))
@@ -1484,34 +582,14 @@ def run_volume_big_move_scan(fyers, symbols):
     gc.collect()
     return results, errors, stats
 
-def _options_summary_dataframe(options_data: Dict[str, Any]) -> pd.DataFrame:
-    rows = []
-    for x in options_data.get("chain", []):
-        rows.append({
-            "Symbol": x.get("symbol"), "Strike": x.get("strike_price"), "Type": x.get("option_type"),
-            "LTP": x.get("ltp"), "OI": x.get("oi"), "OI Change": x.get("oich"),
-            "Volume": x.get("volume"), "Bid": x.get("bid"), "Ask": x.get("ask"),
-            "IV": (x.get("greeks") or {}).get("iv"), "Delta": (x.get("greeks") or {}).get("delta")
-        })
-    return pd.DataFrame(rows)
-
-
-def _master_view(master_df, columns):
-    if master_df is None or master_df.empty:
-        return pd.DataFrame(columns=columns)
-    return master_df[[c for c in columns if c in master_df.columns]].copy()
-
 # ════════════════════════════════════════════════════════════════════════════════
 # EXPORT UTILITIES
 # ════════════════════════════════════════════════════════════════════════════════
-def to_excel_bytes(dfs_dict: Dict[str, pd.DataFrame]) -> bytes:
-    """Export multiple dataframes to Excel with separate sheets"""
+def to_excel_bytes(df, sheet_name: str = "Results") -> bytes:
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-        for sheet_name, df in dfs_dict.items():
-            safe_name = sheet_name[:31]
-            if not df.empty:
-                df.to_excel(writer, index=False, sheet_name=safe_name)
+        safe_name = sheet_name[:31]
+        df.to_excel(writer, index=False, sheet_name=safe_name)
     buf.seek(0)
     return buf.getvalue()
 
@@ -1525,196 +603,54 @@ def to_json_bytes(df) -> bytes:
 # MAIN APP
 # ════════════════════════════════════════════════════════════════════════════════
 def show_scanner(fyers) -> None:
-    """Streamlit main app - NSE AI PRO V15 - Upgraded with Multi-Timeframe + CHoCH + MSS + Options"""
+    """Streamlit main entry point - Focused: Full Scan + F&O OI + 15-Min Rev + Vol BigMove"""
     
-    st.set_page_config(page_title="NSE AI PRO V16", layout="wide")
-    st.title("🚀 NSE AI PRO V16 — 2300 Stock + F&O + Options + MTF Structure")
+    st.title("🚀 NSE AI PRO V14 — Focused Scanner")
     st.caption(f"🕒 Current Time (IST): {_now_ist().strftime('%d-%b-%Y %H:%M:%S')} IST")
     
-    # Load symbols
-    all_symbols = load_nse_equity_symbols()
-    fo_symbols = load_fo_stocks()
+    symbols = load_nse_equity_symbols()
+    st.caption(f"Loaded {len(symbols)} NSE equity symbols.")
     
-    st.caption(f"📊 Loaded {len(all_symbols)} NSE equity symbols | 📈 F&O Stocks: {len(fo_symbols)}")
-    
-    if not all_symbols:
-        st.warning("❌ No symbols loaded — check network access.")
+    if not symbols:
+        st.warning("No symbols loaded — check network access.")
         return
     
-    # Top controls
-    col1, col2, col3 = st.columns([2, 1, 1])
+    col1, col2 = st.columns([2, 1])
     with col1:
-        limit = st.number_input("Limit symbols (0 = all)", min_value=0, max_value=len(all_symbols), value=min(DEFAULT_SCAN_STOCKS, len(all_symbols)), step=50)
+        limit = st.number_input("Limit symbols (0 = all)", min_value=0, max_value=len(symbols), value=100, step=50)
     with col2:
-        st.caption(f"~{((limit or len(all_symbols)) / MAX_WORKERS) * 0.5 / 60:.1f}–{((limit or len(all_symbols)) / MAX_WORKERS) * 2.0 / 60:.1f} min")
-    with col3:
-        st.empty()
+        st.caption(f"~{((limit or len(symbols)) / MAX_WORKERS) * 0.3 / 60:.1f}–{((limit or len(symbols)) / MAX_WORKERS) * 1.0 / 60:.1f} min")
     
-    scan_universe = all_symbols if limit == 0 else all_symbols[:limit]
+    scan_universe = symbols if limit == 0 else symbols[:limit]
     
     # Tabs
-    tabs = st.tabs([
-        "📊 F&O Scanner", "🧠 Master Signal Engine", "⏱️ 5M Analysis",
-        "⏱️ 15M Analysis", "🕐 1H Analysis", "🔄 CHoCH / MSS",
-        "📂 Options Chain", "⏱️ 15-Min Reversal Scanner", "🌋 Volume Big Movement Scanner",
+    tab_rev, tab_vol = st.tabs([
+        "⏱️ 15-Min Reversal Scanner",
+        "🌋 Volume Big Movement Scanner",
     ])
     
     # ════════════════════════════════════════════════════════════════════════════════
-    # TAB 1: F&O SCANNER
+    # 15-MINUTE REVERSAL TAB
     # ════════════════════════════════════════════════════════════════════════════════
-    with tabs[0]:
-        st.markdown("### 📊 F&O Stocks Scanner\nDetects bullish/bearish trends in F&O-eligible stocks using 15M analysis.")
-        
-        fo_col1, fo_col2 = st.columns([1, 1])
-        with fo_col1:
-            fo_lim = st.number_input("Limit F&O symbols (0=all)", min_value=0, max_value=len(fo_symbols), value=min(len(fo_symbols), DEFAULT_SCAN_STOCKS), step=50, key="fo_limit")
-        with fo_col2:
-            st.empty()
-        
-        fo_universe = fo_symbols if fo_lim == 0 else fo_symbols[:fo_lim]
-        
-        if st.button(f"📊 Run F&O Scanner ({len(fo_universe)} symbols)", key="fo_run"):
-            if len(fo_universe) > 0:
-                with st.spinner("Scanning F&O stocks…"):
-                    fo_results, fo_errors, fo_stats = run_fo_scanner(fyers, fo_universe)
-                    st.session_state["fo_df"] = pd.DataFrame(fo_results) if fo_results else pd.DataFrame()
-                    st.session_state["fo_errors"] = fo_errors
-                    st.session_state["fo_stats"] = fo_stats
-            else:
-                st.warning("⚠️ No F&O stocks available to scan.")
-        
-        if "fo_stats" in st.session_state:
-            _display_scan_summary(st.session_state["fo_stats"])
-        
-        fo_df = st.session_state.get("fo_df")
-        if fo_df is not None and not fo_df.empty:
-            fo_sorted = fo_df.sort_values("Confidence %", ascending=False)
-            st.dataframe(fo_sorted, use_container_width=True, height=400)
-            
-            col_e1, col_e2 = st.columns(2)
-            with col_e1:
-                st.download_button("📥 Excel", data=to_excel_bytes({"F&O Signals": fo_sorted}), 
-                                  file_name=f"nse_fo_{_now_ist().strftime('%Y%m%d_%H%M')}.xlsx", 
-                                  mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="dl_fo_xlsx")
-            with col_e2:
-                st.download_button("📥 CSV", data=to_csv_bytes(fo_sorted), 
-                                  file_name=f"nse_fo_{_now_ist().strftime('%Y%m%d_%H%M')}.csv", 
-                                  mime="text/csv", key="dl_fo_csv")
-        else:
-            st.info("Run F&O Scanner above.")
-        
-        if st.session_state.get("fo_errors"):
-            with st.expander(f"⚠️ Skipped ({len(st.session_state.get('fo_errors', []))})"):
-                st.text("\n".join(st.session_state.get("fo_errors", [])[:20]))
-    
-    # ════════════════════════════════════════════════════════════════════════════════
-    # TAB 2: MASTER SIGNAL ENGINE
-    # ════════════════════════════════════════════════════════════════════════════════
-    with tabs[1]:
-        st.markdown("### 🧠 Master Signal Engine\n5M + 15M + 1H Multi-Timeframe Analysis with CHoCH, MSS, and Structure Detection.")
-        
-        master_col1, master_col2 = st.columns([1, 1])
-        with master_col1:
-            master_lim = st.number_input("Limit symbols (0=all)", min_value=0, max_value=len(scan_universe), value=min(DEFAULT_SCAN_STOCKS, len(scan_universe)), step=50, key="master_limit")
-        with master_col2:
-            st.empty()
-        
-        master_universe = scan_universe if master_lim == 0 else scan_universe[:master_lim]
-        
-        if st.button(f"🧠 Run Master Signal Scan ({len(master_universe)} symbols)", key="master_run"):
-            with st.spinner("Analyzing 5M + 15M + 1H timeframes…"):
-                master_results, master_errors, master_stats = run_master_signal_scan(fyers, master_universe, fo_symbols)
-                st.session_state["master_df"] = pd.DataFrame(master_results) if master_results else pd.DataFrame()
-                st.session_state["master_errors"] = master_errors
-                st.session_state["master_stats"] = master_stats
-        
-        if "master_stats" in st.session_state:
-            _display_scan_summary(st.session_state["master_stats"])
-        
-        master_df = st.session_state.get("master_df")
-        if master_df is not None and not master_df.empty:
-            master_sorted = master_df.sort_values("Confidence %", ascending=False)
-            st.dataframe(master_sorted, use_container_width=True, height=500)
-            
-            col_e1, col_e2 = st.columns(2)
-            with col_e1:
-                st.download_button("📥 Excel", data=to_excel_bytes({"Master Signals": master_sorted}), 
-                                  file_name=f"nse_master_{_now_ist().strftime('%Y%m%d_%H%M')}.xlsx", 
-                                  mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="dl_master_xlsx")
-            with col_e2:
-                st.download_button("📥 CSV", data=to_csv_bytes(master_sorted), 
-                                  file_name=f"nse_master_{_now_ist().strftime('%Y%m%d_%H%M')}.csv", 
-                                  mime="text/csv", key="dl_master_csv")
-        else:
-            st.info("Run Master Signal Scan above.")
-        
-        if st.session_state.get("master_errors"):
-            with st.expander(f"⚠️ Skipped ({len(st.session_state.get('master_errors', []))})"):
-                st.text("\n".join(st.session_state.get("master_errors", [])[:20]))
-    
-    # ════════════════════════════════════════════════════════════════════════════════
-    # TAB 3-7: MULTI-TIMEFRAME / STRUCTURE / OPTIONS VIEWS
-    # ════════════════════════════════════════════════════════════════════════════════
-    master_df_live = st.session_state.get("master_df", pd.DataFrame())
-
-    with tabs[2]:
-        st.markdown("### ⏱️ 5-Minute Analysis")
-        st.info("Run Master Signal Scan first. This view uses the same isolated 5M analysis; no new API scan is required.")
-        st.dataframe(_master_view(master_df_live, ["Stock","LTP","5M Trend","5M Structure","5M CHoCH","5M MSS","VWAP","EMA Trend","RSI","MACD","RVOL","Final Signal","Confidence %"]), use_container_width=True, height=450)
-
-    with tabs[3]:
-        st.markdown("### ⏱️ 15-Minute Analysis")
-        st.dataframe(_master_view(master_df_live, ["Stock","LTP","15M Trend","15M Structure","15M CHoCH","15M MSS","Final Signal","Confidence %","Entry","Stop Loss","Target 1","Target 2"]), use_container_width=True, height=450)
-
-    with tabs[4]:
-        st.markdown("### 🕐 1-Hour Analysis")
-        st.dataframe(_master_view(master_df_live, ["Stock","LTP","1H Trend","1H Structure","1H CHoCH","1H MSS","Final Signal","Confidence %"]), use_container_width=True, height=450)
-
-    with tabs[5]:
-        st.markdown("### 🔄 CHoCH / MSS Multi-Timeframe Structure")
-        st.dataframe(_master_view(master_df_live, ["Stock","5M Structure","15M Structure","1H Structure","5M CHoCH","15M CHoCH","1H CHoCH","5M MSS","15M MSS","1H MSS","Final Signal","Confidence %"]), use_container_width=True, height=450)
-
-    with tabs[6]:
-        st.markdown("### 📂 Live Options Chain")
-        if fo_symbols:
-            fo_names = [x.replace("NSE:","").replace("-EQ","") for x in fo_symbols]
-            selected_name = st.selectbox("Select F&O underlying", fo_names, key="options_underlying")
-            selected_symbol = f"NSE:{selected_name}-EQ"
-            if st.button("📡 Load Live Options Chain", key="options_load"):
-                od = fetch_options_chain_data(fyers, selected_symbol)
-                st.session_state["options_selected"] = selected_name
-                st.session_state["options_data"] = od
-        od = st.session_state.get("options_data")
-        if od:
-            if od.get("status") == "OK":
-                c1,c2,c3,c4,c5 = st.columns(5)
-                c1.metric("Spot", od.get("spot") or "N/A"); c2.metric("ATM", od.get("atm_strike") or "N/A")
-                c3.metric("PCR", od.get("pcr") if od.get("pcr") is not None else "N/A")
-                c4.metric("Max Pain", od.get("max_pain") or "N/A"); c5.metric("Bias", od.get("options_bias","NEUTRAL"))
-                st.dataframe(_options_summary_dataframe(od), use_container_width=True, height=500)
-            else:
-                st.warning(f"Options data unavailable: {od.get('message','unknown error')}")
-        else:
-            st.info("Select an F&O underlying and load its live option chain.")
-
-    # ════════════════════════════════════════════════════════════════════════════════
-    # TAB 3: 15-MINUTE REVERSAL SCANNER (ORIGINAL - PRESERVED)
-    # ════════════════════════════════════════════════════════════════════════════════
-    with tabs[7]:
-        st.markdown("### ⏱️ 15-Minute Reversal Zone Scanner\nDetects swing reversal zones on 15-min candles using ATR-based threshold logic.")
+    with tab_rev:
+        st.markdown(
+            "### ⏱️ 15-Minute Reversal Zone Scanner\n"
+            f"Detects swing reversal zones on 15-min candles using ATR-based threshold logic. "
+            f"Min RVOL: {VOL_BIGMOVE_MIN_RVOL}x, Looks for confirmed reversal candles near recent swing highs/lows."
+        )
         
         rev_col1, rev_col2 = st.columns([1, 1])
         with rev_col1:
-            rev_lim = st.number_input("Limit symbols (0=all)", min_value=0, max_value=len(scan_universe), value=min(DEFAULT_SCAN_STOCKS, len(scan_universe)), step=50, key="rev_limit")
+            rev_lim = st.number_input("Limit symbols (0=all)", min_value=0, max_value=len(symbols), value=min(200, len(symbols)), step=50, key="rev_limit")
         with rev_col2:
             st.empty()
         
-        rev_universe = scan_universe if rev_lim == 0 else scan_universe[:rev_lim]
+        rev_universe = symbols if rev_lim == 0 else symbols[:rev_lim]
         
         if st.button(f"⏱️ Run 15-Min Reversal Scan ({len(rev_universe)} symbols)", key="rev_run"):
             with st.spinner("Scanning 15-min candles for reversals…"):
                 rev_results, rev_errors, rev_stats = run_15min_reversal_scan(fyers, rev_universe)
-                st.session_state["rev_df"] = pd.DataFrame(rev_results) if rev_results else pd.DataFrame()
+                st.session_state["rev_df"] = pd.DataFrame(rev_results)
                 st.session_state["rev_errors"] = rev_errors
                 st.session_state["rev_stats"] = rev_stats
         
@@ -1726,40 +662,48 @@ def show_scanner(fyers) -> None:
             rev_sorted = rev_df.sort_values("Confidence %", ascending=False)
             st.dataframe(rev_sorted, use_container_width=True, height=400)
             
-            col_e1, col_e2 = st.columns(2)
+            col_e1, col_e2, col_e3 = st.columns(3)
             with col_e1:
-                st.download_button("📥 Excel", data=to_excel_bytes({"15M Reversals": rev_sorted}), 
+                st.download_button("📥 Excel", data=to_excel_bytes(rev_sorted, "15-Min Reversals"), 
                                   file_name=f"nse_15min_rev_{_now_ist().strftime('%Y%m%d_%H%M')}.xlsx", 
                                   mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="dl_rev_xlsx")
             with col_e2:
                 st.download_button("📥 CSV", data=to_csv_bytes(rev_sorted), 
                                   file_name=f"nse_15min_rev_{_now_ist().strftime('%Y%m%d_%H%M')}.csv", 
                                   mime="text/csv", key="dl_rev_csv")
+            with col_e3:
+                st.download_button("📥 JSON", data=to_json_bytes(rev_sorted), 
+                                  file_name=f"nse_15min_rev_{_now_ist().strftime('%Y%m%d_%H%M')}.json", 
+                                  mime="application/json", key="dl_rev_json")
         else:
-            st.info("Run 15-Min Reversal Scan above.")
+            st.info("Run a 15-Min Reversal scan above.")
         
         if st.session_state.get("rev_errors"):
-            with st.expander(f"⚠️ Skipped ({len(st.session_state.get('rev_errors', []))})"):
-                st.text("\n".join(st.session_state.get("rev_errors", [])[:20]))
+            with st.expander(f"⚠️ Skipped ({len(st.session_state['rev_errors'])})"):
+                st.text("\n".join(st.session_state["rev_errors"][:20]))
     
     # ════════════════════════════════════════════════════════════════════════════════
-    # TAB 4: VOLUME BIG MOVEMENT SCANNER (ORIGINAL - PRESERVED)
+    # VOLUME BIG MOVEMENT TAB
     # ════════════════════════════════════════════════════════════════════════════════
-    with tabs[8]:
-        st.markdown("### 🌋 Volume Big Movement Scanner\nDetects large volume-driven moves on daily candles.")
+    with tab_vol:
+        st.markdown(
+            "### 🌋 Volume Big Movement Scanner\n"
+            f"Detects large volume-driven moves on daily candles. "
+            f"Requires: RVOL ≥ {VOL_BIGMOVE_MIN_RVOL}x AND body ≥ {VOL_BIGMOVE_MIN_BODY_PCT}% + significant ATR expansion."
+        )
         
         vol_col1, vol_col2 = st.columns([1, 1])
         with vol_col1:
-            vol_lim = st.number_input("Limit symbols (0=all)", min_value=0, max_value=len(scan_universe), value=min(DEFAULT_SCAN_STOCKS, len(scan_universe)), step=50, key="vol_limit")
+            vol_lim = st.number_input("Limit symbols (0=all)", min_value=0, max_value=len(symbols), value=min(300, len(symbols)), step=50, key="vol_limit")
         with vol_col2:
             st.empty()
         
-        vol_universe = scan_universe if vol_lim == 0 else scan_universe[:vol_lim]
+        vol_universe = symbols if vol_lim == 0 else symbols[:vol_lim]
         
         if st.button(f"🌋 Run Volume Big Move Scan ({len(vol_universe)} symbols)", key="vol_run"):
             with st.spinner("Scanning daily candles for big volume moves…"):
                 vol_results, vol_errors, vol_stats = run_volume_big_move_scan(fyers, vol_universe)
-                st.session_state["vol_df"] = pd.DataFrame(vol_results) if vol_results else pd.DataFrame()
+                st.session_state["vol_df"] = pd.DataFrame(vol_results)
                 st.session_state["vol_errors"] = vol_errors
                 st.session_state["vol_stats"] = vol_stats
         
@@ -1771,21 +715,25 @@ def show_scanner(fyers) -> None:
             vol_sorted = vol_df.sort_values("Confidence %", ascending=False)
             st.dataframe(vol_sorted, use_container_width=True, height=400)
             
-            col_e1, col_e2 = st.columns(2)
+            col_e1, col_e2, col_e3 = st.columns(3)
             with col_e1:
-                st.download_button("📥 Excel", data=to_excel_bytes({"Volume Big Moves": vol_sorted}), 
+                st.download_button("📥 Excel", data=to_excel_bytes(vol_sorted, "Volume Big Moves"), 
                                   file_name=f"nse_vol_bigmove_{_now_ist().strftime('%Y%m%d_%H%M')}.xlsx", 
                                   mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="dl_vol_xlsx")
             with col_e2:
                 st.download_button("📥 CSV", data=to_csv_bytes(vol_sorted), 
                                   file_name=f"nse_vol_bigmove_{_now_ist().strftime('%Y%m%d_%H%M')}.csv", 
                                   mime="text/csv", key="dl_vol_csv")
+            with col_e3:
+                st.download_button("📥 JSON", data=to_json_bytes(vol_sorted), 
+                                  file_name=f"nse_vol_bigmove_{_now_ist().strftime('%Y%m%d_%H%M')}.json", 
+                                  mime="application/json", key="dl_vol_json")
         else:
-            st.info("Run Volume Big Move Scan above.")
+            st.info("Run a Volume Big Move scan above.")
         
         if st.session_state.get("vol_errors"):
-            with st.expander(f"⚠️ Skipped ({len(st.session_state.get('vol_errors', []))})"):
-                st.text("\n".join(st.session_state.get("vol_errors", [])[:20]))
+            with st.expander(f"⚠️ Skipped ({len(st.session_state['vol_errors'])})"):
+                st.text("\n".join(st.session_state["vol_errors"][:20]))
     
     gc.collect()
 
@@ -1793,6 +741,7 @@ def show_scanner(fyers) -> None:
 # ENTRY POINT
 # ════════════════════════════════════════════════════════════════════════════════
 if __name__ == "__main__":
+    # Initialize Fyers session (user must set FYERS_ACCESS_TOKEN env var)
     access_token = os.environ.get("FYERS_ACCESS_TOKEN")
     if not access_token:
         st.error("❌ FYERS_ACCESS_TOKEN not set in environment variables")
@@ -1800,8 +749,7 @@ if __name__ == "__main__":
     
     try:
         from fyers_api import fyersModel
-        app_id = os.environ.get("FYERS_APP_ID", "DEMO")
-        fyers = fyersModel.FyersModel(client_id=app_id, token=access_token, log_path="")
+        fyers = fyersModel.FyersModel(client_id="DEMO", token=access_token, log_path="")
         show_scanner(fyers)
     except ImportError:
         st.error("❌ fyers-api not installed. Run: pip install fyers-api")
