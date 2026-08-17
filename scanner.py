@@ -89,12 +89,32 @@ _ensure_app_folders()
 logger = logging.getLogger("nse_scanner_v15")
 logger.setLevel(logging.INFO)
 
-def _candle_signal_timestamp(df, is_daily: bool = False) -> Tuple[str, str]:
+def _candle_signal_timestamp(df, is_daily: bool = False, resolution: str = "15") -> Tuple[str, str]:
+    """Return the CLOSE time of the actual signal candle, not the candle-open time.
+
+    FYERS timestamps represent the candle start. The scanner removes the current
+    unclosed candle, so iloc[-1] is the latest CLOSED candle. Displaying its raw
+    timestamp made the UI look one candle behind. We therefore report the candle
+    close time (and keep the generated-at time separate where needed).
+    """
     ts = df["Time"].iloc[-1]
     if ts.tzinfo is None:
         ts = ts.tz_localize("UTC")
     ts_ist = ts.tz_convert(IST)
-    return ts_ist.strftime("%d-%b-%Y"), ts_ist.strftime("%H:%M:%S") + " IST"
+    if is_daily:
+        # NSE cash session closes at 15:30 IST.
+        close_ts = ts_ist.replace(hour=15, minute=30, second=0, microsecond=0)
+    else:
+        try:
+            minutes = int(resolution)
+        except Exception:
+            minutes = 15
+        close_ts = ts_ist + timedelta(minutes=minutes)
+    return close_ts.strftime("%d-%b-%Y"), close_ts.strftime("%H:%M:%S") + " IST"
+
+def _generated_timestamp() -> str:
+    """Current scanner detection time, separate from the signal candle time."""
+    return _now_ist().strftime("%d-%b-%Y %H:%M:%S IST")
 
 # ════════════════════════════════════════════════════════════════════════════════
 # CORE INDICATORS (RETAINED FROM ORIGINAL)
@@ -223,77 +243,65 @@ def detect_structure(df) -> Dict[str, Any]:
 
 
 def detect_choch(df) -> Dict[str, Any]:
-    """Confirmed CHoCH: close breaks the last confirmed opposing swing."""
+    """Detect a NEW confirmed CHoCH on the latest CLOSED candle only.
+
+    A signal is emitted only when the previous close was on the old side of the
+    confirmed swing and the latest close crosses it. This prevents the same old
+    CHoCH from being reported again on every subsequent candle.
+    """
     ph, pl = _confirmed_pivots(df)
     out = {"bullish_choch":False, "bearish_choch":False, "choch_price":None,
            "choch_type":"NONE", "confirmation":"NONE"}
     if len(ph) < 2 or len(pl) < 2 or len(df) < 10:
         out["confirmation"] = "PENDING"
         return out
+    prev_close = float(df["Close"].iloc[-2])
     close = float(df["Close"].iloc[-1])
-    # Prior bearish sequence: lower high + lower low, then close above latest LH.
     bearish_structure = ph[-1][1] < ph[-2][1] and pl[-1][1] < pl[-2][1]
     bullish_structure = ph[-1][1] > ph[-2][1] and pl[-1][1] > pl[-2][1]
-    if bearish_structure and close > ph[-1][1]:
+    if bearish_structure and prev_close <= ph[-1][1] and close > ph[-1][1]:
         out.update(bullish_choch=True, choch_price=ph[-1][1], choch_type="BULLISH_CHoCH", confirmation="CONFIRMED")
-    elif bullish_structure and close < pl[-1][1]:
+    elif bullish_structure and prev_close >= pl[-1][1] and close < pl[-1][1]:
         out.update(bearish_choch=True, choch_price=pl[-1][1], choch_type="BEARISH_CHoCH", confirmation="CONFIRMED")
     return out
 
 
 def detect_cisd(df: pd.DataFrame) -> Dict[str, Any]:
-    """Confirmed, non-repainting CISD (Change in State of Delivery).
-
-    Bullish CISD: a confirmed candle closes above the high of the most recent
-    confirmed bearish delivery candle.
-    Bearish CISD: a confirmed candle closes below the low of the most recent
-    confirmed bullish delivery candle.
-    """
-    result = {
-        "bullish_cisd": False,
-        "bearish_cisd": False,
-        "cisd_type": "NONE",
-        "cisd_price": None,
-    }
+    """Detect a NEW confirmed CISD event on the latest CLOSED candle only."""
+    result = {"bullish_cisd": False, "bearish_cisd": False, "cisd_type": "NONE", "cisd_price": None}
     if df is None or len(df) < 5:
         return result
-
     d = df.reset_index(drop=True)
-    # Use only completed candles; _fetch_timeframe_data already removes the
-    # current unclosed candle.
     last = d.iloc[-1]
+    prev_close = float(d["Close"].iloc[-2])
     prior = d.iloc[:-1]
-
     bearish = prior[prior["Close"] < prior["Open"]]
     bullish = prior[prior["Close"] > prior["Open"]]
-
-    if not bearish.empty and float(last["Close"]) > float(bearish.iloc[-1]["High"]):
-        result.update({
-            "bullish_cisd": True,
-            "cisd_type": "BULLISH_CISD",
-            "cisd_price": float(last["Close"]),
-        })
-    elif not bullish.empty and float(last["Close"]) < float(bullish.iloc[-1]["Low"]):
-        result.update({
-            "bearish_cisd": True,
-            "cisd_type": "BEARISH_CISD",
-            "cisd_price": float(last["Close"]),
-        })
-
+    if not bearish.empty:
+        level = float(bearish.iloc[-1]["High"])
+        if prev_close <= level and float(last["Close"]) > level:
+            result.update(bullish_cisd=True, cisd_type="BULLISH_CISD", cisd_price=float(last["Close"]))
+    if not bullish.empty and not result["bullish_cisd"]:
+        level = float(bullish.iloc[-1]["Low"])
+        if prev_close >= level and float(last["Close"]) < level:
+            result.update(bearish_cisd=True, cisd_type="BEARISH_CISD", cisd_price=float(last["Close"]))
     return result
 
 
 def detect_mss(df) -> Dict[str, Any]:
-    """Confirmed Market Structure Shift using a close beyond a confirmed pivot."""
+    """Detect a NEW confirmed MSS event on the latest CLOSED candle only."""
     ph, pl = _confirmed_pivots(df)
     out = {"bullish_mss":False, "bearish_mss":False, "mss_type":"NONE", "confirmation":"NONE"}
     if len(ph) < 2 or len(pl) < 2 or len(df) < 10:
         out["confirmation"] = "PENDING"
         return out
+    prev_close = float(df["Close"].iloc[-2])
     close = float(df["Close"].iloc[-1])
-    if ph[-1][1] < ph[-2][1] and pl[-1][1] < pl[-2][1] and close > ph[-1][1]:
+    bearish_structure = ph[-1][1] < ph[-2][1] and pl[-1][1] < pl[-2][1]
+    bullish_structure = ph[-1][1] > ph[-2][1] and pl[-1][1] > pl[-2][1]
+    if bearish_structure and prev_close <= ph[-1][1] and close > ph[-1][1]:
         out.update(bullish_mss=True, mss_type="BULLISH_MSS", confirmation="CONFIRMED")
-    elif ph[-1][1] > ph[-2][1] and pl[-1][1] > pl[-2][1] and close < pl[-1][1]:
+    elif bullish_structure and prev_close >= pl[-1][1] and close < pl[-1][1]:
         out.update(bearish_mss=True, mss_type="BEARISH_MSS", confirmation="CONFIRMED")
     return out
 
@@ -610,6 +618,7 @@ def analyze_timeframe(fyers, symbol: str, resolution: str) -> Dict[str, Any]:
         rsi_oversold = rsi_val < 30
         
         macd_bullish = macd_line.iloc[-1] > macd_sig.iloc[-1]
+        candle_date, candle_close_time = _candle_signal_timestamp(df, is_daily=False, resolution=resolution)
         
         return {
             "timeframe": resolution,
@@ -619,6 +628,9 @@ def analyze_timeframe(fyers, symbol: str, resolution: str) -> Dict[str, Any]:
                 "last_high": last_high,
                 "last_low": last_low,
                 "last_open": last_open,
+                "signal_candle_date": candle_date,
+                "signal_candle_time": candle_close_time,
+                "signal_generated_at": _generated_timestamp(),
                 "structure_type": structure["type"],
                 "structure_trend": structure["trend"],
                 "current_high": structure["current_high"],
@@ -983,20 +995,32 @@ def calculate_master_signal(symbol: str, analysis_5m: Dict, analysis_15m: Dict, 
     confidence = round(abs(total_score - 50) * 2, 1)
     confidence = max(0, min(100, confidence))
 
+    # Final direction must agree with the lower-timeframe entry and the two
+    # higher-timeframe contexts. This prevents a strong 1H score from forcing
+    # a BUY while 5M/15M are clearly bearish (and vice versa).
+    bullish_alignment = scores["5m_score"] >= 55 and scores["15m_score"] >= 55 and scores["1h_score"] >= 50
+    bearish_alignment = scores["5m_score"] <= 45 and scores["15m_score"] <= 45 and scores["1h_score"] <= 50
+    strong_bull_alignment = scores["5m_score"] >= 65 and scores["15m_score"] >= 65 and scores["1h_score"] >= 60
+    strong_bear_alignment = scores["5m_score"] <= 35 and scores["15m_score"] <= 35 and scores["1h_score"] <= 40
+
     if hard_conflict and max(tf_scores) - min(tf_scores) >= 20:
         final_signal = "NEUTRAL / WAIT"
         confidence = min(confidence, 55.0)
         reasons.append("Multi-timeframe conflict: WAIT")
-    elif total_score >= 72:
+    elif strong_bull_alignment and total_score >= 70:
         final_signal = "STRONG BUY"
-    elif total_score >= 60:
+    elif bullish_alignment and total_score >= 58:
         final_signal = "BUY"
-    elif total_score <= 28:
+    elif strong_bear_alignment and total_score <= 30:
         final_signal = "STRONG SELL"
-    elif total_score <= 40:
+    elif bearish_alignment and total_score <= 42:
         final_signal = "SELL"
     else:
         final_signal = "NEUTRAL / WAIT"
+        if total_score > 50 and not bullish_alignment:
+            reasons.append("Bullish score lacks 5M/15M/1H alignment")
+        elif total_score < 50 and not bearish_alignment:
+            reasons.append("Bearish score lacks 5M/15M/1H alignment")
     
     # Calculate Entry/SL/Targets
     if analysis_5m.get("status") == "OK" and analysis_5m.get("data"):
@@ -1077,6 +1101,8 @@ def _fetch_master_signal(fyers, symbol: str, fo_set=None):
         return {
             "Stock": stock_ticker,
             "LTP": ltp,
+            "Signal Time": _generated_timestamp(),
+            "Signal Candle Time": data_5m.get("signal_candle_time", "N/A"),
             "5M Trend": data_5m.get("structure_trend", "N/A"),
             "15M Trend": data_15m.get("structure_trend", "N/A"),
             "1H Trend": data_1h.get("structure_trend", "N/A"),
@@ -1180,6 +1206,8 @@ def _fetch_fo_signal(fyers, symbol):
         return {
             "Stock": stock_ticker,
             "LTP": round(float(ltp), 2),
+            "Signal Time": _generated_timestamp(),
+            "Signal Candle Time": data5.get("signal_candle_time", "N/A"),
             "5M Trend": data5.get("structure_trend", "N/A"),
             "15M Trend": data15.get("structure_trend", "N/A"),
             "1H Trend": data1h.get("structure_trend", "N/A"),
@@ -1355,13 +1383,14 @@ def _fetch_15min_reversal_signal(fyers, symbol):
         vol_avg20 = float(df["Volume"].tail(20).mean())
         rvol = round(float(df["Volume"].iloc[-1] / vol_avg20), 2) if vol_avg20 > 0 else 0.0
         
-        signal_date_str, signal_time_str = _candle_signal_timestamp(df, is_daily=False)
+        signal_date_str, signal_time_str = _candle_signal_timestamp(df, is_daily=False, resolution="15")
         
         confidence = min(95.0, max(35.0, 50 + abs(rsi_val - 50) * 0.5 + rvol * 8 + rr_ratio * 5))
         
         return {
             "Signal Date": signal_date_str,
-            "Signal Time": signal_time_str,
+            "Signal Time": _generated_timestamp(),
+            "Signal Candle Time": signal_time_str,
             "Stock": stock_ticker,
             "LTP": entry,
             "Type": "🟢 REVERSAL BUY" if is_buy else "🔴 REVERSAL SELL",
@@ -1511,11 +1540,12 @@ def _fetch_volume_big_move_signal(fyers, symbol):
         reward = abs(t1 - entry)
         rr_ratio = round(reward / risk, 2) if risk > 0 else 0.0
         
-        signal_date_str, signal_time_str = _candle_signal_timestamp(df, is_daily=True)
+        signal_date_str, signal_time_str = _candle_signal_timestamp(df, is_daily=True, resolution="D")
         
         return {
             "Signal Date": signal_date_str,
-            "Signal Time": signal_time_str,
+            "Signal Time": _generated_timestamp(),
+            "Signal Candle Time": signal_time_str,
             "Stock": stock_ticker,
             "LTP": entry,
             "Type": "🟢 BIG UP MOVE" if is_up else "🔴 BIG DOWN MOVE",
@@ -1744,19 +1774,19 @@ def show_scanner(fyers) -> None:
     with tabs[2]:
         st.markdown("### ⏱️ 5-Minute Analysis")
         st.info("Run Master Signal Scan first. This view uses the same isolated 5M analysis; no new API scan is required.")
-        st.dataframe(_master_view(master_df_live, ["Stock","LTP","5M Trend","5M Structure","5M CHoCH","5M MSS","VWAP","EMA Trend","RSI","MACD","RVOL","Final Signal","Confidence %"]), use_container_width=True, height=450)
+        st.dataframe(_master_view(master_df_live, ["Stock","LTP","Signal Time","Signal Candle Time","5M Trend","5M Structure","5M CHoCH","5M MSS","VWAP","EMA Trend","RSI","MACD","RVOL","Final Signal","Confidence %"]), use_container_width=True, height=450)
 
     with tabs[3]:
         st.markdown("### ⏱️ 15-Minute Analysis")
-        st.dataframe(_master_view(master_df_live, ["Stock","LTP","15M Trend","15M Structure","15M CHoCH","15M MSS","Final Signal","Confidence %","Entry","Stop Loss","Target 1","Target 2"]), use_container_width=True, height=450)
+        st.dataframe(_master_view(master_df_live, ["Stock","LTP","Signal Time","Signal Candle Time","15M Trend","15M Structure","15M CHoCH","15M MSS","Final Signal","Confidence %","Entry","Stop Loss","Target 1","Target 2"]), use_container_width=True, height=450)
 
     with tabs[4]:
         st.markdown("### 🕐 1-Hour Analysis")
-        st.dataframe(_master_view(master_df_live, ["Stock","LTP","1H Trend","1H Structure","1H CHoCH","1H MSS","Final Signal","Confidence %"]), use_container_width=True, height=450)
+        st.dataframe(_master_view(master_df_live, ["Stock","LTP","Signal Time","Signal Candle Time","1H Trend","1H Structure","1H CHoCH","1H MSS","Final Signal","Confidence %"]), use_container_width=True, height=450)
 
     with tabs[5]:
         st.markdown("### 🔄 CHoCH / MSS Multi-Timeframe Structure")
-        st.dataframe(_master_view(master_df_live, ["Stock","5M Structure","15M Structure","1H Structure","5M CHoCH","15M CHoCH","1H CHoCH","5M MSS","15M MSS","1H MSS","Final Signal","Confidence %"]), use_container_width=True, height=450)
+        st.dataframe(_master_view(master_df_live, ["Stock","Signal Time","Signal Candle Time","5M Structure","15M Structure","1H Structure","5M CHoCH","15M CHoCH","1H CHoCH","5M MSS","15M MSS","1H MSS","Final Signal","Confidence %"]), use_container_width=True, height=450)
 
     with tabs[6]:
         st.markdown("### 📂 Live Options Chain")
