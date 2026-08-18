@@ -1,19 +1,25 @@
 """
-option_chain.py (ENHANCED v2 - PRODUCTION READY)
+option_chain.py (ENHANCED)
 ==========================
 Institutional-grade NSE India Options Chain Dashboard with AI-Powered Price Action Signals.
 
-✅ NEW FEATURES:
-- Commodities support (MCX: Gold, Silver, Crude, Natural Gas + NCDEX)
-- Fixed price action signals with comprehensive error handling
-- Safe FYERS integration with detailed feedback
-- Robust technical indicator calculations
-- Clear user messaging for all errors
-
-Data Source: FYERS (Primary) → NSE (Fallback for option chains only)
+Data Source: FYERS (Primary) → NSE (Fallback for option chain only)
 Live Signals: MSS, HH/HL/LH/LL, BOS, CHoCH, VWAP, EMA, RSI, MACD, Volume, RVOL
 Confirmation: 5M, 15M, 30M, 1H, 1D multi-timeframe analysis
 Trade Signal Output: BUY/SELL/HOLD with Entry, SL, T1, T2, T3, Probability, Confidence
+
+This version:
+- Makes FYERS the PRIMARY live data source (NSE is fallback for option chains only)
+- Fetches price data (OHLCV) for multiple timeframes from FYERS
+- Detects market structure: HH, HL, LH, LL per timeframe
+- Detects Break of Structure (BOS) and Change of Character (CHoCH)
+- Calculates Market Structure Shifts (MSS) with non-repaint logic
+- Calculates technical indicators on live data
+- Generates multi-timeframe confirmed trade signals
+- Computes entry/exit levels and probability scores
+- Shows NO SIGNAL if FYERS is unavailable (no fake data generation)
+- Preserves all existing option-chain, Greeks, GEX/DEX, AI features
+- Single-file architecture: no separate modules
 """
 
 from __future__ import annotations
@@ -70,19 +76,6 @@ INDEX_SYMBOLS: dict[str, str] = {
     "SENSEX": "SENSEX",
 }
 
-# ✅ COMMODITIES SUPPORT ADDED
-COMMODITY_SYMBOLS: dict[str, dict] = {
-    # MCX Commodities (Multi Commodity Exchange)
-    "GOLD": {"exchange": "MCX", "symbol_pattern": "GOLD", "lot_size": 1},
-    "SILVER": {"exchange": "MCX", "symbol_pattern": "SILVER", "lot_size": 1},
-    "CRUDEOIL": {"exchange": "MCX", "symbol_pattern": "CRUDEOIL", "lot_size": 100},
-    "NATURALGAS": {"exchange": "MCX", "symbol_pattern": "NATURALGAS", "lot_size": 1},
-    
-    # NCDEX Commodities (National Commodity & Derivatives Exchange)
-    "CARDAMOM": {"exchange": "NCDEX", "symbol_pattern": "CARDAMOM", "lot_size": 1},
-    "TURMERIC": {"exchange": "NCDEX", "symbol_pattern": "TURMERIC", "lot_size": 1},
-}
-
 NSE_UNSUPPORTED_INDICES: set[str] = {"SENSEX", "BANKEX"}
 
 DEFAULT_LOT_SIZES: dict[str, int] = {
@@ -92,13 +85,6 @@ DEFAULT_LOT_SIZES: dict[str, int] = {
     "MIDCPNIFTY": 50,
     "SENSEX": 10,
     "BANKEX": 15,
-    # Commodities
-    "GOLD": 1,
-    "SILVER": 1,
-    "CRUDEOIL": 100,
-    "NATURALGAS": 1,
-    "CARDAMOM": 1,
-    "TURMERIC": 1,
     "_STOCK_DEFAULT": 1,
 }
 
@@ -151,9 +137,9 @@ DEFAULT_MACD_PARAMS = {"fast": 12, "slow": 26, "signal": 9}
 DEFAULT_VWAP_PERIOD = 20
 
 # MSS and signal parameters
-MSS_MIN_STRENGTH = 1.0
-BOS_CONFIRMATION_BARS = 1
-CHOCH_CONFIRMATION_BARS = 2
+MSS_MIN_STRENGTH = 1.0  # minimum % move to confirm MSS
+BOS_CONFIRMATION_BARS = 1  # bars to confirm BOS
+CHOCH_CONFIRMATION_BARS = 2  # bars to confirm CHoCH
 
 FYERS_INDEX_SYMBOL_CANDIDATES: dict[str, list[str]] = {
     "NIFTY": ["NSE:NIFTY50-INDEX"],
@@ -162,16 +148,6 @@ FYERS_INDEX_SYMBOL_CANDIDATES: dict[str, list[str]] = {
     "MIDCPNIFTY": ["NSE:MIDCPNIFTY-INDEX", "NSE:MIDCAPNIFTY-INDEX"],
     "SENSEX": ["BSE:SENSEX-INDEX", "BSE:SENSEX-INDEX50"],
     "BANKEX": ["BSE:BANKEX-INDEX"],
-}
-
-# ✅ FYERS COMMODITY SYMBOL CANDIDATES ADDED
-FYERS_COMMODITY_SYMBOL_CANDIDATES: dict[str, list[str]] = {
-    "GOLD": ["MCX:GOLDM-OPT"],
-    "SILVER": ["MCX:SILVERM-OPT"],
-    "CRUDEOIL": ["MCX:CRUDEOILM-OPT"],
-    "NATURALGAS": ["MCX:NGRDM-OPT"],
-    "CARDAMOM": ["NCDEX:CARDAMOMM-OPT"],
-    "TURMERIC": ["NCDEX:TURMERICM-OPT"],
 }
 
 
@@ -307,12 +283,7 @@ def fyers_stock_symbol_candidates(stock: str) -> list[str]:
 
 
 def _fyers_index_candidates(symbol_key: str) -> list[str]:
-    """Get FYERS candidates for indices or commodities."""
-    if symbol_key in FYERS_INDEX_SYMBOL_CANDIDATES:
-        return FYERS_INDEX_SYMBOL_CANDIDATES[symbol_key]
-    if symbol_key in FYERS_COMMODITY_SYMBOL_CANDIDATES:
-        return FYERS_COMMODITY_SYMBOL_CANDIDATES[symbol_key]
-    return [f"NSE:{symbol_key}-INDEX"]
+    return FYERS_INDEX_SYMBOL_CANDIDATES.get(symbol_key, [f"NSE:{symbol_key}-INDEX"])
 
 
 def _fyers_call_optionchain(fyers: Any, symbol: str, strikecount: int, timestamp: str = "") -> Optional[dict]:
@@ -327,6 +298,7 @@ def _fyers_call_optionchain(fyers: Any, symbol: str, strikecount: int, timestamp
 
 
 def _fyers_call_history(fyers: Any, symbol: str, resolution: str, count: int = 100) -> Optional[dict]:
+    """Fetches OHLCV candle data from FYERS. Resolution: 1, 5, 15, 30, 60, 1D, etc."""
     try:
         req = {
             "symbol": symbol,
@@ -342,17 +314,10 @@ def _fyers_call_history(fyers: Any, symbol: str, resolution: str, count: int = 1
         return None
 
 
-# ✅ ENHANCED CANDLE FETCHING WITH ERROR REPORTING
-def fetch_fyers_candles_safe(fyers: Any, symbol: str, timeframe_minutes: int, 
-                              count: int = 100) -> tuple[Optional[pd.DataFrame], Optional[str]]:
-    """
-    Fetch OHLCV candles from FYERS with DETAILED ERROR REPORTING.
-    Returns: (DataFrame, error_message)
-    - If successful: (df, None)
-    - If failed: (None, error_msg)
-    """
+def fetch_fyers_candles(fyers: Any, symbol: str, timeframe_minutes: int, count: int = 100) -> Optional[pd.DataFrame]:
+    """Fetches OHLCV candles from FYERS for a given timeframe. Returns None if unavailable."""
     if fyers is None:
-        return None, "⚠️ FYERS client not initialized"
+        return None
 
     resolution_map = {
         5: "5",
@@ -363,62 +328,38 @@ def fetch_fyers_candles_safe(fyers: Any, symbol: str, timeframe_minutes: int,
     }
     resolution = resolution_map.get(timeframe_minutes, str(timeframe_minutes))
 
-    try:
-        logger.info(f"Fetching {symbol} at {resolution}min resolution")
-        resp = _fyers_call_history(fyers, symbol, resolution, count)
-        
-        if resp is None:
-            return None, f"❌ FYERS returned None for {symbol}"
-        
-        if not isinstance(resp, dict):
-            return None, f"❌ FYERS response is not a dict: {type(resp)}"
-        
-        status = resp.get("s")
-        if status != "ok":
-            code = resp.get("code", "unknown")
-            message = resp.get("message", "")
-            return None, f"❌ FYERS status '{status}' (code: {code}) - {message}"
+    resp = _fyers_call_history(fyers, symbol, resolution, count)
+    if not isinstance(resp, dict) or resp.get("s") != "ok":
+        logger.warning("FYERS history returned non-ok status for %s: %s", symbol, resp.get("s") if resp else None)
+        return None
 
-        candles = resp.get("candles", [])
-        if not isinstance(candles, list):
-            return None, f"❌ FYERS candles not a list: {type(candles)}"
-        
-        if not candles:
-            return None, f"❌ FYERS returned empty candles for {symbol} at {resolution}min"
+    data = resp.get("candles", []) if isinstance(resp.get("candles"), list) else []
+    if not data:
+        logger.warning("FYERS history returned empty candles for %s", symbol)
+        return None
 
-        rows = []
-        for candle in candles:
-            if not isinstance(candle, list) or len(candle) < 5:
-                continue
-            try:
-                rows.append({
-                    "timestamp": int(candle[0]) if len(candle) > 0 else 0,
-                    "open": float(candle[1]) if len(candle) > 1 else 0.0,
-                    "high": float(candle[2]) if len(candle) > 2 else 0.0,
-                    "low": float(candle[3]) if len(candle) > 3 else 0.0,
-                    "close": float(candle[4]) if len(candle) > 4 else 0.0,
-                    "volume": float(candle[5]) if len(candle) > 5 else 0.0,
-                })
-            except (TypeError, ValueError, IndexError) as e:
-                logger.warning(f"Skipping malformed candle: {e}")
-                continue
+    rows = []
+    for candle in data:
+        if not isinstance(candle, list) or len(candle) < 5:
+            continue
+        try:
+            rows.append({
+                "timestamp": int(candle[0]) if len(candle) > 0 else 0,
+                "open": float(candle[1]) if len(candle) > 1 else 0.0,
+                "high": float(candle[2]) if len(candle) > 2 else 0.0,
+                "low": float(candle[3]) if len(candle) > 3 else 0.0,
+                "close": float(candle[4]) if len(candle) > 4 else 0.0,
+                "volume": float(candle[5]) if len(candle) > 5 else 0.0,
+            })
+        except (TypeError, ValueError, IndexError):
+            continue
 
-        if not rows:
-            return None, f"❌ All {len(candles)} candles were malformed"
+    if not rows:
+        return None
 
-        df = pd.DataFrame(rows)
-        df = df.sort_values("timestamp").reset_index(drop=True)
-        
-        if len(df) < 5:
-            return None, f"❌ Insufficient candles: got {len(df)}, need at least 5"
-        
-        logger.info(f"✅ Successfully fetched {len(df)} candles for {symbol} at {resolution}min")
-        return df, None
-
-    except Exception as e:
-        error_msg = f"❌ Exception fetching {symbol}: {str(e)}"
-        logger.error(error_msg)
-        return None, error_msg
+    df = pd.DataFrame(rows)
+    df = df.sort_values("timestamp").reset_index(drop=True)
+    return df
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -486,81 +427,27 @@ def calculate_rvol(df: pd.DataFrame, period: int = 20) -> pd.Series:
     return rvol.fillna(1.0)
 
 
-# ✅ SAFE TECHNICAL INDICATORS WITH ERROR HANDLING
-def add_technical_indicators_safe(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
-    """
-    Add technical indicators with validation.
-    Returns: (enhanced_df, warnings_list)
-    """
-    warnings = []
-    
-    if df is None or df.empty:
-        warnings.append("⚠️ DataFrame is empty")
-        return df if df is not None else pd.DataFrame(), warnings
-    
-    if len(df) < 10:
-        warnings.append(f"⚠️ Only {len(df)} candles available (need ≥10 for reliable indicators)")
-    
-    d = df.copy()
-    
-    try:
-        d["rsi"] = calculate_rsi(d)
-        if d["rsi"].isna().all():
-            warnings.append("⚠️ RSI calculation failed")
-    except Exception as e:
-        warnings.append(f"⚠️ RSI error: {e}")
-        d["rsi"] = 50.0
-    
-    try:
-        d["ema_9"] = calculate_ema(d, 9)
-        d["ema_21"] = calculate_ema(d, 21)
-        if d["ema_9"].isna().all() or d["ema_21"].isna().all():
-            warnings.append("⚠️ EMA calculation failed")
-    except Exception as e:
-        warnings.append(f"⚠️ EMA error: {e}")
-        d["ema_9"] = d["close"]
-        d["ema_21"] = d["close"]
-    
-    try:
-        d["macd"], d["macd_signal"], d["macd_hist"] = calculate_macd(d)
-        if d["macd"].isna().all():
-            warnings.append("⚠️ MACD calculation failed")
-    except Exception as e:
-        warnings.append(f"⚠️ MACD error: {e}")
-        d["macd"] = 0.0
-        d["macd_signal"] = 0.0
-        d["macd_hist"] = 0.0
-    
-    try:
-        d["vwap"] = calculate_vwap(d)
-        if d["vwap"].isna().all():
-            warnings.append("⚠️ VWAP calculation failed")
-    except Exception as e:
-        warnings.append(f"⚠️ VWAP error: {e}")
-        d["vwap"] = d["close"]
-    
-    try:
-        d["rvol"] = calculate_rvol(d)
-        if d["rvol"].isna().all():
-            warnings.append("⚠️ RVOL calculation failed")
-    except Exception as e:
-        warnings.append(f"⚠️ RVOL error: {e}")
-        d["rvol"] = 1.0
-    
-    return d, warnings
-
-
 def add_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    """Add all technical indicators to DataFrame (original, for option chains)."""
+    """Add all technical indicators to DataFrame."""
     if df.empty:
         return df
     
     d = df.copy()
+    
+    # RSI
     d["rsi"] = calculate_rsi(d)
+    
+    # EMA
     d["ema_9"] = calculate_ema(d, 9)
     d["ema_21"] = calculate_ema(d, 21)
+    
+    # MACD
     d["macd"], d["macd_signal"], d["macd_hist"] = calculate_macd(d)
+    
+    # VWAP
     d["vwap"] = calculate_vwap(d)
+    
+    # RVOL
     d["rvol"] = calculate_rvol(d)
     
     return d
@@ -600,7 +487,7 @@ def detect_structure_levels(df: pd.DataFrame, lookback: int = 5) -> dict[str, fl
 
 
 def detect_bos(df: pd.DataFrame, structure_levels: dict) -> bool:
-    """Detect Break of Structure (BOS)."""
+    """Detect Break of Structure (BOS) - when price breaks above resistance or below support."""
     if df.empty or len(df) < 2:
         return False
     
@@ -609,39 +496,55 @@ def detect_bos(df: pd.DataFrame, structure_levels: dict) -> bool:
     current_high = df["high"].iloc[-1]
     current_low = df["low"].iloc[-1]
     
+    # BOS up: high breaks above previous resistance
     bos_up = current_high > resistance and resistance > 0
+    # BOS down: low breaks below previous support
     bos_down = current_low < support and support > 0
     
     return bos_up or bos_down
 
 
 def detect_choch(df: pd.DataFrame, lookback: int = 10) -> bool:
-    """Detect Change of Character (CHoCH)."""
+    """Detect Change of Character (CHoCH) - sustained shift from bullish to bearish or vice versa."""
     if df.empty or len(df) < lookback:
         return False
     
     recent = df.tail(lookback)
+    
+    # Check if there's a clear shift in highs and lows pattern
+    # CHoCH = multiple consecutive bars making lower highs/lows or higher highs/lows
     lows = recent["low"].values
     highs = recent["high"].values
     
+    # Count lower lows and lower highs (bearish shift)
     lower_lows = sum(1 for i in range(1, len(lows)) if lows[i] < lows[i-1])
     lower_highs = sum(1 for i in range(1, len(highs)) if highs[i] < highs[i-1])
+    
     bearish_shift = (lower_lows >= lookback - 2) and (lower_highs >= lookback - 2)
     
+    # Count higher lows and higher highs (bullish shift)
     higher_lows = sum(1 for i in range(1, len(lows)) if lows[i] > lows[i-1])
     higher_highs = sum(1 for i in range(1, len(highs)) if highs[i] > highs[i-1])
+    
     bullish_shift = (higher_lows >= lookback - 2) and (higher_highs >= lookback - 2)
     
     return bearish_shift or bullish_shift
 
 
 def detect_mss(df_list: dict[str, pd.DataFrame]) -> dict[str, dict]:
-    """Detect Market Structure Shift (MSS) across timeframes."""
+    """Detect Market Structure Shift (MSS) across timeframes.
+    
+    MSS = confirmation of structure break across multiple timeframes with:
+    - BOS on lower timeframe
+    - Aligned direction on higher timeframes
+    - Minimum strength threshold
+    """
     result = {tf: {"mss": False, "direction": "NONE", "strength": 0.0} for tf in df_list.keys()}
     
     if not df_list or not all(df_list.values()):
         return result
     
+    # Primary signal from 5M
     if "5M" in df_list and not df_list["5M"].empty:
         df_5m = df_list["5M"]
         levels_5m = detect_structure_levels(df_5m)
@@ -651,10 +554,10 @@ def detect_mss(df_list: dict[str, pd.DataFrame]) -> dict[str, dict]:
             close_5m = df_5m["close"].iloc[-1]
             open_5m = df_5m["open"].iloc[-1]
             
-            if close_5m > open_5m:
+            if close_5m > open_5m:  # Bullish
                 direction = "UP"
                 strength = abs((close_5m - levels_5m.get("support", close_5m)) / levels_5m.get("support", 1)) * 100
-            else:
+            else:  # Bearish
                 direction = "DOWN"
                 strength = abs((levels_5m.get("resistance", close_5m) - close_5m) / levels_5m.get("resistance", 1)) * 100
             
@@ -662,6 +565,7 @@ def detect_mss(df_list: dict[str, pd.DataFrame]) -> dict[str, dict]:
             result["5M"]["direction"] = direction if strength >= MSS_MIN_STRENGTH else "NONE"
             result["5M"]["strength"] = min(strength, 100.0)
     
+    # Confirmation from higher timeframes
     for tf in ["15M", "30M", "1H", "1D"]:
         if tf not in df_list or df_list[tf] is None or df_list[tf].empty:
             continue
@@ -675,7 +579,7 @@ def detect_mss(df_list: dict[str, pd.DataFrame]) -> dict[str, dict]:
             direction = "UP" if close > open_ else "DOWN"
             result[tf]["mss"] = True
             result[tf]["direction"] = direction
-            result[tf]["strength"] = 75.0
+            result[tf]["strength"] = 75.0  # CHoCH = high confidence
     
     return result
 
@@ -687,200 +591,177 @@ def detect_mss(df_list: dict[str, pd.DataFrame]) -> dict[str, dict]:
 @dataclass
 class TradeSignal:
     """Represents a single trade signal with all relevant details."""
-    signal: str
+    signal: str  # BUY, SELL, HOLD
     entry: float
     stop_loss: float
     target_1: float
     target_2: float
     target_3: float
     risk_reward_ratio: float
-    probability: float
-    confidence: float
-    confirmation_timeframes: list[str]
-    technical_reasons: list[str]
+    probability: float  # 0-100
+    confidence: float  # 0-100
+    confirmation_timeframes: list[str]  # Which TFs confirm this signal
+    technical_reasons: list[str]  # Why this signal was generated
     timestamp: datetime = field(default_factory=datetime.now)
-
-
-# ✅ SAFE SIGNAL GENERATION WITH COMPREHENSIVE VALIDATION
-def generate_trade_signal_safe(df_dict: dict[str, pd.DataFrame], spot: float, 
-                                mss: dict[str, dict], fyers_available: bool) -> tuple[Optional[TradeSignal], list[str]]:
-    """
-    Generate trade signal with comprehensive validation and error reporting.
-    Returns: (TradeSignal or None, warnings_list)
-    """
-    warnings = []
-    
-    if not fyers_available:
-        warnings.append("⚠️ FYERS not available - cannot generate accurate price action signals")
-        return None, warnings
-    
-    if not df_dict or not any(df_dict.values()):
-        warnings.append("⚠️ No candle data provided")
-        return None, warnings
-    
-    df_5m = df_dict.get("5M")
-    if df_5m is None:
-        warnings.append("⚠️ 5M candle data is None")
-        return None, warnings
-    
-    if df_5m.empty:
-        warnings.append("⚠️ 5M candle data is empty")
-        return None, warnings
-    
-    if len(df_5m) < 10:
-        warnings.append(f"⚠️ Only {len(df_5m)} 5M candles (need ≥10)")
-        return None, warnings
-    
-    required_cols = ["close", "high", "low", "open"]
-    missing = [c for c in required_cols if c not in df_5m.columns]
-    if missing:
-        warnings.append(f"⚠️ Missing OHLC columns: {missing}")
-        return None, warnings
-    
-    try:
-        current_close = float(df_5m["close"].iloc[-1])
-        current_high = float(df_5m["high"].iloc[-1])
-        current_low = float(df_5m["low"].iloc[-1])
-        
-        if current_close <= 0 or current_high <= 0 or current_low <= 0:
-            warnings.append(f"⚠️ Invalid OHLC values: C={current_close}, H={current_high}, L={current_low}")
-            return None, warnings
-        
-        current_rsi = float(df_5m["rsi"].iloc[-1]) if "rsi" in df_5m.columns else 50.0
-        current_ema_9 = float(df_5m["ema_9"].iloc[-1]) if "ema_9" in df_5m.columns else current_close
-        current_ema_21 = float(df_5m["ema_21"].iloc[-1]) if "ema_21" in df_5m.columns else current_close
-        current_macd = float(df_5m["macd"].iloc[-1]) if "macd" in df_5m.columns else 0.0
-        current_macd_hist = float(df_5m["macd_hist"].iloc[-1]) if "macd_hist" in df_5m.columns else 0.0
-        current_rvol = float(df_5m["rvol"].iloc[-1]) if "rvol" in df_5m.columns else 1.0
-        
-        levels_5m = detect_structure_levels(df_5m)
-        resistance = levels_5m.get("resistance", current_close)
-        support = levels_5m.get("support", current_close)
-        
-        signal_type = "HOLD"
-        confidence_score = 0.0
-        probability_score = 50.0
-        technical_reasons = []
-        confirmed_tfs = []
-        
-        # BUY Signal Logic
-        buy_score = 0.0
-        
-        if current_close > current_ema_9:
-            buy_score += 25
-            technical_reasons.append("Price > EMA 9")
-        
-        if current_ema_9 > current_ema_21:
-            buy_score += 20
-            technical_reasons.append("EMA 9 > EMA 21")
-        
-        if current_macd > 0 and current_macd_hist > 0:
-            buy_score += 20
-            technical_reasons.append("MACD bullish")
-        
-        if 40 <= current_rsi <= 70:
-            buy_score += 15
-            technical_reasons.append(f"RSI {current_rsi:.0f} (bullish)")
-        
-        if current_rvol > 1.2:
-            buy_score += 10
-            technical_reasons.append("High volume")
-        
-        if mss.get("5M", {}).get("mss") and mss["5M"].get("direction") == "UP":
-            buy_score += 15
-            technical_reasons.append("MSS UP confirmed")
-            confirmed_tfs.append("5M")
-        
-        # SELL Signal Logic
-        sell_score = 0.0
-        
-        if current_close < current_ema_9:
-            sell_score += 25
-            technical_reasons.append("Price < EMA 9")
-        
-        if current_ema_9 < current_ema_21:
-            sell_score += 20
-            technical_reasons.append("EMA 9 < EMA 21")
-        
-        if current_macd < 0 and current_macd_hist < 0:
-            sell_score += 20
-            technical_reasons.append("MACD bearish")
-        
-        if 30 <= current_rsi <= 60:
-            sell_score += 15
-            technical_reasons.append(f"RSI {current_rsi:.0f} (bearish)")
-        
-        if current_rvol > 1.2:
-            sell_score += 10
-            technical_reasons.append("High volume")
-        
-        if mss.get("5M", {}).get("mss") and mss["5M"].get("direction") == "DOWN":
-            sell_score += 15
-            technical_reasons.append("MSS DOWN confirmed")
-            confirmed_tfs.append("5M")
-        
-        if buy_score > sell_score and buy_score >= 60:
-            signal_type = "BUY"
-            confidence_score = min(buy_score, 100.0)
-            probability_score = 50.0 + (buy_score / 2)
-        elif sell_score > buy_score and sell_score >= 60:
-            signal_type = "SELL"
-            confidence_score = min(sell_score, 100.0)
-            probability_score = 50.0 + (sell_score / 2)
-        else:
-            signal_type = "HOLD"
-            confidence_score = max(buy_score, sell_score)
-            probability_score = 50.0
-        
-        if signal_type == "BUY":
-            entry = current_close
-            stop_loss = support * 0.995
-            range_val = entry - stop_loss
-            target_1 = entry + range_val
-            target_2 = entry + (range_val * 1.5)
-            target_3 = entry + (range_val * 2.0)
-        elif signal_type == "SELL":
-            entry = current_close
-            stop_loss = resistance * 1.005
-            range_val = stop_loss - entry
-            target_1 = entry - range_val
-            target_2 = entry - (range_val * 1.5)
-            target_3 = entry - (range_val * 2.0)
-        else:
-            entry = current_close
-            stop_loss = support
-            target_1 = (resistance + entry) / 2
-            target_2 = resistance
-            target_3 = resistance * 1.01
-        
-        risk_reward = abs(entry - target_1) / abs(entry - stop_loss) if entry != stop_loss else 1.0
-        
-        signal = TradeSignal(
-            signal=signal_type,
-            entry=entry,
-            stop_loss=stop_loss,
-            target_1=target_1,
-            target_2=target_2,
-            target_3=target_3,
-            risk_reward_ratio=risk_reward,
-            probability=min(probability_score, 100.0),
-            confidence=confidence_score,
-            confirmation_timeframes=confirmed_tfs if confirmed_tfs else ["5M"],
-            technical_reasons=technical_reasons if technical_reasons else ["Neutral"],
-        )
-        
-        return signal, warnings
-        
-    except Exception as e:
-        warnings.append(f"❌ Signal generation exception: {str(e)}")
-        return None, warnings
 
 
 def generate_trade_signal(df_dict: dict[str, pd.DataFrame], spot: float, mss: dict[str, dict],
                           fyers_available: bool) -> Optional[TradeSignal]:
-    """Original function for backward compatibility."""
-    signal, _ = generate_trade_signal_safe(df_dict, spot, mss, fyers_available)
-    return signal
+    """Generate a multi-timeframe confirmed trade signal. Returns None if FYERS is unavailable."""
+    
+    if not fyers_available:
+        logger.warning("FYERS not available - cannot generate trade signal")
+        return None
+    
+    if not df_dict or not any(df_dict.values()):
+        return None
+    
+    # Get 5M as primary timeframe for signal
+    df_5m = df_dict.get("5M")
+    if df_5m is None or df_5m.empty or len(df_5m) < 10:
+        return None
+    
+    # Analyze 5M technical setup
+    current_close = float(df_5m["close"].iloc[-1])
+    current_high = float(df_5m["high"].iloc[-1])
+    current_low = float(df_5m["low"].iloc[-1])
+    current_rsi = float(df_5m["rsi"].iloc[-1]) if "rsi" in df_5m.columns else 50.0
+    current_ema_9 = float(df_5m["ema_9"].iloc[-1]) if "ema_9" in df_5m.columns else current_close
+    current_ema_21 = float(df_5m["ema_21"].iloc[-1]) if "ema_21" in df_5m.columns else current_close
+    current_macd = float(df_5m["macd"].iloc[-1]) if "macd" in df_5m.columns else 0.0
+    current_macd_hist = float(df_5m["macd_hist"].iloc[-1]) if "macd_hist" in df_5m.columns else 0.0
+    current_rvol = float(df_5m["rvol"].iloc[-1]) if "rvol" in df_5m.columns else 1.0
+    
+    # Detect structure
+    levels_5m = detect_structure_levels(df_5m)
+    resistance = levels_5m.get("resistance", current_close)
+    support = levels_5m.get("support", current_close)
+    
+    signal_type = "HOLD"
+    confidence_score = 0.0
+    probability_score = 50.0
+    technical_reasons = []
+    confirmed_tfs = []
+    
+    # ─── BUY Signal Logic ───
+    buy_score = 0.0
+    
+    # Condition 1: Price above 9 EMA
+    if current_close > current_ema_9:
+        buy_score += 25
+        technical_reasons.append("Price > EMA 9")
+    
+    # Condition 2: 9 EMA > 21 EMA (trend)
+    if current_ema_9 > current_ema_21:
+        buy_score += 20
+        technical_reasons.append("EMA 9 > EMA 21")
+    
+    # Condition 3: MACD above zero line and histogram positive
+    if current_macd > 0 and current_macd_hist > 0:
+        buy_score += 20
+        technical_reasons.append("MACD bullish")
+    
+    # Condition 4: RSI not overbought but bullish (30-70)
+    if 40 <= current_rsi <= 70:
+        buy_score += 15
+        technical_reasons.append(f"RSI {current_rsi:.0f} (bullish zone)")
+    
+    # Condition 5: High volume
+    if current_rvol > 1.2:
+        buy_score += 10
+        technical_reasons.append("High volume")
+    
+    # Condition 6: MSS confirmation
+    if mss.get("5M", {}).get("mss") and mss["5M"].get("direction") == "UP":
+        buy_score += 15
+        technical_reasons.append("MSS confirmed (UP)")
+        confirmed_tfs.append("5M")
+    
+    # ─── SELL Signal Logic ───
+    sell_score = 0.0
+    
+    # Condition 1: Price below 9 EMA
+    if current_close < current_ema_9:
+        sell_score += 25
+        technical_reasons.append("Price < EMA 9")
+    
+    # Condition 2: 9 EMA < 21 EMA (downtrend)
+    if current_ema_9 < current_ema_21:
+        sell_score += 20
+        technical_reasons.append("EMA 9 < EMA 21")
+    
+    # Condition 3: MACD below zero line and histogram negative
+    if current_macd < 0 and current_macd_hist < 0:
+        sell_score += 20
+        technical_reasons.append("MACD bearish")
+    
+    # Condition 4: RSI not oversold but bearish (30-70)
+    if 30 <= current_rsi <= 60:
+        sell_score += 15
+        technical_reasons.append(f"RSI {current_rsi:.0f} (bearish zone)")
+    
+    # Condition 5: High volume
+    if current_rvol > 1.2:
+        sell_score += 10
+        technical_reasons.append("High volume")
+    
+    # Condition 6: MSS confirmation
+    if mss.get("5M", {}).get("mss") and mss["5M"].get("direction") == "DOWN":
+        sell_score += 15
+        technical_reasons.append("MSS confirmed (DOWN)")
+        confirmed_tfs.append("5M")
+    
+    # Determine signal
+    if buy_score > sell_score and buy_score >= 60:
+        signal_type = "BUY"
+        confidence_score = min(buy_score, 100.0)
+        probability_score = 50.0 + (buy_score / 2)  # Scale to 0-100
+    elif sell_score > buy_score and sell_score >= 60:
+        signal_type = "SELL"
+        confidence_score = min(sell_score, 100.0)
+        probability_score = 50.0 + (sell_score / 2)
+    else:
+        signal_type = "HOLD"
+        confidence_score = max(buy_score, sell_score)
+        probability_score = 50.0
+    
+    # Calculate entry, SL, and targets
+    if signal_type == "BUY":
+        entry = current_close
+        stop_loss = support * 0.995  # 0.5% below support
+        range_val = entry - stop_loss
+        target_1 = entry + range_val  # 1:1 RR
+        target_2 = entry + (range_val * 1.5)  # 1.5:1 RR
+        target_3 = entry + (range_val * 2.0)  # 2:1 RR
+    elif signal_type == "SELL":
+        entry = current_close
+        stop_loss = resistance * 1.005  # 0.5% above resistance
+        range_val = stop_loss - entry
+        target_1 = entry - range_val
+        target_2 = entry - (range_val * 1.5)
+        target_3 = entry - (range_val * 2.0)
+    else:  # HOLD
+        entry = current_close
+        stop_loss = support
+        target_1 = (resistance + entry) / 2
+        target_2 = resistance
+        target_3 = resistance * 1.01
+    
+    risk_reward = abs(entry - target_1) / abs(entry - stop_loss) if entry != stop_loss else 1.0
+    
+    return TradeSignal(
+        signal=signal_type,
+        entry=entry,
+        stop_loss=stop_loss,
+        target_1=target_1,
+        target_2=target_2,
+        target_3=target_3,
+        risk_reward_ratio=risk_reward,
+        probability=min(probability_score, 100.0),
+        confidence=confidence_score,
+        confirmation_timeframes=confirmed_tfs if confirmed_tfs else ["5M"],
+        technical_reasons=technical_reasons if technical_reasons else ["Neutral"],
+    )
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -889,7 +770,8 @@ def generate_trade_signal(df_dict: dict[str, pd.DataFrame], spot: float, mss: di
 
 @st.cache_data(ttl=15, show_spinner=False)
 def fetch_option_chain_raw(symbol: str, is_index: bool) -> dict:
-    """Cached (15s TTL) raw NSE option-chain JSON fetch."""
+    """Cached (15s TTL) raw NSE option-chain JSON fetch. NSE is used only as
+    fallback for option chains when FYERS is unavailable."""
     session = get_nse_session()
     url = NSE_INDEX_CHAIN_URL if is_index else NSE_EQUITY_CHAIN_URL
     payload, error = fetch_json_with_retry(session, url, params={"symbol": symbol})
@@ -1159,7 +1041,7 @@ def compute_gex_dex(df: pd.DataFrame, spot: float, lot_size: int) -> dict[str, A
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# 12. FYERS OPTION CHAIN PARSING
+# 12. FYERS OPTION CHAIN PARSING (Fallback)
 # ══════════════════════════════════════════════════════════════════════════
 
 def _fyers_extract_expiry_list(response: dict) -> list[tuple[str, str]]:
@@ -1514,7 +1396,7 @@ def _normalize_series(series: pd.Series) -> pd.Series:
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# 14. AI SIGNAL ENGINE
+# 14. AI SIGNAL ENGINE — BUY/SELL/HOLD (Existing, Preserved)
 # ══════════════════════════════════════════════════════════════════════════
 
 AI_SCORE_WEIGHTS = {
@@ -1707,17 +1589,20 @@ def chart_price_action(df: pd.DataFrame, title: str = "Price Action with Indicat
         subplot_titles=("Price", "Volume")
     )
     
+    # Candlestick
     fig.add_trace(go.Candlestick(
         x=df.index, open=df["open"], high=df["high"], low=df["low"], close=df["close"],
         name="OHLC", showlegend=True
     ), row=1, col=1)
     
+    # VWAP
     if "vwap" in df.columns:
         fig.add_trace(go.Scatter(
             x=df.index, y=df["vwap"], mode="lines", name="VWAP",
             line=dict(color=BLUE, width=2)
         ), row=1, col=1)
     
+    # EMA
     if "ema_9" in df.columns:
         fig.add_trace(go.Scatter(
             x=df.index, y=df["ema_9"], mode="lines", name="EMA 9",
@@ -1729,6 +1614,7 @@ def chart_price_action(df: pd.DataFrame, title: str = "Price Action with Indicat
             line=dict(color=RED, width=1.5)
         ), row=1, col=1)
     
+    # Volume
     if "volume" in df.columns:
         colors = [GREEN if df["close"].iloc[i] >= df["open"].iloc[i] else RED for i in range(len(df))]
         fig.add_trace(go.Bar(
@@ -1755,6 +1641,7 @@ def chart_technical_indicators(df: pd.DataFrame) -> go.Figure:
         subplot_titles=("RSI (14)", "MACD", "Momentum")
     )
     
+    # RSI
     if "rsi" in df.columns:
         fig.add_trace(go.Scatter(
             x=df.index, y=df["rsi"], mode="lines", name="RSI",
@@ -1763,6 +1650,7 @@ def chart_technical_indicators(df: pd.DataFrame) -> go.Figure:
         fig.add_hline(y=70, line_dash="dash", line_color=RED, annotation_text="Overbought", row=1, col=1)
         fig.add_hline(y=30, line_dash="dash", line_color=GREEN, annotation_text="Oversold", row=1, col=1)
     
+    # MACD
     if "macd" in df.columns and "macd_signal" in df.columns:
         fig.add_trace(go.Scatter(
             x=df.index, y=df["macd"], mode="lines", name="MACD",
@@ -1779,6 +1667,7 @@ def chart_technical_indicators(df: pd.DataFrame) -> go.Figure:
                 marker_color=colors
             ), row=2, col=1)
     
+    # Momentum (simple)
     if len(df) > 1:
         momentum = df["close"].pct_change() * 100
         fig.add_trace(go.Scatter(
@@ -2156,32 +2045,19 @@ def _pcr_sentiment_badge(pcr: float) -> str:
 # 19. MAIN DASHBOARD
 # ══════════════════════════════════════════════════════════════════════════
 
-# ✅ UPDATED SIDEBAR WITH COMMODITIES SUPPORT
 def _sidebar_config() -> dict:
     with st.sidebar:
         st.markdown("### ⚙️ Configuration")
-        instrument_type = st.radio(
-            "Instrument Type", 
-            ["Index", "F&O Stock", "Commodity"],  # ✅ Added Commodity
-            key="oc_instr_type"
-        )
-        
-        is_index = False
-        is_commodity = False
-        
-        if instrument_type == "Index":
+        instrument_type = st.radio("Instrument Type", ["Index", "F&O Stock"], key="oc_instr_type")
+        is_index = instrument_type == "Index"
+
+        if is_index:
             symbol = st.selectbox("Index", list(INDEX_SYMBOLS.keys()), key="oc_index_select")
-            is_index = True
             if symbol in NSE_UNSUPPORTED_INDICES:
-                st.caption(f"ℹ️ {symbol} is BSE-listed — requires FYERS.")
-        
-        elif instrument_type == "Commodity":  # ✅ NEW COMMODITY HANDLING
-            symbol = st.selectbox("Commodity", list(COMMODITY_SYMBOLS.keys()), key="oc_commodity_select")
-            is_commodity = True
-            commodity_info = COMMODITY_SYMBOLS[symbol]
-            st.caption(f"📍 Exchange: **{commodity_info['exchange']}** | Lot: {commodity_info['lot_size']}")
-        
-        else:  # F&O Stock
+                st.caption(
+                    f"ℹ️ {symbol} is BSE-listed — requires a connected FYERS client."
+                )
+        else:
             raw_symbol = st.text_input(
                 "Stock Symbol (e.g. RELIANCE, TCS, INFY)", "RELIANCE", key="oc_stock_input"
             )
@@ -2198,12 +2074,7 @@ def _sidebar_config() -> dict:
             except ValueError:
                 st.caption("⚠️ Enter a valid numeric strike price.")
 
-        # ✅ UPDATED LOT SIZE LOGIC FOR COMMODITIES
-        if is_commodity:
-            default_lot = COMMODITY_SYMBOLS[symbol]["lot_size"]
-        else:
-            default_lot = DEFAULT_LOT_SIZES.get(symbol, DEFAULT_LOT_SIZES["_STOCK_DEFAULT"])
-        
+        default_lot = DEFAULT_LOT_SIZES.get(symbol, DEFAULT_LOT_SIZES["_STOCK_DEFAULT"])
         lot_size = st.number_input(
             "Lot Size",
             min_value=1, value=default_lot, step=1, key="oc_lot_size",
@@ -2212,14 +2083,6 @@ def _sidebar_config() -> dict:
         st.divider()
         st.markdown("### 📊 Price Action Analysis")
         analyze_price_action = st.checkbox("Fetch & Analyze Price Action (requires FYERS)", value=False, key="oc_price_action")
-        
-        if analyze_price_action:
-            st.info(
-                "💡 **FYERS Setup Required:**\n"
-                "1. Install fyers-apiv3: `pip install fyers-apiv3`\n"
-                "2. Initialize FYERS client with your credentials\n"
-                "3. Pass it to show_option_chain(fyers=your_fyers_client)"
-            )
 
         st.divider()
         st.markdown("### 🔄 Auto Refresh")
@@ -2232,37 +2095,29 @@ def _sidebar_config() -> dict:
         fetch_clicked = st.button("🔄 Fetch Live Data", use_container_width=True, type="primary")
 
     return {
-        "is_index": is_index, 
-        "is_commodity": is_commodity,  # ✅ ADDED
-        "symbol": symbol, 
-        "strike_count": strike_count,
-        "show_greeks": show_greeks, 
-        "min_ai_conf": min_ai_conf, 
-        "strike_search": strike_search,
-        "lot_size": lot_size, 
-        "auto_refresh": auto_refresh, 
-        "refresh_secs": refresh_secs,
-        "debug_mode": debug_mode, 
-        "fetch_clicked": fetch_clicked,
+        "is_index": is_index, "symbol": symbol, "strike_count": strike_count,
+        "show_greeks": show_greeks, "min_ai_conf": min_ai_conf, "strike_search": strike_search,
+        "lot_size": lot_size, "auto_refresh": auto_refresh, "refresh_secs": refresh_secs,
+        "debug_mode": debug_mode, "fetch_clicked": fetch_clicked,
         "analyze_price_action": analyze_price_action,
     }
 
 
-# ✅ UPDATED FETCH PIPELINE WITH SAFE PRICE ACTION
 def _do_fetch_and_process(cfg: dict, fyers: Any = None) -> Optional[dict]:
-    """Full fetch → parse → validate → analytics pipeline with better error handling."""
+    """Full fetch -> parse -> validate -> analytics pipeline."""
     preferred_expiry = st.session_state.get("oc_selected_expiry", "")
-    stock_name = cfg["symbol"] if not cfg["is_index"] and not cfg.get("is_commodity", False) else ""
-    
+    stock_name = cfg["symbol"] if not cfg["is_index"] else ""
     fetch_result = fetch_chain_unified(
         fyers, cfg["symbol"], cfg["is_index"], stock_name, preferred_expiry, cfg["strike_count"],
     )
+    if cfg["debug_mode"]:
+        st.write("**Fetch result:**", fetch_result.get("ok"), fetch_result.get("source"), fetch_result.get("error"))
 
     if not fetch_result.get("ok"):
-        st.error(f"**Chain Fetch Failed:**\n{fetch_result.get('error', 'Unknown error')}")
-        if cfg["debug_mode"]:
-            with st.expander("Debug Details"):
-                st.write(fetch_result)
+        st.error(
+            f"⚠️ Could not fetch option chain for **{cfg['symbol']}**: "
+            f"{fetch_result.get('error', 'Unknown error.')} "
+        )
         return None
 
     df_all: pd.DataFrame = fetch_result["df"]
@@ -2270,7 +2125,10 @@ def _do_fetch_and_process(cfg: dict, fyers: Any = None) -> Optional[dict]:
     data_source: str = fetch_result.get("source", "UNKNOWN")
 
     if not validate_chain_df(df_all):
-        st.error("**Chain Validation Failed:** No usable option chain received.")
+        st.error(
+            f"⚠️ Received a response for **{cfg['symbol']}**, but it did not contain a usable "
+            "option chain."
+        )
         return None
 
     spot = meta["spot_price"]
@@ -2301,66 +2159,36 @@ def _do_fetch_and_process(cfg: dict, fyers: Any = None) -> Optional[dict]:
 
     oi_shift_notes = detect_oi_shift(cfg["symbol"], expiry_label, support, resistance)
 
-    # ═══════════════════════════════════════════════════════════════
-    # ✅ PRICE ACTION ANALYSIS - ENHANCED WITH ERROR HANDLING
-    # ═══════════════════════════════════════════════════════════════
+    # Price Action Analysis (FYERS-dependent)
     price_action_data = None
     trade_signal = None
-    pa_warnings = []
-    
-    if cfg["analyze_price_action"]:
-        if fyers is None:
-            pa_warnings.append("❌ FYERS client not provided - price action signals unavailable")
-            pa_warnings.append("To enable: initialize FYERS and pass to show_option_chain(fyers=client)")
-        else:
-            fyers_symbol_candidates = (
-                _fyers_index_candidates(cfg["symbol"]) if cfg["is_index"] else 
-                (FYERS_COMMODITY_SYMBOL_CANDIDATES.get(cfg["symbol"], []) if cfg.get("is_commodity", False) else
-                 fyers_stock_symbol_candidates(stock_name))
-            )
+    if cfg["analyze_price_action"] and fyers is not None:
+        fyers_symbol_candidates = (
+            _fyers_index_candidates(cfg["symbol"]) if cfg["is_index"] else fyers_stock_symbol_candidates(stock_name)
+        )
+        fyers_symbol = fyers_symbol_candidates[0] if fyers_symbol_candidates else None
+        
+        if fyers_symbol:
+            df_dict = {}
+            for tf_name, tf_mins in TIMEFRAMES.items():
+                df_tf = fetch_fyers_candles(fyers, fyers_symbol, tf_mins, count=100)
+                df_dict[tf_name] = df_tf
             
-            if not fyers_symbol_candidates:
-                pa_warnings.append(f"⚠️ No FYERS symbols found for {cfg['symbol']}")
-            else:
-                fyers_symbol = fyers_symbol_candidates[0]
-                df_dict = {}
-                candle_errors = []
+            if any(df_dict.values()):
+                # Add technical indicators to candles
+                for tf_name in df_dict:
+                    if df_dict[tf_name] is not None and not df_dict[tf_name].empty:
+                        df_dict[tf_name] = add_technical_indicators(df_dict[tf_name])
                 
-                # Fetch all timeframes with safe function
-                for tf_name, tf_mins in TIMEFRAMES.items():
-                    df_tf, error = fetch_fyers_candles_safe(fyers, fyers_symbol, tf_mins, count=100)
-                    if error:
-                        candle_errors.append(f"{tf_name}: {error}")
-                    df_dict[tf_name] = df_tf
+                # Detect MSS and generate signal
+                mss = detect_mss(df_dict)
+                trade_signal = generate_trade_signal(df_dict, spot, mss, fyers is not None)
                 
-                if candle_errors:
-                    for err in candle_errors:
-                        pa_warnings.append(err)
-                
-                # If we have at least 5M data, proceed
-                if df_dict.get("5M") is not None and not df_dict["5M"].empty:
-                    # Add technical indicators with validation
-                    for tf_name in df_dict:
-                        if df_dict[tf_name] is not None and not df_dict[tf_name].empty:
-                            df_dict[tf_name], ti_warnings = add_technical_indicators_safe(df_dict[tf_name])
-                            for warning in ti_warnings:
-                                pa_warnings.append(f"{tf_name} {warning}")
-                    
-                    # Detect MSS and generate signal
-                    mss = detect_mss(df_dict)
-                    trade_signal, signal_warnings = generate_trade_signal_safe(
-                        df_dict, spot, mss, fyers is not None
-                    )
-                    for warning in signal_warnings:
-                        pa_warnings.append(warning)
-                    
-                    price_action_data = {
-                        "df_dict": df_dict,
-                        "mss": mss,
-                        "trade_signal": trade_signal,
-                    }
-                else:
-                    pa_warnings.append("❌ Could not fetch 5M candle data - price action signals unavailable")
+                price_action_data = {
+                    "df_dict": df_dict,
+                    "mss": mss,
+                    "trade_signal": trade_signal,
+                }
 
     return {
         "df": df, "meta": meta, "spot": spot, "atm_strike": atm_strike, "expiry_label": expiry_label,
@@ -2368,7 +2196,6 @@ def _do_fetch_and_process(cfg: dict, fyers: Any = None) -> Optional[dict]:
         "atm_iv": atm_iv, "iv_rank": iv_rank, "iv_percentile": iv_percentile, "gex_dex": gex_dex,
         "oi_shift_notes": oi_shift_notes, "data_source": data_source,
         "price_action_data": price_action_data, "trade_signal": trade_signal,
-        "pa_warnings": pa_warnings,  # ✅ COLLECT ALL WARNINGS
     }
 
 
@@ -2460,7 +2287,9 @@ def _render_ai_signal_cards(state: dict, min_conf: float) -> None:
     df = state["df"]
     qualifying = df[df["AI Confidence %"] >= min_conf].sort_values("AI Confidence %", ascending=False)
     if qualifying.empty:
-        st.info(f"No strikes meet the {min_conf:.0f}% AI confidence threshold.")
+        st.info(
+            f"No strikes meet the {min_conf:.0f}% AI confidence threshold."
+        )
         return
     for _, row in qualifying.head(15).iterrows():
         signal = row["AI Signal"]
@@ -2545,17 +2374,6 @@ def run_dashboard(fyers: Any = None) -> None:
                 f"PE {r['pe_ltp']:.2f} (OI {r['pe_oi']:,.0f})"
             )
 
-    # ✅ DISPLAY PRICE ACTION WARNINGS
-    if state.get("pa_warnings"):
-        with st.expander("📊 Price Action Status", expanded=True):
-            for warning in state["pa_warnings"]:
-                if "❌" in warning:
-                    st.error(warning)
-                elif "⚠️" in warning:
-                    st.warning(warning)
-                else:
-                    st.info(warning)
-
     # Display trade signal if available
     if state.get("trade_signal"):
         st.divider()
@@ -2614,6 +2432,7 @@ def run_dashboard(fyers: Any = None) -> None:
             df_dict = state["price_action_data"]["df_dict"]
             mss = state["price_action_data"]["mss"]
             
+            # Display MSS status
             st.markdown("### Market Structure Status")
             mss_cols = st.columns(len(df_dict))
             for (tf_name, df_tf), col in zip(df_dict.items(), mss_cols):
@@ -2632,6 +2451,7 @@ def run_dashboard(fyers: Any = None) -> None:
             
             st.divider()
             
+            # Display candle charts
             st.markdown("### Timeframe Charts")
             for tf_name, df_tf in df_dict.items():
                 if df_tf is not None and not df_tf.empty:
@@ -2639,6 +2459,7 @@ def run_dashboard(fyers: Any = None) -> None:
                         st.plotly_chart(chart_price_action(df_tf, title=f"{tf_name} Price Action"),
                                        use_container_width=True, config={"displayModeBar": False})
             
+            # Technical indicators
             st.markdown("### Technical Indicators (5M)")
             if df_dict.get("5M") is not None and not df_dict["5M"].empty:
                 st.plotly_chart(chart_technical_indicators(df_dict["5M"]),
