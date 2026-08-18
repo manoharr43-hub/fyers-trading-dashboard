@@ -305,6 +305,75 @@ def detect_mss(df) -> Dict[str, Any]:
         out.update(bearish_mss=True, mss_type="BEARISH_MSS", confirmation="CONFIRMED")
     return out
 
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# BUY PRESSURE / SELL PRESSURE ENGINE
+# ═══════════════════════════════════════════════════════════════════════════════
+def calculate_buy_sell_pressure(df: Optional[pd.DataFrame]) -> Dict[str, Any]:
+    default = {
+        "buy_pressure": 0.0, "sell_pressure": 0.0,
+        "buy_volume": 0.0, "sell_volume": 0.0,
+        "pressure_difference": 0.0,
+        "pressure_signal": "DATA UNAVAILABLE",
+        "next_candle_bias": "⚪ WAIT / NO CLEAR BIAS",
+    }
+    try:
+        if df is None or len(df) < 2 or not {"Open","High","Low","Close","Volume"}.issubset(df.columns):
+            return default
+        d = df.dropna(subset=["Open","High","Low","Close"]).copy()
+        if len(d) < 2:
+            return default
+        row = d.iloc[-1]
+        o,h,l,c,v = map(float, [row["Open"],row["High"],row["Low"],row["Close"],row["Volume"]])
+        rng=max(h-l,1e-9); body=abs(c-o); body_pct=min(100.0,body/rng*100.0)
+        close_pos=max(0.0,min(100.0,(c-l)/rng*100.0))
+        upper=max(0.0,h-max(o,c)); lower=max(0.0,min(o,c)-l)
+        avg=float(d["Volume"].tail(20).mean()) if len(d) else 0.0
+        rvol=v/avg if avg>0 else 1.0
+        rv=min(100.0,max(0.0,rvol*50.0))
+        if c>o:
+            buy=close_pos*.40+body_pct*.30+rv*.30
+            sell=(100-close_pos)*.40+max(0,50-body_pct*.50)*.30+rv*.30
+        elif c<o:
+            sell=(100-close_pos)*.40+body_pct*.30+rv*.30
+            buy=close_pos*.40+max(0,50-body_pct*.50)*.30+rv*.30
+        else:
+            buy=close_pos*.50+rv*.50; sell=(100-close_pos)*.50+rv*.50
+        if lower>upper: buy+=8
+        elif upper>lower: sell+=8
+        buy=max(0,min(100,buy)); sell=max(0,min(100,sell)); diff=buy-sell
+        if c>o: bv,sv=v,0.0
+        elif c<o: bv,sv=0.0,v
+        else: bv=v*close_pos/100; sv=v-bv
+        if diff>=25: sig="🟢 STRONG BUY PRESSURE"
+        elif diff>=10: sig="🟢 BUY PRESSURE"
+        elif diff<=-25: sig="🔴 STRONG SELL PRESSURE"
+        elif diff<=-10: sig="🔴 SELL PRESSURE"
+        else: sig="⚪ BALANCED"
+        if buy>=65 and buy>sell and rvol>=1.5: bias="🟢 NEXT CANDLE BUY BIAS"
+        elif sell>=65 and sell>buy and rvol>=1.5: bias="🔴 NEXT CANDLE SELL BIAS"
+        else: bias="⚪ WAIT / NO CLEAR BIAS"
+        return {"buy_pressure":round(buy,1),"sell_pressure":round(sell,1),"buy_volume":round(bv,2),"sell_volume":round(sv,2),"pressure_difference":round(diff,1),"pressure_signal":sig,"next_candle_bias":bias}
+    except Exception:
+        return default
+
+def _combine_pressure(p5,p15,p1h):
+    buy=p5["buy_pressure"]*.40+p15["buy_pressure"]*.35+p1h["buy_pressure"]*.25
+    sell=p5["sell_pressure"]*.40+p15["sell_pressure"]*.35+p1h["sell_pressure"]*.25
+    diff=buy-sell
+    if diff>=25: sig="🟢 STRONG BUY PRESSURE"
+    elif diff>=10: sig="🟢 BUY PRESSURE"
+    elif diff<=-25: sig="🔴 STRONG SELL PRESSURE"
+    elif diff<=-10: sig="🔴 SELL PRESSURE"
+    else: sig="⚪ BALANCED"
+    if buy>=65 and buy>sell: bias="🟢 NEXT CANDLE BUY BIAS"
+    elif sell>=65 and sell>buy: bias="🔴 NEXT CANDLE SELL BIAS"
+    else: bias="⚪ WAIT / NO CLEAR BIAS"
+    return {"buy":round(buy,1),"sell":round(sell,1),"diff":round(diff,1),"signal":sig,"bias":bias}
+
+def _pressure_from_analysis(a):
+    return calculate_buy_sell_pressure(a.get("df") if isinstance(a,dict) else None)
+
 # ════════════════════════════════════════════════════════════════════════════════
 # SYMBOL LOADING (RETAINED WITH ENHANCEMENT FOR F&O)
 # ════════════════════════════════════════════════════════════════════════════════
@@ -1097,6 +1166,17 @@ def _fetch_master_signal(fyers, symbol: str, fo_set=None):
         data_5m = analysis_5m.get("data") if analysis_5m.get("status") == "OK" else {}
         data_15m = analysis_15m.get("data") if analysis_15m.get("status") == "OK" else {}
         data_1h = analysis_1h.get("data") if analysis_1h.get("status") == "OK" else {}
+        p5 = _pressure_from_analysis(analysis_5m)
+        p15 = _pressure_from_analysis(analysis_15m)
+        p1h = _pressure_from_analysis(analysis_1h)
+        mp = _combine_pressure(p5,p15,p1h)
+        fs = master["final_signal"]
+        if "BUY" in fs:
+            pressure_confirmation = "✅ BUY PRESSURE CONFIRMED" if mp["buy"] >= 60 and mp["buy"] > mp["sell"] else "⚠️ BUY PRESSURE CONFLICT" if mp["sell"] > mp["buy"] else "⚪ BUY PRESSURE WEAK"
+        elif "SELL" in fs:
+            pressure_confirmation = "✅ SELL PRESSURE CONFIRMED" if mp["sell"] >= 60 and mp["sell"] > mp["buy"] else "⚠️ SELL PRESSURE CONFLICT" if mp["buy"] > mp["sell"] else "⚪ SELL PRESSURE WEAK"
+        else:
+            pressure_confirmation = "⚪ NO SIGNAL"
         
         return {
             "Stock": stock_ticker,
@@ -1123,6 +1203,24 @@ def _fetch_master_signal(fyers, symbol: str, fo_set=None):
             "RSI": round(data_5m.get("rsi", 50), 1),
             "MACD": "🟢" if data_5m.get("macd_bullish") else "🔴",
             "RVOL": data_5m.get("rvol", 0),
+            "5M Buy Pressure %": p5["buy_pressure"],
+            "5M Sell Pressure %": p5["sell_pressure"],
+            "5M Pressure Difference": p5["pressure_difference"],
+            "5M Pressure Signal": p5["pressure_signal"],
+            "15M Buy Pressure %": p15["buy_pressure"],
+            "15M Sell Pressure %": p15["sell_pressure"],
+            "15M Pressure Difference": p15["pressure_difference"],
+            "15M Pressure Signal": p15["pressure_signal"],
+            "1H Buy Pressure %": p1h["buy_pressure"],
+            "1H Sell Pressure %": p1h["sell_pressure"],
+            "1H Pressure Difference": p1h["pressure_difference"],
+            "1H Pressure Signal": p1h["pressure_signal"],
+            "Master Buy Pressure %": mp["buy"],
+            "Master Sell Pressure %": mp["sell"],
+            "Pressure Difference": mp["diff"],
+            "Pressure Signal": mp["signal"],
+            "Pressure Confirmation": pressure_confirmation,
+            "Next Candle Bias": mp["bias"],
             "CE OI": options_data.get("ce_oi", "N/A"),
             "PE OI": options_data.get("pe_oi", "N/A"),
             "PCR": options_data.get("pcr", "N/A"),
@@ -1199,6 +1297,8 @@ def _fetch_fo_signal(fyers, symbol):
         data5 = a5.get("data") or {}
         data15 = a15.get("data") or {}
         data1h = a1h.get("data") or {}
+        p5 = _pressure_from_analysis(a5); p15 = _pressure_from_analysis(a15); p1h = _pressure_from_analysis(a1h)
+        mp = _combine_pressure(p5,p15,p1h)
         ltp = data5.get("last_close") or data15.get("last_close") or data1h.get("last_close")
         if ltp is None:
             return None, f"{symbol}: LTP unavailable"
@@ -1225,6 +1325,11 @@ def _fetch_fo_signal(fyers, symbol):
             "RSI": data5.get("rsi", "N/A"),
             "MACD": "🟢 Bullish" if data5.get("macd_bullish") else "🔴 Bearish",
             "RVOL": data5.get("rvol", 0),
+            "5M Buy Pressure %": p5["buy_pressure"], "5M Sell Pressure %": p5["sell_pressure"],
+            "15M Buy Pressure %": p15["buy_pressure"], "15M Sell Pressure %": p15["sell_pressure"],
+            "1H Buy Pressure %": p1h["buy_pressure"], "1H Sell Pressure %": p1h["sell_pressure"],
+            "Master Buy Pressure %": mp["buy"], "Master Sell Pressure %": mp["sell"],
+            "Pressure Difference": mp["diff"], "Pressure Signal": mp["signal"], "Next Candle Bias": mp["bias"],
             "Final Signal": master["final_signal"],
             "Confidence %": master["confidence"],
             "Entry": master["entry"],
@@ -1774,15 +1879,15 @@ def show_scanner(fyers) -> None:
     with tabs[2]:
         st.markdown("### ⏱️ 5-Minute Analysis")
         st.info("Run Master Signal Scan first. This view uses the same isolated 5M analysis; no new API scan is required.")
-        st.dataframe(_master_view(master_df_live, ["Stock","LTP","Signal Time","Signal Candle Time","5M Trend","5M Structure","5M CHoCH","5M MSS","VWAP","EMA Trend","RSI","MACD","RVOL","Final Signal","Confidence %"]), use_container_width=True, height=450)
+        st.dataframe(_master_view(master_df_live, ["Stock","LTP","Signal Time","Signal Candle Time","5M Trend","5M Structure","5M CHoCH","5M MSS","VWAP","EMA Trend","RSI","MACD","RVOL","5M Buy Pressure %","5M Sell Pressure %","5M Pressure Difference","5M Pressure Signal","Final Signal","Confidence %"]), use_container_width=True, height=450)
 
     with tabs[3]:
         st.markdown("### ⏱️ 15-Minute Analysis")
-        st.dataframe(_master_view(master_df_live, ["Stock","LTP","Signal Time","Signal Candle Time","15M Trend","15M Structure","15M CHoCH","15M MSS","Final Signal","Confidence %","Entry","Stop Loss","Target 1","Target 2"]), use_container_width=True, height=450)
+        st.dataframe(_master_view(master_df_live, ["Stock","LTP","Signal Time","Signal Candle Time","15M Trend","15M Structure","15M CHoCH","15M MSS","15M Buy Pressure %","15M Sell Pressure %","15M Pressure Difference","15M Pressure Signal","Final Signal","Confidence %","Entry","Stop Loss","Target 1","Target 2"]), use_container_width=True, height=450)
 
     with tabs[4]:
         st.markdown("### 🕐 1-Hour Analysis")
-        st.dataframe(_master_view(master_df_live, ["Stock","LTP","Signal Time","Signal Candle Time","1H Trend","1H Structure","1H CHoCH","1H MSS","Final Signal","Confidence %"]), use_container_width=True, height=450)
+        st.dataframe(_master_view(master_df_live, ["Stock","LTP","Signal Time","Signal Candle Time","1H Trend","1H Structure","1H CHoCH","1H MSS","1H Buy Pressure %","1H Sell Pressure %","1H Pressure Difference","1H Pressure Signal","Final Signal","Confidence %"]), use_container_width=True, height=450)
 
     with tabs[5]:
         st.markdown("### 🔄 CHoCH / MSS Multi-Timeframe Structure")
