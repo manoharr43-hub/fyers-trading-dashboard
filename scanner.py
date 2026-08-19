@@ -86,7 +86,7 @@ def _ensure_app_folders() -> None:
         os.makedirs(folder, exist_ok=True)
 
 _ensure_app_folders()
-logger = logging.getLogger("nse_scanner_v16_fixed")
+logger = logging.getLogger("nse_scanner_v16_enhanced")
 logger.setLevel(logging.INFO)
 
 def _candle_signal_timestamp(df, is_daily: bool = False, resolution: str = "15") -> Tuple[str, str]:
@@ -305,8 +305,7 @@ def detect_structure(df) -> Dict[str, Any]:
 
 
 def detect_choch(df) -> Dict[str, Any]:
-    """Detect a NEW confirmed CHoCH on the latest CLOSED candle only.
-    FIX: Stricter confirmation - requires close beyond pivot by at least 0.1% to prevent false signals."""
+    """Detect a NEW confirmed CHoCH on the latest CLOSED candle only."""
     ph, pl = _confirmed_pivots(df)
     out = {"bullish_choch":False, "bearish_choch":False, "choch_price":None,
            "choch_type":"NONE", "confirmation":"NONE"}
@@ -318,7 +317,6 @@ def detect_choch(df) -> Dict[str, Any]:
     bearish_structure = ph[-1][1] < ph[-2][1] and pl[-1][1] < pl[-2][1]
     bullish_structure = ph[-1][1] > ph[-2][1] and pl[-1][1] > pl[-2][1]
     
-    # FIX: Add minimum move threshold (0.1% or 0.5 pips) to prevent micro-breaks
     min_move = max(ph[-1][1] * 0.001, 0.5)
     
     if bearish_structure and prev_close <= ph[-1][1] and close > (ph[-1][1] + min_move):
@@ -329,8 +327,7 @@ def detect_choch(df) -> Dict[str, Any]:
 
 
 def detect_cisd(df: pd.DataFrame) -> Dict[str, Any]:
-    """Detect a NEW confirmed CISD event on the latest CLOSED candle only.
-    FIX: Added stricter confirmation to prevent false breaks."""
+    """Detect a NEW confirmed CISD event on the latest CLOSED candle only."""
     result = {"bullish_cisd": False, "bearish_cisd": False, "cisd_type": "NONE", "cisd_price": None}
     if df is None or len(df) < 5:
         return result
@@ -339,11 +336,10 @@ def detect_cisd(df: pd.DataFrame) -> Dict[str, Any]:
     prev_close = float(d["Close"].iloc[-2])
     prior = d.iloc[:-1]
     
-    # FIX: Look for last 3 red candles for bearish block
     bearish = prior[prior["Close"] < prior["Open"]].tail(3)
     bullish = prior[prior["Close"] > prior["Open"]].tail(3)
     
-    min_move = float(last["Close"]) * 0.001  # 0.1% min move
+    min_move = float(last["Close"]) * 0.001
     
     if not bearish.empty:
         level = float(bearish.iloc[-1]["High"])
@@ -358,8 +354,7 @@ def detect_cisd(df: pd.DataFrame) -> Dict[str, Any]:
 
 
 def detect_mss(df) -> Dict[str, Any]:
-    """Detect a NEW confirmed MSS event on the latest CLOSED candle only.
-    FIX: Stricter MSS confirmation - same as CHoCH."""
+    """Detect a NEW confirmed MSS event on the latest CLOSED candle only."""
     ph, pl = _confirmed_pivots(df)
     out = {"bullish_mss":False, "bearish_mss":False, "mss_type":"NONE", "confirmation":"NONE"}
     if len(ph) < 2 or len(pl) < 2 or len(df) < 10:
@@ -370,7 +365,6 @@ def detect_mss(df) -> Dict[str, Any]:
     bearish_structure = ph[-1][1] < ph[-2][1] and pl[-1][1] < pl[-2][1]
     bullish_structure = ph[-1][1] > ph[-2][1] and pl[-1][1] > pl[-2][1]
     
-    # FIX: Add minimum move threshold
     min_move = max(ph[-1][1] * 0.001, 0.5)
     
     if bearish_structure and prev_close <= ph[-1][1] and close > (ph[-1][1] + min_move):
@@ -772,6 +766,7 @@ def _fyers_optionchain_request(fyers, symbol: str, strikecount: int = OPTIONS_ST
 
 
 def _calculate_max_pain(chain_rows):
+    """Calculate max pain level from options chain data."""
     strikes = sorted({float(x.get("strike_price")) for x in chain_rows if x.get("option_type") in ("CE", "PE") and x.get("strike_price") not in (None, -1)})
     if not strikes:
         return None
@@ -1048,10 +1043,9 @@ def calculate_master_signal(symbol: str, analysis_5m: Dict, analysis_15m: Dict, 
     hard_conflict = bullish_tfs >= 1 and bearish_tfs >= 1
 
     # ════════════════════════════════════════════════════════════════════════════
-    # FIX: Changed confidence multiplier from 1.8 to 0.8 (CRITICAL FIX!)
-    # This makes confidence scores realistic instead of requiring impossible thresholds
+    # CONFIDENCE CALCULATION (FIXED - multiplier changed from 1.8 to 0.8)
     # ════════════════════════════════════════════════════════════════════════════
-    confidence = round(abs(total_score - 50) * 0.8, 1)  # ← CHANGED FROM 1.8 TO 0.8
+    confidence = round(abs(total_score - 50) * 0.8, 1)  # ← FIXED: 0.8 instead of 1.8
     confidence = max(0, min(100, confidence))
 
     # STRICT: Requires strong alignment AND pressure confirmation
@@ -1229,32 +1223,181 @@ def run_master_signal_scan(fyers, symbols, fo_symbols=None):
     return results, errors, stats
 
 # ════════════════════════════════════════════════════════════════════════════════
-# EXPORT UTILITIES
+# F&O ANALYSIS & EXPORT UTILITIES (NEW)
 # ════════════════════════════════════════════════════════════════════════════════
-def to_excel_bytes(dfs_dict: Dict[str, pd.DataFrame]) -> bytes:
-    """Export multiple dataframes to Excel with separate sheets"""
+def _interpret_pcr(pcr_val) -> str:
+    """Interpret PCR ratio for market sentiment."""
+    if not isinstance(pcr_val, (int, float)) or pcr_val <= 0:
+        return "N/A"
+    
+    if pcr_val >= 1.10:
+        return "STRONG BEARISH (PCR > 1.10)"
+    elif pcr_val >= 1.00:
+        return "BEARISH (PCR 1.00-1.10)"
+    elif pcr_val >= 0.95:
+        return "NEUTRAL (PCR 0.95-1.00)"
+    elif pcr_val >= 0.80:
+        return "BULLISH (PCR 0.80-0.95)"
+    else:
+        return "STRONG BULLISH (PCR < 0.80)"
+
+
+def extract_fo_data(results_df: pd.DataFrame) -> pd.DataFrame:
+    """Extract F&O-specific analysis from master signal results.
+    
+    BUG FIXES:
+    - Proper type handling for OI values
+    - Safe PCR calculation with fallback
+    - Skip rows without F&O data
+    - Comprehensive error handling
+    """
+    if results_df is None or results_df.empty:
+        return pd.DataFrame()
+    
+    fo_data = []
+    
+    for idx, row in results_df.iterrows():
+        try:
+            # Skip rows without options data
+            ce_oi = row.get("CE OI", "N/A")
+            pe_oi = row.get("PE OI", "N/A")
+            
+            # Bug fix: Check for N/A before conversion
+            if ce_oi == "N/A" or pe_oi == "N/A":
+                continue
+            
+            # Safe conversion to float
+            try:
+                ce_oi_val = float(ce_oi) if ce_oi != "N/A" else 0.0
+                pe_oi_val = float(pe_oi) if pe_oi != "N/A" else 0.0
+            except (ValueError, TypeError):
+                continue
+            
+            # Get or calculate PCR
+            pcr_val = row.get("PCR", "N/A")
+            if pcr_val == "N/A" and ce_oi_val > 0:
+                pcr_val = round(pe_oi_val / ce_oi_val, 3)
+            elif pcr_val == "N/A":
+                pcr_val = 0.0
+            else:
+                try:
+                    pcr_val = float(pcr_val)
+                except (ValueError, TypeError):
+                    pcr_val = 0.0
+            
+            # Build F&O entry with bug fixes
+            fo_entry = {
+                "Stock": str(row.get("Stock", "N/A")).strip(),
+                "LTP": round(float(row.get("LTP", 0)), 2) if row.get("LTP", "N/A") != "N/A" else "N/A",
+                "Signal": str(row.get("Final Signal", "N/A")).strip(),
+                "Confidence %": round(float(row.get("Confidence %", 0)), 1) if row.get("Confidence %", "N/A") != "N/A" else "N/A",
+                "CE OI": int(round(ce_oi_val, 0)),
+                "PE OI": int(round(pe_oi_val, 0)),
+                "Total OI": int(round(ce_oi_val + pe_oi_val, 0)),
+                "PCR": round(pcr_val, 3) if pcr_val > 0 else "N/A",
+                "PCR Status": _interpret_pcr(pcr_val) if pcr_val > 0 else "N/A",
+                "Options Bias": str(row.get("Options Bias", "NEUTRAL")).strip(),
+                "Entry": round(float(row.get("Entry", 0)), 2) if row.get("Entry", "N/A") != "N/A" else "N/A",
+                "Stop Loss": round(float(row.get("Stop Loss", 0)), 2) if row.get("Stop Loss", "N/A") != "N/A" else "N/A",
+                "Target 1": round(float(row.get("Target 1", 0)), 2) if row.get("Target 1", "N/A") != "N/A" else "N/A",
+                "Target 2": round(float(row.get("Target 2", 0)), 2) if row.get("Target 2", "N/A") != "N/A" else "N/A",
+                "Risk:Reward": round(float(row.get("Risk:Reward", 0)), 2) if row.get("Risk:Reward", "N/A") != "N/A" else "N/A",
+                "5M Pressure": str(row.get("Pressure Trend", "NEUTRAL")).strip(),
+                "5M Buy %": round(float(row.get("5M Buying Pressure", 0)), 1) if row.get("5M Buying Pressure", "N/A") != "N/A" else "N/A",
+                "5M Sell %": round(float(row.get("5M Selling Pressure", 0)), 1) if row.get("5M Selling Pressure", "N/A") != "N/A" else "N/A",
+            }
+            fo_data.append(fo_entry)
+        
+        except Exception as e:
+            logging.warning(f"Error extracting F&O data for row {idx}: {type(e).__name__}: {str(e)[:50]}")
+            continue
+    
+    return pd.DataFrame(fo_data) if fo_data else pd.DataFrame()
+
+
+def to_excel_bytes(dfs_dict: Dict[str, pd.DataFrame], results_df: pd.DataFrame = None) -> bytes:
+    """Export multiple dataframes to Excel with separate sheets including F&O analysis.
+    
+    BUG FIXES:
+    - Proper error handling for empty/None dataframes
+    - Sheet name sanitization (max 31 chars)
+    - Safe sheet writing with fallback
+    - F&O extraction integration
+    
+    Args:
+        dfs_dict: Dictionary of sheet_name -> DataFrame
+        results_df: Optional main results dataframe to extract F&O data from
+    
+    Returns:
+        Bytes containing Excel file with all sheets
+    """
     buf = io.BytesIO()
-    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-        for sheet_name, df in dfs_dict.items():
-            safe_name = sheet_name[:31]
-            if not df.empty:
-                df.to_excel(writer, index=False, sheet_name=safe_name)
-    buf.seek(0)
-    return buf.getvalue()
+    
+    try:
+        with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+            # Add main sheets
+            for sheet_name, df in dfs_dict.items():
+                if df is not None and not df.empty:
+                    safe_name = str(sheet_name)[:31]  # Bug fix: Ensure string & max 31 chars
+                    try:
+                        df.to_excel(writer, index=False, sheet_name=safe_name)
+                    except Exception as e:
+                        logging.warning(f"Failed to write sheet '{safe_name}': {type(e).__name__}")
+                        continue
+            
+            # Add F&O analysis tab if results available
+            if results_df is not None and not results_df.empty:
+                try:
+                    fo_df = extract_fo_data(results_df)
+                    if not fo_df.empty:
+                        # Bug fix: Truncate sheet name safely
+                        fo_sheet_name = "F&O Analysis"[:31]
+                        fo_df.to_excel(writer, index=False, sheet_name=fo_sheet_name)
+                    else:
+                        # Create info sheet if no F&O data
+                        info_df = pd.DataFrame({
+                            "Status": ["No F&O-enabled symbols in scan results"],
+                            "Note": ["F&O data only available for stocks with active derivatives"]
+                        })
+                        try:
+                            info_df.to_excel(writer, index=False, sheet_name="F&O Info")
+                        except:
+                            pass  # Silent fail for info sheet
+                except Exception as e:
+                    logging.warning(f"F&O extraction error: {type(e).__name__}: {str(e)[:50]}")
+                    try:
+                        error_df = pd.DataFrame({"Error": [f"F&O Analysis failed: {str(e)[:80]}"]})
+                        error_df.to_excel(writer, index=False, sheet_name="F&O Errors")
+                    except:
+                        pass  # Silent fail for error sheet
+        
+        buf.seek(0)
+        return buf.getvalue()
+    
+    except Exception as e:
+        logging.error(f"Excel export critical error: {type(e).__name__}: {e}")
+        raise
+
 
 def to_csv_bytes(df) -> bytes:
+    """Export dataframe to CSV bytes."""
+    if df is None or df.empty:
+        return b"No data"
     return df.to_csv(index=False).encode("utf-8")
 
 def to_json_bytes(df) -> bytes:
+    """Export dataframe to JSON bytes."""
+    if df is None or df.empty:
+        return b"{}"
     return df.to_json(orient="records", indent=2, force_ascii=False).encode("utf-8")
 
 # ════════════════════════════════════════════════════════════════════════════════
 # MAIN APP (IMPROVED UI WITH DYNAMIC FILTERING)
 # ════════════════════════════════════════════════════════════════════════════════
 def show_scanner(fyers) -> None:
-    """Streamlit main app - NSE AI PRO V16.1 FIXED (Reports Now Showing!)"""
+    """Streamlit main app - NSE AI PRO V16.1 ENHANCED (F&O Analysis + Bug Fixes)"""
     
-    st.title("🚀 NSE AI PRO V16.1 FIXED — Reports Now Visible!")
+    st.title("🚀 NSE AI PRO V16.1 ENHANCED — F&O Analysis Ready!")
     st.caption(f"🕒 Current Time (IST): {_now_ist().strftime('%d-%b-%Y %H:%M:%S')} IST")
     
     # Load symbols
@@ -1276,10 +1419,11 @@ def show_scanner(fyers) -> None:
     scan_universe = all_symbols if limit == 0 else all_symbols[:limit]
     
     # Main tab - Master Signal Engine
-    st.markdown("### 🧠 Master Signal Engine (Fixed + Pressure)\nStrict multi-timeframe alignment + buying/selling pressure confirmation")
+    st.markdown("### 🧠 Master Signal Engine (Fixed + Pressure + F&O)")
+    st.markdown("Strict multi-timeframe alignment + buying/selling pressure + F&O analysis")
     
     if st.button(f"🧠 RUN SCAN ({len(scan_universe)} symbols)", key="master_run"):
-        with st.spinner("Analyzing with pressure indicators…"):
+        with st.spinner("Analyzing with pressure indicators & F&O data…"):
             master_results, master_errors, master_stats = run_master_signal_scan(fyers, scan_universe, fo_symbols)
             st.session_state["master_df"] = pd.DataFrame(master_results) if master_results else pd.DataFrame()
             st.session_state["master_errors"] = master_errors
@@ -1290,7 +1434,7 @@ def show_scanner(fyers) -> None:
         _display_scan_summary(st.session_state["master_stats"])
     
     # ════════════════════════════════════════════════════════════════════════════
-    # FIX: Improved display with dynamic filtering
+    # IMPROVED DISPLAY WITH DYNAMIC FILTERING & F&O EXPORT
     # ════════════════════════════════════════════════════════════════════════════
     
     master_df = st.session_state.get("master_df")
@@ -1341,19 +1485,22 @@ def show_scanner(fyers) -> None:
             # Show table
             st.dataframe(filtered_df, use_container_width=True, height=500)
             
-            # Download buttons
-            st.markdown("### 💾 Export Results")
+            # Download buttons with F&O tab
+            st.markdown("### 💾 Export Results (with F&O Analysis Tab)")
             col_d1, col_d2, col_d3 = st.columns(3)
             
             with col_d1:
-                excel_data = to_excel_bytes({"Signals": filtered_df})
-                st.download_button(
-                    label="📥 Download Excel",
-                    data=excel_data,
-                    file_name=f"nse_signals_{_now_ist().strftime('%Y%m%d_%H%M')}.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    key="dl_excel"
-                )
+                try:
+                    excel_data = to_excel_bytes({"Signals": filtered_df}, results_df=master_sorted)
+                    st.download_button(
+                        label="📥 Download Excel (with F&O)",
+                        data=excel_data,
+                        file_name=f"nse_signals_fo_{_now_ist().strftime('%Y%m%d_%H%M')}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        key="dl_excel_fo"
+                    )
+                except Exception as e:
+                    st.error(f"Excel export failed: {e}")
             
             with col_d2:
                 csv_data = to_csv_bytes(filtered_df)
@@ -1394,6 +1541,22 @@ def show_scanner(fyers) -> None:
             with stat_col4:
                 avg_rr = filtered_df[filtered_df["Risk:Reward"] > 0]["Risk:Reward"].mean()
                 st.metric("Avg Risk:Reward", f"{avg_rr:.2f}" if not pd.isna(avg_rr) else "N/A")
+            
+            # F&O Analysis Preview
+            st.markdown("### 📊 F&O Analysis Preview")
+            try:
+                fo_preview = extract_fo_data(master_sorted)
+                if not fo_preview.empty:
+                    fo_preview_filtered = fo_preview[fo_preview["Stock"].isin(filtered_df["Stock"])]
+                    if not fo_preview_filtered.empty:
+                        st.dataframe(fo_preview_filtered, use_container_width=True, height=300)
+                        st.caption(f"✅ F&O data for {len(fo_preview_filtered)} F&O-enabled stocks | Full F&O analysis in Excel export")
+                    else:
+                        st.info("ℹ️ No F&O data for filtered stocks. Download Excel to see full F&O Analysis tab.")
+                else:
+                    st.info("ℹ️ No F&O-enabled stocks in this scan.")
+            except Exception as e:
+                st.warning(f"F&O preview error: {e}")
         
         else:
             st.warning(f"❌ No signals found with confidence ≥ {min_confidence}%")
@@ -1405,7 +1568,7 @@ def show_scanner(fyers) -> None:
             st.caption(f"Showing top 20 of {len(master_sorted)} total scans")
     
     else:
-        st.info("👈 Click 'RUN SCAN' above to analyze stocks and generate trading signals.")
+        st.info("👈 Click 'RUN SCAN' above to analyze stocks and generate trading signals with F&O analysis.")
     
     # Show errors if any
     if st.session_state.get("master_errors"):
