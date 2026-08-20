@@ -1,17 +1,25 @@
 """
-option_chain.py (ENHANCED VERSION)
-==================================
-NSE India Options Chain Dashboard with AI-Powered Price Action Signals
-+ Institutional Buy/Sell Pressure Analysis
+option_chain.py (ENHANCED)
+==========================
+Institutional-grade NSE India Options Chain Dashboard with AI-Powered Price Action Signals.
 
 Data Source: FYERS (Primary) → NSE (Fallback for option chain only)
 Live Signals: MSS, HH/HL/LH/LL, BOS, CHoCH, VWAP, EMA, RSI, MACD, Volume, RVOL
 Confirmation: 5M, 15M, 30M, 1H, 1D multi-timeframe analysis
 Trade Signal Output: BUY/SELL/HOLD with Entry, SL, T1, T2, T3, Probability, Confidence
-Pressure Signals: Buy Pressure, Sell Pressure, Net Bias, Aggression, Volume/OI Anomalies
 
-This version includes institutional buy/sell pressure indicators
-while preserving all original functionality.
+This version:
+- Makes FYERS the PRIMARY live data source (NSE is fallback for option chains only)
+- Fetches price data (OHLCV) for multiple timeframes from FYERS
+- Detects market structure: HH, HL, LH, LL per timeframe
+- Detects Break of Structure (BOS) and Change of Character (CHoCH)
+- Calculates Market Structure Shifts (MSS) with non-repaint logic
+- Calculates technical indicators on live data
+- Generates multi-timeframe confirmed trade signals
+- Computes entry/exit levels and probability scores
+- Shows NO SIGNAL if FYERS is unavailable (no fake data generation)
+- Preserves all existing option-chain, Greeks, GEX/DEX, AI features
+- Single-file architecture: no separate modules
 """
 
 from __future__ import annotations
@@ -39,7 +47,7 @@ from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
 # ══════════════════════════════════════════════════════════════════════════
-# 1. LOGGING (ORIGINAL)
+# 1. LOGGING
 # ══════════════════════════════════════════════════════════════════════════
 
 logger = logging.getLogger("option_chain_dashboard")
@@ -53,7 +61,7 @@ logger.setLevel(logging.INFO)
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# 2. CONSTANTS (ORIGINAL - UNMODIFIED)
+# 2. CONSTANTS
 # ══════════════════════════════════════════════════════════════════════════
 
 NSE_BASE_URL = "https://www.nseindia.com"
@@ -113,6 +121,7 @@ RED = "#f85149"
 AMBER = "#d29922"
 BLUE = "#58a6ff"
 
+# Timeframe constants
 TIMEFRAMES = {
     "5M": 5 * 60,
     "15M": 15 * 60,
@@ -121,14 +130,16 @@ TIMEFRAMES = {
     "1D": 24 * 60 * 60,
 }
 
+# Technical analysis parameters
 DEFAULT_RSI_PERIOD = 14
 DEFAULT_EMA_PERIODS = {"fast": 9, "slow": 21}
 DEFAULT_MACD_PARAMS = {"fast": 12, "slow": 26, "signal": 9}
 DEFAULT_VWAP_PERIOD = 20
 
-MSS_MIN_STRENGTH = 1.0
-BOS_CONFIRMATION_BARS = 1
-CHOCH_CONFIRMATION_BARS = 2
+# MSS and signal parameters
+MSS_MIN_STRENGTH = 1.0  # minimum % move to confirm MSS
+BOS_CONFIRMATION_BARS = 1  # bars to confirm BOS
+CHOCH_CONFIRMATION_BARS = 2  # bars to confirm CHoCH
 
 FYERS_INDEX_SYMBOL_CANDIDATES: dict[str, list[str]] = {
     "NIFTY": ["NSE:NIFTY50-INDEX"],
@@ -141,26 +152,7 @@ FYERS_INDEX_SYMBOL_CANDIDATES: dict[str, list[str]] = {
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# 0. BUY/SELL PRESSURE DATATYPES (NEW - Non-intrusive)
-# ══════════════════════════════════════════════════════════════════════════
-
-@dataclass
-class MarketPressure:
-    """Market-wide pressure summary."""
-    total_call_pressure: float = 50.0
-    total_put_pressure: float = 50.0
-    net_market_bias: float = 0.0
-    market_sentiment: str = "NEUTRAL"
-    pcr_vs_pressure: str = "N/A"
-    volume_surge_detected: bool = False
-    oi_accumulation_detected: bool = False
-    itm_pressure: float = 50.0
-    atm_pressure: float = 50.0
-    otm_pressure: float = 50.0
-
-
-# ══════════════════════════════════════════════════════════════════════════
-# 3. HTTP / SESSION LAYER (ORIGINAL - UNMODIFIED)
+# 3. HTTP / SESSION LAYER
 # ══════════════════════════════════════════════════════════════════════════
 
 def _build_retrying_session() -> requests.Session:
@@ -254,7 +246,7 @@ def fetch_json_with_retry(
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# 4. FYERS LIVE DATA FUNCTIONS (ORIGINAL - UNMODIFIED)
+# 4. FYERS LIVE DATA FUNCTIONS (PRIMARY DATA SOURCE)
 # ══════════════════════════════════════════════════════════════════════════
 
 def _fyers_field(d: dict, *aliases: str, default: Any = None) -> Any:
@@ -306,7 +298,7 @@ def _fyers_call_optionchain(fyers: Any, symbol: str, strikecount: int, timestamp
 
 
 def _fyers_call_history(fyers: Any, symbol: str, resolution: str, count: int = 100) -> Optional[dict]:
-    """Fetches OHLCV candle data from FYERS."""
+    """Fetches OHLCV candle data from FYERS. Resolution: 1, 5, 15, 30, 60, 1D, etc."""
     try:
         req = {
             "symbol": symbol,
@@ -323,7 +315,7 @@ def _fyers_call_history(fyers: Any, symbol: str, resolution: str, count: int = 1
 
 
 def fetch_fyers_candles(fyers: Any, symbol: str, timeframe_minutes: int, count: int = 100) -> Optional[pd.DataFrame]:
-    """Fetches OHLCV candles from FYERS for a given timeframe."""
+    """Fetches OHLCV candles from FYERS for a given timeframe. Returns None if unavailable."""
     if fyers is None:
         return None
 
@@ -371,7 +363,7 @@ def fetch_fyers_candles(fyers: Any, symbol: str, timeframe_minutes: int, count: 
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# 5. TECHNICAL INDICATOR FUNCTIONS (ORIGINAL - UNMODIFIED)
+# 5. TECHNICAL INDICATOR FUNCTIONS
 # ══════════════════════════════════════════════════════════════════════════
 
 def calculate_rsi(df: pd.DataFrame, period: int = DEFAULT_RSI_PERIOD, col: str = "close") -> pd.Series:
@@ -442,18 +434,27 @@ def add_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
     
     d = df.copy()
     
+    # RSI
     d["rsi"] = calculate_rsi(d)
+    
+    # EMA
     d["ema_9"] = calculate_ema(d, 9)
     d["ema_21"] = calculate_ema(d, 21)
+    
+    # MACD
     d["macd"], d["macd_signal"], d["macd_hist"] = calculate_macd(d)
+    
+    # VWAP
     d["vwap"] = calculate_vwap(d)
+    
+    # RVOL
     d["rvol"] = calculate_rvol(d)
     
     return d
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# 6. MARKET STRUCTURE DETECTION (ORIGINAL - UNMODIFIED)
+# 6. MARKET STRUCTURE DETECTION (HH/HL/LH/LL, BOS, CHoCH)
 # ══════════════════════════════════════════════════════════════════════════
 
 def detect_hh_ll(df: pd.DataFrame) -> tuple[pd.Series, pd.Series]:
@@ -486,7 +487,7 @@ def detect_structure_levels(df: pd.DataFrame, lookback: int = 5) -> dict[str, fl
 
 
 def detect_bos(df: pd.DataFrame, structure_levels: dict) -> bool:
-    """Detect Break of Structure (BOS)."""
+    """Detect Break of Structure (BOS) - when price breaks above resistance or below support."""
     if df.empty or len(df) < 2:
         return False
     
@@ -495,39 +496,55 @@ def detect_bos(df: pd.DataFrame, structure_levels: dict) -> bool:
     current_high = df["high"].iloc[-1]
     current_low = df["low"].iloc[-1]
     
+    # BOS up: high breaks above previous resistance
     bos_up = current_high > resistance and resistance > 0
+    # BOS down: low breaks below previous support
     bos_down = current_low < support and support > 0
     
     return bos_up or bos_down
 
 
 def detect_choch(df: pd.DataFrame, lookback: int = 10) -> bool:
-    """Detect Change of Character (CHoCH)."""
+    """Detect Change of Character (CHoCH) - sustained shift from bullish to bearish or vice versa."""
     if df.empty or len(df) < lookback:
         return False
     
     recent = df.tail(lookback)
+    
+    # Check if there's a clear shift in highs and lows pattern
+    # CHoCH = multiple consecutive bars making lower highs/lows or higher highs/lows
     lows = recent["low"].values
     highs = recent["high"].values
     
+    # Count lower lows and lower highs (bearish shift)
     lower_lows = sum(1 for i in range(1, len(lows)) if lows[i] < lows[i-1])
     lower_highs = sum(1 for i in range(1, len(highs)) if highs[i] < highs[i-1])
+    
     bearish_shift = (lower_lows >= lookback - 2) and (lower_highs >= lookback - 2)
     
+    # Count higher lows and higher highs (bullish shift)
     higher_lows = sum(1 for i in range(1, len(lows)) if lows[i] > lows[i-1])
     higher_highs = sum(1 for i in range(1, len(highs)) if highs[i] > highs[i-1])
+    
     bullish_shift = (higher_lows >= lookback - 2) and (higher_highs >= lookback - 2)
     
     return bearish_shift or bullish_shift
 
 
 def detect_mss(df_list: dict[str, pd.DataFrame]) -> dict[str, dict]:
-    """Detect Market Structure Shift (MSS) across timeframes."""
+    """Detect Market Structure Shift (MSS) across timeframes.
+    
+    MSS = confirmation of structure break across multiple timeframes with:
+    - BOS on lower timeframe
+    - Aligned direction on higher timeframes
+    - Minimum strength threshold
+    """
     result = {tf: {"mss": False, "direction": "NONE", "strength": 0.0} for tf in df_list.keys()}
     
     if not df_list or not all(df_list.values()):
         return result
     
+    # Primary signal from 5M
     if "5M" in df_list and not df_list["5M"].empty:
         df_5m = df_list["5M"]
         levels_5m = detect_structure_levels(df_5m)
@@ -537,10 +554,10 @@ def detect_mss(df_list: dict[str, pd.DataFrame]) -> dict[str, dict]:
             close_5m = df_5m["close"].iloc[-1]
             open_5m = df_5m["open"].iloc[-1]
             
-            if close_5m > open_5m:
+            if close_5m > open_5m:  # Bullish
                 direction = "UP"
                 strength = abs((close_5m - levels_5m.get("support", close_5m)) / levels_5m.get("support", 1)) * 100
-            else:
+            else:  # Bearish
                 direction = "DOWN"
                 strength = abs((levels_5m.get("resistance", close_5m) - close_5m) / levels_5m.get("resistance", 1)) * 100
             
@@ -548,6 +565,7 @@ def detect_mss(df_list: dict[str, pd.DataFrame]) -> dict[str, dict]:
             result["5M"]["direction"] = direction if strength >= MSS_MIN_STRENGTH else "NONE"
             result["5M"]["strength"] = min(strength, 100.0)
     
+    # Confirmation from higher timeframes
     for tf in ["15M", "30M", "1H", "1D"]:
         if tf not in df_list or df_list[tf] is None or df_list[tf].empty:
             continue
@@ -561,35 +579,35 @@ def detect_mss(df_list: dict[str, pd.DataFrame]) -> dict[str, dict]:
             direction = "UP" if close > open_ else "DOWN"
             result[tf]["mss"] = True
             result[tf]["direction"] = direction
-            result[tf]["strength"] = 75.0
+            result[tf]["strength"] = 75.0  # CHoCH = high confidence
     
     return result
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# 7. TRADE SIGNAL GENERATION (ORIGINAL - UNMODIFIED)
+# 7. TRADE SIGNAL GENERATION
 # ══════════════════════════════════════════════════════════════════════════
 
 @dataclass
 class TradeSignal:
     """Represents a single trade signal with all relevant details."""
-    signal: str
+    signal: str  # BUY, SELL, HOLD
     entry: float
     stop_loss: float
     target_1: float
     target_2: float
     target_3: float
     risk_reward_ratio: float
-    probability: float
-    confidence: float
-    confirmation_timeframes: list[str] = field(default_factory=list)
-    technical_reasons: list[str] = field(default_factory=list)
+    probability: float  # 0-100
+    confidence: float  # 0-100
+    confirmation_timeframes: list[str]  # Which TFs confirm this signal
+    technical_reasons: list[str]  # Why this signal was generated
     timestamp: datetime = field(default_factory=datetime.now)
 
 
 def generate_trade_signal(df_dict: dict[str, pd.DataFrame], spot: float, mss: dict[str, dict],
                           fyers_available: bool) -> Optional[TradeSignal]:
-    """Generate a multi-timeframe confirmed trade signal."""
+    """Generate a multi-timeframe confirmed trade signal. Returns None if FYERS is unavailable."""
     
     if not fyers_available:
         logger.warning("FYERS not available - cannot generate trade signal")
@@ -598,10 +616,12 @@ def generate_trade_signal(df_dict: dict[str, pd.DataFrame], spot: float, mss: di
     if not df_dict or not any(df_dict.values()):
         return None
     
+    # Get 5M as primary timeframe for signal
     df_5m = df_dict.get("5M")
     if df_5m is None or df_5m.empty or len(df_5m) < 10:
         return None
     
+    # Analyze 5M technical setup
     current_close = float(df_5m["close"].iloc[-1])
     current_high = float(df_5m["high"].iloc[-1])
     current_low = float(df_5m["low"].iloc[-1])
@@ -612,6 +632,7 @@ def generate_trade_signal(df_dict: dict[str, pd.DataFrame], spot: float, mss: di
     current_macd_hist = float(df_5m["macd_hist"].iloc[-1]) if "macd_hist" in df_5m.columns else 0.0
     current_rvol = float(df_5m["rvol"].iloc[-1]) if "rvol" in df_5m.columns else 1.0
     
+    # Detect structure
     levels_5m = detect_structure_levels(df_5m)
     resistance = levels_5m.get("resistance", current_close)
     support = levels_5m.get("support", current_close)
@@ -622,64 +643,79 @@ def generate_trade_signal(df_dict: dict[str, pd.DataFrame], spot: float, mss: di
     technical_reasons = []
     confirmed_tfs = []
     
+    # ─── BUY Signal Logic ───
     buy_score = 0.0
     
+    # Condition 1: Price above 9 EMA
     if current_close > current_ema_9:
         buy_score += 25
         technical_reasons.append("Price > EMA 9")
     
+    # Condition 2: 9 EMA > 21 EMA (trend)
     if current_ema_9 > current_ema_21:
         buy_score += 20
         technical_reasons.append("EMA 9 > EMA 21")
     
+    # Condition 3: MACD above zero line and histogram positive
     if current_macd > 0 and current_macd_hist > 0:
         buy_score += 20
         technical_reasons.append("MACD bullish")
     
+    # Condition 4: RSI not overbought but bullish (30-70)
     if 40 <= current_rsi <= 70:
         buy_score += 15
         technical_reasons.append(f"RSI {current_rsi:.0f} (bullish zone)")
     
+    # Condition 5: High volume
     if current_rvol > 1.2:
         buy_score += 10
         technical_reasons.append("High volume")
     
+    # Condition 6: MSS confirmation
     if mss.get("5M", {}).get("mss") and mss["5M"].get("direction") == "UP":
         buy_score += 15
         technical_reasons.append("MSS confirmed (UP)")
         confirmed_tfs.append("5M")
     
+    # ─── SELL Signal Logic ───
     sell_score = 0.0
     
+    # Condition 1: Price below 9 EMA
     if current_close < current_ema_9:
         sell_score += 25
         technical_reasons.append("Price < EMA 9")
     
+    # Condition 2: 9 EMA < 21 EMA (downtrend)
     if current_ema_9 < current_ema_21:
         sell_score += 20
         technical_reasons.append("EMA 9 < EMA 21")
     
+    # Condition 3: MACD below zero line and histogram negative
     if current_macd < 0 and current_macd_hist < 0:
         sell_score += 20
         technical_reasons.append("MACD bearish")
     
+    # Condition 4: RSI not oversold but bearish (30-70)
     if 30 <= current_rsi <= 60:
         sell_score += 15
         technical_reasons.append(f"RSI {current_rsi:.0f} (bearish zone)")
     
+    # Condition 5: High volume
     if current_rvol > 1.2:
         sell_score += 10
         technical_reasons.append("High volume")
     
+    # Condition 6: MSS confirmation
     if mss.get("5M", {}).get("mss") and mss["5M"].get("direction") == "DOWN":
         sell_score += 15
         technical_reasons.append("MSS confirmed (DOWN)")
         confirmed_tfs.append("5M")
     
+    # Determine signal
     if buy_score > sell_score and buy_score >= 60:
         signal_type = "BUY"
         confidence_score = min(buy_score, 100.0)
-        probability_score = 50.0 + (buy_score / 2)
+        probability_score = 50.0 + (buy_score / 2)  # Scale to 0-100
     elif sell_score > buy_score and sell_score >= 60:
         signal_type = "SELL"
         confidence_score = min(sell_score, 100.0)
@@ -689,21 +725,22 @@ def generate_trade_signal(df_dict: dict[str, pd.DataFrame], spot: float, mss: di
         confidence_score = max(buy_score, sell_score)
         probability_score = 50.0
     
+    # Calculate entry, SL, and targets
     if signal_type == "BUY":
         entry = current_close
-        stop_loss = support * 0.995
+        stop_loss = support * 0.995  # 0.5% below support
         range_val = entry - stop_loss
-        target_1 = entry + range_val
-        target_2 = entry + (range_val * 1.5)
-        target_3 = entry + (range_val * 2.0)
+        target_1 = entry + range_val  # 1:1 RR
+        target_2 = entry + (range_val * 1.5)  # 1.5:1 RR
+        target_3 = entry + (range_val * 2.0)  # 2:1 RR
     elif signal_type == "SELL":
         entry = current_close
-        stop_loss = resistance * 1.005
+        stop_loss = resistance * 1.005  # 0.5% above resistance
         range_val = stop_loss - entry
         target_1 = entry - range_val
         target_2 = entry - (range_val * 1.5)
         target_3 = entry - (range_val * 2.0)
-    else:
+    else:  # HOLD
         entry = current_close
         stop_loss = support
         target_1 = (resistance + entry) / 2
@@ -728,12 +765,13 @@ def generate_trade_signal(df_dict: dict[str, pd.DataFrame], spot: float, mss: di
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# 8. DATA FETCH + PARSE LAYER (ORIGINAL - UNMODIFIED)
+# 8. DATA FETCH + PARSE LAYER (NSE Fallback)
 # ══════════════════════════════════════════════════════════════════════════
 
 @st.cache_data(ttl=15, show_spinner=False)
 def fetch_option_chain_raw(symbol: str, is_index: bool) -> dict:
-    """Cached (15s TTL) raw NSE option-chain JSON fetch."""
+    """Cached (15s TTL) raw NSE option-chain JSON fetch. NSE is used only as
+    fallback for option chains when FYERS is unavailable."""
     session = get_nse_session()
     url = NSE_INDEX_CHAIN_URL if is_index else NSE_EQUITY_CHAIN_URL
     payload, error = fetch_json_with_retry(session, url, params={"symbol": symbol})
@@ -851,7 +889,7 @@ def parse_days_to_expiry(expiry_label: str) -> float:
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# 9. GREEKS ENGINE (ORIGINAL - UNMODIFIED)
+# 9. GREEKS ENGINE (Black-Scholes)
 # ══════════════════════════════════════════════════════════════════════════
 
 def _norm_cdf(x: float) -> float:
@@ -923,7 +961,7 @@ def add_greeks_columns(df: pd.DataFrame, spot: float, expiry_label: str,
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# 10. IV RANK / IV PERCENTILE (ORIGINAL - UNMODIFIED)
+# 10. IV RANK / IV PERCENTILE
 # ══════════════════════════════════════════════════════════════════════════
 
 IV_HISTORY_KEY = "oc_atm_iv_history"
@@ -964,7 +1002,7 @@ def compute_iv_rank_percentile(symbol: str, expiry_label: str, current_iv: float
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# 11. GEX / DEX (ORIGINAL - UNMODIFIED)
+# 11. GEX / DEX
 # ══════════════════════════════════════════════════════════════════════════
 
 def compute_gex_dex(df: pd.DataFrame, spot: float, lot_size: int) -> dict[str, Any]:
@@ -1003,7 +1041,7 @@ def compute_gex_dex(df: pd.DataFrame, spot: float, lot_size: int) -> dict[str, A
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# 12. FYERS OPTION CHAIN PARSING (ORIGINAL - UNMODIFIED)
+# 12. FYERS OPTION CHAIN PARSING (Fallback)
 # ══════════════════════════════════════════════════════════════════════════
 
 def _fyers_extract_expiry_list(response: dict) -> list[tuple[str, str]]:
@@ -1208,7 +1246,7 @@ def fetch_via_fyers(fyers: Any, symbol_key: str, is_index: bool, stock_name: str
 
 def fetch_chain_unified(fyers: Any, symbol_key: str, is_index: bool, stock_name: str,
                          preferred_expiry: str, strike_count: int) -> dict:
-    """FYERS-first, NSE-fallback."""
+    """FYERS-first, NSE-fallback. FYERS is PRIMARY, NSE used only if FYERS unavailable."""
     fyers_error = None
     if fyers is not None:
         result = fetch_via_fyers(fyers, symbol_key, is_index, stock_name, preferred_expiry, strike_count)
@@ -1243,7 +1281,7 @@ def fetch_chain_unified(fyers: Any, symbol_key: str, is_index: bool, stock_name:
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# 13. ANALYTICS (ORIGINAL - UNMODIFIED)
+# 13. ANALYTICS — PCR / MAX PAIN / SUPPORT-RESISTANCE / BUILDUP / MONEYNESS
 # ══════════════════════════════════════════════════════════════════════════
 
 def calc_pcr(df: pd.DataFrame) -> float:
@@ -1358,7 +1396,7 @@ def _normalize_series(series: pd.Series) -> pd.Series:
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# 14. AI SIGNAL ENGINE (ORIGINAL - UNMODIFIED)
+# 14. AI SIGNAL ENGINE — BUY/SELL/HOLD (Existing, Preserved)
 # ══════════════════════════════════════════════════════════════════════════
 
 AI_SCORE_WEIGHTS = {
@@ -1457,239 +1495,7 @@ def detect_institutional_smart_money(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# 15. BUY/SELL PRESSURE FUNCTIONS (NEW - ADDED CLEANLY)
-# ══════════════════════════════════════════════════════════════════════════
-
-def _normalize_0_100(value: float, min_val: float = 0.0, max_val: float = 1.0) -> float:
-    """Normalize value to 0-100 range."""
-    if max_val == min_val:
-        return 50.0
-    normalized = ((value - min_val) / (max_val - min_val)) * 100
-    return max(0.0, min(100.0, normalized))
-
-
-def calculate_volume_pressure(df: pd.DataFrame) -> pd.DataFrame:
-    """Calculate volume-based pressure."""
-    d = df.copy()
-    if d.empty or "ce_volume" not in d.columns or "pe_volume" not in d.columns:
-        d["call_volume_pressure"] = 0.0
-        d["put_volume_pressure"] = 0.0
-        d["volume_ratio"] = 1.0
-        return d
-    
-    d["ce_volume"] = d["ce_volume"].clip(lower=0)
-    d["pe_volume"] = d["pe_volume"].clip(lower=0)
-    
-    total_ce_vol = d["ce_volume"].sum()
-    total_pe_vol = d["pe_volume"].sum()
-    max_vol = max(total_ce_vol, total_pe_vol, 1)
-    
-    d["call_volume_pressure"] = _normalize_0_100(d["ce_volume"], 0, max_vol)
-    d["put_volume_pressure"] = _normalize_0_100(d["pe_volume"], 0, max_vol)
-    d["volume_ratio"] = (d["ce_volume"] / (d["pe_volume"] + 1e-6)).clip(0, 10)
-    
-    return d
-
-
-def calculate_oi_change_pressure(df: pd.DataFrame) -> pd.DataFrame:
-    """Calculate OI change momentum."""
-    d = df.copy()
-    if d.empty or "ce_chng_oi" not in d.columns or "pe_chng_oi" not in d.columns:
-        d["call_oi_accumulation"] = 0.0
-        d["put_oi_accumulation"] = 0.0
-        d["oi_momentum"] = 0.0
-        return d
-    
-    max_oi_chg = max(d["ce_chng_oi"].abs().max(), d["pe_chng_oi"].abs().max(), 1)
-    
-    d["call_oi_accumulation"] = (d["ce_chng_oi"] / max_oi_chg) * 50 + 50
-    d["put_oi_accumulation"] = (d["pe_chng_oi"] / max_oi_chg) * 50 + 50
-    d["oi_momentum"] = (d["ce_chng_oi"] - d["pe_chng_oi"]) / max_oi_chg * 100
-    d["oi_momentum"] = d["oi_momentum"].clip(-100, 100)
-    
-    return d
-
-
-def calculate_delta_pressure(df: pd.DataFrame, spot: float) -> pd.DataFrame:
-    """Calculate delta-weighted pressure."""
-    d = df.copy()
-    if d.empty or "ce_delta" not in d.columns or "pe_delta" not in d.columns:
-        d["call_delta_exposure"] = 0.0
-        d["put_delta_exposure"] = 0.0
-        d["delta_imbalance"] = 0.0
-        return d
-    
-    d["call_delta_exposure"] = d["ce_delta"] * d.get("ce_oi", 0)
-    d["put_delta_exposure"] = d["pe_delta"] * d.get("pe_oi", 0)
-    
-    total_call_delta = d["call_delta_exposure"].sum()
-    total_put_delta = d["put_delta_exposure"].sum()
-    
-    max_delta = max(abs(total_call_delta), abs(total_put_delta), 1)
-    d["call_delta_pressure"] = _normalize_0_100(total_call_delta, -max_delta, max_delta)
-    d["put_delta_pressure"] = _normalize_0_100(-total_put_delta, -max_delta, max_delta)
-    
-    d["delta_imbalance"] = (total_call_delta - total_put_delta) / max_delta * 100
-    d["delta_imbalance"] = d["delta_imbalance"].clip(-100, 100)
-    
-    return d
-
-
-def calculate_composite_pressure(df: pd.DataFrame, spot: float, lot_size: int = 1) -> pd.DataFrame:
-    """Calculate composite buy/sell pressure."""
-    d = df.copy()
-    
-    if d.empty:
-        d["buy_pressure"] = 0.0
-        d["sell_pressure"] = 0.0
-        d["net_pressure"] = 0.0
-        d["pressure_direction"] = "NEUTRAL"
-        d["aggression_level"] = 0.0
-        return d
-    
-    for col in ["call_volume_pressure", "put_volume_pressure", "call_oi_accumulation",
-                "put_oi_accumulation", "call_delta_pressure", "put_delta_pressure",
-                "ce_volume", "pe_volume", "ce_chng_oi", "pe_chng_oi"]:
-        if col not in d.columns:
-            d[col] = 0.0
-    
-    if "ce_ltp" in d.columns and "ce_change" in d.columns:
-        d["price_action"] = (d["ce_change"] / (d["ce_ltp"] + 1e-6)) * 100
-        d["price_action"] = d["price_action"].clip(-50, 50)
-    else:
-        d["price_action"] = 0.0
-    
-    w_volume, w_oi, w_delta, w_price = 0.30, 0.35, 0.25, 0.10
-    
-    d["buy_pressure"] = (
-        (d["call_volume_pressure"] * w_volume) +
-        (d["call_oi_accumulation"] * w_oi) +
-        (d["call_delta_pressure"] * w_delta) +
-        (_normalize_0_100(d["price_action"], -50, 50) * w_price)
-    )
-    
-    d["sell_pressure"] = (
-        (d["put_volume_pressure"] * w_volume) +
-        (d["put_oi_accumulation"] * w_oi) +
-        (d["put_delta_pressure"] * w_delta) +
-        (_normalize_0_100(-d["price_action"], -50, 50) * w_price)
-    )
-    
-    d["net_pressure"] = d["buy_pressure"] - d["sell_pressure"]
-    d["net_pressure"] = d["net_pressure"].clip(-100, 100)
-    d["aggression_level"] = (d["buy_pressure"].abs() + d["sell_pressure"].abs()) / 2
-    
-    def _classify_pressure(net_p: float, aggr: float) -> str:
-        if net_p > 60 and aggr > 70:
-            return "STRONG BUY"
-        elif net_p > 30:
-            return "BUY"
-        elif net_p > -30:
-            return "NEUTRAL"
-        elif net_p > -60:
-            return "SELL"
-        else:
-            return "STRONG SELL" if aggr > 70 else "SELL"
-    
-    d["pressure_direction"] = d.apply(
-        lambda row: _classify_pressure(row["net_pressure"], row["aggression_level"]),
-        axis=1
-    )
-    
-    return d
-
-
-def detect_pressure_anomalies(df: pd.DataFrame) -> pd.DataFrame:
-    """Detect unusual volume/OI spikes."""
-    d = df.copy()
-    
-    if d.empty or "ce_volume" not in d.columns:
-        d["volume_spike"] = False
-        d["oi_surge"] = False
-        d["unusual_activity"] = False
-        return d
-    
-    vol_q75 = (df["ce_volume"] + df["pe_volume"]).quantile(0.75)
-    d["total_volume"] = d["ce_volume"] + d["pe_volume"]
-    d["volume_spike"] = d["total_volume"] > (vol_q75 * 1.5)
-    
-    if "ce_chng_oi" in d.columns and "pe_chng_oi" in d.columns:
-        oi_q75 = (d["ce_chng_oi"].abs() + d["pe_chng_oi"].abs()).quantile(0.75)
-        d["oi_surge"] = (d["ce_chng_oi"].abs() + d["pe_chng_oi"].abs()) > (oi_q75 * 1.5)
-    else:
-        d["oi_surge"] = False
-    
-    d["unusual_activity"] = d["volume_spike"] | d["oi_surge"]
-    
-    return d
-
-
-def calculate_market_pressure_summary(df: pd.DataFrame, spot: float, pcr: float) -> MarketPressure:
-    """Calculate market-wide pressure summary."""
-    if df.empty:
-        return MarketPressure()
-    
-    total_call_pressure = df["buy_pressure"].mean() if "buy_pressure" in df.columns else 50
-    total_put_pressure = df["sell_pressure"].mean() if "sell_pressure" in df.columns else 50
-    net_bias = total_call_pressure - total_put_pressure
-    
-    if net_bias > 40:
-        sentiment = "EXTREME BULLISH" if net_bias > 60 else "BULLISH"
-    elif net_bias < -40:
-        sentiment = "EXTREME BEARISH" if net_bias < -60 else "BEARISH"
-    else:
-        sentiment = "NEUTRAL"
-    
-    if pcr > 1.3 and net_bias < -20:
-        pcr_corr = "⚠️ Divergence"
-    elif pcr < 0.7 and net_bias > 20:
-        pcr_corr = "✓ Aligned"
-    else:
-        pcr_corr = "Neutral"
-    
-    volume_surge = df["volume_spike"].sum() > len(df) * 0.15 if "volume_spike" in df.columns else False
-    oi_accum = (df["ce_chng_oi"].sum() > 0 if "ce_chng_oi" in df.columns else False)
-    
-    atm_strikes = df[df.get("ATM", False)]
-    itm_ce = df[df.get("CE Moneyness", "") == "ITM"]
-    otm_ce = df[df.get("CE Moneyness", "") == "OTM"]
-    
-    itm_pressure = itm_ce["buy_pressure"].mean() if not itm_ce.empty and "buy_pressure" in itm_ce.columns else 50
-    atm_pressure = atm_strikes["buy_pressure"].mean() if not atm_strikes.empty and "buy_pressure" in atm_strikes.columns else 50
-    otm_pressure = otm_ce["buy_pressure"].mean() if not otm_ce.empty and "buy_pressure" in otm_ce.columns else 50
-    
-    return MarketPressure(
-        total_call_pressure=round(total_call_pressure, 2),
-        total_put_pressure=round(total_put_pressure, 2),
-        net_market_bias=round(net_bias, 2),
-        market_sentiment=sentiment,
-        pcr_vs_pressure=pcr_corr,
-        volume_surge_detected=volume_surge,
-        oi_accumulation_detected=oi_accum,
-        itm_pressure=round(itm_pressure, 2),
-        atm_pressure=round(atm_pressure, 2),
-        otm_pressure=round(otm_pressure, 2),
-    )
-
-
-def add_pressure_analysis(df: pd.DataFrame, spot: float, lot_size: int = 1) -> tuple[pd.DataFrame, MarketPressure]:
-    """Full pressure analysis pipeline."""
-    d = df.copy()
-    
-    d = calculate_volume_pressure(d)
-    d = calculate_oi_change_pressure(d)
-    d = calculate_delta_pressure(d, spot)
-    d = calculate_composite_pressure(d, spot, lot_size)
-    d = detect_pressure_anomalies(d)
-    
-    pcr = d["pe_oi"].sum() / d["ce_oi"].sum() if d["ce_oi"].sum() > 0 else 1.0
-    market_pressure = calculate_market_pressure_summary(d, spot, pcr)
-    
-    return d, market_pressure
-
-
-# ══════════════════════════════════════════════════════════════════════════
-# 16. CHARTS (ORIGINAL - UNMODIFIED + NEW PRESSURE CHARTS)
+# 15. CHARTS (Plotly)
 # ══════════════════════════════════════════════════════════════════════════
 
 def _plotly_dark_layout(fig: go.Figure, height: int = 420, title: str = "") -> go.Figure:
@@ -1783,17 +1589,20 @@ def chart_price_action(df: pd.DataFrame, title: str = "Price Action with Indicat
         subplot_titles=("Price", "Volume")
     )
     
+    # Candlestick
     fig.add_trace(go.Candlestick(
         x=df.index, open=df["open"], high=df["high"], low=df["low"], close=df["close"],
         name="OHLC", showlegend=True
     ), row=1, col=1)
     
+    # VWAP
     if "vwap" in df.columns:
         fig.add_trace(go.Scatter(
             x=df.index, y=df["vwap"], mode="lines", name="VWAP",
             line=dict(color=BLUE, width=2)
         ), row=1, col=1)
     
+    # EMA
     if "ema_9" in df.columns:
         fig.add_trace(go.Scatter(
             x=df.index, y=df["ema_9"], mode="lines", name="EMA 9",
@@ -1805,6 +1614,7 @@ def chart_price_action(df: pd.DataFrame, title: str = "Price Action with Indicat
             line=dict(color=RED, width=1.5)
         ), row=1, col=1)
     
+    # Volume
     if "volume" in df.columns:
         colors = [GREEN if df["close"].iloc[i] >= df["open"].iloc[i] else RED for i in range(len(df))]
         fig.add_trace(go.Bar(
@@ -1831,6 +1641,7 @@ def chart_technical_indicators(df: pd.DataFrame) -> go.Figure:
         subplot_titles=("RSI (14)", "MACD", "Momentum")
     )
     
+    # RSI
     if "rsi" in df.columns:
         fig.add_trace(go.Scatter(
             x=df.index, y=df["rsi"], mode="lines", name="RSI",
@@ -1839,6 +1650,7 @@ def chart_technical_indicators(df: pd.DataFrame) -> go.Figure:
         fig.add_hline(y=70, line_dash="dash", line_color=RED, annotation_text="Overbought", row=1, col=1)
         fig.add_hline(y=30, line_dash="dash", line_color=GREEN, annotation_text="Oversold", row=1, col=1)
     
+    # MACD
     if "macd" in df.columns and "macd_signal" in df.columns:
         fig.add_trace(go.Scatter(
             x=df.index, y=df["macd"], mode="lines", name="MACD",
@@ -1855,6 +1667,7 @@ def chart_technical_indicators(df: pd.DataFrame) -> go.Figure:
                 marker_color=colors
             ), row=2, col=1)
     
+    # Momentum (simple)
     if len(df) > 1:
         momentum = df["close"].pct_change() * 100
         fig.add_trace(go.Scatter(
@@ -1892,114 +1705,7 @@ def gauge_pcr(pcr: float) -> go.Figure:
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# NEW PRESSURE CHARTS
-# ══════════════════════════════════════════════════════════════════════════
-
-def chart_pressure_by_strike(df: pd.DataFrame, spot: float) -> go.Figure:
-    """Chart buy/sell pressure by strike."""
-    fig = go.Figure()
-    
-    if df.empty or "buy_pressure" not in df.columns:
-        return _plotly_dark_layout(fig, title="Buy/Sell Pressure by Strike")
-    
-    df_sorted = df.sort_values("strike_price")
-    
-    fig.add_trace(go.Bar(
-        x=df_sorted["buy_pressure"],
-        y=df_sorted["strike_price"],
-        orientation="h",
-        name="Buy Pressure",
-        marker_color=GREEN,
-        hovertemplate="Strike %{y}<br>Buy: %{x:.0f}<extra></extra>",
-    ))
-    
-    fig.add_trace(go.Bar(
-        x=-df_sorted["sell_pressure"],
-        y=df_sorted["strike_price"],
-        orientation="h",
-        name="Sell Pressure",
-        marker_color=RED,
-        hovertemplate="Strike %{y}<br>Sell: %{customdata:.0f}<extra></extra>",
-        customdata=df_sorted["sell_pressure"],
-    ))
-    
-    if spot:
-        fig.add_hline(y=spot, line_dash="dash", line_color=BLUE, 
-                     annotation_text=f"Spot {spot:,.0f}",
-                     annotation_font_color=BLUE)
-    
-    fig.update_layout(
-        barmode="overlay",
-        xaxis=dict(title="Pressure Score", showgrid=True, gridcolor=BORDER_COLOR),
-        yaxis=dict(title="Strike", showgrid=True, gridcolor=BORDER_COLOR),
-    )
-    
-    return _plotly_dark_layout(fig, height=500, title="Buy/Sell Pressure by Strike")
-
-
-def chart_net_pressure(df: pd.DataFrame, spot: float) -> go.Figure:
-    """Chart net pressure (directional)."""
-    fig = go.Figure()
-    
-    if df.empty or "net_pressure" not in df.columns:
-        return _plotly_dark_layout(fig, title="Net Pressure Bias")
-    
-    df_sorted = df.sort_values("strike_price")
-    colors = [GREEN if x > 0 else RED for x in df_sorted["net_pressure"]]
-    
-    fig.add_trace(go.Bar(
-        x=df_sorted["strike_price"],
-        y=df_sorted["net_pressure"],
-        marker_color=colors,
-        name="Net Pressure",
-        hovertemplate="Strike %{x:,.0f}<br>Net: %{y:.0f}<extra></extra>",
-    ))
-    
-    fig.add_hline(y=0, line_dash="dash", line_color=TEXT_MUTED)
-    
-    if spot:
-        fig.add_vline(x=spot, line_dash="dash", line_color=BLUE,
-                     annotation_text=f"Spot {spot:,.0f}",
-                     annotation_font_color=BLUE)
-    
-    fig.update_layout(
-        xaxis=dict(title="Strike", showgrid=True, gridcolor=BORDER_COLOR),
-        yaxis=dict(title="Net Pressure (-100 to +100)", showgrid=True, gridcolor=BORDER_COLOR),
-    )
-    
-    return _plotly_dark_layout(fig, height=400, title="Net Pressure Bias by Strike")
-
-
-def chart_aggression_level(df: pd.DataFrame) -> go.Figure:
-    """Chart aggression level."""
-    fig = go.Figure()
-    
-    if df.empty or "aggression_level" not in df.columns:
-        return _plotly_dark_layout(fig, title="Aggression Level")
-    
-    df_sorted = df.sort_values("strike_price")
-    
-    fig.add_trace(go.Scatter(
-        x=df_sorted["strike_price"],
-        y=df_sorted["aggression_level"],
-        mode="lines+markers",
-        name="Aggression",
-        line=dict(color=AMBER, width=2),
-        fill="tozeroy",
-        fillcolor=f"rgba(210, 153, 34, 0.2)",
-        hovertemplate="Strike %{x:,.0f}<br>Aggression: %{y:.0f}<extra></extra>",
-    ))
-    
-    fig.update_layout(
-        xaxis=dict(title="Strike", showgrid=True, gridcolor=BORDER_COLOR),
-        yaxis=dict(title="Aggression Level (0-100)", showgrid=True, gridcolor=BORDER_COLOR, range=[0, 100]),
-    )
-    
-    return _plotly_dark_layout(fig, height=350, title="Aggression Level by Strike")
-
-
-# ══════════════════════════════════════════════════════════════════════════
-# 17. HTML TABLE RENDERING (ORIGINAL - UNMODIFIED)
+# 16. HTML TABLE RENDERING
 # ══════════════════════════════════════════════════════════════════════════
 
 _TABLE_CSS = f"""
@@ -2128,7 +1834,7 @@ def render_chain_table_html(df: pd.DataFrame, show_greeks: bool, top_n: int = 40
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# 18. EXCEL EXPORT (ORIGINAL - UNMODIFIED)
+# 17. EXCEL EXPORT
 # ══════════════════════════════════════════════════════════════════════════
 
 FILL_HEADER = PatternFill(start_color="1F4E78", end_color="1F4E78", fill_type="solid")
@@ -2203,8 +1909,7 @@ def _conditional_color_signal_columns(ws, header_values: list, start_row: int) -
 def export_excel_report(df: pd.DataFrame, meta: dict, pcr: float, max_pain: float,
                          support: Optional[float], resistance: Optional[float],
                          symbol: str, expiry_label: str, iv_rank: float,
-                         iv_percentile: float, gex_dex: dict, market_pressure: Optional[MarketPressure] = None,
-                         trade_signal: Optional[TradeSignal] = None) -> io.BytesIO:
+                         iv_percentile: float, gex_dex: dict, trade_signal: Optional[TradeSignal] = None) -> io.BytesIO:
     wb = Workbook()
 
     ws_summary = wb.active
@@ -2222,18 +1927,6 @@ def export_excel_report(df: pd.DataFrame, meta: dict, pcr: float, max_pain: floa
         ("Total CE OI", int(df["ce_oi"].sum()) if not df.empty else 0),
         ("Total PE OI", int(df["pe_oi"].sum()) if not df.empty else 0),
     ]
-    
-    if market_pressure:
-        summary_rows.extend([
-            ("", ""),
-            ("MARKET PRESSURE", ""),
-            ("Market Sentiment", market_pressure.market_sentiment),
-            ("Net Market Bias", market_pressure.net_market_bias),
-            ("Buy Pressure", market_pressure.total_call_pressure),
-            ("Sell Pressure", market_pressure.total_put_pressure),
-            ("Volume Surge Detected", market_pressure.volume_surge_detected),
-            ("OI Accumulation", market_pressure.oi_accumulation_detected),
-        ])
     
     if trade_signal:
         summary_rows.extend([
@@ -2285,15 +1978,6 @@ def export_excel_report(df: pd.DataFrame, meta: dict, pcr: float, max_pain: floa
     if signal_cols:
         sig_df = df[signal_cols].sort_values("AI Confidence %", ascending=False) if "AI Confidence %" in df.columns else df[signal_cols]
         _write_dataframe(ws_signals, sig_df)
-    
-    if "buy_pressure" in df.columns:
-        ws_pressure = wb.create_sheet("Buy-Sell Pressure")
-        pressure_cols = [c for c in [
-            "strike_price", "buy_pressure", "sell_pressure", "net_pressure",
-            "pressure_direction", "aggression_level", "volume_spike", "oi_surge",
-        ] if c in df.columns]
-        if pressure_cols:
-            _write_dataframe(ws_pressure, df[pressure_cols])
 
     buffer = io.BytesIO()
     wb.save(buffer)
@@ -2306,14 +1990,14 @@ def export_csv_bytes(df: pd.DataFrame) -> bytes:
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# 19. STREAMLIT UI (ORIGINAL WITH PRESSURE ENHANCEMENTS)
+# 18. STREAMLIT UI — PAGE CONFIG, CSS, SUMMARY CARDS
 # ══════════════════════════════════════════════════════════════════════════
 
 def _configure_page() -> None:
     try:
         st.set_page_config(
-            page_title="NSE Options Chain Dashboard + Price Action + Buy/Sell Pressure",
-            page_icon="📊", layout="wide", initial_sidebar_state="expanded",
+            page_title="NSE Options Chain Dashboard + Price Action Signals", page_icon="📊",
+            layout="wide", initial_sidebar_state="expanded",
         )
     except Exception as e:
         logger.warning("st.set_page_config() skipped: %s", e)
@@ -2357,6 +2041,10 @@ def _pcr_sentiment_badge(pcr: float) -> str:
     return f'<span style="color:{AMBER};font-weight:700;">🟡 Neutral</span>'
 
 
+# ══════════════════════════════════════════════════════════════════════════
+# 19. MAIN DASHBOARD
+# ══════════════════════════════════════════════════════════════════════════
+
 def _sidebar_config() -> dict:
     with st.sidebar:
         st.markdown("### ⚙️ Configuration")
@@ -2366,7 +2054,9 @@ def _sidebar_config() -> dict:
         if is_index:
             symbol = st.selectbox("Index", list(INDEX_SYMBOLS.keys()), key="oc_index_select")
             if symbol in NSE_UNSUPPORTED_INDICES:
-                st.caption(f"ℹ️ {symbol} is BSE-listed — requires a connected FYERS client.")
+                st.caption(
+                    f"ℹ️ {symbol} is BSE-listed — requires a connected FYERS client."
+                )
         else:
             raw_symbol = st.text_input(
                 "Stock Symbol (e.g. RELIANCE, TCS, INFY)", "RELIANCE", key="oc_stock_input"
@@ -2386,7 +2076,8 @@ def _sidebar_config() -> dict:
 
         default_lot = DEFAULT_LOT_SIZES.get(symbol, DEFAULT_LOT_SIZES["_STOCK_DEFAULT"])
         lot_size = st.number_input(
-            "Lot Size", min_value=1, value=default_lot, step=1, key="oc_lot_size",
+            "Lot Size",
+            min_value=1, value=default_lot, step=1, key="oc_lot_size",
         )
 
         st.divider()
@@ -2454,9 +2145,6 @@ def _do_fetch_and_process(cfg: dict, fyers: Any = None) -> Optional[dict]:
     df = classify_moneyness(df, spot)
     df = compute_ai_scores(df, spot, atm_strike, calc_max_pain(df), calc_pcr(df))
     df = detect_institutional_smart_money(df)
-    
-    # ✅ ADD PRESSURE ANALYSIS
-    df, market_pressure = add_pressure_analysis(df, spot, cfg["lot_size"])
 
     pcr = calc_pcr(df)
     max_pain = calc_max_pain(df)
@@ -2471,6 +2159,7 @@ def _do_fetch_and_process(cfg: dict, fyers: Any = None) -> Optional[dict]:
 
     oi_shift_notes = detect_oi_shift(cfg["symbol"], expiry_label, support, resistance)
 
+    # Price Action Analysis (FYERS-dependent)
     price_action_data = None
     trade_signal = None
     if cfg["analyze_price_action"] and fyers is not None:
@@ -2486,10 +2175,12 @@ def _do_fetch_and_process(cfg: dict, fyers: Any = None) -> Optional[dict]:
                 df_dict[tf_name] = df_tf
             
             if any(df_dict.values()):
+                # Add technical indicators to candles
                 for tf_name in df_dict:
                     if df_dict[tf_name] is not None and not df_dict[tf_name].empty:
                         df_dict[tf_name] = add_technical_indicators(df_dict[tf_name])
                 
+                # Detect MSS and generate signal
                 mss = detect_mss(df_dict)
                 trade_signal = generate_trade_signal(df_dict, spot, mss, fyers is not None)
                 
@@ -2505,12 +2196,10 @@ def _do_fetch_and_process(cfg: dict, fyers: Any = None) -> Optional[dict]:
         "atm_iv": atm_iv, "iv_rank": iv_rank, "iv_percentile": iv_percentile, "gex_dex": gex_dex,
         "oi_shift_notes": oi_shift_notes, "data_source": data_source,
         "price_action_data": price_action_data, "trade_signal": trade_signal,
-        "market_pressure": market_pressure,
     }
 
 
 def _render_summary_cards(state: dict) -> None:
-    """Enhanced with pressure metrics."""
     c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Spot Price", f"₹{state['spot']:,.2f}" if state["spot"] else "—")
     c2.metric("ATM Strike", f"₹{state['atm_strike']:,.0f}")
@@ -2529,22 +2218,78 @@ def _render_summary_cards(state: dict) -> None:
     else:
         c10.metric("Signal", "No Signal")
 
-    # NEW: Pressure metrics
-    mp = state.get("market_pressure")
-    if mp:
-        p1, p2, p3, p4, p5 = st.columns(5)
-        p1.metric("Buy Pressure", f"{mp.total_call_pressure:.0f}")
-        p2.metric("Sell Pressure", f"{mp.total_put_pressure:.0f}")
-        p3.metric("Market Bias", f"{mp.net_market_bias:+.0f}", delta=mp.market_sentiment.split()[0])
-        p4.metric("Volume Spike", "🔴 YES" if mp.volume_surge_detected else "🟢 No")
-        p5.metric("OI Surge", "🔴 YES" if mp.oi_accumulation_detected else "🟢 No")
+
+def _render_trade_signal_card(signal: TradeSignal) -> None:
+    """Render a formatted trade signal card."""
+    signal_color = GREEN if signal.signal == "BUY" else (RED if signal.signal == "SELL" else AMBER)
+    card_class = "trade-signal-card trade-signal-buy" if signal.signal == "BUY" else \
+                 ("trade-signal-card trade-signal-sell" if signal.signal == "SELL" else "trade-signal-card")
+    
+    st.markdown(f"""
+    <div class="{card_class}">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
+        <div style="font-size:24px;font-weight:700;color:{signal_color};">{signal.signal}</div>
+        <div style="text-align:right;">
+          <div style="color:{TEXT_MUTED};font-size:11px;text-transform:uppercase;">Probability</div>
+          <div style="color:{TEXT_MAIN};font-size:18px;font-weight:700;">{signal.probability:.1f}%</div>
+        </div>
+      </div>
+      
+      <div style="display:grid;grid-template-columns:repeat(5,1fr);gap:8px;margin-bottom:12px;">
+        <div style="background:{PANEL_BG};padding:8px;border-radius:4px;text-align:center;">
+          <div style="color:{TEXT_MUTED};font-size:10px;">ENTRY</div>
+          <div style="color:{TEXT_MAIN};font-weight:700;">₹{signal.entry:.2f}</div>
+        </div>
+        <div style="background:{PANEL_BG};padding:8px;border-radius:4px;text-align:center;">
+          <div style="color:{RED};font-size:10px;">SL</div>
+          <div style="color:{TEXT_MAIN};font-weight:700;">₹{signal.stop_loss:.2f}</div>
+        </div>
+        <div style="background:{PANEL_BG};padding:8px;border-radius:4px;text-align:center;">
+          <div style="color:{AMBER};font-size:10px;">T1</div>
+          <div style="color:{TEXT_MAIN};font-weight:700;">₹{signal.target_1:.2f}</div>
+        </div>
+        <div style="background:{PANEL_BG};padding:8px;border-radius:4px;text-align:center;">
+          <div style="color:{AMBER};font-size:10px;">T2</div>
+          <div style="color:{TEXT_MAIN};font-weight:700;">₹{signal.target_2:.2f}</div>
+        </div>
+        <div style="background:{PANEL_BG};padding:8px;border-radius:4px;text-align:center;">
+          <div style="color:{GREEN};font-size:10px;">T3</div>
+          <div style="color:{TEXT_MAIN};font-weight:700;">₹{signal.target_3:.2f}</div>
+        </div>
+      </div>
+      
+      <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:12px;">
+        <div>
+          <div style="color:{TEXT_MUTED};font-size:11px;text-transform:uppercase;">Risk:Reward</div>
+          <div style="color:{TEXT_MAIN};font-weight:700;font-size:16px;">1:{signal.risk_reward_ratio:.2f}</div>
+        </div>
+        <div>
+          <div style="color:{TEXT_MUTED};font-size:11px;text-transform:uppercase;">Confidence</div>
+          <div style="color:{signal_color};font-weight:700;font-size:16px;">{signal.confidence:.0f}%</div>
+        </div>
+        <div>
+          <div style="color:{TEXT_MUTED};font-size:11px;text-transform:uppercase;">Confirmation</div>
+          <div style="color:{TEXT_MAIN};font-weight:700;font-size:14px;">{', '.join(signal.confirmation_timeframes)}</div>
+        </div>
+      </div>
+      
+      <div style="background:{PANEL_BG};padding:8px;border-radius:4px;">
+        <div style="color:{TEXT_MUTED};font-size:11px;text-transform:uppercase;margin-bottom:6px;">Technical Reasons:</div>
+        <div style="color:{TEXT_MAIN};font-size:12px;">
+          {'<br>'.join(f"• {reason}" for reason in signal.technical_reasons)}
+        </div>
+      </div>
+    </div>
+    """, unsafe_allow_html=True)
 
 
 def _render_ai_signal_cards(state: dict, min_conf: float) -> None:
     df = state["df"]
     qualifying = df[df["AI Confidence %"] >= min_conf].sort_values("AI Confidence %", ascending=False)
     if qualifying.empty:
-        st.info(f"No strikes meet the {min_conf:.0f}% AI confidence threshold.")
+        st.info(
+            f"No strikes meet the {min_conf:.0f}% AI confidence threshold."
+        )
         return
     for _, row in qualifying.head(15).iterrows():
         signal = row["AI Signal"]
@@ -2567,7 +2312,7 @@ def _render_ai_signal_cards(state: dict, min_conf: float) -> None:
 def run_dashboard(fyers: Any = None) -> None:
     _configure_page()
     _inject_css()
-    st.markdown("## 📊 Options Chain + Price Action + Buy/Sell Pressure")
+    st.markdown("## 📊 Options Chain Dashboard + AI-Powered Price Action Signals")
 
     cfg = _sidebar_config()
 
@@ -2629,15 +2374,24 @@ def run_dashboard(fyers: Any = None) -> None:
                 f"PE {r['pe_ltp']:.2f} (OI {r['pe_oi']:,.0f})"
             )
 
+    # Display trade signal if available
+    if state.get("trade_signal"):
+        st.divider()
+        st.markdown("### 🎯 PRICE ACTION TRADE SIGNAL")
+        _render_trade_signal_card(state["trade_signal"])
+
     st.divider()
 
+    # Tabs
     if state.get("price_action_data") and state["price_action_data"].get("df_dict"):
-        tab_chain, tab_charts, tab_pressure, tab_greeks, tab_ai, tab_gex, tab_price_action, tab_export = st.tabs([
-            "📋 Chain", "📈 OI", "💪 Pressure", "🧮 Greeks", "🤖 AI", "⚡ GEX", "💹 Price Action", "📥 Export",
+        tab_chain, tab_charts, tab_greeks, tab_ai, tab_gex, tab_price_action, tab_export = st.tabs([
+            "📋 Option Chain", "📈 OI Charts", "🧮 Greeks", "🤖 AI Signals",
+            "⚡ GEX/DEX", "💹 Price Action", "📥 Export",
         ])
     else:
-        tab_chain, tab_charts, tab_pressure, tab_greeks, tab_ai, tab_gex, tab_export = st.tabs([
-            "📋 Chain", "📈 OI", "💪 Pressure", "🧮 Greeks", "🤖 AI", "⚡ GEX", "📥 Export",
+        tab_chain, tab_charts, tab_greeks, tab_ai, tab_gex, tab_export = st.tabs([
+            "📋 Option Chain", "📈 OI Charts", "🧮 Greeks", "🤖 AI Signals",
+            "⚡ GEX/DEX", "📥 Export",
         ])
 
     with tab_chain:
@@ -2651,57 +2405,6 @@ def run_dashboard(fyers: Any = None) -> None:
         with col_b:
             st.plotly_chart(chart_iv_skew(df), use_container_width=True, config={"displayModeBar": False})
 
-    # NEW: Pressure Tab
-    with tab_pressure:
-        st.markdown('<div class="block-title">💪 Buy/Sell Pressure Analysis</div>', unsafe_allow_html=True)
-        
-        mp = state.get("market_pressure")
-        if mp:
-            col1, col2, col3, col4 = st.columns(4)
-            with col1:
-                color = GREEN if mp.net_market_bias > 0 else RED
-                st.metric("Market Bias", f"{mp.net_market_bias:+.0f}", delta=mp.market_sentiment)
-            with col2:
-                st.metric("Buy Pressure", f"{mp.total_call_pressure:.0f}")
-            with col3:
-                st.metric("Sell Pressure", f"{mp.total_put_pressure:.0f}")
-            with col4:
-                st.metric("Aggression", f"{(df['aggression_level'].mean() if 'aggression_level' in df.columns else 50):.0f}")
-            
-            st.divider()
-            
-            col_itm, col_atm, col_otm = st.columns(3)
-            with col_itm:
-                st.metric("ITM Pressure", f"{mp.itm_pressure:.0f}")
-            with col_atm:
-                st.metric("ATM Pressure", f"{mp.atm_pressure:.0f}")
-            with col_otm:
-                st.metric("OTM Pressure", f"{mp.otm_pressure:.0f}")
-            
-            st.divider()
-            
-            anom_col1, anom_col2 = st.columns(2)
-            with anom_col1:
-                if mp.volume_surge_detected:
-                    st.warning("🚨 **VOLUME SPIKE** — Unusual activity detected")
-                else:
-                    st.info("✓ Volume levels normal")
-            with anom_col2:
-                if mp.oi_accumulation_detected:
-                    st.warning("🚨 **OI SURGE** — Strong accumulation detected")
-                else:
-                    st.info("✓ OI changes normal")
-            
-            st.divider()
-            
-            st.plotly_chart(chart_pressure_by_strike(df, state["spot"]), use_container_width=True, config={"displayModeBar": False})
-            
-            col_net, col_agg = st.columns(2)
-            with col_net:
-                st.plotly_chart(chart_net_pressure(df, state["spot"]), use_container_width=True, config={"displayModeBar": False})
-            with col_agg:
-                st.plotly_chart(chart_aggression_level(df), use_container_width=True, config={"displayModeBar": False})
-
     with tab_greeks:
         g1, g2 = st.columns(2)
         with g1:
@@ -2712,7 +2415,7 @@ def run_dashboard(fyers: Any = None) -> None:
             st.plotly_chart(chart_greeks(df, "vega"), use_container_width=True, config={"displayModeBar": False})
 
     with tab_ai:
-        st.markdown('<div class="block-title">🤖 AI Trade Signals</div>', unsafe_allow_html=True)
+        st.markdown('<div class="block-title">🤖 AI Trade Signals (Option Chain)</div>', unsafe_allow_html=True)
         _render_ai_signal_cards(state, cfg["min_ai_conf"])
 
     with tab_gex:
@@ -2725,28 +2428,56 @@ def run_dashboard(fyers: Any = None) -> None:
 
     if state.get("price_action_data") and state["price_action_data"].get("df_dict"):
         with tab_price_action:
-            st.markdown('<div class="block-title">💹 Price Action</div>', unsafe_allow_html=True)
+            st.markdown('<div class="block-title">💹 Multi-Timeframe Price Action Analysis</div>', unsafe_allow_html=True)
             df_dict = state["price_action_data"]["df_dict"]
+            mss = state["price_action_data"]["mss"]
             
+            # Display MSS status
+            st.markdown("### Market Structure Status")
+            mss_cols = st.columns(len(df_dict))
+            for (tf_name, df_tf), col in zip(df_dict.items(), mss_cols):
+                with col:
+                    mss_status = mss.get(tf_name, {})
+                    mss_flag = mss_status.get("mss", False)
+                    direction = mss_status.get("direction", "NONE")
+                    color = GREEN if direction == "UP" else (RED if direction == "DOWN" else TEXT_MUTED)
+                    st.markdown(f"""
+                    <div style="background:{PANEL_BG};border:1px solid {BORDER_COLOR};border-radius:8px;padding:12px;text-align:center;">
+                      <div style="color:{TEXT_MUTED};font-size:11px;text-transform:uppercase;margin-bottom:8px;">{tf_name}</div>
+                      <div style="color:{color};font-weight:700;font-size:16px;">{'✓ MSS' if mss_flag else '✗ No MSS'}</div>
+                      <div style="color:{color};font-weight:700;font-size:14px;">{direction}</div>
+                    </div>
+                    """, unsafe_allow_html=True)
+            
+            st.divider()
+            
+            # Display candle charts
+            st.markdown("### Timeframe Charts")
             for tf_name, df_tf in df_dict.items():
                 if df_tf is not None and not df_tf.empty:
-                    with st.expander(f"📊 {tf_name}", expanded=(tf_name == "5M")):
-                        st.plotly_chart(chart_price_action(df_tf, title=f"{tf_name}"),
+                    with st.expander(f"📊 {tf_name} Chart", expanded=(tf_name == "5M")):
+                        st.plotly_chart(chart_price_action(df_tf, title=f"{tf_name} Price Action"),
                                        use_container_width=True, config={"displayModeBar": False})
+            
+            # Technical indicators
+            st.markdown("### Technical Indicators (5M)")
+            if df_dict.get("5M") is not None and not df_dict["5M"].empty:
+                st.plotly_chart(chart_technical_indicators(df_dict["5M"]),
+                               use_container_width=True, config={"displayModeBar": False})
 
     with tab_export:
-        st.markdown('<div class="block-title">📥 Export</div>', unsafe_allow_html=True)
+        st.markdown('<div class="block-title">📥 Export Reports</div>', unsafe_allow_html=True)
         col_x, col_y = st.columns(2)
         with col_x:
             try:
                 excel_buf = export_excel_report(
                     df, meta, state["pcr"], state["max_pain"], state["support"], state["resistance"],
                     cfg["symbol"], state["expiry_label"], state["iv_rank"], state["iv_percentile"],
-                    state["gex_dex"], state.get("market_pressure"), state.get("trade_signal"),
+                    state["gex_dex"], state.get("trade_signal"),
                 )
                 st.download_button(
-                    "📥 Excel", data=excel_buf,
-                    file_name=f"oc_{cfg['symbol']}_{datetime.now().strftime('%H%M%S')}.xlsx",
+                    "⬇️ Excel Report", data=excel_buf,
+                    file_name=f"option_chain_{cfg['symbol']}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     use_container_width=True,
                 )
@@ -2756,15 +2487,15 @@ def run_dashboard(fyers: Any = None) -> None:
             try:
                 csv_bytes = export_csv_bytes(df)
                 st.download_button(
-                    "📥 CSV", data=csv_bytes,
-                    file_name=f"oc_{cfg['symbol']}_{datetime.now().strftime('%H%M%S')}.csv",
+                    "⬇️ CSV Export", data=csv_bytes,
+                    file_name=f"option_chain_{cfg['symbol']}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
                     mime="text/csv", use_container_width=True,
                 )
             except Exception as e:
                 st.error(f"CSV export failed: {e}")
 
     st.caption(
-        f"**NSE Options + FYERS Price Action + Buy/Sell Pressure** | Last: {meta.get('fetched_at', datetime.now()).strftime('%H:%M:%S')} | "
+        f"**NSE Options + FYERS Price Action** | Last: {meta.get('fetched_at', datetime.now()).strftime('%H:%M:%S')} | "
         "Educational tool — not financial advice."
     )
 
