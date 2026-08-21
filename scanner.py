@@ -975,246 +975,508 @@ def fetch_options_chain_data(fyers, symbol: str, expiry_timestamp: str = "") -> 
         return empty
 
 # ════════════════════════════════════════════════════════════════════════════════
-# MASTER SIGNAL ENGINE (IMPROVED WITH STRICTER RULES)
+# STRICT MULTI-TIMEFRAME SIGNAL VALIDATION ENGINE (FIXED)
 # ════════════════════════════════════════════════════════════════════════════════
 def calculate_master_signal(symbol: str, analysis_5m: Dict, analysis_15m: Dict, analysis_1h: Dict, options_data: Dict = None) -> Dict[str, Any]:
     """
-    Calculate master signal using weighted scoring from multi-timeframe analysis.
-    Includes Next Candle Bias as a confirmation factor.
+    STRICT master signal validation engine.
+    
+    Prevents wrong BUY/SELL by enforcing:
+    1. Multi-timeframe alignment (no conflicting timeframes)
+    2. Pressure validation (direction must match)
+    3. VWAP confirmation (price must be on correct side)
+    4. EMA structure (must not contradict)
+    5. Market structure validation (CHoCH/MSS/CISD support)
+    6. Volume confirmation (RVOL preference)
+    7. Next Candle Bias conflict detection (override if strongly opposed)
+    8. Options validation for F&O
+    
+    Returns NEUTRAL/WAIT rather than forcing wrong signals.
     """
     if options_data is None:
         options_data = {"status":"DATA_UNAVAILABLE", "options_bias":"NEUTRAL"}
     
-    reasons = []
-    scores = {
-        "5m_score": 50,
-        "15m_score": 50,
-        "1h_score": 50,
-        "pressure_score": 50,
-        "options_score": 50,
-    }
+    # ════════════════════════════════════════════════════════════════════════════
+    # EXTRACT DATA FROM EACH TIMEFRAME
+    # ════════════════════════════════════════════════════════════════════════════
+    data_5m = analysis_5m.get("data") if analysis_5m.get("status") == "OK" else None
+    data_15m = analysis_15m.get("data") if analysis_15m.get("status") == "OK" else None
+    data_1h = analysis_1h.get("data") if analysis_1h.get("status") == "OK" else None
     
     # ════════════════════════════════════════════════════════════════════════════
-    # 5M ANALYSIS (Entry timeframe)
+    # VALIDATION GATE 1: TIMEFRAME AVAILABILITY
     # ════════════════════════════════════════════════════════════════════════════
-    if analysis_5m.get("status") == "OK" and analysis_5m.get("data"):
-        data_5m = analysis_5m["data"]
-        score_5m = 50
-        
-        # Structure (Primary signal) - STRICT
-        if data_5m["structure_trend"] == "BULLISH" and data_5m["structure_type"] in ("HH/HL", "HH", "HL"):
-            score_5m += 20
-            reasons.append(f"5M: {data_5m['structure_type']} bullish")
-        elif data_5m["structure_trend"] == "BEARISH" and data_5m["structure_type"] in ("LH/LL", "LH", "LL"):
-            score_5m -= 20
-            reasons.append(f"5M: {data_5m['structure_type']} bearish")
-        else:
-            score_5m -= 5
-        
-        # CHoCH & MSS - STRICT confirmation only
-        if data_5m["bullish_choch"] or data_5m["bullish_mss"]:
-            score_5m += 15
-            reasons.append("5M: CHoCH/MSS bullish")
-        elif data_5m["bearish_choch"] or data_5m["bearish_mss"]:
-            score_5m -= 15
-            reasons.append("5M: CHoCH/MSS bearish")
-        
-        # CISD
-        if data_5m.get("bullish_cisd"):
-            score_5m += 8
-            reasons.append("5M: CISD bullish")
-        elif data_5m.get("bearish_cisd"):
-            score_5m -= 8
-            reasons.append("5M: CISD bearish")
-        
-        # EMA
-        if data_5m["ema_trend"] == "BULLISH":
-            score_5m += 8
-        elif data_5m["ema_trend"] == "BEARISH":
-            score_5m -= 8
-        else:
-            score_5m -= 2
-        
-        # RSI
-        if 45 < data_5m["rsi"] < 55:
-            score_5m -= 3
-        elif data_5m["rsi"] >= 70:
-            score_5m -= 5
-        elif data_5m["rsi"] <= 30:
-            score_5m += 5
-        
-        # MACD
-        if data_5m["macd_bullish"]:
-            score_5m += 5
-        else:
-            score_5m -= 5
-        
-        # Volume
-        if data_5m["rvol"] > 1.5:
-            score_5m += 3
-        elif data_5m["rvol"] < 0.8:
-            score_5m -= 2
-        
-        score_5m = max(0, min(100, score_5m))
-        scores["5m_score"] = score_5m
+    if not data_5m or not data_15m or not data_1h:
+        return {
+            "final_signal": "🟡 NEUTRAL",
+            "confidence": 0.0,
+            "entry": None,
+            "stop_loss": None,
+            "target1": None,
+            "target2": None,
+            "rr_ratio": None,
+            "scores": {"5m": 0, "15m": 0, "1h": 0, "pressure": 0, "options": 0},
+            "signal_reason": "Insufficient timeframe data",
+        }
     
     # ════════════════════════════════════════════════════════════════════════════
-    # 15M ANALYSIS (Momentum)
+    # CLASSIFY EACH TIMEFRAME
     # ════════════════════════════════════════════════════════════════════════════
-    if analysis_15m.get("status") == "OK" and analysis_15m.get("data"):
-        data_15m = analysis_15m["data"]
-        score_15m = 50
+    def classify_tf_direction(data: Dict) -> str:
+        """Return BULLISH, BEARISH, or NEUTRAL based on structure."""
+        trend = data.get("structure_trend", "NEUTRAL")
+        struct_type = data.get("structure_type", "UNKNOWN")
         
-        if data_15m["structure_trend"] == "BULLISH":
-            score_15m += 18
-            reasons.append("15M: Bullish")
-        elif data_15m["structure_trend"] == "BEARISH":
-            score_15m -= 18
-            reasons.append("15M: Bearish")
+        if trend == "BULLISH":
+            return "BULLISH"
+        elif trend == "BEARISH":
+            return "BEARISH"
         else:
-            score_15m -= 5
-        
-        if data_15m["bullish_choch"] or data_15m["bullish_mss"]:
-            score_15m += 12
-        elif data_15m["bearish_choch"] or data_15m["bearish_mss"]:
-            score_15m -= 12
-        
-        if data_15m["ema_trend"] == "BULLISH":
-            score_15m += 7
-        elif data_15m["ema_trend"] == "BEARISH":
-            score_15m -= 7
-        
-        if data_15m["rsi"] >= 70:
-            score_15m -= 4
-        elif data_15m["rsi"] <= 30:
-            score_15m += 4
-        
-        if data_15m["macd_bullish"]:
-            score_15m += 4
-        else:
-            score_15m -= 4
-        
-        if data_15m["rvol"] > 1.5:
-            score_15m += 3
-        
-        score_15m = max(0, min(100, score_15m))
-        scores["15m_score"] = score_15m
+            return "NEUTRAL"
+    
+    tf_5m = classify_tf_direction(data_5m)
+    tf_15m = classify_tf_direction(data_15m)
+    tf_1h = classify_tf_direction(data_1h)
     
     # ════════════════════════════════════════════════════════════════════════════
-    # 1H ANALYSIS (Trend context)
+    # VALIDATION GATE 2: MULTI-TIMEFRAME ALIGNMENT
     # ════════════════════════════════════════════════════════════════════════════
-    if analysis_1h.get("status") == "OK" and analysis_1h.get("data"):
-        data_1h = analysis_1h["data"]
-        score_1h = 50
-        
-        if data_1h["structure_trend"] == "BULLISH":
-            score_1h += 15
-            reasons.append("1H: Bullish")
-        elif data_1h["structure_trend"] == "BEARISH":
-            score_1h -= 15
-            reasons.append("1H: Bearish")
-        else:
-            score_1h -= 5
-        
-        if data_1h["bullish_choch"]:
-            score_1h += 8
-        elif data_1h["bearish_choch"]:
-            score_1h -= 8
-        
-        if data_1h["ema_trend"] == "BULLISH":
-            score_1h += 8
-        elif data_1h["ema_trend"] == "BEARISH":
-            score_1h -= 8
-        
-        if data_1h["rvol"] > 1.5:
-            score_1h += 2
-        
-        score_1h = max(0, min(100, score_1h))
-        scores["1h_score"] = score_1h
+    # For BUY: 5M bullish + 15M bullish/neutral + 1H NOT bearish
+    # For SELL: 5M bearish + 15M bearish/neutral + 1H NOT bullish
+    # Conflict = NEUTRAL
+    
+    is_bullish_aligned = (
+        (tf_5m == "BULLISH") and
+        (tf_15m in ["BULLISH", "NEUTRAL"]) and
+        (tf_1h != "BEARISH")
+    )
+    
+    is_bearish_aligned = (
+        (tf_5m == "BEARISH") and
+        (tf_15m in ["BEARISH", "NEUTRAL"]) and
+        (tf_1h != "BULLISH")
+    )
+    
+    hard_conflict = (tf_5m == "BULLISH" and tf_1h == "BEARISH") or (tf_5m == "BEARISH" and tf_1h == "BULLISH")
+    
+    if hard_conflict or (not is_bullish_aligned and not is_bearish_aligned):
+        return {
+            "final_signal": "🟡 NEUTRAL",
+            "confidence": 20.0 if hard_conflict else 35.0,
+            "entry": None,
+            "stop_loss": None,
+            "target1": None,
+            "target2": None,
+            "rr_ratio": None,
+            "scores": {
+                "5m": 50,
+                "15m": 50,
+                "1h": 50,
+                "pressure": 50,
+                "options": 50,
+            },
+            "signal_reason": f"Timeframe conflict: 5M {tf_5m} vs 15M {tf_15m} vs 1H {tf_1h}",
+        }
     
     # ════════════════════════════════════════════════════════════════════════════
-    # BUYING/SELLING PRESSURE (Confirmation)
+    # VALIDATION GATE 3: PRESSURE CONFIRMATION
     # ════════════════════════════════════════════════════════════════════════════
-    if analysis_5m.get("status") == "OK" and analysis_5m.get("data"):
-        d5 = analysis_5m["data"]
-        pressure_trend = d5.get("pressure_trend", "NEUTRAL")
-        
-        if pressure_trend == "STRONG_BUYING":
-            scores["pressure_score"] = 85
-        elif pressure_trend == "BUYING":
-            scores["pressure_score"] = 70
-        elif pressure_trend == "STRONG_SELLING":
-            scores["pressure_score"] = 15
-        elif pressure_trend == "SELLING":
-            scores["pressure_score"] = 30
-        else:
-            scores["pressure_score"] = 50
+    pressure_trend = data_5m.get("pressure_trend", "NEUTRAL")
+    pressure_buy = pressure_trend in ["BUYING", "STRONG_BUYING"]
+    pressure_sell = pressure_trend in ["SELLING", "STRONG_SELLING"]
+    pressure_strong_buy = pressure_trend == "STRONG_BUYING"
+    pressure_strong_sell = pressure_trend == "STRONG_SELLING"
     
-    # Options confirmation (F&O only)
-    opt_bias = options_data.get("options_bias", "NEUTRAL") if isinstance(options_data, dict) else "NEUTRAL"
-    if "BULLISH" in str(opt_bias):
-        scores["options_score"] = 75
-        reasons.append("Options: Bullish")
-    elif "BEARISH" in str(opt_bias):
-        scores["options_score"] = 25
-        reasons.append("Options: Bearish")
+    if is_bullish_aligned and not pressure_buy:
+        # Bullish alignment but pressure is bearish or neutral
+        # Downgrade signal or set to neutral
+        is_bullish_aligned = False
+    
+    if is_bearish_aligned and not pressure_sell:
+        # Bearish alignment but pressure is bullish or neutral
+        # Downgrade signal or set to neutral
+        is_bearish_aligned = False
+    
+    if not is_bullish_aligned and not is_bearish_aligned:
+        return {
+            "final_signal": "🟡 NEUTRAL",
+            "confidence": 30.0,
+            "entry": None,
+            "stop_loss": None,
+            "target1": None,
+            "target2": None,
+            "rr_ratio": None,
+            "scores": {
+                "5m": 50,
+                "15m": 50,
+                "1h": 50,
+                "pressure": 50,
+                "options": 50,
+            },
+            "signal_reason": f"Pressure conflict: {pressure_trend}",
+        }
+    
+    # ════════════════════════════════════════════════════════════════════════════
+    # VALIDATION GATE 4: VWAP CONFIRMATION
+    # ════════════════════════════════════════════════════════════════════════════
+    last_close = data_5m.get("last_close", 0)
+    vwap = data_5m.get("vwap")
+    
+    if vwap is not None:
+        price_above_vwap = last_close > vwap
+        
+        if is_bullish_aligned and not price_above_vwap:
+            # Bullish but price below VWAP - only allow with very strong structure
+            if not (data_5m.get("bullish_choch") or data_5m.get("bullish_mss")):
+                is_bullish_aligned = False
+        
+        if is_bearish_aligned and price_above_vwap:
+            # Bearish but price above VWAP - only allow with very strong structure
+            if not (data_5m.get("bearish_choch") or data_5m.get("bearish_mss")):
+                is_bearish_aligned = False
+    
+    if not is_bullish_aligned and not is_bearish_aligned:
+        return {
+            "final_signal": "🟡 NEUTRAL",
+            "confidence": 30.0,
+            "entry": None,
+            "stop_loss": None,
+            "target1": None,
+            "target2": None,
+            "rr_ratio": None,
+            "scores": {
+                "5m": 50,
+                "15m": 50,
+                "1h": 50,
+                "pressure": 50,
+                "options": 50,
+            },
+            "signal_reason": f"VWAP conflict: Price {last_close:.2f} vs VWAP {vwap:.2f if vwap else 'N/A'}",
+        }
+    
+    # ════════════════════════════════════════════════════════════════════════════
+    # VALIDATION GATE 5: EMA STRUCTURE
+    # ════════════════════════════════════════════════════════════════════════════
+    ema_trend = data_5m.get("ema_trend", "NEUTRAL")
+    
+    if is_bullish_aligned and ema_trend == "BEARISH":
+        is_bullish_aligned = False
+    
+    if is_bearish_aligned and ema_trend == "BULLISH":
+        is_bearish_aligned = False
+    
+    if not is_bullish_aligned and not is_bearish_aligned:
+        return {
+            "final_signal": "🟡 NEUTRAL",
+            "confidence": 30.0,
+            "entry": None,
+            "stop_loss": None,
+            "target1": None,
+            "target2": None,
+            "rr_ratio": None,
+            "scores": {
+                "5m": 50,
+                "15m": 50,
+                "1h": 50,
+                "pressure": 50,
+                "options": 50,
+            },
+            "signal_reason": f"EMA conflict: Trend {ema_trend} vs Structure {tf_5m}",
+        }
+    
+    # ════════════════════════════════════════════════════════════════════════════
+    # CONFIDENCE CALCULATION (Based on agreement of factors)
+    # ════════════════════════════════════════════════════════════════════════════
+    confirmation_count = 0
+    total_factors = 0
+    
+    # Factor 1: 5M Structure
+    if tf_5m == "BULLISH":
+        confirmation_count += 1
+    elif tf_5m == "BEARISH":
+        confirmation_count -= 1
+    total_factors += 1
+    
+    # Factor 2: 15M Structure
+    if tf_15m == "BULLISH":
+        confirmation_count += 1
+    elif tf_15m == "BEARISH":
+        confirmation_count -= 1
+    total_factors += 1
+    
+    # Factor 3: 1H Structure
+    if tf_1h == "BULLISH":
+        confirmation_count += 1
+    elif tf_1h == "BEARISH":
+        confirmation_count -= 1
+    total_factors += 1
+    
+    # Factor 4: Pressure
+    if pressure_buy:
+        confirmation_count += 1
+    elif pressure_sell:
+        confirmation_count -= 1
+    total_factors += 1
+    
+    # Factor 5: VWAP
+    if vwap is not None:
+        if is_bullish_aligned and price_above_vwap:
+            confirmation_count += 1
+        elif is_bearish_aligned and not price_above_vwap:
+            confirmation_count += 1
+        total_factors += 1
+    
+    # Factor 6: EMA
+    if ema_trend == "BULLISH":
+        confirmation_count += 1
+    elif ema_trend == "BEARISH":
+        confirmation_count -= 1
+    total_factors += 1
+    
+    # Factor 7: Market Structure (CHoCH/MSS/CISD)
+    has_bullish_structure = (
+        data_5m.get("bullish_choch") or 
+        data_5m.get("bullish_mss") or 
+        data_5m.get("bullish_cisd") or
+        (data_5m.get("structure_type") in ["HH/HL", "HL"])
+    )
+    has_bearish_structure = (
+        data_5m.get("bearish_choch") or 
+        data_5m.get("bearish_mss") or 
+        data_5m.get("bearish_cisd") or
+        (data_5m.get("structure_type") in ["LH/LL", "LH"])
+    )
+    
+    if is_bullish_aligned and has_bullish_structure:
+        confirmation_count += 1
+    elif is_bearish_aligned and has_bearish_structure:
+        confirmation_count += 1
+    total_factors += 1
+    
+    # Factor 8: Volume/RVOL
+    rvol = data_5m.get("rvol", 1.0)
+    if rvol >= 1.2:
+        confirmation_count += 1
+    elif rvol < 0.8:
+        confirmation_count -= 1
+    total_factors += 1
+    
+    # Calculate raw confidence (0-100)
+    raw_confidence = (confirmation_count / total_factors) * 100 if total_factors > 0 else 0
+    confidence = max(0, min(100, abs(raw_confidence)))
+    
+    # ════════════════════════════════════════════════════════════════════════════
+    # VALIDATION GATE 6: NEXT CANDLE BIAS CONFLICT DETECTION
+    # ════════════════════════════════════════════════════════════════════════════
+    df_5m = analysis_5m.get("df")
+    if df_5m is not None:
+        next_bias = calculate_next_candle_bias(df_5m, analysis_5m)
     else:
-        scores["options_score"] = 50
-
+        next_bias = {"bias": "NEUTRAL", "confidence": 0.0}
+    
+    next_bias_str = next_bias.get("bias", "NEUTRAL")
+    next_bias_conf = next_bias.get("confidence", 0.0)
+    
+    # Check for strong conflict
+    if is_bullish_aligned and "SELL" in next_bias_str and next_bias_conf >= 70:
+        # Strong bearish next candle bias vs bullish signal
+        return {
+            "final_signal": "🟡 NEUTRAL",
+            "confidence": 40.0,
+            "entry": None,
+            "stop_loss": None,
+            "target1": None,
+            "target2": None,
+            "rr_ratio": None,
+            "scores": {
+                "5m": 70,
+                "15m": 60,
+                "1h": 55,
+                "pressure": 70 if pressure_strong_buy else 60,
+                "options": 50,
+            },
+            "signal_reason": f"Next Candle Bias conflict: Bullish setup but Next Bias {next_bias_str}",
+        }
+    
+    if is_bearish_aligned and "BUY" in next_bias_str and next_bias_conf >= 70:
+        # Strong bullish next candle bias vs bearish signal
+        return {
+            "final_signal": "🟡 NEUTRAL",
+            "confidence": 40.0,
+            "entry": None,
+            "stop_loss": None,
+            "target1": None,
+            "target2": None,
+            "rr_ratio": None,
+            "scores": {
+                "5m": 30,
+                "15m": 40,
+                "1h": 45,
+                "pressure": 30 if pressure_strong_sell else 40,
+                "options": 50,
+            },
+            "signal_reason": f"Next Candle Bias conflict: Bearish setup but Next Bias {next_bias_str}",
+        }
+    
     # ════════════════════════════════════════════════════════════════════════════
-    # WEIGHTED CALCULATION WITH ALIGNMENT CHECKS
+    # VALIDATION GATE 7: OPTIONS VALIDATION (F&O ONLY)
     # ════════════════════════════════════════════════════════════════════════════
-    total_score = (scores["5m_score"] * 0.30 + scores["15m_score"] * 0.30 +
-                   scores["1h_score"] * 0.20 + scores["pressure_score"] * 0.10 +
-                   scores["options_score"] * 0.10)
-
-    # Strict alignment rules
-    tf_scores = [scores["5m_score"], scores["15m_score"], scores["1h_score"]]
-    bullish_tfs = sum(1 for x in tf_scores if x >= 60)
-    bearish_tfs = sum(1 for x in tf_scores if x <= 40)
+    options_bias = options_data.get("options_bias", "NEUTRAL")
+    options_conflict = False
     
-    hard_conflict = bullish_tfs >= 1 and bearish_tfs >= 1
-
-    # Confidence calculation
-    confidence = round(abs(total_score - 50) * 0.8, 1)
-    confidence = max(0, min(100, confidence))
-
-    # STRICT signal generation
-    bullish_aligned = scores["5m_score"] >= 65 and scores["15m_score"] >= 60 and scores["1h_score"] >= 55
-    bearish_aligned = scores["5m_score"] <= 35 and scores["15m_score"] <= 40 and scores["1h_score"] <= 45
+    if is_bullish_aligned and "BEARISH" in str(options_bias):
+        options_conflict = True
+    elif is_bearish_aligned and "BULLISH" in str(options_bias):
+        options_conflict = True
     
-    pressure_bullish = scores["pressure_score"] >= 65
-    pressure_bearish = scores["pressure_score"] <= 35
+    if options_conflict:
+        # Options data strongly opposes signal - only allow if price action is exceptional
+        if not (has_bullish_structure or has_bearish_structure):
+            confidence = min(confidence, 50.0)
     
-    if hard_conflict:
-        final_signal = "NEUTRAL"
-        confidence = min(confidence, 40.0)
-        reasons.append("TF conflict")
-    elif bullish_aligned and pressure_bullish and total_score >= 72:
-        final_signal = "🟢 STRONG BUY"
-    elif bullish_aligned and total_score >= 62:
-        final_signal = "🟢 BUY"
-    elif bearish_aligned and pressure_bearish and total_score <= 28:
-        final_signal = "🔴 STRONG SELL"
-    elif bearish_aligned and total_score <= 38:
-        final_signal = "🔴 SELL"
+    # ════════════════════════════════════════════════════════════════════════════
+    # STRICT SIGNAL GENERATION THRESHOLDS
+    # ════════════════════════════════════════════════════════════════════════════
+    # Calculate composite score for signal severity classification
+    composite_score = 50
+    
+    if is_bullish_aligned:
+        # Base bullish score
+        if tf_5m == "BULLISH" and tf_15m == "BULLISH":
+            composite_score += 20  # Both entry and momentum bullish
+        elif tf_5m == "BULLISH":
+            composite_score += 15  # Entry bullish but momentum neutral
+        
+        if tf_1h == "BULLISH":
+            composite_score += 5   # Trend context bullish
+        
+        if pressure_strong_buy:
+            composite_score += 15  # Strong buy pressure
+        elif pressure_buy:
+            composite_score += 10  # Moderate buy pressure
+        
+        if vwap is not None and price_above_vwap:
+            composite_score += 8
+        
+        if has_bullish_structure:
+            composite_score += 10
+        
+        if rvol >= 1.5:
+            composite_score += 5
+        elif rvol < 1.2:
+            composite_score -= 3
+        
+        # Threshold checks
+        if composite_score >= 80 and pressure_strong_buy and has_bullish_structure:
+            final_signal = "🟢 STRONG BUY"
+            confidence = min(100, confidence + 10)
+        elif composite_score >= 70 and pressure_buy:
+            final_signal = "🟢 BUY"
+            confidence = min(95, confidence + 5)
+        else:
+            final_signal = "🟡 NEUTRAL"
+            confidence = min(confidence, 60)
+    
+    elif is_bearish_aligned:
+        # Base bearish score
+        if tf_5m == "BEARISH" and tf_15m == "BEARISH":
+            composite_score -= 20  # Both entry and momentum bearish
+        elif tf_5m == "BEARISH":
+            composite_score -= 15  # Entry bearish but momentum neutral
+        
+        if tf_1h == "BEARISH":
+            composite_score -= 5   # Trend context bearish
+        
+        if pressure_strong_sell:
+            composite_score -= 15  # Strong sell pressure
+        elif pressure_sell:
+            composite_score -= 10  # Moderate sell pressure
+        
+        if vwap is not None and not price_above_vwap:
+            composite_score -= 8
+        
+        if has_bearish_structure:
+            composite_score -= 10
+        
+        if rvol >= 1.5:
+            composite_score -= 5
+        elif rvol < 1.2:
+            composite_score += 3
+        
+        # Threshold checks
+        if composite_score <= 20 and pressure_strong_sell and has_bearish_structure:
+            final_signal = "🔴 STRONG SELL"
+            confidence = min(100, confidence + 10)
+        elif composite_score <= 30 and pressure_sell:
+            final_signal = "🔴 SELL"
+            confidence = min(95, confidence + 5)
+        else:
+            final_signal = "🟡 NEUTRAL"
+            confidence = min(confidence, 60)
+    
     else:
         final_signal = "🟡 NEUTRAL"
-        reasons.append("Insufficient alignment")
+        confidence = 35.0
     
-    # Calculate Entry/SL/Targets
+    # ════════════════════════════════════════════════════════════════════════════
+    # BUILD SIGNAL REASON
+    # ════════════════════════════════════════════════════════════════════════════
+    reason_parts = []
+    
+    if "BUY" in final_signal:
+        reason_parts.append(f"5M {tf_5m}")
+        reason_parts.append(f"15M {tf_15m}")
+        reason_parts.append(f"1H {tf_1h}")
+        if pressure_buy:
+            reason_parts.append(f"Buy Pressure {data_5m.get('buying_pressure', 'N/A')}%")
+        if vwap is not None and price_above_vwap:
+            reason_parts.append("Above VWAP")
+        if ema_trend == "BULLISH":
+            reason_parts.append("EMA Bullish")
+        if has_bullish_structure:
+            reason_parts.append(f"{data_5m.get('structure_type', 'Structure')} Bullish")
+        if rvol >= 1.5:
+            reason_parts.append(f"RVOL {rvol}x")
+    
+    elif "SELL" in final_signal:
+        reason_parts.append(f"5M {tf_5m}")
+        reason_parts.append(f"15M {tf_15m}")
+        reason_parts.append(f"1H {tf_1h}")
+        if pressure_sell:
+            reason_parts.append(f"Sell Pressure {data_5m.get('selling_pressure', 'N/A')}%")
+        if vwap is not None and not price_above_vwap:
+            reason_parts.append("Below VWAP")
+        if ema_trend == "BEARISH":
+            reason_parts.append("EMA Bearish")
+        if has_bearish_structure:
+            reason_parts.append(f"{data_5m.get('structure_type', 'Structure')} Bearish")
+        if rvol >= 1.5:
+            reason_parts.append(f"RVOL {rvol}x")
+    
+    else:
+        reason_parts = ["Insufficient confirmation", f"TF: 5M {tf_5m} 15M {tf_15m} 1H {tf_1h}", f"Pressure: {pressure_trend}"]
+    
+    signal_reason = " + ".join(reason_parts)
+    
+    # ════════════════════════════════════════════════════════════════════════════
+    # CALCULATE ENTRY, SL, TARGETS ONLY FOR VALID SIGNALS
+    # ════════════════════════════════════════════════════════════════════════════
     entry = sl = t1 = t2 = rr_ratio = None
-    if analysis_5m.get("status") == "OK" and analysis_5m.get("data"):
-        data_5m = analysis_5m["data"]
-        entry = round(data_5m["last_close"], 2)
-        atr_5m = data_5m["atr"]
+    
+    if "BUY" in final_signal or "SELL" in final_signal:
+        entry = round(last_close, 2)
+        atr_5m = data_5m.get("atr", 0)
+        swing_high = data_5m.get("swing_high")
+        swing_low = data_5m.get("swing_low")
         
         if "BUY" in final_signal:
-            sl = round(data_5m["swing_low"] - atr_5m * 0.5, 2) if data_5m["swing_low"] else round(entry - atr_5m * 2, 2)
+            # BUY logic
+            sl = round(swing_low - atr_5m * 0.5, 2) if swing_low else round(entry - atr_5m * 2, 2)
             t1 = round(entry + atr_5m * 1.5, 2)
             t2 = round(entry + atr_5m * 2.5, 2)
         else:
-            sl = round(data_5m["swing_high"] + atr_5m * 0.5, 2) if data_5m["swing_high"] else round(entry + atr_5m * 2, 2)
+            # SELL logic
+            sl = round(swing_high + atr_5m * 0.5, 2) if swing_high else round(entry + atr_5m * 2, 2)
             t1 = round(entry - atr_5m * 1.5, 2)
             t2 = round(entry - atr_5m * 2.5, 2)
         
@@ -1230,9 +1492,30 @@ def calculate_master_signal(symbol: str, analysis_5m: Dict, analysis_15m: Dict, 
         "target1": t1,
         "target2": t2,
         "rr_ratio": rr_ratio,
-        "scores": scores,
-        "reasons": reasons,
+        "scores": {
+            "5m": 70 if tf_5m == "BULLISH" else 30 if tf_5m == "BEARISH" else 50,
+            "15m": 70 if tf_15m == "BULLISH" else 30 if tf_15m == "BEARISH" else 50,
+            "1h": 70 if tf_1h == "BULLISH" else 30 if tf_1h == "BEARISH" else 50,
+            "pressure": 70 if pressure_strong_buy else 60 if pressure_buy else 30 if pressure_strong_sell else 40 if pressure_sell else 50,
+            "options": 75 if "BULLISH" in str(options_bias) else 25 if "BEARISH" in str(options_bias) else 50,
+        },
+        "signal_reason": signal_reason,
     }
+
+# ════════════════════════════════════════════════════════════════════════════════
+# NORMALIZED SIGNAL CLASSIFICATION (for filters)
+# ════════════════════════════════════════════════════════════════════════════════
+def normalize_signal(signal_str: str) -> str:
+    """Return normalized signal class: BUY, SELL, or NEUTRAL."""
+    if pd.isna(signal_str) or signal_str is None:
+        return "NEUTRAL"
+    sig = str(signal_str).upper()
+    if "BUY" in sig and "SELL" not in sig:
+        return "BUY"
+    elif "SELL" in sig:
+        return "SELL"
+    else:
+        return "NEUTRAL"
 
 # ════════════════════════════════════════════════════════════════════════════════
 # NSE SIGNAL SCANNER WORKER
@@ -1256,7 +1539,7 @@ def _fetch_nse_signal(fyers, symbol: str):
         
         # NO options data for NSE scanner
         
-        # Calculate master signal
+        # Calculate master signal (STRICT VALIDATION ENGINE)
         master = calculate_master_signal(symbol, analysis_5m, analysis_15m, analysis_1h)
         
         # Calculate Next Candle Bias
@@ -1313,6 +1596,7 @@ def _fetch_nse_signal(fyers, symbol: str):
             "NEXT CANDLE CONFIDENCE %": next_bias.get("confidence", 0.0),
             "AI SIGNAL": master["final_signal"],
             "AI CONFIDENCE %": master["confidence"],
+            "SIGNAL REASON": master["signal_reason"],
             "ENTRY": master["entry"],
             "STOP LOSS": master["stop_loss"],
             "TARGET 1": master["target1"],
@@ -1346,7 +1630,7 @@ def _fetch_fo_signal(fyers, symbol: str):
         # Fetch options data for F&O
         options_data = fetch_options_chain_data(fyers, symbol)
         
-        # Calculate master signal
+        # Calculate master signal (STRICT VALIDATION ENGINE)
         master = calculate_master_signal(symbol, analysis_5m, analysis_15m, analysis_1h, options_data)
         
         # Calculate Next Candle Bias
@@ -1410,6 +1694,7 @@ def _fetch_fo_signal(fyers, symbol: str):
             "OPTIONS BIAS": options_data.get("options_bias", "N/A"),
             "AI SIGNAL": master["final_signal"],
             "AI CONFIDENCE %": master["confidence"],
+            "SIGNAL REASON": master["signal_reason"],
             "ENTRY": master["entry"],
             "STOP LOSS": master["stop_loss"],
             "TARGET 1": master["target1"],
@@ -1602,7 +1887,7 @@ def _format_excel_output(df, scanner_type: str = "NSE") -> bytes:
                     # Auto-fit columns
                     for col_num, col_title in enumerate(df_export.columns, 1):
                         max_length = len(str(col_title)) + 2
-                        for row_num in range(2, min(len(df_export) + 2, 100)):  # Check first 100 rows
+                        for row_num in range(2, min(len(df_export) + 2, 100)):
                             try:
                                 cell_val = str(worksheet.cell(row=row_num, column=col_num).value)
                                 max_length = max(max_length, len(cell_val))
@@ -1614,7 +1899,6 @@ def _format_excel_output(df, scanner_type: str = "NSE") -> bytes:
                         worksheet.column_dimensions[col_letter].width = adjusted_width
                 
                 except Exception as format_err:
-                    # If formatting fails, just continue with basic export
                     logging.warning(f"Excel formatting error: {format_err}")
             
             # Add summary sheet
@@ -1629,20 +1913,18 @@ def _format_excel_output(df, scanner_type: str = "NSE") -> bytes:
                     ],
                     "Value": [
                         str(len(df)),
-                        str(len(df[df["AI SIGNAL"].str.contains("BUY", na=False)])),
-                        str(len(df[df["AI SIGNAL"].str.contains("SELL", na=False)])),
-                        str(len(df[df["AI SIGNAL"].str.contains("NEUTRAL", na=False)])),
-                        f"{df['AI CONFIDENCE %'].astype(float, errors='ignore').mean():.1f}%"
+                        str(len(df[df["AI SIGNAL"].str.contains("BUY", na=False, regex=False)])),
+                        str(len(df[df["AI SIGNAL"].str.contains("SELL", na=False, regex=False)])),
+                        str(len(df[df["AI SIGNAL"].str.contains("NEUTRAL", na=False, regex=False)])),
+                        f"{pd.to_numeric(df['AI CONFIDENCE %'], errors='coerce').mean():.1f}%"
                     ]
                 }
                 summary_df = pd.DataFrame(summary_data)
                 summary_df.to_excel(writer, index=False, sheet_name="Summary")
             except Exception:
-                # If summary fails, skip it
                 pass
     
     except Exception as e:
-        # Ultimate fallback: CSV-like export in Excel
         logging.error(f"Excel export error: {e}")
         try:
             buf = io.BytesIO()
@@ -1651,7 +1933,6 @@ def _format_excel_output(df, scanner_type: str = "NSE") -> bytes:
                 df_export.to_excel(writer, index=False, sheet_name="Signals")
         except Exception as final_err:
             logging.error(f"Final Excel fallback failed: {final_err}")
-            # Return CSV as last resort
             buf = io.BytesIO()
             buf.write(to_csv_bytes(df))
     
@@ -1680,15 +1961,15 @@ def to_json_bytes(df) -> bytes:
 # MAIN APP - DUAL TAB INTERFACE
 # ════════════════════════════════════════════════════════════════════════════════
 def show_scanner(fyers) -> None:
-    """Streamlit main app - NSE AI PRO V16.2 with Dual Tabs"""
+    """Streamlit main app - NSE AI PRO V16.2 with Dual Tabs (FIXED)"""
     
     try:
-        st.set_page_config(page_title="NSE AI PRO V16.2", layout="wide")
+        st.set_page_config(page_title="NSE AI PRO V16.2 FIXED", layout="wide")
     except:
         pass  # Already configured
     
-    st.title("🚀 NSE AI PRO V16.2 — Dual Scanners (NSE + F&O)")
-    st.caption(f"🕒 Current Time (IST): {_now_ist().strftime('%d-%b-%Y %H:%M:%S')} IST | Built for Production")
+    st.title("🚀 NSE AI PRO V16.2 FIXED — Strict Multi-Timeframe Validation")
+    st.caption(f"🕒 Current Time (IST): {_now_ist().strftime('%d-%b-%Y %H:%M:%S')} IST | STRICT SIGNALS - NO FALSE CONFIRMATIONS")
     
     # Load symbols
     try:
@@ -1712,7 +1993,7 @@ def show_scanner(fyers) -> None:
     # NSE STOCKS TAB
     # ════════════════════════════════════════════════════════════════════════════════
     with tab_nse:
-        st.markdown("### NSE Equity Stocks Scanner\nTechnical analysis only – no options data")
+        st.markdown("### NSE Equity Stocks Scanner\n✅ Strict validation - only high-quality signals\nMulti-timeframe alignment required (5M + 15M + 1H)")
         
         col1, col2 = st.columns([3, 1])
         with col1:
@@ -1724,7 +2005,7 @@ def show_scanner(fyers) -> None:
         nse_universe = all_symbols if nse_limit == 0 else all_symbols[:nse_limit]
         
         if st.button(f"🔍 SCAN NSE ({len(nse_universe)} stocks)", key="nse_run"):
-            with st.spinner("Analyzing NSE stocks with technical indicators…"):
+            with st.spinner("Analyzing NSE stocks with strict multi-timeframe validation…"):
                 nse_results, nse_errors, nse_stats = run_nse_scan(fyers, nse_universe)
                 st.session_state["nse_df"] = pd.DataFrame(nse_results) if nse_results else pd.DataFrame()
                 st.session_state["nse_errors"] = nse_errors
@@ -1761,7 +2042,7 @@ def show_scanner(fyers) -> None:
                 col_f1, col_f2, col_f3, col_f4 = st.columns(4)
                 
                 with col_f1:
-                    nse_min_conf = st.slider("Min Confidence %", 0, 100, 0, step=5, key="nse_conf")  # DEFAULT 0
+                    nse_min_conf = st.slider("Min Confidence %", 0, 100, 70, step=5, key="nse_conf")
                 with col_f2:
                     nse_signal = st.selectbox("Signal", ["ALL", "BUY", "SELL", "STRONG ONLY"], key="nse_signal")
                 with col_f3:
@@ -1769,33 +2050,33 @@ def show_scanner(fyers) -> None:
                 with col_f4:
                     nse_sort = st.selectbox("Sort By", ["AI CONFIDENCE %", "LTP", "RVOL", "RISK:REWARD"], key="nse_sort")
                 
-                # Apply NSE filters - with better error handling
+                # Apply NSE filters - SAFE METHOD using normalized signals
                 nse_filtered = nse_sorted.copy()
                 
                 # Convert confidence to numeric - SAFE METHOD
                 try:
                     confidence_col = pd.to_numeric(nse_filtered["AI CONFIDENCE %"], errors='coerce')
-                    nse_filtered["AI CONFIDENCE %"] = confidence_col
                     nse_filtered = nse_filtered[confidence_col >= nse_min_conf]
                 except Exception as e:
                     st.warning(f"⚠️ Confidence filter error: {e}")
                 
-                # Signal filter
+                # Signal filter - using normalized classification
                 if nse_signal != "ALL":
                     try:
+                        normalized_signals = nse_filtered["AI SIGNAL"].apply(normalize_signal)
                         if nse_signal == "BUY":
-                            nse_filtered = nse_filtered[nse_filtered["AI SIGNAL"].astype(str).str.contains("BUY", na=False, case=False)]
+                            nse_filtered = nse_filtered[normalized_signals == "BUY"]
                         elif nse_signal == "SELL":
-                            nse_filtered = nse_filtered[nse_filtered["AI SIGNAL"].astype(str).str.contains("SELL", na=False, case=False)]
+                            nse_filtered = nse_filtered[normalized_signals == "SELL"]
                         elif nse_signal == "STRONG ONLY":
-                            nse_filtered = nse_filtered[nse_filtered["AI SIGNAL"].astype(str).str.contains("STRONG", na=False, case=False)]
+                            nse_filtered = nse_filtered[nse_filtered["AI SIGNAL"].astype(str).str.contains("STRONG", na=False)]
                     except Exception as e:
                         st.warning(f"⚠️ Signal filter error: {e}")
                 
                 # Bias filter
                 if nse_bias != "ALL":
                     try:
-                        nse_filtered = nse_filtered[nse_filtered["NEXT CANDLE BIAS"].astype(str).str.contains(nse_bias, na=False, case=False)]
+                        nse_filtered = nse_filtered[nse_filtered["NEXT CANDLE BIAS"].astype(str).str.contains(nse_bias, na=False)]
                     except Exception as e:
                         st.warning(f"⚠️ Bias filter error: {e}")
                 
@@ -1865,10 +2146,10 @@ def show_scanner(fyers) -> None:
                     with stat_c1:
                         st.metric("Total", len(nse_filtered))
                     with stat_c2:
-                        buy_c = len(nse_filtered[nse_filtered["AI SIGNAL"].astype(str).str.contains("BUY", na=False)])
+                        buy_c = len(nse_filtered[nse_filtered["AI SIGNAL"].apply(normalize_signal) == "BUY"])
                         st.metric("BUY", buy_c)
                     with stat_c3:
-                        sell_c = len(nse_filtered[nse_filtered["AI SIGNAL"].astype(str).str.contains("SELL", na=False)])
+                        sell_c = len(nse_filtered[nse_filtered["AI SIGNAL"].apply(normalize_signal) == "SELL"])
                         st.metric("SELL", sell_c)
                     with stat_c4:
                         try:
@@ -1877,60 +2158,16 @@ def show_scanner(fyers) -> None:
                         except:
                             st.metric("Avg Conf", "N/A")
                     with stat_c5:
-                        st.metric("Signals", len(nse_filtered))
+                        strong_c = len(nse_filtered[nse_filtered["AI SIGNAL"].astype(str).str.contains("STRONG", na=False)])
+                        st.metric("STRONG", strong_c)
                 else:
                     st.warning("❌ No signals found with current filters.")
-                    st.info("💡 **Tips to see results:**\n- Lower the Confidence % threshold\n- Try 'ALL' for Signal Type\n- Try 'ALL' for Next Candle Bias")
+                    st.info("💡 **Tips:**\n- Try lower confidence threshold (70% is default)\n- Try 'ALL' for Signal Type\n- Try 'ALL' for Next Candle Bias\n- Note: Strict validation may reduce signal quantity but improves quality")
                     
                     # Show what we DO have (unfiltered)
                     with st.expander("📋 Show All Data (before filter)", expanded=True):
                         st.write(f"Found {len(nse_sorted)} total signals before filtering")
                         st.dataframe(nse_sorted.head(20), use_container_width=True)
-                        
-                        # Download unfiltered
-                        st.markdown("**Download All Signals:**")
-                        col_uf1, col_uf2, col_uf3 = st.columns(3)
-                        with col_uf1:
-                            try:
-                                excel_data = _format_excel_output(nse_sorted, "NSE")
-                                st.download_button(
-                                    label="📊 Excel All",
-                                    data=excel_data,
-                                    file_name=f"NSE_ALL_{_now_ist().strftime('%Y%m%d_%H%M')}.xlsx",
-                                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                                    key="nse_dl_excel_all",
-                                    use_container_width=True
-                                )
-                            except Exception as e:
-                                st.error(f"Error: {str(e)[:50]}")
-                        
-                        with col_uf2:
-                            try:
-                                csv_data = to_csv_bytes(nse_sorted)
-                                st.download_button(
-                                    label="📄 CSV All",
-                                    data=csv_data,
-                                    file_name=f"NSE_ALL_{_now_ist().strftime('%Y%m%d_%H%M')}.csv",
-                                    mime="text/csv",
-                                    key="nse_dl_csv_all",
-                                    use_container_width=True
-                                )
-                            except Exception as e:
-                                st.error(f"Error: {str(e)[:50]}")
-                        
-                        with col_uf3:
-                            try:
-                                json_data = to_json_bytes(nse_sorted)
-                                st.download_button(
-                                    label="📋 JSON All",
-                                    data=json_data,
-                                    file_name=f"NSE_ALL_{_now_ist().strftime('%Y%m%d_%H%M')}.json",
-                                    mime="application/json",
-                                    key="nse_dl_json_all",
-                                    use_container_width=True
-                                )
-                            except Exception as e:
-                                st.error(f"Error: {str(e)[:50]}")
             
             except Exception as e:
                 st.error(f"❌ NSE Tab Error: {str(e)[:200]}")
@@ -1938,9 +2175,6 @@ def show_scanner(fyers) -> None:
                     st.write(f"Data shape: {nse_df.shape}")
                     st.write(f"Columns: {list(nse_df.columns)}")
                     st.write(f"Error: {e}")
-                    # Show first few rows anyway
-                    st.write("First 3 rows:")
-                    st.dataframe(nse_df.head(3))
         else:
             st.info("👈 Click 'SCAN NSE' button to start analyzing stocks")
     
@@ -1948,7 +2182,7 @@ def show_scanner(fyers) -> None:
     # F&O STOCKS TAB
     # ════════════════════════════════════════════════════════════════════════════════
     with tab_fo:
-        st.markdown("### F&O Stocks Scanner\nTechnical + options analysis for derivatives universe")
+        st.markdown("### F&O Stocks Scanner\n✅ Strict validation + options analysis\nMulti-timeframe alignment + PCR confirmation required")
         
         col1, col2 = st.columns([3, 1])
         with col1:
@@ -1960,7 +2194,7 @@ def show_scanner(fyers) -> None:
         fo_universe = fo_symbols if fo_limit == 0 else fo_symbols[:fo_limit]
         
         if st.button(f"🔍 SCAN F&O ({len(fo_universe)} stocks)", key="fo_run"):
-            with st.spinner("Analyzing F&O stocks with options data…"):
+            with st.spinner("Analyzing F&O stocks with strict validation + options data…"):
                 fo_results, fo_errors, fo_stats = run_fo_scan(fyers, fo_universe)
                 st.session_state["fo_df"] = pd.DataFrame(fo_results) if fo_results else pd.DataFrame()
                 st.session_state["fo_errors"] = fo_errors
@@ -1997,7 +2231,7 @@ def show_scanner(fyers) -> None:
                 col_f1, col_f2, col_f3, col_f4, col_f5 = st.columns(5)
                 
                 with col_f1:
-                    fo_min_conf = st.slider("Min Confidence %", 0, 100, 0, step=5, key="fo_conf")  # DEFAULT 0
+                    fo_min_conf = st.slider("Min Confidence %", 0, 100, 70, step=5, key="fo_conf")
                 with col_f2:
                     fo_signal = st.selectbox("Signal", ["ALL", "BUY", "SELL", "STRONG ONLY"], key="fo_signal")
                 with col_f3:
@@ -2007,40 +2241,40 @@ def show_scanner(fyers) -> None:
                 with col_f5:
                     fo_sort = st.selectbox("Sort By", ["AI CONFIDENCE %", "LTP", "RVOL", "PCR"], key="fo_sort")
                 
-                # Apply F&O filters - with better error handling
+                # Apply F&O filters - SAFE METHOD using normalized signals
                 fo_filtered = fo_sorted.copy()
                 
                 # Convert confidence to numeric - SAFE METHOD
                 try:
                     confidence_col = pd.to_numeric(fo_filtered["AI CONFIDENCE %"], errors='coerce')
-                    fo_filtered["AI CONFIDENCE %"] = confidence_col
                     fo_filtered = fo_filtered[confidence_col >= fo_min_conf]
                 except Exception as e:
                     st.warning(f"⚠️ Confidence filter error: {e}")
                 
-                # Signal filter
+                # Signal filter - using normalized classification
                 if fo_signal != "ALL":
                     try:
+                        normalized_signals = fo_filtered["AI SIGNAL"].apply(normalize_signal)
                         if fo_signal == "BUY":
-                            fo_filtered = fo_filtered[fo_filtered["AI SIGNAL"].astype(str).str.contains("BUY", na=False, case=False)]
+                            fo_filtered = fo_filtered[normalized_signals == "BUY"]
                         elif fo_signal == "SELL":
-                            fo_filtered = fo_filtered[fo_filtered["AI SIGNAL"].astype(str).str.contains("SELL", na=False, case=False)]
+                            fo_filtered = fo_filtered[normalized_signals == "SELL"]
                         elif fo_signal == "STRONG ONLY":
-                            fo_filtered = fo_filtered[fo_filtered["AI SIGNAL"].astype(str).str.contains("STRONG", na=False, case=False)]
+                            fo_filtered = fo_filtered[fo_filtered["AI SIGNAL"].astype(str).str.contains("STRONG", na=False)]
                     except Exception as e:
                         st.warning(f"⚠️ Signal filter error: {e}")
                 
                 # Bias filter
                 if fo_bias != "ALL":
                     try:
-                        fo_filtered = fo_filtered[fo_filtered["NEXT CANDLE BIAS"].astype(str).str.contains(fo_bias, na=False, case=False)]
+                        fo_filtered = fo_filtered[fo_filtered["NEXT CANDLE BIAS"].astype(str).str.contains(fo_bias, na=False)]
                     except Exception as e:
                         st.warning(f"⚠️ Bias filter error: {e}")
                 
                 # Options filter
                 if fo_opt != "ALL":
                     try:
-                        fo_filtered = fo_filtered[fo_filtered["OPTIONS BIAS"].astype(str).str.contains(fo_opt, na=False, case=False)]
+                        fo_filtered = fo_filtered[fo_filtered["OPTIONS BIAS"].astype(str).str.contains(fo_opt, na=False)]
                     except Exception as e:
                         st.warning(f"⚠️ Options filter error: {e}")
                 
@@ -2115,10 +2349,10 @@ def show_scanner(fyers) -> None:
                     with stat_c1:
                         st.metric("Total", len(fo_filtered))
                     with stat_c2:
-                        buy_c = len(fo_filtered[fo_filtered["AI SIGNAL"].astype(str).str.contains("BUY", na=False)])
+                        buy_c = len(fo_filtered[fo_filtered["AI SIGNAL"].apply(normalize_signal) == "BUY"])
                         st.metric("BUY", buy_c)
                     with stat_c3:
-                        sell_c = len(fo_filtered[fo_filtered["AI SIGNAL"].astype(str).str.contains("SELL", na=False)])
+                        sell_c = len(fo_filtered[fo_filtered["AI SIGNAL"].apply(normalize_signal) == "SELL"])
                         st.metric("SELL", sell_c)
                     with stat_c4:
                         try:
@@ -2134,61 +2368,11 @@ def show_scanner(fyers) -> None:
                         except:
                             st.metric("Avg PCR", "N/A")
                     with stat_c6:
-                        bullish_opt = len(fo_filtered[fo_filtered["OPTIONS BIAS"].astype(str).str.contains("BULLISH", na=False)])
-                        st.metric("Bullish", bullish_opt)
+                        strong_c = len(fo_filtered[fo_filtered["AI SIGNAL"].astype(str).str.contains("STRONG", na=False)])
+                        st.metric("STRONG", strong_c)
                 else:
                     st.warning("❌ No signals found with current filters.")
-                    st.info("💡 **Tips to see results:**\n- Lower the Confidence % threshold\n- Try 'ALL' for Signal Type\n- Try 'ALL' for Next Candle Bias\n- Try 'ALL' for Options Bias")
-                    
-                    # Show what we DO have (unfiltered)
-                    with st.expander("📋 Show All Data (before filter)", expanded=True):
-                        st.write(f"Found {len(fo_sorted)} total signals before filtering")
-                        st.dataframe(fo_sorted.head(20), use_container_width=True)
-                        
-                        # Download unfiltered
-                        st.markdown("**Download All Signals:**")
-                        col_uf1, col_uf2, col_uf3 = st.columns(3)
-                        with col_uf1:
-                            try:
-                                excel_data = _format_excel_output(fo_sorted, "FO")
-                                st.download_button(
-                                    label="📊 Excel All",
-                                    data=excel_data,
-                                    file_name=f"FO_ALL_{_now_ist().strftime('%Y%m%d_%H%M')}.xlsx",
-                                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                                    key="fo_dl_excel_all",
-                                    use_container_width=True
-                                )
-                            except Exception as e:
-                                st.error(f"Error: {str(e)[:50]}")
-                        
-                        with col_uf2:
-                            try:
-                                csv_data = to_csv_bytes(fo_sorted)
-                                st.download_button(
-                                    label="📄 CSV All",
-                                    data=csv_data,
-                                    file_name=f"FO_ALL_{_now_ist().strftime('%Y%m%d_%H%M')}.csv",
-                                    mime="text/csv",
-                                    key="fo_dl_csv_all",
-                                    use_container_width=True
-                                )
-                            except Exception as e:
-                                st.error(f"Error: {str(e)[:50]}")
-                        
-                        with col_uf3:
-                            try:
-                                json_data = to_json_bytes(fo_sorted)
-                                st.download_button(
-                                    label="📋 JSON All",
-                                    data=json_data,
-                                    file_name=f"FO_ALL_{_now_ist().strftime('%Y%m%d_%H%M')}.json",
-                                    mime="application/json",
-                                    key="fo_dl_json_all",
-                                    use_container_width=True
-                                )
-                            except Exception as e:
-                                st.error(f"Error: {str(e)[:50]}")
+                    st.info("💡 **Tips:**\n- Try lower confidence threshold (70% is default)\n- Try 'ALL' for Signal Type\n- Try 'ALL' filters\n- Note: Strict validation improves signal quality significantly")
             
             except Exception as e:
                 st.error(f"❌ F&O Tab Error: {str(e)[:200]}")
@@ -2196,9 +2380,6 @@ def show_scanner(fyers) -> None:
                     st.write(f"Data shape: {fo_df.shape}")
                     st.write(f"Columns: {list(fo_df.columns)}")
                     st.write(f"Error: {e}")
-                    # Show first few rows anyway
-                    st.write("First 3 rows:")
-                    st.dataframe(fo_df.head(3))
         else:
             st.info("👈 Click 'SCAN F&O' button to start analyzing stocks")
     
