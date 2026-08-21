@@ -2472,79 +2472,39 @@ def show_scanner(fyers) -> None:
     # TAB 3: STRONG SIGNALS
     # ════════════════════════════════════════════════════════════════════════════════
     with tabs[3]:
-        st.markdown("### 🔥 Strong Signals Only\nHigh-confidence BUY/SELL setups")
-
-        col_ss1, col_ss2, col_ss3 = st.columns([2, 2, 1])
-        with col_ss1:
-            strong_source = st.radio("Source", ["NSE Stocks", "F&O Stocks"], horizontal=True, key="strong_source")
-        with col_ss2:
-            strong_threshold = st.slider("Minimum Confidence %", 50, 95, 75, 5, key="strong_threshold")
-        with col_ss3:
-            strong_limit = st.number_input("Scan Limit", 10, 1000, 200, 10, key="strong_limit")
-
+        st.markdown("### 🔥 Strong Signals Only\nHigh-confidence setups (≥70%)")
+        
+        strong_source = st.radio("Source", ["NSE Stocks", "F&O Stocks"], horizontal=True, key="strong_source")
+        
         if strong_source == "NSE Stocks":
-            strong_universe = all_symbols[:min(strong_limit, len(all_symbols))]
+            nse_df = st.session_state.get("nse_df")
+            strong_df = nse_df
         else:
-            strong_universe = fo_symbols[:min(strong_limit, len(fo_symbols))]
-
-        if st.button(f"🚀 RUN STRONG SIGNALS ({len(strong_universe)})", key="strong_run", type="primary"):
-            with st.spinner(f"Scanning {len(strong_universe)} {strong_source} for strong signals…"):
-                if strong_source == "NSE Stocks":
-                    strong_results, strong_errors, strong_stats = run_nse_scan(fyers, strong_universe)
-                    st.session_state["strong_df"] = pd.DataFrame(strong_results) if strong_results else pd.DataFrame()
-                    st.session_state["strong_errors"] = strong_errors
-                    st.session_state["strong_stats"] = strong_stats
-                    st.session_state["strong_source_used"] = "NSE Stocks"
-                else:
-                    strong_results, strong_errors, strong_stats = run_fo_scan(fyers, strong_universe)
-                    st.session_state["strong_df"] = pd.DataFrame(strong_results) if strong_results else pd.DataFrame()
-                    st.session_state["strong_errors"] = strong_errors
-                    st.session_state["strong_stats"] = strong_stats
-                    st.session_state["strong_source_used"] = "F&O Stocks"
-
-        strong_df = st.session_state.get("strong_df")
+            fo_df = st.session_state.get("fo_df")
+            strong_df = fo_df
+        
         if strong_df is not None and not strong_df.empty:
             try:
-                confidence_col = pd.to_numeric(strong_df.get("AI CONFIDENCE %", pd.Series(dtype=float)), errors="coerce")
-                strong_filtered = strong_df[confidence_col >= strong_threshold].copy()
-
-                if "AI SIGNAL" in strong_filtered.columns:
-                    normalized = strong_filtered["AI SIGNAL"].apply(normalize_signal)
-                    strong_filtered = strong_filtered[normalized != "NEUTRAL"]
-
-                try:
-                    strong_filtered = strong_filtered.sort_values("AI CONFIDENCE %", ascending=False)
-                except Exception:
-                    pass
-
+                # Filter for strong signals
+                confidence_col = pd.to_numeric(strong_df.get("AI CONFIDENCE %", pd.Series([])), errors='coerce')
+                strong_filtered = strong_df[confidence_col >= 75].copy()
+                
+                # Only BUY/SELL
+                normalized = strong_filtered["AI SIGNAL"].apply(normalize_signal)
+                strong_filtered = strong_filtered[normalized != "NEUTRAL"]
+                
                 st.subheader(f"💪 {len(strong_filtered)} Strong Signals")
+                
                 if len(strong_filtered) > 0:
-                    st.dataframe(strong_filtered, use_container_width=True, height=450)
-
-                    st.markdown("### 📥 Strong Signals Export")
-                    col_sd1, col_sd2, col_sd3 = st.columns(3)
-                    with col_sd1:
-                        excel_data = _format_excel_output(strong_filtered, "STRONG_SIGNALS")
-                        st.download_button("📊 DOWNLOAD EXCEL", excel_data,
-                                           f"Strong_Signals_{_now_ist().strftime('%Y%m%d_%H%M')}.xlsx",
-                                           "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="strong_xls")
-                    with col_sd2:
-                        st.download_button("📄 DOWNLOAD CSV", to_csv_bytes(strong_filtered),
-                                           f"Strong_Signals_{_now_ist().strftime('%Y%m%d_%H%M')}.csv", "text/csv", key="strong_csv")
-                    with col_sd3:
-                        st.download_button("📋 DOWNLOAD JSON", to_json_bytes(strong_filtered),
-                                           f"Strong_Signals_{_now_ist().strftime('%Y%m%d_%H%M')}.json", "application/json", key="strong_json")
+                    st.dataframe(strong_filtered.sort_values("AI CONFIDENCE %", ascending=False), 
+                               use_container_width=True, height=400)
                 else:
-                    st.warning(f"No BUY/SELL signals found at ≥{strong_threshold}% confidence.")
-
-                if st.session_state.get("strong_errors"):
-                    with st.expander(f"⚠️ Scan Errors ({len(st.session_state['strong_errors'])})"):
-                        for i, err in enumerate(st.session_state["strong_errors"][:20], 1):
-                            st.text(f"{i}. {err}")
+                    st.warning("No strong signals (≥75% confidence) found. Lower the threshold in Settings tab.")
+            
             except Exception as e:
-                st.error(f"❌ Strong Signals Error: {str(e)[:150]}")
+                st.error(f"❌ Error: {str(e)[:100]}")
         else:
-            st.info("👈 Select NSE/F&O and click 'RUN STRONG SIGNALS'")
+            st.info(f"👈 Run '{strong_source}' scanner first")
     
     # ════════════════════════════════════════════════════════════════════════════════
     # TAB 4: SWING (GOLDEN CROSS / DEATH CROSS)
@@ -2800,187 +2760,123 @@ def show_scanner(fyers) -> None:
     # ════════════════════════════════════════════════════════════════════════════════
     with tabs[6]:
         st.markdown("### 📊 Market Dashboard - Statistics & Sentiment")
-
-        col_dash1, col_dash2, col_dash3 = st.columns([2, 2, 1])
+        
+        col_dash1, col_dash2 = st.columns(2)
+        
         with col_dash1:
             dashboard_source = st.radio("Data Source", ["NSE Stocks", "F&O Stocks"], horizontal=True, key="dash_source")
-        with col_dash2:
-            dashboard_limit = st.number_input("Dashboard Scan Limit", 10, 1000, 200, 10, key="dash_limit")
-        with col_dash3:
-            st.write("")
-            st.write("")
-            run_dashboard = st.button("🔄 RUN DASHBOARD", key="dashboard_run", type="primary")
-
-        if run_dashboard:
-            with st.spinner(f"Refreshing {dashboard_source} market dashboard…"):
-                if dashboard_source == "NSE Stocks":
-                    dash_universe = all_symbols[:min(dashboard_limit, len(all_symbols))]
-                    dash_results, dash_errors, dash_stats = run_nse_scan(fyers, dash_universe)
-                    st.session_state["dashboard_df"] = pd.DataFrame(dash_results) if dash_results else pd.DataFrame()
-                    st.session_state["dashboard_errors"] = dash_errors
-                else:
-                    dash_universe = fo_symbols[:min(dashboard_limit, len(fo_symbols))]
-                    dash_results, dash_errors, dash_stats = run_fo_scan(fyers, dash_universe)
-                    st.session_state["dashboard_df"] = pd.DataFrame(dash_results) if dash_results else pd.DataFrame()
-                    st.session_state["dashboard_errors"] = dash_errors
-                st.session_state["dashboard_source_used"] = dashboard_source
-
-        dash_df = st.session_state.get("dashboard_df")
-        if dash_df is None or dash_df.empty:
-            # Fall back to latest NSE/F&O scan if dashboard has not been run yet.
-            dash_df = st.session_state.get("nse_df") if dashboard_source == "NSE Stocks" else st.session_state.get("fo_df")
-
-        if dash_df is not None and not dash_df.empty:
-            try:
-                stats = calculate_market_stats(dash_df)
-
-                st.markdown("### 📈 Market Overview")
-                col_ov1, col_ov2, col_ov3, col_ov4, col_ov5 = st.columns(5)
-                with col_ov1:
-                    st.metric("Total Scanned", stats["total"])
-                with col_ov2:
-                    st.metric("🟢 BUY", stats["buy"])
-                with col_ov3:
-                    st.metric("🔴 SELL", stats["sell"])
-                with col_ov4:
-                    st.metric("🟡 NEUTRAL", stats["neutral"])
-                with col_ov5:
-                    st.metric("Avg Confidence", f"{stats['avg_confidence']:.1f}%")
-
-                st.markdown("### 💪 Strong Signals")
-                col_str1, col_str2 = st.columns(2)
-                with col_str1:
-                    st.metric("💪 Strong BUY", stats["strong_buy"])
-                with col_str2:
-                    st.metric("💪 Strong SELL", stats["strong_sell"])
-
-                st.markdown("### 😊 Market Sentiment")
-                col_sent1, col_sent2, col_sent3 = st.columns(3)
-                with col_sent1:
-                    st.metric("Bullish %", f"{stats['buy_pct']:.1f}%")
-                with col_sent2:
-                    st.metric("Bearish %", f"{stats['sell_pct']:.1f}%")
-                with col_sent3:
-                    st.metric("Neutral %", f"{stats['neutral_pct']:.1f}%")
-
-                st.markdown("### 📥 Dashboard Export")
-                col_md1, col_md2, col_md3 = st.columns(3)
-                with col_md1:
-                    dashboard_excel = _format_excel_output(dash_df, "MARKET_DASHBOARD")
-                    st.download_button("📊 DOWNLOAD EXCEL", dashboard_excel,
-                                       f"Market_Dashboard_{_now_ist().strftime('%Y%m%d_%H%M')}.xlsx",
-                                       "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="dashboard_xls")
-                with col_md2:
-                    st.download_button("📄 DOWNLOAD CSV", to_csv_bytes(dash_df),
-                                       f"Market_Dashboard_{_now_ist().strftime('%Y%m%d_%H%M')}.csv", "text/csv", key="dashboard_csv")
-                with col_md3:
-                    st.download_button("📋 DOWNLOAD JSON", to_json_bytes(dash_df),
-                                       f"Market_Dashboard_{_now_ist().strftime('%Y%m%d_%H%M')}.json", "application/json", key="dashboard_json")
-
-                if st.checkbox("Show Market Chart", value=True, key="dashboard_chart"):
-                    try:
-                        import matplotlib.pyplot as plt
-                        fig, ax = plt.subplots(figsize=(10, 4))
-                        categories = ["BUY", "SELL", "NEUTRAL"]
-                        counts = [stats["buy"], stats["sell"], stats["neutral"]]
-                        ax.bar(categories, counts)
-                        ax.set_ylabel("Count")
-                        ax.set_title("Market Signal Distribution")
-                        plt.tight_layout()
-                        st.pyplot(fig)
-                        plt.close(fig)
-                    except Exception as e:
-                        st.warning(f"Chart error: {str(e)[:80]}")
-
-                if st.session_state.get("dashboard_errors"):
-                    with st.expander(f"⚠️ Dashboard Errors ({len(st.session_state['dashboard_errors'])})"):
-                        for i, err in enumerate(st.session_state["dashboard_errors"][:20], 1):
-                            st.text(f"{i}. {err}")
-            except Exception as e:
-                st.error(f"❌ Dashboard Error: {str(e)[:150]}")
+        
+        if dashboard_source == "NSE Stocks":
+            dash_df = st.session_state.get("nse_df")
         else:
-            st.info("👈 Click 'RUN DASHBOARD' to scan and build the market dashboard")
-
+            dash_df = st.session_state.get("fo_df")
+        
+        if dash_df is not None and not dash_df.empty:
+            stats = calculate_market_stats(dash_df)
+            
+            # Market overview
+            st.markdown("### 📈 Market Overview")
+            col_ov1, col_ov2, col_ov3, col_ov4, col_ov5 = st.columns(5)
+            
+            with col_ov1:
+                st.metric("Total Scanned", stats["total"])
+            with col_ov2:
+                st.metric("🟢 BUY", stats["buy"])
+            with col_ov3:
+                st.metric("🔴 SELL", stats["sell"])
+            with col_ov4:
+                st.metric("🟡 NEUTRAL", stats["neutral"])
+            with col_ov5:
+                st.metric("Avg Confidence", f"{stats['avg_confidence']:.1f}%")
+            
+            # Strong signals
+            st.markdown("### 💪 Strong Signals")
+            col_str1, col_str2 = st.columns(2)
+            
+            with col_str1:
+                st.metric("💪 Strong BUY", stats["strong_buy"])
+            with col_str2:
+                st.metric("💪 Strong SELL", stats["strong_sell"])
+            
+            # Market sentiment
+            st.markdown("### 😊 Market Sentiment")
+            col_sent1, col_sent2, col_sent3 = st.columns(3)
+            
+            with col_sent1:
+                st.metric("Bullish %", f"{stats['buy_pct']:.1f}%")
+            with col_sent2:
+                st.metric("Bearish %", f"{stats['sell_pct']:.1f}%")
+            with col_sent3:
+                st.metric("Neutral %", f"{stats['neutral_pct']:.1f}%")
+            
+            # Chart
+            if st.checkbox("Show Chart"):
+                try:
+                    import matplotlib.pyplot as plt
+                    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4))
+                    
+                    # Pie chart
+                    labels = ["🟢 BUY", "🔴 SELL", "🟡 NEUTRAL"]
+                    sizes = [stats["buy"], stats["sell"], stats["neutral"]]
+                    colors = ["#2ecc71", "#e74c3c", "#f39c12"]
+                    ax1.pie(sizes, labels=labels, colors=colors, autopct="%1.1f%%", startangle=90)
+                    ax1.set_title("Signal Distribution")
+                    
+                    # Bar chart
+                    categories = ["Strong BUY", "BUY", "SELL", "Strong SELL"]
+                    counts = [stats["strong_buy"], stats["buy"] - stats["strong_buy"],
+                             stats["sell"] - stats["strong_sell"], stats["strong_sell"]]
+                    ax2.bar(categories, counts, color=["#27ae60", "#2ecc71", "#e74c3c", "#c0392b"])
+                    ax2.set_ylabel("Count")
+                    ax2.set_title("Signal Strength Distribution")
+                    plt.tight_layout()
+                    st.pyplot(fig)
+                except Exception as e:
+                    st.warning(f"Chart error: {str(e)[:50]}")
+        else:
+            st.info(f"👈 Run '{dashboard_source}' scanner first")
+    
     # ════════════════════════════════════════════════════════════════════════════════
     # TAB 7: SETTINGS
     # ════════════════════════════════════════════════════════════════════════════════
     with tabs[7]:
         st.markdown("### ⚙️ Scanner Settings & Configuration")
-
+        
         st.markdown("#### 🎯 Signal Filtering")
         col_set1, col_set2, col_set3 = st.columns(3)
+        
         with col_set1:
             default_conf = st.number_input("Default Min Confidence %", 0, 100, DEFAULT_CONFIDENCE_THRESHOLD, 5, key="set_conf")
         with col_set2:
             default_rvol = st.slider("Default Min RVOL", 0.5, 3.0, DEFAULT_RVOL_THRESHOLD, 0.1, key="set_rvol")
         with col_set3:
             default_strong_rvol = st.slider("Strong Signal RVOL", 1.0, 3.0, DEFAULT_STRONG_RVOL, 0.1, key="set_strong_rvol")
-
+        
         st.markdown("#### 📊 Scan Parameters")
         col_set4, col_set5 = st.columns(2)
+        
         with col_set4:
             max_workers_setting = st.slider("Max Parallel Workers", 2, 16, MAX_WORKERS, 1, key="set_workers")
         with col_set5:
             batch_size_setting = st.slider("Batch Size", 10, 100, BATCH_SIZE, 10, key="set_batch")
-
+        
         st.markdown("#### 🔄 Auto Refresh")
         col_set6, col_set7 = st.columns(2)
+        
         with col_set6:
             auto_refresh = st.checkbox("Enable Auto Refresh", value=False, key="set_refresh")
         with col_set7:
-            refresh_interval = st.selectbox("Refresh Interval", REFRESH_INTERVALS, key="set_refresh_int") if auto_refresh else REFRESH_INTERVALS[0]
-
+            if auto_refresh:
+                refresh_interval = st.selectbox("Refresh Interval", REFRESH_INTERVALS, key="set_refresh_int")
+        
         st.markdown("#### 📋 Display Options")
         col_set8, col_set9 = st.columns(2)
+        
         with col_set8:
             show_errors = st.checkbox("Show Error Details", value=False, key="set_errors")
         with col_set9:
             show_logs = st.checkbox("Show API Logs", value=False, key="set_logs")
-
-        st.markdown("### ▶️ Apply / Run Settings")
-        if st.button("▶️ APPLY SETTINGS", key="settings_run", type="primary"):
-            st.session_state["app_settings"] = {
-                "Min Confidence %": default_conf,
-                "Min RVOL": default_rvol,
-                "Strong Signal RVOL": default_strong_rvol,
-                "Max Parallel Workers": max_workers_setting,
-                "Batch Size": batch_size_setting,
-                "Auto Refresh": auto_refresh,
-                "Refresh Interval Seconds": refresh_interval,
-                "Show Error Details": show_errors,
-                "Show API Logs": show_logs,
-                "Applied At": _generated_timestamp(),
-            }
-            st.success("✅ Settings applied successfully. These values are now saved for this Streamlit session.")
-
-        current_settings = st.session_state.get("app_settings", {
-            "Min Confidence %": default_conf,
-            "Min RVOL": default_rvol,
-            "Strong Signal RVOL": default_strong_rvol,
-            "Max Parallel Workers": max_workers_setting,
-            "Batch Size": batch_size_setting,
-            "Auto Refresh": auto_refresh,
-            "Refresh Interval Seconds": refresh_interval,
-            "Show Error Details": show_errors,
-            "Show API Logs": show_logs,
-            "Applied At": "Not applied yet",
-        })
-
-        st.markdown("### 📋 Current Settings")
-        settings_df = pd.DataFrame([current_settings])
-        st.dataframe(settings_df, use_container_width=True)
-
-        st.markdown("### 📥 Settings Export")
-        col_es1, col_es2 = st.columns(2)
-        with col_es1:
-            settings_excel = _format_excel_output(settings_df, "SETTINGS")
-            st.download_button("📊 DOWNLOAD SETTINGS EXCEL", settings_excel,
-                               f"Scanner_Settings_{_now_ist().strftime('%Y%m%d_%H%M')}.xlsx",
-                               "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="settings_xls")
-        with col_es2:
-            st.download_button("📄 DOWNLOAD SETTINGS CSV", to_csv_bytes(settings_df),
-                               f"Scanner_Settings_{_now_ist().strftime('%Y%m%d_%H%M')}.csv", "text/csv", key="settings_csv")
-
+        
         st.markdown("#### ℹ️ Information")
         st.info("""
         **Scanner Features:**
@@ -2992,15 +2888,12 @@ def show_scanner(fyers) -> None:
         - ✅ Options chain analysis (F&O)
         - ✅ Golden Cross / Death Cross detection
         - ✅ Next Candle Bias prediction
-        - ✅ Strong Signals RUN button + Excel export
-        - ✅ Market Dashboard RUN button + Excel export
-        - ✅ Settings APPLY button + Excel export
         
         **Data Source:** Fyers Live API
         **Timeframes:** 5M, 15M, 1H, Daily
         **Universes:** NSE Equities + F&O Stocks
         """)
-
+    
     gc.collect()
 
 # ════════════════════════════════════════════════════════════════════════════════
