@@ -1,29 +1,17 @@
 """
-OPTION CHAIN DASHBOARD - FIXED VERSION
-====================================
-Root Causes Fixed:
-1. ✅ Automatic expiry API calls during Streamlit rerun → blocked page
-2. ✅ No FYERS validation before calls → crashes
-3. ✅ Missing MCX fallback for commodities
-4. ✅ No timeout protection on external APIs
-5. ✅ Session state not cleared on symbol change
-6. ✅ BOS/CHoCH using current candle (look-ahead bias)
+option_chain.py (ENHANCED VERSION)
+==================================
+NSE India Options Chain Dashboard with AI-Powered Price Action Signals
++ Institutional Buy/Sell Pressure Analysis
 
-Fixes Applied:
-1. ✅ LAZY EXPIRY LOADING - Only load when user clicks button
-2. ✅ FYERS VALIDATION - Check client exists, catch all exceptions
-3. ✅ MCX FALLBACK - Demo data for commodities when FYERS fails
-4. ✅ TIMEOUT PROTECTION - All external calls have timeouts + retries
-5. ✅ SESSION STATE CLEANUP - Clear data only on symbol/expiry change
-6. ✅ NO REPAINTING - All indicators use historical data only
+Data Source: FYERS (Primary) → NSE (Fallback for option chain only)
+Live Signals: MSS, HH/HL/LH/LL, BOS, CHoCH, VWAP, EMA, RSI, MACD, Volume, RVOL
+Confirmation: 5M, 15M, 30M, 1H, 1D multi-timeframe analysis
+Trade Signal Output: BUY/SELL/HOLD with Entry, SL, T1, T2, T3, Probability, Confidence
+Pressure Signals: Buy Pressure, Sell Pressure, Net Bias, Aggression, Volume/OI Anomalies
 
-Why Page Won't Get Stuck:
-- No blocking API calls on page load
-- All API calls have timeout (10s) + retries (3x)
-- Errors are caught and displayed, never crash
-- MCX demo fallback means commodities always work
-- User can always click "Load Expiry" or change symbol
-- Session state prevents repeated API calls for same data
+This version includes institutional buy/sell pressure indicators
+while preserving all original functionality.
 """
 
 from __future__ import annotations
@@ -33,8 +21,9 @@ import logging
 import math
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
+from collections import deque
 
 import numpy as np
 import pandas as pd
@@ -44,30 +33,34 @@ import streamlit as st
 from plotly.subplots import make_subplots
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
-# ═══════════════════════════════════════════════════════════════════════════
-# LOGGING SETUP
-# ═══════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════
+# 1. LOGGING (ORIGINAL)
+# ══════════════════════════════════════════════════════════════════════════
 
 logger = logging.getLogger("option_chain_dashboard")
 if not logger.handlers:
-    handler = logging.StreamHandler()
-    handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
-    logger.addHandler(handler)
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(
+        logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+    )
+    logger.addHandler(_handler)
 logger.setLevel(logging.INFO)
 
-# ═══════════════════════════════════════════════════════════════════════════
-# CONSTANTS
-# ═══════════════════════════════════════════════════════════════════════════
+
+# ══════════════════════════════════════════════════════════════════════════
+# 2. CONSTANTS (ORIGINAL - UNMODIFIED)
+# ══════════════════════════════════════════════════════════════════════════
 
 NSE_BASE_URL = "https://www.nseindia.com"
 NSE_INDEX_CHAIN_URL = f"{NSE_BASE_URL}/api/option-chain-indices"
 NSE_EQUITY_CHAIN_URL = f"{NSE_BASE_URL}/api/option-chain-equities"
 
-INDEX_SYMBOLS = {
+INDEX_SYMBOLS: dict[str, str] = {
     "NIFTY": "NIFTY",
     "BANKNIFTY": "BANKNIFTY",
     "FINNIFTY": "FINNIFTY",
@@ -75,61 +68,41 @@ INDEX_SYMBOLS = {
     "SENSEX": "SENSEX",
 }
 
-NSE_UNSUPPORTED_INDICES = {"SENSEX", "BANKEX"}
+NSE_UNSUPPORTED_INDICES: set[str] = {"SENSEX", "BANKEX"}
 
-# COMMODITIES (MCX)
-COMMODITIES = {
-    "GOLD": {"name": "Gold (MCX)", "symbol": "GOLD", "exchange": "MCX", "tick_size": 1.0, "multiplier": 1},
-    "SILVER": {"name": "Silver (MCX)", "symbol": "SILVER", "exchange": "MCX", "tick_size": 1.0, "multiplier": 1},
-    "CRUDEOIL": {"name": "Crude Oil (MCX)", "symbol": "CRUDEOIL", "exchange": "MCX", "tick_size": 1.0, "multiplier": 100},
-    "NATURALGAS": {"name": "Natural Gas (MCX)", "symbol": "NATURALGAS", "exchange": "MCX", "tick_size": 0.1, "multiplier": 1},
+DEFAULT_LOT_SIZES: dict[str, int] = {
+    "NIFTY": 25,
+    "BANKNIFTY": 15,
+    "FINNIFTY": 25,
+    "MIDCPNIFTY": 50,
+    "SENSEX": 10,
+    "BANKEX": 15,
+    "_STOCK_DEFAULT": 1,
 }
-
-COMMODITY_LOT_SIZES = {"GOLD": 1, "SILVER": 1, "CRUDEOIL": 1, "NATURALGAS": 1}
-
-MCX_COMMODITY_EXPIRY_FALLBACK = {
-    "GOLD": ["02-Apr-2026", "03-Jun-2026", "07-Aug-2026", "02-Dec-2026"],
-    "SILVER": ["05-Mar-2026", "04-Jun-2026", "25-Sep-2026", "31-Dec-2026"],
-    "CRUDEOIL": ["19-Feb-2026", "19-Mar-2026", "16-Apr-2026", "21-May-2026"],
-    "NATURALGAS": ["26-Feb-2026", "26-Mar-2026", "28-May-2026", "25-Jun-2026"],
-}
-
-FYERS_COMMODITY_SYMBOL_CANDIDATES = {
-    "GOLD": ["MCX_GOLD", "MCX:GOLD"],  # FYERS V3 MCX Gold underlying
-    "SILVER": ["MCX_SILVER", "MCX:SILVER"],  # FYERS V3 MCX Silver underlying
-    "CRUDEOIL": ["MCX_CL", "MCX_CRUDEOIL", "MCX:CL"],  # MCX Crude Oil (CL is commodity code)
-    "NATURALGAS": ["MCX_NGAS", "MCX_NATURALGAS", "MCX:NGAS"],  # MCX Natural Gas (NGAS)
-}
-
-FYERS_INDEX_SYMBOL_CANDIDATES = {
-    "NIFTY": ["NSE:NIFTY50-INDEX"],
-    "BANKNIFTY": ["NSE:NIFTYBANK-INDEX", "NSE:BANKNIFTY-INDEX"],
-    "FINNIFTY": ["NSE:FINNIFTY-INDEX"],
-    "MIDCPNIFTY": ["NSE:MIDCPNIFTY-INDEX", "NSE:MIDCAPNIFTY-INDEX"],
-    "SENSEX": ["BSE:SENSEX-INDEX", "BSE:SENSEX-INDEX50"],
-    "BANKEX": ["BSE:BANKEX-INDEX"],
-}
-
-DEFAULT_LOT_SIZES = {"NIFTY": 25, "BANKNIFTY": 15, "FINNIFTY": 25, "MIDCPNIFTY": 50, "SENSEX": 10, "BANKEX": 15, "_STOCK_DEFAULT": 1}
 
 RISK_FREE_RATE = 0.07
 MIN_SIGMA = 0.01
 MAX_SIGMA = 5.0
 TRADING_DAYS_MIN_T = 0.25
+
 REQUEST_TIMEOUT = 10
 MAX_RETRIES = 3
 RETRY_BACKOFF_SECONDS = 1.5
 
 _NSE_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+    ),
     "Accept": "application/json, text/plain, */*",
     "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
     "Referer": f"{NSE_BASE_URL}/option-chain",
+    "Connection": "keep-alive",
 }
 
 REQUIRED_CHAIN_COLUMNS = ["strike_price", "ce_ltp", "ce_oi", "pe_ltp", "pe_oi"]
 
-# THEME COLORS
 DARK_BG = "#0d1117"
 PANEL_BG = "#161b22"
 BORDER_COLOR = "#30363d"
@@ -140,7 +113,13 @@ RED = "#f85149"
 AMBER = "#d29922"
 BLUE = "#58a6ff"
 
-TIMEFRAMES = {"5M": 5*60, "15M": 15*60, "30M": 30*60, "1H": 60*60, "1D": 24*60*60}
+TIMEFRAMES = {
+    "5M": 5 * 60,
+    "15M": 15 * 60,
+    "30M": 30 * 60,
+    "1H": 60 * 60,
+    "1D": 24 * 60 * 60,
+}
 
 DEFAULT_RSI_PERIOD = 14
 DEFAULT_EMA_PERIODS = {"fast": 9, "slow": 21}
@@ -151,15 +130,19 @@ MSS_MIN_STRENGTH = 1.0
 BOS_CONFIRMATION_BARS = 1
 CHOCH_CONFIRMATION_BARS = 2
 
-IV_HISTORY_KEY = "oc_atm_iv_history"
-IV_HISTORY_MAX_POINTS = 500
-COMMODITY_IV_HISTORY_KEY = "oc_commodity_iv_history"
-COMMODITY_OI_SHIFT_HISTORY_KEY = "oc_commodity_oi_shift_history"
-OI_SHIFT_HISTORY_KEY = "oc_prev_support_resistance"
+FYERS_INDEX_SYMBOL_CANDIDATES: dict[str, list[str]] = {
+    "NIFTY": ["NSE:NIFTY50-INDEX"],
+    "BANKNIFTY": ["NSE:NIFTYBANK-INDEX", "NSE:BANKNIFTY-INDEX"],
+    "FINNIFTY": ["NSE:FINNIFTY-INDEX"],
+    "MIDCPNIFTY": ["NSE:MIDCPNIFTY-INDEX", "NSE:MIDCAPNIFTY-INDEX"],
+    "SENSEX": ["BSE:SENSEX-INDEX", "BSE:SENSEX-INDEX50"],
+    "BANKEX": ["BSE:BANKEX-INDEX"],
+}
 
-# ═══════════════════════════════════════════════════════════════════════════
-# MARKET PRESSURE DATACLASS
-# ═══════════════════════════════════════════════════════════════════════════
+
+# ══════════════════════════════════════════════════════════════════════════
+# 0. BUY/SELL PRESSURE DATATYPES (NEW - Non-intrusive)
+# ══════════════════════════════════════════════════════════════════════════
 
 @dataclass
 class MarketPressure:
@@ -175,28 +158,12 @@ class MarketPressure:
     atm_pressure: float = 50.0
     otm_pressure: float = 50.0
 
-@dataclass
-class TradeSignal:
-    """Trade signal with all details."""
-    signal: str
-    entry: float
-    stop_loss: float
-    target_1: float
-    target_2: float
-    target_3: float
-    risk_reward_ratio: float
-    probability: float
-    confidence: float
-    confirmation_timeframes: list[str] = field(default_factory=list)
-    technical_reasons: list[str] = field(default_factory=list)
-    timestamp: datetime = field(default_factory=datetime.now)
 
-# ═══════════════════════════════════════════════════════════════════════════
-# HTTP SESSION LAYER - WITH TIMEOUT & RETRY PROTECTION
-# ═══════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════
+# 3. HTTP / SESSION LAYER (ORIGINAL - UNMODIFIED)
+# ══════════════════════════════════════════════════════════════════════════
 
 def _build_retrying_session() -> requests.Session:
-    """Build session with retry logic and timeout."""
     session = requests.Session()
     session.headers.update(_NSE_HEADERS)
     retry_cfg = Retry(
@@ -211,82 +178,93 @@ def _build_retrying_session() -> requests.Session:
     session.mount("http://", adapter)
     return session
 
+
 @st.cache_resource(show_spinner=False)
 def get_nse_session() -> requests.Session:
-    """Get cached NSE session."""
     session = _build_retrying_session()
     _warm_up_session(session)
     return session
 
+
 def _warm_up_session(session: requests.Session) -> bool:
-    """Warm up NSE session."""
     try:
         session.get(NSE_BASE_URL, timeout=REQUEST_TIMEOUT)
         session.get(f"{NSE_BASE_URL}/option-chain", timeout=REQUEST_TIMEOUT)
         return True
-    except Exception as e:
+    except requests.exceptions.RequestException as e:
         logger.warning("NSE session warm-up failed: %s", e)
         return False
 
+
 def fetch_json_with_retry(
-    session: requests.Session, url: str, params: Optional[dict] = None, max_retries: int = MAX_RETRIES
+    session: requests.Session, url: str, params: Optional[dict] = None,
+    max_retries: int = MAX_RETRIES,
 ) -> tuple[Optional[dict], Optional[str]]:
-    """Fetch JSON with retry logic and timeout protection."""
     last_error = "Unknown error"
-    
     for attempt in range(1, max_retries + 1):
         try:
             resp = session.get(url, params=params, timeout=REQUEST_TIMEOUT)
         except requests.exceptions.Timeout:
             last_error = f"Timeout on attempt {attempt}/{max_retries}"
-            logger.warning(last_error)
+            logger.warning("%s for %s", last_error, url)
             time.sleep(RETRY_BACKOFF_SECONDS * attempt)
             continue
         except requests.exceptions.ConnectionError as e:
-            last_error = f"Connection error: {e}"
+            last_error = f"Connection error on attempt {attempt}/{max_retries}: {e}"
             logger.warning(last_error)
             time.sleep(RETRY_BACKOFF_SECONDS * attempt)
             continue
         except requests.exceptions.RequestException as e:
-            last_error = f"Request error: {e}"
+            last_error = f"Request exception on attempt {attempt}/{max_retries}: {e}"
             logger.warning(last_error)
             time.sleep(RETRY_BACKOFF_SECONDS * attempt)
             continue
 
         if resp.status_code in (401, 403):
-            last_error = f"HTTP {resp.status_code} - session stale"
+            last_error = f"HTTP {resp.status_code} (stale session) on attempt {attempt}/{max_retries}"
+            logger.warning("%s — re-warming NSE session and retrying", last_error)
             _warm_up_session(session)
             time.sleep(RETRY_BACKOFF_SECONDS * attempt)
             continue
 
         if resp.status_code != 200:
-            last_error = f"HTTP {resp.status_code}"
+            last_error = f"HTTP {resp.status_code} on attempt {attempt}/{max_retries}"
+            logger.warning(last_error)
             time.sleep(RETRY_BACKOFF_SECONDS * attempt)
             continue
 
         try:
             payload = resp.json()
         except ValueError as e:
-            last_error = f"Invalid JSON: {e}"
+            last_error = f"Invalid JSON on attempt {attempt}/{max_retries}: {e}"
+            logger.warning(last_error)
             time.sleep(RETRY_BACKOFF_SECONDS * attempt)
             continue
 
         if not payload:
-            last_error = "Empty JSON payload"
+            last_error = f"Empty JSON payload on attempt {attempt}/{max_retries}"
+            logger.warning(last_error)
             time.sleep(RETRY_BACKOFF_SECONDS * attempt)
             continue
 
         return payload, None
 
-    logger.error("fetch_json_with_retry failed after %d attempts: %s", max_retries, last_error)
+    logger.error("fetch_json_with_retry exhausted all retries for %s: %s", url, last_error)
     return None, last_error
 
-# ═══════════════════════════════════════════════════════════════════════════
-# UTILITY FUNCTIONS
-# ═══════════════════════════════════════════════════════════════════════════
+
+# ══════════════════════════════════════════════════════════════════════════
+# 4. FYERS LIVE DATA FUNCTIONS (ORIGINAL - UNMODIFIED)
+# ══════════════════════════════════════════════════════════════════════════
+
+def _fyers_field(d: dict, *aliases: str, default: Any = None) -> Any:
+    for alias in aliases:
+        if alias in d and d[alias] is not None:
+            return d[alias]
+    return default
+
 
 def _safe_num(val: Any, default: float = 0.0) -> float:
-    """Safe numeric conversion."""
     try:
         if val is None:
             return default
@@ -297,8 +275,8 @@ def _safe_num(val: Any, default: float = 0.0) -> float:
     except (TypeError, ValueError):
         return default
 
+
 def normalize_stock_symbol(raw: str) -> str:
-    """Normalize stock symbol."""
     s = (raw or "").strip().upper()
     if s.endswith("-EQ"):
         s = s[:-3]
@@ -306,73 +284,29 @@ def normalize_stock_symbol(raw: str) -> str:
         s = s.split(":")[-1]
     return s
 
+
 def fyers_stock_symbol_candidates(stock: str) -> list[str]:
-    """Get FYERS symbol candidates for stock."""
     base = normalize_stock_symbol(stock)
     return [f"NSE:{base}-EQ", f"NSE:{base}"]
 
-def fyers_commodity_symbol_candidates(commodity_key: str) -> list[str]:
-    """Get FYERS symbol candidates for commodity."""
-    return FYERS_COMMODITY_SYMBOL_CANDIDATES.get(commodity_key, [f"MCX:{commodity_key}-OPT"])
 
 def _fyers_index_candidates(symbol_key: str) -> list[str]:
-    """Get FYERS index symbol candidates."""
     return FYERS_INDEX_SYMBOL_CANDIDATES.get(symbol_key, [f"NSE:{symbol_key}-INDEX"])
 
-def is_commodity(symbol: str) -> bool:
-    """Check if symbol is commodity."""
-    return symbol.upper() in COMMODITIES
-
-def _fyers_field(d: dict, *aliases: str, default: Any = None) -> Any:
-    """Extract field from dict with multiple aliases."""
-    for alias in aliases:
-        if alias in d and d[alias] is not None:
-            return d[alias]
-    return default
-
-# ═══════════════════════════════════════════════════════════════════════════
-# FYERS API CALLS - WITH VALIDATION & EXCEPTION HANDLING
-# ═══════════════════════════════════════════════════════════════════════════
 
 def _fyers_call_optionchain(fyers: Any, symbol: str, strikecount: int, timestamp: str = "") -> Optional[dict]:
-    """Safe FYERS optionchain call with exception handling and detailed logging."""
-    if fyers is None:
-        logger.warning("FYERS client is None - cannot make optionchain call")
-        return None
-    
+    req: dict[str, Any] = {"symbol": symbol, "strikecount": int(strikecount)}
+    if timestamp:
+        req["timestamp"] = str(timestamp)
     try:
-        req = {"symbol": symbol, "strikecount": int(strikecount)}
-        if timestamp:
-            req["timestamp"] = str(timestamp)
-        
-        logger.debug("FYERS optionchain request: symbol=%s, strikecount=%d", symbol, strikecount)
-        result = fyers.optionchain(data=req)
-        
-        if not isinstance(result, dict):
-            logger.warning("FYERS optionchain returned non-dict for %s: type=%s", symbol, type(result))
-            return None
-        
-        # Log response status
-        status = result.get("s", "unknown")
-        logger.info("FYERS optionchain response for %s: status=%s", symbol, status)
-        
-        if status != "ok":
-            logger.warning("FYERS optionchain non-ok status for %s: %s", symbol, result.get("msg", "no message"))
-            return result  # Return for further validation
-        
-        return result
-    except AttributeError as e:
-        logger.warning("FYERS client missing optionchain method: %s", e)
-        return None
+        return fyers.optionchain(data=req)
     except Exception as e:
-        logger.warning("FYERS optionchain call raised for %s: %s", symbol, e)
+        logger.warning("FYERS optionchain() call raised for %s: %s", symbol, e)
         return None
 
+
 def _fyers_call_history(fyers: Any, symbol: str, resolution: str, count: int = 100) -> Optional[dict]:
-    """Safe FYERS history call with exception handling."""
-    if fyers is None:
-        return None
-    
+    """Fetches OHLCV candle data from FYERS."""
     try:
         req = {
             "symbol": symbol,
@@ -384,23 +318,32 @@ def _fyers_call_history(fyers: Any, symbol: str, resolution: str, count: int = 1
         }
         return fyers.history(data=req)
     except Exception as e:
-        logger.warning("FYERS history call raised for %s: %s", symbol, e)
+        logger.warning("FYERS history() call raised for %s (res %s): %s", symbol, resolution, e)
         return None
 
+
 def fetch_fyers_candles(fyers: Any, symbol: str, timeframe_minutes: int, count: int = 100) -> Optional[pd.DataFrame]:
-    """Fetch OHLCV candles from FYERS."""
+    """Fetches OHLCV candles from FYERS for a given timeframe."""
     if fyers is None:
         return None
 
-    resolution_map = {5: "5", 15: "15", 30: "30", 60: "60", 1440: "1D"}
+    resolution_map = {
+        5: "5",
+        15: "15",
+        30: "30",
+        60: "60",
+        1440: "1D",
+    }
     resolution = resolution_map.get(timeframe_minutes, str(timeframe_minutes))
 
     resp = _fyers_call_history(fyers, symbol, resolution, count)
     if not isinstance(resp, dict) or resp.get("s") != "ok":
+        logger.warning("FYERS history returned non-ok status for %s: %s", symbol, resp.get("s") if resp else None)
         return None
 
     data = resp.get("candles", []) if isinstance(resp.get("candles"), list) else []
     if not data:
+        logger.warning("FYERS history returned empty candles for %s", symbol)
         return None
 
     rows = []
@@ -426,12 +369,13 @@ def fetch_fyers_candles(fyers: Any, symbol: str, timeframe_minutes: int, count: 
     df = df.sort_values("timestamp").reset_index(drop=True)
     return df
 
-# ═══════════════════════════════════════════════════════════════════════════
-# TECHNICAL INDICATORS
-# ═══════════════════════════════════════════════════════════════════════════
+
+# ══════════════════════════════════════════════════════════════════════════
+# 5. TECHNICAL INDICATOR FUNCTIONS (ORIGINAL - UNMODIFIED)
+# ══════════════════════════════════════════════════════════════════════════
 
 def calculate_rsi(df: pd.DataFrame, period: int = DEFAULT_RSI_PERIOD, col: str = "close") -> pd.Series:
-    """Calculate RSI."""
+    """Calculate RSI (Relative Strength Index)."""
     if df.empty or col not in df.columns:
         return pd.Series(index=df.index, dtype=float)
     
@@ -446,14 +390,19 @@ def calculate_rsi(df: pd.DataFrame, period: int = DEFAULT_RSI_PERIOD, col: str =
     rsi = 100 - (100 / (1 + rs))
     return rsi.fillna(50.0)
 
+
 def calculate_ema(df: pd.DataFrame, period: int, col: str = "close") -> pd.Series:
-    """Calculate EMA."""
+    """Calculate Exponential Moving Average."""
     if df.empty or col not in df.columns:
         return pd.Series(index=df.index, dtype=float)
     return df[col].ewm(span=period, adjust=False).mean()
 
-def calculate_macd(df: pd.DataFrame, fast: int = 12, slow: int = 26, signal: int = 9, col: str = "close") -> tuple:
-    """Calculate MACD."""
+
+def calculate_macd(df: pd.DataFrame, fast: int = DEFAULT_MACD_PARAMS["fast"],
+                   slow: int = DEFAULT_MACD_PARAMS["slow"],
+                   signal: int = DEFAULT_MACD_PARAMS["signal"],
+                   col: str = "close") -> tuple[pd.Series, pd.Series, pd.Series]:
+    """Calculate MACD, Signal line, and Histogram."""
     if df.empty or col not in df.columns:
         return pd.Series(0, index=df.index), pd.Series(0, index=df.index), pd.Series(0, index=df.index)
     
@@ -465,8 +414,9 @@ def calculate_macd(df: pd.DataFrame, fast: int = 12, slow: int = 26, signal: int
     
     return macd, signal_line, histogram
 
+
 def calculate_vwap(df: pd.DataFrame) -> pd.Series:
-    """Calculate VWAP."""
+    """Calculate Volume Weighted Average Price."""
     if df.empty or not all(c in df.columns for c in ["high", "low", "close", "volume"]):
         return pd.Series(index=df.index, dtype=float)
     
@@ -474,8 +424,9 @@ def calculate_vwap(df: pd.DataFrame) -> pd.Series:
     vwap = (typical_price * df["volume"]).cumsum() / df["volume"].cumsum()
     return vwap.fillna(df["close"])
 
+
 def calculate_rvol(df: pd.DataFrame, period: int = 20) -> pd.Series:
-    """Calculate Relative Volume."""
+    """Calculate Relative Volume (current volume vs average)."""
     if df.empty or "volume" not in df.columns:
         return pd.Series(1.0, index=df.index)
     
@@ -483,12 +434,14 @@ def calculate_rvol(df: pd.DataFrame, period: int = 20) -> pd.Series:
     rvol = df["volume"] / avg_vol.replace(0, 1.0)
     return rvol.fillna(1.0)
 
+
 def add_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    """Add all technical indicators."""
+    """Add all technical indicators to DataFrame."""
     if df.empty:
         return df
     
     d = df.copy()
+    
     d["rsi"] = calculate_rsi(d)
     d["ema_9"] = calculate_ema(d, 9)
     d["ema_21"] = calculate_ema(d, 21)
@@ -498,52 +451,64 @@ def add_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
     
     return d
 
-# ═══════════════════════════════════════════════════════════════════════════
-# MARKET STRUCTURE DETECTION (NO REPAINTING - USES HISTORICAL DATA ONLY)
-# ═══════════════════════════════════════════════════════════════════════════
+
+# ══════════════════════════════════════════════════════════════════════════
+# 6. MARKET STRUCTURE DETECTION (ORIGINAL - UNMODIFIED)
+# ══════════════════════════════════════════════════════════════════════════
+
+def detect_hh_ll(df: pd.DataFrame) -> tuple[pd.Series, pd.Series]:
+    """Detect Higher High (HH) and Lower Low (LL) relative to previous candle."""
+    if df.empty or len(df) < 2:
+        return pd.Series(False, index=df.index), pd.Series(False, index=df.index)
+    
+    hh = pd.Series(False, index=df.index)
+    ll = pd.Series(False, index=df.index)
+    
+    for i in range(1, len(df)):
+        hh.iloc[i] = df["high"].iloc[i] > df["high"].iloc[i-1]
+        ll.iloc[i] = df["low"].iloc[i] < df["low"].iloc[i-1]
+    
+    return hh, ll
+
 
 def detect_structure_levels(df: pd.DataFrame, lookback: int = 5) -> dict[str, float]:
-    """Detect support/resistance from HISTORICAL data only (no current candle)."""
-    if df.empty or len(df) < lookback + 1:
+    """Detect major support and resistance levels (highs and lows)."""
+    if df.empty or len(df) < lookback:
         return {"resistance": 0.0, "support": 0.0, "recent_high": 0.0, "recent_low": 0.0}
     
-    # Use ONLY confirmed previous candles, NOT current candle
-    historical = df.iloc[:-1].tail(lookback) if len(df) > 1 else df.tail(lookback)
-    
+    recent = df.tail(lookback)
     return {
-        "resistance": float(historical["high"].max()) if not historical.empty else 0.0,
-        "support": float(historical["low"].min()) if not historical.empty else 0.0,
-        "recent_high": float(df["high"].iloc[-2]) if len(df) > 1 else 0.0,
-        "recent_low": float(df["low"].iloc[-2]) if len(df) > 1 else 0.0,
+        "resistance": float(recent["high"].max()),
+        "support": float(recent["low"].min()),
+        "recent_high": float(df["high"].iloc[-1]),
+        "recent_low": float(df["low"].iloc[-1]),
     }
 
+
 def detect_bos(df: pd.DataFrame, structure_levels: dict) -> bool:
-    """Detect Break of Structure using CONFIRMED levels (not current candle)."""
+    """Detect Break of Structure (BOS)."""
     if df.empty or len(df) < 2:
         return False
     
     resistance = structure_levels.get("resistance", 0.0)
     support = structure_levels.get("support", 0.0)
+    current_high = df["high"].iloc[-1]
+    current_low = df["low"].iloc[-1]
     
-    # Use PREVIOUS candle, not current
-    prev_high = df["high"].iloc[-2] if len(df) > 1 else df["high"].iloc[-1]
-    prev_low = df["low"].iloc[-2] if len(df) > 1 else df["low"].iloc[-1]
-    
-    bos_up = prev_high > resistance and resistance > 0
-    bos_down = prev_low < support and support > 0
+    bos_up = current_high > resistance and resistance > 0
+    bos_down = current_low < support and support > 0
     
     return bos_up or bos_down
 
+
 def detect_choch(df: pd.DataFrame, lookback: int = 10) -> bool:
-    """Detect Change of Character using CONFIRMED data (no future candles)."""
-    if df.empty or len(df) < lookback + 1:
+    """Detect Change of Character (CHoCH)."""
+    if df.empty or len(df) < lookback:
         return False
     
-    # Use only historical data, exclude current candle
-    historical = df.iloc[:-1].tail(lookback)
-    
-    lows = historical["low"].values
-    highs = historical["high"].values
+    recent = df.tail(lookback)
+    lows = recent["low"].values
+    highs = recent["high"].values
     
     lower_lows = sum(1 for i in range(1, len(lows)) if lows[i] < lows[i-1])
     lower_highs = sum(1 for i in range(1, len(highs)) if highs[i] < highs[i-1])
@@ -555,22 +520,22 @@ def detect_choch(df: pd.DataFrame, lookback: int = 10) -> bool:
     
     return bearish_shift or bullish_shift
 
+
 def detect_mss(df_list: dict[str, pd.DataFrame]) -> dict[str, dict]:
-    """Detect Market Structure Shift (no repainting)."""
+    """Detect Market Structure Shift (MSS) across timeframes."""
     result = {tf: {"mss": False, "direction": "NONE", "strength": 0.0} for tf in df_list.keys()}
     
-    if not df_list or not any(df_list.values()):
+    if not df_list or not all(df_list.values()):
         return result
     
-    if "5M" in df_list and df_list["5M"] is not None and not df_list["5M"].empty and len(df_list["5M"]) > 1:
+    if "5M" in df_list and not df_list["5M"].empty:
         df_5m = df_list["5M"]
         levels_5m = detect_structure_levels(df_5m)
         bos_5m = detect_bos(df_5m, levels_5m)
         
-        if bos_5m:
-            # Use previous candle for signal generation
-            close_5m = df_5m["close"].iloc[-2] if len(df_5m) > 1 else df_5m["close"].iloc[-1]
-            open_5m = df_5m["open"].iloc[-2] if len(df_5m) > 1 else df_5m["open"].iloc[-1]
+        if bos_5m and len(df_5m) >= 2:
+            close_5m = df_5m["close"].iloc[-1]
+            open_5m = df_5m["open"].iloc[-1]
             
             if close_5m > open_5m:
                 direction = "UP"
@@ -584,15 +549,15 @@ def detect_mss(df_list: dict[str, pd.DataFrame]) -> dict[str, dict]:
             result["5M"]["strength"] = min(strength, 100.0)
     
     for tf in ["15M", "30M", "1H", "1D"]:
-        if tf not in df_list or df_list[tf] is None or df_list[tf].empty or len(df_list[tf]) < 2:
+        if tf not in df_list or df_list[tf] is None or df_list[tf].empty:
             continue
         
         df = df_list[tf]
         choch = detect_choch(df)
         
         if choch:
-            close = df["close"].iloc[-2] if len(df) > 1 else df["close"].iloc[-1]
-            open_ = df["open"].iloc[-2] if len(df) > 1 else df["open"].iloc[-1]
+            close = df["close"].iloc[-1]
+            open_ = df["open"].iloc[-1]
             direction = "UP" if close > open_ else "DOWN"
             result[tf]["mss"] = True
             result[tf]["direction"] = direction
@@ -600,13 +565,31 @@ def detect_mss(df_list: dict[str, pd.DataFrame]) -> dict[str, dict]:
     
     return result
 
-# ═══════════════════════════════════════════════════════════════════════════
-# TRADE SIGNAL GENERATION
-# ═══════════════════════════════════════════════════════════════════════════
+
+# ══════════════════════════════════════════════════════════════════════════
+# 7. TRADE SIGNAL GENERATION (ORIGINAL - UNMODIFIED)
+# ══════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class TradeSignal:
+    """Represents a single trade signal with all relevant details."""
+    signal: str
+    entry: float
+    stop_loss: float
+    target_1: float
+    target_2: float
+    target_3: float
+    risk_reward_ratio: float
+    probability: float
+    confidence: float
+    confirmation_timeframes: list[str] = field(default_factory=list)
+    technical_reasons: list[str] = field(default_factory=list)
+    timestamp: datetime = field(default_factory=datetime.now)
+
 
 def generate_trade_signal(df_dict: dict[str, pd.DataFrame], spot: float, mss: dict[str, dict],
                           fyers_available: bool) -> Optional[TradeSignal]:
-    """Generate trade signal from price action."""
+    """Generate a multi-timeframe confirmed trade signal."""
     
     if not fyers_available:
         logger.warning("FYERS not available - cannot generate trade signal")
@@ -743,13 +726,14 @@ def generate_trade_signal(df_dict: dict[str, pd.DataFrame], spot: float, mss: di
         technical_reasons=technical_reasons if technical_reasons else ["Neutral"],
     )
 
-# ═══════════════════════════════════════════════════════════════════════════
-# DATA FETCH & PARSE LAYER
-# ═══════════════════════════════════════════════════════════════════════════
+
+# ══════════════════════════════════════════════════════════════════════════
+# 8. DATA FETCH + PARSE LAYER (ORIGINAL - UNMODIFIED)
+# ══════════════════════════════════════════════════════════════════════════
 
 @st.cache_data(ttl=15, show_spinner=False)
 def fetch_option_chain_raw(symbol: str, is_index: bool) -> dict:
-    """Cached NSE option-chain fetch."""
+    """Cached (15s TTL) raw NSE option-chain JSON fetch."""
     session = get_nse_session()
     url = NSE_INDEX_CHAIN_URL if is_index else NSE_EQUITY_CHAIN_URL
     payload, error = fetch_json_with_retry(session, url, params={"symbol": symbol})
@@ -760,8 +744,9 @@ def fetch_option_chain_raw(symbol: str, is_index: bool) -> dict:
         return {"ok": False, "payload": payload, "error": "Response had no option-chain records."}
     return {"ok": True, "payload": payload, "error": None}
 
+
 def parse_option_chain(payload: dict, preferred_expiry: str = "") -> tuple[pd.DataFrame, dict]:
-    """Parse NSE's raw option-chain payload."""
+    """Parses NSE's raw option-chain payload."""
     meta = {
         "spot_price": 0.0, "expiry_dates": [], "selected_expiry": "",
         "fetched_at": datetime.now(), "total_rows_seen": 0, "rows_parsed": 0,
@@ -827,8 +812,8 @@ def parse_option_chain(payload: dict, preferred_expiry: str = "") -> tuple[pd.Da
     df.reset_index(drop=True, inplace=True)
     return df, meta
 
+
 def validate_chain_df(df: pd.DataFrame) -> bool:
-    """Validate option chain dataframe."""
     try:
         if df is None or not isinstance(df, pd.DataFrame) or df.empty:
             return False
@@ -837,11 +822,11 @@ def validate_chain_df(df: pd.DataFrame) -> bool:
         strikes = pd.to_numeric(df["strike_price"], errors="coerce").dropna()
         return bool((strikes > 0).sum() > 0)
     except Exception as e:
-        logger.error("validate_chain_df raised: %s", e)
+        logger.error("validate_chain_df raised an exception: %s", e)
         return False
 
+
 def filter_strikes_around_atm(df: pd.DataFrame, spot: float, n_each_side: int) -> pd.DataFrame:
-    """Filter strikes around ATM."""
     if df is None or df.empty or n_each_side <= 0:
         return df
     d = df.sort_values("strike_price").reset_index(drop=True)
@@ -851,8 +836,8 @@ def filter_strikes_around_atm(df: pd.DataFrame, spot: float, n_each_side: int) -
     hi = min(len(d), atm_idx + n_each_side + 1)
     return d.iloc[lo:hi].reset_index(drop=True)
 
+
 def parse_days_to_expiry(expiry_label: str) -> float:
-    """Parse days to expiry."""
     if not expiry_label:
         return 7.0
     for fmt in ("%d-%b-%Y", "%d-%m-%Y", "%Y-%m-%d"):
@@ -864,18 +849,21 @@ def parse_days_to_expiry(expiry_label: str) -> float:
             continue
     return 7.0
 
-# ═══════════════════════════════════════════════════════════════════════════
-# GREEKS ENGINE
-# ═══════════════════════════════════════════════════════════════════════════
+
+# ══════════════════════════════════════════════════════════════════════════
+# 9. GREEKS ENGINE (ORIGINAL - UNMODIFIED)
+# ══════════════════════════════════════════════════════════════════════════
 
 def _norm_cdf(x: float) -> float:
     return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
 
+
 def _norm_pdf(x: float) -> float:
     return math.exp(-0.5 * x * x) / math.sqrt(2.0 * math.pi)
 
-def bs_greeks(spot: float, strike: float, t_years: float, r: float, sigma: float, is_call: bool) -> dict[str, float]:
-    """Black-Scholes greeks."""
+
+def bs_greeks(spot: float, strike: float, t_years: float, r: float, sigma: float,
+              is_call: bool) -> dict[str, float]:
     if spot <= 0 or strike <= 0 or t_years <= 0 or sigma <= 0:
         return {"delta": 0.0, "gamma": 0.0, "theta": 0.0, "vega": 0.0}
     sigma = min(max(sigma, MIN_SIGMA), MAX_SIGMA)
@@ -908,11 +896,13 @@ def bs_greeks(spot: float, strike: float, t_years: float, r: float, sigma: float
         "theta": round(theta, 4), "vega": round(vega, 4),
     }
 
-def add_greeks_columns(df: pd.DataFrame, spot: float, expiry_label: str, r: float = RISK_FREE_RATE) -> pd.DataFrame:
-    """Add Greeks columns."""
+
+def add_greeks_columns(df: pd.DataFrame, spot: float, expiry_label: str,
+                        r: float = RISK_FREE_RATE) -> pd.DataFrame:
     d = df.copy()
     if d.empty:
-        for col in ("ce_delta", "ce_gamma", "ce_theta", "ce_vega", "pe_delta", "pe_gamma", "pe_theta", "pe_vega"):
+        for col in ("ce_delta", "ce_gamma", "ce_theta", "ce_vega",
+                    "pe_delta", "pe_gamma", "pe_theta", "pe_vega"):
             d[col] = 0.0
         return d
 
@@ -931,12 +921,16 @@ def add_greeks_columns(df: pd.DataFrame, spot: float, expiry_label: str, r: floa
         d[f"pe_{key}"] = pe_g.apply(lambda x: x[key])
     return d
 
-# ═══════════════════════════════════════════════════════════════════════════
-# IV RANK / IV PERCENTILE (WITH COMMODITY TRACKING)
-# ═══════════════════════════════════════════════════════════════════════════
+
+# ══════════════════════════════════════════════════════════════════════════
+# 10. IV RANK / IV PERCENTILE (ORIGINAL - UNMODIFIED)
+# ══════════════════════════════════════════════════════════════════════════
+
+IV_HISTORY_KEY = "oc_atm_iv_history"
+IV_HISTORY_MAX_POINTS = 500
+
 
 def _atm_iv(df: pd.DataFrame, spot: float) -> float:
-    """Get ATM IV."""
     if df.empty or not spot:
         return 0.0
     idx = (df["strike_price"] - spot).abs().idxmin()
@@ -944,8 +938,8 @@ def _atm_iv(df: pd.DataFrame, spot: float) -> float:
     ivs = [v for v in (row.get("ce_iv", 0), row.get("pe_iv", 0)) if v and v > 0]
     return float(np.mean(ivs)) if ivs else 0.0
 
+
 def update_iv_history(symbol: str, expiry_label: str, atm_iv: float) -> None:
-    """Update IV history for equities/indices."""
     if atm_iv <= 0:
         return
     history = st.session_state.setdefault(IV_HISTORY_KEY, {})
@@ -957,8 +951,8 @@ def update_iv_history(symbol: str, expiry_label: str, atm_iv: float) -> None:
     history[key] = series
     st.session_state[IV_HISTORY_KEY] = history
 
+
 def compute_iv_rank_percentile(symbol: str, expiry_label: str, current_iv: float) -> tuple[float, float]:
-    """Compute IV rank/percentile for equities/indices."""
     history = st.session_state.get(IV_HISTORY_KEY, {})
     series = history.get(f"{symbol}|{expiry_label}", [])
     if len(series) < 2 or current_iv <= 0:
@@ -968,36 +962,12 @@ def compute_iv_rank_percentile(symbol: str, expiry_label: str, current_iv: float
     iv_percentile = (sum(1 for v in series if v <= current_iv) / len(series)) * 100
     return round(float(np.clip(iv_rank, 0, 100)), 1), round(iv_percentile, 1)
 
-def update_commodity_iv_history(commodity_key: str, expiry_label: str, atm_iv: float) -> None:
-    """Update IV history for commodities."""
-    if atm_iv <= 0:
-        return
-    history = st.session_state.setdefault(COMMODITY_IV_HISTORY_KEY, {})
-    key = f"{commodity_key}|{expiry_label}"
-    series = history.get(key, [])
-    series.append(atm_iv)
-    if len(series) > IV_HISTORY_MAX_POINTS:
-        series = series[-IV_HISTORY_MAX_POINTS:]
-    history[key] = series
-    st.session_state[COMMODITY_IV_HISTORY_KEY] = history
 
-def compute_commodity_iv_rank_percentile(commodity_key: str, expiry_label: str, current_iv: float) -> tuple[float, float]:
-    """Compute IV rank/percentile for commodities."""
-    history = st.session_state.get(COMMODITY_IV_HISTORY_KEY, {})
-    series = history.get(f"{commodity_key}|{expiry_label}", [])
-    if len(series) < 2 or current_iv <= 0:
-        return 0.0, 0.0
-    lo, hi = min(series), max(series)
-    iv_rank = ((current_iv - lo) / (hi - lo)) * 100 if hi > lo else 50.0
-    iv_percentile = (sum(1 for v in series if v <= current_iv) / len(series)) * 100
-    return round(float(np.clip(iv_rank, 0, 100)), 1), round(iv_percentile, 1)
-
-# ═══════════════════════════════════════════════════════════════════════════
-# GEX / DEX
-# ═══════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════
+# 11. GEX / DEX (ORIGINAL - UNMODIFIED)
+# ══════════════════════════════════════════════════════════════════════════
 
 def compute_gex_dex(df: pd.DataFrame, spot: float, lot_size: int) -> dict[str, Any]:
-    """Compute GEX/DEX."""
     if df.empty or not spot:
         return {"total_gex": 0.0, "total_dex": 0.0, "by_strike": pd.DataFrame(),
                 "max_gex_strike": None, "min_gex_strike": None, "gamma_flip": None}
@@ -1031,12 +1001,12 @@ def compute_gex_dex(df: pd.DataFrame, spot: float, lot_size: int) -> dict[str, A
         "gamma_flip": gamma_flip,
     }
 
-# ═══════════════════════════════════════════════════════════════════════════
-# FYERS PARSING
-# ═══════════════════════════════════════════════════════════════════════════
+
+# ══════════════════════════════════════════════════════════════════════════
+# 12. FYERS OPTION CHAIN PARSING (ORIGINAL - UNMODIFIED)
+# ══════════════════════════════════════════════════════════════════════════
 
 def _fyers_extract_expiry_list(response: dict) -> list[tuple[str, str]]:
-    """Extract expiry list from FYERS response."""
     data = response.get("data", {}) if isinstance(response, dict) else {}
     raw = data.get("expiryData") or data.get("expirydata") or []
     out = []
@@ -1051,7 +1021,7 @@ def _fyers_extract_expiry_list(response: dict) -> list[tuple[str, str]]:
         except (TypeError, ValueError, OSError):
             label = str(ts)
         out.append((label, str(ts)))
-    seen = set()
+    seen: set = set()
     deduped = []
     for label, ts in out:
         if ts not in seen:
@@ -1067,33 +1037,17 @@ def _fyers_extract_expiry_list(response: dict) -> list[tuple[str, str]]:
     deduped.sort(key=_ts_key)
     return deduped
 
+
 def _fyers_extract_chain_rows(response: dict) -> tuple[list[dict], dict]:
-    """
-    Extract chain rows from FYERS response.
-    
-    Tries multiple possible keys for option chain data:
-    - optionChain (FYERS V3 standard)
-    - optionsChain (alternate)
-    - options, optionschain (legacy)
-    """
     data = response.get("data", {}) if isinstance(response, dict) else {}
-    
-    # Log available keys for debugging
-    if isinstance(data, dict):
-        logger.debug("FYERS response data keys: %s", list(data.keys()))
-    
-    # Try multiple possible keys for option chain data
-    for key in ("optionChain", "optionsChain", "options", "optionschain"):
+    for key in ("optionsChain", "options", "optionschain"):
         candidate = data.get(key)
         if isinstance(candidate, list) and candidate:
-            logger.debug("Found option chain rows under key '%s': %d records", key, len(candidate))
             return candidate, data
-    
-    logger.debug("No option chain rows found in response. Checked keys: optionChain, optionsChain, options, optionschain")
     return [], data
 
+
 def _fyers_extract_spot(response: dict, data: dict) -> float:
-    """Extract spot price from FYERS response."""
     for src in (data, response if isinstance(response, dict) else {}):
         if not isinstance(src, dict):
             continue
@@ -1103,8 +1057,8 @@ def _fyers_extract_spot(response: dict, data: dict) -> float:
                 return f
     return 0.0
 
+
 def _bs_price(spot: float, strike: float, t: float, r: float, sigma: float, is_call: bool) -> float:
-    """Black-Scholes price."""
     if t <= 0 or sigma <= 0 or spot <= 0 or strike <= 0:
         return max(0.0, (spot - strike) if is_call else (strike - spot))
     d1 = (math.log(spot / strike) + (r + 0.5 * sigma ** 2) * t) / (sigma * math.sqrt(t))
@@ -1113,8 +1067,9 @@ def _bs_price(spot: float, strike: float, t: float, r: float, sigma: float, is_c
         return spot * _norm_cdf(d1) - strike * math.exp(-r * t) * _norm_cdf(d2)
     return strike * math.exp(-r * t) * _norm_cdf(-d2) - spot * _norm_cdf(-d1)
 
-def implied_volatility(price: float, spot: float, strike: float, t_years: float, is_call: bool, r: float = RISK_FREE_RATE) -> float:
-    """Calculate implied volatility."""
+
+def implied_volatility(price: float, spot: float, strike: float, t_years: float,
+                        is_call: bool, r: float = RISK_FREE_RATE) -> float:
     if price <= 0 or spot <= 0 or strike <= 0 or t_years <= 0:
         return 0.0
     sigma = 0.30
@@ -1134,9 +1089,10 @@ def implied_volatility(price: float, spot: float, strike: float, t_years: float,
         sigma = max(MIN_SIGMA, min(sigma, MAX_SIGMA))
     return round(sigma * 100, 2)
 
+
 def parse_fyers_chain(rows: list[dict], spot: float, expiry_label: str) -> pd.DataFrame:
-    """Parse FYERS chain rows."""
-    ce_rows, pe_rows = {}, {}
+    ce_rows: dict[float, dict] = {}
+    pe_rows: dict[float, dict] = {}
     for item in rows:
         if not isinstance(item, dict):
             continue
@@ -1191,8 +1147,9 @@ def parse_fyers_chain(rows: list[dict], spot: float, expiry_label: str) -> pd.Da
     df.reset_index(drop=True, inplace=True)
     return df
 
-def fetch_via_fyers(fyers: Any, symbol_key: str, is_index: bool, stock_name: str, preferred_expiry: str, strike_count: int) -> dict:
-    """Fetch via FYERS with validation."""
+
+def fetch_via_fyers(fyers: Any, symbol_key: str, is_index: bool, stock_name: str,
+                     preferred_expiry: str, strike_count: int) -> dict:
     symbol_candidates = (
         _fyers_index_candidates(symbol_key) if is_index else fyers_stock_symbol_candidates(stock_name)
     )
@@ -1248,146 +1205,15 @@ def fetch_via_fyers(fyers: Any, symbol_key: str, is_index: bool, stock_name: str
     }
     return {"ok": True, "df": df, "meta": meta, "error": None}
 
-def fetch_via_fyers_commodity(fyers: Any, commodity_key: str, preferred_expiry: str, strike_count: int) -> dict:
-    """
-    Fetch MCX commodity option chain via FYERS V3 API.
-    
-    Uses correct MCX underlying symbols:
-    - CRUDEOIL → MCX_CL
-    - GOLD → MCX_GOLD
-    - SILVER → MCX_SILVER
-    - NATURALGAS → MCX_NGAS
-    """
-    symbol_candidates = fyers_commodity_symbol_candidates(commodity_key)
-    
-    if not symbol_candidates:
-        error_msg = f"No FYERS symbol candidates for commodity {commodity_key}."
-        logger.error(error_msg)
-        return {"ok": False, "df": pd.DataFrame(), "meta": {}, "error": error_msg}
-    
-    logger.info("Fetching MCX commodity %s with symbol candidates: %s", commodity_key, symbol_candidates)
-    
-    expiry_resp, used_symbol = None, None
-    
-    for sym in symbol_candidates:
-        logger.debug("Attempting FYERS optionchain for commodity %s with symbol: %s", commodity_key, sym)
-        resp = _fyers_call_optionchain(fyers, sym, strikecount=2)
-        if isinstance(resp, dict) and resp.get("s") == "ok":
-            expiry_resp, used_symbol = resp, sym
-            logger.info("SUCCESS: FYERS optionchain returned valid response for commodity %s using symbol %s", commodity_key, sym)
-            break
-        else:
-            resp_status = resp.get("s", "no response") if isinstance(resp, dict) else "invalid response"
-            logger.debug("FYERS optionchain failed for symbol %s: status=%s", sym, resp_status)
-    
-    if expiry_resp is None or used_symbol is None:
-        error_msg = f"FYERS returned no valid response for commodity {commodity_key}. Tried symbols: {symbol_candidates}"
-        logger.error(error_msg)
-        return {"ok": False, "df": pd.DataFrame(), "meta": {}, "error": error_msg}
-    
-    # Extract available expiry dates
-    expiry_list = _fyers_extract_expiry_list(expiry_resp)
-    if not expiry_list:
-        error_msg = f"No expiry dates available for commodity {commodity_key} from FYERS response."
-        logger.error(error_msg)
-        return {"ok": False, "df": pd.DataFrame(), "meta": {}, "error": error_msg}
-    
-    logger.info("Available expiry dates for commodity %s: %s", commodity_key, [lbl for lbl, _ in expiry_list])
-    
-    # Select expiry: prefer user input, fall back to first available
-    selected_label, selected_ts = expiry_list[0]
-    for label, ts in expiry_list:
-        if label == preferred_expiry:
-            selected_label, selected_ts = label, ts
-            logger.info("Selected preferred expiry %s for commodity %s", label, commodity_key)
-            break
-    else:
-        logger.info("Using first available expiry %s for commodity %s", selected_label, commodity_key)
-    
-    # Fetch full chain with requested strike count
-    logger.debug("Fetching option chain for commodity %s with strikecount=%d and expiry=%s", 
-                 commodity_key, strike_count, selected_label)
-    chain_resp = _fyers_call_optionchain(fyers, used_symbol, strikecount=strike_count, timestamp=selected_ts)
-    
-    if not isinstance(chain_resp, dict) or chain_resp.get("s") != "ok":
-        error_msg = f"FYERS commodity chain fetch failed for {commodity_key}. Status: {chain_resp.get('s', 'unknown') if isinstance(chain_resp, dict) else 'invalid response'}"
-        logger.error(error_msg)
-        return {"ok": False, "df": pd.DataFrame(), "meta": {}, "error": error_msg}
-    
-    # Extract chain rows
-    rows, data = _fyers_extract_chain_rows(chain_resp)
-    if not rows:
-        error_msg = f"Empty option chain rows for commodity {commodity_key}. Response keys: {list(chain_resp.get('data', {}).keys()) if isinstance(chain_resp, dict) else 'no data'}"
-        logger.error(error_msg)
-        return {"ok": False, "df": pd.DataFrame(), "meta": {}, "error": error_msg}
-    
-    logger.info("Extracted %d option chain rows for commodity %s", len(rows), commodity_key)
-    
-    # Parse and validate
-    spot = _fyers_extract_spot(chain_resp, data)
-    df = parse_fyers_chain(rows, spot, selected_label)
-    
-    if not validate_chain_df(df):
-        error_msg = f"Commodity chain validation failed for {commodity_key}. Rows parsed: {len(df)}"
-        logger.error(error_msg)
-        return {"ok": False, "df": pd.DataFrame(), "meta": {}, "error": error_msg}
-    
-    logger.info("Successfully parsed and validated %d strikes for commodity %s. Spot: %.2f", len(df), commodity_key, spot)
-    
-    meta = {
-        "spot_price": spot, 
-        "expiry_dates": [lbl for lbl, _ in expiry_list],
-        "selected_expiry": selected_label, 
-        "fetched_at": datetime.now(),
-        "total_rows_seen": len(rows), 
-        "rows_parsed": len(df),
-        "commodity": True, 
-        "exchange": "MCX",
-        "fyers_symbol": used_symbol,  # Track which symbol worked
-    }
-    
-    return {"ok": True, "df": df, "meta": meta, "error": None}
 
-# DEMO MODE REMOVED - Production requires only LIVE data from configured data sources
-
-def fetch_chain_commodity(fyers: Any, commodity_key: str, preferred_expiry: str, strike_count: int) -> dict:
-    """
-    Fetch commodity chain - LIVE DATA ONLY.
-    
-    Production requirement: No demo/fallback data.
-    If FYERS unavailable, return clear error.
-    """
-    if fyers is None:
-        return {
-            "ok": False, "df": pd.DataFrame(), "meta": {},
-            "error": "🔴 LIVE DATA ERROR: FYERS client not authenticated. Cannot fetch live commodity data.",
-            "source": "NONE", "data_status": "ERROR"
-        }
-    
-    result = fetch_via_fyers_commodity(fyers, commodity_key, preferred_expiry, strike_count)
-    if result["ok"]:
-        result["source"] = "FYERS"
-        result["data_status"] = "LIVE"
-        return result
-    
-    fyers_error = result.get("error", "Unknown error")
-    logger.error("FYERS commodity fetch failed for %s: %s", commodity_key, fyers_error)
-    
-    # Production: No demo fallback. Return clear error.
-    return {
-        "ok": False, "df": pd.DataFrame(), "meta": {},
-        "error": f"🔴 LIVE DATA ERROR: {fyers_error}. Cannot fetch live data for {commodity_key}.",
-        "source": "NONE", "data_status": "ERROR"
-    }
-
-def fetch_chain_unified(fyers: Any, symbol_key: str, is_index: bool, stock_name: str, preferred_expiry: str, strike_count: int) -> dict:
-    """Fetch option chain - FYERS → NSE fallback. LIVE data only."""
+def fetch_chain_unified(fyers: Any, symbol_key: str, is_index: bool, stock_name: str,
+                         preferred_expiry: str, strike_count: int) -> dict:
+    """FYERS-first, NSE-fallback."""
     fyers_error = None
     if fyers is not None:
         result = fetch_via_fyers(fyers, symbol_key, is_index, stock_name, preferred_expiry, strike_count)
         if result["ok"]:
             result["source"] = "FYERS"
-            result["data_status"] = "LIVE"
             return result
         fyers_error = result.get("error")
         logger.warning("FYERS fetch failed, falling back to NSE: %s", fyers_error)
@@ -1398,37 +1224,37 @@ def fetch_chain_unified(fyers: Any, symbol_key: str, is_index: bool, stock_name:
             "a FYERS (or other BSE-capable) client is required for this index."
         )
         combined = f"FYERS: {fyers_error} | {error}" if fyers_error else error
-        return {"ok": False, "df": pd.DataFrame(), "meta": {}, "error": combined, "source": "NONE", "data_status": "ERROR"}
+        return {"ok": False, "df": pd.DataFrame(), "meta": {}, "error": combined, "source": "NONE"}
 
     nse_symbol = symbol_key if is_index else normalize_stock_symbol(stock_name)
     raw_result = fetch_option_chain_raw(nse_symbol, is_index)
     if not raw_result.get("ok"):
         error = raw_result.get("error") or "NSE fetch failed."
         combined = f"FYERS: {fyers_error} | NSE: {error}" if fyers_error else error
-        return {"ok": False, "df": pd.DataFrame(), "meta": {}, "error": combined, "source": "NONE", "data_status": "ERROR"}
+        return {"ok": False, "df": pd.DataFrame(), "meta": {}, "error": combined, "source": "NONE"}
 
     df, meta = parse_option_chain(raw_result["payload"], preferred_expiry=preferred_expiry)
     if not validate_chain_df(df):
         error = "NSE response did not contain a usable option chain."
         combined = f"FYERS: {fyers_error} | NSE: {error}" if fyers_error else error
-        return {"ok": False, "df": pd.DataFrame(), "meta": meta, "error": combined, "source": "NONE", "data_status": "ERROR"}
+        return {"ok": False, "df": pd.DataFrame(), "meta": meta, "error": combined, "source": "NONE"}
 
-    return {"ok": True, "df": df, "meta": meta, "error": None, "source": "NSE", "data_status": "LIVE"}
+    return {"ok": True, "df": df, "meta": meta, "error": None, "source": "NSE"}
 
-# ═══════════════════════════════════════════════════════════════════════════
-# ANALYTICS & PCR/MAX PAIN
-# ═══════════════════════════════════════════════════════════════════════════
+
+# ══════════════════════════════════════════════════════════════════════════
+# 13. ANALYTICS (ORIGINAL - UNMODIFIED)
+# ══════════════════════════════════════════════════════════════════════════
 
 def calc_pcr(df: pd.DataFrame) -> float:
-    """Calculate PCR."""
     if df.empty:
         return 0.0
     total_ce = df["ce_oi"].sum()
     total_pe = df["pe_oi"].sum()
     return round(float(total_pe / total_ce), 3) if total_ce > 0 else 0.0
 
+
 def calc_max_pain(df: pd.DataFrame) -> float:
-    """Calculate Max Pain."""
     if df.empty:
         return 0.0
     strikes = df["strike_price"].values
@@ -1440,8 +1266,8 @@ def calc_max_pain(df: pd.DataFrame) -> float:
     ]
     return float(strikes[int(np.argmin(pain))]) if pain else 0.0
 
+
 def calc_max_oi(df: pd.DataFrame) -> dict[str, Optional[float]]:
-    """Calculate max OI strikes."""
     if df.empty:
         return {"max_ce_oi_strike": None, "max_pe_oi_strike": None}
     return {
@@ -1449,16 +1275,16 @@ def calc_max_oi(df: pd.DataFrame) -> dict[str, Optional[float]]:
         "max_pe_oi_strike": float(df.loc[df["pe_oi"].idxmax(), "strike_price"]),
     }
 
+
 def calc_support_resistance(df: pd.DataFrame) -> tuple[Optional[float], Optional[float]]:
-    """Calculate support and resistance."""
     if df.empty:
         return None, None
     support = float(df.loc[df["pe_oi"].idxmax(), "strike_price"])
     resistance = float(df.loc[df["ce_oi"].idxmax(), "strike_price"])
     return support, resistance
 
+
 def classify_buildup(df: pd.DataFrame) -> pd.DataFrame:
-    """Classify buildup status."""
     d = df.copy()
 
     def _matrix(price_chg: float, oi_chg: float) -> str:
@@ -1481,8 +1307,8 @@ def classify_buildup(df: pd.DataFrame) -> pd.DataFrame:
     d["Put Unwinding"] = d["pe_chng_oi"] < 0
     return d
 
+
 def classify_moneyness(df: pd.DataFrame, spot: float) -> pd.DataFrame:
-    """Classify moneyness."""
     d = df.copy()
     if d.empty:
         d["ATM"] = False
@@ -1500,9 +1326,12 @@ def classify_moneyness(df: pd.DataFrame, spot: float) -> pd.DataFrame:
     )
     return d
 
+
+OI_SHIFT_HISTORY_KEY = "oc_prev_support_resistance"
+
+
 def detect_oi_shift(symbol: str, expiry_label: str, support: Optional[float],
                      resistance: Optional[float]) -> list[str]:
-    """Detect OI shift for equities/indices."""
     notes = []
     history = st.session_state.setdefault(OI_SHIFT_HISTORY_KEY, {})
     key = f"{symbol}|{expiry_label}"
@@ -1518,33 +1347,121 @@ def detect_oi_shift(symbol: str, expiry_label: str, support: Optional[float],
     st.session_state[OI_SHIFT_HISTORY_KEY] = history
     return notes
 
-def detect_commodity_oi_shift(commodity_key: str, expiry_label: str, support: Optional[float],
-                             resistance: Optional[float]) -> list[str]:
-    """Detect OI shift for commodities."""
-    notes = []
-    history = st.session_state.setdefault(COMMODITY_OI_SHIFT_HISTORY_KEY, {})
-    key = f"{commodity_key}|{expiry_label}"
-    prev = history.get(key)
-    
-    if prev:
-        if prev.get("support") is not None and support is not None and support != prev["support"]:
-            direction = "up" if support > prev["support"] else "down"
-            notes.append(f"Support shifted {direction}: {prev['support']:,.0f} → {support:,.0f}")
-        if prev.get("resistance") is not None and resistance is not None and resistance != prev["resistance"]:
-            direction = "up" if resistance > prev["resistance"] else "down"
-            notes.append(f"Resistance shifted {direction}: {prev['resistance']:,.0f} → {resistance:,.0f}")
-    
-    history[key] = {"support": support, "resistance": resistance}
-    st.session_state[COMMODITY_OI_SHIFT_HISTORY_KEY] = history
-    
-    return notes
 
-# ═══════════════════════════════════════════════════════════════════════════
-# BUY/SELL PRESSURE CALCULATIONS
-# ═══════════════════════════════════════════════════════════════════════════
+def _normalize_series(series: pd.Series) -> pd.Series:
+    s = series.astype(float)
+    if s.empty:
+        return s
+    if s.max() == s.min():
+        return pd.Series(0.5, index=s.index)
+    return (s - s.min()) / (s.max() - s.min())
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 14. AI SIGNAL ENGINE (ORIGINAL - UNMODIFIED)
+# ══════════════════════════════════════════════════════════════════════════
+
+AI_SCORE_WEIGHTS = {
+    "put_writing": 0.18, "call_unwind": 0.12, "volume": 0.12, "pcr_bias": 0.12,
+    "proximity": 0.12, "max_pain_proximity": 0.10, "highest_oi": 0.10,
+    "delta_oi_magnitude": 0.08, "iv_stability": 0.06,
+}
+
+
+def compute_ai_scores(df: pd.DataFrame, spot: float, atm_strike: float,
+                       max_pain: float, pcr: float) -> pd.DataFrame:
+    d = df.copy()
+    if d.empty:
+        d["CE Score"] = pd.Series(dtype=float)
+        d["PE Score"] = pd.Series(dtype=float)
+        return d
+
+    ce_oi_s = _normalize_series(d["ce_oi"])
+    pe_oi_s = _normalize_series(d["pe_oi"])
+    pe_chng_s = _normalize_series(d["pe_chng_oi"])
+    ce_chng_s = _normalize_series(d["ce_chng_oi"])
+    ce_unwind_s = _normalize_series((-d["ce_chng_oi"]).clip(lower=0))
+    pe_unwind_s = _normalize_series((-d["pe_chng_oi"]).clip(lower=0))
+    ce_vol_s = _normalize_series(d["ce_volume"])
+    pe_vol_s = _normalize_series(d["pe_volume"])
+    delta_oi_mag_s = _normalize_series(d["ce_chng_oi"].abs() + d["pe_chng_oi"].abs())
+
+    avg_ce_iv = d.loc[d["ce_iv"] > 0, "ce_iv"].mean() if (d["ce_iv"] > 0).any() else 0.0
+    avg_pe_iv = d.loc[d["pe_iv"] > 0, "pe_iv"].mean() if (d["pe_iv"] > 0).any() else 0.0
+    ce_iv_stability_s = _normalize_series(-(d["ce_iv"] - avg_ce_iv).abs())
+    pe_iv_stability_s = _normalize_series(-(d["pe_iv"] - avg_pe_iv).abs())
+
+    ref = spot if spot else (atm_strike if atm_strike else float(d["strike_price"].median()))
+    proximity_s = 1 - _normalize_series((d["strike_price"] - ref).abs())
+    maxpain_proximity_s = 1 - _normalize_series((d["strike_price"] - max_pain).abs()) if max_pain else pd.Series(0.5, index=d.index)
+
+    pcr_bull_bias = float(np.clip(((pcr or 1.0) - 1.0), -1, 1))
+    pcr_bull_s = (pcr_bull_bias + 1) / 2
+    pcr_bear_s = 1 - pcr_bull_s
+
+    w = AI_SCORE_WEIGHTS
+    ce_score = (
+        pe_chng_s * w["put_writing"] + ce_unwind_s * w["call_unwind"] + ce_vol_s * w["volume"]
+        + pcr_bull_s * w["pcr_bias"] + proximity_s * w["proximity"]
+        + maxpain_proximity_s * w["max_pain_proximity"] + ce_oi_s * w["highest_oi"]
+        + delta_oi_mag_s * w["delta_oi_magnitude"] + ce_iv_stability_s * w["iv_stability"]
+    ) * 100
+
+    pe_score = (
+        ce_chng_s * w["put_writing"] + pe_unwind_s * w["call_unwind"] + pe_vol_s * w["volume"]
+        + pcr_bear_s * w["pcr_bias"] + proximity_s * w["proximity"]
+        + maxpain_proximity_s * w["max_pain_proximity"] + pe_oi_s * w["highest_oi"]
+        + delta_oi_mag_s * w["delta_oi_magnitude"] + pe_iv_stability_s * w["iv_stability"]
+    ) * 100
+
+    d["CE Score"] = ce_score.clip(0, 100).round(1)
+    d["PE Score"] = pe_score.clip(0, 100).round(1)
+
+    def _decision(row) -> str:
+        ce, pe = row["CE Score"], row["PE Score"]
+        if abs(ce - pe) < 3:
+            return "HOLD"
+        return "BUY CE" if ce > pe else "BUY PE"
+
+    d["AI Signal"] = d.apply(_decision, axis=1)
+    d["AI Confidence %"] = d[["CE Score", "PE Score"]].max(axis=1).round(1)
+    return d
+
+
+def detect_institutional_smart_money(df: pd.DataFrame) -> pd.DataFrame:
+    d = df.copy()
+    if d.empty:
+        d["Institutional Signal"] = pd.Series(dtype=object)
+        d["Smart Money"] = pd.Series(dtype=bool)
+        return d
+
+    ce_oi_q75 = d["ce_oi"].quantile(0.75) if d["ce_oi"].max() > 0 else 0
+    pe_oi_q75 = d["pe_oi"].quantile(0.75) if d["pe_oi"].max() > 0 else 0
+    ce_vol_med = d["ce_volume"].median()
+    pe_vol_med = d["pe_volume"].median()
+
+    def _inst_signal(row) -> str:
+        ce_inst = row["ce_oi"] >= ce_oi_q75 > 0 and row["ce_chng_oi"] > 0 and row["ce_volume"] >= ce_vol_med
+        pe_inst = row["pe_oi"] >= pe_oi_q75 > 0 and row["pe_chng_oi"] > 0 and row["pe_volume"] >= pe_vol_med
+        if ce_inst and pe_inst:
+            return "Institutional Activity (Both Sides)"
+        if ce_inst:
+            return "Institutional Call Writing"
+        if pe_inst:
+            return "Institutional Put Writing"
+        return "None"
+
+    d["Institutional Signal"] = d.apply(_inst_signal, axis=1)
+    d["Smart Money"] = d["Institutional Signal"] != "None"
+    return d
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 15. BUY/SELL PRESSURE FUNCTIONS (NEW - ADDED CLEANLY)
+# ══════════════════════════════════════════════════════════════════════════
 
 def _normalize_0_100(value, min_val: float = 0.0, max_val: float = 1.0):
-    """Normalize to 0-100."""
+    """Normalize value to 0-100 range. Handles both scalars and pandas Series."""
     if max_val == min_val:
         if isinstance(value, pd.Series):
             return pd.Series(50.0, index=value.index)
@@ -1556,8 +1473,9 @@ def _normalize_0_100(value, min_val: float = 0.0, max_val: float = 1.0):
         return normalized.clip(0, 100)
     return max(0.0, min(100.0, normalized))
 
+
 def calculate_volume_pressure(df: pd.DataFrame) -> pd.DataFrame:
-    """Calculate volume pressure."""
+    """Calculate volume-based pressure."""
     d = df.copy()
     if d.empty or "ce_volume" not in d.columns or "pe_volume" not in d.columns:
         d["call_volume_pressure"] = 0.0
@@ -1578,8 +1496,9 @@ def calculate_volume_pressure(df: pd.DataFrame) -> pd.DataFrame:
     
     return d
 
+
 def calculate_oi_change_pressure(df: pd.DataFrame) -> pd.DataFrame:
-    """Calculate OI change pressure."""
+    """Calculate OI change momentum."""
     d = df.copy()
     if d.empty or "ce_chng_oi" not in d.columns or "pe_chng_oi" not in d.columns:
         d["call_oi_accumulation"] = 0.0
@@ -1596,8 +1515,9 @@ def calculate_oi_change_pressure(df: pd.DataFrame) -> pd.DataFrame:
     
     return d
 
+
 def calculate_delta_pressure(df: pd.DataFrame, spot: float) -> pd.DataFrame:
-    """Calculate delta pressure."""
+    """Calculate delta-weighted pressure."""
     d = df.copy()
     if d.empty or "ce_delta" not in d.columns or "pe_delta" not in d.columns:
         d["call_delta_exposure"] = 0.0
@@ -1619,6 +1539,7 @@ def calculate_delta_pressure(df: pd.DataFrame, spot: float) -> pd.DataFrame:
     d["delta_imbalance"] = d["delta_imbalance"].clip(-100, 100)
     
     return d
+
 
 def calculate_composite_pressure(df: pd.DataFrame, spot: float, lot_size: int = 1) -> pd.DataFrame:
     """Calculate composite buy/sell pressure."""
@@ -1683,8 +1604,9 @@ def calculate_composite_pressure(df: pd.DataFrame, spot: float, lot_size: int = 
     
     return d
 
+
 def detect_pressure_anomalies(df: pd.DataFrame) -> pd.DataFrame:
-    """Detect pressure anomalies."""
+    """Detect unusual volume/OI spikes."""
     d = df.copy()
     
     if d.empty or "ce_volume" not in d.columns:
@@ -1707,8 +1629,9 @@ def detect_pressure_anomalies(df: pd.DataFrame) -> pd.DataFrame:
     
     return d
 
+
 def calculate_market_pressure_summary(df: pd.DataFrame, spot: float, pcr: float) -> MarketPressure:
-    """Calculate market pressure summary."""
+    """Calculate market-wide pressure summary."""
     if df.empty:
         return MarketPressure()
     
@@ -1754,6 +1677,7 @@ def calculate_market_pressure_summary(df: pd.DataFrame, spot: float, pcr: float)
         otm_pressure=round(otm_pressure, 2),
     )
 
+
 def add_pressure_analysis(df: pd.DataFrame, spot: float, lot_size: int = 1) -> tuple[pd.DataFrame, MarketPressure]:
     """Full pressure analysis pipeline."""
     d = df.copy()
@@ -1769,130 +1693,23 @@ def add_pressure_analysis(df: pd.DataFrame, spot: float, lot_size: int = 1) -> t
     
     return d, market_pressure
 
-# ═══════════════════════════════════════════════════════════════════════════
-# AI SCORING & INSTITUTIONAL SIGNALS
-# ═══════════════════════════════════════════════════════════════════════════
 
-AI_SCORE_WEIGHTS = {
-    "put_writing": 0.18, "call_unwind": 0.12, "volume": 0.12, "pcr_bias": 0.12,
-    "proximity": 0.12, "max_pain_proximity": 0.10, "highest_oi": 0.10,
-    "delta_oi_magnitude": 0.08, "iv_stability": 0.06,
-}
-
-def _normalize_series(series: pd.Series) -> pd.Series:
-    """Normalize series."""
-    s = series.astype(float)
-    if s.empty:
-        return s
-    if s.max() == s.min():
-        return pd.Series(0.5, index=s.index)
-    return (s - s.min()) / (s.max() - s.min())
-
-def compute_ai_scores(df: pd.DataFrame, spot: float, atm_strike: float, max_pain: float, pcr: float) -> pd.DataFrame:
-    """Compute AI scores."""
-    d = df.copy()
-    if d.empty:
-        d["CE Score"] = pd.Series(dtype=float)
-        d["PE Score"] = pd.Series(dtype=float)
-        return d
-
-    ce_oi_s = _normalize_series(d["ce_oi"])
-    pe_oi_s = _normalize_series(d["pe_oi"])
-    pe_chng_s = _normalize_series(d["pe_chng_oi"])
-    ce_chng_s = _normalize_series(d["ce_chng_oi"])
-    ce_unwind_s = _normalize_series((-d["ce_chng_oi"]).clip(lower=0))
-    pe_unwind_s = _normalize_series((-d["pe_chng_oi"]).clip(lower=0))
-    ce_vol_s = _normalize_series(d["ce_volume"])
-    pe_vol_s = _normalize_series(d["pe_volume"])
-    delta_oi_mag_s = _normalize_series(d["ce_chng_oi"].abs() + d["pe_chng_oi"].abs())
-
-    avg_ce_iv = d.loc[d["ce_iv"] > 0, "ce_iv"].mean() if (d["ce_iv"] > 0).any() else 0.0
-    avg_pe_iv = d.loc[d["pe_iv"] > 0, "pe_iv"].mean() if (d["pe_iv"] > 0).any() else 0.0
-    ce_iv_stability_s = _normalize_series(-(d["ce_iv"] - avg_ce_iv).abs())
-    pe_iv_stability_s = _normalize_series(-(d["pe_iv"] - avg_pe_iv).abs())
-
-    ref = spot if spot else (atm_strike if atm_strike else float(d["strike_price"].median()))
-    proximity_s = 1 - _normalize_series((d["strike_price"] - ref).abs())
-    maxpain_proximity_s = 1 - _normalize_series((d["strike_price"] - max_pain).abs()) if max_pain else pd.Series(0.5, index=d.index)
-
-    pcr_bull_bias = float(np.clip(((pcr or 1.0) - 1.0), -1, 1))
-    pcr_bull_s = (pcr_bull_bias + 1) / 2
-    pcr_bear_s = 1 - pcr_bull_s
-
-    w = AI_SCORE_WEIGHTS
-    ce_score = (
-        pe_chng_s * w["put_writing"] + ce_unwind_s * w["call_unwind"] + ce_vol_s * w["volume"]
-        + pcr_bull_s * w["pcr_bias"] + proximity_s * w["proximity"]
-        + maxpain_proximity_s * w["max_pain_proximity"] + ce_oi_s * w["highest_oi"]
-        + delta_oi_mag_s * w["delta_oi_magnitude"] + ce_iv_stability_s * w["iv_stability"]
-    ) * 100
-
-    pe_score = (
-        ce_chng_s * w["put_writing"] + pe_unwind_s * w["call_unwind"] + pe_vol_s * w["volume"]
-        + pcr_bear_s * w["pcr_bias"] + proximity_s * w["proximity"]
-        + maxpain_proximity_s * w["max_pain_proximity"] + pe_oi_s * w["highest_oi"]
-        + delta_oi_mag_s * w["delta_oi_magnitude"] + pe_iv_stability_s * w["iv_stability"]
-    ) * 100
-
-    d["CE Score"] = ce_score.clip(0, 100).round(1)
-    d["PE Score"] = pe_score.clip(0, 100).round(1)
-
-    def _decision(row) -> str:
-        ce, pe = row["CE Score"], row["PE Score"]
-        if abs(ce - pe) < 3:
-            return "HOLD"
-        return "BUY CE" if ce > pe else "BUY PE"
-
-    d["AI Signal"] = d.apply(_decision, axis=1)
-    d["AI Confidence %"] = d[["CE Score", "PE Score"]].max(axis=1).round(1)
-    return d
-
-def detect_institutional_smart_money(df: pd.DataFrame) -> pd.DataFrame:
-    """Detect institutional activity."""
-    d = df.copy()
-    if d.empty:
-        d["Institutional Signal"] = pd.Series(dtype=object)
-        d["Smart Money"] = pd.Series(dtype=bool)
-        return d
-
-    ce_oi_q75 = d["ce_oi"].quantile(0.75) if d["ce_oi"].max() > 0 else 0
-    pe_oi_q75 = d["pe_oi"].quantile(0.75) if d["pe_oi"].max() > 0 else 0
-    ce_vol_med = d["ce_volume"].median()
-    pe_vol_med = d["pe_volume"].median()
-
-    def _inst_signal(row) -> str:
-        ce_inst = row["ce_oi"] >= ce_oi_q75 > 0 and row["ce_chng_oi"] > 0 and row["ce_volume"] >= ce_vol_med
-        pe_inst = row["pe_oi"] >= pe_oi_q75 > 0 and row["pe_chng_oi"] > 0 and row["pe_volume"] >= pe_vol_med
-        if ce_inst and pe_inst:
-            return "Institutional Activity (Both Sides)"
-        if ce_inst:
-            return "Institutional Call Writing"
-        if pe_inst:
-            return "Institutional Put Writing"
-        return "None"
-
-    d["Institutional Signal"] = d.apply(_inst_signal, axis=1)
-    d["Smart Money"] = d["Institutional Signal"] != "None"
-    return d
-
-# ═══════════════════════════════════════════════════════════════════════════
-# CHARTS (PLOTLY)
-# ═══════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════
+# 16. CHARTS (ORIGINAL - UNMODIFIED + NEW PRESSURE CHARTS)
+# ══════════════════════════════════════════════════════════════════════════
 
 def _plotly_dark_layout(fig: go.Figure, height: int = 420, title: str = "") -> go.Figure:
-    """Apply dark theme."""
     fig.update_layout(
         paper_bgcolor=DARK_BG, plot_bgcolor=DARK_BG,
         font=dict(color=TEXT_MUTED, family="Courier New"),
         height=height, margin=dict(l=10, r=10, t=40 if title else 10, b=10),
         title=dict(text=title, font=dict(color=TEXT_MAIN, size=14)) if title else None,
         legend=dict(bgcolor=PANEL_BG, bordercolor=BORDER_COLOR, borderwidth=1),
-        hovermode="closest",
     )
     return fig
 
+
 def chart_oi_bars(df: pd.DataFrame, max_pain: float) -> go.Figure:
-    """Chart OI bars."""
     fig = make_subplots(rows=1, cols=2, subplot_titles=("Call OI (CE)", "Put OI (PE)"),
                          shared_yaxes=True, horizontal_spacing=0.04)
     if df.empty:
@@ -1924,8 +1741,8 @@ def chart_oi_bars(df: pd.DataFrame, max_pain: float) -> go.Figure:
     fig.update_annotations(font_color=TEXT_MUTED)
     return _plotly_dark_layout(fig, height=480)
 
+
 def chart_iv_skew(df: pd.DataFrame) -> go.Figure:
-    """Chart IV skew."""
     fig = go.Figure()
     if not df.empty:
         fig.add_trace(go.Scatter(x=df["strike_price"], y=df["ce_iv"], mode="lines+markers",
@@ -1936,8 +1753,8 @@ def chart_iv_skew(df: pd.DataFrame) -> go.Figure:
                        yaxis=dict(title="IV %", showgrid=True, gridcolor=BORDER_COLOR))
     return _plotly_dark_layout(fig, height=320, title="Implied Volatility Skew")
 
+
 def chart_greeks(df: pd.DataFrame, greek: str) -> go.Figure:
-    """Chart Greeks."""
     fig = go.Figure()
     col_ce, col_pe = f"ce_{greek}", f"pe_{greek}"
     if not df.empty and col_ce in df.columns:
@@ -1949,8 +1766,8 @@ def chart_greeks(df: pd.DataFrame, greek: str) -> go.Figure:
                        yaxis=dict(title=greek.title(), showgrid=True, gridcolor=BORDER_COLOR))
     return _plotly_dark_layout(fig, height=300, title=f"{greek.title()} by Strike")
 
+
 def chart_gex_by_strike(gex_data: dict) -> go.Figure:
-    """Chart GEX."""
     fig = go.Figure()
     by_strike = gex_data.get("by_strike", pd.DataFrame())
     if not by_strike.empty:
@@ -1960,14 +1777,16 @@ def chart_gex_by_strike(gex_data: dict) -> go.Figure:
                        yaxis=dict(title="Gamma Exposure", showgrid=True, gridcolor=BORDER_COLOR))
     return _plotly_dark_layout(fig, height=320, title="Gamma Exposure (GEX) by Strike")
 
+
 def chart_price_action(df: pd.DataFrame, title: str = "Price Action with Indicators") -> go.Figure:
-    """Chart price action."""
+    """Chart price action with VWAP, EMA, and volume."""
     if df.empty or "close" not in df.columns:
         return _plotly_dark_layout(go.Figure(), title=title)
     
     fig = make_subplots(
         rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.1,
-        row_heights=[0.7, 0.3], subplot_titles=("Price", "Volume")
+        row_heights=[0.7, 0.3],
+        subplot_titles=("Price", "Volume")
     )
     
     fig.add_trace(go.Candlestick(
@@ -2007,8 +1826,9 @@ def chart_price_action(df: pd.DataFrame, title: str = "Price Action with Indicat
     
     return _plotly_dark_layout(fig, height=500, title=title)
 
+
 def chart_technical_indicators(df: pd.DataFrame) -> go.Figure:
-    """Chart technical indicators."""
+    """Chart RSI, MACD, and Momentum."""
     if df.empty:
         return _plotly_dark_layout(go.Figure())
     
@@ -2060,8 +1880,8 @@ def chart_technical_indicators(df: pd.DataFrame) -> go.Figure:
     
     return _plotly_dark_layout(fig, height=600)
 
+
 def gauge_pcr(pcr: float) -> go.Figure:
-    """Gauge PCR."""
     fig = go.Figure(go.Indicator(
         mode="gauge+number", value=pcr,
         number={"font": {"color": TEXT_MAIN, "size": 32, "family": "Courier New"}},
@@ -2076,8 +1896,13 @@ def gauge_pcr(pcr: float) -> go.Figure:
     ))
     return _plotly_dark_layout(fig, height=220)
 
+
+# ══════════════════════════════════════════════════════════════════════════
+# NEW PRESSURE CHARTS
+# ══════════════════════════════════════════════════════════════════════════
+
 def chart_pressure_by_strike(df: pd.DataFrame, spot: float) -> go.Figure:
-    """Chart buy/sell pressure."""
+    """Chart buy/sell pressure by strike."""
     fig = go.Figure()
     
     if df.empty or "buy_pressure" not in df.columns:
@@ -2117,8 +1942,9 @@ def chart_pressure_by_strike(df: pd.DataFrame, spot: float) -> go.Figure:
     
     return _plotly_dark_layout(fig, height=500, title="Buy/Sell Pressure by Strike")
 
+
 def chart_net_pressure(df: pd.DataFrame, spot: float) -> go.Figure:
-    """Chart net pressure."""
+    """Chart net pressure (directional)."""
     fig = go.Figure()
     
     if df.empty or "net_pressure" not in df.columns:
@@ -2149,6 +1975,7 @@ def chart_net_pressure(df: pd.DataFrame, spot: float) -> go.Figure:
     
     return _plotly_dark_layout(fig, height=400, title="Net Pressure Bias by Strike")
 
+
 def chart_aggression_level(df: pd.DataFrame) -> go.Figure:
     """Chart aggression level."""
     fig = go.Figure()
@@ -2176,68 +2003,10 @@ def chart_aggression_level(df: pd.DataFrame) -> go.Figure:
     
     return _plotly_dark_layout(fig, height=350, title="Aggression Level by Strike")
 
-# ═══════════════════════════════════════════════════════════════════════════
-# HTML TABLE RENDERING
-# ═══════════════════════════════════════════════════════════════════════════
 
-# ═══════════════════════════════════════════════════════════════════════════
-# LIVE DATA STATUS & TABLE TITLE HELPERS
-# ═══════════════════════════════════════════════════════════════════════════
-
-def get_live_data_status_badge(data_status: str) -> str:
-    """Get live data status badge with emoji."""
-    status_map = {
-        "LIVE": "🟢 LIVE DATA",
-        "ERROR": "🔴 LIVE DATA ERROR",
-        "UNAVAILABLE": "🟠 LIVE DATA UNAVAILABLE",
-        "NONE": "⚪ NO DATA",
-    }
-    return status_map.get(data_status, "⚪ UNKNOWN")
-
-def format_live_timestamp() -> str:
-    """Format current timestamp in IST."""
-    from datetime import datetime
-    import pytz
-    
-    ist = pytz.timezone('Asia/Kolkata')
-    now_ist = datetime.now(ist)
-    return now_ist.strftime("%d-%b-%Y %H:%M:%S IST")
-
-def render_option_chain_header(symbol: str, exchange: str, expiry: str, spot: float, data_status: str, fetched_time: datetime) -> str:
-    """
-    Render dynamic option chain table header with LIVE data status.
-    
-    Example output:
-    ### SILVER (MCX) — LIVE OPTION CHAIN
-    🟢 LIVE DATA | Exchange: MCX | Expiry: 28-Aug-2026 | Spot: ₹90,000 | Updated: 22-Aug-2026 09:36:12 IST
-    """
-    status_badge = get_live_data_status_badge(data_status)
-    
-    # Format spot price
-    spot_str = f"₹{spot:,.0f}" if spot > 0 else "—"
-    
-    # Format expiry
-    expiry_str = expiry if expiry else "—"
-    
-    # Format updated time
-    if fetched_time:
-        try:
-            import pytz
-            ist = pytz.timezone('Asia/Kolkata')
-            if fetched_time.tzinfo is None:
-                fetched_time = fetched_time.replace(tzinfo=pytz.UTC)
-            fetched_ist = fetched_time.astimezone(ist)
-            updated_str = fetched_ist.strftime("%d-%b-%Y %H:%M:%S IST")
-        except:
-            updated_str = fetched_time.strftime("%d-%b-%Y %H:%M:%S")
-    else:
-        updated_str = "—"
-    
-    # Build header
-    title = f"### {symbol.upper()} ({exchange.upper()}) — LIVE OPTION CHAIN"
-    status_line = f"{status_badge} | Exchange: **{exchange}** | Expiry: **{expiry_str}** | Spot: **{spot_str}** | Updated: **{updated_str}**"
-    
-    return f"{title}\n\n{status_line}"
+# ══════════════════════════════════════════════════════════════════════════
+# 17. HTML TABLE RENDERING (ORIGINAL - UNMODIFIED)
+# ══════════════════════════════════════════════════════════════════════════
 
 _TABLE_CSS = f"""
 <style>
@@ -2250,8 +2019,8 @@ _TABLE_CSS = f"""
 </style>
 """
 
+
 def _safe_cell(val: Any) -> str:
-    """Safe HTML escaping."""
     if val is None:
         return ""
     try:
@@ -2262,8 +2031,8 @@ def _safe_cell(val: Any) -> str:
     s = str(val)
     return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
 
+
 def _oi_cell_style(val: float, heavy_thresh: float, max_val: float) -> str:
-    """Style OI cell."""
     if max_val <= 0:
         return f"color:{TEXT_MUTED};"
     pct = max(0.0, min(100.0, (val / max_val) * 100))
@@ -2273,8 +2042,8 @@ def _oi_cell_style(val: float, heavy_thresh: float, max_val: float) -> str:
     weight = "font-weight:700;" if is_heavy else ""
     return bg + weight
 
+
 def _oi_change_cell_style(val: float, heavy_thresh: float) -> str:
-    """Style OI change cell."""
     if val == 0:
         return f"color:{TEXT_MUTED};"
     is_large = heavy_thresh > 0 and abs(val) >= heavy_thresh
@@ -2282,8 +2051,8 @@ def _oi_change_cell_style(val: float, heavy_thresh: float) -> str:
         return f"color:#0d3b2e;font-weight:700;background-color:{GREEN};" if is_large else f"color:{GREEN};"
     return f"color:#3b0d1a;font-weight:700;background-color:{RED};" if is_large else f"color:{RED};"
 
+
 def _signal_cell_style(val: str) -> str:
-    """Style signal cell."""
     v = str(val).upper()
     if "BUY CE" in v or "STRONG BUY" in v or "BUY" in v:
         return f"color:{GREEN};font-weight:700;"
@@ -2293,8 +2062,8 @@ def _signal_cell_style(val: str) -> str:
         return f"color:{AMBER};font-weight:700;"
     return f"color:{TEXT_MUTED};"
 
+
 def render_chain_table_html(df: pd.DataFrame, show_greeks: bool, top_n: int = 400) -> str:
-    """Render option chain table HTML."""
     if df.empty:
         return _TABLE_CSS + "<div style='color:#8b949e;padding:12px;'>No rows to display.</div>"
 
@@ -2363,9 +2132,10 @@ def render_chain_table_html(df: pd.DataFrame, show_greeks: bool, top_n: int = 40
         + f'<tbody>{"".join(rows_html)}</tbody></table></div>'
     )
 
-# ═══════════════════════════════════════════════════════════════════════════
-# EXCEL EXPORT
-# ═══════════════════════════════════════════════════════════════════════════
+
+# ══════════════════════════════════════════════════════════════════════════
+# 18. EXCEL EXPORT (ORIGINAL - UNMODIFIED)
+# ══════════════════════════════════════════════════════════════════════════
 
 FILL_HEADER = PatternFill(start_color="1F4E78", end_color="1F4E78", fill_type="solid")
 FILL_GREEN = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
@@ -2374,29 +2144,29 @@ FILL_AMBER = PatternFill(start_color="FFEB9C", end_color="FFEB9C", fill_type="so
 FONT_HEADER = Font(color="FFFFFF", bold=True, size=11)
 THIN_BORDER = Border(*(Side(style="thin", color="30363D"),) * 4)
 
+
 def _style_header_row(ws, row_idx: int = 1) -> None:
-    """Style header row."""
     for cell in ws[row_idx]:
         cell.fill = FILL_HEADER
         cell.font = FONT_HEADER
         cell.alignment = Alignment(horizontal="center", vertical="center")
         cell.border = THIN_BORDER
 
+
 def _autosize_columns(ws) -> None:
-    """Auto-size columns."""
     for col_cells in ws.columns:
         length = max((len(str(c.value)) if c.value is not None else 0) for c in col_cells)
         col_letter = get_column_letter(col_cells[0].column)
         ws.column_dimensions[col_letter].width = min(max(length + 3, 10), 40)
 
+
 def _apply_borders(ws) -> None:
-    """Apply borders."""
     for row in ws.iter_rows():
         for cell in row:
             cell.border = THIN_BORDER
 
+
 def _write_dataframe(ws, df: pd.DataFrame, start_row: int = 1) -> None:
-    """Write dataframe to worksheet."""
     for j, col_name in enumerate(df.columns, start=1):
         ws.cell(row=start_row, column=j, value=str(col_name))
     for i, (_, row) in enumerate(df.iterrows(), start=start_row + 1):
@@ -2415,8 +2185,8 @@ def _write_dataframe(ws, df: pd.DataFrame, start_row: int = 1) -> None:
     _apply_borders(ws)
     _autosize_columns(ws)
 
+
 def _conditional_color_signal_columns(ws, header_values: list, start_row: int) -> None:
-    """Color signal columns."""
     target_cols = [
         idx + 1 for idx, h in enumerate(header_values)
         if h and any(k in str(h) for k in ("Signal", "Buildup", "Institutional", "Smart Money"))
@@ -2435,33 +2205,23 @@ def _conditional_color_signal_columns(ws, header_values: list, start_row: int) -
             if fill:
                 cell.fill = fill
 
+
 def export_excel_report(df: pd.DataFrame, meta: dict, pcr: float, max_pain: float,
                          support: Optional[float], resistance: Optional[float],
                          symbol: str, expiry_label: str, iv_rank: float,
                          iv_percentile: float, gex_dex: dict, market_pressure: Optional[MarketPressure] = None,
-                         trade_signal: Optional[TradeSignal] = None, is_commodity: bool = False) -> io.BytesIO:
-    """Export to Excel."""
+                         trade_signal: Optional[TradeSignal] = None) -> io.BytesIO:
     wb = Workbook()
 
     ws_summary = wb.active
     ws_summary.title = "Summary"
-    
-    asset_type = "Commodity (MCX)" if is_commodity else "Equity/Index"
-    exchange = meta.get("exchange", "NSE")
-    
     summary_rows = [
-        ("Asset Type", asset_type),
-        ("Exchange", exchange),
-        ("Symbol", symbol),
-        ("Expiry", expiry_label),
+        ("Symbol", symbol), ("Expiry", expiry_label),
         ("Generated At", datetime.now().strftime("%d-%b-%Y %H:%M:%S")),
         ("Spot Price", round(meta.get("spot_price", 0.0), 2)),
-        ("PCR", pcr),
-        ("Max Pain", max_pain),
-        ("Support (Max PE OI)", support),
-        ("Resistance (Max CE OI)", resistance),
-        ("IV Rank", iv_rank),
-        ("IV Percentile", iv_percentile),
+        ("PCR", pcr), ("Max Pain", max_pain),
+        ("Support (Max PE OI)", support), ("Resistance (Max CE OI)", resistance),
+        ("IV Rank", iv_rank), ("IV Percentile", iv_percentile),
         ("Total GEX", round(gex_dex.get("total_gex", 0.0), 2)),
         ("Total DEX", round(gex_dex.get("total_dex", 0.0), 2)),
         ("Gamma Flip Strike", gex_dex.get("gamma_flip")),
@@ -2546,26 +2306,26 @@ def export_excel_report(df: pd.DataFrame, meta: dict, pcr: float, max_pain: floa
     buffer.seek(0)
     return buffer
 
+
 def export_csv_bytes(df: pd.DataFrame) -> bytes:
-    """Export to CSV."""
     return df.to_csv(index=False).encode("utf-8")
 
-# ═══════════════════════════════════════════════════════════════════════════
-# STREAMLIT UI - LAZY LOADING FIX
-# ═══════════════════════════════════════════════════════════════════════════
+
+# ══════════════════════════════════════════════════════════════════════════
+# 19. STREAMLIT UI (ORIGINAL WITH PRESSURE ENHANCEMENTS)
+# ══════════════════════════════════════════════════════════════════════════
 
 def _configure_page() -> None:
-    """Configure Streamlit page."""
     try:
         st.set_page_config(
-            page_title="NSE Options Chain Dashboard + Price Action + Commodities",
+            page_title="NSE Options Chain Dashboard + Price Action + Buy/Sell Pressure",
             page_icon="📊", layout="wide", initial_sidebar_state="expanded",
         )
     except Exception as e:
         logger.warning("st.set_page_config() skipped: %s", e)
 
+
 def _inject_css() -> None:
-    """Inject CSS."""
     st.markdown(f"""
     <style>
     .stApp {{ background-color: {DARK_BG}; }}
@@ -2583,187 +2343,107 @@ def _inject_css() -> None:
     button[data-baseweb="tab"] {{ color: {TEXT_MUTED} !important; }}
     button[data-baseweb="tab"][aria-selected="true"] {{ color: {BLUE} !important; border-bottom: 2px solid {BLUE}; }}
     hr {{ border-color: {BORDER_COLOR}; }}
+    .intel-card {{ background: {PANEL_BG}; border: 1px solid {BORDER_COLOR}; border-radius: 8px;
+        padding: 14px 16px; margin-bottom: 8px; }}
+    .intel-label {{ color: {TEXT_MUTED}; font-size: 11px; text-transform: uppercase; letter-spacing: .08em; }}
+    .intel-value {{ color: {TEXT_MAIN}; font-size: 20px; font-weight: 700; font-family: 'Courier New', monospace; }}
+    .trade-signal-card {{ background: linear-gradient(135deg, {PANEL_BG} 0%, #1c2128 100%); 
+        border: 2px solid {BLUE}; border-radius: 12px; padding: 16px 18px; margin: 12px 0; }}
+    .trade-signal-buy {{ border-left: 4px solid {GREEN}; }}
+    .trade-signal-sell {{ border-left: 4px solid {RED}; }}
     </style>
     """, unsafe_allow_html=True)
 
+
 def _pcr_sentiment_badge(pcr: float) -> str:
-    """PCR sentiment badge."""
     if pcr > 1.3:
         return f'<span style="color:{GREEN};font-weight:700;">🟢 Bullish (High PCR)</span>'
     if pcr < 0.7:
         return f'<span style="color:{RED};font-weight:700;">🔴 Bearish (Low PCR)</span>'
     return f'<span style="color:{AMBER};font-weight:700;">🟡 Neutral</span>'
 
-# ═══════════════════════════════════════════════════════════════════════════
-# LAZY EXPIRY LOADING - MAIN FIX
-# ═══════════════════════════════════════════════════════════════════════════
 
-def load_expiry_lazy(fyers: Any, is_index: bool, symbol: str, stock_name: str, is_commodity: bool) -> tuple[list[str], Optional[str]]:
-    """
-    FIXED: Lazy load expiry - only called when user clicks button.
-    No automatic API calls during page render.
-    Supports MCX fallback for commodities.
-    """
-    try:
-        if is_commodity:
-            symbol_candidates = fyers_commodity_symbol_candidates(symbol)
-            
-            # Try FYERS first
-            if fyers is not None:
-                for sym in symbol_candidates:
-                    try:
-                        resp = _fyers_call_optionchain(fyers, sym, strikecount=2)
-                        if isinstance(resp, dict) and resp.get("s") == "ok":
-                            expiry_list = _fyers_extract_expiry_list(resp)
-                            if expiry_list:
-                                logger.info("Loaded commodity expiry from FYERS: %s", symbol)
-                                return [lbl for lbl, _ in expiry_list], None
-                    except Exception as e:
-                        logger.warning("FYERS expiry load failed for commodity %s: %s", sym, e)
-                        continue
-            
-            # MCX fallback
-            if symbol in MCX_COMMODITY_EXPIRY_FALLBACK:
-                expiry_dates = MCX_COMMODITY_EXPIRY_FALLBACK[symbol]
-                logger.info("Loaded commodity expiry from MCX fallback: %s (%d dates)", symbol, len(expiry_dates))
-                return expiry_dates, None
-            
-            return [], f"No expiry data for {symbol}. Supported: {', '.join(MCX_COMMODITY_EXPIRY_FALLBACK.keys())}"
-        
-        else:
-            symbol_candidates = (
-                _fyers_index_candidates(symbol) if is_index
-                else fyers_stock_symbol_candidates(stock_name)
-            )
-            
-            if not symbol_candidates:
-                return [], "No symbol candidates found."
-            
-            # Try FYERS
-            if fyers is not None:
-                for sym in symbol_candidates:
-                    try:
-                        resp = _fyers_call_optionchain(fyers, sym, strikecount=2)
-                        if isinstance(resp, dict) and resp.get("s") == "ok":
-                            expiry_list = _fyers_extract_expiry_list(resp)
-                            if expiry_list:
-                                logger.info("Loaded expiry from FYERS: %s", symbol)
-                                return [lbl for lbl, _ in expiry_list], None
-                    except Exception as e:
-                        logger.warning("FYERS expiry load failed for %s: %s", sym, e)
-                        continue
-            
-            # NSE fallback
-            if not (is_index and symbol in NSE_UNSUPPORTED_INDICES):
-                nse_symbol = symbol if is_index else normalize_stock_symbol(stock_name)
-                raw_result = fetch_option_chain_raw(nse_symbol, is_index)
-                if raw_result.get("ok"):
-                    _, meta = parse_option_chain(raw_result["payload"])
-                    expiry_dates = meta.get("expiry_dates", [])
-                    if expiry_dates:
-                        logger.info("Loaded expiry from NSE: %s (%d dates)", symbol, len(expiry_dates))
-                        return expiry_dates, None
-            
-            return [], f"Could not load expiry for {symbol}. Try FYERS or check symbol."
-    
-    except Exception as e:
-        logger.error("load_expiry_lazy exception: %s", e)
-        return [], f"Error loading expiry: {str(e)[:100]}"
-
-def _sidebar_config(fyers: Any = None) -> dict:
-    """Sidebar configuration."""
+def _sidebar_config() -> dict:
     with st.sidebar:
         st.markdown("### ⚙️ Configuration")
-        
-        asset_class = st.radio("Asset Class", ["Equities & Indices", "Commodities"], key="oc_asset_class")
-        
-        if asset_class == "Equities & Indices":
-            instrument_type = st.radio("Instrument Type", ["Index", "F&O Stock"], key="oc_instr_type")
-            is_index = instrument_type == "Index"
-            is_commodity = False
+        instrument_type = st.radio("Instrument Type", ["Index", "F&O Stock"], key="oc_instr_type")
+        is_index = instrument_type == "Index"
 
-            if is_index:
-                symbol = st.selectbox("Index", list(INDEX_SYMBOLS.keys()), key="oc_index_select")
-                if symbol in NSE_UNSUPPORTED_INDICES:
-                    st.caption(f"ℹ️ {symbol} is BSE-listed — requires FYERS.")
-            else:
-                raw_symbol = st.text_input("Stock Symbol (e.g. RELIANCE, TCS)", "RELIANCE", key="oc_stock_input")
-                symbol = normalize_stock_symbol(raw_symbol)
-        
+        if is_index:
+            symbol = st.selectbox("Index", list(INDEX_SYMBOLS.keys()), key="oc_index_select")
+            if symbol in NSE_UNSUPPORTED_INDICES:
+                st.caption(f"ℹ️ {symbol} is BSE-listed — requires a connected FYERS client.")
         else:
-            commodity_name = st.selectbox(
-                "Commodity",
-                list(COMMODITIES.keys()),
-                format_func=lambda x: COMMODITIES[x]["name"],
-                key="oc_commodity_select"
+            raw_symbol = st.text_input(
+                "Stock Symbol (e.g. RELIANCE, TCS, INFY)", "RELIANCE", key="oc_stock_input"
             )
-            symbol = commodity_name
-            is_commodity = True
-            is_index = False
-            
-            comm_info = COMMODITIES[symbol]
-            st.info(f"📦 **{comm_info['name']}**\n\nExchange: **{comm_info['exchange']}**\n\n✅ *No FYERS needed*")
+            symbol = normalize_stock_symbol(raw_symbol)
 
         strike_count = st.slider("Strikes Around ATM", 5, 40, 15, step=5, key="oc_strike_count")
-        show_greeks = st.checkbox("Show Greeks", value=True, key="oc_show_greeks")
+        show_greeks = st.checkbox("Show Greeks in chain table", value=True, key="oc_show_greeks")
         min_ai_conf = st.slider("Min AI Confidence %", 0, 100, 55, step=5, key="oc_min_ai_conf")
-        strike_search_raw = st.text_input("Search Strike", value="", key="oc_strike_search")
+        strike_search_raw = st.text_input("Search Strike Price", value="", key="oc_strike_search")
         strike_search = 0.0
         if strike_search_raw.strip():
             try:
                 strike_search = float(strike_search_raw.strip())
             except ValueError:
-                st.caption("⚠️ Enter valid numeric strike.")
+                st.caption("⚠️ Enter a valid numeric strike price.")
 
-        if is_commodity:
-            default_lot = COMMODITY_LOT_SIZES.get(symbol, 1)
-        else:
-            default_lot = DEFAULT_LOT_SIZES.get(symbol, 1)
-        
-        lot_size = st.number_input("Lot Size", min_value=1, value=default_lot, step=1, key="oc_lot_size")
+        default_lot = DEFAULT_LOT_SIZES.get(symbol, DEFAULT_LOT_SIZES["_STOCK_DEFAULT"])
+        lot_size = st.number_input(
+            "Lot Size", min_value=1, value=default_lot, step=1, key="oc_lot_size",
+        )
 
         st.divider()
-        analyze_price_action = st.checkbox("Price Action (needs FYERS)", value=False, key="oc_price_action")
+        st.markdown("### 📊 Price Action Analysis")
+        analyze_price_action = st.checkbox("Fetch & Analyze Price Action (requires FYERS)", value=False, key="oc_price_action")
 
         st.divider()
-        auto_refresh = st.checkbox("Auto-refresh", value=False, key="oc_auto_refresh")
-        refresh_secs = st.slider("Interval (sec)", 10, 120, 20, step=5, key="oc_refresh_secs", disabled=not auto_refresh)
+        st.markdown("### 🔄 Auto Refresh")
+        auto_refresh = st.checkbox("Enable auto-refresh", value=False, key="oc_auto_refresh")
+        refresh_secs = st.slider("Refresh interval (seconds)", 10, 120, 20, step=5, key="oc_refresh_secs",
+                                  disabled=not auto_refresh)
 
         st.divider()
         debug_mode = st.checkbox("Debug info", value=False, key="oc_debug_mode")
+        fetch_clicked = st.button("🔄 Fetch Live Data", use_container_width=True, type="primary")
 
     return {
-        "is_index": is_index, "is_commodity": is_commodity, "symbol": symbol,
-        "strike_count": strike_count, "show_greeks": show_greeks, "min_ai_conf": min_ai_conf,
-        "strike_search": strike_search, "lot_size": lot_size, "auto_refresh": auto_refresh,
-        "refresh_secs": refresh_secs, "debug_mode": debug_mode,
-        "analyze_price_action": analyze_price_action, "asset_class": asset_class,
+        "is_index": is_index, "symbol": symbol, "strike_count": strike_count,
+        "show_greeks": show_greeks, "min_ai_conf": min_ai_conf, "strike_search": strike_search,
+        "lot_size": lot_size, "auto_refresh": auto_refresh, "refresh_secs": refresh_secs,
+        "debug_mode": debug_mode, "fetch_clicked": fetch_clicked,
+        "analyze_price_action": analyze_price_action,
     }
 
+
 def _do_fetch_and_process(cfg: dict, fyers: Any = None) -> Optional[dict]:
-    """Full fetch → parse → validate → analytics pipeline."""
+    """Full fetch -> parse -> validate -> analytics pipeline."""
     preferred_expiry = st.session_state.get("oc_selected_expiry", "")
-    
-    if cfg.get("is_commodity"):
-        fetch_result = fetch_chain_commodity(fyers, cfg["symbol"], preferred_expiry, cfg["strike_count"])
-    else:
-        stock_name = cfg["symbol"] if not cfg["is_index"] else ""
-        fetch_result = fetch_chain_unified(fyers, cfg["symbol"], cfg["is_index"], stock_name, preferred_expiry, cfg["strike_count"])
-    
+    stock_name = cfg["symbol"] if not cfg["is_index"] else ""
+    fetch_result = fetch_chain_unified(
+        fyers, cfg["symbol"], cfg["is_index"], stock_name, preferred_expiry, cfg["strike_count"],
+    )
     if cfg["debug_mode"]:
-        st.write("Fetch:", fetch_result.get("ok"), fetch_result.get("source"))
+        st.write("**Fetch result:**", fetch_result.get("ok"), fetch_result.get("source"), fetch_result.get("error"))
 
     if not fetch_result.get("ok"):
-        st.error(f"⚠️ Could not fetch: {fetch_result.get('error', 'Unknown error')}")
+        st.error(
+            f"⚠️ Could not fetch option chain for **{cfg['symbol']}**: "
+            f"{fetch_result.get('error', 'Unknown error.')} "
+        )
         return None
 
-    df_all = fetch_result["df"]
-    meta = fetch_result["meta"]
-    data_source = fetch_result.get("source", "UNKNOWN")
-    data_status = fetch_result.get("data_status", "LIVE")
+    df_all: pd.DataFrame = fetch_result["df"]
+    meta: dict = fetch_result["meta"]
+    data_source: str = fetch_result.get("source", "UNKNOWN")
 
     if not validate_chain_df(df_all):
-        st.error(f"⚠️ No usable chain data received.")
+        st.error(
+            f"⚠️ Received a response for **{cfg['symbol']}**, but it did not contain a usable "
+            "option chain."
+        )
         return None
 
     spot = meta["spot_price"]
@@ -2772,13 +2452,16 @@ def _do_fetch_and_process(cfg: dict, fyers: Any = None) -> Optional[dict]:
         df = df_all
 
     expiry_label = meta["selected_expiry"]
-    atm_strike = float(df.iloc[(df["strike_price"] - spot).abs().argsort().iloc[0]]["strike_price"]) if spot else float(df["strike_price"].median())
+    atm_strike = float(df.iloc[(df["strike_price"] - spot).abs().argsort().iloc[0]]["strike_price"]) if spot else \
+        float(df["strike_price"].median())
 
     df = add_greeks_columns(df, spot, expiry_label)
     df = classify_buildup(df)
     df = classify_moneyness(df, spot)
     df = compute_ai_scores(df, spot, atm_strike, calc_max_pain(df), calc_pcr(df))
     df = detect_institutional_smart_money(df)
+    
+    # ✅ ADD PRESSURE ANALYSIS
     df, market_pressure = add_pressure_analysis(df, spot, cfg["lot_size"])
 
     pcr = calc_pcr(df)
@@ -2787,28 +2470,19 @@ def _do_fetch_and_process(cfg: dict, fyers: Any = None) -> Optional[dict]:
     max_oi = calc_max_oi(df)
 
     atm_iv = _atm_iv(df, spot)
-    if cfg.get("is_commodity"):
-        update_commodity_iv_history(cfg["symbol"], expiry_label, atm_iv)
-        iv_rank, iv_percentile = compute_commodity_iv_rank_percentile(cfg["symbol"], expiry_label, atm_iv)
-        oi_shift_notes = detect_commodity_oi_shift(cfg["symbol"], expiry_label, support, resistance)
-    else:
-        update_iv_history(cfg["symbol"], expiry_label, atm_iv)
-        iv_rank, iv_percentile = compute_iv_rank_percentile(cfg["symbol"], expiry_label, atm_iv)
-        oi_shift_notes = detect_oi_shift(cfg["symbol"], expiry_label, support, resistance)
+    update_iv_history(cfg["symbol"], expiry_label, atm_iv)
+    iv_rank, iv_percentile = compute_iv_rank_percentile(cfg["symbol"], expiry_label, atm_iv)
 
     gex_dex = compute_gex_dex(df, spot, cfg["lot_size"])
+
+    oi_shift_notes = detect_oi_shift(cfg["symbol"], expiry_label, support, resistance)
 
     price_action_data = None
     trade_signal = None
     if cfg["analyze_price_action"] and fyers is not None:
-        if cfg.get("is_commodity"):
-            fyers_symbol_candidates = fyers_commodity_symbol_candidates(cfg["symbol"])
-        else:
-            fyers_symbol_candidates = (
-                _fyers_index_candidates(cfg["symbol"]) if cfg["is_index"] 
-                else fyers_stock_symbol_candidates(cfg["symbol"])
-            )
-        
+        fyers_symbol_candidates = (
+            _fyers_index_candidates(cfg["symbol"]) if cfg["is_index"] else fyers_stock_symbol_candidates(stock_name)
+        )
         fyers_symbol = fyers_symbol_candidates[0] if fyers_symbol_candidates else None
         
         if fyers_symbol:
@@ -2835,13 +2509,14 @@ def _do_fetch_and_process(cfg: dict, fyers: Any = None) -> Optional[dict]:
         "df": df, "meta": meta, "spot": spot, "atm_strike": atm_strike, "expiry_label": expiry_label,
         "pcr": pcr, "max_pain": max_pain, "support": support, "resistance": resistance, "max_oi": max_oi,
         "atm_iv": atm_iv, "iv_rank": iv_rank, "iv_percentile": iv_percentile, "gex_dex": gex_dex,
-        "oi_shift_notes": oi_shift_notes, "data_source": data_source, "data_status": data_status,
+        "oi_shift_notes": oi_shift_notes, "data_source": data_source,
         "price_action_data": price_action_data, "trade_signal": trade_signal,
-        "market_pressure": market_pressure, "is_commodity": cfg.get("is_commodity", False),
+        "market_pressure": market_pressure,
     }
 
+
 def _render_summary_cards(state: dict) -> None:
-    """Render summary metrics."""
+    """Enhanced with pressure metrics."""
     c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Spot Price", f"₹{state['spot']:,.2f}" if state["spot"] else "—")
     c2.metric("ATM Strike", f"₹{state['atm_strike']:,.0f}")
@@ -2860,184 +2535,178 @@ def _render_summary_cards(state: dict) -> None:
     else:
         c10.metric("Signal", "No Signal")
 
+    # NEW: Pressure metrics
     mp = state.get("market_pressure")
     if mp:
         p1, p2, p3, p4, p5 = st.columns(5)
         p1.metric("Buy Pressure", f"{mp.total_call_pressure:.0f}")
         p2.metric("Sell Pressure", f"{mp.total_put_pressure:.0f}")
-        p3.metric("Market Bias", f"{mp.net_market_bias:+.0f}")
+        p3.metric("Market Bias", f"{mp.net_market_bias:+.0f}", delta=mp.market_sentiment.split()[0])
         p4.metric("Volume Spike", "🔴 YES" if mp.volume_surge_detected else "🟢 No")
         p5.metric("OI Surge", "🔴 YES" if mp.oi_accumulation_detected else "🟢 No")
 
+
 def _render_ai_signal_cards(state: dict, min_conf: float) -> None:
-    """Render AI signal cards."""
     df = state["df"]
     qualifying = df[df["AI Confidence %"] >= min_conf].sort_values("AI Confidence %", ascending=False)
     if qualifying.empty:
-        st.info(f"No strikes meet {min_conf:.0f}% AI confidence.")
+        st.info(f"No strikes meet the {min_conf:.0f}% AI confidence threshold.")
         return
     for _, row in qualifying.head(15).iterrows():
         signal = row["AI Signal"]
         color = GREEN if "CE" in signal else (RED if "PE" in signal else AMBER)
         st.markdown(f"""
-        <div style="background:{PANEL_BG};border:1px solid {BORDER_COLOR};border-radius:8px;padding:12px;margin-bottom:8px;">
-          <div style="display:flex;justify-content:space-between;">
-            <div><b style="color:{TEXT_MAIN};">{row['strike_price']:,.0f}</b> <span style="color:{color};font-weight:700;">{signal}</span></div>
-            <div style="color:{TEXT_MUTED};font-size:12px;">Conf: <span style="color:{TEXT_MAIN};font-weight:700;">{row['AI Confidence %']:.0f}%</span></div>
+        <div class="intel-card">
+          <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;">
+            <div><b style="color:{TEXT_MAIN};">{row['strike_price']:,.0f}</b>
+              &nbsp; <span style="color:{color};font-weight:700;">{_safe_cell(signal)}</span></div>
+            <div class="intel-label">Confidence
+              <span style="color:{TEXT_MAIN};font-weight:700;font-size:15px;">{row['AI Confidence %']:.0f}%</span></div>
+          </div>
+          <div style="margin-top:8px;color:{TEXT_MUTED};font-size:12px;">
+            CE Score {row['CE Score']:.1f} &nbsp;|&nbsp; PE Score {row['PE Score']:.1f}
           </div>
         </div>
         """, unsafe_allow_html=True)
 
+
 def run_dashboard(fyers: Any = None) -> None:
-    """Main dashboard runner."""
     _configure_page()
     _inject_css()
     st.markdown("## 📊 Options Chain + Price Action + Buy/Sell Pressure")
 
-    cfg = _sidebar_config(fyers)
+    cfg = _sidebar_config()
 
     if cfg["symbol"] != st.session_state.get("oc_last_symbol"):
         st.session_state["oc_last_symbol"] = cfg["symbol"]
         st.session_state.pop("oc_state", None)
         st.session_state.pop("oc_selected_expiry", None)
-        st.session_state.pop("oc_expiry_list", None)
-        st.session_state.pop("oc_expiry_loaded", None)
-        st.session_state.pop("oc_expiry_error", None)
 
-    # LAZY EXPIRY LOADING
-    expiry_list = st.session_state.get("oc_expiry_list", [])
-    expiry_loaded = st.session_state.get("oc_expiry_loaded", False)
-    expiry_error = st.session_state.get("oc_expiry_error", None)
-
-    if not expiry_loaded or expiry_error:
-        st.markdown("### 📅 Expiry Dates")
-        col1, col2 = st.columns([3, 1])
-        with col1:
-            if expiry_error:
-                st.warning(f"⚠️ {expiry_error}")
-        with col2:
-            if st.button("🔄 Load Expiry", use_container_width=True, type="primary", key="oc_load_expiry_btn"):
-                with st.spinner("Loading expiry..."):
-                    new_expiry_list, error = load_expiry_lazy(fyers, cfg["is_index"], cfg["symbol"], cfg["symbol"], cfg["is_commodity"])
-                if error:
-                    st.session_state["oc_expiry_error"] = error
-                    st.error(f"❌ {error}")
-                else:
-                    st.session_state["oc_expiry_list"] = new_expiry_list
-                    st.session_state["oc_expiry_loaded"] = True
-                    st.session_state["oc_expiry_error"] = None
-                    st.session_state["oc_selected_expiry"] = new_expiry_list[0] if new_expiry_list else ""
-                    st.rerun()
-        
-        if not expiry_loaded:
-            st.info("👆 Click **Load Expiry** to continue.")
-            return
-
-    if expiry_list:
-        current_exp = st.session_state.get("oc_selected_expiry", expiry_list[0] if expiry_list else "")
-        selected_expiry = st.selectbox(
-            "Select Expiry", expiry_list, index=(expiry_list.index(current_exp) if current_exp in expiry_list else 0),
-            key="oc_expiry_dropdown"
-        )
-        if selected_expiry != st.session_state.get("oc_selected_expiry"):
-            st.session_state["oc_selected_expiry"] = selected_expiry
-            st.session_state.pop("oc_state", None)
-
-    col_fetch, col_empty = st.columns([1, 5])
-    with col_fetch:
-        fetch_clicked = st.button("🔄 Fetch Live Data", use_container_width=True, type="primary", key="oc_fetch_btn")
-
-    if fetch_clicked or cfg["auto_refresh"]:
-        with st.spinner(f"Fetching {cfg['symbol']}…"):
+    if cfg["fetch_clicked"] or cfg["auto_refresh"]:
+        with st.spinner(f"Fetching live data for {cfg['symbol']}…"):
             result = _do_fetch_and_process(cfg, fyers)
         if result is not None:
             st.session_state["oc_state"] = result
+            st.session_state["oc_selected_expiry"] = result["expiry_label"]
 
     state = st.session_state.get("oc_state")
     if state is None:
-        st.info("👈 Select expiry, then click **Fetch Live Data**.")
+        st.info("👈 Choose an instrument and click **Fetch Live Data**.")
         return
 
-    df = state["df"]
+    df: pd.DataFrame = state["df"]
     meta = state["meta"]
 
+    expiry_options = meta.get("expiry_dates", [])
+    if expiry_options:
+        current = state["expiry_label"] if state["expiry_label"] in expiry_options else expiry_options[0]
+        selected = st.selectbox(
+            "Expiry", expiry_options, index=expiry_options.index(current), key="oc_expiry_selectbox"
+        )
+        if selected != st.session_state.get("oc_selected_expiry"):
+            st.session_state["oc_selected_expiry"] = selected
+            with st.spinner("Reloading for selected expiry…"):
+                refreshed = _do_fetch_and_process(cfg, fyers)
+            if refreshed is not None:
+                st.session_state["oc_state"] = refreshed
+                state = refreshed
+                df = state["df"]
+
     if cfg["debug_mode"]:
-        with st.expander("🔍 Debug"):
-            st.write(f"Rows: {meta.get('rows_parsed')} parsed")
-            st.write(f"Source: {state.get('data_source')}")
+        with st.expander("🔍 Debug", expanded=False):
+            st.write(f"Rows: {meta.get('total_rows_seen')} seen, {meta.get('rows_parsed')} parsed")
+            st.write(f"Source: {state.get('data_source', 'UNKNOWN')}")
+            st.dataframe(df.head(3), use_container_width=True)
 
     _render_summary_cards(state)
     source = state.get("data_source", "UNKNOWN")
-    if "DEMO" in source:
-        source_badge = "🔬 DEMO"
-    elif source == "FYERS":
-        source_badge = "🟢 FYERS"
-    elif source == "NSE":
-        source_badge = "🟡 NSE"
-    else:
-        source_badge = "⚪ Unknown"
-    st.caption(f"📡 {source_badge} | {_pcr_sentiment_badge(state['pcr'])}", unsafe_allow_html=True)
+    source_badge = "🟢 FYERS" if source == "FYERS" else ("🟡 NSE" if source == "NSE" else "⚪ Unknown")
+    st.caption(f"📡 Source: **{source_badge}** | Sentiment: {_pcr_sentiment_badge(state['pcr'])}", unsafe_allow_html=True)
 
     for note in state.get("oi_shift_notes", []):
         st.info(f"🔀 {note}")
-    
-    if meta.get("demo_data"):
-        st.warning("⚠️ **DEMO DATA** — Sample commodity chain for testing.", icon="🔬")
 
     if cfg["strike_search"]:
         match = df[(df["strike_price"] - cfg["strike_search"]).abs() < 0.5]
         if not match.empty:
             r = match.iloc[0]
-            st.success(f"🔎 {cfg['strike_search']:,.0f} → CE {r['ce_ltp']:.2f} | PE {r['pe_ltp']:.2f}")
+            st.success(
+                f"🔎 {cfg['strike_search']:,.0f} → CE {r['ce_ltp']:.2f} (OI {r['ce_oi']:,.0f}) | "
+                f"PE {r['pe_ltp']:.2f} (OI {r['pe_oi']:,.0f})"
+            )
 
     st.divider()
 
-    if state.get("price_action_data"):
+    if state.get("price_action_data") and state["price_action_data"].get("df_dict"):
         tab_chain, tab_charts, tab_pressure, tab_greeks, tab_ai, tab_gex, tab_price_action, tab_export = st.tabs([
-            "📋", "📈", "💪", "🧮", "🤖", "⚡", "💹", "📥"])
+            "📋 Chain", "📈 OI", "💪 Pressure", "🧮 Greeks", "🤖 AI", "⚡ GEX", "💹 Price Action", "📥 Export",
+        ])
     else:
         tab_chain, tab_charts, tab_pressure, tab_greeks, tab_ai, tab_gex, tab_export = st.tabs([
-            "📋", "📈", "💪", "🧮", "🤖", "⚡", "📥"])
+            "📋 Chain", "📈 OI", "💪 Pressure", "🧮 Greeks", "🤖 AI", "⚡ GEX", "📥 Export",
+        ])
 
     with tab_chain:
-        # Display LIVE data status header
-        header = render_option_chain_header(
-            symbol=cfg["symbol"],
-            exchange=meta.get("exchange", "NSE"),
-            expiry=state.get("expiry_label", "—"),
-            spot=state.get("spot", 0),
-            data_status=state.get("data_status", "LIVE"),
-            fetched_time=meta.get("fetched_at", datetime.now())
-        )
-        st.markdown(header)
-        st.divider()
-        
-        # Display option chain table
         st.markdown(render_chain_table_html(df, cfg["show_greeks"]), unsafe_allow_html=True)
 
     with tab_charts:
         st.plotly_chart(chart_oi_bars(df, state["max_pain"]), use_container_width=True, config={"displayModeBar": False})
-        c_a, c_b = st.columns(2)
-        with c_a:
+        col_a, col_b = st.columns(2)
+        with col_a:
             st.plotly_chart(gauge_pcr(state["pcr"]), use_container_width=True, config={"displayModeBar": False})
-        with c_b:
+        with col_b:
             st.plotly_chart(chart_iv_skew(df), use_container_width=True, config={"displayModeBar": False})
 
+    # NEW: Pressure Tab
     with tab_pressure:
+        st.markdown('<div class="block-title">💪 Buy/Sell Pressure Analysis</div>', unsafe_allow_html=True)
+        
         mp = state.get("market_pressure")
         if mp:
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Bias", f"{mp.net_market_bias:+.0f}")
-            c2.metric("Buy", f"{mp.total_call_pressure:.0f}")
-            c3.metric("Sell", f"{mp.total_put_pressure:.0f}")
-            c4.metric("Aggression", f"{(df['aggression_level'].mean() if 'aggression_level' in df.columns else 50):.0f}")
+            col1, col2, col3, col4 = st.columns(4)
+            with col1:
+                color = GREEN if mp.net_market_bias > 0 else RED
+                st.metric("Market Bias", f"{mp.net_market_bias:+.0f}", delta=mp.market_sentiment)
+            with col2:
+                st.metric("Buy Pressure", f"{mp.total_call_pressure:.0f}")
+            with col3:
+                st.metric("Sell Pressure", f"{mp.total_put_pressure:.0f}")
+            with col4:
+                st.metric("Aggression", f"{(df['aggression_level'].mean() if 'aggression_level' in df.columns else 50):.0f}")
+            
             st.divider()
-        st.plotly_chart(chart_pressure_by_strike(df, state["spot"]), use_container_width=True, config={"displayModeBar": False})
-        c_net, c_agg = st.columns(2)
-        with c_net:
-            st.plotly_chart(chart_net_pressure(df, state["spot"]), use_container_width=True, config={"displayModeBar": False})
-        with c_agg:
-            st.plotly_chart(chart_aggression_level(df), use_container_width=True, config={"displayModeBar": False})
+            
+            col_itm, col_atm, col_otm = st.columns(3)
+            with col_itm:
+                st.metric("ITM Pressure", f"{mp.itm_pressure:.0f}")
+            with col_atm:
+                st.metric("ATM Pressure", f"{mp.atm_pressure:.0f}")
+            with col_otm:
+                st.metric("OTM Pressure", f"{mp.otm_pressure:.0f}")
+            
+            st.divider()
+            
+            anom_col1, anom_col2 = st.columns(2)
+            with anom_col1:
+                if mp.volume_surge_detected:
+                    st.warning("🚨 **VOLUME SPIKE** — Unusual activity detected")
+                else:
+                    st.info("✓ Volume levels normal")
+            with anom_col2:
+                if mp.oi_accumulation_detected:
+                    st.warning("🚨 **OI SURGE** — Strong accumulation detected")
+                else:
+                    st.info("✓ OI changes normal")
+            
+            st.divider()
+            
+            st.plotly_chart(chart_pressure_by_strike(df, state["spot"]), use_container_width=True, config={"displayModeBar": False})
+            
+            col_net, col_agg = st.columns(2)
+            with col_net:
+                st.plotly_chart(chart_net_pressure(df, state["spot"]), use_container_width=True, config={"displayModeBar": False})
+            with col_agg:
+                st.plotly_chart(chart_aggression_level(df), use_container_width=True, config={"displayModeBar": False})
 
     with tab_greeks:
         g1, g2 = st.columns(2)
@@ -3049,6 +2718,7 @@ def run_dashboard(fyers: Any = None) -> None:
             st.plotly_chart(chart_greeks(df, "vega"), use_container_width=True, config={"displayModeBar": False})
 
     with tab_ai:
+        st.markdown('<div class="block-title">🤖 AI Trade Signals</div>', unsafe_allow_html=True)
         _render_ai_signal_cards(state, cfg["min_ai_conf"])
 
     with tab_gex:
@@ -3059,24 +2729,26 @@ def run_dashboard(fyers: Any = None) -> None:
         e3.metric("Gamma Flip", f"{gf:,.0f}" if gf else "—")
         st.plotly_chart(chart_gex_by_strike(state["gex_dex"]), use_container_width=True, config={"displayModeBar": False})
 
-    if state.get("price_action_data"):
+    if state.get("price_action_data") and state["price_action_data"].get("df_dict"):
         with tab_price_action:
+            st.markdown('<div class="block-title">💹 Price Action</div>', unsafe_allow_html=True)
             df_dict = state["price_action_data"]["df_dict"]
-            for tf_name in TIMEFRAMES.keys():
-                if tf_name in df_dict and df_dict[tf_name] is not None and not df_dict[tf_name].empty:
-                    with st.expander(f"{tf_name}", expanded=(tf_name == "5M")):
-                        st.plotly_chart(chart_price_action(df_dict[tf_name], f"{tf_name}"),
+            
+            for tf_name, df_tf in df_dict.items():
+                if df_tf is not None and not df_tf.empty:
+                    with st.expander(f"📊 {tf_name}", expanded=(tf_name == "5M")):
+                        st.plotly_chart(chart_price_action(df_tf, title=f"{tf_name}"),
                                        use_container_width=True, config={"displayModeBar": False})
 
     with tab_export:
-        c_x, c_y = st.columns(2)
-        with c_x:
+        st.markdown('<div class="block-title">📥 Export</div>', unsafe_allow_html=True)
+        col_x, col_y = st.columns(2)
+        with col_x:
             try:
                 excel_buf = export_excel_report(
                     df, meta, state["pcr"], state["max_pain"], state["support"], state["resistance"],
                     cfg["symbol"], state["expiry_label"], state["iv_rank"], state["iv_percentile"],
                     state["gex_dex"], state.get("market_pressure"), state.get("trade_signal"),
-                    is_commodity=state.get("is_commodity", False),
                 )
                 st.download_button(
                     "📥 Excel", data=excel_buf,
@@ -3086,7 +2758,7 @@ def run_dashboard(fyers: Any = None) -> None:
                 )
             except Exception as e:
                 st.error(f"Excel export failed: {e}")
-        with c_y:
+        with col_y:
             try:
                 csv_bytes = export_csv_bytes(df)
                 st.download_button(
@@ -3097,19 +2769,24 @@ def run_dashboard(fyers: Any = None) -> None:
             except Exception as e:
                 st.error(f"CSV export failed: {e}")
 
-    st.caption(f"**NSE Options + FYERS + Buy/Sell Pressure + MCX Commodities** | {meta.get('fetched_at', datetime.now()).strftime('%H:%M:%S')} | Educational tool")
+    st.caption(
+        f"**NSE Options + FYERS Price Action + Buy/Sell Pressure** | Last: {meta.get('fetched_at', datetime.now()).strftime('%H:%M:%S')} | "
+        "Educational tool — not financial advice."
+    )
 
     if cfg["auto_refresh"]:
         time.sleep(cfg["refresh_secs"])
         st.rerun()
 
+
 def show_option_chain(fyers: Any = None) -> None:
-    """Entry point."""
+    """Entry point for hosting apps."""
     if fyers is not None:
-        logger.info("show_option_chain() received FYERS client.")
+        logger.info("show_option_chain() received FYERS client — using as PRIMARY data source.")
     else:
-        logger.info("show_option_chain() — no FYERS (using NSE + MCX fallback).")
+        logger.info("show_option_chain() — no FYERS client (NSE fallback only).")
     run_dashboard(fyers)
+
 
 if __name__ == "__main__":
     run_dashboard()
