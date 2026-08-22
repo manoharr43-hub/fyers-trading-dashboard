@@ -2144,6 +2144,29 @@ def run_fo_scan(fyers, symbols):
 # ════════════════════════════════════════════════════════════════════════════════
 # MAIN APP - V17 WITH ALL NEW TABS
 # ════════════════════════════════════════════════════════════════════════════════
+
+def _download_df_buttons(df, prefix):
+    """Download dataframe as Excel and CSV when data exists."""
+    if df is None or getattr(df, "empty", True):
+        return
+    try:
+        st.download_button(
+            "📥 DOWNLOAD EXCEL",
+            data=_format_excel_output(df, scanner_type=prefix),
+            file_name=f"{prefix.lower()}_results.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key=f"{prefix}_excel_download",
+        )
+    except Exception as e:
+        st.warning(f"Excel export error: {str(e)[:100]}")
+    st.download_button(
+        "📄 DOWNLOAD CSV",
+        data=df.to_csv(index=False).encode("utf-8"),
+        file_name=f"{prefix.lower()}_results.csv",
+        mime="text/csv",
+        key=f"{prefix}_csv_download",
+    )
+
 def show_scanner(fyers) -> None:
     """Streamlit main app - NSE AI PRO V17 with Complete Feature Set"""
     
@@ -2473,6 +2496,10 @@ def show_scanner(fyers) -> None:
     # ════════════════════════════════════════════════════════════════════════════════
     with tabs[3]:
         st.markdown("### 🔥 Strong Signals Only\nHigh-confidence setups (≥70%)")
+        if st.button("🚀 RUN STRONG SIGNALS", type="primary", key="run_strong_signals"):
+            st.session_state["strong_signals_run"] = True
+            st.rerun()
+
         
         strong_source = st.radio("Source", ["NSE Stocks", "F&O Stocks"], horizontal=True, key="strong_source")
         
@@ -2760,6 +2787,10 @@ def show_scanner(fyers) -> None:
     # ════════════════════════════════════════════════════════════════════════════════
     with tabs[6]:
         st.markdown("### 📊 Market Dashboard - Statistics & Sentiment")
+        if st.button("🔄 RUN MARKET DASHBOARD", type="primary", key="run_market_dashboard"):
+            st.session_state["market_dashboard_run"] = True
+            st.rerun()
+
         
         col_dash1, col_dash2 = st.columns(2)
         
@@ -2841,6 +2872,10 @@ def show_scanner(fyers) -> None:
     # ════════════════════════════════════════════════════════════════════════════════
     with tabs[7]:
         st.markdown("### ⚙️ Scanner Settings & Configuration")
+        if st.button("▶️ APPLY SETTINGS", type="primary", key="apply_settings"):
+            st.session_state["settings_applied"] = True
+            st.success("Settings applied for this session.")
+
         
         st.markdown("#### 🎯 Signal Filtering")
         col_set1, col_set2, col_set3 = st.columns(3)
