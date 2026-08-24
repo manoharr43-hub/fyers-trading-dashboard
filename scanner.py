@@ -2496,6 +2496,10 @@ def show_scanner(fyers) -> None:
     # ════════════════════════════════════════════════════════════════════════════════
     with tabs[3]:
         st.markdown("### 🔥 Strong Signals Only\nHigh-confidence setups (≥70%)")
+        if st.button("🚀 RUN STRONG SIGNALS", type="primary", key="run_strong_signals"):
+            st.session_state["strong_signals_run"] = True
+            st.rerun()
+
         
         strong_source = st.radio("Source", ["NSE Stocks", "F&O Stocks"], horizontal=True, key="strong_source")
         
@@ -2783,6 +2787,10 @@ def show_scanner(fyers) -> None:
     # ════════════════════════════════════════════════════════════════════════════════
     with tabs[6]:
         st.markdown("### 📊 Market Dashboard - Statistics & Sentiment")
+        if st.button("🔄 RUN MARKET DASHBOARD", type="primary", key="run_market_dashboard"):
+            st.session_state["market_dashboard_run"] = True
+            st.rerun()
+
         
         col_dash1, col_dash2 = st.columns(2)
         
@@ -2864,6 +2872,10 @@ def show_scanner(fyers) -> None:
     # ════════════════════════════════════════════════════════════════════════════════
     with tabs[7]:
         st.markdown("### ⚙️ Scanner Settings & Configuration")
+        if st.button("▶️ APPLY SETTINGS", type="primary", key="apply_settings"):
+            st.session_state["settings_applied"] = True
+            st.success("Settings applied for this session.")
+
         
         st.markdown("#### 🎯 Signal Filtering")
         col_set1, col_set2, col_set3 = st.columns(3)
