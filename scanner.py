@@ -69,12 +69,22 @@ REFRESH_INTERVALS = [30, 60, 120]
 # ════════════════════════════════════════════════════════════════════════════════
 # MOMENTUM MOVERS CONSTANTS (NEW)
 # ════════════════════════════════════════════════════════════════════════════════
-MOMENTUM_MIN_SCORE = 70
-MOMENTUM_STRONG_SCORE = 85
-MOMENTUM_DEVELOPING_SCORE = 55
-MOMENTUM_MIN_MOVE_PCT = 0.1
-MOMENTUM_MIN_RVOL = 1.2
-MOMENTUM_MIN_BODY_PCT = 20
+# STRICT ANTI-FALSE-SIGNAL SETTINGS
+MOMENTUM_MIN_SCORE = 75
+MOMENTUM_STRONG_SCORE = 88
+MOMENTUM_DEVELOPING_SCORE = 75
+MOMENTUM_MIN_MOVE_PCT = 0.30
+MOMENTUM_MIN_MOVE_15M_PCT = 0.60
+MOMENTUM_MIN_RVOL = 1.50
+MOMENTUM_STRONG_RVOL = 2.00
+MOMENTUM_MIN_BODY_PCT = 55
+MOMENTUM_MIN_AI_CONFIDENCE = 70
+MOMENTUM_MIN_PRESSURE = 58
+MOMENTUM_BUY_MIN_RSI = 52
+MOMENTUM_BUY_MAX_RSI = 72
+MOMENTUM_SELL_MIN_RSI = 28
+MOMENTUM_SELL_MAX_RSI = 48
+MOMENTUM_MIN_CONFIRMATIONS = 6
 MOMENTUM_DISPLAY_COUNT = 10
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -242,55 +252,49 @@ def calculate_buying_selling_pressure(df) -> Dict[str, Any]:
 # MOMENTUM SCORING ENGINE (NEW - V17)
 # ════════════════════════════════════════════════════════════════════════════════
 def calculate_movement_metrics(df) -> Dict[str, float]:
-    """Calculate how much the stock is actually moving right now."""
-    if df is None or len(df) < 10:
-        return {
-            "move_5m_pct": 0.0,
-            "move_15m_pct": 0.0,
-            "candle_body_pct": 0.0,
-            "atr_normalized_move": 0.0,
-            "price_acceleration": 0.0,
-        }
-    
+    """Strict movement calculation using the last CLOSED candle only."""
+    empty = {
+        "move_5m_pct": 0.0, "move_15m_pct": 0.0,
+        "candle_body_pct": 0.0, "atr_normalized_move": 0.0,
+        "price_acceleration": 0.0, "direction": "NEUTRAL",
+        "confirmed": False,
+    }
+    if df is None or len(df) < 20:
+        return empty
     try:
-        close = float(df["Close"].iloc[-1])
-        open_ = float(df["Open"].iloc[-1])
-        high = float(df["High"].iloc[-1])
-        low = float(df["Low"].iloc[-1])
-        
-        close_5m_ago = float(df["Close"].iloc[-2]) if len(df) >= 2 else close
-        move_5m_pct = abs((close - close_5m_ago) / close_5m_ago * 100) if close_5m_ago != 0 else 0.0
-        
-        close_15m_ago = float(df["Close"].iloc[-4]) if len(df) >= 4 else close
-        move_15m_pct = abs((close - close_15m_ago) / close_15m_ago * 100) if close_15m_ago != 0 else 0.0
-        
+        d = df.copy().reset_index(drop=True)
+        last = d.iloc[-2]
+        prev = d.iloc[-3]
+        prev4 = d.iloc[-5]
+        close = float(last["Close"]); open_ = float(last["Open"])
+        high = float(last["High"]); low = float(last["Low"])
+        prev_close = float(prev["Close"]); close_15m = float(prev4["Close"])
+        if prev_close <= 0 or close_15m <= 0:
+            return empty
+        direction = "BULLISH" if close > open_ else "BEARISH" if close < open_ else "NEUTRAL"
+        move_5m_pct = abs((close - prev_close) / prev_close * 100)
+        move_15m_pct = abs((close - close_15m) / close_15m * 100)
         hl_range = high - low
         body = abs(close - open_)
-        candle_body_pct = (body / hl_range * 100) if hl_range != 0 else 0.0
-        
-        atr = calculate_atr(df, period=14)
-        atr_val = float(atr.iloc[-1]) if len(atr) > 0 else 0.01
-        atr_normalized = (body / atr_val) if atr_val > 0 else 0.0
-        
-        prev_body = abs(float(df["Close"].iloc[-2]) - float(df["Open"].iloc[-2])) if len(df) >= 2 else body
-        acceleration = (body / prev_body) if prev_body > 0 else 1.0
-        
+        candle_body_pct = body / hl_range * 100 if hl_range > 0 else 0.0
+        atr_series = calculate_atr(d, period=14)
+        atr_val = float(atr_series.iloc[-2]) if len(atr_series) >= 2 and pd.notna(atr_series.iloc[-2]) else 0.0
+        atr_normalized = body / atr_val if atr_val > 0 else 0.0
+        prev_body = abs(float(prev["Close"]) - float(prev["Open"]))
+        acceleration = body / prev_body if prev_body > 0 else 1.0
+        confirmed = (move_5m_pct >= MOMENTUM_MIN_MOVE_PCT and
+                     move_15m_pct >= MOMENTUM_MIN_MOVE_15M_PCT and
+                     candle_body_pct >= MOMENTUM_MIN_BODY_PCT)
         return {
             "move_5m_pct": round(move_5m_pct, 2),
             "move_15m_pct": round(move_15m_pct, 2),
             "candle_body_pct": round(candle_body_pct, 1),
             "atr_normalized_move": round(atr_normalized, 2),
             "price_acceleration": round(acceleration, 2),
+            "direction": direction, "confirmed": confirmed,
         }
-    
-    except Exception as e:
-        return {
-            "move_5m_pct": 0.0,
-            "move_15m_pct": 0.0,
-            "candle_body_pct": 0.0,
-            "atr_normalized_move": 0.0,
-            "price_acceleration": 0.0,
-        }
+    except Exception:
+        return empty
 
 def calculate_momentum_score(analysis_5m: Dict, analysis_15m: Dict, analysis_1h: Dict, movement_metrics: Dict, is_bullish: bool) -> Dict[str, Any]:
     """Calculate momentum score (0-100) based on multiple factors."""
@@ -2094,112 +2098,124 @@ def _fetch_fo_signal(fyers, symbol: str):
 # ════════════════════════════════════════════════════════════════════════════════
 # MOMENTUM SCANNER WORKER (NEW)
 # ════════════════════════════════════════════════════════════════════════════════
+def validate_strict_momentum(analysis_5m: Dict, analysis_15m: Dict, analysis_1h: Dict, movement: Dict, direction: str, ai_confidence: float = 0) -> Dict[str, Any]:
+    """Hard validation gate. Any major conflict rejects the signal."""
+    d5 = analysis_5m.get("data", {}); d15 = analysis_15m.get("data", {}); d1h = analysis_1h.get("data", {})
+    reasons = []; confirmations = 0
+    t5 = d5.get("structure_trend", "NEUTRAL"); t15 = d15.get("structure_trend", "NEUTRAL"); t1h = d1h.get("structure_trend", "NEUTRAL")
+
+    if direction == "BUY":
+        if t5 != "BULLISH": reasons.append("5M not bullish")
+        if t15 != "BULLISH": reasons.append("15M not bullish")
+        if t1h == "BEARISH": reasons.append("1H bearish conflict")
+    else:
+        if t5 != "BEARISH": reasons.append("5M not bearish")
+        if t15 != "BEARISH": reasons.append("15M not bearish")
+        if t1h == "BULLISH": reasons.append("1H bullish conflict")
+
+    if movement.get("move_5m_pct", 0) >= MOMENTUM_MIN_MOVE_PCT: confirmations += 1
+    else: reasons.append("5M movement weak")
+    if movement.get("move_15m_pct", 0) >= MOMENTUM_MIN_MOVE_15M_PCT: confirmations += 1
+    else: reasons.append("15M movement weak")
+    if movement.get("candle_body_pct", 0) >= MOMENTUM_MIN_BODY_PCT: confirmations += 1
+    else: reasons.append("Weak candle body")
+
+    rvol = float(d5.get("rvol", 0) or 0)
+    if rvol >= MOMENTUM_MIN_RVOL: confirmations += 1
+    else: reasons.append(f"Low RVOL {rvol:.2f}")
+
+    price = float(d5.get("last_close", 0) or 0); vwap = d5.get("vwap")
+    if vwap is not None:
+        if (direction == "BUY" and price > float(vwap)) or (direction == "SELL" and price < float(vwap)): confirmations += 1
+        else: reasons.append("VWAP conflict")
+
+    ema = d5.get("ema_trend", "NEUTRAL")
+    if ema == ("BULLISH" if direction == "BUY" else "BEARISH"): confirmations += 1
+    else: reasons.append("EMA conflict")
+
+    pressure = d5.get("pressure_trend", "NEUTRAL")
+    buying = float(d5.get("buying_pressure", 50) or 50); selling = float(d5.get("selling_pressure", 50) or 50)
+    if direction == "BUY" and pressure in ["BUYING", "STRONG_BUYING"] and buying >= MOMENTUM_MIN_PRESSURE: confirmations += 1
+    elif direction == "SELL" and pressure in ["SELLING", "STRONG_SELLING"] and selling >= MOMENTUM_MIN_PRESSURE: confirmations += 1
+    else: reasons.append("Pressure conflict")
+
+    rsi = float(d5.get("rsi", 50) or 50)
+    rsi_ok = (MOMENTUM_BUY_MIN_RSI <= rsi <= MOMENTUM_BUY_MAX_RSI) if direction == "BUY" else (MOMENTUM_SELL_MIN_RSI <= rsi <= MOMENTUM_SELL_MAX_RSI)
+    if rsi_ok: confirmations += 1
+    else: reasons.append(f"RSI invalid {rsi:.1f}")
+
+    macd_bullish = bool(d5.get("macd_bullish", False))
+    if (direction == "BUY" and macd_bullish) or (direction == "SELL" and not macd_bullish): confirmations += 1
+    else: reasons.append("MACD conflict")
+
+    structure_event = ((d5.get("bullish_choch") or d5.get("bullish_mss") or d5.get("bullish_cisd")) if direction == "BUY" else (d5.get("bearish_choch") or d5.get("bearish_mss") or d5.get("bearish_cisd")))
+    if structure_event: confirmations += 1
+    else: reasons.append("No confirmed structure event")
+
+    if ai_confidence >= MOMENTUM_MIN_AI_CONFIDENCE: confirmations += 1
+    else: reasons.append(f"AI confidence low {ai_confidence:.1f}%")
+
+    return {"passed": len(reasons) == 0 and confirmations >= MOMENTUM_MIN_CONFIRMATIONS, "confirmations": confirmations, "reasons": reasons, "direction": direction}
+
 def _fetch_momentum_signal(fyers, symbol: str, is_fo: bool = False):
-    """Worker for MOMENTUM MOVERS scanning."""
+    """STRICT MOMENTUM MOVERS worker: confirmed signals only."""
     stock_ticker = symbol.replace("NSE:", "").replace("-EQ", "") if isinstance(symbol, str) else str(symbol)
-    
     if not isinstance(symbol, str) or not _VALID_EQ_SYMBOL_RE.match(symbol):
         return None, f"{symbol}: invalid format"
-    
     try:
-        analysis_5m = analyze_timeframe(fyers, symbol, "5")
-        analysis_15m = analyze_timeframe(fyers, symbol, "15")
-        analysis_1h = analyze_timeframe(fyers, symbol, "60")
-        
-        if analysis_5m.get("status") != "OK" or analysis_15m.get("status") != "OK" or analysis_1h.get("status") != "OK":
-            return None, None
-        
-        data_5m = analysis_5m.get("data", {})
-        data_15m = analysis_15m.get("data", {})
-        data_1h = analysis_1h.get("data", {})
-        df_5m = analysis_5m.get("df")
-        
-        if not data_5m or df_5m is None:
-            return None, None
-        
-        # Calculate movement metrics
-        movement_metrics = calculate_movement_metrics(df_5m)
-        move_5m = movement_metrics.get("move_5m_pct", 0)
-        move_15m = movement_metrics.get("move_15m_pct", 0)
-        
-        # Check if stock is actually moving
-        if move_5m < MOMENTUM_MIN_MOVE_PCT or move_15m < MOMENTUM_MIN_MOVE_PCT * 2:
-            return None, None
-        
-        rvol = data_5m.get("rvol", 0)
-        if rvol < MOMENTUM_MIN_RVOL:
-            return None, None
-        
-        # Determine if bullish or bearish based on 5M trend
-        tf_5m_trend = data_5m.get("structure_trend", "NEUTRAL")
-        tf_15m_trend = data_15m.get("structure_trend", "NEUTRAL")
-        
-        is_bullish = tf_5m_trend == "BULLISH" and tf_15m_trend in ["BULLISH", "NEUTRAL"]
-        is_bearish = tf_5m_trend == "BEARISH" and tf_15m_trend in ["BEARISH", "NEUTRAL"]
-        
-        if not is_bullish and not is_bearish:
-            return None, None
-        
-        # Calculate momentum score
-        momentum_result = calculate_momentum_score(analysis_5m, analysis_15m, analysis_1h, movement_metrics, is_bullish)
-        
-        score = momentum_result.get("score", 0)
-        status = momentum_result.get("status", "NONE")
-        
-        # Filter: only show score >= 55 (DEVELOPING and above)
-        if score < MOMENTUM_DEVELOPING_SCORE:
-            return None, None
-        
-        # Calculate AI confidence (from master signal)
-        master = calculate_master_signal(symbol, analysis_5m, analysis_15m, analysis_1h)
-        ai_signal = master.get("final_signal", "NEUTRAL")
-        ai_confidence = master.get("confidence", 0)
-        
-        ltp = data_5m.get("last_close", 0)
-        pressure_trend = data_5m.get("pressure_trend", "NEUTRAL")
-        buying_pct = data_5m.get("buying_pressure", 50)
-        selling_pct = data_5m.get("selling_pressure", 50)
-        ema_trend = data_5m.get("ema_trend", "NEUTRAL")
-        vwap = data_5m.get("vwap")
-        
-        # Build result
+        a5 = analyze_timeframe(fyers, symbol, "5"); a15 = analyze_timeframe(fyers, symbol, "15"); a1h = analyze_timeframe(fyers, symbol, "60")
+        if any(x.get("status") != "OK" for x in [a5, a15, a1h]): return None, None
+        d5 = a5.get("data", {}); d15 = a15.get("data", {}); d1h = a1h.get("data", {}); df5 = a5.get("df")
+        if not d5 or df5 is None: return None, None
+
+        movement = calculate_movement_metrics(df5)
+        move5 = movement.get("move_5m_pct", 0); move15 = movement.get("move_15m_pct", 0); body = movement.get("candle_body_pct", 0)
+        if move5 < MOMENTUM_MIN_MOVE_PCT or move15 < MOMENTUM_MIN_MOVE_15M_PCT or body < MOMENTUM_MIN_BODY_PCT: return None, None
+        rvol = float(d5.get("rvol", 0) or 0)
+        if rvol < MOMENTUM_MIN_RVOL: return None, None
+
+        t5 = d5.get("structure_trend", "NEUTRAL"); t15 = d15.get("structure_trend", "NEUTRAL"); t1h = d1h.get("structure_trend", "NEUTRAL")
+        direction = None
+        if t5 == "BULLISH" and t15 == "BULLISH" and t1h != "BEARISH" and movement.get("direction") == "BULLISH": direction = "BUY"
+        elif t5 == "BEARISH" and t15 == "BEARISH" and t1h != "BULLISH" and movement.get("direction") == "BEARISH": direction = "SELL"
+        else: return None, None
+
+        master = calculate_master_signal(symbol, a5, a15, a1h)
+        ai_signal = str(master.get("final_signal", "NEUTRAL")); ai_conf = float(master.get("confidence", 0) or 0)
+        if direction not in ai_signal or ai_conf < MOMENTUM_MIN_AI_CONFIDENCE: return None, None
+
+        validation = validate_strict_momentum(a5, a15, a1h, movement, direction, ai_conf)
+        if not validation["passed"]: return None, None
+
+        momentum = calculate_momentum_score(a5, a15, a1h, movement, direction == "BUY")
+        score = float(momentum.get("score", 0) or 0)
+        if rvol >= MOMENTUM_STRONG_RVOL: score += 3
+        if body >= 70: score += 2
+        if validation["confirmations"] >= 9: score += 3
+        score = min(100, round(score, 1))
+        if score < MOMENTUM_MIN_SCORE: return None, None
+
+        status = ("🟢 STRONG MOMENTUM BUY" if direction == "BUY" else "🔴 STRONG MOMENTUM SELL") if score >= MOMENTUM_STRONG_SCORE else ("🟢 MOMENTUM BUY" if direction == "BUY" else "🔴 MOMENTUM SELL")
+        ltp = float(d5.get("last_close", 0) or 0); vwap = d5.get("vwap"); pressure = d5.get("pressure_trend", "NEUTRAL")
         result = {
-            "Symbol": stock_ticker,
-            "LTP": round(float(ltp), 2),
-            "Move %": round(move_5m, 2),
-            "5M Move %": round(move_5m, 2),
-            "15M Move %": round(move_15m, 2),
-            "1H Trend": data_1h.get("structure_trend", "N/A"),
-            "RVOL": round(rvol, 2),
-            "🟢 BUY PRESSURE %": round(buying_pct, 1),
-            "🔴 SELL PRESSURE %": round(selling_pct, 1),
-            "VWAP": round(vwap, 2) if vwap else "N/A",
-            "EMA TREND": ema_trend,
-            "BOS": "✅" if (data_5m.get("bullish_choch") or data_5m.get("bearish_choch")) else "−",
-            "CHoCH": "✅" if (data_5m.get("bullish_choch") or data_5m.get("bearish_choch")) else "−",
-            "MSS": "✅" if (data_5m.get("bullish_mss") or data_5m.get("bearish_mss")) else "−",
-            "MOMENTUM SCORE": score,
-            "MOMENTUM SIGNAL": status,
-            "AI CONFIDENCE %": round(ai_confidence, 1),
-            "AI SIGNAL": ai_signal,
-            "ENTRY": master.get("entry", "N/A"),
-            "STOP LOSS": master.get("stop_loss", "N/A"),
-            "TARGET 1": master.get("target1", "N/A"),
-            "TARGET 2": master.get("target2", "N/A"),
-            "RISK:REWARD": master.get("rr_ratio", "N/A"),
-            "SIGNAL REASON": master.get("signal_reason", ""),
+            "Symbol": stock_ticker, "LTP": round(ltp, 2), "Move %": round(move5, 2), "5M Move %": round(move5, 2), "15M Move %": round(move15, 2),
+            "1H Trend": t1h, "RVOL": round(rvol, 2), "🟢 BUY PRESSURE %": round(float(d5.get("buying_pressure", 50)), 1),
+            "🔴 SELL PRESSURE %": round(float(d5.get("selling_pressure", 50)), 1), "VWAP": round(float(vwap), 2) if vwap is not None else "N/A",
+            "EMA TREND": d5.get("ema_trend", "NEUTRAL"), "BOS": "✅" if (d5.get("bullish_mss") or d5.get("bearish_mss")) else "−",
+            "CHoCH": "✅" if (d5.get("bullish_choch") or d5.get("bearish_choch")) else "−", "MSS": "✅" if (d5.get("bullish_mss") or d5.get("bearish_mss")) else "−",
+            "MOMENTUM SCORE": score, "MOMENTUM SIGNAL": status, "AI CONFIDENCE %": round(ai_conf, 1), "AI SIGNAL": ai_signal,
+            "CONFIRMATIONS": validation["confirmations"], "CANDLE BODY %": round(body, 1), "MOVEMENT": movement.get("direction", "NEUTRAL"),
+            "ENTRY": master.get("entry", "N/A"), "STOP LOSS": master.get("stop_loss", "N/A"), "TARGET 1": master.get("target1", "N/A"),
+            "TARGET 2": master.get("target2", "N/A"), "RISK:REWARD": master.get("rr_ratio", "N/A"),
+            "SIGNAL REASON": f"{direction} confirmed | 5M={t5} | 15M={t15} | 1H={t1h} | Move5={move5:.2f}% | Move15={move15:.2f}% | RVOL={rvol:.2f} | Pressure={pressure} | Confirmations={validation['confirmations']}"
         }
-        
-        # Add options data for F&O
         if is_fo:
             options_data = fetch_options_chain_data(fyers, symbol)
-            result["PCR"] = options_data.get("pcr", "N/A")
-            result["OPTIONS BIAS"] = options_data.get("options_bias", "N/A")
-        
+            result["PCR"] = options_data.get("pcr", "N/A"); result["OPTIONS BIAS"] = options_data.get("options_bias", "N/A")
         return result, None
-    
     except Exception as e:
-        return None, f"{symbol}: error"
+        logger.exception("Momentum error for %s: %s", symbol, e)
+        return None, f"{symbol}: momentum error"
 
 # ════════════════════════════════════════════════════════════════════════════════
 # THREADED SCAN FUNCTIONS
