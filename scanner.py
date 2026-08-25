@@ -61,10 +61,21 @@ OPTIONS_HTTP_TIMEOUT = 15
 DEFAULT_CONFIDENCE_THRESHOLD = 70
 DEFAULT_RVOL_THRESHOLD = 1.2
 DEFAULT_STRONG_RVOL = 1.5
-GOLDEN_CROSS_MIN_SIGNALS = 1  # Minimum signals needed for Golden Cross dashboard
+GOLDEN_CROSS_MIN_SIGNALS = 1
 DEATH_CROSS_MIN_SIGNALS = 1
 ADDITIONAL_ANALYSIS_LOOKBACK_DAYS = 30
-REFRESH_INTERVALS = [30, 60, 120]  # seconds
+REFRESH_INTERVALS = [30, 60, 120]
+
+# ════════════════════════════════════════════════════════════════════════════════
+# MOMENTUM MOVERS CONSTANTS (NEW)
+# ════════════════════════════════════════════════════════════════════════════════
+MOMENTUM_MIN_SCORE = 70
+MOMENTUM_STRONG_SCORE = 85
+MOMENTUM_DEVELOPING_SCORE = 55
+MOMENTUM_MIN_MOVE_PCT = 0.1
+MOMENTUM_MIN_RVOL = 1.2
+MOMENTUM_MIN_BODY_PCT = 20
+MOMENTUM_DISPLAY_COUNT = 10
 
 # ════════════════════════════════════════════════════════════════════════════════
 # 15-MIN REVERSAL SCANNER CONSTANTS (ORIGINAL)
@@ -108,7 +119,6 @@ _ensure_app_folders()
 logger = logging.getLogger("nse_scanner_v17")
 logger.setLevel(logging.DEBUG)
 
-# Add file handler
 if not logger.handlers:
     fh = logging.FileHandler("logs/scanner.log", encoding="utf-8")
     fh.setLevel(logging.DEBUG)
@@ -117,7 +127,6 @@ if not logger.handlers:
     logger.addHandler(fh)
 
 def _candle_signal_timestamp(df, is_daily: bool = False, resolution: str = "15") -> Tuple[str, str]:
-    """Return the CLOSE time of the actual signal candle, not the candle-open time."""
     ts = df["Time"].iloc[-1]
     if ts.tzinfo is None:
         ts = ts.tz_localize("UTC")
@@ -133,7 +142,6 @@ def _candle_signal_timestamp(df, is_daily: bool = False, resolution: str = "15")
     return close_ts.strftime("%d-%b-%Y"), close_ts.strftime("%H:%M:%S") + " IST"
 
 def _generated_timestamp() -> str:
-    """Current scanner detection time, separate from the signal candle time."""
     return _now_ist().strftime("%d-%b-%Y %H:%M:%S IST")
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -173,7 +181,6 @@ def _last_valid_atr(df, period: int = 14) -> float:
 # BUYING/SELLING PRESSURE INDICATORS
 # ════════════════════════════════════════════════════════════════════════════════
 def calculate_buying_selling_pressure(df) -> Dict[str, Any]:
-    """Calculate buying and selling pressure using volume-weighted price analysis."""
     if len(df) < 5:
         return {
             "buying_pressure": 50, "selling_pressure": 50,
@@ -232,15 +239,221 @@ def calculate_buying_selling_pressure(df) -> Dict[str, Any]:
     }
 
 # ════════════════════════════════════════════════════════════════════════════════
+# MOMENTUM SCORING ENGINE (NEW - V17)
+# ════════════════════════════════════════════════════════════════════════════════
+def calculate_movement_metrics(df) -> Dict[str, float]:
+    """Calculate how much the stock is actually moving right now."""
+    if df is None or len(df) < 10:
+        return {
+            "move_5m_pct": 0.0,
+            "move_15m_pct": 0.0,
+            "candle_body_pct": 0.0,
+            "atr_normalized_move": 0.0,
+            "price_acceleration": 0.0,
+        }
+    
+    try:
+        close = float(df["Close"].iloc[-1])
+        open_ = float(df["Open"].iloc[-1])
+        high = float(df["High"].iloc[-1])
+        low = float(df["Low"].iloc[-1])
+        
+        close_5m_ago = float(df["Close"].iloc[-2]) if len(df) >= 2 else close
+        move_5m_pct = abs((close - close_5m_ago) / close_5m_ago * 100) if close_5m_ago != 0 else 0.0
+        
+        close_15m_ago = float(df["Close"].iloc[-4]) if len(df) >= 4 else close
+        move_15m_pct = abs((close - close_15m_ago) / close_15m_ago * 100) if close_15m_ago != 0 else 0.0
+        
+        hl_range = high - low
+        body = abs(close - open_)
+        candle_body_pct = (body / hl_range * 100) if hl_range != 0 else 0.0
+        
+        atr = calculate_atr(df, period=14)
+        atr_val = float(atr.iloc[-1]) if len(atr) > 0 else 0.01
+        atr_normalized = (body / atr_val) if atr_val > 0 else 0.0
+        
+        prev_body = abs(float(df["Close"].iloc[-2]) - float(df["Open"].iloc[-2])) if len(df) >= 2 else body
+        acceleration = (body / prev_body) if prev_body > 0 else 1.0
+        
+        return {
+            "move_5m_pct": round(move_5m_pct, 2),
+            "move_15m_pct": round(move_15m_pct, 2),
+            "candle_body_pct": round(candle_body_pct, 1),
+            "atr_normalized_move": round(atr_normalized, 2),
+            "price_acceleration": round(acceleration, 2),
+        }
+    
+    except Exception as e:
+        return {
+            "move_5m_pct": 0.0,
+            "move_15m_pct": 0.0,
+            "candle_body_pct": 0.0,
+            "atr_normalized_move": 0.0,
+            "price_acceleration": 0.0,
+        }
+
+def calculate_momentum_score(analysis_5m: Dict, analysis_15m: Dict, analysis_1h: Dict, movement_metrics: Dict, is_bullish: bool) -> Dict[str, Any]:
+    """Calculate momentum score (0-100) based on multiple factors."""
+    data_5m = analysis_5m.get("data", {})
+    data_15m = analysis_15m.get("data", {})
+    data_1h = analysis_1h.get("data", {})
+    
+    if not data_5m:
+        return {"score": 0, "status": "INSUFFICIENT_DATA"}
+    
+    score = 50
+    score_breakdown = {}
+    
+    try:
+        # 1. PRICE MOVEMENT (20 points)
+        move_5m = movement_metrics.get("move_5m_pct", 0)
+        move_15m = movement_metrics.get("move_15m_pct", 0)
+        
+        if move_5m >= 0.5 and move_15m >= 1.0:
+            score += 20
+        elif move_5m >= 0.3 and move_15m >= 0.5:
+            score += 15
+        elif move_5m >= 0.1:
+            score += 10
+        else:
+            score -= 5
+        
+        score_breakdown["price_movement"] = 20
+        
+        # 2. 5M MOMENTUM (15 points)
+        tf_5m = data_5m.get("structure_trend", "NEUTRAL")
+        if (is_bullish and tf_5m == "BULLISH") or (not is_bullish and tf_5m == "BEARISH"):
+            score += 15
+            score_breakdown["5m_momentum"] = 15
+        else:
+            score -= 10
+            score_breakdown["5m_momentum"] = -10
+        
+        # 3. 15M TREND (15 points)
+        tf_15m = data_15m.get("structure_trend", "NEUTRAL")
+        if (is_bullish and tf_15m in ["BULLISH", "NEUTRAL"]) or (not is_bullish and tf_15m in ["BEARISH", "NEUTRAL"]):
+            score += 15
+            score_breakdown["15m_trend"] = 15
+        elif (is_bullish and tf_15m == "BEARISH") or (not is_bullish and tf_15m == "BULLISH"):
+            score -= 8
+            score_breakdown["15m_trend"] = -8
+        else:
+            score += 7
+            score_breakdown["15m_trend"] = 7
+        
+        # 4. 1H TREND (10 points)
+        tf_1h = data_1h.get("structure_trend", "NEUTRAL")
+        if (is_bullish and tf_1h in ["BULLISH", "NEUTRAL"]) or (not is_bullish and tf_1h in ["BEARISH", "NEUTRAL"]):
+            score += 10
+            score_breakdown["1h_trend"] = 10
+        elif (is_bullish and tf_1h == "BEARISH") or (not is_bullish and tf_1h == "BULLISH"):
+            score -= 5
+            score_breakdown["1h_trend"] = -5
+        
+        # 5. VWAP (10 points)
+        vwap = data_5m.get("vwap")
+        price = data_5m.get("last_close", 0)
+        if vwap is not None:
+            if (is_bullish and price > vwap) or (not is_bullish and price < vwap):
+                score += 10
+                score_breakdown["vwap"] = 10
+            else:
+                score -= 5
+                score_breakdown["vwap"] = -5
+        
+        # 6. EMA ALIGNMENT (10 points)
+        ema_trend = data_5m.get("ema_trend", "NEUTRAL")
+        if (is_bullish and ema_trend == "BULLISH") or (not is_bullish and ema_trend == "BEARISH"):
+            score += 10
+            score_breakdown["ema"] = 10
+        elif (is_bullish and ema_trend == "BEARISH") or (not is_bullish and ema_trend == "BULLISH"):
+            score -= 8
+            score_breakdown["ema"] = -8
+        else:
+            score += 3
+            score_breakdown["ema"] = 3
+        
+        # 7. BUYING/SELLING PRESSURE (10 points)
+        pressure_trend = data_5m.get("pressure_trend", "NEUTRAL")
+        
+        if is_bullish:
+            if pressure_trend == "STRONG_BUYING":
+                score += 10
+                score_breakdown["pressure"] = 10
+            elif pressure_trend == "BUYING":
+                score += 7
+                score_breakdown["pressure"] = 7
+            elif pressure_trend == "STRONG_SELLING":
+                score -= 8
+                score_breakdown["pressure"] = -8
+            elif pressure_trend == "SELLING":
+                score -= 3
+                score_breakdown["pressure"] = -3
+        else:
+            if pressure_trend == "STRONG_SELLING":
+                score += 10
+                score_breakdown["pressure"] = 10
+            elif pressure_trend == "SELLING":
+                score += 7
+                score_breakdown["pressure"] = 7
+            elif pressure_trend == "STRONG_BUYING":
+                score -= 8
+                score_breakdown["pressure"] = -8
+            elif pressure_trend == "BUYING":
+                score -= 3
+                score_breakdown["pressure"] = -3
+        
+        # 8. RVOL (10 points)
+        rvol = data_5m.get("rvol", 1.0)
+        if rvol >= 2.0:
+            score += 10
+            score_breakdown["rvol"] = 10
+        elif rvol >= 1.5:
+            score += 8
+            score_breakdown["rvol"] = 8
+        elif rvol >= 1.2:
+            score += 5
+            score_breakdown["rvol"] = 5
+        elif rvol < 0.8:
+            score -= 5
+            score_breakdown["rvol"] = -5
+        else:
+            score_breakdown["rvol"] = 0
+        
+        score = max(0, min(100, score))
+        
+        if score >= 85:
+            if is_bullish:
+                status = "🟢 STRONG MOMENTUM BUY"
+            else:
+                status = "🔴 STRONG MOMENTUM SELL"
+        elif score >= 70:
+            if is_bullish:
+                status = "🟢 MOMENTUM BUY"
+            else:
+                status = "🔴 MOMENTUM SELL"
+        elif score >= 55:
+            if is_bullish:
+                status = "🟡 DEVELOPING BUY"
+            else:
+                status = "🟠 DEVELOPING SELL"
+        else:
+            status = "NONE"
+        
+        return {
+            "score": round(score, 1),
+            "status": status,
+            "breakdown": score_breakdown,
+        }
+    
+    except Exception as e:
+        return {"score": 0, "status": "ERROR"}
+
+# ════════════════════════════════════════════════════════════════════════════════
 # NEXT CANDLE BIAS CALCULATION (NEW)
 # ════════════════════════════════════════════════════════════════════════════════
 def calculate_next_candle_bias(df, timeframe_analysis: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Calculate Next Candle Bias using weighted scoring from confirmed data.
-    
-    Uses only currently confirmed information - NO future/incomplete candles.
-    Returns bias (BUY/SELL/NEUTRAL) and confidence (0-100).
-    """
+    """Calculate Next Candle Bias using weighted scoring from confirmed data."""
     if df is None or len(df) < 5:
         return {"bias": "NEUTRAL", "confidence": 0.0}
     
@@ -252,18 +465,16 @@ def calculate_next_candle_bias(df, timeframe_analysis: Dict[str, Any]) -> Dict[s
         buy_score = 50.0
         scores_count = 0
         
-        # 1. Candle direction (current/last closed candle)
         last_close = float(df["Close"].iloc[-1])
         last_open = float(df["Open"].iloc[-1])
         
-        if last_close > last_open:  # Green candle
+        if last_close > last_open:
             buy_score += 8
             scores_count += 1
-        elif last_close < last_open:  # Red candle
+        elif last_close < last_open:
             buy_score -= 8
             scores_count += 1
         
-        # 2. Buying/Selling Pressure
         pressure_trend = data.get("pressure_trend", "NEUTRAL")
         if pressure_trend == "STRONG_BUYING":
             buy_score += 12
@@ -275,7 +486,6 @@ def calculate_next_candle_bias(df, timeframe_analysis: Dict[str, Any]) -> Dict[s
             buy_score -= 8
         scores_count += 1
         
-        # 3. Price vs VWAP
         vwap = data.get("vwap")
         if vwap is not None:
             if last_close > vwap:
@@ -284,7 +494,6 @@ def calculate_next_candle_bias(df, timeframe_analysis: Dict[str, Any]) -> Dict[s
                 buy_score -= 6
             scores_count += 1
         
-        # 4. EMA Trend
         ema_trend = data.get("ema_trend", "NEUTRAL")
         if ema_trend == "BULLISH":
             buy_score += 7
@@ -292,26 +501,23 @@ def calculate_next_candle_bias(df, timeframe_analysis: Dict[str, Any]) -> Dict[s
             buy_score -= 7
         scores_count += 1
         
-        # 5. RSI (with proper interpretation)
         rsi = data.get("rsi", 50)
-        if rsi > 70:  # Overbought - potential pullback
+        if rsi > 70:
             buy_score -= 4
-        elif rsi < 30:  # Oversold - potential bounce
+        elif rsi < 30:
             buy_score += 4
-        elif rsi > 60:  # Bullish territory
+        elif rsi > 60:
             buy_score += 3
-        elif rsi < 40:  # Bearish territory
+        elif rsi < 40:
             buy_score -= 3
         scores_count += 1
         
-        # 6. MACD
         if data.get("macd_bullish"):
             buy_score += 5
         else:
             buy_score -= 5
         scores_count += 1
         
-        # 7. Structure
         structure_trend = data.get("structure_trend", "NEUTRAL")
         if structure_trend == "BULLISH":
             buy_score += 6
@@ -319,32 +525,26 @@ def calculate_next_candle_bias(df, timeframe_analysis: Dict[str, Any]) -> Dict[s
             buy_score -= 6
         scores_count += 1
         
-        # 8. BOS/CHoCH/MSS (strong directional signals)
         if data.get("bullish_choch") or data.get("bullish_mss") or data.get("bullish_cisd"):
             buy_score += 10
         elif data.get("bearish_choch") or data.get("bearish_mss") or data.get("bearish_cisd"):
             buy_score -= 10
         scores_count += 1
         
-        # 9. Volume/RVOL confirmation
         rvol = data.get("rvol", 1.0)
-        if rvol > 1.5:  # Strong volume
+        if rvol > 1.5:
             if buy_score > 50:
                 buy_score += 4
             else:
                 buy_score -= 4
-        elif rvol < 0.8:  # Weak volume
+        elif rvol < 0.8:
             buy_score = buy_score * 0.95
         scores_count += 1
         
-        # Normalize score to 0-100
         buy_score = max(0, min(100, buy_score))
-        
-        # Calculate confidence based on how clear the signal is
         confidence = round(abs(buy_score - 50) * 0.8, 1)
         confidence = max(0, min(100, confidence))
         
-        # Determine bias
         if buy_score >= 65:
             bias = "🟢 BUY"
         elif buy_score <= 35:
@@ -365,7 +565,7 @@ def calculate_next_candle_bias(df, timeframe_analysis: Dict[str, Any]) -> Dict[s
 # NEW INDICATORS (MULTI-TIMEFRAME)
 # ════════════════════════════════════════════════════════════════════════════════
 def calculate_vwap(df) -> pd.Series:
-    """Calculate VWAP (Volume Weighted Average Price)"""
+    """Calculate VWAP"""
     if "Volume" not in df.columns or len(df) == 0:
         return pd.Series([np.nan] * len(df), index=df.index)
     
@@ -406,7 +606,7 @@ def find_swing_highs_lows(df, lookback: int = SWING_LOOKBACK_PERIODS) -> Dict[st
     return empty
 
 def _confirmed_pivots(df, left: int = 2, right: int = 2):
-    """Return confirmed pivot highs/lows. The final `right` candles are excluded."""
+    """Return confirmed pivot highs/lows."""
     if df is None or len(df) < left + right + 3:
         return [], []
     d = df.reset_index(drop=True)
@@ -715,11 +915,7 @@ def _display_scan_summary(stats: "ScanStats") -> None:
 # TIMEFRAME DATA FETCHER (NEW)
 # ════════════════════════════════════════════════════════════════════════════════
 def _fetch_timeframe_data(fyers, symbol, resolution: str, lookback_days: int = 30) -> Optional[pd.DataFrame]:
-    """
-    Fetch OHLCV data for a specific timeframe.
-    Returns cleaned DataFrame or None if failed.
-    Ensures no data contamination between timeframes.
-    """
+    """Fetch OHLCV data for a specific timeframe."""
     date_from = (datetime.today() - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
     date_to = datetime.today().strftime("%Y-%m-%d")
     
@@ -748,12 +944,11 @@ def _fetch_timeframe_data(fyers, symbol, resolution: str, lookback_days: int = 3
         if len(df) < 10:
             return None
         
-        # Remove unclosed candle (last candle less than resolution old)
         if len(df) > 1:
             last_time = df["Time"].iloc[-1]
             candle_age = (_now_ist() - last_time).total_seconds() / 60
             res_minutes = int(resolution)
-            if candle_age < res_minutes + 1:  # Unclosed candle
+            if candle_age < res_minutes + 1:
                 df = df.iloc[:-1].reset_index(drop=True)
         
         if len(df) < 10:
@@ -768,10 +963,7 @@ def _fetch_timeframe_data(fyers, symbol, resolution: str, lookback_days: int = 3
 # TIMEFRAME ANALYSIS ENGINE (NEW - WITH PRESSURE)
 # ════════════════════════════════════════════════════════════════════════════════
 def analyze_timeframe(fyers, symbol: str, resolution: str) -> Dict[str, Any]:
-    """
-    Analyze a specific timeframe.
-    Returns comprehensive structure, CHoCH, MSS, and indicator data WITH PRESSURE.
-    """
+    """Analyze a specific timeframe."""
     df = _fetch_timeframe_data(fyers, symbol, resolution, lookback_days=30)
     
     if df is None or len(df) < 10:
@@ -782,7 +974,6 @@ def analyze_timeframe(fyers, symbol: str, resolution: str) -> Dict[str, Any]:
         }
     
     try:
-        # Calculate indicators
         rsi = calculate_rsi(df["Close"])
         macd_line, macd_sig, macd_hist = calculate_macd(df["Close"])
         atr = calculate_atr(df)
@@ -792,28 +983,23 @@ def analyze_timeframe(fyers, symbol: str, resolution: str) -> Dict[str, Any]:
         ema50 = calculate_ema(df["Close"], 50)
         ema200 = calculate_ema(df["Close"], 200)
         
-        # Calculate buying/selling pressure
         pressure = calculate_buying_selling_pressure(df)
         
-        # Structure analysis
         structure = detect_structure(df)
         choch = detect_choch(df)
         mss = detect_mss(df)
         cisd = detect_cisd(df)
         swings = find_swing_highs_lows(df)
         
-        # Volume analysis
         vol_avg20 = float(df["Volume"].tail(20).mean()) if "Volume" in df.columns else 0
         last_vol = float(df["Volume"].iloc[-1]) if "Volume" in df.columns else 0
         rvol = round(last_vol / vol_avg20, 2) if vol_avg20 > 0 else 0.0
         
-        # Price levels
         last_close = float(df["Close"].iloc[-1])
         last_high = float(df["High"].iloc[-1])
         last_low = float(df["Low"].iloc[-1])
         last_open = float(df["Open"].iloc[-1])
         
-        # Trend determination
         ema_trend = "BULLISH" if ema9.iloc[-1] > ema21.iloc[-1] > ema50.iloc[-1] else "BEARISH" if ema9.iloc[-1] < ema21.iloc[-1] < ema50.iloc[-1] else "NEUTRAL"
         
         rsi_val = float(rsi.iloc[-1])
@@ -869,7 +1055,6 @@ def analyze_timeframe(fyers, symbol: str, resolution: str) -> Dict[str, Any]:
                 "macd_value": round(float(macd_line.iloc[-1]), 4),
                 "rvol": rvol,
                 "atr": round(float(atr.iloc[-1]), 2),
-                # Pressure indicators
                 "buying_pressure": pressure["buying_pressure"],
                 "selling_pressure": pressure["selling_pressure"],
                 "pressure_trend": pressure["trend"],
@@ -980,34 +1165,14 @@ def fetch_options_chain_data(fyers, symbol: str, expiry_timestamp: str = "") -> 
 # STRICT MULTI-TIMEFRAME SIGNAL VALIDATION ENGINE (FIXED)
 # ════════════════════════════════════════════════════════════════════════════════
 def calculate_master_signal(symbol: str, analysis_5m: Dict, analysis_15m: Dict, analysis_1h: Dict, options_data: Dict = None) -> Dict[str, Any]:
-    """
-    STRICT master signal validation engine.
-    
-    Prevents wrong BUY/SELL by enforcing:
-    1. Multi-timeframe alignment (no conflicting timeframes)
-    2. Pressure validation (direction must match)
-    3. VWAP confirmation (price must be on correct side)
-    4. EMA structure (must not contradict)
-    5. Market structure validation (CHoCH/MSS/CISD support)
-    6. Volume confirmation (RVOL preference)
-    7. Next Candle Bias conflict detection (override if strongly opposed)
-    8. Options validation for F&O
-    
-    Returns NEUTRAL/WAIT rather than forcing wrong signals.
-    """
+    """STRICT master signal validation engine."""
     if options_data is None:
         options_data = {"status":"DATA_UNAVAILABLE", "options_bias":"NEUTRAL"}
     
-    # ════════════════════════════════════════════════════════════════════════════
-    # EXTRACT DATA FROM EACH TIMEFRAME
-    # ════════════════════════════════════════════════════════════════════════════
     data_5m = analysis_5m.get("data") if analysis_5m.get("status") == "OK" else None
     data_15m = analysis_15m.get("data") if analysis_15m.get("status") == "OK" else None
     data_1h = analysis_1h.get("data") if analysis_1h.get("status") == "OK" else None
     
-    # ════════════════════════════════════════════════════════════════════════════
-    # VALIDATION GATE 1: TIMEFRAME AVAILABILITY
-    # ════════════════════════════════════════════════════════════════════════════
     if not data_5m or not data_15m or not data_1h:
         return {
             "final_signal": "🟡 NEUTRAL",
@@ -1021,14 +1186,8 @@ def calculate_master_signal(symbol: str, analysis_5m: Dict, analysis_15m: Dict, 
             "signal_reason": "Insufficient timeframe data",
         }
     
-    # ════════════════════════════════════════════════════════════════════════════
-    # CLASSIFY EACH TIMEFRAME
-    # ════════════════════════════════════════════════════════════════════════════
     def classify_tf_direction(data: Dict) -> str:
-        """Return BULLISH, BEARISH, or NEUTRAL based on structure."""
         trend = data.get("structure_trend", "NEUTRAL")
-        struct_type = data.get("structure_type", "UNKNOWN")
-        
         if trend == "BULLISH":
             return "BULLISH"
         elif trend == "BEARISH":
@@ -1040,9 +1199,6 @@ def calculate_master_signal(symbol: str, analysis_5m: Dict, analysis_15m: Dict, 
     tf_15m = classify_tf_direction(data_15m)
     tf_1h = classify_tf_direction(data_1h)
     
-    # ════════════════════════════════════════════════════════════════════════════
-    # VALIDATION GATE 2: MULTI-TIMEFRAME ALIGNMENT
-    # ════════════════════════════════════════════════════════════════════════════
     is_bullish_aligned = (
         (tf_5m == "BULLISH") and
         (tf_15m in ["BULLISH", "NEUTRAL"]) and
@@ -1076,9 +1232,6 @@ def calculate_master_signal(symbol: str, analysis_5m: Dict, analysis_15m: Dict, 
             "signal_reason": f"Timeframe conflict: 5M {tf_5m} vs 15M {tf_15m} vs 1H {tf_1h}",
         }
     
-    # ════════════════════════════════════════════════════════════════════════════
-    # VALIDATION GATE 3: PRESSURE CONFIRMATION
-    # ════════════════════════════════════════════════════════════════════════════
     pressure_trend = data_5m.get("pressure_trend", "NEUTRAL")
     pressure_buy = pressure_trend in ["BUYING", "STRONG_BUYING"]
     pressure_sell = pressure_trend in ["SELLING", "STRONG_SELLING"]
@@ -1110,9 +1263,6 @@ def calculate_master_signal(symbol: str, analysis_5m: Dict, analysis_15m: Dict, 
             "signal_reason": f"Pressure conflict: {pressure_trend}",
         }
     
-    # ════════════════════════════════════════════════════════════════════════════
-    # VALIDATION GATE 4: VWAP CONFIRMATION
-    # ════════════════════════════════════════════════════════════════════════════
     last_close = data_5m.get("last_close", 0)
     vwap = data_5m.get("vwap")
     
@@ -1146,9 +1296,6 @@ def calculate_master_signal(symbol: str, analysis_5m: Dict, analysis_15m: Dict, 
             "signal_reason": f"VWAP conflict: Price {last_close:.2f} vs VWAP {vwap:.2f if vwap else 'N/A'}",
         }
     
-    # ════════════════════════════════════════════════════════════════════════════
-    # VALIDATION GATE 5: EMA STRUCTURE
-    # ════════════════════════════════════════════════════════════════════════════
     ema_trend = data_5m.get("ema_trend", "NEUTRAL")
     
     if is_bullish_aligned and ema_trend == "BEARISH":
@@ -1176,41 +1323,33 @@ def calculate_master_signal(symbol: str, analysis_5m: Dict, analysis_15m: Dict, 
             "signal_reason": f"EMA conflict: Trend {ema_trend} vs Structure {tf_5m}",
         }
     
-    # ════════════════════════════════════════════════════════════════════════════
-    # CONFIDENCE CALCULATION (Based on agreement of factors)
-    # ════════════════════════════════════════════════════════════════════════════
     confirmation_count = 0
     total_factors = 0
     
-    # Factor 1: 5M Structure
     if tf_5m == "BULLISH":
         confirmation_count += 1
     elif tf_5m == "BEARISH":
         confirmation_count -= 1
     total_factors += 1
     
-    # Factor 2: 15M Structure
     if tf_15m == "BULLISH":
         confirmation_count += 1
     elif tf_15m == "BEARISH":
         confirmation_count -= 1
     total_factors += 1
     
-    # Factor 3: 1H Structure
     if tf_1h == "BULLISH":
         confirmation_count += 1
     elif tf_1h == "BEARISH":
         confirmation_count -= 1
     total_factors += 1
     
-    # Factor 4: Pressure
     if pressure_buy:
         confirmation_count += 1
     elif pressure_sell:
         confirmation_count -= 1
     total_factors += 1
     
-    # Factor 5: VWAP
     if vwap is not None:
         if is_bullish_aligned and price_above_vwap:
             confirmation_count += 1
@@ -1218,14 +1357,12 @@ def calculate_master_signal(symbol: str, analysis_5m: Dict, analysis_15m: Dict, 
             confirmation_count += 1
         total_factors += 1
     
-    # Factor 6: EMA
     if ema_trend == "BULLISH":
         confirmation_count += 1
     elif ema_trend == "BEARISH":
         confirmation_count -= 1
     total_factors += 1
     
-    # Factor 7: Market Structure (CHoCH/MSS/CISD)
     has_bullish_structure = (
         data_5m.get("bullish_choch") or 
         data_5m.get("bullish_mss") or 
@@ -1245,7 +1382,6 @@ def calculate_master_signal(symbol: str, analysis_5m: Dict, analysis_15m: Dict, 
         confirmation_count += 1
     total_factors += 1
     
-    # Factor 8: Volume/RVOL
     rvol = data_5m.get("rvol", 1.0)
     if rvol >= 1.2:
         confirmation_count += 1
@@ -1253,13 +1389,9 @@ def calculate_master_signal(symbol: str, analysis_5m: Dict, analysis_15m: Dict, 
         confirmation_count -= 1
     total_factors += 1
     
-    # Calculate raw confidence (0-100)
     raw_confidence = (confirmation_count / total_factors) * 100 if total_factors > 0 else 0
     confidence = max(0, min(100, abs(raw_confidence)))
     
-    # ════════════════════════════════════════════════════════════════════════════
-    # VALIDATION GATE 6: NEXT CANDLE BIAS CONFLICT DETECTION
-    # ════════════════════════════════════════════════════════════════════════════
     df_5m = analysis_5m.get("df")
     if df_5m is not None:
         next_bias = calculate_next_candle_bias(df_5m, analysis_5m)
@@ -1269,7 +1401,6 @@ def calculate_master_signal(symbol: str, analysis_5m: Dict, analysis_15m: Dict, 
     next_bias_str = next_bias.get("bias", "NEUTRAL")
     next_bias_conf = next_bias.get("confidence", 0.0)
     
-    # Check for strong conflict
     if is_bullish_aligned and "SELL" in next_bias_str and next_bias_conf >= 70:
         return {
             "final_signal": "🟡 NEUTRAL",
@@ -1308,9 +1439,6 @@ def calculate_master_signal(symbol: str, analysis_5m: Dict, analysis_15m: Dict, 
             "signal_reason": f"Next Candle Bias conflict: Bearish setup but Next Bias {next_bias_str}",
         }
     
-    # ════════════════════════════════════════════════════════════════════════════
-    # VALIDATION GATE 7: OPTIONS VALIDATION (F&O ONLY)
-    # ════════════════════════════════════════════════════════════════════════════
     options_bias = options_data.get("options_bias", "NEUTRAL")
     options_conflict = False
     
@@ -1323,9 +1451,6 @@ def calculate_master_signal(symbol: str, analysis_5m: Dict, analysis_15m: Dict, 
         if not (has_bullish_structure or has_bearish_structure):
             confidence = min(confidence, 50.0)
     
-    # ════════════════════════════════════════════════════════════════════════════
-    # STRICT SIGNAL GENERATION THRESHOLDS
-    # ════════════════════════════════════════════════════════════════════════════
     composite_score = 50
     
     if is_bullish_aligned:
@@ -1402,9 +1527,6 @@ def calculate_master_signal(symbol: str, analysis_5m: Dict, analysis_15m: Dict, 
         final_signal = "🟡 NEUTRAL"
         confidence = 35.0
     
-    # ════════════════════════════════════════════════════════════════════════════
-    # BUILD SIGNAL REASON
-    # ════════════════════════════════════════════════════════════════════════════
     reason_parts = []
     
     if "BUY" in final_signal:
@@ -1442,9 +1564,6 @@ def calculate_master_signal(symbol: str, analysis_5m: Dict, analysis_15m: Dict, 
     
     signal_reason = " + ".join(reason_parts)
     
-    # ════════════════════════════════════════════════════════════════════════════
-    # CALCULATE ENTRY, SL, TARGETS ONLY FOR VALID SIGNALS
-    # ════════════════════════════════════════════════════════════════════════════
     entry = sl = t1 = t2 = rr_ratio = None
     
     if "BUY" in final_signal or "SELL" in final_signal:
@@ -1503,21 +1622,7 @@ def normalize_signal(signal_str: str) -> str:
 # V17 NEW FEATURES: GOLDEN CROSS / DEATH CROSS DETECTION (DAILY)
 # ════════════════════════════════════════════════════════════════════════════════
 def detect_golden_death_cross(fyers, symbol: str) -> Dict[str, Any]:
-    """
-    Detect Golden Cross (EMA50 crosses above EMA200) and Death Cross (EMA50 crosses below EMA200).
-    Uses DAILY closed candles only.
-    
-    Returns: {
-        "golden_cross": bool,
-        "death_cross": bool,
-        "ema50": float,
-        "ema200": float,
-        "ema_trend": str,  # BULLISH/BEARISH/NEUTRAL
-        "signal": str,  # Golden Cross / Death Cross / NONE
-        "signal_date": str,
-        "ltp": float
-    }
-    """
+    """Detect Golden Cross and Death Cross using DAILY closed candles only."""
     empty = {
         "golden_cross": False,
         "death_cross": False,
@@ -1531,7 +1636,6 @@ def detect_golden_death_cross(fyers, symbol: str) -> Dict[str, Any]:
     }
     
     try:
-        # Fetch daily data (last 100 days for accurate EMA)
         date_from = (datetime.today() - timedelta(days=100)).strftime("%Y-%m-%d")
         date_to = datetime.today().strftime("%Y-%m-%d")
         
@@ -1553,7 +1657,6 @@ def detect_golden_death_cross(fyers, symbol: str) -> Dict[str, Any]:
             empty["reason"] = "INSUFFICIENT_DATA"
             return empty
         
-        # Build dataframe
         df = pd.DataFrame(candles, columns=["Time", "Open", "High", "Low", "Close", "Volume"])
         df["Time"] = pd.to_datetime(df["Time"], unit="s", utc=True).dt.tz_convert("Asia/Kolkata")
         df[["Open", "High", "Low", "Close", "Volume"]] = df[["Open", "High", "Low", "Close", "Volume"]].apply(pd.to_numeric, errors="coerce")
@@ -1563,28 +1666,22 @@ def detect_golden_death_cross(fyers, symbol: str) -> Dict[str, Any]:
             empty["reason"] = "INSUFFICIENT_DATA"
             return empty
         
-        # Calculate EMAs
         ema50 = calculate_ema(df["Close"], 50)
         ema200 = calculate_ema(df["Close"], 200)
         
-        # Get last two values for crossover detection
         if len(ema50) < 2 or len(ema200) < 2:
             empty["reason"] = "EMA_CALCULATION_ERROR"
             return empty
         
-        # Previous candle (index -2)
         prev_ema50 = float(ema50.iloc[-2])
         prev_ema200 = float(ema200.iloc[-2])
         
-        # Current candle (index -1) - ONLY CLOSED CANDLES
         curr_ema50 = float(ema50.iloc[-1])
         curr_ema200 = float(ema200.iloc[-1])
         
-        # Current price
         ltp = float(df["Close"].iloc[-1])
         signal_date = df["Time"].iloc[-1].strftime("%d-%b-%Y")
         
-        # Determine EMA trend
         if curr_ema50 > curr_ema200:
             ema_trend = "BULLISH"
         elif curr_ema50 < curr_ema200:
@@ -1592,13 +1689,9 @@ def detect_golden_death_cross(fyers, symbol: str) -> Dict[str, Any]:
         else:
             ema_trend = "NEUTRAL"
         
-        # Detect Golden Cross (EMA50 crosses above EMA200)
         golden_cross = (prev_ema50 <= prev_ema200) and (curr_ema50 > curr_ema200)
-        
-        # Detect Death Cross (EMA50 crosses below EMA200)
         death_cross = (prev_ema50 >= prev_ema200) and (curr_ema50 < curr_ema200)
         
-        # Determine signal
         if golden_cross:
             signal = "🟢 GOLDEN CROSS"
         elif death_cross:
@@ -1623,66 +1716,7 @@ def detect_golden_death_cross(fyers, symbol: str) -> Dict[str, Any]:
         return empty
 
 # ════════════════════════════════════════════════════════════════════════════════
-# V17 SIGNAL EXPLANATION GENERATOR
-# ════════════════════════════════════════════════════════════════════════════════
-def generate_signal_explanation(signal_data: Dict[str, Any], data_5m: Dict[str, Any]) -> str:
-    """Generate human-readable explanation for WHY/SELL/NEUTRAL."""
-    signal = signal_data.get("final_signal", "NEUTRAL")
-    confidence = signal_data.get("confidence", 0)
-    reason = signal_data.get("signal_reason", "")
-    
-    explanation = f"**{signal}** — {confidence:.0f}% Confidence\n\n"
-    explanation += f"**Reason:** {reason}\n\n"
-    
-    # Add detailed factors
-    explanation += "**Factors:**\n"
-    
-    if data_5m:
-        # Pressure
-        bp = data_5m.get("buying_pressure", "N/A")
-        sp = data_5m.get("selling_pressure", "N/A")
-        explanation += f"• Buying Pressure: {bp}%\n"
-        explanation += f"• Selling Pressure: {sp}%\n"
-        
-        # Structure
-        struct_type = data_5m.get("structure_type", "N/A")
-        struct_trend = data_5m.get("structure_trend", "N/A")
-        explanation += f"• Market Structure: {struct_type} ({struct_trend})\n"
-        
-        # Price & VWAP
-        price = data_5m.get("last_close", "N/A")
-        vwap = data_5m.get("vwap", "N/A")
-        if vwap != "N/A":
-            position = "Above" if price > vwap else "Below"
-            explanation += f"• Price {position} VWAP ({price:.2f} vs {vwap:.2f})\n"
-        
-        # EMA
-        ema_trend = data_5m.get("ema_trend", "N/A")
-        explanation += f"• EMA Trend: {ema_trend}\n"
-        
-        # RSI
-        rsi = data_5m.get("rsi", "N/A")
-        explanation += f"• RSI: {rsi}\n"
-        
-        # Structure signals
-        if data_5m.get("bullish_choch"):
-            explanation += "• ✓ Bullish CHoCH confirmed\n"
-        elif data_5m.get("bearish_choch"):
-            explanation += "• ✗ Bearish CHoCH confirmed\n"
-        
-        if data_5m.get("bullish_mss"):
-            explanation += "• ✓ Bullish MSS confirmed\n"
-        elif data_5m.get("bearish_mss"):
-            explanation += "• ✗ Bearish MSS confirmed\n"
-        
-        # Volume
-        rvol = data_5m.get("rvol", "N/A")
-        explanation += f"• Volume: {rvol}x average\n"
-    
-    return explanation
-
-# ════════════════════════════════════════════════════════════════════════════════
-# SCAN STATISTICS & MARKET DASHBOARD FUNCTIONS
+# MARKET STATISTICS
 # ════════════════════════════════════════════════════════════════════════════════
 def calculate_market_stats(results_df: pd.DataFrame) -> Dict[str, Any]:
     """Calculate market statistics from scan results."""
@@ -1703,24 +1737,20 @@ def calculate_market_stats(results_df: pd.DataFrame) -> Dict[str, Any]:
     try:
         total = len(results_df)
         
-        # Normalize signals
         normalized = results_df.get("AI SIGNAL", pd.Series([])).apply(normalize_signal)
         buy_count = len(normalized[normalized == "BUY"])
         sell_count = len(normalized[normalized == "SELL"])
         neutral_count = len(normalized[normalized == "NEUTRAL"])
         
-        # Strong signals
         strong_buy = len(results_df[results_df.get("AI SIGNAL", pd.Series([])).astype(str).str.contains("STRONG BUY", na=False)])
         strong_sell = len(results_df[results_df.get("AI SIGNAL", pd.Series([])).astype(str).str.contains("STRONG SELL", na=False)])
         
-        # Average confidence
         try:
             avg_conf = pd.to_numeric(results_df.get("AI CONFIDENCE %", pd.Series([])), errors='coerce').mean()
             avg_conf = 0 if pd.isna(avg_conf) else avg_conf
         except:
             avg_conf = 0
         
-        # Percentages
         buy_pct = (buy_count / total * 100) if total > 0 else 0
         sell_pct = (sell_count / total * 100) if total > 0 else 0
         neutral_pct = (neutral_count / total * 100) if total > 0 else 0
@@ -1806,7 +1836,7 @@ def _format_excel_output(df, scanner_type: str = "NSE") -> bytes:
                             try:
                                 cell_value = str(cell.value)
                                 
-                                if col_title == "AI SIGNAL":
+                                if col_title in ["AI SIGNAL", "MOMENTUM SIGNAL"]:
                                     if "BUY" in cell_value and "SELL" not in cell_value:
                                         cell.fill = green_fill
                                     elif "SELL" in cell_value:
@@ -1814,7 +1844,7 @@ def _format_excel_output(df, scanner_type: str = "NSE") -> bytes:
                                     else:
                                         cell.fill = yellow_fill
                                 
-                                elif col_title == "AI CONFIDENCE %":
+                                elif col_title in ["AI CONFIDENCE %", "MOMENTUM SCORE"]:
                                     try:
                                         conf_val = float(cell_value)
                                         if conf_val >= 70:
@@ -1844,10 +1874,10 @@ def _format_excel_output(df, scanner_type: str = "NSE") -> bytes:
                 "Metric": ["Total Stocks", "BUY Signals", "SELL Signals", "NEUTRAL Signals", "Avg Confidence %"],
                 "Value": [
                     str(len(df)),
-                    str(len(df[df["AI SIGNAL"].apply(lambda x: normalize_signal(x)) == "BUY"])),
-                    str(len(df[df["AI SIGNAL"].apply(lambda x: normalize_signal(x)) == "SELL"])),
-                    str(len(df[df["AI SIGNAL"].apply(lambda x: normalize_signal(x)) == "NEUTRAL"])),
-                    f"{pd.to_numeric(df.get('AI CONFIDENCE %', pd.Series([])), errors='coerce').mean():.1f}%"
+                    str(len(df[df["AI SIGNAL"].apply(lambda x: normalize_signal(x)) == "BUY"])) if "AI SIGNAL" in df.columns else "N/A",
+                    str(len(df[df["AI SIGNAL"].apply(lambda x: normalize_signal(x)) == "SELL"])) if "AI SIGNAL" in df.columns else "N/A",
+                    str(len(df[df["AI SIGNAL"].apply(lambda x: normalize_signal(x)) == "NEUTRAL"])) if "AI SIGNAL" in df.columns else "N/A",
+                    f"{pd.to_numeric(df.get('AI CONFIDENCE %', pd.Series([])), errors='coerce').mean():.1f}%" if "AI CONFIDENCE %" in df.columns else "N/A"
                 ]
             }
             summary_df = pd.DataFrame(summary_data)
@@ -1899,7 +1929,6 @@ def _fetch_nse_signal(fyers, symbol: str):
         return None, f"{symbol}: invalid format"
     
     try:
-        # Fetch all timeframes
         analysis_5m = analyze_timeframe(fyers, symbol, "5")
         analysis_15m = analyze_timeframe(fyers, symbol, "15")
         analysis_1h = analyze_timeframe(fyers, symbol, "60")
@@ -1907,16 +1936,13 @@ def _fetch_nse_signal(fyers, symbol: str):
         if all(a.get("status") != "OK" for a in [analysis_5m, analysis_15m, analysis_1h]):
             return None, None
         
-        # Calculate master signal
         master = calculate_master_signal(symbol, analysis_5m, analysis_15m, analysis_1h)
         
-        # Calculate Next Candle Bias
         if analysis_5m.get("status") == "OK" and analysis_5m.get("data"):
             next_bias = calculate_next_candle_bias(analysis_5m.get("df"), analysis_5m)
         else:
             next_bias = {"bias": "NEUTRAL", "confidence": 0.0}
         
-        # Get LTP
         ltp = None
         for analysis in [analysis_5m, analysis_15m, analysis_1h]:
             if analysis.get("status") == "OK" and analysis.get("data"):
@@ -1926,7 +1952,6 @@ def _fetch_nse_signal(fyers, symbol: str):
         if ltp is None:
             return None, None
         
-        # Build result
         data_5m = analysis_5m.get("data") if analysis_5m.get("status") == "OK" else {}
         data_15m = analysis_15m.get("data") if analysis_15m.get("status") == "OK" else {}
         data_1h = analysis_1h.get("data") if analysis_1h.get("status") == "OK" else {}
@@ -1986,7 +2011,6 @@ def _fetch_fo_signal(fyers, symbol: str):
         return None, f"{symbol}: invalid format"
     
     try:
-        # Fetch all timeframes
         analysis_5m = analyze_timeframe(fyers, symbol, "5")
         analysis_15m = analyze_timeframe(fyers, symbol, "15")
         analysis_1h = analyze_timeframe(fyers, symbol, "60")
@@ -1994,19 +2018,15 @@ def _fetch_fo_signal(fyers, symbol: str):
         if all(a.get("status") != "OK" for a in [analysis_5m, analysis_15m, analysis_1h]):
             return None, None
         
-        # Fetch options data for F&O
         options_data = fetch_options_chain_data(fyers, symbol)
         
-        # Calculate master signal
         master = calculate_master_signal(symbol, analysis_5m, analysis_15m, analysis_1h, options_data)
         
-        # Calculate Next Candle Bias
         if analysis_5m.get("status") == "OK" and analysis_5m.get("data"):
             next_bias = calculate_next_candle_bias(analysis_5m.get("df"), analysis_5m)
         else:
             next_bias = {"bias": "NEUTRAL", "confidence": 0.0}
         
-        # Get LTP
         ltp = None
         for analysis in [analysis_5m, analysis_15m, analysis_1h]:
             if analysis.get("status") == "OK" and analysis.get("data"):
@@ -2016,7 +2036,6 @@ def _fetch_fo_signal(fyers, symbol: str):
         if ltp is None:
             return None, None
         
-        # Build result
         data_5m = analysis_5m.get("data") if analysis_5m.get("status") == "OK" else {}
         data_15m = analysis_15m.get("data") if analysis_15m.get("status") == "OK" else {}
         data_1h = analysis_1h.get("data") if analysis_1h.get("status") == "OK" else {}
@@ -2071,6 +2090,116 @@ def _fetch_fo_signal(fyers, symbol: str):
     
     except Exception as e:
         return None, f"{symbol}: error ({type(e).__name__})"
+
+# ════════════════════════════════════════════════════════════════════════════════
+# MOMENTUM SCANNER WORKER (NEW)
+# ════════════════════════════════════════════════════════════════════════════════
+def _fetch_momentum_signal(fyers, symbol: str, is_fo: bool = False):
+    """Worker for MOMENTUM MOVERS scanning."""
+    stock_ticker = symbol.replace("NSE:", "").replace("-EQ", "") if isinstance(symbol, str) else str(symbol)
+    
+    if not isinstance(symbol, str) or not _VALID_EQ_SYMBOL_RE.match(symbol):
+        return None, f"{symbol}: invalid format"
+    
+    try:
+        analysis_5m = analyze_timeframe(fyers, symbol, "5")
+        analysis_15m = analyze_timeframe(fyers, symbol, "15")
+        analysis_1h = analyze_timeframe(fyers, symbol, "60")
+        
+        if analysis_5m.get("status") != "OK" or analysis_15m.get("status") != "OK" or analysis_1h.get("status") != "OK":
+            return None, None
+        
+        data_5m = analysis_5m.get("data", {})
+        data_15m = analysis_15m.get("data", {})
+        data_1h = analysis_1h.get("data", {})
+        df_5m = analysis_5m.get("df")
+        
+        if not data_5m or df_5m is None:
+            return None, None
+        
+        # Calculate movement metrics
+        movement_metrics = calculate_movement_metrics(df_5m)
+        move_5m = movement_metrics.get("move_5m_pct", 0)
+        move_15m = movement_metrics.get("move_15m_pct", 0)
+        
+        # Check if stock is actually moving
+        if move_5m < MOMENTUM_MIN_MOVE_PCT or move_15m < MOMENTUM_MIN_MOVE_PCT * 2:
+            return None, None
+        
+        rvol = data_5m.get("rvol", 0)
+        if rvol < MOMENTUM_MIN_RVOL:
+            return None, None
+        
+        # Determine if bullish or bearish based on 5M trend
+        tf_5m_trend = data_5m.get("structure_trend", "NEUTRAL")
+        tf_15m_trend = data_15m.get("structure_trend", "NEUTRAL")
+        
+        is_bullish = tf_5m_trend == "BULLISH" and tf_15m_trend in ["BULLISH", "NEUTRAL"]
+        is_bearish = tf_5m_trend == "BEARISH" and tf_15m_trend in ["BEARISH", "NEUTRAL"]
+        
+        if not is_bullish and not is_bearish:
+            return None, None
+        
+        # Calculate momentum score
+        momentum_result = calculate_momentum_score(analysis_5m, analysis_15m, analysis_1h, movement_metrics, is_bullish)
+        
+        score = momentum_result.get("score", 0)
+        status = momentum_result.get("status", "NONE")
+        
+        # Filter: only show score >= 55 (DEVELOPING and above)
+        if score < MOMENTUM_DEVELOPING_SCORE:
+            return None, None
+        
+        # Calculate AI confidence (from master signal)
+        master = calculate_master_signal(symbol, analysis_5m, analysis_15m, analysis_1h)
+        ai_signal = master.get("final_signal", "NEUTRAL")
+        ai_confidence = master.get("confidence", 0)
+        
+        ltp = data_5m.get("last_close", 0)
+        pressure_trend = data_5m.get("pressure_trend", "NEUTRAL")
+        buying_pct = data_5m.get("buying_pressure", 50)
+        selling_pct = data_5m.get("selling_pressure", 50)
+        ema_trend = data_5m.get("ema_trend", "NEUTRAL")
+        vwap = data_5m.get("vwap")
+        
+        # Build result
+        result = {
+            "Symbol": stock_ticker,
+            "LTP": round(float(ltp), 2),
+            "Move %": round(move_5m, 2),
+            "5M Move %": round(move_5m, 2),
+            "15M Move %": round(move_15m, 2),
+            "1H Trend": data_1h.get("structure_trend", "N/A"),
+            "RVOL": round(rvol, 2),
+            "🟢 BUY PRESSURE %": round(buying_pct, 1),
+            "🔴 SELL PRESSURE %": round(selling_pct, 1),
+            "VWAP": round(vwap, 2) if vwap else "N/A",
+            "EMA TREND": ema_trend,
+            "BOS": "✅" if (data_5m.get("bullish_choch") or data_5m.get("bearish_choch")) else "−",
+            "CHoCH": "✅" if (data_5m.get("bullish_choch") or data_5m.get("bearish_choch")) else "−",
+            "MSS": "✅" if (data_5m.get("bullish_mss") or data_5m.get("bearish_mss")) else "−",
+            "MOMENTUM SCORE": score,
+            "MOMENTUM SIGNAL": status,
+            "AI CONFIDENCE %": round(ai_confidence, 1),
+            "AI SIGNAL": ai_signal,
+            "ENTRY": master.get("entry", "N/A"),
+            "STOP LOSS": master.get("stop_loss", "N/A"),
+            "TARGET 1": master.get("target1", "N/A"),
+            "TARGET 2": master.get("target2", "N/A"),
+            "RISK:REWARD": master.get("rr_ratio", "N/A"),
+            "SIGNAL REASON": master.get("signal_reason", ""),
+        }
+        
+        # Add options data for F&O
+        if is_fo:
+            options_data = fetch_options_chain_data(fyers, symbol)
+            result["PCR"] = options_data.get("pcr", "N/A")
+            result["OPTIONS BIAS"] = options_data.get("options_bias", "N/A")
+        
+        return result, None
+    
+    except Exception as e:
+        return None, f"{symbol}: error"
 
 # ════════════════════════════════════════════════════════════════════════════════
 # THREADED SCAN FUNCTIONS
@@ -2141,34 +2270,44 @@ def run_fo_scan(fyers, symbols):
     gc.collect()
     return results, errors, stats
 
-# ════════════════════════════════════════════════════════════════════════════════
-# MAIN APP - V17 WITH ALL NEW TABS
-# ════════════════════════════════════════════════════════════════════════════════
+def run_momentum_scan(fyers, symbols, is_fo: bool = False):
+    """Threaded scan for MOMENTUM stocks."""
+    symbols = _validate_symbols(symbols)
+    results, errors = [], []
+    stats = ScanStats(total=len(symbols))
+    progress = st.progress(0.0, text=f"Scanning Momentum Stocks 0 / {len(symbols)}")
+    done = 0
+    
+    for i in range(0, len(symbols), BATCH_SIZE):
+        batch = symbols[i:i + BATCH_SIZE]
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            futures = {executor.submit(_fetch_momentum_signal, fyers, s, is_fo): s for s in batch}
+            for future in as_completed(futures):
+                try:
+                    res, err = future.result()
+                except Exception as e:
+                    res, err = None, f"{futures[future]}: worker error"
+                
+                if res:
+                    results.append(res)
+                if err:
+                    errors.append(err)
+                stats.record(has_result=bool(res), has_error=bool(err))
+                done += 1
+                progress.progress(done / max(len(symbols), 1), text=f"Scanning Momentum {done} / {len(symbols)}")
+        
+        if i + BATCH_SIZE < len(symbols):
+            time.sleep(BATCH_PAUSE_SECONDS)
+    
+    progress.empty()
+    gc.collect()
+    return results, errors, stats
 
-def _download_df_buttons(df, prefix):
-    """Download dataframe as Excel and CSV when data exists."""
-    if df is None or getattr(df, "empty", True):
-        return
-    try:
-        st.download_button(
-            "📥 DOWNLOAD EXCEL",
-            data=_format_excel_output(df, scanner_type=prefix),
-            file_name=f"{prefix.lower()}_results.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            key=f"{prefix}_excel_download",
-        )
-    except Exception as e:
-        st.warning(f"Excel export error: {str(e)[:100]}")
-    st.download_button(
-        "📄 DOWNLOAD CSV",
-        data=df.to_csv(index=False).encode("utf-8"),
-        file_name=f"{prefix.lower()}_results.csv",
-        mime="text/csv",
-        key=f"{prefix}_csv_download",
-    )
-
+# ════════════════════════════════════════════════════════════════════════════════
+# MAIN APP - V17 WITH NEW MOMENTUM MOVERS TAB
+# ════════════════════════════════════════════════════════════════════════════════
 def show_scanner(fyers) -> None:
-    """Streamlit main app - NSE AI PRO V17 with Complete Feature Set"""
+    """Streamlit main app - NSE AI PRO V17 with MOMENTUM MOVERS"""
     
     try:
         st.set_page_config(page_title="NSE AI PRO V17", layout="wide")
@@ -2176,9 +2315,8 @@ def show_scanner(fyers) -> None:
         pass
     
     st.title("🚀 NSE AI PRO V17 — Professional Intraday + Swing Scanner")
-    st.caption(f"🕒 Current Time (IST): {_now_ist().strftime('%d-%b-%Y %H:%M:%S')} IST | Multi-Timeframe Analysis + Golden Cross Detection")
+    st.caption(f"🕒 Current Time (IST): {_now_ist().strftime('%d-%b-%Y %H:%M:%S')} IST | Multi-Timeframe + Momentum Engine")
     
-    # Load symbols
     try:
         all_symbols = load_nse_equity_symbols()
         fo_symbols = load_fo_stocks()
@@ -2193,10 +2331,10 @@ def show_scanner(fyers) -> None:
     
     st.caption(f"📊 NSE Equities: {len(all_symbols)} | 📈 F&O Stocks: {len(fo_symbols)}")
     
-    # Create tabs
     tabs = st.tabs([
         "🇮🇳 NSE STOCKS",
         "📊 F&O STOCKS",
+        "⚡ MOMENTUM MOVERS",
         "⚡ LIVE INTRADAY",
         "🔥 STRONG SIGNALS",
         "📈 SWING (GOLDEN/DEATH CROSS)",
@@ -2227,22 +2365,14 @@ def show_scanner(fyers) -> None:
                 st.session_state["nse_errors"] = nse_errors
                 st.session_state["nse_stats"] = nse_stats
         
-        # Display NSE results
         if "nse_stats" in st.session_state:
             _display_scan_summary(st.session_state["nse_stats"])
-            
-            if st.session_state.get("nse_errors"):
-                with st.expander(f"⚠️ Errors ({len(st.session_state['nse_errors'])})", expanded=False):
-                    for i, err in enumerate(st.session_state["nse_errors"][:10], 1):
-                        st.text(f"{i}. {err}")
         
         nse_df = st.session_state.get("nse_df")
         if nse_df is not None and not nse_df.empty:
             try:
                 st.info(f"📊 Loaded: {len(nse_df)} signals")
                 
-                # Filters
-                st.markdown("### 🔽 Filter & Export")
                 col_f1, col_f2, col_f3 = st.columns(3)
                 
                 with col_f1:
@@ -2252,7 +2382,6 @@ def show_scanner(fyers) -> None:
                 with col_f3:
                     nse_sort = st.selectbox("Sort By", ["AI CONFIDENCE %", "LTP", "RVOL"], key="nse_sort_filter")
                 
-                # Apply filters
                 nse_filtered = nse_df.copy()
                 try:
                     confidence_col = pd.to_numeric(nse_filtered["AI CONFIDENCE %"], errors='coerce')
@@ -2284,7 +2413,6 @@ def show_scanner(fyers) -> None:
                 
                 st.dataframe(nse_filtered, use_container_width=True, height=500)
                 
-                # Download buttons
                 st.markdown("### 📥 Download")
                 col_d1, col_d2, col_d3 = st.columns(3)
                 
@@ -2427,9 +2555,131 @@ def show_scanner(fyers) -> None:
             st.info("👈 Click 'SCAN F&O' to start")
     
     # ════════════════════════════════════════════════════════════════════════════════
-    # TAB 2: LIVE INTRADAY
+    # TAB 2: MOMENTUM MOVERS (NEW)
     # ════════════════════════════════════════════════════════════════════════════════
     with tabs[2]:
+        st.markdown("### ⚡ MOMENTUM MOVERS — Real-Time Price & Volume Momentum\nIdentifies stocks CURRENTLY MOVING with genuine momentum (Score ≥ 70)")
+        
+        col_m1, col_m2, col_m3 = st.columns([2, 2, 1])
+        with col_m1:
+            momentum_type = st.radio("Select Universe", ["NSE Stocks", "F&O Stocks"], horizontal=True, key="momentum_type")
+            momentum_universe = all_symbols if momentum_type == "NSE Stocks" else fo_symbols
+        with col_m2:
+            momentum_limit = st.number_input("Scan limit", min_value=50, max_value=len(momentum_universe),
+                                            value=min(300, len(momentum_universe)), step=50, key="momentum_limit")
+        with col_m3:
+            st.metric("Available", len(momentum_universe))
+        
+        momentum_symbols = momentum_universe[:momentum_limit]
+        
+        if st.button(f"⚡ SCAN MOMENTUM ({len(momentum_symbols)} stocks)", key="momentum_run", type="primary"):
+            with st.spinner("Analyzing momentum…"):
+                is_fo = momentum_type == "F&O Stocks"
+                momentum_results, _, _ = run_momentum_scan(fyers, momentum_symbols, is_fo=is_fo)
+                
+                if momentum_results:
+                    momentum_df = pd.DataFrame(momentum_results)
+                    
+                    # Separate into BUY and SELL
+                    buy_signals = momentum_df[momentum_df["MOMENTUM SIGNAL"].astype(str).str.contains("BUY", na=False)]
+                    sell_signals = momentum_df[momentum_df["MOMENTUM SIGNAL"].astype(str).str.contains("SELL", na=False)]
+                    developing_buy = momentum_df[momentum_df["MOMENTUM SIGNAL"].astype(str).str.contains("DEVELOPING BUY", na=False)]
+                    developing_sell = momentum_df[momentum_df["MOMENTUM SIGNAL"].astype(str).str.contains("DEVELOPING SELL", na=False)]
+                    
+                    st.session_state["momentum_buy_df"] = buy_signals
+                    st.session_state["momentum_sell_df"] = sell_signals
+                    st.session_state["momentum_dev_buy_df"] = developing_buy
+                    st.session_state["momentum_dev_sell_df"] = developing_sell
+        
+        # Display MOMENTUM BUY
+        buy_df = st.session_state.get("momentum_buy_df")
+        if buy_df is not None and not buy_df.empty:
+            buy_df = buy_df.sort_values("MOMENTUM SCORE", ascending=False)
+            
+            st.markdown("## 🟢 TOP MOMENTUM BUY")
+            col_m_b1, col_m_b2 = st.columns(2)
+            with col_m_b1:
+                show_buy_count = st.selectbox("Show Top N", [5, 10, 20, 50], index=1, key="buy_count_select")
+            with col_m_b2:
+                st.metric("Total BUY Momentum Signals", len(buy_df))
+            
+            buy_display = buy_df.head(show_buy_count)
+            
+            # Show table
+            display_cols = ["Symbol", "LTP", "Move %", "5M Move %", "15M Move %", "1H Trend", "RVOL", 
+                          "🟢 BUY PRESSURE %", "VWAP", "EMA TREND", "BOS", "CHoCH", "MSS", 
+                          "MOMENTUM SCORE", "AI CONFIDENCE %", "MOMENTUM SIGNAL", "ENTRY", "STOP LOSS", "TARGET 1", "TARGET 2", "RISK:REWARD", "SIGNAL REASON"]
+            
+            display_cols = [col for col in display_cols if col in buy_display.columns]
+            st.dataframe(buy_display[display_cols], use_container_width=True, height=400)
+            
+            # Download
+            col_bd1, col_bd2, col_bd3 = st.columns(3)
+            with col_bd1:
+                try:
+                    excel_data = _format_excel_output(buy_display, "MOMENTUM_BUY")
+                    st.download_button("📥 Download Excel", excel_data, f"Momentum_Buy_{_now_ist().strftime('%Y%m%d_%H%M')}.xlsx",
+                                     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="momentum_buy_excel")
+                except:
+                    pass
+        else:
+            st.info("👈 Click 'SCAN MOMENTUM' to find BUY momentum stocks")
+        
+        # Display MOMENTUM SELL
+        sell_df = st.session_state.get("momentum_sell_df")
+        if sell_df is not None and not sell_df.empty:
+            sell_df = sell_df.sort_values("MOMENTUM SCORE", ascending=False)
+            
+            st.markdown("## 🔴 TOP MOMENTUM SELL")
+            col_m_s1, col_m_s2 = st.columns(2)
+            with col_m_s1:
+                show_sell_count = st.selectbox("Show Top N", [5, 10, 20, 50], index=1, key="sell_count_select")
+            with col_m_s2:
+                st.metric("Total SELL Momentum Signals", len(sell_df))
+            
+            sell_display = sell_df.head(show_sell_count)
+            
+            display_cols = ["Symbol", "LTP", "Move %", "5M Move %", "15M Move %", "1H Trend", "RVOL", 
+                          "🔴 SELL PRESSURE %", "VWAP", "EMA TREND", "BOS", "CHoCH", "MSS", 
+                          "MOMENTUM SCORE", "AI CONFIDENCE %", "MOMENTUM SIGNAL", "ENTRY", "STOP LOSS", "TARGET 1", "TARGET 2", "RISK:REWARD", "SIGNAL REASON"]
+            
+            display_cols = [col for col in display_cols if col in sell_display.columns]
+            st.dataframe(sell_display[display_cols], use_container_width=True, height=400)
+            
+            # Download
+            col_sd1, col_sd2, col_sd3 = st.columns(3)
+            with col_sd1:
+                try:
+                    excel_data = _format_excel_output(sell_display, "MOMENTUM_SELL")
+                    st.download_button("📥 Download Excel", excel_data, f"Momentum_Sell_{_now_ist().strftime('%Y%m%d_%H%M')}.xlsx",
+                                     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="momentum_sell_excel")
+                except:
+                    pass
+        else:
+            st.info("👈 Click 'SCAN MOMENTUM' to find SELL momentum stocks")
+        
+        # Display DEVELOPING
+        dev_buy_df = st.session_state.get("momentum_dev_buy_df")
+        dev_sell_df = st.session_state.get("momentum_dev_sell_df")
+        
+        if (dev_buy_df is not None and not dev_buy_df.empty) or (dev_sell_df is not None and not dev_sell_df.empty):
+            with st.expander("🟡 DEVELOPING MOMENTUM (Early Detection)", expanded=False):
+                if dev_buy_df is not None and not dev_buy_df.empty:
+                    st.markdown("#### 🟡 Developing BUY")
+                    dev_buy_display = dev_buy_df.sort_values("MOMENTUM SCORE", ascending=False).head(10)
+                    display_cols = [col for col in ["Symbol", "LTP", "Move %", "RVOL", "🟢 BUY PRESSURE %", "MOMENTUM SCORE", "MOMENTUM SIGNAL"] if col in dev_buy_display.columns]
+                    st.dataframe(dev_buy_display[display_cols], use_container_width=True, height=200)
+                
+                if dev_sell_df is not None and not dev_sell_df.empty:
+                    st.markdown("#### 🟠 Developing SELL")
+                    dev_sell_display = dev_sell_df.sort_values("MOMENTUM SCORE", ascending=False).head(10)
+                    display_cols = [col for col in ["Symbol", "LTP", "Move %", "RVOL", "🔴 SELL PRESSURE %", "MOMENTUM SCORE", "MOMENTUM SIGNAL"] if col in dev_sell_display.columns]
+                    st.dataframe(dev_sell_display[display_cols], use_container_width=True, height=200)
+    
+    # ════════════════════════════════════════════════════════════════════════════════
+    # TAB 3: LIVE INTRADAY
+    # ════════════════════════════════════════════════════════════════════════════════
+    with tabs[3]:
         st.markdown("### ⚡ Live Intraday Scanner\nReal-time multi-timeframe analysis (5M, 15M, 1H)")
         
         col1, col2 = st.columns(2)
@@ -2492,14 +2742,10 @@ def show_scanner(fyers) -> None:
             st.info("👈 Click 'SCAN LIVE INTRADAY' to fetch data")
     
     # ════════════════════════════════════════════════════════════════════════════════
-    # TAB 3: STRONG SIGNALS
+    # TAB 4: STRONG SIGNALS
     # ════════════════════════════════════════════════════════════════════════════════
-    with tabs[3]:
+    with tabs[4]:
         st.markdown("### 🔥 Strong Signals Only\nHigh-confidence setups (≥70%)")
-        if st.button("🚀 RUN STRONG SIGNALS", type="primary", key="run_strong_signals"):
-            st.session_state["strong_signals_run"] = True
-            st.rerun()
-
         
         strong_source = st.radio("Source", ["NSE Stocks", "F&O Stocks"], horizontal=True, key="strong_source")
         
@@ -2512,11 +2758,9 @@ def show_scanner(fyers) -> None:
         
         if strong_df is not None and not strong_df.empty:
             try:
-                # Filter for strong signals
                 confidence_col = pd.to_numeric(strong_df.get("AI CONFIDENCE %", pd.Series([])), errors='coerce')
                 strong_filtered = strong_df[confidence_col >= 75].copy()
                 
-                # Only BUY/SELL
                 normalized = strong_filtered["AI SIGNAL"].apply(normalize_signal)
                 strong_filtered = strong_filtered[normalized != "NEUTRAL"]
                 
@@ -2534,9 +2778,9 @@ def show_scanner(fyers) -> None:
             st.info(f"👈 Run '{strong_source}' scanner first")
     
     # ════════════════════════════════════════════════════════════════════════════════
-    # TAB 4: SWING (GOLDEN CROSS / DEATH CROSS)
+    # TAB 5: SWING (GOLDEN CROSS / DEATH CROSS)
     # ════════════════════════════════════════════════════════════════════════════════
-    with tabs[4]:
+    with tabs[5]:
         st.markdown("### 📈 Swing Analysis - Golden Cross & Death Cross Detection\nDaily EMA50/EMA200 crossovers")
         
         col1, col2 = st.columns([3, 1])
@@ -2582,7 +2826,6 @@ def show_scanner(fyers) -> None:
         if swing_df is not None and not swing_df.empty:
             st.success(f"✅ Analysis Complete: {len(swing_df)} stocks analyzed")
             
-            # Filter by signal type
             col_s1, col_s2 = st.columns(2)
             with col_s1:
                 swing_signal_filter = st.selectbox("Signal Type", ["ALL", "🟢 GOLDEN CROSS", "🔴 DEATH CROSS"], key="swing_sig_filter")
@@ -2598,7 +2841,6 @@ def show_scanner(fyers) -> None:
                 swing_filtered = swing_filtered[swing_filtered["EMA Trend"] == swing_trend_filter]
             
             if len(swing_filtered) > 0:
-                # Separate by signal type
                 golden = swing_filtered[swing_filtered["Signal"] == "🟢 GOLDEN CROSS"]
                 death = swing_filtered[swing_filtered["Signal"] == "🔴 DEATH CROSS"]
                 other = swing_filtered[swing_filtered["Signal"] == "NONE"]
@@ -2620,9 +2862,9 @@ def show_scanner(fyers) -> None:
             st.info("👈 Click 'DETECT CROSSOVERS' to start swing analysis")
     
     # ════════════════════════════════════════════════════════════════════════════════
-    # TAB 5: ADDITIONAL ANALYSIS
+    # TAB 6: ADDITIONAL ANALYSIS
     # ════════════════════════════════════════════════════════════════════════════════
-    with tabs[5]:
+    with tabs[6]:
         st.markdown("### 🧠 Additional Analysis - Deep Dive on Single Stock")
         
         col1, col2 = st.columns(2)
@@ -2640,13 +2882,11 @@ def show_scanner(fyers) -> None:
                     analysis_15m = analyze_timeframe(fyers, aa_symbol_input, "15")
                     analysis_1h = analyze_timeframe(fyers, aa_symbol_input, "60")
                     
-                    # Options for F&O
                     if aa_universe == "F&O":
                         options_data = fetch_options_chain_data(fyers, aa_symbol_input)
                     else:
                         options_data = None
                     
-                    # Master signal
                     master_signal = calculate_master_signal(aa_symbol_input, analysis_5m, analysis_15m, analysis_1h, options_data)
                     
                     st.session_state["aa_analysis"] = {
@@ -2664,13 +2904,11 @@ def show_scanner(fyers) -> None:
         if aa_analysis:
             ticker = aa_symbol_input.replace("NSE:", "").replace("-EQ", "")
             
-            # Overall signal
             st.markdown(f"## {ticker} Analysis")
             master = aa_analysis.get("master", {})
             signal = master.get("final_signal", "NEUTRAL")
             conf = master.get("confidence", 0)
             
-            # Color the signal
             if "BUY" in signal:
                 st.success(f"{signal} — {conf:.0f}% Confidence")
             elif "SELL" in signal:
@@ -2678,7 +2916,6 @@ def show_scanner(fyers) -> None:
             else:
                 st.warning(f"{signal} — {conf:.0f}% Confidence")
             
-            # Timeframe analysis
             st.markdown("### ⏱️ Timeframe Analysis")
             col_5m, col_15m, col_1h = st.columns(3)
             
@@ -2710,7 +2947,6 @@ def show_scanner(fyers) -> None:
                     st.write(f"EMA50: {d1h.get('ema50', 'N/A')}")
                     st.write(f"EMA200: {d1h.get('ema200', 'N/A')}")
             
-            # Pressure analysis
             st.markdown("### 📊 Pressure Analysis")
             if d5:
                 bp = d5.get("buying_pressure", 0)
@@ -2721,7 +2957,6 @@ def show_scanner(fyers) -> None:
                 with col_bp2:
                     st.metric("🔴 Selling Pressure", f"{sp}%")
             
-            # Market structure
             st.markdown("### 🏗️ Market Structure")
             col_struct1, col_struct2, col_struct3 = st.columns(3)
             
@@ -2743,7 +2978,6 @@ def show_scanner(fyers) -> None:
                 elif d5 and d5.get("bearish_cisd"):
                     st.error("❌ Bearish CISD")
             
-            # Trade plan
             st.markdown("### 💹 Trade Plan")
             col_tp1, col_tp2, col_tp3, col_tp4 = st.columns(4)
             
@@ -2762,12 +2996,10 @@ def show_scanner(fyers) -> None:
             with col_tp4:
                 st.metric("Target 2 / R:R", f"{t2} / {rr}")
             
-            # Signal explanation
             st.markdown("### 📝 Signal Explanation")
             reason = master.get("signal_reason", "N/A")
             st.info(reason)
             
-            # Options (if F&O)
             if aa_universe == "F&O" and aa_analysis.get("options"):
                 st.markdown("### 📊 Options Analysis")
                 opt = aa_analysis["options"]
@@ -2783,19 +3015,12 @@ def show_scanner(fyers) -> None:
                     st.metric("Options Bias", opt.get("options_bias", "N/A"))
     
     # ════════════════════════════════════════════════════════════════════════════════
-    # TAB 6: MARKET DASHBOARD
+    # TAB 7: MARKET DASHBOARD
     # ════════════════════════════════════════════════════════════════════════════════
-    with tabs[6]:
+    with tabs[7]:
         st.markdown("### 📊 Market Dashboard - Statistics & Sentiment")
-        if st.button("🔄 RUN MARKET DASHBOARD", type="primary", key="run_market_dashboard"):
-            st.session_state["market_dashboard_run"] = True
-            st.rerun()
-
         
-        col_dash1, col_dash2 = st.columns(2)
-        
-        with col_dash1:
-            dashboard_source = st.radio("Data Source", ["NSE Stocks", "F&O Stocks"], horizontal=True, key="dash_source")
+        dashboard_source = st.radio("Data Source", ["NSE Stocks", "F&O Stocks"], horizontal=True, key="dash_source")
         
         if dashboard_source == "NSE Stocks":
             dash_df = st.session_state.get("nse_df")
@@ -2805,7 +3030,6 @@ def show_scanner(fyers) -> None:
         if dash_df is not None and not dash_df.empty:
             stats = calculate_market_stats(dash_df)
             
-            # Market overview
             st.markdown("### 📈 Market Overview")
             col_ov1, col_ov2, col_ov3, col_ov4, col_ov5 = st.columns(5)
             
@@ -2820,7 +3044,6 @@ def show_scanner(fyers) -> None:
             with col_ov5:
                 st.metric("Avg Confidence", f"{stats['avg_confidence']:.1f}%")
             
-            # Strong signals
             st.markdown("### 💪 Strong Signals")
             col_str1, col_str2 = st.columns(2)
             
@@ -2829,7 +3052,6 @@ def show_scanner(fyers) -> None:
             with col_str2:
                 st.metric("💪 Strong SELL", stats["strong_sell"])
             
-            # Market sentiment
             st.markdown("### 😊 Market Sentiment")
             col_sent1, col_sent2, col_sent3 = st.columns(3)
             
@@ -2839,43 +3061,14 @@ def show_scanner(fyers) -> None:
                 st.metric("Bearish %", f"{stats['sell_pct']:.1f}%")
             with col_sent3:
                 st.metric("Neutral %", f"{stats['neutral_pct']:.1f}%")
-            
-            # Chart
-            if st.checkbox("Show Chart"):
-                try:
-                    import matplotlib.pyplot as plt
-                    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4))
-                    
-                    # Pie chart
-                    labels = ["🟢 BUY", "🔴 SELL", "🟡 NEUTRAL"]
-                    sizes = [stats["buy"], stats["sell"], stats["neutral"]]
-                    colors = ["#2ecc71", "#e74c3c", "#f39c12"]
-                    ax1.pie(sizes, labels=labels, colors=colors, autopct="%1.1f%%", startangle=90)
-                    ax1.set_title("Signal Distribution")
-                    
-                    # Bar chart
-                    categories = ["Strong BUY", "BUY", "SELL", "Strong SELL"]
-                    counts = [stats["strong_buy"], stats["buy"] - stats["strong_buy"],
-                             stats["sell"] - stats["strong_sell"], stats["strong_sell"]]
-                    ax2.bar(categories, counts, color=["#27ae60", "#2ecc71", "#e74c3c", "#c0392b"])
-                    ax2.set_ylabel("Count")
-                    ax2.set_title("Signal Strength Distribution")
-                    plt.tight_layout()
-                    st.pyplot(fig)
-                except Exception as e:
-                    st.warning(f"Chart error: {str(e)[:50]}")
         else:
             st.info(f"👈 Run '{dashboard_source}' scanner first")
     
     # ════════════════════════════════════════════════════════════════════════════════
-    # TAB 7: SETTINGS
+    # TAB 8: SETTINGS
     # ════════════════════════════════════════════════════════════════════════════════
-    with tabs[7]:
+    with tabs[8]:
         st.markdown("### ⚙️ Scanner Settings & Configuration")
-        if st.button("▶️ APPLY SETTINGS", type="primary", key="apply_settings"):
-            st.session_state["settings_applied"] = True
-            st.success("Settings applied for this session.")
-
         
         st.markdown("#### 🎯 Signal Filtering")
         col_set1, col_set2, col_set3 = st.columns(3)
@@ -2887,34 +3080,19 @@ def show_scanner(fyers) -> None:
         with col_set3:
             default_strong_rvol = st.slider("Strong Signal RVOL", 1.0, 3.0, DEFAULT_STRONG_RVOL, 0.1, key="set_strong_rvol")
         
-        st.markdown("#### 📊 Scan Parameters")
-        col_set4, col_set5 = st.columns(2)
+        st.markdown("#### 📊 Momentum Settings")
+        col_mom1, col_mom2, col_mom3 = st.columns(3)
         
-        with col_set4:
-            max_workers_setting = st.slider("Max Parallel Workers", 2, 16, MAX_WORKERS, 1, key="set_workers")
-        with col_set5:
-            batch_size_setting = st.slider("Batch Size", 10, 100, BATCH_SIZE, 10, key="set_batch")
-        
-        st.markdown("#### 🔄 Auto Refresh")
-        col_set6, col_set7 = st.columns(2)
-        
-        with col_set6:
-            auto_refresh = st.checkbox("Enable Auto Refresh", value=False, key="set_refresh")
-        with col_set7:
-            if auto_refresh:
-                refresh_interval = st.selectbox("Refresh Interval", REFRESH_INTERVALS, key="set_refresh_int")
-        
-        st.markdown("#### 📋 Display Options")
-        col_set8, col_set9 = st.columns(2)
-        
-        with col_set8:
-            show_errors = st.checkbox("Show Error Details", value=False, key="set_errors")
-        with col_set9:
-            show_logs = st.checkbox("Show API Logs", value=False, key="set_logs")
+        with col_mom1:
+            momentum_min_score = st.slider("Min Momentum Score (BUY/SELL)", 50, 100, MOMENTUM_MIN_SCORE, 5, key="set_mom_score")
+        with col_mom2:
+            momentum_strong_score = st.slider("Strong Momentum Score", 75, 100, MOMENTUM_STRONG_SCORE, 5, key="set_mom_strong")
+        with col_mom3:
+            momentum_min_rvol = st.slider("Min Momentum RVOL", 1.0, 3.0, MOMENTUM_MIN_RVOL, 0.1, key="set_mom_rvol")
         
         st.markdown("#### ℹ️ Information")
         st.info("""
-        **Scanner Features:**
+        **NSE AI PRO V17 — Features:**
         - ✅ Multi-timeframe analysis (5M, 15M, 1H, Daily)
         - ✅ Strict signal validation engine
         - ✅ Pressure-based confirmation
@@ -2922,6 +3100,7 @@ def show_scanner(fyers) -> None:
         - ✅ Market structure (CHoCH, MSS, CISD)
         - ✅ Options chain analysis (F&O)
         - ✅ Golden Cross / Death Cross detection
+        - ✅ **⚡ NEW: MOMENTUM MOVERS Scanner**
         - ✅ Next Candle Bias prediction
         
         **Data Source:** Fyers Live API
