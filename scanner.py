@@ -72,8 +72,20 @@ REFRESH_INTERVALS = [30, 60, 120]
 MOMENTUM_MIN_SCORE = 70
 MOMENTUM_STRONG_SCORE = 85
 MOMENTUM_DEVELOPING_SCORE = 55
-MOMENTUM_MIN_MOVE_PCT = 0.1
-MOMENTUM_MIN_RVOL = 1.2
+# BIG MOVE scanner: current price action + last consolidation + structure.
+BIGMOVE_CONSOLIDATION_MIN_BARS = 4
+BIGMOVE_CONSOLIDATION_MAX_BARS = 12
+BIGMOVE_MAX_RANGE_PCT = 1.20
+BIGMOVE_MAX_BAR_ATR_MULT = 1.10
+BIGMOVE_MIN_BREAK_PCT = 0.25
+BIGMOVE_MIN_BODY_ATR = 0.80
+BIGMOVE_MIN_BODY_PCT = 55.0
+BIGMOVE_MIN_RVOL = 1.50
+BIGMOVE_MIN_SCORE = 70
+BIGMOVE_STRONG_SCORE = 85
+BIGMOVE_LOOKBACK_BARS = 40
+MOMENTUM_MIN_MOVE_PCT = 0.10
+MOMENTUM_MIN_RVOL = 1.20
 MOMENTUM_MIN_BODY_PCT = 20
 MOMENTUM_DISPLAY_COUNT = 10
 
@@ -242,55 +254,213 @@ def calculate_buying_selling_pressure(df) -> Dict[str, Any]:
 # MOMENTUM SCORING ENGINE (NEW - V17)
 # ════════════════════════════════════════════════════════════════════════════════
 def calculate_movement_metrics(df) -> Dict[str, float]:
-    """Calculate how much the stock is actually moving right now."""
+    """Measure the latest CLOSED candle and short-term movement."""
+    empty = {
+        "move_5m_pct": 0.0,
+        "move_15m_pct": 0.0,
+        "candle_body_pct": 0.0,
+        "atr_normalized_move": 0.0,
+        "price_acceleration": 0.0,
+    }
     if df is None or len(df) < 10:
-        return {
-            "move_5m_pct": 0.0,
-            "move_15m_pct": 0.0,
-            "candle_body_pct": 0.0,
-            "atr_normalized_move": 0.0,
-            "price_acceleration": 0.0,
-        }
-    
+        return empty
     try:
-        close = float(df["Close"].iloc[-1])
-        open_ = float(df["Open"].iloc[-1])
-        high = float(df["High"].iloc[-1])
-        low = float(df["Low"].iloc[-1])
-        
-        close_5m_ago = float(df["Close"].iloc[-2]) if len(df) >= 2 else close
-        move_5m_pct = abs((close - close_5m_ago) / close_5m_ago * 100) if close_5m_ago != 0 else 0.0
-        
-        close_15m_ago = float(df["Close"].iloc[-4]) if len(df) >= 4 else close
-        move_15m_pct = abs((close - close_15m_ago) / close_15m_ago * 100) if close_15m_ago != 0 else 0.0
-        
-        hl_range = high - low
+        d = df.reset_index(drop=True).copy()
+        last = d.iloc[-1]
+        prev = d.iloc[-2]
+        close = float(last["Close"])
+        open_ = float(last["Open"])
+        high = float(last["High"])
+        low = float(last["Low"])
+        prev_close = float(prev["Close"])
+        base_15 = float(d["Close"].iloc[-4]) if len(d) >= 4 else prev_close
+        rng = max(high - low, 0.0)
         body = abs(close - open_)
-        candle_body_pct = (body / hl_range * 100) if hl_range != 0 else 0.0
-        
-        atr = calculate_atr(df, period=14)
-        atr_val = float(atr.iloc[-1]) if len(atr) > 0 else 0.01
-        atr_normalized = (body / atr_val) if atr_val > 0 else 0.0
-        
-        prev_body = abs(float(df["Close"].iloc[-2]) - float(df["Open"].iloc[-2])) if len(df) >= 2 else body
-        acceleration = (body / prev_body) if prev_body > 0 else 1.0
-        
+        atr_series = calculate_atr(d, 14)
+        atr = float(atr_series.iloc[-1]) if len(atr_series) and pd.notna(atr_series.iloc[-1]) else max(close * 0.005, 0.01)
+        prev_body = abs(float(prev["Close"]) - float(prev["Open"]))
         return {
-            "move_5m_pct": round(move_5m_pct, 2),
-            "move_15m_pct": round(move_15m_pct, 2),
-            "candle_body_pct": round(candle_body_pct, 1),
-            "atr_normalized_move": round(atr_normalized, 2),
-            "price_acceleration": round(acceleration, 2),
+            "move_5m_pct": round(abs(close-prev_close)/prev_close*100, 2) if prev_close else 0.0,
+            "move_15m_pct": round(abs(close-base_15)/base_15*100, 2) if base_15 else 0.0,
+            "candle_body_pct": round(body/rng*100, 1) if rng else 0.0,
+            "atr_normalized_move": round(body/atr, 2) if atr else 0.0,
+            "price_acceleration": round(body/prev_body, 2) if prev_body else 1.0,
         }
-    
+    except Exception:
+        return empty
+
+
+def _bigmove_pivots(df: pd.DataFrame, left: int = 2, right: int = 2):
+    """Confirmed pivots, excluding the current unconfirmed candle."""
+    if df is None or len(df) < left + right + 5:
+        return [], []
+    d = df.reset_index(drop=True)
+    highs = d["High"].astype(float).to_numpy()
+    lows = d["Low"].astype(float).to_numpy()
+    ph, pl = [], []
+    for i in range(left, len(d) - right):
+        if highs[i] >= max(highs[i-left:i]) and highs[i] > max(highs[i+1:i+right+1]):
+            ph.append((i, float(highs[i])))
+        if lows[i] <= min(lows[i-left:i]) and lows[i] < min(lows[i+1:i+right+1]):
+            pl.append((i, float(lows[i])))
+    return ph, pl
+
+
+def detect_last_consolidation(df: pd.DataFrame) -> Dict[str, Any]:
+    """Find the most recent tight range immediately before the current move."""
+    empty = {
+        "found": False, "start_idx": None, "end_idx": None, "bars": 0,
+        "high": None, "low": None, "range_pct": 0.0, "range_atr": 0.0,
+    }
+    if df is None or len(df) < 20:
+        return empty
+    try:
+        d = df.reset_index(drop=True).copy()
+        last_idx = len(d) - 1
+        atr_s = calculate_atr(d, 14)
+        atr = float(atr_s.iloc[-1]) if pd.notna(atr_s.iloc[-1]) else max(float(d["Close"].iloc[-1])*0.005, 0.01)
+        best = None
+        # The latest consolidation must end before the breakout candle.
+        for end_idx in range(last_idx - 1, max(2, last_idx - BIGMOVE_LOOKBACK_BARS), -1):
+            for bars in range(BIGMOVE_CONSOLIDATION_MIN_BARS, BIGMOVE_CONSOLIDATION_MAX_BARS + 1):
+                start_idx = end_idx - bars + 1
+                if start_idx < 2:
+                    continue
+                w = d.iloc[start_idx:end_idx+1]
+                hi = float(w["High"].max()); lo = float(w["Low"].min())
+                mid = (hi + lo) / 2.0
+                if mid <= 0:
+                    continue
+                range_pct = (hi-lo)/mid*100.0
+                bar_ranges = (w["High"] - w["Low"]).astype(float)
+                median_bar_range = float(bar_ranges.median()) if len(bar_ranges) else 0.0
+                # Tight range + no single abnormal expansion inside consolidation.
+                if range_pct > BIGMOVE_MAX_RANGE_PCT:
+                    continue
+                if median_bar_range > atr * BIGMOVE_MAX_BAR_ATR_MULT:
+                    continue
+                # Prefer the latest qualifying range; allow only a small gap to breakout.
+                gap = last_idx - end_idx
+                if gap > 2:
+                    continue
+                score = (gap * 1000) + (BIGMOVE_CONSOLIDATION_MAX_BARS - bars) + range_pct
+                if best is None or score < best[0]:
+                    best = (score, start_idx, end_idx, bars, hi, lo, range_pct, (hi-lo)/atr if atr else 0.0)
+        if best is None:
+            return empty
+        _, start_idx, end_idx, bars, hi, lo, range_pct, range_atr = best
+        return {
+            "found": True, "start_idx": int(start_idx), "end_idx": int(end_idx),
+            "bars": int(bars), "high": hi, "low": lo,
+            "range_pct": round(range_pct, 2), "range_atr": round(range_atr, 2),
+        }
+    except Exception:
+        return empty
+
+
+def detect_big_move_setup(df: pd.DataFrame) -> Dict[str, Any]:
+    """Detect BIG BUY/BIG SELL from the latest consolidation breakout and HH/HL or LH/LL."""
+    out = {
+        "signal": "NO BIG MOVE", "direction": "NONE", "score": 0.0,
+        "reason": "", "consolidation": detect_last_consolidation(df),
+        "breakout_level": None, "breakout_move_pct": 0.0,
+        "body_pct": 0.0, "body_atr": 0.0, "rvol": 0.0,
+        "structure": "NONE", "hh_hl": False, "lh_ll": False,
+        "current_move_pct": 0.0,
+    }
+    if df is None or len(df) < 25:
+        out["reason"] = "Insufficient 5M candles"
+        return out
+    try:
+        d = df.reset_index(drop=True).copy()
+        c = detect_last_consolidation(d)
+        if not c["found"]:
+            out["reason"] = "No recent tight consolidation"
+            return out
+
+        last = d.iloc[-1]
+        close = float(last["Close"]); open_ = float(last["Open"])
+        high = float(last["High"]); low = float(last["Low"])
+        body = abs(close-open_); rng = max(high-low, 0.0)
+        atr_s = calculate_atr(d, 14)
+        atr = float(atr_s.iloc[-1]) if pd.notna(atr_s.iloc[-1]) else max(close*0.005, 0.01)
+        vol_avg = float(d["Volume"].iloc[-21:-1].mean()) if len(d) >= 22 else float(d["Volume"].iloc[:-1].mean())
+        rvol = float(last["Volume"])/vol_avg if vol_avg > 0 else 0.0
+        body_pct = body/rng*100 if rng else 0.0
+        body_atr = body/atr if atr else 0.0
+
+        buy_break = close > float(c["high"])
+        sell_break = close < float(c["low"])
+        breakout_level = c["high"] if buy_break else c["low"] if sell_break else None
+        breakout_move_pct = abs(close-breakout_level)/breakout_level*100 if breakout_level else 0.0
+        prev_close = float(d["Close"].iloc[-2])
+        current_move_pct = abs(close-prev_close)/prev_close*100 if prev_close else 0.0
+
+        # Latest confirmed HH/HL or LH/LL structure. The current breakout candle
+        # is not treated as a confirmed pivot, so we never use an unfinished pivot.
+        ph, pl = _bigmove_pivots(d)
+        hh_hl = False; lh_ll = False
+        if len(ph) >= 2 and len(pl) >= 2:
+            hh_hl = ph[-1][1] > ph[-2][1] and pl[-1][1] > pl[-2][1]
+            lh_ll = ph[-1][1] < ph[-2][1] and pl[-1][1] < pl[-2][1]
+        structure = "HH/HL" if hh_hl else "LH/LL" if lh_ll else "NONE"
+
+        # Score is evidence, not an EMA/RSI/AI score.
+        score = 0.0
+        reasons = []
+        if buy_break or sell_break:
+            score += 30; reasons.append("consolidation breakout")
+        if body_atr >= BIGMOVE_MIN_BODY_ATR:
+            score += 20; reasons.append(f"big candle {body_atr:.2f} ATR")
+        if body_pct >= BIGMOVE_MIN_BODY_PCT:
+            score += 10; reasons.append(f"body {body_pct:.0f}%")
+        if rvol >= BIGMOVE_MIN_RVOL:
+            score += 20; reasons.append(f"RVOL {rvol:.2f}x")
+        if breakout_move_pct >= BIGMOVE_MIN_BREAK_PCT:
+            score += 10; reasons.append(f"break {breakout_move_pct:.2f}%")
+        if hh_hl or lh_ll:
+            score += 10; reasons.append(structure)
+
+        # BIG MOVE requires the directional breakout + strong candle + volume.
+        core_ok = (body_atr >= BIGMOVE_MIN_BODY_ATR and body_pct >= BIGMOVE_MIN_BODY_PCT
+                   and rvol >= BIGMOVE_MIN_RVOL and breakout_move_pct >= BIGMOVE_MIN_BREAK_PCT)
+        if buy_break and core_ok:
+            out["direction"] = "UP"
+            out["structure"] = structure
+            out["hh_hl"] = hh_hl
+            out["signal"] = "🟢 BIG BUY" if score >= BIGMOVE_STRONG_SCORE else "🟢 BUY MOVE"
+        elif sell_break and core_ok:
+            out["direction"] = "DOWN"
+            out["structure"] = structure
+            out["lh_ll"] = lh_ll
+            out["signal"] = "🔴 BIG SELL" if score >= BIGMOVE_STRONG_SCORE else "🔴 SELL MOVE"
+        else:
+            if not buy_break and not sell_break:
+                reasons.append("no consolidation break")
+            if body_atr < BIGMOVE_MIN_BODY_ATR:
+                reasons.append(f"candle < {BIGMOVE_MIN_BODY_ATR:.2f} ATR")
+            if body_pct < BIGMOVE_MIN_BODY_PCT:
+                reasons.append(f"body < {BIGMOVE_MIN_BODY_PCT:.0f}%")
+            if rvol < BIGMOVE_MIN_RVOL:
+                reasons.append(f"RVOL < {BIGMOVE_MIN_RVOL:.2f}x")
+            if breakout_move_pct < BIGMOVE_MIN_BREAK_PCT:
+                reasons.append(f"break < {BIGMOVE_MIN_BREAK_PCT:.2f}%")
+
+        out.update({
+            "score": round(min(100.0, score), 1),
+            "reason": " | ".join(reasons),
+            "breakout_level": breakout_level,
+            "breakout_move_pct": round(breakout_move_pct, 2),
+            "body_pct": round(body_pct, 1),
+            "body_atr": round(body_atr, 2),
+            "rvol": round(rvol, 2),
+            "current_move_pct": round(current_move_pct, 2),
+            "consolidation": c,
+        })
+        return out
     except Exception as e:
-        return {
-            "move_5m_pct": 0.0,
-            "move_15m_pct": 0.0,
-            "candle_body_pct": 0.0,
-            "atr_normalized_move": 0.0,
-            "price_acceleration": 0.0,
-        }
+        out["reason"] = f"BIG MOVE error: {type(e).__name__}"
+        return out
 
 def calculate_momentum_score(analysis_5m: Dict, analysis_15m: Dict, analysis_1h: Dict, movement_metrics: Dict, is_bullish: bool) -> Dict[str, Any]:
     """Calculate momentum score (0-100) based on multiple factors."""
@@ -2095,111 +2265,85 @@ def _fetch_fo_signal(fyers, symbol: str):
 # MOMENTUM SCANNER WORKER (NEW)
 # ════════════════════════════════════════════════════════════════════════════════
 def _fetch_momentum_signal(fyers, symbol: str, is_fo: bool = False):
-    """Worker for MOMENTUM MOVERS scanning."""
+    """BIG MOVE scanner: last consolidation breakout + current price action + HH/HL or LH/LL."""
     stock_ticker = symbol.replace("NSE:", "").replace("-EQ", "") if isinstance(symbol, str) else str(symbol)
-    
     if not isinstance(symbol, str) or not _VALID_EQ_SYMBOL_RE.match(symbol):
         return None, f"{symbol}: invalid format"
-    
     try:
+        # 5M is the execution/movement timeframe. 15M/1H are shown for context only.
         analysis_5m = analyze_timeframe(fyers, symbol, "5")
         analysis_15m = analyze_timeframe(fyers, symbol, "15")
         analysis_1h = analyze_timeframe(fyers, symbol, "60")
-        
-        if analysis_5m.get("status") != "OK" or analysis_15m.get("status") != "OK" or analysis_1h.get("status") != "OK":
-            return None, None
-        
-        data_5m = analysis_5m.get("data", {})
-        data_15m = analysis_15m.get("data", {})
-        data_1h = analysis_1h.get("data", {})
-        df_5m = analysis_5m.get("df")
-        
-        if not data_5m or df_5m is None:
-            return None, None
-        
-        # Calculate movement metrics
-        movement_metrics = calculate_movement_metrics(df_5m)
-        move_5m = movement_metrics.get("move_5m_pct", 0)
-        move_15m = movement_metrics.get("move_15m_pct", 0)
-        
-        # Check if stock is actually moving
-        if move_5m < MOMENTUM_MIN_MOVE_PCT or move_15m < MOMENTUM_MIN_MOVE_PCT * 2:
-            return None, None
-        
-        rvol = data_5m.get("rvol", 0)
-        if rvol < MOMENTUM_MIN_RVOL:
-            return None, None
-        
-        # Determine if bullish or bearish based on 5M trend
-        tf_5m_trend = data_5m.get("structure_trend", "NEUTRAL")
-        tf_15m_trend = data_15m.get("structure_trend", "NEUTRAL")
-        
-        is_bullish = tf_5m_trend == "BULLISH" and tf_15m_trend in ["BULLISH", "NEUTRAL"]
-        is_bearish = tf_5m_trend == "BEARISH" and tf_15m_trend in ["BEARISH", "NEUTRAL"]
-        
-        if not is_bullish and not is_bearish:
-            return None, None
-        
-        # Calculate momentum score
-        momentum_result = calculate_momentum_score(analysis_5m, analysis_15m, analysis_1h, movement_metrics, is_bullish)
-        
-        score = momentum_result.get("score", 0)
-        status = momentum_result.get("status", "NONE")
-        
-        # Filter: only show score >= 55 (DEVELOPING and above)
-        if score < MOMENTUM_DEVELOPING_SCORE:
-            return None, None
-        
-        # Calculate AI confidence (from master signal)
-        master = calculate_master_signal(symbol, analysis_5m, analysis_15m, analysis_1h)
-        ai_signal = master.get("final_signal", "NEUTRAL")
-        ai_confidence = master.get("confidence", 0)
-        
-        ltp = data_5m.get("last_close", 0)
-        pressure_trend = data_5m.get("pressure_trend", "NEUTRAL")
-        buying_pct = data_5m.get("buying_pressure", 50)
-        selling_pct = data_5m.get("selling_pressure", 50)
-        ema_trend = data_5m.get("ema_trend", "NEUTRAL")
-        vwap = data_5m.get("vwap")
-        
-        # Build result
+        if analysis_5m.get("status") != "OK":
+            return None, f"{symbol}: 5M data unavailable"
+        df5 = analysis_5m.get("df")
+        d5 = analysis_5m.get("data", {})
+        if df5 is None or not d5:
+            return None, f"{symbol}: no 5M data"
+
+        setup = detect_big_move_setup(df5)
+        if setup["direction"] == "NONE":
+            # Return a diagnostic row instead of silently hiding every rejection.
+            return {
+                "Symbol": stock_ticker,
+                "LTP": round(float(d5.get("last_close", 0)), 2),
+                "SIGNAL": "⚪ NO BIG MOVE",
+                "DIRECTION": "NONE",
+                "MOVE %": setup.get("current_move_pct", 0),
+                "BREAKOUT MOVE %": setup.get("breakout_move_pct", 0),
+                "CONSOLIDATION BARS": setup["consolidation"].get("bars", 0),
+                "CONSOLIDATION HIGH": setup["consolidation"].get("high", "N/A"),
+                "CONSOLIDATION LOW": setup["consolidation"].get("low", "N/A"),
+                "CONSOLIDATION RANGE %": setup["consolidation"].get("range_pct", 0),
+                "STRUCTURE": setup.get("structure", "NONE"),
+                "HH/HL": "✅" if setup.get("hh_hl") else "−",
+                "LH/LL": "✅" if setup.get("lh_ll") else "−",
+                "BODY %": setup.get("body_pct", 0),
+                "BODY / ATR": setup.get("body_atr", 0),
+                "RVOL": setup.get("rvol", 0),
+                "SCORE": setup.get("score", 0),
+                "REASON": setup.get("reason", ""),
+                "5M TREND": d5.get("structure_trend", "N/A"),
+                "15M TREND": analysis_15m.get("data", {}).get("structure_trend", "N/A"),
+                "1H TREND": analysis_1h.get("data", {}).get("structure_trend", "N/A"),
+            }, None
+
+        c = setup["consolidation"]
+        direction = setup["direction"]
+        score = float(setup["score"])
+        signal = setup["signal"]
         result = {
             "Symbol": stock_ticker,
-            "LTP": round(float(ltp), 2),
-            "Move %": round(move_5m, 2),
-            "5M Move %": round(move_5m, 2),
-            "15M Move %": round(move_15m, 2),
-            "1H Trend": data_1h.get("structure_trend", "N/A"),
-            "RVOL": round(rvol, 2),
-            "🟢 BUY PRESSURE %": round(buying_pct, 1),
-            "🔴 SELL PRESSURE %": round(selling_pct, 1),
-            "VWAP": round(vwap, 2) if vwap else "N/A",
-            "EMA TREND": ema_trend,
-            "BOS": "✅" if (data_5m.get("bullish_choch") or data_5m.get("bearish_choch")) else "−",
-            "CHoCH": "✅" if (data_5m.get("bullish_choch") or data_5m.get("bearish_choch")) else "−",
-            "MSS": "✅" if (data_5m.get("bullish_mss") or data_5m.get("bearish_mss")) else "−",
-            "MOMENTUM SCORE": score,
-            "MOMENTUM SIGNAL": status,
-            "AI CONFIDENCE %": round(ai_confidence, 1),
-            "AI SIGNAL": ai_signal,
-            "ENTRY": master.get("entry", "N/A"),
-            "STOP LOSS": master.get("stop_loss", "N/A"),
-            "TARGET 1": master.get("target1", "N/A"),
-            "TARGET 2": master.get("target2", "N/A"),
-            "RISK:REWARD": master.get("rr_ratio", "N/A"),
-            "SIGNAL REASON": master.get("signal_reason", ""),
+            "LTP": round(float(d5.get("last_close", 0)), 2),
+            "SIGNAL": signal,
+            "DIRECTION": direction,
+            "MOVE %": setup["current_move_pct"],
+            "BREAKOUT MOVE %": setup["breakout_move_pct"],
+            "BREAKOUT LEVEL": round(float(setup["breakout_level"]), 2) if setup.get("breakout_level") else "N/A",
+            "CONSOLIDATION BARS": c.get("bars", 0),
+            "CONSOLIDATION HIGH": round(float(c["high"]), 2) if c.get("high") else "N/A",
+            "CONSOLIDATION LOW": round(float(c["low"]), 2) if c.get("low") else "N/A",
+            "CONSOLIDATION RANGE %": c.get("range_pct", 0),
+            "STRUCTURE": setup.get("structure", "NONE"),
+            "HH/HL": "✅" if setup.get("hh_hl") else "−",
+            "LH/LL": "✅" if setup.get("lh_ll") else "−",
+            "BODY %": setup["body_pct"],
+            "BODY / ATR": setup["body_atr"],
+            "RVOL": setup["rvol"],
+            "SCORE": score,
+            "REASON": setup["reason"],
+            "5M TREND": d5.get("structure_trend", "N/A"),
+            "15M TREND": analysis_15m.get("data", {}).get("structure_trend", "N/A"),
+            "1H TREND": analysis_1h.get("data", {}).get("structure_trend", "N/A"),
         }
-        
-        # Add options data for F&O
         if is_fo:
             options_data = fetch_options_chain_data(fyers, symbol)
             result["PCR"] = options_data.get("pcr", "N/A")
             result["OPTIONS BIAS"] = options_data.get("options_bias", "N/A")
-        
         return result, None
-    
     except Exception as e:
-        return None, f"{symbol}: error"
+        logger.exception("BIG MOVE worker failed for %s", symbol)
+        return None, f"{symbol}: error ({type(e).__name__}: {str(e)[:100]})"
 
 # ════════════════════════════════════════════════════════════════════════════════
 # THREADED SCAN FUNCTIONS
@@ -2555,127 +2699,77 @@ def show_scanner(fyers) -> None:
             st.info("👈 Click 'SCAN F&O' to start")
     
     # ════════════════════════════════════════════════════════════════════════════════
-    # TAB 2: MOMENTUM MOVERS (NEW)
+    # TAB 2: MOMENTUM MOVERS — BIG MOVE UP/DOWN
     # ════════════════════════════════════════════════════════════════════════════════
     with tabs[2]:
-        st.markdown("### ⚡ MOMENTUM MOVERS — Real-Time Price & Volume Momentum\nIdentifies stocks CURRENTLY MOVING with genuine momentum (Score ≥ 70)")
-        
+        st.markdown("### ⚡ MOMENTUM MOVERS — BIG MOVE UP / DOWN")
+        st.caption("Detects the latest consolidation breakout and the current large move. EMA/RSI/MACD/AI are NOT used for this tab.")
+
         col_m1, col_m2, col_m3 = st.columns([2, 2, 1])
         with col_m1:
             momentum_type = st.radio("Select Universe", ["NSE Stocks", "F&O Stocks"], horizontal=True, key="momentum_type")
             momentum_universe = all_symbols if momentum_type == "NSE Stocks" else fo_symbols
         with col_m2:
-            momentum_limit = st.number_input("Scan limit", min_value=50, max_value=len(momentum_universe),
-                                            value=min(300, len(momentum_universe)), step=50, key="momentum_limit")
+            momentum_limit = st.number_input("Scan limit", min_value=50, max_value=len(momentum_universe), value=min(300, len(momentum_universe)), step=50, key="momentum_limit")
         with col_m3:
             st.metric("Available", len(momentum_universe))
-        
+
         momentum_symbols = momentum_universe[:momentum_limit]
-        
-        if st.button(f"⚡ SCAN MOMENTUM ({len(momentum_symbols)} stocks)", key="momentum_run", type="primary"):
-            with st.spinner("Analyzing momentum…"):
+        if st.button(f"⚡ SCAN BIG MOVE ({len(momentum_symbols)} stocks)", key="momentum_run", type="primary"):
+            with st.spinner("Scanning current BIG MOVE UP/DOWN…"):
                 is_fo = momentum_type == "F&O Stocks"
-                momentum_results, _, _ = run_momentum_scan(fyers, momentum_symbols, is_fo=is_fo)
-                
-                if momentum_results:
-                    momentum_df = pd.DataFrame(momentum_results)
-                    
-                    # Separate into BUY and SELL
-                    buy_signals = momentum_df[momentum_df["MOMENTUM SIGNAL"].astype(str).str.contains("BUY", na=False)]
-                    sell_signals = momentum_df[momentum_df["MOMENTUM SIGNAL"].astype(str).str.contains("SELL", na=False)]
-                    developing_buy = momentum_df[momentum_df["MOMENTUM SIGNAL"].astype(str).str.contains("DEVELOPING BUY", na=False)]
-                    developing_sell = momentum_df[momentum_df["MOMENTUM SIGNAL"].astype(str).str.contains("DEVELOPING SELL", na=False)]
-                    
-                    st.session_state["momentum_buy_df"] = buy_signals
-                    st.session_state["momentum_sell_df"] = sell_signals
-                    st.session_state["momentum_dev_buy_df"] = developing_buy
-                    st.session_state["momentum_dev_sell_df"] = developing_sell
-        
-        # Display MOMENTUM BUY
-        buy_df = st.session_state.get("momentum_buy_df")
-        if buy_df is not None and not buy_df.empty:
-            buy_df = buy_df.sort_values("MOMENTUM SCORE", ascending=False)
-            
-            st.markdown("## 🟢 TOP MOMENTUM BUY")
-            col_m_b1, col_m_b2 = st.columns(2)
-            with col_m_b1:
-                show_buy_count = st.selectbox("Show Top N", [5, 10, 20, 50], index=1, key="buy_count_select")
-            with col_m_b2:
-                st.metric("Total BUY Momentum Signals", len(buy_df))
-            
-            buy_display = buy_df.head(show_buy_count)
-            
-            # Show table
-            display_cols = ["Symbol", "LTP", "Move %", "5M Move %", "15M Move %", "1H Trend", "RVOL", 
-                          "🟢 BUY PRESSURE %", "VWAP", "EMA TREND", "BOS", "CHoCH", "MSS", 
-                          "MOMENTUM SCORE", "AI CONFIDENCE %", "MOMENTUM SIGNAL", "ENTRY", "STOP LOSS", "TARGET 1", "TARGET 2", "RISK:REWARD", "SIGNAL REASON"]
-            
-            display_cols = [col for col in display_cols if col in buy_display.columns]
-            st.dataframe(buy_display[display_cols], use_container_width=True, height=400)
-            
-            # Download
-            col_bd1, col_bd2, col_bd3 = st.columns(3)
-            with col_bd1:
-                try:
-                    excel_data = _format_excel_output(buy_display, "MOMENTUM_BUY")
-                    st.download_button("📥 Download Excel", excel_data, f"Momentum_Buy_{_now_ist().strftime('%Y%m%d_%H%M')}.xlsx",
-                                     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="momentum_buy_excel")
-                except:
-                    pass
+                momentum_results, momentum_errors, momentum_stats = run_momentum_scan(fyers, momentum_symbols, is_fo=is_fo)
+                mdf = pd.DataFrame(momentum_results) if momentum_results else pd.DataFrame()
+                st.session_state["momentum_df"] = mdf
+                st.session_state["momentum_errors"] = momentum_errors
+                st.session_state["momentum_stats"] = momentum_stats
+                st.session_state["momentum_scanned_at"] = _generated_timestamp()
+
+        if "momentum_stats" in st.session_state:
+            _display_scan_summary(st.session_state["momentum_stats"])
+            st.caption(f"Last scan: {st.session_state.get('momentum_scanned_at', 'N/A')}")
+
+        mdf = st.session_state.get("momentum_df")
+        if mdf is not None and not mdf.empty:
+            # Show only actual big moves first; diagnostics remain available below.
+            big = mdf[mdf["DIRECTION"].isin(["UP", "DOWN"])].copy() if "DIRECTION" in mdf.columns else pd.DataFrame()
+            no_move = mdf[~mdf["DIRECTION"].isin(["UP", "DOWN"])].copy() if "DIRECTION" in mdf.columns else mdf.copy()
+
+            if not big.empty:
+                up = big[big["DIRECTION"] == "UP"].sort_values(["SCORE", "RVOL"], ascending=False)
+                down = big[big["DIRECTION"] == "DOWN"].sort_values(["SCORE", "RVOL"], ascending=False)
+                c1, c2 = st.columns(2)
+                with c1:
+                    st.markdown(f"### 🟢 BIG MOVE UP — {len(up)}")
+                    st.dataframe(up, use_container_width=True, height=420)
+                with c2:
+                    st.markdown(f"### 🔴 BIG MOVE DOWN — {len(down)}")
+                    st.dataframe(down, use_container_width=True, height=420)
+            else:
+                st.warning("No BIG MOVE UP/DOWN found in this scan.")
+
+            with st.expander(f"🔎 Diagnostic report — {len(no_move)} stocks did not qualify"):
+                st.dataframe(no_move, use_container_width=True, height=450)
+
+            st.markdown("### 📥 Download BIG MOVE Report")
+            try:
+                st.download_button(
+                    "📊 Excel",
+                    _format_excel_output(mdf, "BIG_MOVE"),
+                    f"BIG_MOVE_{_now_ist().strftime('%Y%m%d_%H%M')}.xlsx",
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key="momentum_xls",
+                )
+            except Exception as e:
+                st.error(f"Excel export error: {e}")
+        elif "momentum_stats" in st.session_state:
+            st.info("Scan completed. No diagnostic rows were returned; check API errors below.")
         else:
-            st.info("👈 Click 'SCAN MOMENTUM' to find BUY momentum stocks")
-        
-        # Display MOMENTUM SELL
-        sell_df = st.session_state.get("momentum_sell_df")
-        if sell_df is not None and not sell_df.empty:
-            sell_df = sell_df.sort_values("MOMENTUM SCORE", ascending=False)
-            
-            st.markdown("## 🔴 TOP MOMENTUM SELL")
-            col_m_s1, col_m_s2 = st.columns(2)
-            with col_m_s1:
-                show_sell_count = st.selectbox("Show Top N", [5, 10, 20, 50], index=1, key="sell_count_select")
-            with col_m_s2:
-                st.metric("Total SELL Momentum Signals", len(sell_df))
-            
-            sell_display = sell_df.head(show_sell_count)
-            
-            display_cols = ["Symbol", "LTP", "Move %", "5M Move %", "15M Move %", "1H Trend", "RVOL", 
-                          "🔴 SELL PRESSURE %", "VWAP", "EMA TREND", "BOS", "CHoCH", "MSS", 
-                          "MOMENTUM SCORE", "AI CONFIDENCE %", "MOMENTUM SIGNAL", "ENTRY", "STOP LOSS", "TARGET 1", "TARGET 2", "RISK:REWARD", "SIGNAL REASON"]
-            
-            display_cols = [col for col in display_cols if col in sell_display.columns]
-            st.dataframe(sell_display[display_cols], use_container_width=True, height=400)
-            
-            # Download
-            col_sd1, col_sd2, col_sd3 = st.columns(3)
-            with col_sd1:
-                try:
-                    excel_data = _format_excel_output(sell_display, "MOMENTUM_SELL")
-                    st.download_button("📥 Download Excel", excel_data, f"Momentum_Sell_{_now_ist().strftime('%Y%m%d_%H%M')}.xlsx",
-                                     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="momentum_sell_excel")
-                except:
-                    pass
-        else:
-            st.info("👈 Click 'SCAN MOMENTUM' to find SELL momentum stocks")
-        
-        # Display DEVELOPING
-        dev_buy_df = st.session_state.get("momentum_dev_buy_df")
-        dev_sell_df = st.session_state.get("momentum_dev_sell_df")
-        
-        if (dev_buy_df is not None and not dev_buy_df.empty) or (dev_sell_df is not None and not dev_sell_df.empty):
-            with st.expander("🟡 DEVELOPING MOMENTUM (Early Detection)", expanded=False):
-                if dev_buy_df is not None and not dev_buy_df.empty:
-                    st.markdown("#### 🟡 Developing BUY")
-                    dev_buy_display = dev_buy_df.sort_values("MOMENTUM SCORE", ascending=False).head(10)
-                    display_cols = [col for col in ["Symbol", "LTP", "Move %", "RVOL", "🟢 BUY PRESSURE %", "MOMENTUM SCORE", "MOMENTUM SIGNAL"] if col in dev_buy_display.columns]
-                    st.dataframe(dev_buy_display[display_cols], use_container_width=True, height=200)
-                
-                if dev_sell_df is not None and not dev_sell_df.empty:
-                    st.markdown("#### 🟠 Developing SELL")
-                    dev_sell_display = dev_sell_df.sort_values("MOMENTUM SCORE", ascending=False).head(10)
-                    display_cols = [col for col in ["Symbol", "LTP", "Move %", "RVOL", "🔴 SELL PRESSURE %", "MOMENTUM SCORE", "MOMENTUM SIGNAL"] if col in dev_sell_display.columns]
-                    st.dataframe(dev_sell_display[display_cols], use_container_width=True, height=200)
-    
+            st.info("👈 Click 'SCAN BIG MOVE' to find current BIG BUY / BIG SELL stocks.")
+
+        if st.session_state.get("momentum_errors"):
+            with st.expander(f"⚠️ API / scan errors ({len(st.session_state['momentum_errors'])})"):
+                st.dataframe(pd.DataFrame({"Error": st.session_state["momentum_errors"]}), use_container_width=True)
     # ════════════════════════════════════════════════════════════════════════════════
     # TAB 3: LIVE INTRADAY
     # ════════════════════════════════════════════════════════════════════════════════
