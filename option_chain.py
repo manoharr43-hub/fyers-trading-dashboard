@@ -1678,6 +1678,94 @@ def calculate_market_pressure_summary(df: pd.DataFrame, spot: float, pcr: float)
     )
 
 
+
+def add_strike_movement_score(df: pd.DataFrame) -> pd.DataFrame:
+    """Estimate which option side/strike has the strongest near-term movement potential.
+
+    This is a ranking model, not a price prediction. It combines activity, OI change,
+    buy/sell pressure, aggression, anomaly flags and existing AI confidence.
+    """
+    d = df.copy()
+    if d.empty:
+        for c, default in {
+            "movement_score": 0.0,
+            "movement_bias": "NEUTRAL",
+            "movement_strength": "LOW",
+            "ce_movement_score": 0.0,
+            "pe_movement_score": 0.0,
+        }.items():
+            d[c] = default
+        return d
+
+    def pct_rank(series: pd.Series) -> pd.Series:
+        s = pd.to_numeric(series, errors="coerce").fillna(0.0)
+        if s.nunique() <= 1:
+            return pd.Series(50.0, index=s.index)
+        return (s.rank(pct=True) * 100).clip(0, 100)
+
+    ce_vol = pct_rank(d.get("ce_volume", pd.Series(0.0, index=d.index)))
+    pe_vol = pct_rank(d.get("pe_volume", pd.Series(0.0, index=d.index)))
+    ce_oi = pct_rank(d.get("ce_chng_oi", pd.Series(0.0, index=d.index)).abs())
+    pe_oi = pct_rank(d.get("pe_chng_oi", pd.Series(0.0, index=d.index)).abs())
+
+    ce_pressure = pd.to_numeric(d.get("buy_pressure", 50.0), errors="coerce").fillna(50.0).clip(0, 100)
+    pe_pressure = pd.to_numeric(d.get("sell_pressure", 50.0), errors="coerce").fillna(50.0).clip(0, 100)
+    aggression = pd.to_numeric(d.get("aggression_level", 50.0), errors="coerce").fillna(50.0).clip(0, 100)
+
+    total_vol = pd.to_numeric(d.get("total_volume", 0.0), errors="coerce").fillna(0.0)
+    activity = pct_rank(total_vol)
+    oi_activity = pct_rank(
+        pd.to_numeric(d.get("ce_chng_oi", 0.0), errors="coerce").abs().fillna(0.0)
+        + pd.to_numeric(d.get("pe_chng_oi", 0.0), errors="coerce").abs().fillna(0.0)
+    )
+    anomaly = (
+        d.get("volume_spike", pd.Series(False, index=d.index)).astype(bool).astype(float) * 60
+        + d.get("oi_surge", pd.Series(False, index=d.index)).astype(bool).astype(float) * 40
+    ).clip(0, 100)
+
+    ai_conf = pd.to_numeric(d.get("AI Confidence %", 50.0), errors="coerce").fillna(50.0).clip(0, 100)
+    ai_signal = d.get("AI Signal", pd.Series("", index=d.index)).astype(str).str.upper()
+
+    ce_side = (
+        ce_vol * 0.20
+        + ce_oi * 0.15
+        + ce_pressure * 0.35
+        + aggression * 0.15
+        + anomaly * 0.10
+        + ai_conf.where(ai_signal.str.contains("CE|CALL|BUY"), 50.0) * 0.05
+    )
+    pe_side = (
+        pe_vol * 0.20
+        + pe_oi * 0.15
+        + pe_pressure * 0.35
+        + aggression * 0.15
+        + anomaly * 0.10
+        + ai_conf.where(ai_signal.str.contains("PE|PUT|SELL"), 50.0) * 0.05
+    )
+
+    d["ce_movement_score"] = ce_side.clip(0, 100).round(1)
+    d["pe_movement_score"] = pe_side.clip(0, 100).round(1)
+    d["movement_score"] = pd.concat([ce_side, pe_side], axis=1).max(axis=1).clip(0, 100).round(1)
+
+    def bias(row: pd.Series) -> str:
+        ce, pe = float(row["ce_movement_score"]), float(row["pe_movement_score"])
+        if max(ce, pe) < 55:
+            return "NEUTRAL"
+        if abs(ce - pe) < 7:
+            return "BOTH / CHOP"
+        return "CE UP" if ce > pe else "PE UP"
+
+    d["movement_bias"] = d.apply(bias, axis=1)
+    d["movement_strength"] = pd.cut(
+        d["movement_score"], bins=[-1, 45, 60, 75, 100],
+        labels=["LOW", "MODERATE", "STRONG", "VERY STRONG"]
+    ).astype(str)
+
+    # A combined ranking that prioritizes the strongest activity around ATM.
+    d["movement_rank"] = d["movement_score"].rank(method="min", ascending=False).astype(int)
+    return d
+
+
 def add_pressure_analysis(df: pd.DataFrame, spot: float, lot_size: int = 1) -> tuple[pd.DataFrame, MarketPressure]:
     """Full pressure analysis pipeline."""
     d = df.copy()
@@ -1765,6 +1853,25 @@ def chart_greeks(df: pd.DataFrame, greek: str) -> go.Figure:
     fig.update_layout(xaxis=dict(title="Strike", showgrid=True, gridcolor=BORDER_COLOR),
                        yaxis=dict(title=greek.title(), showgrid=True, gridcolor=BORDER_COLOR))
     return _plotly_dark_layout(fig, height=300, title=f"{greek.title()} by Strike")
+
+
+def chart_movement_score(df: pd.DataFrame) -> go.Figure:
+    fig = go.Figure()
+    if df.empty or "movement_score" not in df.columns:
+        return _plotly_dark_layout(fig, height=360, title="Strike Movement Score")
+    d = df.sort_values("movement_score", ascending=False).head(20).sort_values("strike_price")
+    fig.add_trace(go.Bar(
+        x=d["strike_price"], y=d["movement_score"],
+        text=d["movement_bias"], textposition="outside",
+        marker_color=[GREEN if x >= 75 else (AMBER if x >= 60 else RED) for x in d["movement_score"]],
+        name="Movement Score",
+        hovertemplate="Strike %{x:,.0f}<br>Score: %{y:.1f}<br>Bias: %{text}<extra></extra>",
+    ))
+    fig.update_layout(
+        xaxis=dict(title="Strike", showgrid=True, gridcolor=BORDER_COLOR),
+        yaxis=dict(title="Movement Score (0-100)", range=[0, 105], showgrid=True, gridcolor=BORDER_COLOR),
+    )
+    return _plotly_dark_layout(fig, height=380, title="Top Strike Movement Potential")
 
 
 def chart_gex_by_strike(gex_data: dict) -> go.Figure:
@@ -2074,7 +2181,8 @@ def render_chain_table_html(df: pd.DataFrame, show_greeks: bool, top_n: int = 40
     ]
     greek_ce_cols = [("ce_delta", "CE Δ"), ("ce_gamma", "CE Γ"), ("ce_theta", "CE Θ"), ("ce_vega", "CE V")]
     mid_cols = [("strike_price", "STRIKE"), ("CE Buildup", "CE Build"), ("PE Buildup", "PE Build"),
-                ("AI Signal", "AI Signal")]
+                ("AI Signal", "AI Signal"), ("movement_score", "MOVE %"),
+                ("movement_bias", "MOVE BIAS"), ("movement_strength", "MOVE STR")]
     greek_pe_cols = [("pe_delta", "PE Δ"), ("pe_gamma", "PE Γ"), ("pe_theta", "PE Θ"), ("pe_vega", "PE V")]
     pe_cols = [
         ("pe_bid", "PE Bid"), ("pe_ask", "PE Ask"), ("pe_ltp", "PE LTP"), ("pe_iv", "PE IV"),
@@ -2089,7 +2197,7 @@ def render_chain_table_html(df: pd.DataFrame, show_greeks: bool, top_n: int = 40
         "ce_oi": "{:,.0f}", "ce_chng_oi": "{:+,.0f}", "ce_oi_change_pct": "{:+.1f}%",
         "ce_volume": "{:,.0f}", "ce_iv": "{:.1f}", "ce_ltp": "{:.2f}", "ce_bid": "{:.2f}", "ce_ask": "{:.2f}",
         "ce_delta": "{:.3f}", "ce_gamma": "{:.5f}", "ce_theta": "{:.3f}", "ce_vega": "{:.3f}",
-        "strike_price": "{:,.0f}",
+        "strike_price": "{:,.0f}", "movement_score": "{:.1f}",
         "pe_delta": "{:.3f}", "pe_gamma": "{:.5f}", "pe_theta": "{:.3f}", "pe_vega": "{:.3f}",
         "pe_bid": "{:.2f}", "pe_ask": "{:.2f}", "pe_ltp": "{:.2f}", "pe_iv": "{:.1f}",
         "pe_volume": "{:,.0f}", "pe_oi_change_pct": "{:+.1f}%", "pe_chng_oi": "{:+,.0f}", "pe_oi": "{:,.0f}",
@@ -2122,6 +2230,14 @@ def render_chain_table_html(df: pd.DataFrame, show_greeks: bool, top_n: int = 40
                 style = _oi_change_cell_style(val, heavy_pe_chng)
             elif key == "AI Signal":
                 style = _signal_cell_style(val)
+            elif key == "movement_bias":
+                style = _signal_cell_style(val)
+            elif key == "movement_score":
+                try:
+                    score = float(val)
+                    style = f"font-weight:700;color:{GREEN if score >= 75 else (AMBER if score >= 60 else TEXT_MUTED)};"
+                except Exception:
+                    style = ""
             cells.append(f'<td style="{style}">{_safe_cell(display_val)}</td>')
         row_class = "oc-atm-row" if is_atm else ""
         rows_html.append(f'<tr class="{row_class}">{"".join(cells)}</tr>')
@@ -2301,6 +2417,18 @@ def export_excel_report(df: pd.DataFrame, meta: dict, pcr: float, max_pain: floa
         if pressure_cols:
             _write_dataframe(ws_pressure, df[pressure_cols])
 
+    if "movement_score" in df.columns:
+        ws_move = wb.create_sheet("Strike Movement")
+        movement_cols = [c for c in [
+            "movement_rank", "strike_price", "movement_score", "movement_bias", "movement_strength",
+            "ce_movement_score", "pe_movement_score", "buy_pressure", "sell_pressure",
+            "aggression_level", "total_volume", "ce_chng_oi", "pe_chng_oi",
+            "volume_spike", "oi_surge", "AI Signal", "AI Confidence %",
+        ] if c in df.columns]
+        if movement_cols:
+            move_df = df[movement_cols].sort_values("movement_score", ascending=False)
+            _write_dataframe(ws_move, move_df)
+
     buffer = io.BytesIO()
     wb.save(buffer)
     buffer.seek(0)
@@ -2463,6 +2591,7 @@ def _do_fetch_and_process(cfg: dict, fyers: Any = None) -> Optional[dict]:
     
     # ✅ ADD PRESSURE ANALYSIS
     df, market_pressure = add_pressure_analysis(df, spot, cfg["lot_size"])
+    df = add_strike_movement_score(df)
 
     pcr = calc_pcr(df)
     max_pain = calc_max_pain(df)
@@ -2638,12 +2767,12 @@ def run_dashboard(fyers: Any = None) -> None:
     st.divider()
 
     if state.get("price_action_data") and state["price_action_data"].get("df_dict"):
-        tab_chain, tab_charts, tab_pressure, tab_greeks, tab_ai, tab_gex, tab_price_action, tab_export = st.tabs([
-            "📋 Chain", "📈 OI", "💪 Pressure", "🧮 Greeks", "🤖 AI", "⚡ GEX", "💹 Price Action", "📥 Export",
+        tab_chain, tab_charts, tab_pressure, tab_movement, tab_greeks, tab_ai, tab_gex, tab_price_action, tab_export = st.tabs([
+            "📋 Chain", "📈 OI", "💪 Pressure", "🎯 Strike Movement", "🧮 Greeks", "🤖 AI", "⚡ GEX", "💹 Price Action", "📥 Export",
         ])
     else:
-        tab_chain, tab_charts, tab_pressure, tab_greeks, tab_ai, tab_gex, tab_export = st.tabs([
-            "📋 Chain", "📈 OI", "💪 Pressure", "🧮 Greeks", "🤖 AI", "⚡ GEX", "📥 Export",
+        tab_chain, tab_charts, tab_pressure, tab_movement, tab_greeks, tab_ai, tab_gex, tab_export = st.tabs([
+            "📋 Chain", "📈 OI", "💪 Pressure", "🎯 Strike Movement", "🧮 Greeks", "🤖 AI", "⚡ GEX", "📥 Export",
         ])
 
     with tab_chain:
@@ -2707,6 +2836,23 @@ def run_dashboard(fyers: Any = None) -> None:
                 st.plotly_chart(chart_net_pressure(df, state["spot"]), use_container_width=True, config={"displayModeBar": False})
             with col_agg:
                 st.plotly_chart(chart_aggression_level(df), use_container_width=True, config={"displayModeBar": False})
+
+    with tab_movement:
+        st.markdown('<div class="block-title">🎯 Strike Movement Scanner</div>', unsafe_allow_html=True)
+        st.caption("Movement Score is a ranking model based on current option-chain activity; it is not a guaranteed price prediction.")
+        move_cols = [c for c in [
+            "movement_rank", "strike_price", "movement_score", "movement_bias", "movement_strength",
+            "ce_movement_score", "pe_movement_score", "buy_pressure", "sell_pressure",
+            "aggression_level", "total_volume", "ce_chng_oi", "pe_chng_oi",
+            "volume_spike", "oi_surge", "AI Signal", "AI Confidence %",
+        ] if c in df.columns]
+        move_view = df[move_cols].sort_values("movement_score", ascending=False).copy()
+        top_n = st.slider("Top strikes", 5, min(30, max(5, len(move_view))), min(15, max(5, len(move_view))), key="movement_top_n") if len(move_view) >= 5 else len(move_view)
+        if len(move_view):
+            st.dataframe(move_view.head(top_n), use_container_width=True, hide_index=True)
+            st.plotly_chart(chart_movement_score(df), use_container_width=True, config={"displayModeBar": False})
+        else:
+            st.info("No strike movement data available.")
 
     with tab_greeks:
         g1, g2 = st.columns(2)
