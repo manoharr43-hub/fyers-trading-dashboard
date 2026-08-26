@@ -2421,6 +2421,123 @@ def _fetch_fo_signal(fyers, symbol: str):
 # ════════════════════════════════════════════════════════════════════════════════
 # MOMENTUM SCANNER WORKER (NEW)
 # ════════════════════════════════════════════════════════════════════════════════
+def detect_block_order_activity(df: pd.DataFrame) -> Dict[str, Any]:
+    """Estimate institutional/block-order activity from OHLCV only.
+
+    This is a probability score, NOT a true exchange order-book/block-trade feed.
+    It uses abnormal volume, candle body/wicks, price acceptance/rejection and
+    repeated high-volume levels to flag possible large-player activity.
+    """
+    out = {
+        "block_score": 0.0,
+        "block_signal": "NONE",
+        "block_side": "NONE",
+        "block_level": None,
+        "block_rvol": 0.0,
+        "block_reason": "Insufficient data",
+    }
+    if df is None or len(df) < 25:
+        return out
+    try:
+        d = df.reset_index(drop=True).copy()
+        cols = ["Open", "High", "Low", "Close", "Volume"]
+        if any(c not in d.columns for c in cols):
+            out["block_reason"] = "Missing OHLCV columns"
+            return out
+
+        last = d.iloc[-1]
+        o,h,l,c,v = [float(last[x]) for x in cols]
+        prev = float(d["Close"].iloc[-2])
+        if min(o,h,l,c,prev) <= 0:
+            return out
+
+        rng = max(h-l, 1e-9)
+        body = abs(c-o)
+        body_pct = body/rng*100
+        upper_wick = h-max(o,c)
+        lower_wick = min(o,c)-l
+        close_pos = (c-l)/rng
+
+        base = float(d["Volume"].iloc[-21:-1].mean())
+        rvol = v/base if base > 0 else 0.0
+        recent = d.tail(20).copy()
+        avg_ranges = (recent["High"]-recent["Low"]).astype(float).replace(0,np.nan).mean()
+        range_ratio = rng/float(avg_ranges) if avg_ranges and pd.notna(avg_ranges) else 0.0
+
+        # High-volume candle close behavior.
+        buy_points = sell_points = 0.0
+        reasons=[]
+        if rvol >= 2.0:
+            buy_points += 20; sell_points += 20; reasons.append(f"RVOL {rvol:.1f}x")
+        elif rvol >= 1.5:
+            buy_points += 12; sell_points += 12; reasons.append(f"RVOL {rvol:.1f}x")
+        if range_ratio >= 1.5:
+            buy_points += 10; sell_points += 10; reasons.append("large range")
+
+        # Acceptance near high = possible buy absorption/accumulation.
+        if close_pos >= 0.75 and c > o:
+            buy_points += 25
+        if close_pos <= 0.25 and c < o:
+            sell_points += 25
+
+        # Rejection/absorption: large wick with high volume.
+        if lower_wick/rng >= 0.45 and rvol >= 1.5:
+            buy_points += 20; reasons.append("lower-wick absorption")
+        if upper_wick/rng >= 0.45 and rvol >= 1.5:
+            sell_points += 20; reasons.append("upper-wick rejection")
+
+        # Repeated volume concentration around current price.
+        lo, hi = float(recent["Low"].min()), float(recent["High"].max())
+        if hi > lo:
+            bins = np.linspace(lo, hi, 11)
+            mids=(bins[:-1]+bins[1:])/2
+            idx=np.clip(np.digitize(recent["Close"].astype(float), bins)-1,0,9)
+            vol_by_bin=recent.groupby(idx)["Volume"].sum()
+            if len(vol_by_bin):
+                peak_bin=int(vol_by_bin.idxmax())
+                peak_level=float(mids[peak_bin])
+                peak_share=float(vol_by_bin.max()/max(float(recent["Volume"].sum()),1.0))
+                if peak_share >= 0.20 and abs(c-peak_level)/c <= 0.02:
+                    buy_points += 15 if c >= peak_level else 5
+                    sell_points += 15 if c <= peak_level else 5
+                    reasons.append("volume concentration")
+                else:
+                    peak_level=c
+        else:
+            peak_level=c
+
+        # Directional confirmation from recent closes.
+        ret3 = (c/float(d["Close"].iloc[-4])-1)*100 if len(d)>=4 else 0
+        if ret3 > 0.4: buy_points += 10
+        elif ret3 < -0.4: sell_points += 10
+
+        buy_points=min(100,buy_points); sell_points=min(100,sell_points)
+        side = "BUY" if buy_points > sell_points else "SELL" if sell_points > buy_points else "NONE"
+        score=max(buy_points,sell_points)
+        if score >= 75:
+            signal="🔥 VERY HIGH"
+        elif score >= 60:
+            signal="🟢 HIGH BUY" if side=="BUY" else "🔴 HIGH SELL" if side=="SELL" else "🟡 HIGH"
+        elif score >= 45:
+            signal="🟡 POSSIBLE"
+        else:
+            signal="NONE"
+
+        direction_reason = "BUY-side" if side=="BUY" else "SELL-side" if side=="SELL" else "mixed"
+        out.update({
+            "block_score": round(score,1),
+            "block_signal": signal,
+            "block_side": side,
+            "block_level": round(float(peak_level),2) if peak_level is not None else None,
+            "block_rvol": round(rvol,2),
+            "block_reason": f"{direction_reason} | " + (" + ".join(reasons) if reasons else "normal volume/price behavior"),
+        })
+        return out
+    except Exception as e:
+        out["block_reason"] = f"ERROR: {str(e)[:100]}"
+        return out
+
+
 def detect_live_sudden_move(df: pd.DataFrame) -> Dict[str, Any]:
     """Detect CURRENT sudden 5M BUY/SELL movement. No consolidation required."""
     result = {
@@ -2551,6 +2668,7 @@ def _fetch_momentum_signal(fyers, symbol: str, is_fo: bool = False):
             return None, f"{symbol}: insufficient recent 5M data"
 
         move = detect_live_sudden_move(df5)
+        block = detect_block_order_activity(df5)
         ltp = float(df5["Close"].iloc[-1])
         result = {
             "Symbol": stock_ticker,
@@ -2567,6 +2685,12 @@ def _fetch_momentum_signal(fyers, symbol: str, is_fo: bool = False):
             "ACCELERATION": move["price_acceleration"],
             "VOLUME SPIKE": "🔥" if move["volume_spike"] else "−",
             "SCORE": move["score"],
+            "BLOCK ORDER SCORE": block["block_score"],
+            "BLOCK ACTIVITY": block["block_signal"],
+            "BLOCK SIDE": block["block_side"],
+            "BLOCK LEVEL": block["block_level"],
+            "BLOCK RVOL": block["block_rvol"],
+            "BLOCK REASON": block["block_reason"],
             "REASON": move["reason"],
         }
         if is_fo and move["direction"] in ("BUY", "SELL"):
