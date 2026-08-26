@@ -130,6 +130,25 @@ MSS_MIN_STRENGTH = 1.0
 BOS_CONFIRMATION_BARS = 1
 CHOCH_CONFIRMATION_BARS = 2
 
+# ===================== MCX COMMODITY SUPPORT =====================
+MCX_COMMODITIES: dict[str, dict[str, Any]] = {
+    "GOLD": {"roots": ["MCX:GOLD", "MCX:GOLDM"], "lot": 100},
+    "SILVER": {"roots": ["MCX:SILVER", "MCX:SILVERM"], "lot": 30},
+    "CRUDEOIL": {"roots": ["MCX:CRUDEOIL"], "lot": 100},
+    "NATURALGAS": {"roots": ["MCX:NATURALGAS"], "lot": 1250},
+    "COPPER": {"roots": ["MCX:COPPER"], "lot": 2500},
+    "ZINC": {"roots": ["MCX:ZINC"], "lot": 5000},
+    "ALUMINIUM": {"roots": ["MCX:ALUMINIUM"], "lot": 5000},
+    "LEAD": {"roots": ["MCX:LEAD"], "lot": 5000},
+    "NICKEL": {"roots": ["MCX:NICKEL"], "lot": 1500},
+}
+
+def fyers_commodity_symbol_candidates(name: str) -> list[str]:
+    key = str(name).strip().upper()
+    if key in MCX_COMMODITIES:
+        return MCX_COMMODITIES[key]["roots"]
+    return [key] if ":" in key else [f"MCX:{key}"]
+
 FYERS_INDEX_SYMBOL_CANDIDATES: dict[str, list[str]] = {
     "NIFTY": ["NSE:NIFTY50-INDEX"],
     "BANKNIFTY": ["NSE:NIFTYBANK-INDEX", "NSE:BANKNIFTY-INDEX"],
@@ -1149,10 +1168,11 @@ def parse_fyers_chain(rows: list[dict], spot: float, expiry_label: str) -> pd.Da
 
 
 def fetch_via_fyers(fyers: Any, symbol_key: str, is_index: bool, stock_name: str,
-                     preferred_expiry: str, strike_count: int) -> dict:
-    symbol_candidates = (
-        _fyers_index_candidates(symbol_key) if is_index else fyers_stock_symbol_candidates(stock_name)
-    )
+                    preferred_expiry: str, strike_count: int, is_mcx: bool = False) -> dict:
+    if is_mcx:
+        symbol_candidates = fyers_commodity_symbol_candidates(symbol_key)
+    else:
+        symbol_candidates = (_fyers_index_candidates(symbol_key) if is_index else fyers_stock_symbol_candidates(stock_name))
     if not symbol_candidates:
         return {"ok": False, "df": pd.DataFrame(), "meta": {}, "error": "No FYERS symbol candidates resolved."}
 
@@ -1163,8 +1183,7 @@ def fetch_via_fyers(fyers: Any, symbol_key: str, is_index: bool, stock_name: str
             expiry_resp, used_symbol = resp, sym
             break
     if expiry_resp is None:
-        return {"ok": False, "df": pd.DataFrame(), "meta": {},
-                "error": "FYERS returned no usable response for any symbol variant tried."}
+        return {"ok": False, "df": pd.DataFrame(), "meta": {}, "error": f"FYERS returned no usable response for {symbol_key}. Tried: {', '.join(symbol_candidates)}"}
 
     expiry_list = _fyers_extract_expiry_list(expiry_resp)
     if not expiry_list:
@@ -1201,28 +1220,31 @@ def fetch_via_fyers(fyers: Any, symbol_key: str, is_index: bool, stock_name: str
     meta = {
         "spot_price": spot, "expiry_dates": [lbl for lbl, _ in expiry_list],
         "selected_expiry": selected_label, "fetched_at": datetime.now(),
-        "total_rows_seen": len(rows), "rows_parsed": len(df),
+        "total_rows_seen": len(rows), "rows_parsed": len(df), "fyers_symbol": used_symbol,
     }
     return {"ok": True, "df": df, "meta": meta, "error": None}
 
 
 def fetch_chain_unified(fyers: Any, symbol_key: str, is_index: bool, stock_name: str,
-                         preferred_expiry: str, strike_count: int) -> dict:
-    """FYERS-first, NSE-fallback."""
+                       preferred_expiry: str, strike_count: int, is_mcx: bool = False) -> dict:
     fyers_error = None
     if fyers is not None:
-        result = fetch_via_fyers(fyers, symbol_key, is_index, stock_name, preferred_expiry, strike_count)
+        result = fetch_via_fyers(fyers, symbol_key, is_index, stock_name, preferred_expiry, strike_count, is_mcx=is_mcx)
         if result["ok"]:
-            result["source"] = "FYERS"
+            result["source"] = "FYERS-MCX" if is_mcx else "FYERS"
             return result
         fyers_error = result.get("error")
-        logger.warning("FYERS fetch failed, falling back to NSE: %s", fyers_error)
+        logger.warning("FYERS fetch failed: %s", fyers_error)
+
+    if is_mcx:
+        return {
+            "ok": False, "df": pd.DataFrame(), "meta": {},
+            "error": f"MCX Commodity Option Chain requires a connected FYERS client. {fyers_error or ''}",
+            "source": "NONE",
+        }
 
     if is_index and symbol_key in NSE_UNSUPPORTED_INDICES:
-        error = (
-            f"{symbol_key} is BSE-listed and NSE's public option-chain API does not serve it — "
-            "a FYERS (or other BSE-capable) client is required for this index."
-        )
+        error = f"{symbol_key} is BSE-listed and NSE's public option-chain API does not serve it — a FYERS client is required."
         combined = f"FYERS: {fyers_error} | {error}" if fyers_error else error
         return {"ok": False, "df": pd.DataFrame(), "meta": {}, "error": combined, "source": "NONE"}
 
@@ -1238,7 +1260,6 @@ def fetch_chain_unified(fyers: Any, symbol_key: str, is_index: bool, stock_name:
         error = "NSE response did not contain a usable option chain."
         combined = f"FYERS: {fyers_error} | NSE: {error}" if fyers_error else error
         return {"ok": False, "df": pd.DataFrame(), "meta": meta, "error": combined, "source": "NONE"}
-
     return {"ok": True, "df": df, "meta": meta, "error": None, "source": "NSE"}
 
 
@@ -2494,18 +2515,28 @@ def _pcr_sentiment_badge(pcr: float) -> str:
 def _sidebar_config() -> dict:
     with st.sidebar:
         st.markdown("### ⚙️ Configuration")
-        instrument_type = st.radio("Instrument Type", ["Index", "F&O Stock"], key="oc_instr_type")
-        is_index = instrument_type == "Index"
+        market = st.radio("Market", ["🇮🇳 NSE / F&O", "🪙 MCX Commodities"], key="oc_market")
+        is_mcx = market == "🪙 MCX Commodities"
 
-        if is_index:
-            symbol = st.selectbox("Index", list(INDEX_SYMBOLS.keys()), key="oc_index_select")
-            if symbol in NSE_UNSUPPORTED_INDICES:
-                st.caption(f"ℹ️ {symbol} is BSE-listed — requires a connected FYERS client.")
+        if is_mcx:
+            symbol = st.selectbox("Commodity", list(MCX_COMMODITIES.keys()), key="oc_mcx_select")
+            is_index = False
+            stock_name = symbol
+            default_lot = int(MCX_COMMODITIES[symbol]["lot"])
         else:
-            raw_symbol = st.text_input(
-                "Stock Symbol (e.g. RELIANCE, TCS, INFY)", "RELIANCE", key="oc_stock_input"
-            )
-            symbol = normalize_stock_symbol(raw_symbol)
+            instrument_type = st.radio("Instrument Type", ["Index", "F&O Stock"], key="oc_instr_type")
+            is_index = instrument_type == "Index"
+            if is_index:
+                symbol = st.selectbox("Index", list(INDEX_SYMBOLS.keys()), key="oc_index_select")
+                stock_name = ""
+                if symbol in NSE_UNSUPPORTED_INDICES:
+                    st.caption(f"ℹ️ {symbol} is BSE-listed — requires a connected FYERS client.")
+                default_lot = DEFAULT_LOT_SIZES.get(symbol, DEFAULT_LOT_SIZES["_STOCK_DEFAULT"])
+            else:
+                raw_symbol = st.text_input("Stock Symbol (e.g. RELIANCE, TCS, INFY)", "RELIANCE", key="oc_stock_input")
+                symbol = normalize_stock_symbol(raw_symbol)
+                stock_name = symbol
+                default_lot = DEFAULT_LOT_SIZES["_STOCK_DEFAULT"]
 
         strike_count = st.slider("Strikes Around ATM", 5, 40, 15, step=5, key="oc_strike_count")
         show_greeks = st.checkbox("Show Greeks in chain table", value=True, key="oc_show_greeks")
@@ -2518,10 +2549,7 @@ def _sidebar_config() -> dict:
             except ValueError:
                 st.caption("⚠️ Enter a valid numeric strike price.")
 
-        default_lot = DEFAULT_LOT_SIZES.get(symbol, DEFAULT_LOT_SIZES["_STOCK_DEFAULT"])
-        lot_size = st.number_input(
-            "Lot Size", min_value=1, value=default_lot, step=1, key="oc_lot_size",
-        )
+        lot_size = st.number_input("Lot Size", min_value=1, value=default_lot, step=1, key="oc_lot_size")
 
         st.divider()
         st.markdown("### 📊 Price Action Analysis")
@@ -2530,24 +2558,22 @@ def _sidebar_config() -> dict:
         st.divider()
         st.markdown("### 🔄 Auto Refresh")
         auto_refresh = st.checkbox("Enable auto-refresh", value=False, key="oc_auto_refresh")
-        refresh_secs = st.slider("Refresh interval (seconds)", 10, 120, 20, step=5, key="oc_refresh_secs",
-                                  disabled=not auto_refresh)
+        refresh_secs = st.slider("Refresh interval (seconds)", 10, 120, 20, step=5, key="oc_refresh_secs", disabled=not auto_refresh)
 
         st.divider()
         debug_mode = st.checkbox("Debug info", value=False, key="oc_debug_mode")
         col_free, col_live = st.columns(2)
         with col_free:
-            free_run = st.button("🆓 FREE RUN", use_container_width=True, type="primary",
-                                 help="Runs the NSE option-chain scanner without requiring a FYERS client.")
+            free_run = st.button("🆓 FREE RUN", use_container_width=True, type="primary", help="Runs NSE option-chain only. MCX requires FYERS.")
         with col_live:
             fetch_clicked = st.button("🔄 FETCH LIVE", use_container_width=True)
 
     return {
-        "is_index": is_index, "symbol": symbol, "strike_count": strike_count,
-        "show_greeks": show_greeks, "min_ai_conf": min_ai_conf, "strike_search": strike_search,
-        "lot_size": lot_size, "auto_refresh": auto_refresh, "refresh_secs": refresh_secs,
-        "debug_mode": debug_mode, "fetch_clicked": (fetch_clicked or free_run),
-        "free_run": free_run,
+        "is_mcx": is_mcx, "is_index": is_index, "symbol": symbol, "stock_name": stock_name,
+        "strike_count": strike_count, "show_greeks": show_greeks, "min_ai_conf": min_ai_conf,
+        "strike_search": strike_search, "lot_size": lot_size, "auto_refresh": auto_refresh,
+        "refresh_secs": refresh_secs, "debug_mode": debug_mode,
+        "fetch_clicked": (fetch_clicked or free_run), "free_run": free_run,
         "analyze_price_action": analyze_price_action,
     }
 
@@ -2557,7 +2583,7 @@ def _do_fetch_and_process(cfg: dict, fyers: Any = None) -> Optional[dict]:
     preferred_expiry = st.session_state.get("oc_selected_expiry", "")
     stock_name = cfg["symbol"] if not cfg["is_index"] else ""
     fetch_result = fetch_chain_unified(
-        fyers, cfg["symbol"], cfg["is_index"], stock_name, preferred_expiry, cfg["strike_count"],
+        fyers, cfg["symbol"], cfg["is_index"], stock_name, preferred_expiry, cfg["strike_count"], cfg.get("is_mcx", False),
     )
     if cfg["debug_mode"]:
         st.write("**Fetch result:**", fetch_result.get("ok"), fetch_result.get("source"), fetch_result.get("error"))
@@ -2616,7 +2642,8 @@ def _do_fetch_and_process(cfg: dict, fyers: Any = None) -> Optional[dict]:
     trade_signal = None
     if cfg["analyze_price_action"] and fyers is not None:
         fyers_symbol_candidates = (
-            _fyers_index_candidates(cfg["symbol"]) if cfg["is_index"] else fyers_stock_symbol_candidates(stock_name)
+            fyers_commodity_symbol_candidates(cfg["symbol"]) if cfg.get("is_mcx") else
+            (_fyers_index_candidates(cfg["symbol"]) if cfg["is_index"] else fyers_stock_symbol_candidates(stock_name))
         )
         fyers_symbol = fyers_symbol_candidates[0] if fyers_symbol_candidates else None
         
@@ -2709,6 +2736,7 @@ def run_dashboard(fyers: Any = None) -> None:
     _configure_page()
     _inject_css()
     st.markdown("## 📊 Options Chain + Price Action + Buy/Sell Pressure")
+    st.caption("NSE / F&O + 🪙 MCX Commodity Option Chain")
 
     cfg = _sidebar_config()
 
@@ -2773,7 +2801,7 @@ def run_dashboard(fyers: Any = None) -> None:
             st.warning(alert_text)
 
     source = state.get("data_source", "UNKNOWN")
-    source_badge = "🟢 FYERS" if source == "FYERS" else ("🟡 NSE" if source == "NSE" else "⚪ Unknown")
+    source_badge = "🟢 FYERS-MCX" if source == "FYERS-MCX" else ("🟢 FYERS" if source == "FYERS" else ("🟡 NSE" if source == "NSE" else "⚪ Unknown"))
     st.caption(f"📡 Source: **{source_badge}** | Sentiment: {_pcr_sentiment_badge(state['pcr'])}", unsafe_allow_html=True)
 
     for note in state.get("oi_shift_notes", []):
@@ -2940,7 +2968,7 @@ def run_dashboard(fyers: Any = None) -> None:
                 st.error(f"CSV export failed: {e}")
 
     st.caption(
-        f"**NSE Options + FYERS Price Action + Buy/Sell Pressure** | Last: {meta.get('fetched_at', datetime.now()).strftime('%H:%M:%S')} | "
+        f"**NSE/F&O + MCX Options + FYERS Price Action + Buy/Sell Pressure** | Last: {meta.get('fetched_at', datetime.now()).strftime('%H:%M:%S')} | "
         "Educational tool — not financial advice."
     )
 
