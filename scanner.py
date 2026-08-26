@@ -69,21 +69,18 @@ REFRESH_INTERVALS = [30, 60, 120]
 # ════════════════════════════════════════════════════════════════════════════════
 # MOMENTUM MOVERS CONSTANTS (NEW)
 # ════════════════════════════════════════════════════════════════════════════════
-MOMENTUM_MIN_SCORE = 70
+MOMENTUM_MIN_SCORE = 65
 MOMENTUM_STRONG_SCORE = 85
 MOMENTUM_DEVELOPING_SCORE = 55
-# BIG MOVE scanner: current price action + last consolidation + structure.
-BIGMOVE_CONSOLIDATION_MIN_BARS = 4
-BIGMOVE_CONSOLIDATION_MAX_BARS = 12
-BIGMOVE_MAX_RANGE_PCT = 1.20
-BIGMOVE_MAX_BAR_ATR_MULT = 1.10
-BIGMOVE_MIN_BREAK_PCT = 0.25
-BIGMOVE_MIN_BODY_ATR = 0.80
-BIGMOVE_MIN_BODY_PCT = 55.0
-BIGMOVE_MIN_RVOL = 1.50
-BIGMOVE_MIN_SCORE = 70
-BIGMOVE_STRONG_SCORE = 85
-BIGMOVE_LOOKBACK_BARS = 40
+# LIVE movement scanner: recent 5M price action only. No consolidation requirement.
+LIVE_MOVE_MIN_PCT = 0.35
+LIVE_MOVE_BIG_PCT = 0.70
+LIVE_MOVE_MIN_RVOL = 1.30
+LIVE_MOVE_STRONG_RVOL = 1.80
+LIVE_MOVE_MIN_BODY_PCT = 50.0
+LIVE_MOVE_MIN_SCORE = 65
+LIVE_MOVE_STRONG_SCORE = 85
+LIVE_MOVE_LOOKBACK_DAYS = 2
 MOMENTUM_MIN_MOVE_PCT = 0.10
 MOMENTUM_MIN_RVOL = 1.20
 MOMENTUM_MIN_BODY_PCT = 20
@@ -2264,86 +2261,166 @@ def _fetch_fo_signal(fyers, symbol: str):
 # ════════════════════════════════════════════════════════════════════════════════
 # MOMENTUM SCANNER WORKER (NEW)
 # ════════════════════════════════════════════════════════════════════════════════
+def detect_live_sudden_move(df: pd.DataFrame) -> Dict[str, Any]:
+    """Detect CURRENT sudden 5M BUY/SELL movement. No consolidation required."""
+    result = {
+        "signal": "NO MOVE", "direction": "NONE", "score": 0.0,
+        "reason": "", "move_pct": 0.0, "body_pct": 0.0,
+        "body_atr": 0.0, "rvol": 0.0, "structure": "NONE",
+        "hh_hl": False, "lh_ll": False, "price_acceleration": 0.0,
+        "volume_spike": False,
+    }
+    if df is None or len(df) < 12:
+        result["reason"] = "Insufficient recent 5M candles"
+        return result
+    try:
+        d = df.reset_index(drop=True).copy()
+        last = d.iloc[-1]
+        o, h, l, c, v = map(float, [last["Open"], last["High"], last["Low"], last["Close"], last["Volume"]])
+        prev = float(d["Close"].iloc[-2])
+        if min(o, c, prev) <= 0:
+            result["reason"] = "Invalid price data"
+            return result
+
+        move_pct = ((c - prev) / prev) * 100.0
+        candle_range = max(h - l, 1e-9)
+        body = abs(c - o)
+        body_pct = body / candle_range * 100.0
+        atr_s = calculate_atr(d, 14)
+        atr = float(atr_s.iloc[-1]) if len(atr_s) and pd.notna(atr_s.iloc[-1]) else max(c * 0.003, 0.01)
+        body_atr = body / atr if atr > 0 else 0.0
+
+        vol_base = float(d["Volume"].iloc[-11:-1].mean()) if len(d) >= 11 else float(d["Volume"].iloc[:-1].mean())
+        rvol = v / vol_base if vol_base > 0 else 0.0
+
+        # Recent acceleration: current candle move versus average of last few candle moves.
+        moves = []
+        for i in range(max(1, len(d)-6), len(d)-1):
+            pc = float(d["Close"].iloc[i-1]); cc = float(d["Close"].iloc[i])
+            if pc > 0:
+                moves.append(abs((cc-pc)/pc)*100.0)
+        avg_move = float(np.mean(moves)) if moves else 0.0
+        acceleration = abs(move_pct) / avg_move if avg_move > 0 else 0.0
+
+        # Recent market structure, not old daily/history setup.
+        ph, pl = _confirmed_pivots(d.tail(20), left=1, right=1)
+        hh_hl = lh_ll = False
+        if len(ph) >= 2 and len(pl) >= 2:
+            hh_hl = ph[-1][1] > ph[-2][1] and pl[-1][1] > pl[-2][1]
+            lh_ll = ph[-1][1] < ph[-2][1] and pl[-1][1] < pl[-2][1]
+        structure = "HH/HL" if hh_hl else "LH/LL" if lh_ll else "NONE"
+
+        bullish = c > o
+        bearish = c < o
+        volume_spike = rvol >= LIVE_MOVE_MIN_RVOL
+        strong_volume = rvol >= LIVE_MOVE_STRONG_RVOL
+        strong_body = body_pct >= LIVE_MOVE_MIN_BODY_PCT
+        very_strong_body = body_pct >= 65.0
+        acceleration_ok = acceleration >= 1.30
+
+        buy = 0.0
+        sell = 0.0
+        if bullish: buy += 20
+        if move_pct >= LIVE_MOVE_MIN_PCT: buy += 20
+        if move_pct >= LIVE_MOVE_BIG_PCT: buy += 10
+        if bullish and strong_body: buy += 10
+        if bullish and very_strong_body: buy += 5
+        if volume_spike: buy += 10
+        if strong_volume: buy += 5
+        if move_pct > 0 and acceleration_ok: buy += 10
+        if hh_hl: buy += 10
+
+        if bearish: sell += 20
+        if move_pct <= -LIVE_MOVE_MIN_PCT: sell += 20
+        if move_pct <= -LIVE_MOVE_BIG_PCT: sell += 10
+        if bearish and strong_body: sell += 10
+        if bearish and very_strong_body: sell += 5
+        if volume_spike: sell += 10
+        if strong_volume: sell += 5
+        if move_pct < 0 and acceleration_ok: sell += 10
+        if lh_ll: sell += 10
+
+        buy = min(100.0, buy); sell = min(100.0, sell)
+        score = max(buy, sell)
+
+        if buy >= LIVE_MOVE_MIN_SCORE and buy > sell:
+            direction = "BUY"
+            signal = "🔥 BIG BUY" if buy >= LIVE_MOVE_STRONG_SCORE else "🟢 BUY"
+            reasons = [f"Move +{move_pct:.2f}%", f"RVOL {rvol:.2f}x", f"Body {body_pct:.0f}%"]
+            if hh_hl: reasons.append("HH/HL")
+            if acceleration_ok: reasons.append("Acceleration")
+            reason = " + ".join(reasons)
+            score = buy
+        elif sell >= LIVE_MOVE_MIN_SCORE and sell > buy:
+            direction = "SELL"
+            signal = "🔥 BIG SELL" if sell >= LIVE_MOVE_STRONG_SCORE else "🔴 SELL"
+            reasons = [f"Move {move_pct:.2f}%", f"RVOL {rvol:.2f}x", f"Body {body_pct:.0f}%"]
+            if lh_ll: reasons.append("LH/LL")
+            if acceleration_ok: reasons.append("Acceleration")
+            reason = " + ".join(reasons)
+            score = sell
+        else:
+            direction = "NONE"
+            signal = "NO MOVE"
+            reason = f"Move {move_pct:.2f}% | RVOL {rvol:.2f}x | Body {body_pct:.0f}% | Structure {structure}"
+
+        result.update({
+            "signal": signal, "direction": direction, "score": round(score, 1),
+            "reason": reason, "move_pct": round(move_pct, 3),
+            "body_pct": round(body_pct, 1), "body_atr": round(body_atr, 2),
+            "rvol": round(rvol, 2), "structure": structure,
+            "hh_hl": hh_hl, "lh_ll": lh_ll,
+            "price_acceleration": round(acceleration, 2),
+            "volume_spike": volume_spike,
+        })
+        return result
+    except Exception as e:
+        result["reason"] = f"ERROR: {str(e)[:120]}"
+        return result
+
+
 def _fetch_momentum_signal(fyers, symbol: str, is_fo: bool = False):
-    """BIG MOVE scanner: last consolidation breakout + current price action + HH/HL or LH/LL."""
+    """LIVE SUDDEN MOVEMENT worker: recent 5M candles only."""
     stock_ticker = symbol.replace("NSE:", "").replace("-EQ", "") if isinstance(symbol, str) else str(symbol)
     if not isinstance(symbol, str) or not _VALID_EQ_SYMBOL_RE.match(symbol):
         return None, f"{symbol}: invalid format"
     try:
-        # 5M is the execution/movement timeframe. 15M/1H are shown for context only.
-        analysis_5m = analyze_timeframe(fyers, symbol, "5")
-        analysis_15m = analyze_timeframe(fyers, symbol, "15")
-        analysis_1h = analyze_timeframe(fyers, symbol, "60")
-        if analysis_5m.get("status") != "OK":
-            return None, f"{symbol}: 5M data unavailable"
-        df5 = analysis_5m.get("df")
-        d5 = analysis_5m.get("data", {})
-        if df5 is None or not d5:
-            return None, f"{symbol}: no 5M data"
+        # Only recent 5M data is fetched. No 15M/1H confirmation and no consolidation scan.
+        df5 = _fetch_timeframe_data(fyers, symbol, "5", lookback_days=LIVE_MOVE_LOOKBACK_DAYS)
+        if df5 is None or len(df5) < 12:
+            return None, f"{symbol}: insufficient recent 5M data"
 
-        setup = detect_big_move_setup(df5)
-        if setup["direction"] == "NONE":
-            # Return a diagnostic row instead of silently hiding every rejection.
-            return {
-                "Symbol": stock_ticker,
-                "LTP": round(float(d5.get("last_close", 0)), 2),
-                "SIGNAL": "⚪ NO BIG MOVE",
-                "DIRECTION": "NONE",
-                "MOVE %": setup.get("current_move_pct", 0),
-                "BREAKOUT MOVE %": setup.get("breakout_move_pct", 0),
-                "CONSOLIDATION BARS": setup["consolidation"].get("bars", 0),
-                "CONSOLIDATION HIGH": setup["consolidation"].get("high", "N/A"),
-                "CONSOLIDATION LOW": setup["consolidation"].get("low", "N/A"),
-                "CONSOLIDATION RANGE %": setup["consolidation"].get("range_pct", 0),
-                "STRUCTURE": setup.get("structure", "NONE"),
-                "HH/HL": "✅" if setup.get("hh_hl") else "−",
-                "LH/LL": "✅" if setup.get("lh_ll") else "−",
-                "BODY %": setup.get("body_pct", 0),
-                "BODY / ATR": setup.get("body_atr", 0),
-                "RVOL": setup.get("rvol", 0),
-                "SCORE": setup.get("score", 0),
-                "REASON": setup.get("reason", ""),
-                "5M TREND": d5.get("structure_trend", "N/A"),
-                "15M TREND": analysis_15m.get("data", {}).get("structure_trend", "N/A"),
-                "1H TREND": analysis_1h.get("data", {}).get("structure_trend", "N/A"),
-            }, None
-
-        c = setup["consolidation"]
-        direction = setup["direction"]
-        score = float(setup["score"])
-        signal = setup["signal"]
+        move = detect_live_sudden_move(df5)
+        ltp = float(df5["Close"].iloc[-1])
         result = {
             "Symbol": stock_ticker,
-            "LTP": round(float(d5.get("last_close", 0)), 2),
-            "SIGNAL": signal,
-            "DIRECTION": direction,
-            "MOVE %": setup["current_move_pct"],
-            "BREAKOUT MOVE %": setup["breakout_move_pct"],
-            "BREAKOUT LEVEL": round(float(setup["breakout_level"]), 2) if setup.get("breakout_level") else "N/A",
-            "CONSOLIDATION BARS": c.get("bars", 0),
-            "CONSOLIDATION HIGH": round(float(c["high"]), 2) if c.get("high") else "N/A",
-            "CONSOLIDATION LOW": round(float(c["low"]), 2) if c.get("low") else "N/A",
-            "CONSOLIDATION RANGE %": c.get("range_pct", 0),
-            "STRUCTURE": setup.get("structure", "NONE"),
-            "HH/HL": "✅" if setup.get("hh_hl") else "−",
-            "LH/LL": "✅" if setup.get("lh_ll") else "−",
-            "BODY %": setup["body_pct"],
-            "BODY / ATR": setup["body_atr"],
-            "RVOL": setup["rvol"],
-            "SCORE": score,
-            "REASON": setup["reason"],
-            "5M TREND": d5.get("structure_trend", "N/A"),
-            "15M TREND": analysis_15m.get("data", {}).get("structure_trend", "N/A"),
-            "1H TREND": analysis_1h.get("data", {}).get("structure_trend", "N/A"),
+            "LTP": round(ltp, 2),
+            "SIGNAL": move["signal"],
+            "DIRECTION": move["direction"],
+            "MOVE %": move["move_pct"],
+            "BODY %": move["body_pct"],
+            "BODY / ATR": move["body_atr"],
+            "RVOL": move["rvol"],
+            "STRUCTURE": move["structure"],
+            "HH/HL": "✅" if move["hh_hl"] else "−",
+            "LH/LL": "✅" if move["lh_ll"] else "−",
+            "ACCELERATION": move["price_acceleration"],
+            "VOLUME SPIKE": "🔥" if move["volume_spike"] else "−",
+            "SCORE": move["score"],
+            "REASON": move["reason"],
         }
-        if is_fo:
-            options_data = fetch_options_chain_data(fyers, symbol)
-            result["PCR"] = options_data.get("pcr", "N/A")
-            result["OPTIONS BIAS"] = options_data.get("options_bias", "N/A")
+        if is_fo and move["direction"] in ("BUY", "SELL"):
+            try:
+                options_data = fetch_options_chain_data(fyers, symbol)
+                result["PCR"] = options_data.get("pcr", "N/A")
+                result["OPTIONS BIAS"] = options_data.get("options_bias", "N/A")
+            except Exception:
+                result["PCR"] = "N/A"
+                result["OPTIONS BIAS"] = "N/A"
         return result, None
     except Exception as e:
-        logger.exception("BIG MOVE worker failed for %s", symbol)
-        return None, f"{symbol}: error ({type(e).__name__}: {str(e)[:100]})"
+        logger.exception("LIVE MOMENTUM worker failed for %s", symbol)
+        return None, f"{symbol}: error ({type(e).__name__}: {str(e)[:120]})"
 
 # ════════════════════════════════════════════════════════════════════════════════
 # THREADED SCAN FUNCTIONS
@@ -2415,36 +2492,36 @@ def run_fo_scan(fyers, symbols):
     return results, errors, stats
 
 def run_momentum_scan(fyers, symbols, is_fo: bool = False):
-    """Threaded scan for MOMENTUM stocks."""
+    """Threaded LIVE sudden movement scan. Returns BUY/SELL only."""
     symbols = _validate_symbols(symbols)
     results, errors = [], []
     stats = ScanStats(total=len(symbols))
-    progress = st.progress(0.0, text=f"Scanning Momentum Stocks 0 / {len(symbols)}")
+    progress = st.progress(0.0, text=f"Scanning Live Movement 0 / {len(symbols)}")
     done = 0
-    
+
     for i in range(0, len(symbols), BATCH_SIZE):
         batch = symbols[i:i + BATCH_SIZE]
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
             futures = {executor.submit(_fetch_momentum_signal, fyers, s, is_fo): s for s in batch}
             for future in as_completed(futures):
+                symbol = futures[future]
                 try:
                     res, err = future.result()
                 except Exception as e:
-                    res, err = None, f"{futures[future]}: worker error"
-                
-                if res:
+                    res, err = None, f"{symbol}: worker error: {str(e)[:100]}"
+                if res and res.get("DIRECTION") in ("BUY", "SELL"):
                     results.append(res)
                 if err:
                     errors.append(err)
                 stats.record(has_result=bool(res), has_error=bool(err))
                 done += 1
-                progress.progress(done / max(len(symbols), 1), text=f"Scanning Momentum {done} / {len(symbols)}")
-        
+                progress.progress(done / max(len(symbols), 1), text=f"Live Movement {done} / {len(symbols)}")
         if i + BATCH_SIZE < len(symbols):
             time.sleep(BATCH_PAUSE_SECONDS)
-    
+
     progress.empty()
     gc.collect()
+    results.sort(key=lambda x: (float(x.get("SCORE", 0)), abs(float(x.get("MOVE %", 0))), float(x.get("RVOL", 0))), reverse=True)
     return results, errors, stats
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -2699,24 +2776,24 @@ def show_scanner(fyers) -> None:
             st.info("👈 Click 'SCAN F&O' to start")
     
     # ════════════════════════════════════════════════════════════════════════════════
-    # TAB 2: MOMENTUM MOVERS — BIG MOVE UP/DOWN
+    # TAB 2: MOMENTUM MOVERS — LIVE SUDDEN BUY / SELL
     # ════════════════════════════════════════════════════════════════════════════════
     with tabs[2]:
-        st.markdown("### ⚡ MOMENTUM MOVERS — BIG MOVE UP / DOWN")
-        st.caption("Detects the latest consolidation breakout and the current large move. EMA/RSI/MACD/AI are NOT used for this tab.")
+        st.markdown("### ⚡ LIVE SUDDEN MOVEMENT — BUY / SELL")
+        st.caption("Only recent 5M price action + volume + acceleration + HH/HL or LH/LL. No previous consolidation, 15M, 1H or EMA confirmation.")
 
         col_m1, col_m2, col_m3 = st.columns([2, 2, 1])
         with col_m1:
             momentum_type = st.radio("Select Universe", ["NSE Stocks", "F&O Stocks"], horizontal=True, key="momentum_type")
             momentum_universe = all_symbols if momentum_type == "NSE Stocks" else fo_symbols
         with col_m2:
-            momentum_limit = st.number_input("Scan limit", min_value=50, max_value=len(momentum_universe), value=min(300, len(momentum_universe)), step=50, key="momentum_limit")
+            momentum_limit = st.number_input("Scan limit", min_value=50, max_value=len(momentum_universe), value=min(500, len(momentum_universe)), step=50, key="momentum_limit")
         with col_m3:
             st.metric("Available", len(momentum_universe))
 
         momentum_symbols = momentum_universe[:momentum_limit]
-        if st.button(f"⚡ SCAN BIG MOVE ({len(momentum_symbols)} stocks)", key="momentum_run", type="primary"):
-            with st.spinner("Scanning current BIG MOVE UP/DOWN…"):
+        if st.button(f"⚡ SCAN LIVE MOVEMENT ({len(momentum_symbols)} stocks)", key="momentum_run", type="primary"):
+            with st.spinner("Scanning current 5M sudden BUY / SELL movement…"):
                 is_fo = momentum_type == "F&O Stocks"
                 momentum_results, momentum_errors, momentum_stats = run_momentum_scan(fyers, momentum_symbols, is_fo=is_fo)
                 mdf = pd.DataFrame(momentum_results) if momentum_results else pd.DataFrame()
@@ -2731,41 +2808,38 @@ def show_scanner(fyers) -> None:
 
         mdf = st.session_state.get("momentum_df")
         if mdf is not None and not mdf.empty:
-            # Show only actual big moves first; diagnostics remain available below.
-            big = mdf[mdf["DIRECTION"].isin(["UP", "DOWN"])].copy() if "DIRECTION" in mdf.columns else pd.DataFrame()
-            no_move = mdf[~mdf["DIRECTION"].isin(["UP", "DOWN"])].copy() if "DIRECTION" in mdf.columns else mdf.copy()
+            buy = mdf[mdf["DIRECTION"] == "BUY"].copy().sort_values(["SCORE", "RVOL"], ascending=False)
+            sell = mdf[mdf["DIRECTION"] == "SELL"].copy().sort_values(["SCORE", "RVOL"], ascending=False)
 
-            if not big.empty:
-                up = big[big["DIRECTION"] == "UP"].sort_values(["SCORE", "RVOL"], ascending=False)
-                down = big[big["DIRECTION"] == "DOWN"].sort_values(["SCORE", "RVOL"], ascending=False)
-                c1, c2 = st.columns(2)
-                with c1:
-                    st.markdown(f"### 🟢 BIG MOVE UP — {len(up)}")
-                    st.dataframe(up, use_container_width=True, height=420)
-                with c2:
-                    st.markdown(f"### 🔴 BIG MOVE DOWN — {len(down)}")
-                    st.dataframe(down, use_container_width=True, height=420)
-            else:
-                st.warning("No BIG MOVE UP/DOWN found in this scan.")
+            c1, c2 = st.columns(2)
+            with c1:
+                st.markdown(f"### 🟢 BUY — {len(buy)}")
+                if not buy.empty:
+                    st.dataframe(buy, use_container_width=True, height=430)
+                else:
+                    st.info("No current BUY movement found.")
+            with c2:
+                st.markdown(f"### 🔴 SELL — {len(sell)}")
+                if not sell.empty:
+                    st.dataframe(sell, use_container_width=True, height=430)
+                else:
+                    st.info("No current SELL movement found.")
 
-            with st.expander(f"🔎 Diagnostic report — {len(no_move)} stocks did not qualify"):
-                st.dataframe(no_move, use_container_width=True, height=450)
-
-            st.markdown("### 📥 Download BIG MOVE Report")
+            st.markdown("### 📥 Download LIVE MOVEMENT Report")
             try:
                 st.download_button(
                     "📊 Excel",
-                    _format_excel_output(mdf, "BIG_MOVE"),
-                    f"BIG_MOVE_{_now_ist().strftime('%Y%m%d_%H%M')}.xlsx",
+                    _format_excel_output(mdf, "LIVE_MOVEMENT"),
+                    f"LIVE_MOVEMENT_{_now_ist().strftime('%Y%m%d_%H%M')}.xlsx",
                     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     key="momentum_xls",
                 )
             except Exception as e:
                 st.error(f"Excel export error: {e}")
         elif "momentum_stats" in st.session_state:
-            st.info("Scan completed. No diagnostic rows were returned; check API errors below.")
+            st.warning("Scan completed — no current BUY/SELL movement matched the live thresholds.")
         else:
-            st.info("👈 Click 'SCAN BIG MOVE' to find current BIG BUY / BIG SELL stocks.")
+            st.info("👈 Click 'SCAN LIVE MOVEMENT' to find stocks moving NOW.")
 
         if st.session_state.get("momentum_errors"):
             with st.expander(f"⚠️ API / scan errors ({len(st.session_state['momentum_errors'])})"):
@@ -3174,15 +3248,15 @@ def show_scanner(fyers) -> None:
         with col_set3:
             default_strong_rvol = st.slider("Strong Signal RVOL", 1.0, 3.0, DEFAULT_STRONG_RVOL, 0.1, key="set_strong_rvol")
         
-        st.markdown("#### 📊 Momentum Settings")
+        st.markdown("#### ⚡ Live Movement Settings")
         col_mom1, col_mom2, col_mom3 = st.columns(3)
         
         with col_mom1:
-            momentum_min_score = st.slider("Min Momentum Score (BUY/SELL)", 50, 100, MOMENTUM_MIN_SCORE, 5, key="set_mom_score")
+            momentum_min_score = st.slider("Min Live Movement Score", 50, 100, MOMENTUM_MIN_SCORE, 5, key="set_mom_score")
         with col_mom2:
-            momentum_strong_score = st.slider("Strong Momentum Score", 75, 100, MOMENTUM_STRONG_SCORE, 5, key="set_mom_strong")
+            momentum_strong_score = st.slider("Strong BIG MOVE Score", 75, 100, MOMENTUM_STRONG_SCORE, 5, key="set_mom_strong")
         with col_mom3:
-            momentum_min_rvol = st.slider("Min Momentum RVOL", 1.0, 3.0, MOMENTUM_MIN_RVOL, 0.1, key="set_mom_rvol")
+            momentum_min_rvol = st.slider("Min Live Movement RVOL", 1.0, 3.0, MOMENTUM_MIN_RVOL, 0.1, key="set_mom_rvol")
         
         st.markdown("#### ℹ️ Information")
         st.info("""
