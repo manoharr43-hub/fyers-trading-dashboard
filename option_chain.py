@@ -2535,13 +2535,19 @@ def _sidebar_config() -> dict:
 
         st.divider()
         debug_mode = st.checkbox("Debug info", value=False, key="oc_debug_mode")
-        fetch_clicked = st.button("🔄 Fetch Live Data", use_container_width=True, type="primary")
+        col_free, col_live = st.columns(2)
+        with col_free:
+            free_run = st.button("🆓 FREE RUN", use_container_width=True, type="primary",
+                                 help="Runs the NSE option-chain scanner without requiring a FYERS client.")
+        with col_live:
+            fetch_clicked = st.button("🔄 FETCH LIVE", use_container_width=True)
 
     return {
         "is_index": is_index, "symbol": symbol, "strike_count": strike_count,
         "show_greeks": show_greeks, "min_ai_conf": min_ai_conf, "strike_search": strike_search,
         "lot_size": lot_size, "auto_refresh": auto_refresh, "refresh_secs": refresh_secs,
-        "debug_mode": debug_mode, "fetch_clicked": fetch_clicked,
+        "debug_mode": debug_mode, "fetch_clicked": (fetch_clicked or free_run),
+        "free_run": free_run,
         "analyze_price_action": analyze_price_action,
     }
 
@@ -2712,6 +2718,10 @@ def run_dashboard(fyers: Any = None) -> None:
         st.session_state.pop("oc_selected_expiry", None)
 
     if cfg["fetch_clicked"] or cfg["auto_refresh"]:
+        # FREE RUN intentionally works with NSE-only option-chain data.
+        # Price-action/MSS signals require a connected FYERS client.
+        if cfg.get("free_run") and fyers is None:
+            cfg["analyze_price_action"] = False
         with st.spinner(f"Fetching live data for {cfg['symbol']}…"):
             result = _do_fetch_and_process(cfg, fyers)
         if result is not None:
@@ -2748,6 +2758,20 @@ def run_dashboard(fyers: Any = None) -> None:
             st.dataframe(df.head(3), use_container_width=True)
 
     _render_summary_cards(state)
+
+    # Big-movement alert: ranking/pressure based, not a guaranteed prediction.
+    if not df.empty and "movement_score" in df.columns:
+        top_move = df.loc[df["movement_score"].idxmax()]
+        if float(top_move.get("movement_score", 0)) >= 75:
+            bias = str(top_move.get("movement_bias", "NEUTRAL"))
+            alert_text = (
+                f"🚨 BIG MOVEMENT ALERT: Strike {top_move['strike_price']:,.0f} | "
+                f"{bias} | Score {float(top_move['movement_score']):.0f}/100 | "
+                f"Buy {float(top_move.get('buy_pressure', 0)):.0f} / "
+                f"Sell {float(top_move.get('sell_pressure', 0)):.0f}"
+            )
+            st.warning(alert_text)
+
     source = state.get("data_source", "UNKNOWN")
     source_badge = "🟢 FYERS" if source == "FYERS" else ("🟡 NSE" if source == "NSE" else "⚪ Unknown")
     st.caption(f"📡 Source: **{source_badge}** | Sentiment: {_pcr_sentiment_badge(state['pcr'])}", unsafe_allow_html=True)
