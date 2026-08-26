@@ -2841,12 +2841,26 @@ def show_scanner(fyers) -> None:
         
         fo_universe = fo_symbols if fo_limit == 0 else fo_symbols[:fo_limit]
         
-        if st.button(f"🔍 SCAN F&O ({len(fo_universe)} stocks)", key="fo_run"):
-            with st.spinner("Analyzing F&O stocks…"):
-                fo_results, fo_errors, fo_stats = run_fo_scan(fyers, fo_universe)
-                st.session_state["fo_df"] = pd.DataFrame(fo_results) if fo_results else pd.DataFrame()
-                st.session_state["fo_errors"] = fo_errors
-                st.session_state["fo_stats"] = fo_stats
+        # F&O scan button: keep the scan result in session_state so it
+        # survives Streamlit reruns and can be downloaded immediately.
+        if st.button(
+            f"🔍 SCAN F&O ({len(fo_universe)} stocks)",
+            key="fo_run",
+            type="primary",
+            use_container_width=True,
+        ):
+            with st.spinner(f"Analyzing F&O stocks ({len(fo_universe)} symbols)…"):
+                try:
+                    fo_results, fo_errors, fo_stats = run_fo_scan(fyers, fo_universe)
+                    st.session_state["fo_df"] = (
+                        pd.DataFrame(fo_results) if fo_results else pd.DataFrame()
+                    )
+                    st.session_state["fo_errors"] = fo_errors or []
+                    st.session_state["fo_stats"] = fo_stats
+                except Exception as e:
+                    st.session_state["fo_df"] = pd.DataFrame()
+                    st.session_state["fo_errors"] = [str(e)]
+                    st.error(f"❌ F&O scan failed: {type(e).__name__}: {str(e)[:180]}")
         
         if "fo_stats" in st.session_state:
             _display_scan_summary(st.session_state["fo_stats"])
@@ -2907,12 +2921,12 @@ def show_scanner(fyers) -> None:
                 col_d1, col_d2, col_d3 = st.columns(3)
                 
                 with col_d1:
-                    try:
-                        excel_data = _format_excel_output(fo_filtered, "FO")
-                        st.download_button("📊 Excel", excel_data, f"FO_{_now_ist().strftime('%Y%m%d_%H%M')}.xlsx",
-                                         "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="fo_xls")
-                    except:
-                        pass
+                    _excel_download_button(
+                        fo_filtered,
+                        "FO",
+                        "fo_xls_filtered",
+                        label="📊 Excel",
+                    )
                 
                 with col_d2:
                     try:
