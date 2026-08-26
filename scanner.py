@@ -155,6 +155,26 @@ def _show_market_dashboard_button():
         st.dataframe(dash, use_container_width=True, hide_index=True)
 
 
+
+
+def _excel_download_button(df: pd.DataFrame, filename_prefix: str, key: str, label: str = "📥 DOWNLOAD EXCEL"):
+    """Render an Excel download button for a DataFrame."""
+    if df is None or df.empty:
+        return
+    try:
+        excel_data = _format_excel_output(df, filename_prefix)
+        filename = f"{filename_prefix}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+        st.download_button(
+            label,
+            data=excel_data,
+            file_name=filename,
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key=key,
+            use_container_width=True,
+        )
+    except Exception as e:
+        st.error(f"❌ Excel export failed: {str(e)[:150]}")
+
 # ════════════════════════════════════════════════════════════════════════════════
 # IMPORTS & CONFIG (FROM ORIGINAL)
 # ════════════════════════════════════════════════════════════════════════════════
@@ -3095,6 +3115,11 @@ def show_scanner(fyers) -> None:
                 if len(strong_filtered) > 0:
                     st.dataframe(strong_filtered.sort_values("AI CONFIDENCE %", ascending=False), 
                                use_container_width=True, height=400)
+                    _excel_download_button(
+                        strong_filtered.sort_values("AI CONFIDENCE %", ascending=False),
+                        "STRONG_SIGNALS",
+                        "download_strong_signals_excel"
+                    )
                 else:
                     st.warning("No strong signals (≥75% confidence) found. Lower the threshold in Settings tab.")
             
@@ -3407,6 +3432,12 @@ def show_scanner(fyers) -> None:
                 st.metric("Bearish %", f"{stats['sell_pct']:.1f}%")
             with col_sent3:
                 st.metric("Neutral %", f"{stats['neutral_pct']:.1f}%")
+
+            _excel_download_button(
+                dash_df,
+                "MARKET_DASHBOARD",
+                "download_market_dashboard_excel"
+            )
         else:
             st.info(f"👈 Run '{dashboard_source}' scanner first")
     
