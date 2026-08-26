@@ -15,6 +15,146 @@ from datetime import datetime, timedelta
 from typing import List, Optional, Tuple, Dict, Any
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+
+# ============================================================
+# INDEPENDENT STRONG SIGNALS / MARKET DASHBOARD HELPERS
+# ============================================================
+
+def _show_strong_signals_button():
+    """Independent Strong Signals runner."""
+    if st.button("🔥 RUN STRONG SIGNALS", key="run_strong_signals", use_container_width=True):
+        source = st.session_state.get("strong_source", "NSE Stocks")
+        df = st.session_state.get("nse_df" if source == "NSE Stocks" else "fo_df")
+
+        if df is None or len(df) == 0:
+            st.warning(f"⚠️ Run the {source} scanner first.")
+            return
+
+        confidence_col = next(
+            (c for c in ["AI CONFIDENCE %", "CONFIDENCE %", "Confidence %"]
+             if c in df.columns),
+            None
+        )
+        signal_col = next(
+            (c for c in ["AI SIGNAL", "SIGNAL", "Signal"]
+             if c in df.columns),
+            None
+        )
+
+        if confidence_col is None:
+            st.error("❌ Confidence column not found in scanner output.")
+            return
+
+        out = df.copy()
+        conf = pd.to_numeric(out[confidence_col], errors="coerce").fillna(0)
+        out = out[conf >= 75].copy()
+
+        if signal_col:
+            out = out[
+                ~out[signal_col].astype(str).str.upper().isin(
+                    ["NEUTRAL", "NO SIGNAL", "NONE", "N/A"]
+                )
+            ]
+
+        if len(out) == 0:
+            st.warning("No strong signals ≥75% found.")
+        else:
+            out = out.sort_values(confidence_col, ascending=False)
+            st.success(f"🔥 {len(out)} strong signals found.")
+            st.dataframe(out, use_container_width=True, height=450)
+
+
+def _show_market_dashboard_button():
+    """Independent Market Dashboard runner."""
+    if st.button("📊 RUN MARKET DASHBOARD", key="run_market_dashboard", use_container_width=True):
+        source = st.session_state.get("dash_source", "NSE Stocks")
+        df = st.session_state.get("nse_df" if source == "NSE Stocks" else "fo_df")
+
+        if df is None or len(df) == 0:
+            st.warning(f"⚠️ Run the {source} scanner first.")
+            return
+
+        signal_col = next(
+            (c for c in ["AI SIGNAL", "SIGNAL", "Signal"]
+             if c in df.columns),
+            None
+        )
+        confidence_col = next(
+            (c for c in ["AI CONFIDENCE %", "CONFIDENCE %", "Confidence %"]
+             if c in df.columns),
+            None
+        )
+
+        if signal_col is None:
+            st.error("❌ Signal column not found.")
+            return
+
+        s = df[signal_col].astype(str).str.upper()
+
+        buy = int(s.str.contains("BUY", na=False).sum())
+        sell = int(s.str.contains("SELL", na=False).sum())
+        neutral = int(s.isin(["NEUTRAL", "NONE", "NO SIGNAL", "N/A"]).sum())
+
+        strong_buy = 0
+        strong_sell = 0
+        avg_conf = 0.0
+
+        if confidence_col:
+            conf = pd.to_numeric(
+                df[confidence_col], errors="coerce"
+            ).fillna(0)
+
+            strong_buy = int(
+                ((s.str.contains("BUY", na=False)) & (conf >= 75)).sum()
+            )
+            strong_sell = int(
+                ((s.str.contains("SELL", na=False)) & (conf >= 75)).sum()
+            )
+            avg_conf = float(conf.mean()) if len(conf) else 0.0
+
+        total = len(df)
+
+        c1, c2, c3, c4, c5 = st.columns(5)
+        c1.metric("TOTAL", total)
+        c2.metric("🟢 BUY", buy)
+        c3.metric("🔴 SELL", sell)
+        c4.metric("🔥 STRONG BUY", strong_buy)
+        c5.metric("🔥 STRONG SELL", strong_sell)
+
+        st.metric("Average Confidence", f"{avg_conf:.1f}%")
+
+        if buy > sell * 1.15:
+            sentiment = "🟢 BULLISH"
+        elif sell > buy * 1.15:
+            sentiment = "🔴 BEARISH"
+        else:
+            sentiment = "🟡 NEUTRAL"
+
+        st.subheader(f"Market Sentiment: {sentiment}")
+
+        dash = pd.DataFrame({
+            "Metric": [
+                "Total Stocks",
+                "BUY",
+                "SELL",
+                "NEUTRAL",
+                "Strong BUY",
+                "Strong SELL",
+                "Average Confidence"
+            ],
+            "Value": [
+                total,
+                buy,
+                sell,
+                neutral,
+                strong_buy,
+                strong_sell,
+                f"{avg_conf:.1f}%"
+            ]
+        })
+        st.dataframe(dash, use_container_width=True, hide_index=True)
+
+
 # ════════════════════════════════════════════════════════════════════════════════
 # IMPORTS & CONFIG (FROM ORIGINAL)
 # ════════════════════════════════════════════════════════════════════════════════
