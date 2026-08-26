@@ -3054,15 +3054,33 @@ def show_scanner(fyers) -> None:
     # ════════════════════════════════════════════════════════════════════════════════
     with tabs[4]:
         st.markdown("### 🔥 Strong Signals Only\nHigh-confidence setups (≥70%)")
-        
         strong_source = st.radio("Source", ["NSE Stocks", "F&O Stocks"], horizontal=True, key="strong_source")
-        
-        if strong_source == "NSE Stocks":
-            nse_df = st.session_state.get("nse_df")
-            strong_df = nse_df
-        else:
-            fo_df = st.session_state.get("fo_df")
-            strong_df = fo_df
+
+        strong_universe_all = all_symbols if strong_source == "NSE Stocks" else fo_symbols
+        strong_default = min(500 if strong_source == "NSE Stocks" else 200, len(strong_universe_all))
+        strong_limit = st.number_input(
+            "Strong Signals scan limit (0 = all)",
+            min_value=0, max_value=len(strong_universe_all),
+            value=strong_default,
+            step=50 if strong_source == "NSE Stocks" else 25,
+            key="strong_limit"
+        )
+
+        if st.button("🔥 RUN STRONG SIGNALS", key="run_strong_signals", type="primary", use_container_width=True):
+            with st.spinner(f"Scanning {strong_source} for strong signals…"):
+                universe = strong_universe_all if strong_limit == 0 else strong_universe_all[:strong_limit]
+                if strong_source == "NSE Stocks":
+                    r, e, s = run_nse_scan(fyers, universe)
+                    st.session_state["nse_df"] = pd.DataFrame(r) if r else pd.DataFrame()
+                    st.session_state["nse_errors"] = e
+                    st.session_state["nse_stats"] = s
+                else:
+                    r, e, s = run_fo_scan(fyers, universe)
+                    st.session_state["fo_df"] = pd.DataFrame(r) if r else pd.DataFrame()
+                    st.session_state["fo_errors"] = e
+                    st.session_state["fo_stats"] = s
+
+        strong_df = st.session_state.get("nse_df" if strong_source == "NSE Stocks" else "fo_df")
         
         if strong_df is not None and not strong_df.empty:
             try:
@@ -3327,13 +3345,33 @@ def show_scanner(fyers) -> None:
     # ════════════════════════════════════════════════════════════════════════════════
     with tabs[7]:
         st.markdown("### 📊 Market Dashboard - Statistics & Sentiment")
-        
         dashboard_source = st.radio("Data Source", ["NSE Stocks", "F&O Stocks"], horizontal=True, key="dash_source")
-        
-        if dashboard_source == "NSE Stocks":
-            dash_df = st.session_state.get("nse_df")
-        else:
-            dash_df = st.session_state.get("fo_df")
+
+        dash_universe_all = all_symbols if dashboard_source == "NSE Stocks" else fo_symbols
+        dash_default = min(500 if dashboard_source == "NSE Stocks" else 200, len(dash_universe_all))
+        dash_limit = st.number_input(
+            "Dashboard scan limit (0 = all)",
+            min_value=0, max_value=len(dash_universe_all),
+            value=dash_default,
+            step=50 if dashboard_source == "NSE Stocks" else 25,
+            key="dash_limit"
+        )
+
+        if st.button("📊 RUN MARKET DASHBOARD", key="run_market_dashboard", type="primary", use_container_width=True):
+            with st.spinner(f"Scanning {dashboard_source} for market dashboard…"):
+                universe = dash_universe_all if dash_limit == 0 else dash_universe_all[:dash_limit]
+                if dashboard_source == "NSE Stocks":
+                    r, e, s = run_nse_scan(fyers, universe)
+                    st.session_state["nse_df"] = pd.DataFrame(r) if r else pd.DataFrame()
+                    st.session_state["nse_errors"] = e
+                    st.session_state["nse_stats"] = s
+                else:
+                    r, e, s = run_fo_scan(fyers, universe)
+                    st.session_state["fo_df"] = pd.DataFrame(r) if r else pd.DataFrame()
+                    st.session_state["fo_errors"] = e
+                    st.session_state["fo_stats"] = s
+
+        dash_df = st.session_state.get("nse_df" if dashboard_source == "NSE Stocks" else "fo_df")
         
         if dash_df is not None and not dash_df.empty:
             stats = calculate_market_stats(dash_df)
