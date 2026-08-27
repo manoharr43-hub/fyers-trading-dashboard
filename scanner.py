@@ -2818,7 +2818,7 @@ PIN_STRONG_CONFIDENCE = 82
 PIN_PIVOT_LEN = 5
 PIN_EQUAL_ATR_TOL = 0.15
 PIN_BIGMOVE_MIN_SCORE = 70
-PIN_MAX_SCAN = 100
+PIN_MAX_SCAN = None  # Full NSE/F&O universe; no artificial 100-stock limit
 
 
 def calculate_pin_rules(df_5m: pd.DataFrame, data_5m: Dict[str, Any], data_15m: Dict[str, Any], data_1h: Dict[str, Any]) -> Dict[str, Any]:
@@ -2943,13 +2943,20 @@ def _pin_display_symbol(symbol: Any) -> str:
     return raw
 
 
-def _run_pin_scan(fyers, universe, pin_min=PIN_MIN_CONFIDENCE, pin_mode="ALL", scan_limit=None):
-    """Run PIN analysis safely and return (DataFrame, errors)."""
+def _run_pin_scan(fyers, universe, pin_min=PIN_MIN_CONFIDENCE, pin_mode="ALL"):
+    """Run PIN analysis on the complete selected universe; independent from main scanners."""
     rows = []
     errors = []
-    symbols = list(universe or [])
-    if scan_limit is not None:
-        symbols = symbols[:int(scan_limit)]
+
+    # Always use the complete selected universe.
+    # Normalize and de-duplicate symbols so NSE total stocks can be scanned.
+    symbols = []
+    seen = set()
+    for symbol in list(universe or []):
+        normalized = _pin_normalize_symbol(symbol)
+        if normalized and normalized not in seen:
+            seen.add(normalized)
+            symbols.append(normalized)
 
     progress = st.progress(0.0)
     total = len(symbols)
@@ -3041,65 +3048,48 @@ def _show_pin_rules_tab(fyers, all_symbols=None, fo_symbols=None) -> None:
         **Big Movement:** existing consolidation-breakout + candle + RVOL + structure engine.
         """)
 
-    # If a main scanner result exists, use its tickers as the default candidate list.
-    # Otherwise PIN scans the selected universe directly. This makes the tab independent.
-    source_key = "nse_df" if source == "NSE Stocks" else "fo_df"
-    base_df = st.session_state.get(source_key)
+    # FULL UNIVERSE MODE: PIN is completely independent from nse_df/fo_df.
+    # It always scans all symbols loaded for the selected source.
+    candidate_symbols = []
+    seen = set()
+    for symbol in selected_universe:
+        normalized = _pin_normalize_symbol(symbol)
+        if normalized and normalized not in seen:
+            seen.add(normalized)
+            candidate_symbols.append(normalized)
 
-    if isinstance(base_df, pd.DataFrame) and not base_df.empty and "Symbol" in base_df.columns:
-        candidate_symbols = base_df["Symbol"].dropna().astype(str).tolist()
-        candidate_symbols = [_pin_display_symbol(x) for x in candidate_symbols if _pin_display_symbol(x)]
-
-        # Preserve main scanner confidence ordering when available.
-        if "AI CONFIDENCE %" in base_df.columns:
-            work = base_df.copy()
-            work["__conf"] = pd.to_numeric(work["AI CONFIDENCE %"], errors="coerce").fillna(0)
-            work = work.sort_values("__conf", ascending=False)
-            candidate_symbols = [_pin_display_symbol(x) for x in work["Symbol"].dropna().tolist()]
-
-        default_limit = min(30, len(candidate_symbols), PIN_MAX_SCAN)
-    else:
-        candidate_symbols = [_pin_display_symbol(x) for x in selected_universe]
-        candidate_symbols = [x for x in candidate_symbols if x]
-        default_limit = min(30, len(candidate_symbols), PIN_MAX_SCAN)
-
-    candidate_symbols = candidate_symbols[:PIN_MAX_SCAN]
-    max_scan = len(candidate_symbols)
-    if max_scan == 0:
+    total_available = len(candidate_symbols)
+    if total_available == 0:
         st.warning("⚠️ No valid symbols found for PIN scanning.")
         return
 
     c1, c2, c3 = st.columns(3)
     with c1:
-        pin_limit = st.number_input(
-            "PIN scan limit", min_value=1, max_value=max_scan,
-            value=max(1, default_limit), step=1, key="pin_limit"
-        )
-    with c2:
         pin_min = st.slider(
             "Minimum PIN score", min_value=50, max_value=100,
             value=PIN_MIN_CONFIDENCE, step=1, key="pin_min_score"
         )
-    with c3:
+    with c2:
         pin_mode = st.selectbox(
             "Show", ["ALL", "BUY ONLY", "SELL ONLY", "STRONG ONLY"],
             key="pin_mode"
         )
+    with c3:
+        st.metric("TOTAL STOCKS TO SCAN", f"{total_available:,}")
 
-    st.info(f"📊 Ready to scan {int(pin_limit)} of {max_scan} available {source} symbols.")
+    st.info(f"📊 Ready to scan ALL {total_available:,} available {source} symbols. No 100-stock limit.")
 
-    if st.button("📌 RUN PIN RULES", key="pin_run", type="primary", use_container_width=True):
+    if st.button("📌 RUN FULL PIN RULES SCAN", key="pin_run", type="primary", use_container_width=True):
         with st.spinner("Analyzing PIN liquidity, sweeps, reversals and big movement…"):
             result, errors = _run_pin_scan(
                 fyers,
                 candidate_symbols,
                 pin_min=pin_min,
-                pin_mode=pin_mode,
-                scan_limit=int(pin_limit)
+                pin_mode=pin_mode
             )
         st.session_state["pin_df"] = result
         st.session_state["pin_errors"] = errors
-        st.session_state["pin_last_scan_count"] = int(pin_limit)
+        st.session_state["pin_last_scan_count"] = total_available
 
     pin_df = st.session_state.get("pin_df")
     if isinstance(pin_df, pd.DataFrame) and not pin_df.empty:
