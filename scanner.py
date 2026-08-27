@@ -2808,6 +2808,340 @@ def run_momentum_scan(fyers, symbols, is_fo: bool = False):
     results.sort(key=lambda x: (float(x.get("SCORE", 0)), abs(float(x.get("MOVE %", 0))), float(x.get("RVOL", 0))), reverse=True)
     return results, errors, stats
 
+
+# ════════════════════════════════════════════════════════════════════════════════
+# PIN RULES — ADDITIONAL LIQUIDITY / REVERSAL / BIG-MOVE ANALYSIS
+# Existing scanner logic is intentionally untouched. This tab runs only when used.
+# ════════════════════════════════════════════════════════════════════════════════
+PIN_MIN_CONFIDENCE = 70
+PIN_STRONG_CONFIDENCE = 82
+PIN_PIVOT_LEN = 5
+PIN_EQUAL_ATR_TOL = 0.15
+PIN_BIGMOVE_MIN_SCORE = 70
+PIN_MAX_SCAN = 100
+
+
+def calculate_pin_rules(df_5m: pd.DataFrame, data_5m: Dict[str, Any], data_15m: Dict[str, Any], data_1h: Dict[str, Any]) -> Dict[str, Any]:
+    """Rule-based implementation of the supplied Pine 'AI PRO v3' ideas.
+    This is NOT machine-learning AI and it does not access the exchange order book.
+    """
+    out = {
+        "PIN SIGNAL": "WAIT", "PIN SCORE": 0.0, "LIQUIDITY": "NONE",
+        "SWEEP": "NONE", "REVERSAL": "NONE", "EQUAL HIGH": "NO", "EQUAL LOW": "NO",
+        "BIG MOVEMENT": "NO", "BIG MOVE SCORE": 0.0, "STRUCTURE": "NONE",
+        "5M TREND": data_5m.get("structure_trend", "N/A"),
+        "15M TREND": data_15m.get("structure_trend", "N/A"),
+        "1H TREND": data_1h.get("structure_trend", "N/A"),
+        "RVOL": data_5m.get("rvol", 0), "RSI": data_5m.get("rsi", 50),
+        "PRESSURE": data_5m.get("pressure_trend", "N/A"), "REASON": ""
+    }
+    if df_5m is None or len(df_5m) < 30:
+        out["REASON"] = "Insufficient 5M candles"
+        return out
+    try:
+        d = df_5m.reset_index(drop=True).copy()
+        last = d.iloc[-1]
+        o, h, l, c, v = [float(last[x]) for x in ["Open", "High", "Low", "Close", "Volume"]]
+        body = abs(c-o)
+        rng = max(h-l, 1e-9)
+        upper_wick = h-max(o,c)
+        lower_wick = min(o,c)-l
+        atr_s = calculate_atr(d, 14)
+        atr = float(atr_s.iloc[-1]) if pd.notna(atr_s.iloc[-1]) else max(c*0.005, 0.01)
+        vwap_s = calculate_vwap(d)
+        vwap = float(vwap_s.iloc[-1]) if len(vwap_s) else c
+        rsi = float(data_5m.get("rsi", 50) or 50)
+        rvol = float(data_5m.get("rvol", 0) or 0)
+        macd_bull = bool(data_5m.get("macd_bullish", False))
+        ema_trend = data_5m.get("ema_trend", "NEUTRAL")
+        structure_trend = data_5m.get("structure_trend", "NEUTRAL")
+        bull = c > o; bear = c < o
+        strong_bull = bull and body/rng*100 >= 55
+        strong_bear = bear and body/rng*100 >= 55
+
+        # Confirmed liquidity pivots. Current candle is never used as a pivot.
+        ph, pl = _confirmed_pivots(d, left=PIN_PIVOT_LEN, right=PIN_PIVOT_LEN)
+        last_hi = ph[-1][1] if ph else None
+        prev_hi = ph[-2][1] if len(ph) >= 2 else None
+        last_lo = pl[-1][1] if pl else None
+        prev_lo = pl[-2][1] if len(pl) >= 2 else None
+        eq_hi = last_hi is not None and prev_hi is not None and abs(last_hi-prev_hi) <= atr*PIN_EQUAL_ATR_TOL
+        eq_lo = last_lo is not None and prev_lo is not None and abs(last_lo-prev_lo) <= atr*PIN_EQUAL_ATR_TOL
+        sweep_buy = last_hi is not None and h > last_hi and c < last_hi and upper_wick > body
+        sweep_sell = last_lo is not None and l < last_lo and c > last_lo and lower_wick > body
+        bullish_sweep = sweep_sell
+        bearish_sweep = sweep_buy
+
+        bullish_reversal = bullish_sweep and bull and c > vwap and rsi > 45
+        bearish_reversal = bearish_sweep and bear and c < vwap and rsi < 55
+
+        # Pine-style confluence score.
+        buy = 0.0; sell = 0.0
+        buy += 25 if ema_trend == "BULLISH" and structure_trend == "BULLISH" else 15 if structure_trend == "BULLISH" else 0
+        sell += 25 if ema_trend == "BEARISH" and structure_trend == "BEARISH" else 15 if structure_trend == "BEARISH" else 0
+        buy += 15 if rsi >= 55 else 7 if rsi >= 50 else 0
+        sell += 15 if rsi <= 45 else 7 if rsi <= 50 else 0
+        buy += 15 if c > vwap else 0; sell += 15 if c < vwap else 0
+        buy += 20 if macd_bull and float(data_5m.get("macd_hist", 0) or 0) > 0 else 10 if macd_bull else 0
+        sell += 20 if (not macd_bull) and float(data_5m.get("macd_hist", 0) or 0) < 0 else 10 if not macd_bull else 0
+        buy += 10 if rvol >= 1.5 and bull else 0
+        sell += 10 if rvol >= 1.5 and bear else 0
+        buy += 5 if strong_bull else 0; sell += 5 if strong_bear else 0
+        buy += 10 if bullish_sweep else 0; sell += 10 if bearish_sweep else 0
+        buy += 10 if bullish_reversal else 0; sell += 10 if bearish_reversal else 0
+        pin_score = min(100.0, max(buy, sell))
+        direction = "BUY" if buy > sell else "SELL" if sell > buy else "WAIT"
+        if pin_score >= PIN_STRONG_CONFIDENCE and direction != "WAIT":
+            pin_signal = f"{'🟢 STRONG BUY' if direction=='BUY' else '🔴 STRONG SELL'}"
+        elif pin_score >= PIN_MIN_CONFIDENCE and direction != "WAIT":
+            pin_signal = f"{'🟢 BUY' if direction=='BUY' else '🔴 SELL'}"
+        else:
+            pin_signal = "🟡 WAIT"
+
+        # Existing BIG MOVE engine is reused; no duplicate scan logic.
+        bm = detect_big_move_setup(d)
+        structure = bm.get("structure", "NONE")
+        liquidity = "EQ HIGH" if eq_hi else "EQ LOW" if eq_lo else "HIGH" if last_hi is not None else "LOW" if last_lo is not None else "NONE"
+        sweep = "🟢 LOW SWEPT" if bullish_sweep else "🔴 HIGH SWEPT" if bearish_sweep else "NONE"
+        reversal = "🟢 BULL REVERSAL" if bullish_reversal else "🔴 BEAR REVERSAL" if bearish_reversal else "NONE"
+        out.update({
+            "PIN SIGNAL": pin_signal, "PIN SCORE": round(pin_score, 1),
+            "LIQUIDITY": liquidity, "SWEEP": sweep, "REVERSAL": reversal,
+            "EQUAL HIGH": "YES" if eq_hi else "NO", "EQUAL LOW": "YES" if eq_lo else "NO",
+            "BIG MOVEMENT": bm.get("signal", "NO BIG MOVE"),
+            "BIG MOVE SCORE": bm.get("score", 0.0), "STRUCTURE": structure,
+            "REASON": " | ".join([x for x in [
+                "EQ HIGH" if eq_hi else "", "EQ LOW" if eq_lo else "",
+                "LOW SWEEP" if bullish_sweep else "HIGH SWEEP" if bearish_sweep else "",
+                "BULL REVERSAL" if bullish_reversal else "BEAR REVERSAL" if bearish_reversal else "",
+                "BIG MOVE" if bm.get("direction") in ["UP", "DOWN"] else ""
+            ] if x]) or "No PIN confirmation"
+        })
+        return out
+    except Exception as e:
+        out["REASON"] = f"PIN error: {type(e).__name__}"
+        return out
+
+
+def _pin_normalize_symbol(symbol: Any) -> str:
+    """Return a valid FYERS NSE equity symbol for PIN analysis."""
+    raw = str(symbol or "").strip().upper()
+    if not raw:
+        return ""
+    raw = raw.replace("-EQ", "")
+    if raw.startswith("NSE:"):
+        raw = raw[4:]
+    # Remove accidental whitespace and exchange suffixes from scanner output.
+    raw = raw.split("|")[0].strip()
+    return f"NSE:{raw}-EQ"
+
+
+def _pin_display_symbol(symbol: Any) -> str:
+    """Return a clean ticker for the PIN results table."""
+    raw = str(symbol or "").strip().upper()
+    raw = raw.replace("NSE:", "").replace("-EQ", "")
+    return raw
+
+
+def _run_pin_scan(fyers, universe, pin_min=PIN_MIN_CONFIDENCE, pin_mode="ALL", scan_limit=None):
+    """Run PIN analysis safely and return (DataFrame, errors)."""
+    rows = []
+    errors = []
+    symbols = list(universe or [])
+    if scan_limit is not None:
+        symbols = symbols[:int(scan_limit)]
+
+    progress = st.progress(0.0)
+    total = len(symbols)
+
+    try:
+        for n, symbol in enumerate(symbols, 1):
+            display_symbol = _pin_display_symbol(symbol)
+            fyers_symbol = _pin_normalize_symbol(symbol)
+
+            if not fyers_symbol:
+                errors.append(f"{symbol}: invalid symbol")
+                progress.progress(n / max(total, 1))
+                continue
+
+            try:
+                a5 = analyze_timeframe(fyers, fyers_symbol, "5")
+                if a5.get("status") != "OK" or a5.get("df") is None or len(a5.get("df")) < 30:
+                    errors.append(f"{display_symbol}: 5M data unavailable/insufficient")
+                    progress.progress(n / max(total, 1))
+                    continue
+
+                a15 = analyze_timeframe(fyers, fyers_symbol, "15")
+                a1h = analyze_timeframe(fyers, fyers_symbol, "60")
+
+                pin = calculate_pin_rules(
+                    a5.get("df"),
+                    a5.get("data", {}),
+                    a15.get("data", {}),
+                    a1h.get("data", {})
+                )
+                pin["Symbol"] = display_symbol
+                pin["LTP"] = a5.get("data", {}).get("close", "N/A")
+
+                rows.append(pin)
+            except Exception as e:
+                errors.append(f"{display_symbol}: {type(e).__name__}: {str(e)[:120]}")
+
+            progress.progress(n / max(total, 1))
+    finally:
+        progress.empty()
+
+    result = pd.DataFrame(rows)
+    if result.empty:
+        return result, errors
+
+    result["__score"] = pd.to_numeric(result.get("PIN SCORE", 0), errors="coerce").fillna(0)
+    result = result[result["__score"] >= float(pin_min)].copy()
+
+    signal_text = result["PIN SIGNAL"].astype(str).str.upper()
+    if pin_mode == "BUY ONLY":
+        result = result[signal_text.str.contains("BUY", na=False)]
+    elif pin_mode == "SELL ONLY":
+        result = result[signal_text.str.contains("SELL", na=False)]
+    elif pin_mode == "STRONG ONLY":
+        result = result[signal_text.str.contains("STRONG", na=False)]
+
+    result = result.drop(columns=["__score"], errors="ignore")
+    if not result.empty and "PIN SCORE" in result.columns:
+        result = result.sort_values("PIN SCORE", ascending=False).reset_index(drop=True)
+    return result, errors
+
+
+def _show_pin_rules_tab(fyers, all_symbols=None, fo_symbols=None) -> None:
+    """PIN Rules scanner. Runs independently from the main scanners."""
+    st.markdown("### 📌 PIN RULES — Liquidity + Reversal + Big Movement")
+    st.caption("Independent PIN scanner. It does not modify NSE, F&O, Momentum, or other scanner results.")
+
+    source = st.selectbox(
+        "Source",
+        ["NSE Stocks", "F&O Stocks"],
+        key="pin_source"
+    )
+
+    selected_universe = list(all_symbols or []) if source == "NSE Stocks" else list(fo_symbols or [])
+    if not selected_universe:
+        st.error(f"❌ No {source} symbols are available. Check symbol loading/FYERS access.")
+        return
+
+    with st.expander("📖 PIN Rules", expanded=False):
+        st.markdown("""
+        **Liquidity:** confirmed Pivot High/Low → Equal High/Low → liquidity level.
+        
+        **Sweep:** High breaks and closes back below = bearish; Low breaks and closes back above = bullish.
+        
+        **Reversal:** Sweep + candle direction + VWAP + RSI confirmation.
+        
+        **Confluence:** Trend + RSI + VWAP + MACD + RVOL + candle + sweep + reversal.
+        
+        **Big Movement:** existing consolidation-breakout + candle + RVOL + structure engine.
+        """)
+
+    # If a main scanner result exists, use its tickers as the default candidate list.
+    # Otherwise PIN scans the selected universe directly. This makes the tab independent.
+    source_key = "nse_df" if source == "NSE Stocks" else "fo_df"
+    base_df = st.session_state.get(source_key)
+
+    if isinstance(base_df, pd.DataFrame) and not base_df.empty and "Symbol" in base_df.columns:
+        candidate_symbols = base_df["Symbol"].dropna().astype(str).tolist()
+        candidate_symbols = [_pin_display_symbol(x) for x in candidate_symbols if _pin_display_symbol(x)]
+
+        # Preserve main scanner confidence ordering when available.
+        if "AI CONFIDENCE %" in base_df.columns:
+            work = base_df.copy()
+            work["__conf"] = pd.to_numeric(work["AI CONFIDENCE %"], errors="coerce").fillna(0)
+            work = work.sort_values("__conf", ascending=False)
+            candidate_symbols = [_pin_display_symbol(x) for x in work["Symbol"].dropna().tolist()]
+
+        default_limit = min(30, len(candidate_symbols), PIN_MAX_SCAN)
+    else:
+        candidate_symbols = [_pin_display_symbol(x) for x in selected_universe]
+        candidate_symbols = [x for x in candidate_symbols if x]
+        default_limit = min(30, len(candidate_symbols), PIN_MAX_SCAN)
+
+    candidate_symbols = candidate_symbols[:PIN_MAX_SCAN]
+    max_scan = len(candidate_symbols)
+    if max_scan == 0:
+        st.warning("⚠️ No valid symbols found for PIN scanning.")
+        return
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        pin_limit = st.number_input(
+            "PIN scan limit", min_value=1, max_value=max_scan,
+            value=max(1, default_limit), step=1, key="pin_limit"
+        )
+    with c2:
+        pin_min = st.slider(
+            "Minimum PIN score", min_value=50, max_value=100,
+            value=PIN_MIN_CONFIDENCE, step=1, key="pin_min_score"
+        )
+    with c3:
+        pin_mode = st.selectbox(
+            "Show", ["ALL", "BUY ONLY", "SELL ONLY", "STRONG ONLY"],
+            key="pin_mode"
+        )
+
+    st.info(f"📊 Ready to scan {int(pin_limit)} of {max_scan} available {source} symbols.")
+
+    if st.button("📌 RUN PIN RULES", key="pin_run", type="primary", use_container_width=True):
+        with st.spinner("Analyzing PIN liquidity, sweeps, reversals and big movement…"):
+            result, errors = _run_pin_scan(
+                fyers,
+                candidate_symbols,
+                pin_min=pin_min,
+                pin_mode=pin_mode,
+                scan_limit=int(pin_limit)
+            )
+        st.session_state["pin_df"] = result
+        st.session_state["pin_errors"] = errors
+        st.session_state["pin_last_scan_count"] = int(pin_limit)
+
+    pin_df = st.session_state.get("pin_df")
+    if isinstance(pin_df, pd.DataFrame) and not pin_df.empty:
+        pc1, pc2, pc3, pc4 = st.columns(4)
+        signal_series = pin_df["PIN SIGNAL"].astype(str).str.upper() if "PIN SIGNAL" in pin_df.columns else pd.Series(dtype=str)
+        sweep_series = pin_df["SWEEP"].astype(str) if "SWEEP" in pin_df.columns else pd.Series(dtype=str)
+        pc1.metric("📌 PIN SETUPS", len(pin_df))
+        pc2.metric("🟢 BUY", int(signal_series.str.contains("BUY", na=False).sum()))
+        pc3.metric("🔴 SELL", int(signal_series.str.contains("SELL", na=False).sum()))
+        pc4.metric("💧 SWEEPS", int((sweep_series != "NONE").sum()))
+
+        display_cols = [
+            "Symbol", "LTP", "PIN SIGNAL", "PIN SCORE", "LIQUIDITY", "SWEEP",
+            "REVERSAL", "EQUAL HIGH", "EQUAL LOW", "BIG MOVEMENT", "BIG MOVE SCORE",
+            "STRUCTURE", "5M TREND", "15M TREND", "1H TREND", "RVOL", "RSI",
+            "PRESSURE", "AI CONFIDENCE %", "AI SIGNAL", "REASON"
+        ]
+        display_cols = [c for c in display_cols if c in pin_df.columns]
+        st.dataframe(pin_df[display_cols], use_container_width=True, height=500)
+
+        try:
+            st.download_button(
+                "📥 DOWNLOAD PIN RULES EXCEL",
+                _format_excel_output(pin_df, "PIN_RULES"),
+                f"PIN_RULES_{_now_ist().strftime('%Y%m%d_%H%M')}.xlsx",
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="pin_excel",
+                use_container_width=True,
+            )
+        except Exception as e:
+            st.error(f"❌ PIN Excel export failed: {str(e)[:150]}")
+    elif "pin_df" in st.session_state:
+        st.warning("⚠️ No stocks matched the selected PIN rules/score.")
+
+    errors = st.session_state.get("pin_errors", [])
+    if errors:
+        with st.expander(f"⚠️ {len(errors)} symbols could not be analyzed", expanded=False):
+            for err in errors[:100]:
+                st.write(f"• {err}")
+            if len(errors) > 100:
+                st.caption(f"Showing first 100 of {len(errors)} errors.")
+
 # ════════════════════════════════════════════════════════════════════════════════
 # MAIN APP - V17 WITH NEW MOMENTUM MOVERS TAB
 # ════════════════════════════════════════════════════════════════════════════════
@@ -2845,7 +3179,8 @@ def show_scanner(fyers) -> None:
         "📈 SWING (GOLDEN/DEATH CROSS)",
         "🧠 ADDITIONAL ANALYSIS",
         "📊 MARKET DASHBOARD",
-        "⚙️ SETTINGS"
+        "⚙️ SETTINGS",
+        "📌 PIN RULES"
     ])
     
     # ════════════════════════════════════════════════════════════════════════════════
@@ -3622,6 +3957,12 @@ def show_scanner(fyers) -> None:
         **Timeframes:** 5M, 15M, 1H, Daily
         **Universes:** NSE Equities + F&O Stocks
         """)
+    
+    # ════════════════════════════════════════════════════════════════════════════════
+    # TAB 9: PIN RULES — ADDITIONAL ONLY
+    # ════════════════════════════════════════════════════════════════════════════════
+    with tabs[9]:
+        _show_pin_rules_tab(fyers, all_symbols, fo_symbols)
     
     gc.collect()
 
