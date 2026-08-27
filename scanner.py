@@ -2943,60 +2943,136 @@ def _pin_display_symbol(symbol: Any) -> str:
     return raw
 
 
-def _run_pin_scan(fyers, universe, pin_min=PIN_MIN_CONFIDENCE, pin_mode="ALL"):
-    """Run PIN analysis on the complete selected universe; independent from main scanners."""
-    rows = []
-    errors = []
 
-    # Always use the complete selected universe.
-    # Normalize and de-duplicate symbols so NSE total stocks can be scanned.
-    symbols = []
+# ────────────────────────────────────────────────────────────────────────────────
+# FAST TWO-STAGE PIN SCANNER
+# Stage 1: ALL stocks -> 5M analysis only
+# Stage 2: only promising candidates -> 15M + 1H confirmation
+# This keeps PIN independent and avoids ~2 extra requests for weak stocks.
+# ────────────────────────────────────────────────────────────────────────────────
+PIN_FAST_WORKERS = 8
+PIN_FAST_BATCH_SIZE = 80
+PIN_CANDIDATE_SCORE = 40.0
+PIN_CANDIDATE_MIN_RVOL = 1.05
+
+
+def _pin_stage1_candidate(fyers, symbol):
+    """Cheap first-pass filter using only 5-minute data."""
+    display_symbol = _pin_display_symbol(symbol)
+    try:
+        a5 = analyze_timeframe(fyers, symbol, "5")
+        if a5.get("status") != "OK" or a5.get("df") is None or len(a5.get("df")) < 30:
+            return None, f"{display_symbol}: 5M unavailable"
+
+        data5 = a5.get("data", {}) or {}
+        pin = calculate_pin_rules(a5["df"], data5, {}, {})
+        score = float(pin.get("PIN SCORE", 0) or 0)
+        sweep = str(pin.get("SWEEP", "NONE")).upper()
+        reversal = str(pin.get("REVERSAL", "NONE")).upper()
+        big_score = float(pin.get("BIG MOVE SCORE", 0) or 0)
+        rvol = float(data5.get("rvol", 0) or 0)
+
+        # Keep candidates with objective evidence; final decision happens in stage 2.
+        keep = (
+            score >= PIN_CANDIDATE_SCORE
+            or sweep != "NONE"
+            or reversal != "NONE"
+            or big_score >= PIN_BIGMOVE_MIN_SCORE
+            or rvol >= PIN_CANDIDATE_MIN_RVOL
+        )
+        if not keep:
+            return None, None
+
+        return {
+            "symbol": symbol,
+            "display": display_symbol,
+            "a5": a5,
+            "stage1_score": score,
+        }, None
+    except Exception as e:
+        return None, f"{display_symbol}: {type(e).__name__}: {str(e)[:100]}"
+
+
+def _pin_stage2_confirm(fyers, candidate):
+    """Fetch higher timeframes only for stage-1 candidates."""
+    symbol = candidate["symbol"]
+    display_symbol = candidate["display"]
+    try:
+        a15 = analyze_timeframe(fyers, symbol, "15")
+        a1h = analyze_timeframe(fyers, symbol, "60")
+
+        a5 = candidate["a5"]
+        pin = calculate_pin_rules(
+            a5.get("df"),
+            a5.get("data", {}) or {},
+            a15.get("data", {}) if a15.get("status") == "OK" else {},
+            a1h.get("data", {}) if a1h.get("status") == "OK" else {},
+        )
+        pin["Symbol"] = display_symbol
+        pin["LTP"] = (a5.get("data", {}) or {}).get("close", "N/A")
+        return pin, None
+    except Exception as e:
+        return None, f"{display_symbol}: {type(e).__name__}: {str(e)[:100]}"
+
+
+def _run_pin_scan(fyers, universe, pin_min=PIN_MIN_CONFIDENCE, pin_mode="ALL"):
+    """Fast full-universe PIN scan with a 5M prefilter and parallel workers."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
     seen = set()
+    symbols = []
     for symbol in list(universe or []):
         normalized = _pin_normalize_symbol(symbol)
         if normalized and normalized not in seen:
             seen.add(normalized)
             symbols.append(normalized)
 
-    progress = st.progress(0.0)
     total = len(symbols)
+    if total == 0:
+        return pd.DataFrame(), ["No valid symbols available"]
 
-    try:
-        for n, symbol in enumerate(symbols, 1):
-            display_symbol = _pin_display_symbol(symbol)
-            fyers_symbol = _pin_normalize_symbol(symbol)
+    errors = []
+    candidates = []
+    progress = st.progress(0.0)
+    status = st.empty()
 
-            if not fyers_symbol:
-                errors.append(f"{symbol}: invalid symbol")
-                progress.progress(n / max(total, 1))
-                continue
+    # STAGE 1: all stocks, one timeframe only
+    done = 0
+    with ThreadPoolExecutor(max_workers=PIN_FAST_WORKERS) as executor:
+        futures = {
+            executor.submit(_pin_stage1_candidate, fyers, symbol): symbol
+            for symbol in symbols
+        }
+        for future in as_completed(futures):
+            candidate, error = future.result()
+            if candidate is not None:
+                candidates.append(candidate)
+            if error:
+                errors.append(error)
+            done += 1
+            progress.progress(done / total, text=f"Stage 1/2: {done:,}/{total:,} stocks | Candidates: {len(candidates):,}")
 
-            try:
-                a5 = analyze_timeframe(fyers, fyers_symbol, "5")
-                if a5.get("status") != "OK" or a5.get("df") is None or len(a5.get("df")) < 30:
-                    errors.append(f"{display_symbol}: 5M data unavailable/insufficient")
-                    progress.progress(n / max(total, 1))
-                    continue
+    # STAGE 2: candidates only, fetch 15M + 1H
+    rows = []
+    candidate_total = len(candidates)
+    if candidate_total:
+        done = 0
+        with ThreadPoolExecutor(max_workers=PIN_FAST_WORKERS) as executor:
+            futures = {
+                executor.submit(_pin_stage2_confirm, fyers, candidate): candidate
+                for candidate in candidates
+            }
+            for future in as_completed(futures):
+                row, error = future.result()
+                if row is not None:
+                    rows.append(row)
+                if error:
+                    errors.append(error)
+                done += 1
+                progress.progress(done / candidate_total, text=f"Stage 2/2: {done:,}/{candidate_total:,} candidates | Matches: {len(rows):,}")
 
-                a15 = analyze_timeframe(fyers, fyers_symbol, "15")
-                a1h = analyze_timeframe(fyers, fyers_symbol, "60")
-
-                pin = calculate_pin_rules(
-                    a5.get("df"),
-                    a5.get("data", {}),
-                    a15.get("data", {}),
-                    a1h.get("data", {})
-                )
-                pin["Symbol"] = display_symbol
-                pin["LTP"] = a5.get("data", {}).get("close", "N/A")
-
-                rows.append(pin)
-            except Exception as e:
-                errors.append(f"{display_symbol}: {type(e).__name__}: {str(e)[:120]}")
-
-            progress.progress(n / max(total, 1))
-    finally:
-        progress.empty()
+    progress.empty()
+    status.empty()
 
     result = pd.DataFrame(rows)
     if result.empty:
@@ -3005,19 +3081,19 @@ def _run_pin_scan(fyers, universe, pin_min=PIN_MIN_CONFIDENCE, pin_mode="ALL"):
     result["__score"] = pd.to_numeric(result.get("PIN SCORE", 0), errors="coerce").fillna(0)
     result = result[result["__score"] >= float(pin_min)].copy()
 
-    signal_text = result["PIN SIGNAL"].astype(str).str.upper()
-    if pin_mode == "BUY ONLY":
-        result = result[signal_text.str.contains("BUY", na=False)]
-    elif pin_mode == "SELL ONLY":
-        result = result[signal_text.str.contains("SELL", na=False)]
-    elif pin_mode == "STRONG ONLY":
-        result = result[signal_text.str.contains("STRONG", na=False)]
+    if not result.empty:
+        signal_text = result["PIN SIGNAL"].astype(str).str.upper()
+        if pin_mode == "BUY ONLY":
+            result = result[signal_text.str.contains("BUY", na=False)]
+        elif pin_mode == "SELL ONLY":
+            result = result[signal_text.str.contains("SELL", na=False)]
+        elif pin_mode == "STRONG ONLY":
+            result = result[signal_text.str.contains("STRONG", na=False)]
 
     result = result.drop(columns=["__score"], errors="ignore")
     if not result.empty and "PIN SCORE" in result.columns:
         result = result.sort_values("PIN SCORE", ascending=False).reset_index(drop=True)
     return result, errors
-
 
 def _show_pin_rules_tab(fyers, all_symbols=None, fo_symbols=None) -> None:
     """PIN Rules scanner. Runs independently from the main scanners."""
