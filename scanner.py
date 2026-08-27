@@ -2923,8 +2923,9 @@ def calculate_pin_rules(df_5m: pd.DataFrame, data_5m: Dict[str, Any], data_15m: 
         return out
 
 
-def _show_pin_rules_tab(fyers) -> None:
+def _show_pin_rules_tab(fyers, all_symbols=None, fo_symbols=None) -> None:
     st.markdown("### 📌 PIN RULES — Liquidity + Reversal + Big Movement")
+    st.markdown("#### ▶ PIN RULES SCANNER")
     st.caption("Additional analysis only. Existing Scanner tabs and scanner logic are not modified.")
 
     source = st.selectbox("Source", ["NSE Stocks", "F&O Stocks"], key="pin_source")
@@ -2940,8 +2941,45 @@ def _show_pin_rules_tab(fyers) -> None:
         **Big Movement:** existing consolidation-breakout + candle + RVOL + structure engine.
         """)
 
+    # RUN PIN RULES is always visible and active. If the main Scanner has not
+    # been run yet, this button performs a PIN-only scan of the selected universe.
+    # Existing Scanner tabs and their logic remain untouched.
     if base_df is None or base_df.empty:
-        st.info(f"👈 Run the {source} Scanner first, then open this tab.")
+        universe = all_symbols if source == "NSE Stocks" else fo_symbols
+        universe = list(universe or [])[:PIN_MAX_SCAN]
+        if not universe:
+            st.warning(f"No {source} symbols are available.")
+            return
+        st.info(f"▶ PIN Rules can run independently. Selected universe: {len(universe)} stocks.")
+        if st.button("▶ RUN PIN RULES SCANNER", key="pin_run_empty", type="primary", use_container_width=True):
+            rows = []; errors = []
+            progress = st.progress(0.0)
+            total = len(universe)
+            for n, symbol in enumerate(universe, 1):
+                fyers_symbol = symbol if str(symbol).startswith("NSE:") else f"NSE:{symbol}-EQ"
+                try:
+                    a5 = analyze_timeframe(fyers, fyers_symbol, "5")
+                    a15 = analyze_timeframe(fyers, fyers_symbol, "15")
+                    a1h = analyze_timeframe(fyers, fyers_symbol, "60")
+                    if a5.get("status") != "OK" or a5.get("df") is None:
+                        errors.append(f"{symbol}: 5M data unavailable")
+                    else:
+                        pin = calculate_pin_rules(a5.get("df"), a5.get("data", {}), a15.get("data", {}), a1h.get("data", {}))
+                        pin["Symbol"] = str(symbol).replace("NSE:", "").replace("-EQ", "")
+                        pin["LTP"] = a5.get("data", {}).get("close", "N/A")
+                        rows.append(pin)
+                except Exception as e:
+                    errors.append(f"{symbol}: {type(e).__name__}")
+                progress.progress(n / max(total, 1))
+            progress.empty()
+            result = pd.DataFrame(rows)
+            if not result.empty:
+                result["__score"] = pd.to_numeric(result["PIN SCORE"], errors="coerce").fillna(0)
+                result = result[result["__score"] >= PIN_MIN_CONFIDENCE].drop(columns=["__score"], errors="ignore")
+            st.session_state["pin_df"] = result
+            st.session_state["pin_errors"] = errors
+            st.rerun()
+        st.caption("This button runs PIN Rules directly; you do not need to run the old Scanner first.")
         return
 
     max_scan = min(PIN_MAX_SCAN, len(base_df))
@@ -3833,7 +3871,7 @@ def show_scanner(fyers) -> None:
     # TAB 9: PIN RULES — ADDITIONAL ONLY
     # ════════════════════════════════════════════════════════════════════════════════
     with tabs[9]:
-        _show_pin_rules_tab(fyers)
+        _show_pin_rules_tab(fyers, all_symbols, fo_symbols)
     
     gc.collect()
 
