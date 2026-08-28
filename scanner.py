@@ -247,16 +247,6 @@ MOMENTUM_MIN_BODY_PCT = 20
 MOMENTUM_DISPLAY_COUNT = 10
 
 # ════════════════════════════════════════════════════════════════════════════════
-# LIVE EXCHANGE MARKET DEPTH / ORDER FLOW
-# Uses FYERS Market Depth snapshots (real bid/ask book), not TradingView footprint.
-# ════════════════════════════════════════════════════════════════════════════════
-DEPTH_SCAN_LIMIT_DEFAULT = 30
-DEPTH_MIN_IMBALANCE = 15.0
-DEPTH_STRONG_IMBALANCE = 35.0
-DEPTH_BIG_QTY_MULTIPLIER = 2.0
-DEPTH_TOP_LEVELS = 5
-
-# ════════════════════════════════════════════════════════════════════════════════
 # 15-MIN REVERSAL SCANNER CONSTANTS (ORIGINAL)
 # ════════════════════════════════════════════════════════════════════════════════
 REVERSAL_RESOLUTION = "15"
@@ -3105,335 +3095,6 @@ def _run_pin_scan(fyers, universe, pin_min=PIN_MIN_CONFIDENCE, pin_mode="ALL"):
         result = result.sort_values("PIN SCORE", ascending=False).reset_index(drop=True)
     return result, errors
 
-# ════════════════════════════════════════════════════════════════════════════════
-# LIVE EXCHANGE ORDER BOOK ENGINE
-# ════════════════════════════════════════════════════════════════════════════════
-def _safe_float(value, default=0.0):
-    try:
-        if value is None or value == "":
-            return float(default)
-        return float(value)
-    except Exception:
-        return float(default)
-
-
-def _depth_rows(payload, key):
-    """Return normalized FYERS depth rows for bids/asks."""
-    rows = payload.get(key, []) if isinstance(payload, dict) else []
-    if not isinstance(rows, list):
-        return []
-    out = []
-    for row in rows[:DEPTH_TOP_LEVELS]:
-        if isinstance(row, dict):
-            price = _safe_float(row.get("price", row.get("p", 0)))
-            qty = _safe_float(row.get("volume", row.get("qty", row.get("v", 0))))
-            orders = _safe_float(row.get("ord", row.get("orders", row.get("o", 0))))
-        elif isinstance(row, (list, tuple)) and len(row) >= 2:
-            price = _safe_float(row[0])
-            qty = _safe_float(row[1])
-            orders = _safe_float(row[2]) if len(row) > 2 else 0.0
-        else:
-            continue
-        if price > 0 and qty >= 0:
-            out.append({"price": price, "qty": qty, "orders": orders})
-    return out
-
-
-def fetch_live_market_depth(fyers, symbol: str) -> Dict[str, Any]:
-    """Fetch one real FYERS exchange market-depth snapshot.
-
-    This is NOT simulated order flow and NOT TradingView footprint data.
-    FYERS depth returns bid/ask levels and quantities for the symbol.
-    """
-    empty = {
-        "status": "DATA_UNAVAILABLE", "symbol": symbol,
-        "ltp": None, "best_bid": None, "best_ask": None,
-        "bid_qty": 0.0, "ask_qty": 0.0, "total_buy_qty": 0.0,
-        "total_sell_qty": 0.0, "spread": None, "spread_pct": None,
-        "depth_imbalance": 0.0, "buy_score": 0.0, "sell_score": 0.0,
-        "direction": "WAIT", "strength": 0.0, "pin": "WAIT",
-        "reason": "No live depth data", "bids": [], "asks": []
-    }
-    try:
-        if not isinstance(symbol, str) or not _VALID_EQ_SYMBOL_RE.match(symbol):
-            empty["reason"] = "Invalid NSE equity symbol"
-            return empty
-
-        resp = fyers.depth({"symbol": symbol, "ohlcv_flag": "1"})
-        if not isinstance(resp, dict):
-            empty["reason"] = "Invalid FYERS depth response"
-            return empty
-
-        # SDK responses normally expose the depth object under `d`.
-        data = resp.get("d", resp)
-        if isinstance(data, list):
-            data = data[0] if data else {}
-        if not isinstance(data, dict):
-            data = {}
-
-        # Some wrappers put the actual object under `data`.
-        if isinstance(data.get("data"), dict):
-            data = data["data"]
-
-        bids = _depth_rows(data, "bids")
-        asks = _depth_rows(data, "ask")
-        if not asks:
-            asks = _depth_rows(data, "asks")
-
-        ltp = _safe_float(data.get("ltp", data.get("lp", 0)))
-        best_bid = bids[0]["price"] if bids else _safe_float(data.get("bid", 0))
-        best_ask = asks[0]["price"] if asks else _safe_float(data.get("ask", 0))
-
-        bid_qty_levels = sum(x["qty"] for x in bids)
-        ask_qty_levels = sum(x["qty"] for x in asks)
-        total_buy_qty = _safe_float(data.get("totalbuyqty", data.get("total_buy_qty", bid_qty_levels)))
-        total_sell_qty = _safe_float(data.get("totalsellqty", data.get("total_sell_qty", ask_qty_levels)))
-
-        # Prefer the exchange totals when present; otherwise use the five visible levels.
-        buy_base = total_buy_qty if total_buy_qty > 0 else bid_qty_levels
-        sell_base = total_sell_qty if total_sell_qty > 0 else ask_qty_levels
-        total = buy_base + sell_base
-        imbalance = ((buy_base - sell_base) / total * 100.0) if total > 0 else 0.0
-
-        spread = (best_ask - best_bid) if best_bid > 0 and best_ask > 0 else None
-        spread_pct = (spread / ltp * 100.0) if spread is not None and ltp > 0 else None
-
-        # Depth-only direction. It intentionally does not use old candles.
-        buy_score = 50.0 + max(0.0, imbalance) * 0.9
-        sell_score = 50.0 + max(0.0, -imbalance) * 0.9
-        buy_score = min(100.0, buy_score)
-        sell_score = min(100.0, sell_score)
-
-        if imbalance >= DEPTH_STRONG_IMBALANCE:
-            direction = "BUY"
-            strength = min(100.0, 50.0 + imbalance)
-        elif imbalance <= -DEPTH_STRONG_IMBALANCE:
-            direction = "SELL"
-            strength = min(100.0, 50.0 + abs(imbalance))
-        elif imbalance >= DEPTH_MIN_IMBALANCE:
-            direction = "BUY"
-            strength = min(100.0, 50.0 + imbalance * 0.8)
-        elif imbalance <= -DEPTH_MIN_IMBALANCE:
-            direction = "SELL"
-            strength = min(100.0, 50.0 + abs(imbalance) * 0.8)
-        else:
-            direction = "WAIT"
-            strength = 50.0
-
-        pin = "WAIT"
-        if direction == "BUY" and imbalance >= DEPTH_STRONG_IMBALANCE:
-            pin = "🟢 BUY PIN"
-        elif direction == "SELL" and imbalance <= -DEPTH_STRONG_IMBALANCE:
-            pin = "🔴 SELL PIN"
-
-        reasons = []
-        if buy_base > sell_base:
-            reasons.append(f"Bid depth +{imbalance:.1f}%")
-        elif sell_base > buy_base:
-            reasons.append(f"Ask depth {imbalance:.1f}%")
-        if best_bid and best_ask:
-            reasons.append(f"Spread {spread:.2f}" if spread is not None else "Best bid/ask")
-        if not bids or not asks:
-            reasons.append("partial depth")
-
-        return {
-            "status": "OK" if bids or asks or ltp > 0 else "DATA_UNAVAILABLE",
-            "symbol": symbol,
-            "ltp": ltp if ltp > 0 else None,
-            "best_bid": best_bid if best_bid > 0 else None,
-            "best_ask": best_ask if best_ask > 0 else None,
-            "bid_qty": bid_qty_levels,
-            "ask_qty": ask_qty_levels,
-            "total_buy_qty": buy_base,
-            "total_sell_qty": sell_base,
-            "spread": spread,
-            "spread_pct": spread_pct,
-            "depth_imbalance": round(imbalance, 2),
-            "buy_score": round(buy_score, 1),
-            "sell_score": round(sell_score, 1),
-            "direction": direction,
-            "strength": round(strength, 1),
-            "pin": pin,
-            "reason": " | ".join(reasons) if reasons else "Live depth snapshot",
-            "bids": bids,
-            "asks": asks,
-        }
-    except Exception as e:
-        empty["status"] = "ERROR"
-        empty["reason"] = f"Depth error: {type(e).__name__}: {str(e)[:120]}"
-        return empty
-
-
-def _depth_candidate_symbols(fyers, all_symbols, limit=30):
-    """Prefer current live-movement candidates, otherwise rank current quotes."""
-    limit = max(1, min(int(limit), 50))
-    mdf = st.session_state.get("momentum_df")
-    if isinstance(mdf, pd.DataFrame) and not mdf.empty and "Symbol" in mdf.columns:
-        candidates = []
-        seen = set()
-        for _, row in mdf.sort_values("SCORE", ascending=False).iterrows():
-            raw = str(row.get("Symbol", "")).strip().upper()
-            sym = raw if raw.startswith("NSE:") else f"NSE:{raw}-EQ"
-            if _VALID_EQ_SYMBOL_RE.match(sym) and sym not in seen:
-                seen.add(sym)
-                candidates.append(sym)
-            if len(candidates) >= limit:
-                return candidates
-
-    # Live quotes are current snapshots and do not require historical candles.
-    universe = list(all_symbols or [])[:min(len(all_symbols or []), 50)]
-    if not universe:
-        return []
-    try:
-        qresp = fyers.quotes({"symbols": ",".join(universe)})
-        rows = qresp.get("d", []) if isinstance(qresp, dict) else []
-        ranked = []
-        for row in rows if isinstance(rows, list) else []:
-            if not isinstance(row, dict):
-                continue
-            sym = str(row.get("n", row.get("symbol", ""))).strip().upper()
-            v = row.get("v", row)
-            if not isinstance(v, dict):
-                continue
-            chp = _safe_float(v.get("chp", v.get("change_pct", 0)))
-            if sym:
-                ranked.append((abs(chp), sym))
-        ranked.sort(reverse=True)
-        out = []
-        seen = set()
-        for _, sym in ranked:
-            if _VALID_EQ_SYMBOL_RE.match(sym) and sym not in seen:
-                seen.add(sym)
-                out.append(sym)
-            if len(out) >= limit:
-                break
-        return out or universe[:limit]
-    except Exception:
-        return universe[:limit]
-
-
-def run_live_depth_scan(fyers, symbols, max_workers=6):
-    """Fetch real FYERS market-depth snapshots for a small candidate universe."""
-    symbols = _validate_symbols(symbols)
-    rows, errors = [], []
-    if not symbols:
-        return pd.DataFrame(), ["No valid symbols for depth scan"]
-
-    progress = st.progress(0.0, text=f"Live Order Book 0 / {len(symbols)}")
-    done = 0
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {executor.submit(fetch_live_market_depth, fyers, s): s for s in symbols}
-        for future in as_completed(futures):
-            sym = futures[future]
-            try:
-                d = future.result()
-                if d.get("status") == "OK":
-                    ticker = sym.replace("NSE:", "").replace("-EQ", "")
-                    rows.append({
-                        "Symbol": ticker,
-                        "LTP": d.get("ltp"),
-                        "BEST BID": d.get("best_bid"),
-                        "BEST ASK": d.get("best_ask"),
-                        "BID QTY (5L)": round(d.get("bid_qty", 0), 0),
-                        "ASK QTY (5L)": round(d.get("ask_qty", 0), 0),
-                        "TOTAL BUY QTY": round(d.get("total_buy_qty", 0), 0),
-                        "TOTAL SELL QTY": round(d.get("total_sell_qty", 0), 0),
-                        "DEPTH IMBALANCE %": d.get("depth_imbalance", 0),
-                        "BUY SCORE": d.get("buy_score", 0),
-                        "SELL SCORE": d.get("sell_score", 0),
-                        "NEXT DIRECTION": d.get("direction", "WAIT"),
-                        "DIRECTION STRENGTH %": d.get("strength", 0),
-                        "PIN SIGNAL": d.get("pin", "WAIT"),
-                        "SPREAD": d.get("spread"),
-                        "SPREAD %": d.get("spread_pct"),
-                        "REASON": d.get("reason", ""),
-                    })
-                else:
-                    errors.append(f"{sym}: {d.get('reason', 'No depth data')}")
-            except Exception as e:
-                errors.append(f"{sym}: {type(e).__name__}: {str(e)[:120]}")
-            done += 1
-            progress.progress(done / max(len(symbols), 1), text=f"Live Order Book {done} / {len(symbols)}")
-    progress.empty()
-
-    df = pd.DataFrame(rows)
-    if not df.empty:
-        df["__sort"] = pd.to_numeric(df["DIRECTION STRENGTH %"], errors="coerce").fillna(0)
-        df = df.sort_values("__sort", ascending=False).drop(columns=["__sort"]).reset_index(drop=True)
-    return df, errors
-
-
-def _show_live_order_flow_tab(fyers, all_symbols):
-    """Actual FYERS exchange depth tab: current bid/ask book -> direction -> PIN."""
-    st.markdown("### 📖 LIVE EXCHANGE ORDER BOOK — NEXT DIRECTION + PIN")
-    st.caption("Actual FYERS market-depth snapshot: bid/ask quantities and 5 visible depth levels. No TradingView footprint and no simulated order book.")
-
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        depth_limit = st.number_input(
-            "Depth candidates", min_value=5, max_value=50,
-            value=DEPTH_SCAN_LIMIT_DEFAULT, step=5, key="depth_scan_limit"
-        )
-    with c2:
-        st.metric("Depth API", "FYERS LIVE")
-    with c3:
-        st.metric("Max / scan", 50)
-
-    candidates = _depth_candidate_symbols(fyers, all_symbols, depth_limit)
-    if st.session_state.get("momentum_df") is not None and not st.session_state.get("momentum_df").empty:
-        st.info(f"Using current movement candidates first: {len(candidates)} symbols. This avoids scanning the entire NSE depth API one-by-one.")
-    else:
-        st.info(f"No movement list found, so current quote movers are used as depth candidates: {len(candidates)} symbols.")
-
-    if st.button("📖 SCAN LIVE EXCHANGE ORDER BOOK", key="depth_run", type="primary", use_container_width=True):
-        with st.spinner("Reading live FYERS bid/ask market depth…"):
-            depth_df, depth_errors = run_live_depth_scan(fyers, candidates)
-        st.session_state["depth_df"] = depth_df
-        st.session_state["depth_errors"] = depth_errors
-        st.session_state["depth_scanned_at"] = _generated_timestamp()
-
-    depth_df = st.session_state.get("depth_df")
-    if isinstance(depth_df, pd.DataFrame) and not depth_df.empty:
-        buy_df = depth_df[depth_df["NEXT DIRECTION"] == "BUY"].copy()
-        sell_df = depth_df[depth_df["NEXT DIRECTION"] == "SELL"].copy()
-        pins = depth_df[depth_df["PIN SIGNAL"].astype(str).str.contains("PIN", na=False)].copy()
-
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("DEPTH STOCKS", len(depth_df))
-        m2.metric("🟢 BUY", len(buy_df))
-        m3.metric("🔴 SELL", len(sell_df))
-        m4.metric("📌 PINS", len(pins))
-        st.caption(f"Last depth scan: {st.session_state.get('depth_scanned_at', 'N/A')}")
-
-        st.markdown("### 🎯 NEXT DIRECTION — LIVE DEPTH")
-        st.dataframe(
-            depth_df[[
-                "Symbol", "LTP", "BEST BID", "BEST ASK", "TOTAL BUY QTY", "TOTAL SELL QTY",
-                "DEPTH IMBALANCE %", "BUY SCORE", "SELL SCORE", "NEXT DIRECTION",
-                "DIRECTION STRENGTH %", "PIN SIGNAL", "SPREAD %", "REASON"
-            ]],
-            use_container_width=True, height=500
-        )
-
-        if not pins.empty:
-            st.markdown("### 📌 LIVE DEPTH PIN SIGNALS")
-            st.dataframe(
-                pins[["Symbol", "LTP", "TOTAL BUY QTY", "TOTAL SELL QTY", "DEPTH IMBALANCE %", "NEXT DIRECTION", "DIRECTION STRENGTH %", "PIN SIGNAL", "REASON"]],
-                use_container_width=True, height=300
-            )
-
-        _excel_download_button(depth_df, "LIVE_ORDER_BOOK", "depth_excel", label="📥 DOWNLOAD LIVE ORDER BOOK EXCEL")
-    elif "depth_df" in st.session_state:
-        st.warning("No live depth rows were returned. Check FYERS market-data permissions and market hours.")
-    else:
-        st.info("👈 First run LIVE MOVEMENT, then scan LIVE EXCHANGE ORDER BOOK for the current bid/ask pressure.")
-
-    errors = st.session_state.get("depth_errors", [])
-    if errors:
-        with st.expander(f"⚠️ Depth API errors ({len(errors)})", expanded=False):
-            st.dataframe(pd.DataFrame({"Error": errors}), use_container_width=True)
-
-
 def _show_pin_rules_tab(fyers, all_symbols=None, fo_symbols=None) -> None:
     """PIN Rules scanner. Runs independently from the main scanners."""
     st.markdown("### 📌 PIN RULES — Liquidity + Reversal + Big Movement")
@@ -3579,7 +3240,6 @@ def show_scanner(fyers) -> None:
         "🇮🇳 NSE STOCKS",
         "📊 F&O STOCKS",
         "⚡ MOMENTUM MOVERS",
-        "📖 LIVE ORDER BOOK",
         "⚡ LIVE INTRADAY",
         "🔥 STRONG SIGNALS",
         "📈 SWING (GOLDEN/DEATH CROSS)",
@@ -3884,15 +3544,9 @@ def show_scanner(fyers) -> None:
             with st.expander(f"⚠️ API / scan errors ({len(st.session_state['momentum_errors'])})"):
                 st.dataframe(pd.DataFrame({"Error": st.session_state["momentum_errors"]}), use_container_width=True)
     # ════════════════════════════════════════════════════════════════════════════════
-    # TAB 3: LIVE EXCHANGE ORDER BOOK
+    # TAB 3: LIVE INTRADAY
     # ════════════════════════════════════════════════════════════════════════════════
     with tabs[3]:
-        _show_live_order_flow_tab(fyers, all_symbols)
-
-    # ════════════════════════════════════════════════════════════════════════════════
-    # TAB 4: LIVE INTRADAY
-    # ════════════════════════════════════════════════════════════════════════════════
-    with tabs[4]:
         st.markdown("### ⚡ Live Intraday Scanner\nReal-time multi-timeframe analysis (5M, 15M, 1H)")
         
         col1, col2 = st.columns(2)
@@ -3955,9 +3609,9 @@ def show_scanner(fyers) -> None:
             st.info("👈 Click 'SCAN LIVE INTRADAY' to fetch data")
     
     # ════════════════════════════════════════════════════════════════════════════════
-    # TAB 5: STRONG SIGNALS
+    # TAB 4: STRONG SIGNALS
     # ════════════════════════════════════════════════════════════════════════════════
-    with tabs[5]:
+    with tabs[4]:
         st.markdown("### 🔥 Strong Signals Only\nHigh-confidence setups (≥70%)")
         strong_source = st.radio("Source", ["NSE Stocks", "F&O Stocks"], horizontal=True, key="strong_source")
 
@@ -4014,9 +3668,9 @@ def show_scanner(fyers) -> None:
             st.info(f"👈 Run '{strong_source}' scanner first")
     
     # ════════════════════════════════════════════════════════════════════════════════
-    # TAB 6: SWING (GOLDEN CROSS / DEATH CROSS)
+    # TAB 5: SWING (GOLDEN CROSS / DEATH CROSS)
     # ════════════════════════════════════════════════════════════════════════════════
-    with tabs[6]:
+    with tabs[5]:
         st.markdown("### 📈 Swing Analysis - Golden Cross & Death Cross Detection\nDaily EMA50/EMA200 crossovers")
         
         col1, col2 = st.columns([3, 1])
@@ -4098,9 +3752,9 @@ def show_scanner(fyers) -> None:
             st.info("👈 Click 'DETECT CROSSOVERS' to start swing analysis")
     
     # ════════════════════════════════════════════════════════════════════════════════
-    # TAB 7: ADDITIONAL ANALYSIS
+    # TAB 6: ADDITIONAL ANALYSIS
     # ════════════════════════════════════════════════════════════════════════════════
-    with tabs[7]:
+    with tabs[6]:
         st.markdown("### 🧠 Additional Analysis - Deep Dive on Single Stock")
         
         col1, col2 = st.columns(2)
@@ -4251,9 +3905,9 @@ def show_scanner(fyers) -> None:
                     st.metric("Options Bias", opt.get("options_bias", "N/A"))
     
     # ════════════════════════════════════════════════════════════════════════════════
-    # TAB 8: MARKET DASHBOARD
+    # TAB 7: MARKET DASHBOARD
     # ════════════════════════════════════════════════════════════════════════════════
-    with tabs[8]:
+    with tabs[7]:
         st.markdown("### 📊 Market Dashboard - Statistics & Sentiment")
         dashboard_source = st.radio("Data Source", ["NSE Stocks", "F&O Stocks"], horizontal=True, key="dash_source")
 
@@ -4327,9 +3981,9 @@ def show_scanner(fyers) -> None:
             st.info(f"👈 Run '{dashboard_source}' scanner first")
     
     # ════════════════════════════════════════════════════════════════════════════════
-    # TAB 9: SETTINGS
+    # TAB 8: SETTINGS
     # ════════════════════════════════════════════════════════════════════════════════
-    with tabs[9]:
+    with tabs[8]:
         st.markdown("### ⚙️ Scanner Settings & Configuration")
         
         st.markdown("#### 🎯 Signal Filtering")
@@ -4363,8 +4017,7 @@ def show_scanner(fyers) -> None:
         - ✅ Options chain analysis (F&O)
         - ✅ Golden Cross / Death Cross detection
         - ✅ **⚡ NEW: MOMENTUM MOVERS Scanner**
-        - ✅ **📖 NEW: LIVE FYERS EXCHANGE ORDER BOOK**
-        - ✅ Next Candle Bias + LIVE Depth Direction + BUY/SELL PIN
+        - ✅ Next Candle Bias prediction
         
         **Data Source:** Fyers Live API
         **Timeframes:** 5M, 15M, 1H, Daily
@@ -4372,9 +4025,9 @@ def show_scanner(fyers) -> None:
         """)
     
     # ════════════════════════════════════════════════════════════════════════════════
-    # TAB 10: PIN RULES — ADDITIONAL ONLY
+    # TAB 9: PIN RULES — ADDITIONAL ONLY
     # ════════════════════════════════════════════════════════════════════════════════
-    with tabs[10]:
+    with tabs[9]:
         _show_pin_rules_tab(fyers, all_symbols, fo_symbols)
     
     gc.collect()
