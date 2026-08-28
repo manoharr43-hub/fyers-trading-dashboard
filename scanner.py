@@ -3215,12 +3215,39 @@ def show_scanner(fyers) -> None:
     """Streamlit main app - NSE AI PRO V17 with MOMENTUM MOVERS"""
     
     try:
-        st.set_page_config(page_title="NSE AI PRO V17", layout="wide")
+        st.set_page_config(page_title="NSE AI PRO V18 | Professional Scanner", layout="wide")
     except:
         pass
+
+    st.markdown("""
+    <style>
+    .block-container {padding-top:1.2rem; padding-bottom:2rem; max-width:1600px;}
+    .pro-hero {padding:18px 22px; border-radius:16px; margin-bottom:14px;
+        background:linear-gradient(135deg,rgba(30,41,59,.98),rgba(15,23,42,.98));
+        border:1px solid rgba(148,163,184,.20); box-shadow:0 8px 28px rgba(0,0,0,.18);}
+    .pro-hero h2 {margin:0; font-size:1.55rem;}
+    .pro-hero p {margin:6px 0 0; opacity:.78;}
+    .pro-badge {display:inline-block; padding:4px 9px; border-radius:999px;
+        font-size:.72rem; font-weight:700; letter-spacing:.04em;
+        background:rgba(34,197,94,.14); border:1px solid rgba(34,197,94,.28);}
+    div[data-testid="stMetric"] {background:rgba(100,116,139,.07);
+        border:1px solid rgba(148,163,184,.16); border-radius:12px; padding:10px 12px;}
+    button[kind="primary"] {border-radius:10px; font-weight:700;}
+    .stTabs [data-baseweb="tab-list"] {gap:5px; overflow-x:auto;}
+    .stTabs [data-baseweb="tab"] {padding:8px 12px; border-radius:9px;}
+    div[data-testid="stDataFrame"] {border-radius:10px; overflow:hidden;}
+    </style>
+    """, unsafe_allow_html=True)
+    st.markdown("""
+    <div class="pro-hero">
+      <span class="pro-badge">LIVE • FYERS DATA</span>
+      <h2>Professional NSE / F&O Decision Scanner</h2>
+      <p>Evidence-based signals across trend, momentum, VWAP, volume, market structure, liquidity and reversal confirmation.</p>
+    </div>
+    """, unsafe_allow_html=True)
     
-    st.title("🚀 NSE AI PRO V17 — Professional Intraday + Swing Scanner")
-    st.caption(f"🕒 Current Time (IST): {_now_ist().strftime('%d-%b-%Y %H:%M:%S')} IST | Multi-Timeframe + Momentum Engine")
+    st.title("🚀 NSE AI PRO V18 — PROFESSIONAL MARKET SCANNER")
+    st.caption(f"🕒 {_now_ist().strftime('%d-%b-%Y %H:%M:%S')} IST  •  Multi-Timeframe  •  Momentum  •  Liquidity  •  Reversal  •  Structure")
     
     try:
         all_symbols = load_nse_equity_symbols()
@@ -3235,6 +3262,23 @@ def show_scanner(fyers) -> None:
         return
     
     st.caption(f"📊 NSE Equities: {len(all_symbols)} | 📈 F&O Stocks: {len(fo_symbols)}")
+
+    nse_rows = len(st.session_state.get("nse_df", pd.DataFrame()))
+    fo_rows = len(st.session_state.get("fo_df", pd.DataFrame()))
+    mom_rows = len(st.session_state.get("momentum_df", pd.DataFrame()))
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("NSE UNIVERSE", f"{len(all_symbols):,}")
+    c2.metric("F&O UNIVERSE", f"{len(fo_symbols):,}")
+    c3.metric("NSE RESULTS", f"{nse_rows:,}")
+    c4.metric("F&O RESULTS", f"{fo_rows:,}")
+    c5.metric("MOMENTUM HITS", f"{mom_rows:,}")
+    last_scan = (
+        st.session_state.get("momentum_scanned_at")
+        or st.session_state.get("nse_scanned_at")
+        or st.session_state.get("fo_scanned_at")
+        or "Not scanned yet"
+    )
+    st.caption(f"🟢 Scanner ready  •  Last recorded scan: {last_scan}")
     
     tabs = st.tabs([
         "🇮🇳 NSE STOCKS",
@@ -3243,7 +3287,7 @@ def show_scanner(fyers) -> None:
         "⚡ LIVE INTRADAY",
         "🔥 STRONG SIGNALS",
         "📈 SWING (GOLDEN/DEATH CROSS)",
-        "🧠 ADDITIONAL ANALYSIS",
+        "🧠 PRO REPORT",
         "📊 MARKET DASHBOARD",
         "⚙️ SETTINGS",
         "📌 PIN RULES"
@@ -3270,6 +3314,7 @@ def show_scanner(fyers) -> None:
                 st.session_state["nse_df"] = pd.DataFrame(nse_results) if nse_results else pd.DataFrame()
                 st.session_state["nse_errors"] = nse_errors
                 st.session_state["nse_stats"] = nse_stats
+                st.session_state["nse_scanned_at"] = _generated_timestamp()
         
         if "nse_stats" in st.session_state:
             _display_scan_summary(st.session_state["nse_stats"])
@@ -3382,6 +3427,7 @@ def show_scanner(fyers) -> None:
                     )
                     st.session_state["fo_errors"] = fo_errors or []
                     st.session_state["fo_stats"] = fo_stats
+                    st.session_state["fo_scanned_at"] = _generated_timestamp()
                 except Exception as e:
                     st.session_state["fo_df"] = pd.DataFrame()
                     st.session_state["fo_errors"] = [str(e)]
