@@ -2941,155 +2941,6 @@ def add_ai_decision_columns(df: pd.DataFrame) -> pd.DataFrame:
         out = out.sort_values("AI SCORE", ascending=False)
     return out
 
-
-# ════════════════════════════════════════════════════════════════════════════════
-# ORDER BLOCK + LIQUIDITY + BIG MOVE ENGINE
-# Uses OHLCV price action only. It does NOT claim to read hidden NSE order-book
-# / block-trade data. "Order Block" here means a probable price-action zone.
-# ════════════════════════════════════════════════════════════════════════════════
-
-OB_LOOKBACK = 40
-OB_ATR_MULT = 0.35
-OB_RVOL_MIN = 1.30
-OB_STRONG_SCORE = 78.0
-
-def detect_order_block(df: pd.DataFrame) -> Dict[str, Any]:
-    """Detect probable bullish/bearish order-block zones from OHLCV structure."""
-    out = {
-        "OB SIGNAL": "NONE", "OB SCORE": 0.0, "OB TYPE": "NONE",
-        "OB ZONE": "N/A", "OB ENTRY": "N/A", "OB SL": "N/A",
-        "OB TARGET": "N/A", "OB RETEST": "NO", "OB REASON": "Insufficient data"
-    }
-    try:
-        if df is None or len(df) < 25:
-            return out
-
-        d = df.copy()
-        cols = {str(c).lower(): c for c in d.columns}
-        o = pd.to_numeric(d[cols.get("open", "open")], errors="coerce")
-        h = pd.to_numeric(d[cols.get("high", "high")], errors="coerce")
-        l = pd.to_numeric(d[cols.get("low", "low")], errors="coerce")
-        c = pd.to_numeric(d[cols.get("close", "close")], errors="coerce")
-        v = pd.to_numeric(d[cols.get("volume", "volume")], errors="coerce") if "volume" in cols else pd.Series(0, index=d.index)
-
-        atr = (h - l).rolling(14).mean()
-        atr_now = float(atr.iloc[-1]) if pd.notna(atr.iloc[-1]) else float((h-l).tail(14).mean())
-        if not np.isfinite(atr_now) or atr_now <= 0:
-            return out
-
-        avg_vol = float(v.rolling(20).mean().iloc[-1]) if len(v) >= 20 else 0
-        rvol = float(v.iloc[-1] / avg_vol) if avg_vol > 0 else 1.0
-
-        last_c = float(c.iloc[-1])
-        last_h = float(h.iloc[-1])
-        last_l = float(l.iloc[-1])
-
-        # Recent breakout structure.
-        prior_high = float(h.iloc[-11:-1].max())
-        prior_low = float(l.iloc[-11:-1].min())
-        bullish_break = last_c > prior_high
-        bearish_break = last_c < prior_low
-
-        # Find the latest opposite candle before the displacement.
-        start = max(2, len(d) - OB_LOOKBACK)
-        bull_idx = None
-        bear_idx = None
-        for i in range(len(d)-2, start-1, -1):
-            body = abs(float(c.iloc[i]) - float(o.iloc[i]))
-            if bullish_break and float(c.iloc[i]) < float(o.iloc[i]) and body >= atr_now * 0.15:
-                bull_idx = i
-                break
-            if bearish_break and float(c.iloc[i]) > float(o.iloc[i]) and body >= atr_now * 0.15:
-                bear_idx = i
-                break
-
-        candidates = []
-        if bull_idx is not None:
-            z_low = float(l.iloc[bull_idx])
-            z_high = float(max(o.iloc[bull_idx], c.iloc[bull_idx]))
-            candidates.append(("BULLISH", bull_idx, z_low, z_high))
-        if bear_idx is not None:
-            z_low = float(min(o.iloc[bear_idx], c.iloc[bear_idx]))
-            z_high = float(h.iloc[bear_idx])
-            candidates.append(("BEARISH", bear_idx, z_low, z_high))
-
-        if not candidates:
-            return out
-
-        typ, idx, z_low, z_high = candidates[0]
-        zone_mid = (z_low + z_high) / 2.0
-        in_zone = z_low <= last_c <= z_high
-        retest = in_zone or (abs(last_c-zone_mid) <= atr_now * 0.30)
-
-        # Score: displacement + volume + structure + retest.
-        score = 35.0
-        reasons = ["opposite candle before structure break"]
-        if typ == "BULLISH" and bullish_break:
-            score += 20
-            reasons.append("bullish BOS")
-        if typ == "BEARISH" and bearish_break:
-            score += 20
-            reasons.append("bearish BOS")
-        if rvol >= OB_RVOL_MIN:
-            score += 15
-            reasons.append(f"RVOL {rvol:.2f}")
-        if retest:
-            score += 15
-            reasons.append("OB retest")
-        score = min(100.0, score)
-
-        if typ == "BULLISH":
-            entry = zone_mid
-            sl = z_low - atr_now * OB_ATR_MULT
-            target = max(prior_high + atr_now, last_c + atr_now * 2.0)
-            signal = "🔥 STRONG BULLISH OB" if score >= OB_STRONG_SCORE else "🟢 BULLISH OB"
-        else:
-            entry = zone_mid
-            sl = z_high + atr_now * OB_ATR_MULT
-            target = min(prior_low - atr_now, last_c - atr_now * 2.0)
-            signal = "🔥 STRONG BEARISH OB" if score >= OB_STRONG_SCORE else "🔴 BEARISH OB"
-
-        out.update({
-            "OB SIGNAL": signal,
-            "OB SCORE": round(score, 1),
-            "OB TYPE": typ,
-            "OB ZONE": f"{z_low:.2f} - {z_high:.2f}",
-            "OB ENTRY": round(entry, 2),
-            "OB SL": round(sl, 2),
-            "OB TARGET": round(target, 2),
-            "OB RETEST": "YES" if retest else "NO",
-            "OB REASON": " | ".join(reasons),
-        })
-        return out
-    except Exception as e:
-        out["OB REASON"] = f"OB error: {type(e).__name__}"
-        return out
-
-def add_order_block_columns(df: pd.DataFrame, timeframe_df_map=None) -> pd.DataFrame:
-    """Add OB fields using each row's optional dataframe, or current shared DF."""
-    if df is None or df.empty:
-        return df
-    out = df.copy()
-
-    # If scanner rows don't carry raw OHLCV, use conservative row-level fallback:
-    # existing signal fields are still preserved and no fake OB zone is invented.
-    if timeframe_df_map and isinstance(timeframe_df_map, dict):
-        records = []
-        for _, row in out.iterrows():
-            sym = str(row.get("Symbol", row.get("symbol", ""))).upper()
-            records.append(detect_order_block(timeframe_df_map.get(sym, pd.DataFrame())))
-        obdf = pd.DataFrame(records, index=out.index)
-        for col in obdf.columns:
-            out[col] = obdf[col]
-    else:
-        # Do not fabricate price zones when raw candles are unavailable.
-        defaults = detect_order_block(pd.DataFrame())
-        for col, val in defaults.items():
-            out[col] = val
-    if "OB SCORE" in out.columns:
-        out["OB SCORE"] = pd.to_numeric(out["OB SCORE"], errors="coerce").fillna(0)
-    return out
-
 # ════════════════════════════════════════════════════════════════════════════════
 # PIN RULES — ADDITIONAL LIQUIDITY / REVERSAL / BIG-MOVE ANALYSIS
 # Existing scanner logic is intentionally untouched. This tab runs only when used.
@@ -3522,7 +3373,7 @@ def show_scanner(fyers) -> None:
     st.markdown("""
     <div class="pro-hero">
       <span class="pro-badge">LIVE • FYERS DATA</span>
-      <h2>Professional NSE / F&O Decision Scanner • Order Block AI</h2>
+      <h2>Professional NSE / F&O Decision Scanner</h2>
       <p>Evidence-based signals across trend, momentum, VWAP, volume, market structure, liquidity and reversal confirmation.</p>
     </div>
     """, unsafe_allow_html=True)
@@ -3571,8 +3422,8 @@ def show_scanner(fyers) -> None:
         "🧠 AI PRO REPORT",
         "📊 MARKET DASHBOARD",
         "⚙️ SETTINGS",
-        "📌 PIN RULES",
-        "📦 ORDER BLOCK AI"])
+        "📌 PIN RULES"
+    ])
     
     # ════════════════════════════════════════════════════════════════════════════════
     # TAB 0: NSE STOCKS
@@ -4400,90 +4251,3 @@ if __name__ == "__main__":
     except Exception as e:
         st.error(f"❌ Unexpected Error: {e}")
         logger.error(f"Unexpected error: {e}", exc_info=True)
-    # ════════════════════════════════════════════════════════════════════════════════
-    # TAB 10: ORDER BLOCK AI
-    # ════════════════════════════════════════════════════════════════════════════════
-    with tabs[9]:
-        st.markdown("### 📦 ORDER BLOCK AI — Liquidity → BOS/CHoCH → Retest → Big Move")
-        st.caption(
-            "Probable price-action Order Blocks from OHLCV. "
-            "This is not hidden exchange order-book/block-trade access."
-        )
-
-        source_ob = st.selectbox(
-            "Order Block Universe",
-            ["NSE Stocks", "F&O Stocks"],
-            key="ob_source_v20"
-        )
-
-        source_df_key = "nse_df" if source_ob == "NSE Stocks" else "fo_df"
-        base_df = st.session_state.get(source_df_key, pd.DataFrame())
-
-        ob_min_score = st.slider(
-            "Minimum OB Score", 0, 100, 60, 5, key="ob_min_score_v20"
-        )
-        ob_only_retest = st.checkbox(
-            "Retest Only", value=False, key="ob_retest_v20"
-        )
-
-        if base_df is None or base_df.empty:
-            st.info(f"Run the {source_ob} scanner first.")
-        else:
-            # The primary scanner dataframes normally contain signal fields but not
-            # complete OHLCV. We only compute zones where candle data is available.
-            work = base_df.copy()
-
-            # Try to calculate a row-specific OB when a nested/raw dataframe exists.
-            raw_map = {}
-            for _, rr in work.iterrows():
-                sym = str(rr.get("Symbol", rr.get("symbol", ""))).upper()
-                raw = rr.get("DF", rr.get("DATAFRAME", None))
-                if isinstance(raw, pd.DataFrame):
-                    raw_map[sym] = raw
-
-            ob_work = add_order_block_columns(work, raw_map if raw_map else None)
-
-            if "OB SCORE" in ob_work.columns:
-                ob_work["OB SCORE"] = pd.to_numeric(ob_work["OB SCORE"], errors="coerce").fillna(0)
-
-            if ob_only_retest and "OB RETEST" in ob_work.columns:
-                ob_work = ob_work[ob_work["OB RETEST"].astype(str).eq("YES")]
-
-            if "OB SCORE" in ob_work.columns:
-                ob_work = ob_work[ob_work["OB SCORE"] >= ob_min_score]
-                ob_work = ob_work.sort_values("OB SCORE", ascending=False)
-
-            k1, k2, k3, k4 = st.columns(4)
-            k1.metric("OB Candidates", f"{len(ob_work):,}")
-            k2.metric(
-                "Strong OB",
-                f"{int((ob_work['OB SCORE'] >= OB_STRONG_SCORE).sum()) if 'OB SCORE' in ob_work.columns else 0:,}"
-            )
-            k3.metric(
-                "Bullish OB",
-                f"{int(ob_work['OB TYPE'].astype(str).eq('BULLISH').sum()) if 'OB TYPE' in ob_work.columns else 0:,}"
-            )
-            k4.metric(
-                "Bearish OB",
-                f"{int(ob_work['OB TYPE'].astype(str).eq('BEARISH').sum()) if 'OB TYPE' in ob_work.columns else 0:,}"
-            )
-
-            preferred = [
-                "Symbol", "LTP", "OB SIGNAL", "OB SCORE", "OB TYPE",
-                "OB ZONE", "OB ENTRY", "OB SL", "OB TARGET",
-                "OB RETEST", "OB REASON", "AI DECISION", "AI SCORE"
-            ]
-            show_cols = [c for c in preferred if c in ob_work.columns]
-            if show_cols:
-                st.dataframe(ob_work[show_cols], use_container_width=True, hide_index=True)
-            else:
-                st.dataframe(ob_work, use_container_width=True, hide_index=True)
-
-            st.download_button(
-                "📥 Download Order Block AI Report (CSV)",
-                ob_work.to_csv(index=False).encode("utf-8"),
-                file_name="ORDER_BLOCK_AI_V20.csv",
-                mime="text/csv",
-                key="download_ob_v20"
-            )
-
