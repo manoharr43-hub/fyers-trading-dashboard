@@ -1358,232 +1358,6 @@ def _normalize_series(series: pd.Series) -> pd.Series:
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# 13B. PO3 + OPTIONS INTELLIGENCE (ADDITIONAL / NON-INTRUSIVE)
-# ══════════════════════════════════════════════════════════════════════════
-
-PO3_HISTORY_KEY = "oc_po3_spot_history"
-PO3_HISTORY_MAX = 120
-
-
-def _po3_phase_from_price(df_price: Optional[pd.DataFrame], spot: float) -> tuple[str, str, float]:
-    """Heuristic Power-of-3 phase classifier.
-
-    Uses available underlying candles when FYERS is connected. If candles are
-    unavailable, callers can fall back to the short spot-history classifier.
-    This is an analytical heuristic, not a prediction or guaranteed PO3 model.
-    """
-    if df_price is None or df_price.empty or len(df_price) < 8:
-        return "UNKNOWN", "NEUTRAL", 0.0
-
-    d = df_price.tail(min(len(df_price), 30)).copy()
-    close = pd.to_numeric(d.get("close"), errors="coerce").dropna()
-    high = pd.to_numeric(d.get("high"), errors="coerce").dropna()
-    low = pd.to_numeric(d.get("low"), errors="coerce").dropna()
-    open_ = pd.to_numeric(d.get("open"), errors="coerce").dropna()
-    if len(close) < 8 or len(high) < 8 or len(low) < 8:
-        return "UNKNOWN", "NEUTRAL", 0.0
-
-    recent = d.tail(8)
-    prev = d.iloc[:-8] if len(d) > 8 else d.head(max(1, len(d) - 8))
-    recent_high = float(pd.to_numeric(recent["high"], errors="coerce").max())
-    recent_low = float(pd.to_numeric(recent["low"], errors="coerce").min())
-    prior_high = float(pd.to_numeric(prev["high"], errors="coerce").max()) if not prev.empty else recent_high
-    prior_low = float(pd.to_numeric(prev["low"], errors="coerce").min()) if not prev.empty else recent_low
-    last = float(close.iloc[-1])
-    prev_close = float(close.iloc[-8])
-    move_pct = ((last - prev_close) / prev_close * 100.0) if prev_close else 0.0
-    recent_range = ((recent_high - recent_low) / last * 100.0) if last else 0.0
-
-    wick_up = recent_high > prior_high and last < recent_high * 0.9985
-    wick_down = recent_low < prior_low and last > recent_low * 1.0015
-    directional_up = move_pct > 0.35 and last >= float(close.tail(4).mean())
-    directional_down = move_pct < -0.35 and last <= float(close.tail(4).mean())
-    compressed = recent_range < 1.0
-
-    if wick_up or wick_down:
-        direction = "BEARISH" if wick_up and not wick_down else ("BULLISH" if wick_down and not wick_up else "NEUTRAL")
-        return "MANIPULATION", direction, min(100.0, 55.0 + abs(move_pct) * 8.0)
-    if directional_up:
-        return "DISTRIBUTION", "BULLISH", min(100.0, 55.0 + abs(move_pct) * 10.0)
-    if directional_down:
-        return "DISTRIBUTION", "BEARISH", min(100.0, 55.0 + abs(move_pct) * 10.0)
-    if compressed:
-        return "ACCUMULATION", "NEUTRAL", 65.0
-    return "ACCUMULATION", "NEUTRAL", 55.0
-
-
-def _po3_phase_from_spot_history(symbol: str, spot: float) -> tuple[str, str, float]:
-    """Fallback PO3 phase using recent live spot snapshots."""
-    if not spot or spot <= 0:
-        return "UNKNOWN", "NEUTRAL", 0.0
-    history = st.session_state.setdefault(PO3_HISTORY_KEY, {})
-    series = history.get(symbol, [])
-    series.append(float(spot))
-    history[symbol] = series[-PO3_HISTORY_MAX:]
-    st.session_state[PO3_HISTORY_KEY] = history
-
-    if len(series) < 8:
-        return "ACCUMULATION", "NEUTRAL", 45.0
-    window = np.asarray(series[-8:], dtype=float)
-    move_pct = (window[-1] - window[0]) / window[0] * 100.0 if window[0] else 0.0
-    rng_pct = (window.max() - window.min()) / window[-1] * 100.0 if window[-1] else 0.0
-    if rng_pct < 0.15:
-        return "ACCUMULATION", "NEUTRAL", 60.0
-    if abs(move_pct) > 0.25:
-        direction = "BULLISH" if move_pct > 0 else "BEARISH"
-        return "DISTRIBUTION", direction, min(90.0, 55.0 + abs(move_pct) * 12.0)
-    return "MANIPULATION", "BULLISH" if move_pct > 0 else ("BEARISH" if move_pct < 0 else "NEUTRAL"), 55.0
-
-
-def compute_po3_options_intelligence(
-    df: pd.DataFrame,
-    spot: float,
-    symbol: str,
-    price_df: Optional[pd.DataFrame] = None,
-) -> dict[str, Any]:
-    """Build the requested 11-point PO3 + options confirmation panel."""
-    if df is None or df.empty or not spot:
-        return {
-            "spot": spot, "atm_strike": 0.0, "ce_oi": 0.0, "pe_oi": 0.0,
-            "ce_oi_change": 0.0, "pe_oi_change": 0.0, "pcr": 0.0,
-            "call_writing": "N/A", "put_writing": "N/A", "call_unwinding": "N/A",
-            "put_unwinding": "N/A", "spot_po3_phase": "UNKNOWN", "po3_phase": "UNKNOWN",
-            "po3_direction": "NEUTRAL", "po3_options_confirmation": "NO DATA",
-            "final_ce_bias": "NEUTRAL", "final_pe_bias": "NEUTRAL", "confidence": 0.0,
-            "reason": "No option-chain data available."
-        }
-
-    atm_idx = (df["strike_price"] - float(spot)).abs().idxmin()
-    atm = df.loc[atm_idx]
-    atm_strike = float(atm["strike_price"])
-
-    # Aggregate a tight ATM neighbourhood so a single strike does not dominate.
-    strikes = sorted(pd.to_numeric(df["strike_price"], errors="coerce").dropna().unique())
-    if len(strikes) > 1:
-        step = float(np.median(np.diff(strikes)))
-    else:
-        step = max(abs(atm_strike) * 0.01, 1.0)
-    near = df[(df["strike_price"] - atm_strike).abs() <= step * 2.0].copy()
-    if near.empty:
-        near = atm.to_frame().T
-
-    ce_oi = float(near["ce_oi"].sum())
-    pe_oi = float(near["pe_oi"].sum())
-    ce_doi = float(near["ce_chng_oi"].sum())
-    pe_doi = float(near["pe_chng_oi"].sum())
-    pcr = round(pe_oi / ce_oi, 3) if ce_oi > 0 else 0.0
-
-    def _writing(change: float) -> str:
-        return "YES" if change > 0 else "NO"
-    def _unwind(change: float) -> str:
-        return "YES" if change < 0 else "NO"
-
-    spot_phase, candle_direction, phase_conf = _po3_phase_from_price(price_df, spot) if price_df is not None else _po3_phase_from_spot_history(symbol, spot)
-
-    # Options directional votes: CE-side bullish = put writing + call unwinding;
-    # PE-side bearish = call writing + put unwinding. PCR is supporting context.
-    ce_votes = 0
-    pe_votes = 0
-    reasons = []
-    if pe_doi > 0:
-        ce_votes += 1; reasons.append("Put writing")
-    if ce_doi < 0:
-        ce_votes += 1; reasons.append("Call unwinding")
-    if ce_doi > 0:
-        pe_votes += 1; reasons.append("Call writing")
-    if pe_doi < 0:
-        pe_votes += 1; reasons.append("Put unwinding")
-    if pcr >= 1.20:
-        ce_votes += 1; reasons.append(f"PCR {pcr:.2f} bullish")
-    elif 0 < pcr <= 0.80:
-        pe_votes += 1; reasons.append(f"PCR {pcr:.2f} bearish")
-
-    if candle_direction == "BULLISH":
-        ce_votes += 1
-    elif candle_direction == "BEARISH":
-        pe_votes += 1
-
-    if ce_votes > pe_votes:
-        option_dir = "BULLISH"
-    elif pe_votes > ce_votes:
-        option_dir = "BEARISH"
-    else:
-        option_dir = "NEUTRAL"
-
-    if spot_phase == "MANIPULATION":
-        phase_label = "MANIPULATION"
-    elif spot_phase == "DISTRIBUTION":
-        phase_label = "DISTRIBUTION"
-    else:
-        phase_label = spot_phase
-
-    aligned = candle_direction != "NEUTRAL" and candle_direction == option_dir
-    if aligned:
-        confirmation = f"CONFIRMED {option_dir}"
-        final_dir = option_dir
-        conf = min(95.0, 55.0 + abs(ce_votes - pe_votes) * 8.0 + phase_conf * 0.20)
-    elif option_dir != "NEUTRAL" and candle_direction == "NEUTRAL":
-        confirmation = f"OPTIONS {option_dir} / PO3 NEUTRAL"
-        final_dir = option_dir
-        conf = min(78.0, 50.0 + max(ce_votes, pe_votes) * 7.0)
-    elif candle_direction != "NEUTRAL" and option_dir == "NEUTRAL":
-        confirmation = f"PO3 {candle_direction} / OPTIONS NEUTRAL"
-        final_dir = candle_direction
-        conf = min(72.0, 48.0 + phase_conf * 0.25)
-    else:
-        confirmation = "NO CONFIRMATION / CHOP"
-        final_dir = "NEUTRAL"
-        conf = 35.0
-
-    return {
-        "spot": float(spot), "atm_strike": atm_strike,
-        "ce_oi": ce_oi, "pe_oi": pe_oi,
-        "ce_oi_change": ce_doi, "pe_oi_change": pe_doi, "pcr": pcr,
-        "call_writing": _writing(ce_doi), "put_writing": _writing(pe_doi),
-        "call_unwinding": _unwind(ce_doi), "put_unwinding": _unwind(pe_doi),
-        "spot_po3_phase": phase_label, "po3_phase": phase_label,
-        "po3_direction": candle_direction, "po3_options_confirmation": confirmation,
-        "final_ce_bias": "STRONG" if final_dir == "BULLISH" and conf >= 75 else ("YES" if final_dir == "BULLISH" else "NO"),
-        "final_pe_bias": "STRONG" if final_dir == "BEARISH" and conf >= 75 else ("YES" if final_dir == "BEARISH" else "NO"),
-        "final_direction": final_dir, "confidence": round(float(conf), 1),
-        "reason": ", ".join(dict.fromkeys(reasons)) if reasons else "No strong options confirmation"
-    }
-
-
-def _render_po3_intelligence(po3: dict[str, Any]) -> None:
-    """Render compact 11-field PO3 + Options Intelligence dashboard."""
-    st.markdown('<div class="block-title">🧠 PO3 + OPTIONS INTELLIGENCE</div>', unsafe_allow_html=True)
-    r1 = st.columns(4)
-    r1[0].metric("Spot / Underlying", f"₹{po3['spot']:,.2f}" if po3.get("spot") else "—")
-    r1[1].metric("ATM Strike", f"₹{po3['atm_strike']:,.0f}" if po3.get("atm_strike") else "—")
-    r1[2].metric("PO3 Phase", po3.get("po3_phase", "UNKNOWN"))
-    r1[3].metric("PO3 Direction", po3.get("po3_direction", "NEUTRAL"))
-
-    r2 = st.columns(4)
-    r2[0].metric("CE OI", f"{po3.get('ce_oi', 0):,.0f}")
-    r2[1].metric("PE OI", f"{po3.get('pe_oi', 0):,.0f}")
-    r2[2].metric("CE OI Change", f"{po3.get('ce_oi_change', 0):+,.0f}")
-    r2[3].metric("PE OI Change", f"{po3.get('pe_oi_change', 0):+,.0f}")
-
-    r3 = st.columns(5)
-    r3[0].metric("PCR", f"{po3.get('pcr', 0):.3f}")
-    r3[1].metric("Call Writing", po3.get("call_writing", "N/A"))
-    r3[2].metric("Put Writing", po3.get("put_writing", "N/A"))
-    r3[3].metric("Call Unwinding", po3.get("call_unwinding", "N/A"))
-    r3[4].metric("Put Unwinding", po3.get("put_unwinding", "N/A"))
-
-    direction = po3.get("final_direction", "NEUTRAL")
-    if direction == "BULLISH":
-        st.success(f"🟢 PO3 + OPTIONS: {po3.get('po3_options_confirmation')} | Final CE Bias: {po3.get('final_ce_bias')} | Confidence: {po3.get('confidence', 0):.0f}%")
-    elif direction == "BEARISH":
-        st.error(f"🔴 PO3 + OPTIONS: {po3.get('po3_options_confirmation')} | Final PE Bias: {po3.get('final_pe_bias')} | Confidence: {po3.get('confidence', 0):.0f}%")
-    else:
-        st.warning(f"🟡 PO3 + OPTIONS: {po3.get('po3_options_confirmation')} | Final Bias: NEUTRAL | Confidence: {po3.get('confidence', 0):.0f}%")
-    if po3.get("reason"):
-        st.caption("Confirmation factors: " + po3["reason"])
-
-
-# ══════════════════════════════════════════════════════════════════════════
 # 14. AI SIGNAL ENGINE (ORIGINAL - UNMODIFIED)
 # ══════════════════════════════════════════════════════════════════════════
 
@@ -2597,27 +2371,6 @@ def export_excel_report(df: pd.DataFrame, meta: dict, pcr: float, max_pain: floa
             ("Probability", f"{trade_signal.probability:.1f}%"),
             ("Confidence", f"{trade_signal.confidence:.1f}%"),
         ])
-
-    if po3_intelligence:
-        summary_rows.extend([
-            ("", ""), ("PO3 + OPTIONS INTELLIGENCE", ""),
-            ("PO3 Phase", po3_intelligence.get("po3_phase")),
-            ("PO3 Direction", po3_intelligence.get("po3_direction")),
-            ("ATM Strike", po3_intelligence.get("atm_strike")),
-            ("CE OI", po3_intelligence.get("ce_oi")),
-            ("PE OI", po3_intelligence.get("pe_oi")),
-            ("CE OI Change", po3_intelligence.get("ce_oi_change")),
-            ("PE OI Change", po3_intelligence.get("pe_oi_change")),
-            ("PCR", po3_intelligence.get("pcr")),
-            ("Call Writing", po3_intelligence.get("call_writing")),
-            ("Put Writing", po3_intelligence.get("put_writing")),
-            ("Call Unwinding", po3_intelligence.get("call_unwinding")),
-            ("Put Unwinding", po3_intelligence.get("put_unwinding")),
-            ("PO3 + Options Confirmation", po3_intelligence.get("po3_options_confirmation")),
-            ("Final CE Bias", po3_intelligence.get("final_ce_bias")),
-            ("Final PE Bias", po3_intelligence.get("final_pe_bias")),
-            ("Confidence", po3_intelligence.get("confidence")),
-        ])
     
     ws_summary.cell(row=1, column=1, value="Metric")
     ws_summary.cell(row=1, column=2, value="Value")
@@ -2887,11 +2640,6 @@ def _do_fetch_and_process(cfg: dict, fyers: Any = None) -> Optional[dict]:
                     "trade_signal": trade_signal,
                 }
 
-    po3_price_df = None
-    if price_action_data and price_action_data.get("df_dict"):
-        po3_price_df = price_action_data["df_dict"].get("5M")
-    po3_intelligence = compute_po3_options_intelligence(df, spot, cfg["symbol"], po3_price_df)
-
     return {
         "df": df, "meta": meta, "spot": spot, "atm_strike": atm_strike, "expiry_label": expiry_label,
         "pcr": pcr, "max_pain": max_pain, "support": support, "resistance": resistance, "max_oi": max_oi,
@@ -2899,7 +2647,6 @@ def _do_fetch_and_process(cfg: dict, fyers: Any = None) -> Optional[dict]:
         "oi_shift_notes": oi_shift_notes, "data_source": data_source,
         "price_action_data": price_action_data, "trade_signal": trade_signal,
         "market_pressure": market_pressure,
-        "po3_intelligence": po3_intelligence,
     }
 
 
@@ -3044,12 +2791,12 @@ def run_dashboard(fyers: Any = None) -> None:
     st.divider()
 
     if state.get("price_action_data") and state["price_action_data"].get("df_dict"):
-        tab_chain, tab_charts, tab_pressure, tab_movement, tab_greeks, tab_ai, tab_gex, tab_po3, tab_price_action, tab_export = st.tabs([
-            "📋 Chain", "📈 OI", "💪 Pressure", "🎯 Strike Movement", "🧮 Greeks", "🤖 AI", "⚡ GEX", "🧠 PO3 Intelligence", "💹 Price Action", "📥 Export",
+        tab_chain, tab_charts, tab_pressure, tab_movement, tab_greeks, tab_ai, tab_gex, tab_price_action, tab_export = st.tabs([
+            "📋 Chain", "📈 OI", "💪 Pressure", "🎯 Strike Movement", "🧮 Greeks", "🤖 AI", "⚡ GEX", "💹 Price Action", "📥 Export",
         ])
     else:
-        tab_chain, tab_charts, tab_pressure, tab_movement, tab_greeks, tab_ai, tab_gex, tab_po3, tab_export = st.tabs([
-            "📋 Chain", "📈 OI", "💪 Pressure", "🎯 Strike Movement", "🧮 Greeks", "🤖 AI", "⚡ GEX", "🧠 PO3 Intelligence", "📥 Export",
+        tab_chain, tab_charts, tab_pressure, tab_movement, tab_greeks, tab_ai, tab_gex, tab_export = st.tabs([
+            "📋 Chain", "📈 OI", "💪 Pressure", "🎯 Strike Movement", "🧮 Greeks", "🤖 AI", "⚡ GEX", "📥 Export",
         ])
 
     with tab_chain:
@@ -3152,9 +2899,6 @@ def run_dashboard(fyers: Any = None) -> None:
         e3.metric("Gamma Flip", f"{gf:,.0f}" if gf else "—")
         st.plotly_chart(chart_gex_by_strike(state["gex_dex"]), use_container_width=True, config={"displayModeBar": False})
 
-    with tab_po3:
-        _render_po3_intelligence(state.get("po3_intelligence", {}))
-
     if state.get("price_action_data") and state["price_action_data"].get("df_dict"):
         with tab_price_action:
             st.markdown('<div class="block-title">💹 Price Action</div>', unsafe_allow_html=True)
@@ -3175,7 +2919,6 @@ def run_dashboard(fyers: Any = None) -> None:
                     df, meta, state["pcr"], state["max_pain"], state["support"], state["resistance"],
                     cfg["symbol"], state["expiry_label"], state["iv_rank"], state["iv_percentile"],
                     state["gex_dex"], state.get("market_pressure"), state.get("trade_signal"),
-                    state.get("po3_intelligence"),
                 )
                 st.download_button(
                     "📥 Excel", data=excel_buf,
