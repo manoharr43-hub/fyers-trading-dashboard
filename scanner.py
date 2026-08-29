@@ -619,6 +619,52 @@ def detect_big_move_setup(df: pd.DataFrame) -> Dict[str, Any]:
         out["reason"] = f"BIG MOVE error: {type(e).__name__}"
         return out
 
+
+def detect_po3_phase(df: pd.DataFrame) -> Dict[str, Any]:
+    """PO3-style Accumulation -> Manipulation -> Distribution detector using OHLCV.
+    This is a probability/rule model, not proof of institutional manipulation.
+    """
+    out = {"PO3 PHASE":"NONE","PO3 SIGNAL":"WAIT","PO3 SCORE":0.0,
+           "ACCUMULATION":"NO","MANIPULATION":"NO","DISTRIBUTION":"NO",
+           "PO3 EVENT":"NONE","PO3 REASON":"Insufficient data"}
+    if df is None or len(df) < 35: return out
+    try:
+        d=df.reset_index(drop=True).copy()
+        for col in ["Open","High","Low","Close","Volume"]: d[col]=pd.to_numeric(d[col],errors="coerce")
+        d=d.dropna(subset=["Open","High","Low","Close","Volume"]).reset_index(drop=True)
+        if len(d)<35: return out
+        last=d.iloc[-1]; o,h,l,c,v=[float(last[x]) for x in ["Open","High","Low","Close","Volume"]]
+        atrs=calculate_atr(d,14); atr=float(atrs.iloc[-1]) if pd.notna(atrs.iloc[-1]) and float(atrs.iloc[-1])>0 else max(c*.005,.01)
+        zone=d.iloc[-23:-3]; zhi=float(zone["High"].max()); zlo=float(zone["Low"].min()); zmid=(zhi+zlo)/2
+        range_pct=(zhi-zlo)/zmid*100 if zmid>0 else 999
+        median_range=float((zone["High"]-zone["Low"]).median())
+        compression=range_pct<=4.0 and median_range<=atr*1.15
+        ph,pl=_confirmed_pivots(d.iloc[:-1],left=2,right=2)
+        hh=lh=hl=ll=False
+        if len(ph)>=2: hh=ph[-1][1]>ph[-2][1]; lh=ph[-1][1]<ph[-2][1]
+        if len(pl)>=2: hl=pl[-1][1]>pl[-2][1]; ll=pl[-1][1]<pl[-2][1]
+        low_sweep=l<zlo and c>zlo; high_sweep=h>zhi and c<zhi
+        body=abs(c-o); rng=max(h-l,1e-9); lower_wick=min(o,c)-l; upper_wick=h-max(o,c); close_pos=(c-l)/rng
+        base=float(d["Volume"].iloc[-21:-1].mean()) if len(d)>=22 else float(d["Volume"].mean()); rvol=v/base if base>0 else 0
+        acc=(30 if compression else 0)+(20 if hl else 0)+(25 if low_sweep else 0)+(10 if c>zmid else 0)+(15 if rvol>=1.2 and c>o else 0)
+        dist=(30 if compression else 0)+(20 if lh else 0)+(25 if high_sweep else 0)+(10 if c<zmid else 0)+(15 if rvol>=1.2 and c<o else 0)
+        bull_manip=low_sweep and lower_wick>=body and close_pos>=.55
+        bear_manip=high_sweep and upper_wick>=body and close_pos<=.45
+        if bull_manip:
+            phase,event,signal="MANIPULATION","LOW SWEEP + RECLAIM","🟢 PO3 BUY"; score=min(100,max(60,acc+15)); reason=f"Low sweep/reclaim | RVOL {rvol:.2f}x | range {range_pct:.2f}%"
+        elif bear_manip:
+            phase,event,signal="MANIPULATION","HIGH SWEEP + REJECTION","🔴 PO3 SELL"; score=min(100,max(60,dist+15)); reason=f"High sweep/rejection | RVOL {rvol:.2f}x | range {range_pct:.2f}%"
+        elif acc>=50 and compression:
+            phase,event,signal="ACCUMULATION","RANGE + DEMAND","🟡 PO3 ACCUMULATION"; score=min(100,acc); reason=f"Range compression + demand/HL | RVOL {rvol:.2f}x | range {range_pct:.2f}%"
+        elif dist>=50 and compression:
+            phase,event,signal="DISTRIBUTION","RANGE + SUPPLY","🟠 PO3 DISTRIBUTION"; score=min(100,dist); reason=f"Range compression + supply/LH | RVOL {rvol:.2f}x | range {range_pct:.2f}%"
+        else:
+            phase,event,signal="NONE","NONE","WAIT"; score=max(acc,dist) if compression else 0; reason="No strong PO3 phase confirmation"
+        out.update({"PO3 PHASE":phase,"PO3 SIGNAL":signal,"PO3 SCORE":round(score,1),"ACCUMULATION":"YES" if acc>=50 and compression else "NO","MANIPULATION":"YES" if bull_manip or bear_manip else "NO","DISTRIBUTION":"YES" if dist>=50 and compression else "NO","PO3 EVENT":event,"PO3 REASON":reason})
+        return out
+    except Exception as e:
+        out["PO3 REASON"]=f"PO3 error: {type(e).__name__}"; return out
+
 def calculate_momentum_score(analysis_5m: Dict, analysis_15m: Dict, analysis_1h: Dict, movement_metrics: Dict, is_bullish: bool) -> Dict[str, Any]:
     """Calculate momentum score (0-100) based on multiple factors."""
     data_5m = analysis_5m.get("data", {})
@@ -2314,6 +2360,7 @@ def _fetch_nse_signal(fyers, symbol: str):
             "PRESSURE SIGNAL": data_5m.get("pressure_trend", "N/A"),
             "NEXT CANDLE BIAS": next_bias.get("bias", "NEUTRAL"),
             "NEXT CANDLE CONFIDENCE %": next_bias.get("confidence", 0.0),
+            **detect_po3_phase(analysis_5m.get("df")),
             "AI SIGNAL": master["final_signal"],
             "AI CONFIDENCE %": master["confidence"],
             "SIGNAL REASON": master["signal_reason"],
@@ -2398,6 +2445,7 @@ def _fetch_fo_signal(fyers, symbol: str):
             "PRESSURE SIGNAL": data_5m.get("pressure_trend", "N/A"),
             "NEXT CANDLE BIAS": next_bias.get("bias", "NEUTRAL"),
             "NEXT CANDLE CONFIDENCE %": next_bias.get("confidence", 0.0),
+            **detect_po3_phase(analysis_5m.get("df")),
             "ATM STRIKE": round(options_data.get("atm_strike", 0), 2) if options_data.get("atm_strike") else "N/A",
             "PCR": options_data.get("pcr", "N/A"),
             "CE OI": options_data.get("ce_oi", "N/A"),
@@ -3041,7 +3089,9 @@ def calculate_pin_rules(df_5m: pd.DataFrame, data_5m: Dict[str, Any], data_15m: 
             "LIQUIDITY": liquidity, "SWEEP": sweep, "REVERSAL": reversal,
             "EQUAL HIGH": "YES" if eq_hi else "NO", "EQUAL LOW": "YES" if eq_lo else "NO",
             "BIG MOVEMENT": bm.get("signal", "NO BIG MOVE"),
-            "BIG MOVE SCORE": bm.get("score", 0.0), "STRUCTURE": structure,
+            "BIG MOVE SCORE": bm.get("score", 0.0),
+            **detect_po3_phase(d),
+            "STRUCTURE": structure,
             "REASON": " | ".join([x for x in [
                 "EQ HIGH" if eq_hi else "", "EQ LOW" if eq_lo else "",
                 "LOW SWEEP" if bullish_sweep else "HIGH SWEEP" if bearish_sweep else "",
