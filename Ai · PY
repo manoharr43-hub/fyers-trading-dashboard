@@ -937,6 +937,51 @@ def xgb_probability(feat: dict, history_df: pd.DataFrame, cache_key: str = "") -
         return None
 
 
+def run_ai_backtest(symbols, max_test_bars: int = 60) -> pd.DataFrame:
+    """Run an on-demand chronological XGBoost backtest for selected symbols."""
+    rows = []
+    for symbol in symbols:
+        try:
+            df = fetch_price_history(symbol)
+            if df is None or df.empty:
+                rows.append({"Symbol": symbol, "Status": "No historical data"})
+                continue
+
+            data = _xgb_feature_frame(df)
+            if len(data) < 100:
+                rows.append({"Symbol": symbol, "Status": f"Need 100+ usable rows; got {len(data)}"})
+                continue
+
+            test_n = min(int(max_test_bars), max(20, int(len(data) * 0.20)))
+            split = len(data) - test_n
+            train = data.iloc[:split]
+            test = data.iloc[split:]
+            features = [c for c in data.columns if c != "target"]
+
+            if train["target"].nunique() < 2:
+                rows.append({"Symbol": symbol, "Status": "Training data contains one class only"})
+                continue
+
+            model = _xgb_make_model()
+            model.fit(train[features], train["target"])
+            pred = (model.predict_proba(test[features])[:, 1] >= 0.50).astype(int)
+            metrics = _xgb_metrics(test["target"], pred)
+
+            rows.append({
+                "Symbol": symbol,
+                "Status": "OK",
+                "Accuracy %": round(100 * metrics.get("accuracy", 0.0), 2),
+                "Precision UP %": round(100 * metrics.get("precision_up", 0.0), 2),
+                "Recall UP %": round(100 * metrics.get("recall_up", 0.0), 2),
+                "Test Samples": int(metrics.get("test_samples", 0)),
+                "Train Samples": int(len(train)),
+                "Method": "latest chronological holdout",
+            })
+        except Exception as exc:
+            rows.append({"Symbol": symbol, "Status": f"Error: {str(exc)[:120]}"})
+    return pd.DataFrame(rows)
+
+
 # ============================================================================
 # SECTION 8 : TRADE PLAN GENERATOR  (equity + options)
 # ============================================================================
@@ -1506,6 +1551,65 @@ def main():
 
     scan_df = st.session_state["scan_df"]
     last_time = st.session_state["last_scan_time"]
+
+    # ------------------------------------------------------------------------
+    # AI BACKTEST — always visible, even before a full scanner run
+    # ------------------------------------------------------------------------
+    st.divider()
+    with st.expander("🧪 AI BACKTEST — Actual Historical Accuracy", expanded=True):
+        st.caption(
+            "Measured chronological out-of-sample accuracy. "
+            "This is different from AI Confidence."
+        )
+
+        if not XGB_AVAILABLE:
+            st.error("XGBoost is not available. Check requirements.txt and redeploy.")
+        elif not YF_AVAILABLE:
+            st.error("Historical data provider is not available. Check yfinance in requirements.txt.")
+        else:
+            bt_default = FNO_SYMBOLS[:1] if FNO_SYMBOLS else []
+            bt_symbols = st.multiselect(
+                "Select stocks for AI backtest (start with 1–5)",
+                FNO_SYMBOLS,
+                default=bt_default,
+                key="ai_backtest_symbols",
+            )
+            bt_bars = st.slider(
+                "Maximum recent test bars",
+                min_value=20,
+                max_value=100,
+                value=60,
+                step=10,
+                key="ai_backtest_bars",
+            )
+
+            if st.button("🚀 RUN AI BACKTEST", type="primary", key="run_ai_backtest"):
+                if not bt_symbols:
+                    st.warning("Please select at least one stock.")
+                else:
+                    with st.spinner("Running AI historical backtest..."):
+                        st.session_state["ai_backtest_df"] = run_ai_backtest(
+                            bt_symbols, max_test_bars=bt_bars
+                        )
+
+            bt_df = st.session_state.get("ai_backtest_df")
+            if isinstance(bt_df, pd.DataFrame) and not bt_df.empty:
+                ok_df = bt_df[bt_df["Status"] == "OK"] if "Status" in bt_df.columns else bt_df
+
+                if not ok_df.empty and "Accuracy %" in ok_df.columns:
+                    c1, c2, c3 = st.columns(3)
+                    c1.metric("Average Accuracy", f"{ok_df['Accuracy %'].mean():.2f}%")
+                    c2.metric("Stocks Tested", len(ok_df))
+                    c3.metric("Total Test Samples", int(ok_df['Test Samples'].sum()))
+
+                st.dataframe(bt_df, use_container_width=True)
+                st.download_button(
+                    "⬇️ Export AI Backtest CSV",
+                    data=bt_df.to_csv(index=False).encode("utf-8"),
+                    file_name=f"ai_backtest_{dt.date.today()}.csv",
+                    mime="text/csv",
+                    key="ai_backtest_csv",
+                )
 
     if scan_df is None or scan_df.empty:
         st.info("👈 Configure settings in the sidebar and click **Run Full Scan** to generate signals.")
