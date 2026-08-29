@@ -1550,6 +1550,81 @@ def compute_po3_options_intelligence(
     }
 
 
+
+def compute_final_signal(po3: dict[str, Any], trade_signal: Optional[TradeSignal] = None) -> dict[str, Any]:
+    """One clear BUY/SELL/WAIT signal with CHOP and confidence protection."""
+    po3 = po3 if isinstance(po3, dict) else {}
+    direction = str(po3.get("final_direction", "NEUTRAL")).upper()
+    confirmation = str(po3.get("po3_options_confirmation", "")).upper()
+    confidence = float(po3.get("confidence", 0.0) or 0.0)
+
+    trade_name = str(getattr(trade_signal, "signal", "") or "").upper() if trade_signal else ""
+    trade_conf = float(getattr(trade_signal, "confidence", 0.0) or 0.0) if trade_signal else 0.0
+
+    is_chop = (
+        "CHOP" in confirmation
+        or "NO CONFIRMATION" in confirmation
+        or direction in ("", "NEUTRAL", "UNKNOWN")
+    )
+
+    if is_chop or confidence < 55.0:
+        return {
+            "signal": "WAIT",
+            "next_candle": "WAIT",
+            "confidence": round(confidence, 1),
+            "market_status": "CHOP / WAIT",
+            "reason": "CHOP or confidence below 55% — BUY/SELL blocked",
+        }
+
+    if direction == "BULLISH":
+        return {
+            "signal": "BUY",
+            "next_candle": "UP",
+            "confidence": round(min(max(confidence, trade_conf if "BUY" in trade_name else 0.0), 95.0), 1),
+            "market_status": "BULLISH",
+            "reason": po3.get("reason", "PO3 + options bullish confirmation"),
+        }
+
+    if direction == "BEARISH":
+        return {
+            "signal": "SELL",
+            "next_candle": "DOWN",
+            "confidence": round(min(max(confidence, trade_conf if "SELL" in trade_name else 0.0), 95.0), 1),
+            "market_status": "BEARISH",
+            "reason": po3.get("reason", "PO3 + options bearish confirmation"),
+        }
+
+    return {
+        "signal": "WAIT",
+        "next_candle": "WAIT",
+        "confidence": round(confidence, 1),
+        "market_status": "NEUTRAL",
+        "reason": "No confirmed directional alignment",
+    }
+
+
+def _render_final_signal_card(final_signal: dict[str, Any]) -> None:
+    sig = str(final_signal.get("signal", "WAIT")).upper()
+    nxt = str(final_signal.get("next_candle", "WAIT")).upper()
+    conf = float(final_signal.get("confidence", 0.0) or 0.0)
+
+    a, b, c, d = st.columns(4)
+    a.metric("FINAL SIGNAL", "🟢 BUY" if sig == "BUY" else ("🔴 SELL" if sig == "SELL" else "🟡 WAIT"))
+    b.metric("NEXT CANDLE", "🟢 UP" if nxt == "UP" else ("🔴 DOWN" if nxt == "DOWN" else "🟡 WAIT"))
+    c.metric("MARKET", str(final_signal.get("market_status", "NEUTRAL")))
+    d.metric("CONFIDENCE", f"{conf:.0f}%")
+
+    if sig == "BUY":
+        st.success("🟢 FINAL BUY — confirmed bullish conditions")
+    elif sig == "SELL":
+        st.error("🔴 FINAL SELL — confirmed bearish conditions")
+    else:
+        st.warning("🟡 FINAL WAIT — no strong confirmation; weak signals are blocked")
+
+    if final_signal.get("reason"):
+        st.caption("Final decision: " + str(final_signal["reason"]))
+
+
 def _render_po3_intelligence(po3: dict[str, Any]) -> None:
     """Render compact 11-field PO3 + Options Intelligence dashboard."""
     st.markdown('<div class="block-title">🧠 PO3 + OPTIONS INTELLIGENCE</div>', unsafe_allow_html=True)
@@ -1581,6 +1656,9 @@ def _render_po3_intelligence(po3: dict[str, Any]) -> None:
         st.warning(f"🟡 PO3 + OPTIONS: {po3.get('po3_options_confirmation')} | Final Bias: NEUTRAL | Confidence: {po3.get('confidence', 0):.0f}%")
     if po3.get("reason"):
         st.caption("Confirmation factors: " + po3["reason"])
+
+    if po3.get("final_signal"):
+        _render_final_signal_card(po3["final_signal"])
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -2913,6 +2991,7 @@ def _do_fetch_and_process(cfg: dict, fyers: Any = None) -> Optional[dict]:
     if price_action_data and price_action_data.get("df_dict"):
         po3_price_df = price_action_data["df_dict"].get("5M")
     po3_intelligence = compute_po3_options_intelligence(df, spot, cfg["symbol"], po3_price_df)
+    po3_intelligence["final_signal"] = compute_final_signal(po3_intelligence, trade_signal)
 
     return {
         "df": df, "meta": meta, "spot": spot, "atm_strike": atm_strike, "expiry_label": expiry_label,
@@ -2922,6 +3001,7 @@ def _do_fetch_and_process(cfg: dict, fyers: Any = None) -> Optional[dict]:
         "price_action_data": price_action_data, "trade_signal": trade_signal,
         "market_pressure": market_pressure,
         "po3_intelligence": po3_intelligence,
+        "final_signal": po3_intelligence.get("final_signal", {}),
     }
 
 
@@ -2940,10 +3020,15 @@ def _render_summary_cards(state: dict) -> None:
     c8.metric("Total GEX", f"{state['gex_dex'].get('total_gex', 0):,.0f}")
     c9.metric("Total DEX", f"{state['gex_dex'].get('total_dex', 0):,.0f}")
     
-    if state.get("trade_signal"):
-        c10.metric("Signal", state["trade_signal"].signal, delta=f"{state['trade_signal'].confidence:.0f}%")
+    fs = state.get("final_signal", {})
+    if fs:
+        c10.metric("FINAL SIGNAL", fs.get("signal", "WAIT"),
+                   delta=f"{float(fs.get('confidence', 0) or 0):.0f}%")
+    elif state.get("trade_signal"):
+        c10.metric("FINAL SIGNAL", state["trade_signal"].signal,
+                   delta=f"{state['trade_signal'].confidence:.0f}%")
     else:
-        c10.metric("Signal", "No Signal")
+        c10.metric("FINAL SIGNAL", "WAIT")
 
     # NEW: Pressure metrics
     mp = state.get("market_pressure")
