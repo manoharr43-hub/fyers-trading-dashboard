@@ -836,45 +836,103 @@ def sector_index_strength(symbol_change_pct: float, index_change_pct: float) -> 
     return clip(50 + rs * 8, 0, 100)
 
 
-def xgb_probability(feat: dict, history_df: pd.DataFrame) -> Optional[float]:
-    """
-    Trains a tiny, fast XGBoost classifier per symbol on its own rolling
-    history (label = next-day up/down) and returns P(up) for the latest
-    bar. Falls back to None if XGBoost is unavailable or there isn't
-    enough history -- caller must handle that gracefully.
-    """
+# ---------------------------------------------------------------------------
+# XGBOOST AI + HONEST CHRONOLOGICAL VALIDATION
+# ---------------------------------------------------------------------------
+XGB_METRICS_CACHE = {}
+
+
+def _xgb_feature_frame(history_df: pd.DataFrame) -> pd.DataFrame:
+    """Create the same feature family used by the live XGBoost model."""
+    df = history_df.copy()
+    df["ema20"] = ema(df["Close"], 20)
+    df["ema50"] = ema(df["Close"], 50)
+    df["rsi"] = rsi(df["Close"])
+    _, _, hist = macd(df["Close"])
+    df["macd_hist"] = hist
+    df["atr"] = atr(df)
+    df["adx"] = adx(df)
+    df["rel_vol"] = df["Volume"] / df["Volume"].rolling(20).mean()
+    df["ret1"] = df["Close"].pct_change()
+    # Target is next-bar direction. It is never used as a feature.
+    df["target"] = (df["Close"].shift(-1) > df["Close"]).astype(int)
+    cols = ["ema20", "ema50", "rsi", "macd_hist", "atr", "adx", "rel_vol", "ret1", "target"]
+    return df[cols].replace([np.inf, -np.inf], np.nan).dropna().copy()
+
+
+def _xgb_make_model():
+    return xgb.XGBClassifier(
+        n_estimators=120,
+        max_depth=3,
+        learning_rate=0.05,
+        subsample=0.85,
+        colsample_bytree=0.85,
+        min_child_weight=3,
+        reg_lambda=1.0,
+        objective="binary:logistic",
+        eval_metric="logloss",
+        tree_method="hist",
+        random_state=42,
+        n_jobs=2,
+        verbosity=0,
+    )
+
+
+def _xgb_metrics(y_true, y_pred):
+    y_true = np.asarray(y_true, dtype=int)
+    y_pred = np.asarray(y_pred, dtype=int)
+    tp = int(((y_true == 1) & (y_pred == 1)).sum())
+    tn = int(((y_true == 0) & (y_pred == 0)).sum())
+    fp = int(((y_true == 0) & (y_pred == 1)).sum())
+    fn = int(((y_true == 1) & (y_pred == 0)).sum())
+    return {
+        "accuracy": (tp + tn) / max(len(y_true), 1),
+        "precision_up": tp / max(tp + fp, 1),
+        "recall_up": tp / max(tp + fn, 1),
+        "test_samples": len(y_true),
+    }
+
+
+def _xgb_chronological_validation(data: pd.DataFrame, test_fraction: float = 0.20):
+    """No shuffle: old data trains the model, newest data tests it."""
+    if len(data) < 100:
+        return {"available": False, "reason": f"Need 100+ usable rows; got {len(data)}"}
+    split = max(60, min(int(len(data) * (1.0 - test_fraction)), len(data) - 20))
+    train = data.iloc[:split]
+    test = data.iloc[split:]
+    if train["target"].nunique() < 2:
+        return {"available": False, "reason": "Training data contains one class only"}
+    features = [c for c in data.columns if c != "target"]
+    model = _xgb_make_model()
+    model.fit(train[features], train["target"])
+    pred = (model.predict_proba(test[features])[:, 1] >= 0.50).astype(int)
+    out = _xgb_metrics(test["target"], pred)
+    out.update({"available": True, "train_samples": len(train), "method": "chronological holdout"})
+    return out
+
+
+def xgb_probability(feat: dict, history_df: pd.DataFrame, cache_key: str = "") -> Optional[float]:
+    """Train only on past rows, validate chronologically, then predict latest bar."""
     if not XGB_AVAILABLE or history_df is None or len(history_df) < 120:
         return None
     try:
-        df = history_df.copy()
-        df["ema20"] = ema(df["Close"], 20)
-        df["ema50"] = ema(df["Close"], 50)
-        df["rsi"] = rsi(df["Close"])
-        macd_line, signal_line, hist = macd(df["Close"])
-        df["macd_hist"] = hist
-        df["atr"] = atr(df)
-        df["adx"] = adx(df)
-        df["rel_vol"] = df["Volume"] / df["Volume"].rolling(20).mean()
-        df["ret1"] = df["Close"].pct_change()
-        df["target"] = (df["Close"].shift(-1) > df["Close"]).astype(int)
-
-        feature_cols = ["ema20", "ema50", "rsi", "macd_hist", "atr", "adx", "rel_vol", "ret1"]
-        model_df = df[feature_cols + ["target"]].dropna()
-        if len(model_df) < 60:
+        data = _xgb_feature_frame(history_df)
+        if len(data) < 80:
             return None
+        features = [c for c in data.columns if c != "target"]
 
-        X_train = model_df[feature_cols].iloc[:-1]
-        y_train = model_df["target"].iloc[:-1]
-        X_last = model_df[feature_cols].iloc[[-1]]
+        # Measured accuracy is stored separately; it is NOT called confidence.
+        metrics = _xgb_chronological_validation(data)
+        if cache_key:
+            XGB_METRICS_CACHE[cache_key] = metrics
 
-        clf = xgb.XGBClassifier(
-            n_estimators=80, max_depth=3, learning_rate=0.08,
-            subsample=0.8, colsample_bytree=0.8, eval_metric="logloss",
-            verbosity=0,
-        )
-        clf.fit(X_train, y_train)
-        proba_up = clf.predict_proba(X_last)[0][1]
-        return safe_float(proba_up, 0.5)
+        train = data.iloc[:-1]
+        latest = data.iloc[[-1]]
+        if train["target"].nunique() < 2:
+            return None
+        clf = _xgb_make_model()
+        clf.fit(train[features], train["target"])
+        return safe_float(clf.predict_proba(latest[features])[0][1], 0.5)
     except Exception:
         return None
 
@@ -1062,7 +1120,7 @@ def scan_symbol(symbol: str, india_vix: float, index_change_pct: float, capital:
         smc_s = smart_money_score(del_s, feat["rel_vol"], oi_s, structure)
         sector_s = sector_index_strength(feat["day_change_pct"], index_change_pct)
 
-        ml_proba = xgb_probability(feat, df)
+        ml_proba = xgb_probability(feat, df, cache_key=symbol)
 
         # Rule-based bullish probability (0-100) blending every signal
         rule_components = {
@@ -1133,6 +1191,8 @@ def scan_symbol(symbol: str, india_vix: float, index_change_pct: float, capital:
         if not opt["available"]:
             remarks_bits.append("Option chain unavailable - equity signals only")
         remarks_bits.append(model_used)
+        if symbol in XGB_METRICS_CACHE and XGB_METRICS_CACHE[symbol].get("available"):
+            remarks_bits.append(f"Backtest accuracy {XGB_METRICS_CACHE[symbol].get('accuracy', 0)*100:.1f}% on {XGB_METRICS_CACHE[symbol].get('test_samples', 0)} unseen bars")
         ai_remarks = " | ".join(remarks_bits)
 
         row = {
@@ -1184,6 +1244,8 @@ def scan_symbol(symbol: str, india_vix: float, index_change_pct: float, capital:
             "Suggested Capital": plan.capital,
             "Expected ROI": plan.roi,
             "Expected Accuracy": safe_round(min(confidence, 92.0), 1),
+            "AI Backtest Accuracy %": safe_round(100 * XGB_METRICS_CACHE.get(symbol, {}).get("accuracy", float("nan")), 1),
+            "AI Test Samples": int(XGB_METRICS_CACHE.get(symbol, {}).get("test_samples", 0)),
             "AI Remarks": ai_remarks,
             "_rel_vol_raw": feat["rel_vol"],
             "_oi_conf_raw": oi_s,
