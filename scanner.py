@@ -1535,6 +1535,105 @@ def fetch_options_chain_data(fyers, symbol: str, expiry_timestamp: str = "") -> 
         return empty
 
 # ════════════════════════════════════════════════════════════════════════════════
+# F&O + OPTION CHAIN CONSENSUS ENGINE (ADDITIONAL / NON-INTRUSIVE)
+# ════════════════════════════════════════════════════════════════════════════════
+def _normalize_direction(value: Any) -> str:
+    """Normalize BUY/SELL/HOLD-style signal text to a simple direction."""
+    text = str(value or "").upper()
+    if "BUY" in text or "BULLISH" in text:
+        return "BUY"
+    if "SELL" in text or "BEARISH" in text:
+        return "SELL"
+    return "NEUTRAL"
+
+
+def calculate_consensus_row(row: pd.Series) -> dict[str, Any]:
+    """Compare the F&O price-action signal with the live option-chain bias.
+
+    This is an additive decision layer. It does not overwrite the original
+    F&O AI SIGNAL or OPTIONS BIAS columns. A conflict is deliberately mapped
+    to WAIT instead of forcing a BUY/SELL decision.
+    """
+    fo_dir = _normalize_direction(row.get("AI SIGNAL", row.get("F&O SIGNAL", "NEUTRAL")))
+    opt_dir = _normalize_direction(row.get("OPTIONS BIAS", "NEUTRAL"))
+    fo_conf = pd.to_numeric(pd.Series([row.get("AI CONFIDENCE %", 0)]), errors="coerce").iloc[0]
+    fo_conf = float(fo_conf) if pd.notna(fo_conf) else 0.0
+
+    pcr = pd.to_numeric(pd.Series([row.get("PCR", None)]), errors="coerce").iloc[0]
+    call_writing = str(row.get("CALL WRITING", row.get("Call Writing", ""))).upper() in ("TRUE", "YES", "1", "🟢 TRUE")
+    put_writing = str(row.get("PUT WRITING", row.get("Put Writing", ""))).upper() in ("TRUE", "YES", "1", "🟢 TRUE")
+
+    option_score = 50.0
+    option_reason = []
+    if opt_dir == "BUY":
+        option_score += 15
+        option_reason.append("Option bias bullish")
+    elif opt_dir == "SELL":
+        option_score -= 15
+        option_reason.append("Option bias bearish")
+
+    if pd.notna(pcr):
+        if float(pcr) >= 1.05:
+            option_score += 15
+            option_reason.append(f"PCR {float(pcr):.2f} bullish")
+        elif float(pcr) <= 0.80:
+            option_score -= 15
+            option_reason.append(f"PCR {float(pcr):.2f} bearish")
+
+    if put_writing and not call_writing:
+        option_score += 10
+        option_reason.append("Put writing")
+    elif call_writing and not put_writing:
+        option_score -= 10
+        option_reason.append("Call writing")
+
+    option_score = max(0.0, min(100.0, option_score))
+
+    if fo_dir == "BUY" and opt_dir == "BUY":
+        final = "🔥 STRONG BUY"
+        status = "ALIGNED"
+        reason = "F&O BUY + Option Chain BULLISH"
+    elif fo_dir == "SELL" and opt_dir == "SELL":
+        final = "🔥 STRONG SELL"
+        status = "ALIGNED"
+        reason = "F&O SELL + Option Chain BEARISH"
+    elif fo_dir == "BUY" and opt_dir == "SELL":
+        final = "⚠️ CONFLICT / WAIT"
+        status = "CONFLICT"
+        reason = "F&O BUY vs Option Chain BEARISH"
+    elif fo_dir == "SELL" and opt_dir == "BUY":
+        final = "⚠️ CONFLICT / WAIT"
+        status = "CONFLICT"
+        reason = "F&O SELL vs Option Chain BULLISH"
+    else:
+        final = "🟡 CONFIRMATION REQUIRED"
+        status = "NEUTRAL"
+        reason = "One or both engines are neutral"
+
+    consensus_score = max(0.0, min(100.0, (fo_conf + option_score) / 2.0))
+    return {
+        "F&O DIRECTION": fo_dir,
+        "OPTION DIRECTION": opt_dir,
+        "OPTION SCORE %": round(option_score, 1),
+        "CONSENSUS STATUS": status,
+        "CONSENSUS": final,
+        "CONSENSUS SCORE %": round(consensus_score, 1),
+        "CONFLICT / CONFIRMATION REASON": reason + (" | " + "; ".join(option_reason) if option_reason else ""),
+    }
+
+
+def add_consensus_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Add F&O + Option Chain consensus columns without changing old columns."""
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+    consensus = out.apply(calculate_consensus_row, axis=1, result_type="expand")
+    for col in consensus.columns:
+        out[col] = consensus[col]
+    return out
+
+
+# ════════════════════════════════════════════════════════════════════════════════
 # STRICT MULTI-TIMEFRAME SIGNAL VALIDATION ENGINE (FIXED)
 # ════════════════════════════════════════════════════════════════════════════════
 def calculate_master_signal(symbol: str, analysis_5m: Dict, analysis_15m: Dict, analysis_1h: Dict, options_data: Dict = None) -> Dict[str, Any]:
@@ -2453,6 +2552,10 @@ def _fetch_fo_signal(fyers, symbol: str):
             "CE OI CHANGE": options_data.get("ce_oi_change", "N/A"),
             "PE OI CHANGE": options_data.get("pe_oi_change", "N/A"),
             "OPTIONS BIAS": options_data.get("options_bias", "N/A"),
+            "CALL WRITING": options_data.get("call_writing", False),
+            "PUT WRITING": options_data.get("put_writing", False),
+            "CALL UNWINDING": options_data.get("call_unwinding", False),
+            "PUT UNWINDING": options_data.get("put_unwinding", False),
             "AI SIGNAL": master["final_signal"],
             "AI CONFIDENCE %": master["confidence"],
             "SIGNAL REASON": master["signal_reason"],
@@ -3471,6 +3574,7 @@ def show_scanner(fyers) -> None:
         "📈 SWING (GOLDEN/DEATH CROSS)",
         "🧠 AI PRO REPORT",
         "📊 MARKET DASHBOARD",
+        "🤝 F&O + OPTION CONSENSUS",
         "⚙️ SETTINGS",
         "📌 PIN RULES"
     ])
@@ -4214,9 +4318,56 @@ def show_scanner(fyers) -> None:
             st.info(f"👈 Run '{dashboard_source}' scanner first")
     
     # ════════════════════════════════════════════════════════════════════════════════
-    # TAB 8: SETTINGS
+    # TAB 8: F&O + OPTION CHAIN CONSENSUS
     # ════════════════════════════════════════════════════════════════════════════════
     with tabs[8]:
+        st.markdown("### 🤝 F&O + OPTION CHAIN CONSENSUS")
+        st.caption("Existing F&O signal + live option-chain bias. Conflicts are intentionally shown as WAIT; original scanner signals remain unchanged.")
+
+        raw_fo = st.session_state.get("fo_df", pd.DataFrame())
+        if raw_fo is not None and not raw_fo.empty:
+            consensus_df = add_consensus_columns(raw_fo)
+
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("F&O BUY", int((consensus_df["F&O DIRECTION"] == "BUY").sum()))
+            c2.metric("F&O SELL", int((consensus_df["F&O DIRECTION"] == "SELL").sum()))
+            c3.metric("🔥 ALIGNED", int((consensus_df["CONSENSUS STATUS"] == "ALIGNED").sum()))
+            c4.metric("⚠️ CONFLICT", int((consensus_df["CONSENSUS STATUS"] == "CONFLICT").sum()))
+
+            cc1, cc2 = st.columns(2)
+            with cc1:
+                consensus_filter = st.selectbox(
+                    "Final Consensus",
+                    ["ALL", "🔥 STRONG BUY", "🔥 STRONG SELL", "⚠️ CONFLICT / WAIT", "🟡 CONFIRMATION REQUIRED"],
+                    key="consensus_filter"
+                )
+            with cc2:
+                min_consensus = st.slider("Minimum Consensus Score %", 0, 100, 50, 5, key="consensus_score_filter")
+
+            view = consensus_df.copy()
+            view["CONSENSUS SCORE %"] = pd.to_numeric(view["CONSENSUS SCORE %"], errors="coerce").fillna(0)
+            view = view[view["CONSENSUS SCORE %"] >= min_consensus]
+            if consensus_filter != "ALL":
+                view = view[view["CONSENSUS"] == consensus_filter]
+
+            preferred_cols = [
+                "Symbol", "LTP", "AI SIGNAL", "AI CONFIDENCE %",
+                "OPTIONS BIAS", "PCR", "CE OI", "PE OI",
+                "CE OI CHANGE", "PE OI CHANGE", "CALL WRITING", "PUT WRITING",
+                "F&O DIRECTION", "OPTION DIRECTION", "OPTION SCORE %",
+                "CONSENSUS STATUS", "CONSENSUS", "CONSENSUS SCORE %",
+                "CONFLICT / CONFIRMATION REASON", "ENTRY", "STOP LOSS", "TARGET 1", "TARGET 2"
+            ]
+            display_cols = [c for c in preferred_cols if c in view.columns]
+            st.dataframe(view[display_cols].sort_values("CONSENSUS SCORE %", ascending=False), use_container_width=True, hide_index=True)
+            _excel_download_button(view[display_cols], "F&O_OPTION_CONSENSUS", "download_consensus_excel")
+        else:
+            st.info("👈 Run the F&O STOCKS scanner first. Consensus will use the latest F&O results and their live option-chain data.")
+
+    # ════════════════════════════════════════════════════════════════════════════════
+    # TAB 9: SETTINGS
+    # ════════════════════════════════════════════════════════════════════════════════
+    with tabs[9]:
         st.markdown("### ⚙️ Scanner Settings & Configuration")
         
         st.markdown("#### 🎯 Signal Filtering")
