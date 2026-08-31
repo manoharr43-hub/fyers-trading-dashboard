@@ -2291,6 +2291,28 @@ def to_json_bytes(df) -> bytes:
         logging.error(f"JSON export error: {e}")
         return b'{"error": "Could not export to JSON"}'
 
+
+def _get_candle_signal_time(df, close_bar=True):
+    """Return latest candle completion time in IST as a display string."""
+    try:
+        if df is None or len(df) == 0:
+            return _now_ist().strftime("%d-%b-%Y %H:%M:%S IST")
+        if "Time" in df.columns:
+            ts = pd.to_datetime(df["Time"].iloc[-1], errors="coerce")
+        else:
+            ts = pd.to_datetime(df.index[-1], errors="coerce")
+        if pd.isna(ts):
+            return _now_ist().strftime("%d-%b-%Y %H:%M:%S IST")
+        if getattr(ts, "tzinfo", None) is None:
+            ts = ts.tz_localize(IST)
+        else:
+            ts = ts.tz_convert(IST)
+        if close_bar:
+            ts = ts + timedelta(minutes=5)
+        return ts.strftime("%d-%b-%Y %H:%M:%S IST")
+    except Exception:
+        return _now_ist().strftime("%d-%b-%Y %H:%M:%S IST")
+
 # ════════════════════════════════════════════════════════════════════════════════
 # NSE SIGNAL SCANNER WORKER
 # ════════════════════════════════════════════════════════════════════════════════
@@ -2331,6 +2353,7 @@ def _fetch_nse_signal(fyers, symbol: str):
         
         return {
             "Symbol": stock_ticker,
+            "SIGNAL TIME": _get_candle_signal_time(analysis_5m.get("df")),
             "LTP": round(float(ltp), 2),
             "Trend": data_5m.get("structure_trend", "N/A"),
             "5M Trend": data_5m.get("structure_trend", "N/A"),
@@ -2416,6 +2439,7 @@ def _fetch_fo_signal(fyers, symbol: str):
         
         return {
             "Symbol": stock_ticker,
+            "SIGNAL TIME": _get_candle_signal_time(analysis_5m.get("df")),
             "LTP": round(float(ltp), 2),
             "Trend": data_5m.get("structure_trend", "N/A"),
             "5M Trend": data_5m.get("structure_trend", "N/A"),
@@ -3201,6 +3225,7 @@ def _pin_stage2_confirm(fyers, candidate):
             a1h.get("data", {}) if a1h.get("status") == "OK" else {},
         )
         pin["Symbol"] = display_symbol
+        pin["SIGNAL TIME"] = _get_candle_signal_time(a5.get("df"))
         pin["LTP"] = (a5.get("data", {}) or {}).get("close", "N/A")
         return pin, None
     except Exception as e:
@@ -3370,7 +3395,7 @@ def _show_pin_rules_tab(fyers, all_symbols=None, fo_symbols=None) -> None:
         pc4.metric("💧 SWEEPS", int((sweep_series != "NONE").sum()))
 
         display_cols = [
-            "Symbol", "LTP", "PIN SIGNAL", "PIN SCORE", "LIQUIDITY", "SWEEP",
+            "Symbol", "SIGNAL TIME", "LTP", "PIN SIGNAL", "PIN SCORE", "LIQUIDITY", "SWEEP",
             "REVERSAL", "EQUAL HIGH", "EQUAL LOW", "BIG MOVEMENT", "BIG MOVE SCORE",
             "STRUCTURE", "5M TREND", "15M TREND", "1H TREND", "RVOL", "RSI",
             "PRESSURE", "AI CONFIDENCE %", "AI SIGNAL", "REASON"
@@ -3863,7 +3888,13 @@ def show_scanner(fyers) -> None:
                 except:
                     pass
             
-            if intraday_show_cols:
+            if "SIGNAL TIME" in intraday_filtered.columns:
+                _intraday_cols = list(intraday_show_cols) if intraday_show_cols else list(intraday_filtered.columns)
+                if "SIGNAL TIME" not in _intraday_cols:
+                    _intraday_cols = ["SIGNAL TIME"] + _intraday_cols
+                _intraday_cols = [c for c in _intraday_cols if c in intraday_filtered.columns]
+                st.dataframe(intraday_filtered[_intraday_cols], use_container_width=True, height=400)
+            elif intraday_show_cols:
                 st.dataframe(intraday_filtered[intraday_show_cols], use_container_width=True, height=400)
             else:
                 st.dataframe(intraday_filtered, use_container_width=True, height=400)
@@ -3967,6 +3998,11 @@ def show_scanner(fyers) -> None:
                                 "EMA Trend": cc_data.get("ema_trend", "N/A"),
                                 "Signal": cc_data.get("signal", "NONE"),
                                 "Signal Date": cc_data.get("signal_date", "N/A"),
+                                "SIGNAL TIME": (
+                                    pd.to_datetime(cc_data.get("signal_date"), errors="coerce").strftime("%d-%b-%Y %H:%M:%S IST")
+                                    if pd.notna(pd.to_datetime(cc_data.get("signal_date"), errors="coerce"))
+                                    else _now_ist().strftime("%d-%b-%Y %H:%M:%S IST")
+                                ),
                             })
                     except:
                         pass
