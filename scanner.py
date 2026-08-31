@@ -2549,15 +2549,17 @@ def detect_block_order_activity(df: pd.DataFrame) -> Dict[str, Any]:
 
 
 def detect_live_sudden_move(df: pd.DataFrame) -> Dict[str, Any]:
-    """Detect CURRENT sudden 5M BUY/SELL movement. No consolidation required."""
+    """Intraday movement + EARLY PRE-MOVE detector using completed 5M candles.
+    Detects both a move that has started and compression/pressure building before the move.
+    """
     result = {
         "signal": "NO MOVE", "direction": "NONE", "score": 0.0,
         "reason": "", "move_pct": 0.0, "body_pct": 0.0,
         "body_atr": 0.0, "rvol": 0.0, "structure": "NONE",
         "hh_hl": False, "lh_ll": False, "price_acceleration": 0.0,
-        "volume_spike": False,
+        "volume_spike": False, "PRE-MOVE": "NO", "PRE-MOVE SCORE": 0.0,
     }
-    if df is None or len(df) < 12:
+    if df is None or len(df) < 20:
         result["reason"] = "Insufficient recent 5M candles"
         return result
     try:
@@ -2577,10 +2579,9 @@ def detect_live_sudden_move(df: pd.DataFrame) -> Dict[str, Any]:
         atr = float(atr_s.iloc[-1]) if len(atr_s) and pd.notna(atr_s.iloc[-1]) else max(c * 0.003, 0.01)
         body_atr = body / atr if atr > 0 else 0.0
 
-        vol_base = float(d["Volume"].iloc[-11:-1].mean()) if len(d) >= 11 else float(d["Volume"].iloc[:-1].mean())
+        vol_base = float(d["Volume"].iloc[-11:-1].mean()) if len(d) >= 11 else 0.0
         rvol = v / vol_base if vol_base > 0 else 0.0
 
-        # Recent acceleration: current candle move versus average of last few candle moves.
         moves = []
         for i in range(max(1, len(d)-6), len(d)-1):
             pc = float(d["Close"].iloc[i-1]); cc = float(d["Close"].iloc[i])
@@ -2589,7 +2590,6 @@ def detect_live_sudden_move(df: pd.DataFrame) -> Dict[str, Any]:
         avg_move = float(np.mean(moves)) if moves else 0.0
         acceleration = abs(move_pct) / avg_move if avg_move > 0 else 0.0
 
-        # Recent market structure, not old daily/history setup.
         ph, pl = _confirmed_pivots(d.tail(20), left=1, right=1)
         hh_hl = lh_ll = False
         if len(ph) >= 2 and len(pl) >= 2:
@@ -2605,8 +2605,10 @@ def detect_live_sudden_move(df: pd.DataFrame) -> Dict[str, Any]:
         very_strong_body = body_pct >= 65.0
         acceleration_ok = acceleration >= 1.30
 
-        buy = 0.0
-        sell = 0.0
+        # ------------------------------------------------------------
+        # CURRENT MOVE score
+        # ------------------------------------------------------------
+        buy = sell = 0.0
         if bullish: buy += 20
         if move_pct >= LIVE_MOVE_MIN_PCT: buy += 20
         if move_pct >= LIVE_MOVE_BIG_PCT: buy += 10
@@ -2626,9 +2628,51 @@ def detect_live_sudden_move(df: pd.DataFrame) -> Dict[str, Any]:
         if strong_volume: sell += 5
         if move_pct < 0 and acceleration_ok: sell += 10
         if lh_ll: sell += 10
+        buy, sell = min(100.0, buy), min(100.0, sell)
 
-        buy = min(100.0, buy); sell = min(100.0, sell)
-        score = max(buy, sell)
+        # ------------------------------------------------------------
+        # EARLY PRE-MOVE score: movement is NOT yet large.
+        # Looks for compression + building volume + directional pressure.
+        # ------------------------------------------------------------
+        recent = d.tail(6).copy()
+        ranges = (recent["High"] - recent["Low"]).astype(float)
+        atr_recent = float(calculate_atr(d, 14).iloc[-1]) if len(d) else atr
+        range_now = float(ranges.iloc[-1])
+        range_avg = float(ranges.iloc[:-1].mean()) if len(ranges) > 1 else range_now
+        compression = range_now <= max(range_avg * 0.85, atr_recent * 0.75)
+        vol_prev = float(d["Volume"].iloc[-6:-2].mean()) if len(d) >= 6 else 0.0
+        vol_recent = float(d["Volume"].iloc[-2:].mean()) if len(d) >= 2 else 0.0
+        volume_building = vol_prev > 0 and vol_recent >= vol_prev * 1.15
+        close_pos = (c-l) / candle_range if candle_range > 0 else 0.5
+        near_high = close_pos >= 0.72
+        near_low = close_pos <= 0.28
+        small_positive = 0.02 <= move_pct < LIVE_MOVE_MIN_PCT
+        small_negative = -LIVE_MOVE_MIN_PCT < move_pct <= -0.02
+        pressure_buy = float((recent["Close"] > recent["Open"]).sum()) >= 4
+        pressure_sell = float((recent["Close"] < recent["Open"]).sum()) >= 4
+
+        pre_buy = 0.0
+        pre_sell = 0.0
+        if compression: pre_buy += 20; pre_sell += 20
+        if volume_building: pre_buy += 20; pre_sell += 20
+        if 1.05 <= rvol < LIVE_MOVE_MIN_RVOL: pre_buy += 10; pre_sell += 10
+        if small_positive: pre_buy += 15
+        if small_negative: pre_sell += 15
+        if near_high: pre_buy += 10
+        if near_low: pre_sell += 10
+        if pressure_buy: pre_buy += 10
+        if pressure_sell: pre_sell += 10
+        if hh_hl: pre_buy += 15
+        if lh_ll: pre_sell += 15
+        if move_pct > 0 and acceleration >= 1.05: pre_buy += 10
+        if move_pct < 0 and acceleration >= 1.05: pre_sell += 10
+        pre_buy, pre_sell = min(100.0, pre_buy), min(100.0, pre_sell)
+        pre_score = max(pre_buy, pre_sell)
+
+        # A pre-move must not already be a full-size move; this avoids labeling
+        # an ordinary completed BIG BUY as PRE-BIG BUY.
+        pre_buy_ok = pre_buy >= 65 and pre_buy > pre_sell and abs(move_pct) < LIVE_MOVE_MIN_PCT
+        pre_sell_ok = pre_sell >= 65 and pre_sell > pre_buy and abs(move_pct) < LIVE_MOVE_MIN_PCT
 
         if buy >= LIVE_MOVE_MIN_SCORE and buy > sell:
             direction = "BUY"
@@ -2646,9 +2690,20 @@ def detect_live_sudden_move(df: pd.DataFrame) -> Dict[str, Any]:
             if acceleration_ok: reasons.append("Acceleration")
             reason = " + ".join(reasons)
             score = sell
+        elif pre_buy_ok:
+            direction = "BUY"
+            signal = "🟡 PRE-BIG BUY"
+            score = pre_buy
+            reason = "Compression + Volume Building + " + ("HH/HL" if hh_hl else "Bullish Pressure")
+        elif pre_sell_ok:
+            direction = "SELL"
+            signal = "🟡 PRE-BIG SELL"
+            score = pre_sell
+            reason = "Compression + Volume Building + " + ("LH/LL" if lh_ll else "Bearish Pressure")
         else:
             direction = "NONE"
             signal = "NO MOVE"
+            score = max(buy, sell, pre_score)
             reason = f"Move {move_pct:.2f}% | RVOL {rvol:.2f}x | Body {body_pct:.0f}% | Structure {structure}"
 
         result.update({
@@ -2659,12 +2714,13 @@ def detect_live_sudden_move(df: pd.DataFrame) -> Dict[str, Any]:
             "hh_hl": hh_hl, "lh_ll": lh_ll,
             "price_acceleration": round(acceleration, 2),
             "volume_spike": volume_spike,
+            "PRE-MOVE": "BUY" if pre_buy_ok else "SELL" if pre_sell_ok else "NO",
+            "PRE-MOVE SCORE": round(pre_score, 1),
         })
         return result
     except Exception as e:
         result["reason"] = f"ERROR: {str(e)[:120]}"
         return result
-
 
 def _fetch_momentum_signal(fyers, symbol: str, is_fo: bool = False):
     """LIVE SUDDEN MOVEMENT worker: recent 5M candles only."""
@@ -2717,6 +2773,8 @@ def _fetch_momentum_signal(fyers, symbol: str, is_fo: bool = False):
             "ACCELERATION": move["price_acceleration"],
             "VOLUME SPIKE": "🔥" if move["volume_spike"] else "−",
             "SCORE": move["score"],
+            "PRE-MOVE": move.get("PRE-MOVE", "NO"),
+            "PRE-MOVE SCORE": move.get("PRE-MOVE SCORE", 0),
             "BLOCK ORDER SCORE": block["block_score"],
             "BLOCK ACTIVITY": block["block_signal"],
             "BLOCK SIDE": block["block_side"],
@@ -3841,7 +3899,7 @@ def show_scanner(fyers) -> None:
     # ════════════════════════════════════════════════════════════════════════════════
     with tabs[2]:
         st.markdown("### ⚡ LIVE MOVEMENT — INTRADAY BIG BUY / BIG SELL")
-        st.caption("Latest completed 5M candle only: sudden move + volume/RVOL + acceleration + HH/HL or LH/LL. No previous consolidation, 15M, 1H or EMA confirmation.")
+        st.caption("Completed 5M candles: current BIG BUY/SELL + EARLY PRE-BIG BUY/SELL. Early warning uses compression + volume building + directional pressure; no 15M/1H/EMA confirmation.")
 
         col_m1, col_m2, col_m3 = st.columns([2, 2, 1])
         with col_m1:
