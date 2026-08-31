@@ -247,6 +247,16 @@ MOMENTUM_MIN_BODY_PCT = 20
 MOMENTUM_DISPLAY_COUNT = 10
 
 # ════════════════════════════════════════════════════════════════════════════════
+# LIVE EXCHANGE MARKET DEPTH / ORDER FLOW
+# Uses FYERS Market Depth snapshots (real bid/ask book), not TradingView footprint.
+# ════════════════════════════════════════════════════════════════════════════════
+DEPTH_SCAN_LIMIT_DEFAULT = 30
+DEPTH_MIN_IMBALANCE = 15.0
+DEPTH_STRONG_IMBALANCE = 35.0
+DEPTH_BIG_QTY_MULTIPLIER = 2.0
+DEPTH_TOP_LEVELS = 5
+
+# ════════════════════════════════════════════════════════════════════════════════
 # 15-MIN REVERSAL SCANNER CONSTANTS (ORIGINAL)
 # ════════════════════════════════════════════════════════════════════════════════
 REVERSAL_RESOLUTION = "15"
@@ -618,52 +628,6 @@ def detect_big_move_setup(df: pd.DataFrame) -> Dict[str, Any]:
     except Exception as e:
         out["reason"] = f"BIG MOVE error: {type(e).__name__}"
         return out
-
-
-def detect_po3_phase(df: pd.DataFrame) -> Dict[str, Any]:
-    """PO3-style Accumulation -> Manipulation -> Distribution detector using OHLCV.
-    This is a probability/rule model, not proof of institutional manipulation.
-    """
-    out = {"PO3 PHASE":"NONE","PO3 SIGNAL":"WAIT","PO3 SCORE":0.0,
-           "ACCUMULATION":"NO","MANIPULATION":"NO","DISTRIBUTION":"NO",
-           "PO3 EVENT":"NONE","PO3 REASON":"Insufficient data"}
-    if df is None or len(df) < 35: return out
-    try:
-        d=df.reset_index(drop=True).copy()
-        for col in ["Open","High","Low","Close","Volume"]: d[col]=pd.to_numeric(d[col],errors="coerce")
-        d=d.dropna(subset=["Open","High","Low","Close","Volume"]).reset_index(drop=True)
-        if len(d)<35: return out
-        last=d.iloc[-1]; o,h,l,c,v=[float(last[x]) for x in ["Open","High","Low","Close","Volume"]]
-        atrs=calculate_atr(d,14); atr=float(atrs.iloc[-1]) if pd.notna(atrs.iloc[-1]) and float(atrs.iloc[-1])>0 else max(c*.005,.01)
-        zone=d.iloc[-23:-3]; zhi=float(zone["High"].max()); zlo=float(zone["Low"].min()); zmid=(zhi+zlo)/2
-        range_pct=(zhi-zlo)/zmid*100 if zmid>0 else 999
-        median_range=float((zone["High"]-zone["Low"]).median())
-        compression=range_pct<=4.0 and median_range<=atr*1.15
-        ph,pl=_confirmed_pivots(d.iloc[:-1],left=2,right=2)
-        hh=lh=hl=ll=False
-        if len(ph)>=2: hh=ph[-1][1]>ph[-2][1]; lh=ph[-1][1]<ph[-2][1]
-        if len(pl)>=2: hl=pl[-1][1]>pl[-2][1]; ll=pl[-1][1]<pl[-2][1]
-        low_sweep=l<zlo and c>zlo; high_sweep=h>zhi and c<zhi
-        body=abs(c-o); rng=max(h-l,1e-9); lower_wick=min(o,c)-l; upper_wick=h-max(o,c); close_pos=(c-l)/rng
-        base=float(d["Volume"].iloc[-21:-1].mean()) if len(d)>=22 else float(d["Volume"].mean()); rvol=v/base if base>0 else 0
-        acc=(30 if compression else 0)+(20 if hl else 0)+(25 if low_sweep else 0)+(10 if c>zmid else 0)+(15 if rvol>=1.2 and c>o else 0)
-        dist=(30 if compression else 0)+(20 if lh else 0)+(25 if high_sweep else 0)+(10 if c<zmid else 0)+(15 if rvol>=1.2 and c<o else 0)
-        bull_manip=low_sweep and lower_wick>=body and close_pos>=.55
-        bear_manip=high_sweep and upper_wick>=body and close_pos<=.45
-        if bull_manip:
-            phase,event,signal="MANIPULATION","LOW SWEEP + RECLAIM","🟢 PO3 BUY"; score=min(100,max(60,acc+15)); reason=f"Low sweep/reclaim | RVOL {rvol:.2f}x | range {range_pct:.2f}%"
-        elif bear_manip:
-            phase,event,signal="MANIPULATION","HIGH SWEEP + REJECTION","🔴 PO3 SELL"; score=min(100,max(60,dist+15)); reason=f"High sweep/rejection | RVOL {rvol:.2f}x | range {range_pct:.2f}%"
-        elif acc>=50 and compression:
-            phase,event,signal="ACCUMULATION","RANGE + DEMAND","🟡 PO3 ACCUMULATION"; score=min(100,acc); reason=f"Range compression + demand/HL | RVOL {rvol:.2f}x | range {range_pct:.2f}%"
-        elif dist>=50 and compression:
-            phase,event,signal="DISTRIBUTION","RANGE + SUPPLY","🟠 PO3 DISTRIBUTION"; score=min(100,dist); reason=f"Range compression + supply/LH | RVOL {rvol:.2f}x | range {range_pct:.2f}%"
-        else:
-            phase,event,signal="NONE","NONE","WAIT"; score=max(acc,dist) if compression else 0; reason="No strong PO3 phase confirmation"
-        out.update({"PO3 PHASE":phase,"PO3 SIGNAL":signal,"PO3 SCORE":round(score,1),"ACCUMULATION":"YES" if acc>=50 and compression else "NO","MANIPULATION":"YES" if bull_manip or bear_manip else "NO","DISTRIBUTION":"YES" if dist>=50 and compression else "NO","PO3 EVENT":event,"PO3 REASON":reason})
-        return out
-    except Exception as e:
-        out["PO3 REASON"]=f"PO3 error: {type(e).__name__}"; return out
 
 def calculate_momentum_score(analysis_5m: Dict, analysis_15m: Dict, analysis_1h: Dict, movement_metrics: Dict, is_bullish: bool) -> Dict[str, Any]:
     """Calculate momentum score (0-100) based on multiple factors."""
@@ -2291,28 +2255,6 @@ def to_json_bytes(df) -> bytes:
         logging.error(f"JSON export error: {e}")
         return b'{"error": "Could not export to JSON"}'
 
-
-def _get_candle_signal_time(df, close_bar=True):
-    """Return latest candle completion time in IST as a display string."""
-    try:
-        if df is None or len(df) == 0:
-            return _now_ist().strftime("%d-%b-%Y %H:%M:%S IST")
-        if "Time" in df.columns:
-            ts = pd.to_datetime(df["Time"].iloc[-1], errors="coerce")
-        else:
-            ts = pd.to_datetime(df.index[-1], errors="coerce")
-        if pd.isna(ts):
-            return _now_ist().strftime("%d-%b-%Y %H:%M:%S IST")
-        if getattr(ts, "tzinfo", None) is None:
-            ts = ts.tz_localize(IST)
-        else:
-            ts = ts.tz_convert(IST)
-        if close_bar:
-            ts = ts + timedelta(minutes=5)
-        return ts.strftime("%d-%b-%Y %H:%M:%S IST")
-    except Exception:
-        return _now_ist().strftime("%d-%b-%Y %H:%M:%S IST")
-
 # ════════════════════════════════════════════════════════════════════════════════
 # NSE SIGNAL SCANNER WORKER
 # ════════════════════════════════════════════════════════════════════════════════
@@ -2353,7 +2295,6 @@ def _fetch_nse_signal(fyers, symbol: str):
         
         return {
             "Symbol": stock_ticker,
-            "SIGNAL TIME": _get_candle_signal_time(analysis_5m.get("df")),
             "LTP": round(float(ltp), 2),
             "Trend": data_5m.get("structure_trend", "N/A"),
             "5M Trend": data_5m.get("structure_trend", "N/A"),
@@ -2383,7 +2324,6 @@ def _fetch_nse_signal(fyers, symbol: str):
             "PRESSURE SIGNAL": data_5m.get("pressure_trend", "N/A"),
             "NEXT CANDLE BIAS": next_bias.get("bias", "NEUTRAL"),
             "NEXT CANDLE CONFIDENCE %": next_bias.get("confidence", 0.0),
-            **detect_po3_phase(analysis_5m.get("df")),
             "AI SIGNAL": master["final_signal"],
             "AI CONFIDENCE %": master["confidence"],
             "SIGNAL REASON": master["signal_reason"],
@@ -2439,7 +2379,6 @@ def _fetch_fo_signal(fyers, symbol: str):
         
         return {
             "Symbol": stock_ticker,
-            "SIGNAL TIME": _get_candle_signal_time(analysis_5m.get("df")),
             "LTP": round(float(ltp), 2),
             "Trend": data_5m.get("structure_trend", "N/A"),
             "5M Trend": data_5m.get("structure_trend", "N/A"),
@@ -2469,7 +2408,6 @@ def _fetch_fo_signal(fyers, symbol: str):
             "PRESSURE SIGNAL": data_5m.get("pressure_trend", "N/A"),
             "NEXT CANDLE BIAS": next_bias.get("bias", "NEUTRAL"),
             "NEXT CANDLE CONFIDENCE %": next_bias.get("confidence", 0.0),
-            **detect_po3_phase(analysis_5m.get("df")),
             "ATM STRIKE": round(options_data.get("atm_strike", 0), 2) if options_data.get("atm_strike") else "N/A",
             "PCR": options_data.get("pcr", "N/A"),
             "CE OI": options_data.get("ce_oi", "N/A"),
@@ -2742,20 +2680,32 @@ def _fetch_momentum_signal(fyers, symbol: str, is_fo: bool = False):
         move = detect_live_sudden_move(df5)
         block = detect_block_order_activity(df5)
         ltp = float(df5["Close"].iloc[-1])
-        # Signal time = the CLOSED 5M candle that generated the movement signal.
-        candle_ts = df5["Time"].iloc[-1]
-        if getattr(candle_ts, "tzinfo", None) is None:
-            candle_ts = candle_ts.tz_localize(IST)
-        candle_ts_ist = candle_ts.tz_convert(IST)
-        signal_time = (candle_ts_ist + timedelta(minutes=5)).strftime("%d-%b-%Y %H:%M:%S IST")
-        signal_age_min = max(0.0, (_now_ist() - (candle_ts_ist + timedelta(minutes=5))).total_seconds() / 60.0)
+
+        # The scanner removes an unfinished 5M candle in _fetch_timeframe_data().
+        # Therefore the last candle here is the latest completed 5M candle.
+        signal_ts = df5["Time"].iloc[-1] if "Time" in df5.columns else None
+        if signal_ts is not None:
+            try:
+                signal_time = pd.Timestamp(signal_ts)
+                if signal_time.tzinfo is None:
+                    signal_time = signal_time.tz_localize("Asia/Kolkata")
+                else:
+                    signal_time = signal_time.tz_convert("Asia/Kolkata")
+                signal_age_min = max(0.0, (_now_ist() - signal_time).total_seconds() / 60.0)
+                signal_time_text = signal_time.strftime("%d-%b-%Y %H:%M:%S")
+            except Exception:
+                signal_age_min = 0.0
+                signal_time_text = _now_ist().strftime("%d-%b-%Y %H:%M:%S")
+        else:
+            signal_age_min = 0.0
+            signal_time_text = _now_ist().strftime("%d-%b-%Y %H:%M:%S")
 
         result = {
             "Symbol": stock_ticker,
             "LTP": round(ltp, 2),
-            "SIGNAL": move["signal"],
-            "SIGNAL TIME": signal_time,
+            "SIGNAL TIME": signal_time_text,
             "SIGNAL AGE (MIN)": round(signal_age_min, 1),
+            "SIGNAL": move["signal"],
             "DIRECTION": move["direction"],
             "MOVE %": move["move_pct"],
             "BODY %": move["body_pct"],
@@ -2891,138 +2841,6 @@ def run_momentum_scan(fyers, symbols, is_fo: bool = False):
     return results, errors, stats
 
 
-
-# ════════════════════════════════════════════════════════════════════════════════
-# AI PRO V19 — EXPLAINABLE ENSEMBLE / DECISION ENGINE
-# No external AI API required. Scores existing market evidence; does not claim
-# access to hidden order-book data or predictive certainty.
-# ════════════════════════════════════════════════════════════════════════════════
-
-AI_MIN_SCORE = 70.0
-AI_STRONG_SCORE = 82.0
-
-def _ai_num(v, default=0.0):
-    try:
-        x = float(v)
-        return default if not np.isfinite(x) else x
-    except Exception:
-        return default
-
-def calculate_ai_decision(row: Dict[str, Any]) -> Dict[str, Any]:
-    """Explainable ensemble using existing scanner outputs."""
-    r = {str(k).upper(): v for k, v in (row or {}).items()}
-
-    buy = 0.0
-    sell = 0.0
-    reasons_buy = []
-    reasons_sell = []
-
-    conf = _ai_num(r.get("AI CONFIDENCE %", r.get("CONFIDENCE %", 0)))
-    pin = _ai_num(r.get("PIN SCORE", 0))
-    big = _ai_num(r.get("BIG MOVE SCORE", 0))
-    rvol = _ai_num(r.get("RVOL", 0))
-
-    signal = str(r.get("AI SIGNAL", r.get("SIGNAL", ""))).upper()
-    pin_signal = str(r.get("PIN SIGNAL", "")).upper()
-    structure = str(r.get("STRUCTURE", "")).upper()
-    trend = str(r.get("5M TREND", r.get("TREND", ""))).upper()
-    reversal = str(r.get("REVERSAL", "")).upper()
-    sweep = str(r.get("SWEEP", "")).upper()
-
-    # Existing confidence is evidence, not a guarantee.
-    if "BUY" in signal:
-        buy += min(30, conf * 0.30)
-        reasons_buy.append("scanner BUY")
-    elif "SELL" in signal:
-        sell += min(30, conf * 0.30)
-        reasons_sell.append("scanner SELL")
-
-    if "BUY" in pin_signal:
-        buy += 20
-        reasons_buy.append("PIN BUY")
-    elif "SELL" in pin_signal:
-        sell += 20
-        reasons_sell.append("PIN SELL")
-
-    if "BULL" in trend or "BULL" in structure:
-        buy += 12
-        reasons_buy.append("bullish structure")
-    if "BEAR" in trend or "BEAR" in structure:
-        sell += 12
-        reasons_sell.append("bearish structure")
-
-    if "BULL" in reversal:
-        buy += 15
-        reasons_buy.append("bullish reversal")
-    elif "BEAR" in reversal:
-        sell += 15
-        reasons_sell.append("bearish reversal")
-
-    if "LOW SWEPT" in sweep:
-        buy += 10
-        reasons_buy.append("liquidity low sweep")
-    elif "HIGH SWEPT" in sweep:
-        sell += 10
-        reasons_sell.append("liquidity high sweep")
-
-    if big >= 70:
-        if "UP" in str(r.get("BIG MOVEMENT", "")).upper():
-            buy += 15
-            reasons_buy.append("big move UP")
-        elif "DOWN" in str(r.get("BIG MOVEMENT", "")).upper():
-            sell += 15
-            reasons_sell.append("big move DOWN")
-
-    # RVOL is confirmation only.
-    if rvol >= 1.5:
-        if buy > sell:
-            buy += 8
-            reasons_buy.append("high RVOL")
-        elif sell > buy:
-            sell += 8
-            reasons_sell.append("high RVOL")
-
-    buy = min(100.0, buy)
-    sell = min(100.0, sell)
-    score = max(buy, sell)
-    direction = "BUY" if buy > sell else "SELL" if sell > buy else "WAIT"
-
-    if direction == "BUY" and score >= AI_STRONG_SCORE:
-        decision = "🔥 AI STRONG BUY"
-    elif direction == "SELL" and score >= AI_STRONG_SCORE:
-        decision = "🔥 AI STRONG SELL"
-    elif direction == "BUY" and score >= AI_MIN_SCORE:
-        decision = "🟢 AI BUY"
-    elif direction == "SELL" and score >= AI_MIN_SCORE:
-        decision = "🔴 AI SELL"
-    else:
-        decision = "🟡 AI WAIT"
-
-    reason = " | ".join(
-        (reasons_buy if direction == "BUY" else reasons_sell)
-    ) or "insufficient confluence"
-
-    return {
-        "AI DECISION": decision,
-        "AI SCORE": round(score, 1),
-        "AI BUY SCORE": round(buy, 1),
-        "AI SELL SCORE": round(sell, 1),
-        "AI EXPLANATION": reason,
-    }
-
-def add_ai_decision_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """Add AI ensemble columns without modifying original scanner fields."""
-    if df is None or df.empty:
-        return df
-    out = df.copy()
-    decisions = [calculate_ai_decision(row.to_dict()) for _, row in out.iterrows()]
-    ai_df = pd.DataFrame(decisions, index=out.index)
-    for col in ai_df.columns:
-        out[col] = ai_df[col]
-    if "AI SCORE" in out.columns:
-        out = out.sort_values("AI SCORE", ascending=False)
-    return out
-
 # ════════════════════════════════════════════════════════════════════════════════
 # PIN RULES — ADDITIONAL LIQUIDITY / REVERSAL / BIG-MOVE ANALYSIS
 # Existing scanner logic is intentionally untouched. This tab runs only when used.
@@ -3123,9 +2941,7 @@ def calculate_pin_rules(df_5m: pd.DataFrame, data_5m: Dict[str, Any], data_15m: 
             "LIQUIDITY": liquidity, "SWEEP": sweep, "REVERSAL": reversal,
             "EQUAL HIGH": "YES" if eq_hi else "NO", "EQUAL LOW": "YES" if eq_lo else "NO",
             "BIG MOVEMENT": bm.get("signal", "NO BIG MOVE"),
-            "BIG MOVE SCORE": bm.get("score", 0.0),
-            **detect_po3_phase(d),
-            "STRUCTURE": structure,
+            "BIG MOVE SCORE": bm.get("score", 0.0), "STRUCTURE": structure,
             "REASON": " | ".join([x for x in [
                 "EQ HIGH" if eq_hi else "", "EQ LOW" if eq_lo else "",
                 "LOW SWEEP" if bullish_sweep else "HIGH SWEEP" if bearish_sweep else "",
@@ -3225,7 +3041,6 @@ def _pin_stage2_confirm(fyers, candidate):
             a1h.get("data", {}) if a1h.get("status") == "OK" else {},
         )
         pin["Symbol"] = display_symbol
-        pin["SIGNAL TIME"] = _get_candle_signal_time(a5.get("df"))
         pin["LTP"] = (a5.get("data", {}) or {}).get("close", "N/A")
         return pin, None
     except Exception as e:
@@ -3312,6 +3127,335 @@ def _run_pin_scan(fyers, universe, pin_min=PIN_MIN_CONFIDENCE, pin_mode="ALL"):
         result = result.sort_values("PIN SCORE", ascending=False).reset_index(drop=True)
     return result, errors
 
+# ════════════════════════════════════════════════════════════════════════════════
+# LIVE EXCHANGE ORDER BOOK ENGINE
+# ════════════════════════════════════════════════════════════════════════════════
+def _safe_float(value, default=0.0):
+    try:
+        if value is None or value == "":
+            return float(default)
+        return float(value)
+    except Exception:
+        return float(default)
+
+
+def _depth_rows(payload, key):
+    """Return normalized FYERS depth rows for bids/asks."""
+    rows = payload.get(key, []) if isinstance(payload, dict) else []
+    if not isinstance(rows, list):
+        return []
+    out = []
+    for row in rows[:DEPTH_TOP_LEVELS]:
+        if isinstance(row, dict):
+            price = _safe_float(row.get("price", row.get("p", 0)))
+            qty = _safe_float(row.get("volume", row.get("qty", row.get("v", 0))))
+            orders = _safe_float(row.get("ord", row.get("orders", row.get("o", 0))))
+        elif isinstance(row, (list, tuple)) and len(row) >= 2:
+            price = _safe_float(row[0])
+            qty = _safe_float(row[1])
+            orders = _safe_float(row[2]) if len(row) > 2 else 0.0
+        else:
+            continue
+        if price > 0 and qty >= 0:
+            out.append({"price": price, "qty": qty, "orders": orders})
+    return out
+
+
+def fetch_live_market_depth(fyers, symbol: str) -> Dict[str, Any]:
+    """Fetch one real FYERS exchange market-depth snapshot.
+
+    This is NOT simulated order flow and NOT TradingView footprint data.
+    FYERS depth returns bid/ask levels and quantities for the symbol.
+    """
+    empty = {
+        "status": "DATA_UNAVAILABLE", "symbol": symbol,
+        "ltp": None, "best_bid": None, "best_ask": None,
+        "bid_qty": 0.0, "ask_qty": 0.0, "total_buy_qty": 0.0,
+        "total_sell_qty": 0.0, "spread": None, "spread_pct": None,
+        "depth_imbalance": 0.0, "buy_score": 0.0, "sell_score": 0.0,
+        "direction": "WAIT", "strength": 0.0, "pin": "WAIT",
+        "reason": "No live depth data", "bids": [], "asks": []
+    }
+    try:
+        if not isinstance(symbol, str) or not _VALID_EQ_SYMBOL_RE.match(symbol):
+            empty["reason"] = "Invalid NSE equity symbol"
+            return empty
+
+        resp = fyers.depth({"symbol": symbol, "ohlcv_flag": "1"})
+        if not isinstance(resp, dict):
+            empty["reason"] = "Invalid FYERS depth response"
+            return empty
+
+        # SDK responses normally expose the depth object under `d`.
+        data = resp.get("d", resp)
+        if isinstance(data, list):
+            data = data[0] if data else {}
+        if not isinstance(data, dict):
+            data = {}
+
+        # Some wrappers put the actual object under `data`.
+        if isinstance(data.get("data"), dict):
+            data = data["data"]
+
+        bids = _depth_rows(data, "bids")
+        asks = _depth_rows(data, "ask")
+        if not asks:
+            asks = _depth_rows(data, "asks")
+
+        ltp = _safe_float(data.get("ltp", data.get("lp", 0)))
+        best_bid = bids[0]["price"] if bids else _safe_float(data.get("bid", 0))
+        best_ask = asks[0]["price"] if asks else _safe_float(data.get("ask", 0))
+
+        bid_qty_levels = sum(x["qty"] for x in bids)
+        ask_qty_levels = sum(x["qty"] for x in asks)
+        total_buy_qty = _safe_float(data.get("totalbuyqty", data.get("total_buy_qty", bid_qty_levels)))
+        total_sell_qty = _safe_float(data.get("totalsellqty", data.get("total_sell_qty", ask_qty_levels)))
+
+        # Prefer the exchange totals when present; otherwise use the five visible levels.
+        buy_base = total_buy_qty if total_buy_qty > 0 else bid_qty_levels
+        sell_base = total_sell_qty if total_sell_qty > 0 else ask_qty_levels
+        total = buy_base + sell_base
+        imbalance = ((buy_base - sell_base) / total * 100.0) if total > 0 else 0.0
+
+        spread = (best_ask - best_bid) if best_bid > 0 and best_ask > 0 else None
+        spread_pct = (spread / ltp * 100.0) if spread is not None and ltp > 0 else None
+
+        # Depth-only direction. It intentionally does not use old candles.
+        buy_score = 50.0 + max(0.0, imbalance) * 0.9
+        sell_score = 50.0 + max(0.0, -imbalance) * 0.9
+        buy_score = min(100.0, buy_score)
+        sell_score = min(100.0, sell_score)
+
+        if imbalance >= DEPTH_STRONG_IMBALANCE:
+            direction = "BUY"
+            strength = min(100.0, 50.0 + imbalance)
+        elif imbalance <= -DEPTH_STRONG_IMBALANCE:
+            direction = "SELL"
+            strength = min(100.0, 50.0 + abs(imbalance))
+        elif imbalance >= DEPTH_MIN_IMBALANCE:
+            direction = "BUY"
+            strength = min(100.0, 50.0 + imbalance * 0.8)
+        elif imbalance <= -DEPTH_MIN_IMBALANCE:
+            direction = "SELL"
+            strength = min(100.0, 50.0 + abs(imbalance) * 0.8)
+        else:
+            direction = "WAIT"
+            strength = 50.0
+
+        pin = "WAIT"
+        if direction == "BUY" and imbalance >= DEPTH_STRONG_IMBALANCE:
+            pin = "🟢 BUY PIN"
+        elif direction == "SELL" and imbalance <= -DEPTH_STRONG_IMBALANCE:
+            pin = "🔴 SELL PIN"
+
+        reasons = []
+        if buy_base > sell_base:
+            reasons.append(f"Bid depth +{imbalance:.1f}%")
+        elif sell_base > buy_base:
+            reasons.append(f"Ask depth {imbalance:.1f}%")
+        if best_bid and best_ask:
+            reasons.append(f"Spread {spread:.2f}" if spread is not None else "Best bid/ask")
+        if not bids or not asks:
+            reasons.append("partial depth")
+
+        return {
+            "status": "OK" if bids or asks or ltp > 0 else "DATA_UNAVAILABLE",
+            "symbol": symbol,
+            "ltp": ltp if ltp > 0 else None,
+            "best_bid": best_bid if best_bid > 0 else None,
+            "best_ask": best_ask if best_ask > 0 else None,
+            "bid_qty": bid_qty_levels,
+            "ask_qty": ask_qty_levels,
+            "total_buy_qty": buy_base,
+            "total_sell_qty": sell_base,
+            "spread": spread,
+            "spread_pct": spread_pct,
+            "depth_imbalance": round(imbalance, 2),
+            "buy_score": round(buy_score, 1),
+            "sell_score": round(sell_score, 1),
+            "direction": direction,
+            "strength": round(strength, 1),
+            "pin": pin,
+            "reason": " | ".join(reasons) if reasons else "Live depth snapshot",
+            "bids": bids,
+            "asks": asks,
+        }
+    except Exception as e:
+        empty["status"] = "ERROR"
+        empty["reason"] = f"Depth error: {type(e).__name__}: {str(e)[:120]}"
+        return empty
+
+
+def _depth_candidate_symbols(fyers, all_symbols, limit=30):
+    """Prefer current live-movement candidates, otherwise rank current quotes."""
+    limit = max(1, min(int(limit), 50))
+    mdf = st.session_state.get("momentum_df")
+    if isinstance(mdf, pd.DataFrame) and not mdf.empty and "Symbol" in mdf.columns:
+        candidates = []
+        seen = set()
+        for _, row in mdf.sort_values("SCORE", ascending=False).iterrows():
+            raw = str(row.get("Symbol", "")).strip().upper()
+            sym = raw if raw.startswith("NSE:") else f"NSE:{raw}-EQ"
+            if _VALID_EQ_SYMBOL_RE.match(sym) and sym not in seen:
+                seen.add(sym)
+                candidates.append(sym)
+            if len(candidates) >= limit:
+                return candidates
+
+    # Live quotes are current snapshots and do not require historical candles.
+    universe = list(all_symbols or [])[:min(len(all_symbols or []), 50)]
+    if not universe:
+        return []
+    try:
+        qresp = fyers.quotes({"symbols": ",".join(universe)})
+        rows = qresp.get("d", []) if isinstance(qresp, dict) else []
+        ranked = []
+        for row in rows if isinstance(rows, list) else []:
+            if not isinstance(row, dict):
+                continue
+            sym = str(row.get("n", row.get("symbol", ""))).strip().upper()
+            v = row.get("v", row)
+            if not isinstance(v, dict):
+                continue
+            chp = _safe_float(v.get("chp", v.get("change_pct", 0)))
+            if sym:
+                ranked.append((abs(chp), sym))
+        ranked.sort(reverse=True)
+        out = []
+        seen = set()
+        for _, sym in ranked:
+            if _VALID_EQ_SYMBOL_RE.match(sym) and sym not in seen:
+                seen.add(sym)
+                out.append(sym)
+            if len(out) >= limit:
+                break
+        return out or universe[:limit]
+    except Exception:
+        return universe[:limit]
+
+
+def run_live_depth_scan(fyers, symbols, max_workers=6):
+    """Fetch real FYERS market-depth snapshots for a small candidate universe."""
+    symbols = _validate_symbols(symbols)
+    rows, errors = [], []
+    if not symbols:
+        return pd.DataFrame(), ["No valid symbols for depth scan"]
+
+    progress = st.progress(0.0, text=f"Live Order Book 0 / {len(symbols)}")
+    done = 0
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(fetch_live_market_depth, fyers, s): s for s in symbols}
+        for future in as_completed(futures):
+            sym = futures[future]
+            try:
+                d = future.result()
+                if d.get("status") == "OK":
+                    ticker = sym.replace("NSE:", "").replace("-EQ", "")
+                    rows.append({
+                        "Symbol": ticker,
+                        "LTP": d.get("ltp"),
+                        "BEST BID": d.get("best_bid"),
+                        "BEST ASK": d.get("best_ask"),
+                        "BID QTY (5L)": round(d.get("bid_qty", 0), 0),
+                        "ASK QTY (5L)": round(d.get("ask_qty", 0), 0),
+                        "TOTAL BUY QTY": round(d.get("total_buy_qty", 0), 0),
+                        "TOTAL SELL QTY": round(d.get("total_sell_qty", 0), 0),
+                        "DEPTH IMBALANCE %": d.get("depth_imbalance", 0),
+                        "BUY SCORE": d.get("buy_score", 0),
+                        "SELL SCORE": d.get("sell_score", 0),
+                        "NEXT DIRECTION": d.get("direction", "WAIT"),
+                        "DIRECTION STRENGTH %": d.get("strength", 0),
+                        "PIN SIGNAL": d.get("pin", "WAIT"),
+                        "SPREAD": d.get("spread"),
+                        "SPREAD %": d.get("spread_pct"),
+                        "REASON": d.get("reason", ""),
+                    })
+                else:
+                    errors.append(f"{sym}: {d.get('reason', 'No depth data')}")
+            except Exception as e:
+                errors.append(f"{sym}: {type(e).__name__}: {str(e)[:120]}")
+            done += 1
+            progress.progress(done / max(len(symbols), 1), text=f"Live Order Book {done} / {len(symbols)}")
+    progress.empty()
+
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        df["__sort"] = pd.to_numeric(df["DIRECTION STRENGTH %"], errors="coerce").fillna(0)
+        df = df.sort_values("__sort", ascending=False).drop(columns=["__sort"]).reset_index(drop=True)
+    return df, errors
+
+
+def _show_live_order_flow_tab(fyers, all_symbols):
+    """Actual FYERS exchange depth tab: current bid/ask book -> direction -> PIN."""
+    st.markdown("### 📖 LIVE EXCHANGE ORDER BOOK — NEXT DIRECTION + PIN")
+    st.caption("Actual FYERS market-depth snapshot: bid/ask quantities and 5 visible depth levels. No TradingView footprint and no simulated order book.")
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        depth_limit = st.number_input(
+            "Depth candidates", min_value=5, max_value=50,
+            value=DEPTH_SCAN_LIMIT_DEFAULT, step=5, key="depth_scan_limit"
+        )
+    with c2:
+        st.metric("Depth API", "FYERS LIVE")
+    with c3:
+        st.metric("Max / scan", 50)
+
+    candidates = _depth_candidate_symbols(fyers, all_symbols, depth_limit)
+    if st.session_state.get("momentum_df") is not None and not st.session_state.get("momentum_df").empty:
+        st.info(f"Using current movement candidates first: {len(candidates)} symbols. This avoids scanning the entire NSE depth API one-by-one.")
+    else:
+        st.info(f"No movement list found, so current quote movers are used as depth candidates: {len(candidates)} symbols.")
+
+    if st.button("📖 SCAN LIVE EXCHANGE ORDER BOOK", key="depth_run", type="primary", use_container_width=True):
+        with st.spinner("Reading live FYERS bid/ask market depth…"):
+            depth_df, depth_errors = run_live_depth_scan(fyers, candidates)
+        st.session_state["depth_df"] = depth_df
+        st.session_state["depth_errors"] = depth_errors
+        st.session_state["depth_scanned_at"] = _generated_timestamp()
+
+    depth_df = st.session_state.get("depth_df")
+    if isinstance(depth_df, pd.DataFrame) and not depth_df.empty:
+        buy_df = depth_df[depth_df["NEXT DIRECTION"] == "BUY"].copy()
+        sell_df = depth_df[depth_df["NEXT DIRECTION"] == "SELL"].copy()
+        pins = depth_df[depth_df["PIN SIGNAL"].astype(str).str.contains("PIN", na=False)].copy()
+
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("DEPTH STOCKS", len(depth_df))
+        m2.metric("🟢 BUY", len(buy_df))
+        m3.metric("🔴 SELL", len(sell_df))
+        m4.metric("📌 PINS", len(pins))
+        st.caption(f"Last depth scan: {st.session_state.get('depth_scanned_at', 'N/A')}")
+
+        st.markdown("### 🎯 NEXT DIRECTION — LIVE DEPTH")
+        st.dataframe(
+            depth_df[[
+                "Symbol", "LTP", "BEST BID", "BEST ASK", "TOTAL BUY QTY", "TOTAL SELL QTY",
+                "DEPTH IMBALANCE %", "BUY SCORE", "SELL SCORE", "NEXT DIRECTION",
+                "DIRECTION STRENGTH %", "PIN SIGNAL", "SPREAD %", "REASON"
+            ]],
+            use_container_width=True, height=500
+        )
+
+        if not pins.empty:
+            st.markdown("### 📌 LIVE DEPTH PIN SIGNALS")
+            st.dataframe(
+                pins[["Symbol", "LTP", "TOTAL BUY QTY", "TOTAL SELL QTY", "DEPTH IMBALANCE %", "NEXT DIRECTION", "DIRECTION STRENGTH %", "PIN SIGNAL", "REASON"]],
+                use_container_width=True, height=300
+            )
+
+        _excel_download_button(depth_df, "LIVE_ORDER_BOOK", "depth_excel", label="📥 DOWNLOAD LIVE ORDER BOOK EXCEL")
+    elif "depth_df" in st.session_state:
+        st.warning("No live depth rows were returned. Check FYERS market-data permissions and market hours.")
+    else:
+        st.info("👈 First run LIVE MOVEMENT, then scan LIVE EXCHANGE ORDER BOOK for the current bid/ask pressure.")
+
+    errors = st.session_state.get("depth_errors", [])
+    if errors:
+        with st.expander(f"⚠️ Depth API errors ({len(errors)})", expanded=False):
+            st.dataframe(pd.DataFrame({"Error": errors}), use_container_width=True)
+
+
 def _show_pin_rules_tab(fyers, all_symbols=None, fo_symbols=None) -> None:
     """PIN Rules scanner. Runs independently from the main scanners."""
     st.markdown("### 📌 PIN RULES — Liquidity + Reversal + Big Movement")
@@ -3395,7 +3539,7 @@ def _show_pin_rules_tab(fyers, all_symbols=None, fo_symbols=None) -> None:
         pc4.metric("💧 SWEEPS", int((sweep_series != "NONE").sum()))
 
         display_cols = [
-            "Symbol", "SIGNAL TIME", "LTP", "PIN SIGNAL", "PIN SCORE", "LIQUIDITY", "SWEEP",
+            "Symbol", "LTP", "PIN SIGNAL", "PIN SCORE", "LIQUIDITY", "SWEEP",
             "REVERSAL", "EQUAL HIGH", "EQUAL LOW", "BIG MOVEMENT", "BIG MOVE SCORE",
             "STRUCTURE", "5M TREND", "15M TREND", "1H TREND", "RVOL", "RSI",
             "PRESSURE", "AI CONFIDENCE %", "AI SIGNAL", "REASON"
@@ -3426,63 +3570,18 @@ def _show_pin_rules_tab(fyers, all_symbols=None, fo_symbols=None) -> None:
                 st.caption(f"Showing first 100 of {len(errors)} errors.")
 
 # ════════════════════════════════════════════════════════════════════════════════
-
-def _add_signal_time_column(df, timestamp_col="Timestamp"):
-    """Add SIGNAL TIME to an existing scanner result without creating a new tab."""
-    if df is None or df.empty:
-        return df
-    out = df.copy()
-    if "SIGNAL TIME" not in out.columns:
-        if timestamp_col in out.columns:
-            ts = pd.to_datetime(out[timestamp_col], errors="coerce")
-            out["SIGNAL TIME"] = ts.dt.strftime("%d-%b-%Y %H:%M:%S").fillna("")
-        else:
-            # Preserve the existing scan result; use current IST only when
-            # the source result has no candle timestamp available.
-            out["SIGNAL TIME"] = _now_ist().strftime("%d-%b-%Y %H:%M:%S")
-    cols = list(out.columns)
-    cols.remove("SIGNAL TIME")
-    return out[["SIGNAL TIME"] + cols]
-
 # MAIN APP - V17 WITH NEW MOMENTUM MOVERS TAB
 # ════════════════════════════════════════════════════════════════════════════════
 def show_scanner(fyers) -> None:
     """Streamlit main app - NSE AI PRO V17 with MOMENTUM MOVERS"""
     
     try:
-        st.set_page_config(page_title="NSE AI PRO V18 | Professional Scanner", layout="wide")
+        st.set_page_config(page_title="NSE AI PRO V17", layout="wide")
     except:
         pass
-
-    st.markdown("""
-    <style>
-    .block-container {padding-top:1.2rem; padding-bottom:2rem; max-width:1600px;}
-    .pro-hero {padding:18px 22px; border-radius:16px; margin-bottom:14px;
-        background:linear-gradient(135deg,rgba(30,41,59,.98),rgba(15,23,42,.98));
-        border:1px solid rgba(148,163,184,.20); box-shadow:0 8px 28px rgba(0,0,0,.18);}
-    .pro-hero h2 {margin:0; font-size:1.55rem;}
-    .pro-hero p {margin:6px 0 0; opacity:.78;}
-    .pro-badge {display:inline-block; padding:4px 9px; border-radius:999px;
-        font-size:.72rem; font-weight:700; letter-spacing:.04em;
-        background:rgba(34,197,94,.14); border:1px solid rgba(34,197,94,.28);}
-    div[data-testid="stMetric"] {background:rgba(100,116,139,.07);
-        border:1px solid rgba(148,163,184,.16); border-radius:12px; padding:10px 12px;}
-    button[kind="primary"] {border-radius:10px; font-weight:700;}
-    .stTabs [data-baseweb="tab-list"] {gap:5px; overflow-x:auto;}
-    .stTabs [data-baseweb="tab"] {padding:8px 12px; border-radius:9px;}
-    div[data-testid="stDataFrame"] {border-radius:10px; overflow:hidden;}
-    </style>
-    """, unsafe_allow_html=True)
-    st.markdown("""
-    <div class="pro-hero">
-      <span class="pro-badge">LIVE • FYERS DATA</span>
-      <h2>Professional NSE / F&O Decision Scanner</h2>
-      <p>Evidence-based signals across trend, momentum, VWAP, volume, market structure, liquidity and reversal confirmation.</p>
-    </div>
-    """, unsafe_allow_html=True)
     
-    st.title("🚀 NSE AI PRO V18 — PROFESSIONAL MARKET SCANNER")
-    st.caption(f"🕒 {_now_ist().strftime('%d-%b-%Y %H:%M:%S')} IST  •  Multi-Timeframe  •  Momentum  •  Liquidity  •  Reversal  •  Structure")
+    st.title("🚀 NSE AI PRO V17 — Professional Intraday + Swing Scanner")
+    st.caption(f"🕒 Current Time (IST): {_now_ist().strftime('%d-%b-%Y %H:%M:%S')} IST | Multi-Timeframe + Momentum Engine")
     
     try:
         all_symbols = load_nse_equity_symbols()
@@ -3497,32 +3596,16 @@ def show_scanner(fyers) -> None:
         return
     
     st.caption(f"📊 NSE Equities: {len(all_symbols)} | 📈 F&O Stocks: {len(fo_symbols)}")
-
-    nse_rows = len(st.session_state.get("nse_df", pd.DataFrame()))
-    fo_rows = len(st.session_state.get("fo_df", pd.DataFrame()))
-    mom_rows = len(st.session_state.get("momentum_df", pd.DataFrame()))
-    c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("NSE UNIVERSE", f"{len(all_symbols):,}")
-    c2.metric("F&O UNIVERSE", f"{len(fo_symbols):,}")
-    c3.metric("NSE RESULTS", f"{nse_rows:,}")
-    c4.metric("F&O RESULTS", f"{fo_rows:,}")
-    c5.metric("MOMENTUM HITS", f"{mom_rows:,}")
-    last_scan = (
-        st.session_state.get("momentum_scanned_at")
-        or st.session_state.get("nse_scanned_at")
-        or st.session_state.get("fo_scanned_at")
-        or "Not scanned yet"
-    )
-    st.caption(f"🟢 Scanner ready  •  Last recorded scan: {last_scan}")
     
     tabs = st.tabs([
         "🇮🇳 NSE STOCKS",
         "📊 F&O STOCKS",
         "⚡ MOMENTUM MOVERS",
+        "📖 LIVE ORDER BOOK",
         "⚡ LIVE INTRADAY",
         "🔥 STRONG SIGNALS",
         "📈 SWING (GOLDEN/DEATH CROSS)",
-        "🧠 AI PRO REPORT",
+        "🧠 ADDITIONAL ANALYSIS",
         "📊 MARKET DASHBOARD",
         "⚙️ SETTINGS",
         "📌 PIN RULES"
@@ -3549,7 +3632,6 @@ def show_scanner(fyers) -> None:
                 st.session_state["nse_df"] = pd.DataFrame(nse_results) if nse_results else pd.DataFrame()
                 st.session_state["nse_errors"] = nse_errors
                 st.session_state["nse_stats"] = nse_stats
-                st.session_state["nse_scanned_at"] = _generated_timestamp()
         
         if "nse_stats" in st.session_state:
             _display_scan_summary(st.session_state["nse_stats"])
@@ -3662,7 +3744,6 @@ def show_scanner(fyers) -> None:
                     )
                     st.session_state["fo_errors"] = fo_errors or []
                     st.session_state["fo_stats"] = fo_stats
-                    st.session_state["fo_scanned_at"] = _generated_timestamp()
                 except Exception as e:
                     st.session_state["fo_df"] = pd.DataFrame()
                     st.session_state["fo_errors"] = [str(e)]
@@ -3759,8 +3840,8 @@ def show_scanner(fyers) -> None:
     # TAB 2: MOMENTUM MOVERS — LIVE SUDDEN BUY / SELL
     # ════════════════════════════════════════════════════════════════════════════════
     with tabs[2]:
-        st.markdown("### ⚡ LIVE SUDDEN MOVEMENT — BUY / SELL")
-        st.caption("Only recent 5M price action + volume + acceleration + HH/HL or LH/LL. No previous consolidation, 15M, 1H or EMA confirmation.")
+        st.markdown("### ⚡ LIVE MOVEMENT — INTRADAY BIG BUY / BIG SELL")
+        st.caption("Latest completed 5M candle only: sudden move + volume/RVOL + acceleration + HH/HL or LH/LL. No previous consolidation, 15M, 1H or EMA confirmation.")
 
         col_m1, col_m2, col_m3 = st.columns([2, 2, 1])
         with col_m1:
@@ -3772,8 +3853,8 @@ def show_scanner(fyers) -> None:
             st.metric("Available", len(momentum_universe))
 
         momentum_symbols = momentum_universe[:momentum_limit]
-        if st.button(f"⚡ SCAN LIVE MOVEMENT ({len(momentum_symbols)} stocks)", key="momentum_run", type="primary"):
-            with st.spinner("Scanning current 5M sudden BUY / SELL movement…"):
+        if st.button(f"⚡ SCAN INTRADAY MOVEMENT ({len(momentum_symbols)} stocks)", key="momentum_run", type="primary"):
+            with st.spinner("Scanning latest completed 5M intraday BIG BUY / BIG SELL movement…"):
                 is_fo = momentum_type == "F&O Stocks"
                 momentum_results, momentum_errors, momentum_stats = run_momentum_scan(fyers, momentum_symbols, is_fo=is_fo)
                 mdf = pd.DataFrame(momentum_results) if momentum_results else pd.DataFrame()
@@ -3791,12 +3872,6 @@ def show_scanner(fyers) -> None:
             buy = mdf[mdf["DIRECTION"] == "BUY"].copy().sort_values(["SCORE", "RVOL"], ascending=False)
             sell = mdf[mdf["DIRECTION"] == "SELL"].copy().sort_values(["SCORE", "RVOL"], ascending=False)
 
-            # Keep SIGNAL TIME as the first visible column in the Momentum Movers tab.
-            if "SIGNAL TIME" in buy.columns:
-                buy = buy[["SIGNAL TIME"] + [c for c in buy.columns if c != "SIGNAL TIME"]]
-            if "SIGNAL TIME" in sell.columns:
-                sell = sell[["SIGNAL TIME"] + [c for c in sell.columns if c != "SIGNAL TIME"]]
-
             c1, c2 = st.columns(2)
             with c1:
                 st.markdown(f"### 🟢 BUY — {len(buy)}")
@@ -3811,12 +3886,12 @@ def show_scanner(fyers) -> None:
                 else:
                     st.info("No current SELL movement found.")
 
-            st.markdown("### 📥 Download LIVE MOVEMENT Report")
+            st.markdown("### 📥 Download INTRADAY MOVEMENT Report")
             try:
                 st.download_button(
                     "📊 Excel",
-                    _format_excel_output(mdf, "LIVE_MOVEMENT"),
-                    f"LIVE_MOVEMENT_{_now_ist().strftime('%Y%m%d_%H%M')}.xlsx",
+                    _format_excel_output(mdf, "INTRADAY_MOVEMENT"),
+                    f"INTRADAY_MOVEMENT_{_now_ist().strftime('%Y%m%d_%H%M')}.xlsx",
                     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     key="momentum_xls",
                 )
@@ -3825,15 +3900,21 @@ def show_scanner(fyers) -> None:
         elif "momentum_stats" in st.session_state:
             st.warning("Scan completed — no current BUY/SELL movement matched the live thresholds.")
         else:
-            st.info("👈 Click 'SCAN LIVE MOVEMENT' to find stocks moving NOW.")
+            st.info("👈 Click 'SCAN INTRADAY MOVEMENT' to find stocks moving NOW.")
 
         if st.session_state.get("momentum_errors"):
             with st.expander(f"⚠️ API / scan errors ({len(st.session_state['momentum_errors'])})"):
                 st.dataframe(pd.DataFrame({"Error": st.session_state["momentum_errors"]}), use_container_width=True)
     # ════════════════════════════════════════════════════════════════════════════════
-    # TAB 3: LIVE INTRADAY
+    # TAB 3: LIVE EXCHANGE ORDER BOOK
     # ════════════════════════════════════════════════════════════════════════════════
     with tabs[3]:
+        _show_live_order_flow_tab(fyers, all_symbols)
+
+    # ════════════════════════════════════════════════════════════════════════════════
+    # TAB 4: LIVE INTRADAY
+    # ════════════════════════════════════════════════════════════════════════════════
+    with tabs[4]:
         st.markdown("### ⚡ Live Intraday Scanner\nReal-time multi-timeframe analysis (5M, 15M, 1H)")
         
         col1, col2 = st.columns(2)
@@ -3888,13 +3969,7 @@ def show_scanner(fyers) -> None:
                 except:
                     pass
             
-            if "SIGNAL TIME" in intraday_filtered.columns:
-                _intraday_cols = list(intraday_show_cols) if intraday_show_cols else list(intraday_filtered.columns)
-                if "SIGNAL TIME" not in _intraday_cols:
-                    _intraday_cols = ["SIGNAL TIME"] + _intraday_cols
-                _intraday_cols = [c for c in _intraday_cols if c in intraday_filtered.columns]
-                st.dataframe(intraday_filtered[_intraday_cols], use_container_width=True, height=400)
-            elif intraday_show_cols:
+            if intraday_show_cols:
                 st.dataframe(intraday_filtered[intraday_show_cols], use_container_width=True, height=400)
             else:
                 st.dataframe(intraday_filtered, use_container_width=True, height=400)
@@ -3902,9 +3977,9 @@ def show_scanner(fyers) -> None:
             st.info("👈 Click 'SCAN LIVE INTRADAY' to fetch data")
     
     # ════════════════════════════════════════════════════════════════════════════════
-    # TAB 4: STRONG SIGNALS
+    # TAB 5: STRONG SIGNALS
     # ════════════════════════════════════════════════════════════════════════════════
-    with tabs[4]:
+    with tabs[5]:
         st.markdown("### 🔥 Strong Signals Only\nHigh-confidence setups (≥70%)")
         strong_source = st.radio("Source", ["NSE Stocks", "F&O Stocks"], horizontal=True, key="strong_source")
 
@@ -3961,15 +4036,10 @@ def show_scanner(fyers) -> None:
             st.info(f"👈 Run '{strong_source}' scanner first")
     
     # ════════════════════════════════════════════════════════════════════════════════
-    # TAB 5: SWING (GOLDEN CROSS / DEATH CROSS)
+    # TAB 6: SWING (GOLDEN CROSS / DEATH CROSS)
     # ════════════════════════════════════════════════════════════════════════════════
-    with tabs[5]:
+    with tabs[6]:
         st.markdown("### 📈 Swing Analysis - Golden Cross & Death Cross Detection\nDaily EMA50/EMA200 crossovers")
-
-        # AI decision layer is additive; original scanner columns remain intact.
-        for _ai_key in ("nse_df", "fo_df", "momentum_df"):
-            if _ai_key in st.session_state and isinstance(st.session_state[_ai_key], pd.DataFrame):
-                st.session_state[_ai_key] = add_ai_decision_columns(st.session_state[_ai_key])
         
         col1, col2 = st.columns([3, 1])
         with col1:
@@ -3998,11 +4068,6 @@ def show_scanner(fyers) -> None:
                                 "EMA Trend": cc_data.get("ema_trend", "N/A"),
                                 "Signal": cc_data.get("signal", "NONE"),
                                 "Signal Date": cc_data.get("signal_date", "N/A"),
-                                "SIGNAL TIME": (
-                                    pd.to_datetime(cc_data.get("signal_date"), errors="coerce").strftime("%d-%b-%Y %H:%M:%S IST")
-                                    if pd.notna(pd.to_datetime(cc_data.get("signal_date"), errors="coerce"))
-                                    else _now_ist().strftime("%d-%b-%Y %H:%M:%S IST")
-                                ),
                             })
                     except:
                         pass
@@ -4055,9 +4120,9 @@ def show_scanner(fyers) -> None:
             st.info("👈 Click 'DETECT CROSSOVERS' to start swing analysis")
     
     # ════════════════════════════════════════════════════════════════════════════════
-    # TAB 6: ADDITIONAL ANALYSIS
+    # TAB 7: ADDITIONAL ANALYSIS
     # ════════════════════════════════════════════════════════════════════════════════
-    with tabs[6]:
+    with tabs[7]:
         st.markdown("### 🧠 Additional Analysis - Deep Dive on Single Stock")
         
         col1, col2 = st.columns(2)
@@ -4208,9 +4273,9 @@ def show_scanner(fyers) -> None:
                     st.metric("Options Bias", opt.get("options_bias", "N/A"))
     
     # ════════════════════════════════════════════════════════════════════════════════
-    # TAB 7: MARKET DASHBOARD
+    # TAB 8: MARKET DASHBOARD
     # ════════════════════════════════════════════════════════════════════════════════
-    with tabs[7]:
+    with tabs[8]:
         st.markdown("### 📊 Market Dashboard - Statistics & Sentiment")
         dashboard_source = st.radio("Data Source", ["NSE Stocks", "F&O Stocks"], horizontal=True, key="dash_source")
 
@@ -4284,9 +4349,9 @@ def show_scanner(fyers) -> None:
             st.info(f"👈 Run '{dashboard_source}' scanner first")
     
     # ════════════════════════════════════════════════════════════════════════════════
-    # TAB 8: SETTINGS
+    # TAB 9: SETTINGS
     # ════════════════════════════════════════════════════════════════════════════════
-    with tabs[8]:
+    with tabs[9]:
         st.markdown("### ⚙️ Scanner Settings & Configuration")
         
         st.markdown("#### 🎯 Signal Filtering")
@@ -4320,7 +4385,8 @@ def show_scanner(fyers) -> None:
         - ✅ Options chain analysis (F&O)
         - ✅ Golden Cross / Death Cross detection
         - ✅ **⚡ NEW: MOMENTUM MOVERS Scanner**
-        - ✅ Next Candle Bias prediction
+        - ✅ **📖 NEW: LIVE FYERS EXCHANGE ORDER BOOK**
+        - ✅ Next Candle Bias + LIVE Depth Direction + BUY/SELL PIN
         
         **Data Source:** Fyers Live API
         **Timeframes:** 5M, 15M, 1H, Daily
@@ -4328,9 +4394,9 @@ def show_scanner(fyers) -> None:
         """)
     
     # ════════════════════════════════════════════════════════════════════════════════
-    # TAB 9: PIN RULES — ADDITIONAL ONLY
+    # TAB 10: PIN RULES — ADDITIONAL ONLY
     # ════════════════════════════════════════════════════════════════════════════════
-    with tabs[9]:
+    with tabs[10]:
         _show_pin_rules_tab(fyers, all_symbols, fo_symbols)
     
     gc.collect()
