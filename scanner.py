@@ -2718,10 +2718,20 @@ def _fetch_momentum_signal(fyers, symbol: str, is_fo: bool = False):
         move = detect_live_sudden_move(df5)
         block = detect_block_order_activity(df5)
         ltp = float(df5["Close"].iloc[-1])
+        # Signal time = the CLOSED 5M candle that generated the movement signal.
+        candle_ts = df5["Time"].iloc[-1]
+        if getattr(candle_ts, "tzinfo", None) is None:
+            candle_ts = candle_ts.tz_localize(IST)
+        candle_ts_ist = candle_ts.tz_convert(IST)
+        signal_time = (candle_ts_ist + timedelta(minutes=5)).strftime("%d-%b-%Y %H:%M:%S IST")
+        signal_age_min = max(0.0, (_now_ist() - (candle_ts_ist + timedelta(minutes=5))).total_seconds() / 60.0)
+
         result = {
             "Symbol": stock_ticker,
             "LTP": round(ltp, 2),
             "SIGNAL": move["signal"],
+            "SIGNAL TIME": signal_time,
+            "SIGNAL AGE (MIN)": round(signal_age_min, 1),
             "DIRECTION": move["direction"],
             "MOVE %": move["move_pct"],
             "BODY %": move["body_pct"],
