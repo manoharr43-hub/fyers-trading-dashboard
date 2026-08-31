@@ -3401,6 +3401,24 @@ def _show_pin_rules_tab(fyers, all_symbols=None, fo_symbols=None) -> None:
                 st.caption(f"Showing first 100 of {len(errors)} errors.")
 
 # ════════════════════════════════════════════════════════════════════════════════
+
+def _add_signal_time_column(df, timestamp_col="Timestamp"):
+    """Add SIGNAL TIME to an existing scanner result without creating a new tab."""
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+    if "SIGNAL TIME" not in out.columns:
+        if timestamp_col in out.columns:
+            ts = pd.to_datetime(out[timestamp_col], errors="coerce")
+            out["SIGNAL TIME"] = ts.dt.strftime("%d-%b-%Y %H:%M:%S").fillna("")
+        else:
+            # Preserve the existing scan result; use current IST only when
+            # the source result has no candle timestamp available.
+            out["SIGNAL TIME"] = _now_ist().strftime("%d-%b-%Y %H:%M:%S")
+    cols = list(out.columns)
+    cols.remove("SIGNAL TIME")
+    return out[["SIGNAL TIME"] + cols]
+
 # MAIN APP - V17 WITH NEW MOMENTUM MOVERS TAB
 # ════════════════════════════════════════════════════════════════════════════════
 def show_scanner(fyers) -> None:
@@ -3747,6 +3765,12 @@ def show_scanner(fyers) -> None:
         if mdf is not None and not mdf.empty:
             buy = mdf[mdf["DIRECTION"] == "BUY"].copy().sort_values(["SCORE", "RVOL"], ascending=False)
             sell = mdf[mdf["DIRECTION"] == "SELL"].copy().sort_values(["SCORE", "RVOL"], ascending=False)
+
+            # Keep SIGNAL TIME as the first visible column in the Momentum Movers tab.
+            if "SIGNAL TIME" in buy.columns:
+                buy = buy[["SIGNAL TIME"] + [c for c in buy.columns if c != "SIGNAL TIME"]]
+            if "SIGNAL TIME" in sell.columns:
+                sell = sell[["SIGNAL TIME"] + [c for c in sell.columns if c != "SIGNAL TIME"]]
 
             c1, c2 = st.columns(2)
             with c1:
