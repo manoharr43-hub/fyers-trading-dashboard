@@ -3068,6 +3068,10 @@ def calculate_pin_rules(df_5m: pd.DataFrame, data_5m: Dict[str, Any], data_15m: 
         "PIN SIGNAL": "WAIT", "PIN SCORE": 0.0, "LIQUIDITY": "NONE",
         "BUY LIQUIDITY": "NONE", "SELL LIQUIDITY": "NONE",
         "BUY LIQUIDITY SCORE": 0.0, "SELL LIQUIDITY SCORE": 0.0,
+        "TOP LIQUIDITY": "NONE", "TOP LIQUIDITY LEVEL": None,
+        "TOP LIQUIDITY SIDE": "BUY-SIDE", "TOP LIQUIDITY STATUS": "NONE",
+        "BOTTOM LIQUIDITY": "NONE", "BOTTOM LIQUIDITY LEVEL": None,
+        "BOTTOM LIQUIDITY SIDE": "SELL-SIDE", "BOTTOM LIQUIDITY STATUS": "NONE",
         "SWEEP": "NONE", "REVERSAL": "NONE", "EQUAL HIGH": "NO", "EQUAL LOW": "NO",
         "BIG MOVEMENT": "NO", "BIG MOVE SCORE": 0.0, "STRUCTURE": "NONE",
         "5M TREND": data_5m.get("structure_trend", "N/A"),
@@ -3170,6 +3174,14 @@ def calculate_pin_rules(df_5m: pd.DataFrame, data_5m: Dict[str, Any], data_15m: 
         buy_liq = ("HIGH" if buy_liq_score >= 70 else "MEDIUM" if buy_liq_score >= 40 else "LOW" if buy_liq_score > 0 else "NONE")
         sell_liq = ("HIGH" if sell_liq_score >= 70 else "MEDIUM" if sell_liq_score >= 40 else "LOW" if sell_liq_score > 0 else "NONE")
 
+        # Explicit TOP/BOTTOM liquidity identification.
+        # TOP = buy-side liquidity above the latest confirmed swing/equal high.
+        # BOTTOM = sell-side liquidity below the latest confirmed swing/equal low.
+        top_liq = "TOP BUY LIQ" if last_hi is not None else "NONE"
+        bottom_liq = "BOTTOM SELL LIQ" if last_lo is not None else "NONE"
+        top_status = "SWEPT" if bearish_sweep else "ACTIVE" if last_hi is not None else "NONE"
+        bottom_status = "SWEPT" if bullish_sweep else "ACTIVE" if last_lo is not None else "NONE"
+
         sweep = "🟢 LOW SWEPT" if bullish_sweep else "🔴 HIGH SWEPT" if bearish_sweep else "NONE"
         reversal = "🟢 BULL REVERSAL" if bullish_reversal else "🔴 BEAR REVERSAL" if bearish_reversal else "NONE"
         out.update({
@@ -3178,6 +3190,14 @@ def calculate_pin_rules(df_5m: pd.DataFrame, data_5m: Dict[str, Any], data_15m: 
             "BUY LIQUIDITY": buy_liq, "SELL LIQUIDITY": sell_liq,
             "BUY LIQUIDITY SCORE": round(buy_liq_score, 1),
             "SELL LIQUIDITY SCORE": round(sell_liq_score, 1),
+            "TOP LIQUIDITY": top_liq,
+            "TOP LIQUIDITY LEVEL": round(float(last_hi), 2) if last_hi is not None else None,
+            "TOP LIQUIDITY SIDE": "BUY-SIDE",
+            "TOP LIQUIDITY STATUS": top_status,
+            "BOTTOM LIQUIDITY": bottom_liq,
+            "BOTTOM LIQUIDITY LEVEL": round(float(last_lo), 2) if last_lo is not None else None,
+            "BOTTOM LIQUIDITY SIDE": "SELL-SIDE",
+            "BOTTOM LIQUIDITY STATUS": bottom_status,
             "SWEEP": sweep, "REVERSAL": reversal,
             "EQUAL HIGH": "YES" if eq_hi else "NO", "EQUAL LOW": "YES" if eq_lo else "NO",
             "BIG MOVEMENT": bm.get("signal", "NO BIG MOVE"),
@@ -3872,7 +3892,9 @@ def _show_pin_rules_tab(fyers, all_symbols=None, fo_symbols=None) -> None:
 
     with st.expander("📖 PIN Rules", expanded=False):
         st.markdown("""
-        **Liquidity:** Buy-side liquidity = above confirmed Pivot/Equal High; Sell-side liquidity = below confirmed Pivot/Equal Low.
+        **Liquidity:** TOP = Buy-side liquidity above the latest confirmed Pivot/Equal High; BOTTOM = Sell-side liquidity below the latest confirmed Pivot/Equal Low.
+
+        **Liquidity Status:** ACTIVE = not swept; SWEPT = current 5M candle crossed the liquidity level and closed back through it.
         
         **Liquidity Score:** 0–100 setup-strength score based on confirmed level, equal-level confluence and current sweep evidence. It is not actual exchange quantity.
         
@@ -3940,6 +3962,8 @@ def _show_pin_rules_tab(fyers, all_symbols=None, fo_symbols=None) -> None:
 
         display_cols = [
             "Symbol", "LTP", "PIN SIGNAL", "PIN SCORE", "LIQUIDITY",
+            "TOP LIQUIDITY", "TOP LIQUIDITY LEVEL", "TOP LIQUIDITY SIDE", "TOP LIQUIDITY STATUS",
+            "BOTTOM LIQUIDITY", "BOTTOM LIQUIDITY LEVEL", "BOTTOM LIQUIDITY SIDE", "BOTTOM LIQUIDITY STATUS",
             "BUY LIQUIDITY", "BUY LIQUIDITY SCORE", "SELL LIQUIDITY", "SELL LIQUIDITY SCORE",
             "SWEEP", "REVERSAL", "EQUAL HIGH", "EQUAL LOW", "BIG MOVEMENT", "BIG MOVE SCORE",
             "STRUCTURE", "5M TREND", "15M TREND", "1H TREND", "RVOL", "RSI",
