@@ -1,8 +1,4 @@
 import streamlit as st
-try:
-    from streamlit.components.v1 import html as st_html
-except Exception:
-    st_html = None
 import pandas as pd
 import numpy as np
 import requests
@@ -242,9 +238,15 @@ LIVE_MOVE_BIG_PCT = 0.70
 LIVE_MOVE_MIN_RVOL = 1.30
 LIVE_MOVE_STRONG_RVOL = 1.80
 LIVE_MOVE_MIN_BODY_PCT = 50.0
-LIVE_MOVE_MIN_SCORE = 65
-LIVE_MOVE_STRONG_SCORE = 85
+LIVE_MOVE_MIN_SCORE = 70
+LIVE_MOVE_STRONG_SCORE = 90
 LIVE_MOVE_LOOKBACK_DAYS = 2
+# Strict freshness/confirmation rules for LIVE MOVEMENT.
+LIVE_MOVE_MAX_SIGNAL_AGE_MIN = 12.0
+LIVE_MOVE_MIN_BODY_ATR = 0.80
+LIVE_MOVE_BIG_BODY_ATR = 1.00
+LIVE_MOVE_BIG_MIN_PCT = max(LIVE_MOVE_BIG_PCT, 0.70)
+LIVE_MOVE_BIG_MIN_RVOL = max(LIVE_MOVE_STRONG_RVOL, 1.80)
 MOMENTUM_MIN_MOVE_PCT = 0.10
 MOMENTUM_MIN_RVOL = 1.20
 MOMENTUM_MIN_BODY_PCT = 20
@@ -259,15 +261,6 @@ DEPTH_MIN_IMBALANCE = 15.0
 DEPTH_STRONG_IMBALANCE = 35.0
 DEPTH_BIG_QTY_MULTIPLIER = 2.0
 DEPTH_TOP_LEVELS = 5
-
-# ════════════════════════════════════════════════════════════════════════════════
-# 1H LIQUIDITY / TOP-BOTTOM ALERT ENGINE
-# TOP = nearest confirmed 1H swing/equal HIGH above price (BUY-SIDE liquidity)
-# BOTTOM = nearest confirmed 1H swing/equal LOW below price (SELL-SIDE liquidity)
-# ════════════════════════════════════════════════════════════════════════════════
-LIQUIDITY_1H_PIVOT_LEN = 5
-LIQUIDITY_ALERT_TOLERANCE_PCT = 0.15
-LIQUIDITY_ALERT_COOLDOWN_MIN = 15
 
 # ════════════════════════════════════════════════════════════════════════════════
 # 15-MIN REVERSAL SCANNER CONSTANTS (ORIGINAL)
@@ -429,6 +422,37 @@ def calculate_buying_selling_pressure(df) -> Dict[str, Any]:
         "pressure_ratio": round(pressure_ratio, 2) if pressure_ratio != float('inf') else 0,
         "trend": trend
     }
+
+# ════════════════════════════════════════════════════════════════════════════════
+# LIVE CANDLE / FRESHNESS SAFETY HELPERS
+# ════════════════════════════════════════════════════════════════════════════════
+def _completed_candles(df: pd.DataFrame, resolution_minutes: int = 5) -> pd.DataFrame:
+    """Return only completed candles; preserve the original Time column/index."""
+    if df is None or len(df) == 0:
+        return df
+    d = df.copy()
+    if "Time" not in d.columns:
+        return d
+    try:
+        t = pd.to_datetime(d["Time"], errors="coerce", utc=True)
+        cutoff = pd.Timestamp(_now_ist()).tz_convert("UTC")
+        completed = t.notna() & ((t + pd.Timedelta(minutes=resolution_minutes)) <= cutoff)
+        d = d.loc[completed].copy()
+        d["Time"] = t.loc[completed].values
+        return d.reset_index(drop=True)
+    except Exception:
+        return d.reset_index(drop=True)
+
+
+def _signal_candle_timestamp(df: pd.DataFrame, idx: int, resolution_minutes: int = 5):
+    """Get the real candle CLOSE timestamp from Time, never from reset_index()."""
+    try:
+        ts = pd.to_datetime(df["Time"].iloc[idx], errors="coerce", utc=True)
+        if pd.isna(ts):
+            return _now_ist()
+        return ts.tz_convert(IST) + pd.Timedelta(minutes=resolution_minutes)
+    except Exception:
+        return _now_ist()
 
 # ════════════════════════════════════════════════════════════════════════════════
 # MOMENTUM SCORING ENGINE (NEW - V17)
@@ -2683,24 +2707,19 @@ def _pre_move_signal(df: pd.DataFrame, block: Dict[str, Any] = None) -> Dict[str
         buy = sell = 0.0
         br, sr = [], []
 
-        # Neutral energy factors are added to both sides because they identify
-        # a potential expansion but do not predict its direction.
-        if compression:
-            buy += 15; sell += 15
-            br.append("Compression"); sr.append("Compression")
-        if tight_compression:
-            buy += 8; sell += 8
-            br.append("Tight Range"); sr.append("Tight Range")
-
-        if volume_building:
-            buy += 12; sell += 12
-            br.append(f"Volume Building {recent_rvol:.2f}x"); sr.append(f"Volume Building {recent_rvol:.2f}x")
-        if strong_volume_building:
-            buy += 8; sell += 8
-        if rvol >= 1.50:
-            buy += 8; sell += 8
-        if volume_accel >= 1.25:
-            buy += 5; sell += 5
+        # Compression/volume are setup energy only. They no longer create
+        # artificial BUY+SELL scores; direction must come from price/structure.
+        setup_energy = 0.0
+        if compression: setup_energy += 10
+        if tight_compression: setup_energy += 5
+        if volume_building: setup_energy += 8
+        if strong_volume_building: setup_energy += 5
+        if rvol >= 1.50: setup_energy += 5
+        if volume_accel >= 1.25: setup_energy += 4
+        if setup_energy and (ret5 > 0 or ret3 > 0 or buy_pressure >= 55 or hh_hl or above_vwap):
+            buy += setup_energy
+        if setup_energy and (ret5 < 0 or ret3 < 0 or sell_pressure >= 55 or lh_ll or below_vwap):
+            sell += setup_energy
 
         # Directional breakout proximity.
         if very_near_high:
@@ -2796,7 +2815,7 @@ def _pre_move_signal(df: pd.DataFrame, block: Dict[str, Any] = None) -> Dict[str
 
 
 def detect_live_sudden_move(df: pd.DataFrame) -> Dict[str, Any]:
-    """Detect CURRENT sudden 5M BUY/SELL movement. No consolidation required."""
+    """Strict CURRENT closed-5M movement detector; rejects weak/conflicting candles."""
     result = {
         "signal": "NO MOVE", "direction": "NONE", "score": 0.0,
         "reason": "", "move_pct": 0.0, "body_pct": 0.0,
@@ -2804,156 +2823,173 @@ def detect_live_sudden_move(df: pd.DataFrame) -> Dict[str, Any]:
         "hh_hl": False, "lh_ll": False, "price_acceleration": 0.0,
         "volume_spike": False,
     }
-    if df is None or len(df) < 12:
-        result["reason"] = "Insufficient recent 5M candles"
+    if df is None or len(df) < 20:
+        result["reason"] = "Insufficient completed 5M candles"
         return result
     try:
-        d = df.reset_index(drop=True).copy()
-        last = d.iloc[-1]
-        o, h, l, c, v = map(float, [last["Open"], last["High"], last["Low"], last["Close"], last["Volume"]])
-        prev = float(d["Close"].iloc[-2])
-        if min(o, c, prev) <= 0:
-            result["reason"] = "Invalid price data"
+        d = _completed_candles(df, 5)
+        if d is None or len(d) < 20:
+            result["reason"] = "Waiting for completed 5M candle"
+            return result
+        d = d.copy()
+        for col in ["Open", "High", "Low", "Close", "Volume"]:
+            d[col] = pd.to_numeric(d[col], errors="coerce")
+        d = d.dropna(subset=["Open", "High", "Low", "Close", "Volume"]).reset_index(drop=True)
+        if len(d) < 20:
+            result["reason"] = "Insufficient valid 5M candles"
             return result
 
-        move_pct = ((c - prev) / prev) * 100.0
-        candle_range = max(h - l, 1e-9)
-        body = abs(c - o)
-        body_pct = body / candle_range * 100.0
-        atr_s = calculate_atr(d, 14)
-        atr = float(atr_s.iloc[-1]) if len(atr_s) and pd.notna(atr_s.iloc[-1]) else max(c * 0.003, 0.01)
-        body_atr = body / atr if atr > 0 else 0.0
+        last = d.iloc[-1]; prev = d.iloc[-2]
+        o,h,l,c,v = map(float,[last["Open"],last["High"],last["Low"],last["Close"],last["Volume"]])
+        prev_close=float(prev["Close"])
+        if min(o,c,prev_close) <= 0:
+            result["reason"]="Invalid price data"; return result
 
-        vol_base = float(d["Volume"].iloc[-11:-1].mean()) if len(d) >= 11 else float(d["Volume"].iloc[:-1].mean())
-        rvol = v / vol_base if vol_base > 0 else 0.0
+        move_pct=((c-prev_close)/prev_close)*100.0
+        rng=max(h-l,1e-9); body=abs(c-o); body_pct=body/rng*100.0
+        atr_s=calculate_atr(d,14)
+        atr=float(atr_s.iloc[-1]) if len(atr_s) and pd.notna(atr_s.iloc[-1]) else max(c*0.003,0.01)
+        body_atr=body/atr if atr>0 else 0.0
+        vol_base=float(d["Volume"].iloc[-11:-1].mean())
+        rvol=v/vol_base if vol_base>0 else 0.0
 
-        # Recent acceleration: current candle move versus average of last few candle moves.
-        moves = []
-        for i in range(max(1, len(d)-6), len(d)-1):
-            pc = float(d["Close"].iloc[i-1]); cc = float(d["Close"].iloc[i])
-            if pc > 0:
-                moves.append(abs((cc-pc)/pc)*100.0)
-        avg_move = float(np.mean(moves)) if moves else 0.0
-        acceleration = abs(move_pct) / avg_move if avg_move > 0 else 0.0
+        moves=[]
+        for i in range(max(1,len(d)-6),len(d)-1):
+            pc=float(d["Close"].iloc[i-1]); cc=float(d["Close"].iloc[i])
+            if pc>0: moves.append(abs((cc-pc)/pc)*100.0)
+        avg_move=float(np.mean(moves)) if moves else 0.0
+        acceleration=abs(move_pct)/avg_move if avg_move>0 else 0.0
 
-        # Recent market structure, not old daily/history setup.
-        ph, pl = _confirmed_pivots(d.tail(20), left=1, right=1)
-        hh_hl = lh_ll = False
-        if len(ph) >= 2 and len(pl) >= 2:
-            hh_hl = ph[-1][1] > ph[-2][1] and pl[-1][1] > pl[-2][1]
-            lh_ll = ph[-1][1] < ph[-2][1] and pl[-1][1] < pl[-2][1]
-        structure = "HH/HL" if hh_hl else "LH/LL" if lh_ll else "NONE"
+        ph,pl=_confirmed_pivots(d.tail(20),left=1,right=1)
+        hh_hl=lh_ll=False
+        if len(ph)>=2 and len(pl)>=2:
+            hh_hl=ph[-1][1]>ph[-2][1] and pl[-1][1]>pl[-2][1]
+            lh_ll=ph[-1][1]<ph[-2][1] and pl[-1][1]<pl[-2][1]
+        structure="HH/HL" if hh_hl else "LH/LL" if lh_ll else "NONE"
 
-        bullish = c > o
-        bearish = c < o
-        volume_spike = rvol >= LIVE_MOVE_MIN_RVOL
-        strong_volume = rvol >= LIVE_MOVE_STRONG_RVOL
-        strong_body = body_pct >= LIVE_MOVE_MIN_BODY_PCT
-        very_strong_body = body_pct >= 65.0
-        acceleration_ok = acceleration >= 1.30
+        bullish=c>o; bearish=c<o
+        volume_spike=rvol>=LIVE_MOVE_MIN_RVOL
+        strong_volume=rvol>=LIVE_MOVE_STRONG_RVOL
+        strong_body=body_pct>=LIVE_MOVE_MIN_BODY_PCT
+        acceleration_ok=acceleration>=1.30
 
-        buy = 0.0
-        sell = 0.0
-        if bullish: buy += 20
-        if move_pct >= LIVE_MOVE_MIN_PCT: buy += 20
-        if move_pct >= LIVE_MOVE_BIG_PCT: buy += 10
-        if bullish and strong_body: buy += 10
-        if bullish and very_strong_body: buy += 5
-        if volume_spike: buy += 10
-        if strong_volume: buy += 5
-        if move_pct > 0 and acceleration_ok: buy += 10
-        if hh_hl: buy += 10
+        buy=sell=0.0
+        if bullish: buy+=20
+        if move_pct>=LIVE_MOVE_MIN_PCT: buy+=20
+        if move_pct>=LIVE_MOVE_BIG_MIN_PCT: buy+=10
+        if bullish and strong_body: buy+=10
+        if bullish and body_atr>=LIVE_MOVE_MIN_BODY_ATR: buy+=10
+        if volume_spike: buy+=10
+        if strong_volume: buy+=5
+        if move_pct>0 and acceleration_ok: buy+=10
+        if hh_hl: buy+=10
 
-        if bearish: sell += 20
-        if move_pct <= -LIVE_MOVE_MIN_PCT: sell += 20
-        if move_pct <= -LIVE_MOVE_BIG_PCT: sell += 10
-        if bearish and strong_body: sell += 10
-        if bearish and very_strong_body: sell += 5
-        if volume_spike: sell += 10
-        if strong_volume: sell += 5
-        if move_pct < 0 and acceleration_ok: sell += 10
-        if lh_ll: sell += 10
+        if bearish: sell+=20
+        if move_pct<=-LIVE_MOVE_MIN_PCT: sell+=20
+        if move_pct<=-LIVE_MOVE_BIG_MIN_PCT: sell+=10
+        if bearish and strong_body: sell+=10
+        if bearish and body_atr>=LIVE_MOVE_MIN_BODY_ATR: sell+=10
+        if volume_spike: sell+=10
+        if strong_volume: sell+=5
+        if move_pct<0 and acceleration_ok: sell+=10
+        if lh_ll: sell+=10
 
-        buy = min(100.0, buy); sell = min(100.0, sell)
-        score = max(buy, sell)
+        # Hard gates: a score alone cannot create a trade signal.
+        buy_ready=(bullish and move_pct>=LIVE_MOVE_MIN_PCT and strong_body and body_atr>=LIVE_MOVE_MIN_BODY_ATR and rvol>=LIVE_MOVE_MIN_RVOL)
+        sell_ready=(bearish and move_pct<=-LIVE_MOVE_MIN_PCT and strong_body and body_atr>=LIVE_MOVE_MIN_BODY_ATR and rvol>=LIVE_MOVE_MIN_RVOL)
+        if buy_ready and sell_ready: buy_ready=sell_ready=False
 
-        if buy >= LIVE_MOVE_MIN_SCORE and buy > sell:
-            direction = "BUY"
-            signal = "🔥 BIG BUY" if buy >= LIVE_MOVE_STRONG_SCORE else "🟢 BUY"
-            reasons = [f"Move +{move_pct:.2f}%", f"RVOL {rvol:.2f}x", f"Body {body_pct:.0f}%"]
+        buy=min(100.0,buy); sell=min(100.0,sell)
+        direction="NONE"; signal="NO MOVE"; score=max(buy,sell)
+        reasons=[]
+        if buy_ready and buy>=LIVE_MOVE_MIN_SCORE and buy>sell+8:
+            direction="BUY"
+            big=(move_pct>=LIVE_MOVE_BIG_MIN_PCT and rvol>=LIVE_MOVE_BIG_MIN_RVOL and body_pct>=55 and body_atr>=LIVE_MOVE_BIG_BODY_ATR and (hh_hl or close_breakout_up(d)))
+            signal="🔥 BIG BUY" if big and buy>=LIVE_MOVE_STRONG_SCORE else "🟢 BUY"
+            reasons=[f"Move +{move_pct:.2f}%",f"RVOL {rvol:.2f}x",f"Body {body_pct:.0f}%",f"Body/ATR {body_atr:.2f}"]
             if hh_hl: reasons.append("HH/HL")
             if acceleration_ok: reasons.append("Acceleration")
-            reason = " + ".join(reasons)
-            score = buy
-        elif sell >= LIVE_MOVE_MIN_SCORE and sell > buy:
-            direction = "SELL"
-            signal = "🔥 BIG SELL" if sell >= LIVE_MOVE_STRONG_SCORE else "🔴 SELL"
-            reasons = [f"Move {move_pct:.2f}%", f"RVOL {rvol:.2f}x", f"Body {body_pct:.0f}%"]
+        elif sell_ready and sell>=LIVE_MOVE_MIN_SCORE and sell>buy+8:
+            direction="SELL"
+            big=(move_pct<=-LIVE_MOVE_BIG_MIN_PCT and rvol>=LIVE_MOVE_BIG_MIN_RVOL and body_pct>=55 and body_atr>=LIVE_MOVE_BIG_BODY_ATR and (lh_ll or close_breakout_down(d)))
+            signal="🔥 BIG SELL" if big and sell>=LIVE_MOVE_STRONG_SCORE else "🔴 SELL"
+            reasons=[f"Move {move_pct:.2f}%",f"RVOL {rvol:.2f}x",f"Body {body_pct:.0f}%",f"Body/ATR {body_atr:.2f}"]
             if lh_ll: reasons.append("LH/LL")
             if acceleration_ok: reasons.append("Acceleration")
-            reason = " + ".join(reasons)
-            score = sell
         else:
-            direction = "NONE"
-            signal = "NO MOVE"
-            reason = f"Move {move_pct:.2f}% | RVOL {rvol:.2f}x | Body {body_pct:.0f}% | Structure {structure}"
+            reason_parts=[]
+            if not (bullish or bearish): reason_parts.append("Doji/neutral candle")
+            if abs(move_pct)<LIVE_MOVE_MIN_PCT: reason_parts.append("Move below threshold")
+            if body_pct<LIVE_MOVE_MIN_BODY_PCT: reason_parts.append("Weak body")
+            if body_atr<LIVE_MOVE_MIN_BODY_ATR: reason_parts.append("Body below ATR threshold")
+            if rvol<LIVE_MOVE_MIN_RVOL: reason_parts.append("RVOL below threshold")
+            if buy>0 and sell>0 and abs(buy-sell)<=8: reason_parts.append("BUY/SELL conflict")
+            reason_parts.append(f"Move {move_pct:+.2f}% | RVOL {rvol:.2f}x | Body {body_pct:.0f}% | {structure}")
+            result["reason"]=" | ".join(reason_parts)
 
-        result.update({
-            "signal": signal, "direction": direction, "score": round(score, 1),
-            "reason": reason, "move_pct": round(move_pct, 3),
-            "body_pct": round(body_pct, 1), "body_atr": round(body_atr, 2),
-            "rvol": round(rvol, 2), "structure": structure,
-            "hh_hl": hh_hl, "lh_ll": lh_ll,
-            "price_acceleration": round(acceleration, 2),
-            "volume_spike": volume_spike,
-        })
+        if direction!="NONE": result["reason"]=" + ".join(reasons)
+        result.update({"signal":signal,"direction":direction,"score":round(score,1),"move_pct":round(move_pct,3),"body_pct":round(body_pct,1),"body_atr":round(body_atr,2),"rvol":round(rvol,2),"structure":structure,"hh_hl":hh_hl,"lh_ll":lh_ll,"price_acceleration":round(acceleration,2),"volume_spike":volume_spike})
         return result
     except Exception as e:
-        result["reason"] = f"ERROR: {str(e)[:120]}"
-        return result
+        result["reason"]=f"ERROR: {str(e)[:120]}"; return result
 
+
+def close_breakout_up(d: pd.DataFrame) -> bool:
+    if d is None or len(d)<6: return False
+    return float(d["Close"].iloc[-1]) > float(d["High"].iloc[-6:-1].max())
+
+
+def close_breakout_down(d: pd.DataFrame) -> bool:
+    if d is None or len(d)<6: return False
+    return float(d["Close"].iloc[-1]) < float(d["Low"].iloc[-6:-1].min())
 
 def _fetch_momentum_signal(fyers, symbol: str, is_fo: bool = False):
-    """Intraday movement worker. Checks recent completed 5M candles and adds early-warning status."""
-    stock_ticker = symbol.replace("NSE:", "").replace("-EQ", "") if isinstance(symbol,str) else str(symbol)
-    if not isinstance(symbol,str) or not _VALID_EQ_SYMBOL_RE.match(symbol): return None, f"{symbol}: invalid format"
+    """Fresh LIVE movement worker. Uses completed 5M candles and strict freshness."""
+    stock_ticker=symbol.replace("NSE:","").replace("-EQ","") if isinstance(symbol,str) else str(symbol)
+    if not isinstance(symbol,str) or not _VALID_EQ_SYMBOL_RE.match(symbol): return None,f"{symbol}: invalid format"
     try:
         df5=_fetch_timeframe_data(fyers,symbol,"5",lookback_days=LIVE_MOVE_LOOKBACK_DAYS)
-        if df5 is None or len(df5)<25: return None, f"{symbol}: insufficient 5M data"
-        d=df5.reset_index(drop=True).copy()
+        if df5 is None or len(df5)<25: return None,f"{symbol}: insufficient 5M data"
+        d=_completed_candles(df5,5)
+        if d is None or len(d)<20: return None,f"{symbol}: no completed 5M candle"
+        d=d.copy()
         block=detect_block_order_activity(d)
-        pre=_pre_move_signal(d, block=block)
-        # Search the latest 12 completed candles so a signal is not lost on the next candle.
+        pre=_pre_move_signal(d,block=block)
+
         candidates=[]
-        for idx in range(max(12,len(d)-12),len(d)):
+        # Only the latest 3 CLOSED candles are eligible. Older moves are history, not LIVE.
+        first=max(0,len(d)-3)
+        for idx in range(first,len(d)):
             sub=d.iloc[:idx+1]
             mv=detect_live_sudden_move(sub)
             if mv.get("direction") in ("BUY","SELL"):
-                candidates.append((idx,mv))
+                sig_time=_signal_candle_timestamp(d,idx,5)
+                age=max(0,(pd.Timestamp(_now_ist())-pd.Timestamp(sig_time)).total_seconds()/60.0)
+                if age<=LIVE_MOVE_MAX_SIGNAL_AGE_MIN:
+                    candidates.append((idx,mv,sig_time,age))
+
         if candidates:
-            idx,mv=max(candidates,key=lambda x:x[0]); sig_time=d.index[idx] if not isinstance(d.index,pd.RangeIndex) else None
-            if sig_time is None: sig_time=_now_ist()
-            try:
-                sig_time=pd.Timestamp(sig_time).to_pydatetime()
-                if sig_time.tzinfo is None: sig_time=sig_time.replace(tzinfo=_now_ist().tzinfo)
-            except: sig_time=_now_ist()
-            age=max(0,( _now_ist()-sig_time).total_seconds()/60)
+            idx,mv,sig_time,age=max(candidates,key=lambda x:x[0])
             signal=mv["signal"]
+            direction=mv["direction"]
         else:
             mv=detect_live_sudden_move(d)
-            idx=len(d)-1; sig_time=d.index[-1] if not isinstance(d.index,pd.RangeIndex) else _now_ist()
-            try:
-                sig_time=pd.Timestamp(sig_time).to_pydatetime()
-                if sig_time.tzinfo is None: sig_time=sig_time.replace(tzinfo=_now_ist().tzinfo)
-            except: sig_time=_now_ist()
-            age=max(0,(_now_ist()-sig_time).total_seconds()/60)
-            signal=pre["status"] if pre["direction"] in ("BUY","SELL") else "NO MOVE"
+            sig_time=_signal_candle_timestamp(d,len(d)-1,5)
+            age=max(0,(pd.Timestamp(_now_ist())-pd.Timestamp(sig_time)).total_seconds()/60.0)
+            direction="NONE"
+            signal=pre["status"] if pre.get("direction") in ("BUY","SELL") else "NO MOVE"
+            # Never display an old LIVE BUY/SELL as current.
+            if age>LIVE_MOVE_MAX_SIGNAL_AGE_MIN:
+                signal="⚪ WAIT"
+                pre={**pre,"status":"⚪ WAIT","direction":"NONE","reason":f"No fresh movement <= {LIVE_MOVE_MAX_SIGNAL_AGE_MIN:.0f} min"}
+
         ltp=float(d["Close"].iloc[-1])
-        result={"Symbol":stock_ticker,"LTP":round(ltp,2),"SIGNAL TIME":sig_time.strftime("%d-%b-%Y %H:%M:%S"),"SIGNAL AGE (MIN)":round(age,1),"SIGNAL":signal,"DIRECTION":mv.get("direction") if candidates else pre["direction"],"MOVE %":mv.get("move_pct",0.0),"BODY %":mv.get("body_pct",0.0),"BODY / ATR":mv.get("body_atr",0.0),"RVOL":mv.get("rvol",0.0),"STRUCTURE":mv.get("structure", "NONE"),"HH/HL":"✅" if mv.get("hh_hl") else "−","LH/LL":"✅" if mv.get("lh_ll") else "−","ACCELERATION":mv.get("price_acceleration",0.0),"VOLUME SPIKE":"🔥" if mv.get("volume_spike") else "−","SCORE":mv.get("score",0.0),"PRE-MOVE":pre["direction"],"PRE-MOVE SCORE":pre["score"],"PRE-MOVE STATUS":pre["status"],"PRE BUY SCORE":pre.get("buy_score",0),"PRE SELL SCORE":pre.get("sell_score",0),"PRE SCORE GAP":pre.get("score_gap",0),"PRE-MOVE REASON":pre["reason"],"BREAKOUT LEVEL":pre.get("breakout_level"),"BREAKDOWN LEVEL":pre.get("breakdown_level"),"PRE-MOVE RVOL":pre.get("rvol",0),"BLOCK ORDER SCORE":block["block_score"],"BLOCK ACTIVITY":block["block_signal"],"BLOCK SIDE":block["block_side"],"BLOCK LEVEL":block["block_level"],"BLOCK RVOL":block["block_rvol"],"BLOCK REASON":block["block_reason"],"REASON":mv.get("reason",pre["reason"]),"MOVEMENT STATUS": signal if candidates else pre["status"]}
+        result={"Symbol":stock_ticker,"LTP":round(ltp,2),"SIGNAL TIME":pd.Timestamp(sig_time).strftime("%d-%b-%Y %H:%M:%S"),"SIGNAL AGE (MIN)":round(age,1),"SIGNAL":signal,"DIRECTION":direction,"MOVE %":mv.get("move_pct",0.0),"BODY %":mv.get("body_pct",0.0),"BODY / ATR":mv.get("body_atr",0.0),"RVOL":mv.get("rvol",0.0),"STRUCTURE":mv.get("structure","NONE"),"HH/HL":"✅" if mv.get("hh_hl") else "−","LH/LL":"✅" if mv.get("lh_ll") else "−","ACCELERATION":mv.get("price_acceleration",0.0),"VOLUME SPIKE":"🔥" if mv.get("volume_spike") else "−","SCORE":mv.get("score",0.0),"PRE-MOVE":pre["direction"],"PRE-MOVE SCORE":pre["score"],"PRE-MOVE STATUS":pre["status"],"PRE BUY SCORE":pre.get("buy_score",0),"PRE SELL SCORE":pre.get("sell_score",0),"PRE SCORE GAP":pre.get("score_gap",0),"PRE-MOVE REASON":pre["reason"],"BREAKOUT LEVEL":pre.get("breakout_level"),"BREAKDOWN LEVEL":pre.get("breakdown_level"),"PRE-MOVE RVOL":pre.get("rvol",0),"BLOCK ORDER SCORE":block["block_score"],"BLOCK ACTIVITY":block["block_signal"],"BLOCK SIDE":block["block_side"],"BLOCK LEVEL":block["block_level"],"BLOCK RVOL":block["block_rvol"],"BLOCK REASON":block["block_reason"],"REASON":mv.get("reason",pre["reason"]),"MOVEMENT STATUS":signal if direction in ("BUY","SELL") else pre["status"]}
         if is_fo and result["DIRECTION"] in ("BUY","SELL"):
             try:
                 od=fetch_options_chain_data(fyers,symbol); result["PCR"]=od.get("pcr","N/A"); result["OPTIONS BIAS"]=od.get("options_bias","N/A")
-            except: result["PCR"]="N/A"; result["OPTIONS BIAS"]="N/A"
+            except Exception:
+                result["PCR"]="N/A"; result["OPTIONS BIAS"]="N/A"
         return result,None
     except Exception as e:
         logger.exception("LIVE MOMENTUM worker failed for %s",symbol); return None,f"{symbol}: error ({type(e).__name__}: {str(e)[:120]})"
@@ -3073,138 +3109,7 @@ PIN_BIGMOVE_MIN_SCORE = 70
 PIN_MAX_SCAN = None  # Full NSE/F&O universe; no artificial 100-stock limit
 
 
-def _calculate_1h_liquidity_levels(df_1h: Optional[pd.DataFrame], current_price: float) -> Dict[str, Any]:
-    """Identify the nearest confirmed 1H buy-side and sell-side liquidity.
-
-    TOP is the nearest confirmed swing/equal HIGH above current price.
-    BOTTOM is the nearest confirmed swing/equal LOW below current price.
-    This is structural liquidity, not a claim about hidden institutional orders.
-    """
-    out = {
-        "top_level": None, "bottom_level": None,
-        "top_score": 0.0, "bottom_score": 0.0,
-        "top_status": "NONE", "bottom_status": "NONE",
-        "top_equal": False, "bottom_equal": False,
-        "top_distance_pct": None, "bottom_distance_pct": None,
-    }
-    if df_1h is None or len(df_1h) < (LIQUIDITY_1H_PIVOT_LEN * 2 + 5) or current_price <= 0:
-        return out
-    try:
-        d = df_1h.copy().reset_index(drop=True)
-        ph, pl = _confirmed_pivots(d, left=LIQUIDITY_1H_PIVOT_LEN, right=LIQUIDITY_1H_PIVOT_LEN)
-        highs = sorted([float(v) for _, v in ph if float(v) > current_price])
-        lows = sorted([float(v) for _, v in pl if float(v) < current_price], reverse=True)
-        if highs:
-            top = highs[0]
-            out["top_level"] = top
-            out["top_distance_pct"] = abs(top-current_price) / current_price * 100.0
-            out["top_status"] = "NEAR" if out["top_distance_pct"] <= 0.50 else "ACTIVE"
-            out["top_score"] = max(40.0, min(100.0, 100.0 - out["top_distance_pct"] * 20.0))
-            # Equal-high confluence among recent confirmed 1H highs.
-            recent_highs = [float(v) for _, v in ph[-4:]]
-            atr_s = calculate_atr(d, 14)
-            atr = float(atr_s.iloc[-1]) if len(atr_s) and pd.notna(atr_s.iloc[-1]) else max(current_price * 0.005, 0.01)
-            if sum(abs(x-top) <= atr * PIN_EQUAL_ATR_TOL for x in recent_highs) >= 2:
-                out["top_equal"] = True
-                out["top_score"] = min(100.0, out["top_score"] + 15.0)
-        if lows:
-            bottom = lows[0]
-            out["bottom_level"] = bottom
-            out["bottom_distance_pct"] = abs(current_price-bottom) / current_price * 100.0
-            out["bottom_status"] = "NEAR" if out["bottom_distance_pct"] <= 0.50 else "ACTIVE"
-            out["bottom_score"] = max(40.0, min(100.0, 100.0 - out["bottom_distance_pct"] * 20.0))
-            recent_lows = [float(v) for _, v in pl[-4:]]
-            atr_s = calculate_atr(d, 14)
-            atr = float(atr_s.iloc[-1]) if len(atr_s) and pd.notna(atr_s.iloc[-1]) else max(current_price * 0.005, 0.01)
-            if sum(abs(x-bottom) <= atr * PIN_EQUAL_ATR_TOL for x in recent_lows) >= 2:
-                out["bottom_equal"] = True
-                out["bottom_score"] = min(100.0, out["bottom_score"] + 15.0)
-    except Exception:
-        return out
-    return out
-
-
-def _emit_liquidity_browser_notification(alerts: List[Dict[str, Any]]) -> None:
-    """Show Streamlit toast + browser notification once per alert key.
-
-    Browser notifications require the user to allow notifications for localhost.
-    """
-    if not alerts:
-        return
-    if not isinstance(st.session_state.get("liquidity_alert_seen"), set):
-        st.session_state["liquidity_alert_seen"] = set()
-    now = _now_ist()
-    fresh = []
-    for a in alerts:
-        key = f"{a.get('Symbol')}|{a.get('TYPE')}|{a.get('LEVEL')}|{now.strftime('%Y%m%d%H') }"
-        # Same level/type is suppressed for a cooldown window using session timestamp.
-        last_map = st.session_state.setdefault("liquidity_alert_times", {})
-        last = last_map.get(key)
-        if last:
-            try:
-                if (now - last).total_seconds() < LIQUIDITY_ALERT_COOLDOWN_MIN * 60:
-                    continue
-            except Exception:
-                pass
-        last_map[key] = now
-        fresh.append(a)
-        st.toast(f"{a.get('ICON','🔔')} {a.get('Symbol')} {a.get('TYPE')} LIQUIDITY REACHED @ {a.get('LEVEL')}", icon=a.get('ICON','🔔'))
-    if not fresh or st_html is None:
-        return
-    payload = json.dumps(fresh, ensure_ascii=False).replace("</", "<" + "/")
-    script = f"""<script>
-const alerts = {payload};
-(async () => {{
-  try {{
-    if ('Notification' in window) {{
-      if (Notification.permission === 'default') await Notification.requestPermission();
-      if (Notification.permission === 'granted') {{
-        alerts.forEach(a => new Notification(`${{a.ICON || '🔔'}} ${{a.Symbol}} ${{a.TYPE}}`, {{body: `1H liquidity reached @ ${{a.LEVEL}}`}}));
-      }}
-    }}
-    const Ctx = window.AudioContext || window.webkitAudioContext;
-    if (Ctx) {{
-      const ctx = new Ctx(); const o = ctx.createOscillator(); const g = ctx.createGain();
-      o.frequency.value = 880; g.gain.value = 0.05; o.connect(g); g.connect(ctx.destination);
-      o.start(); o.stop(ctx.currentTime + 0.18);
-    }}
-  }} catch(e) {{ console.log('Liquidity notification:', e); }}
-}})();
-</script>"""
-    try:
-        st_html(script, height=0)
-    except Exception:
-        pass
-
-
-def _check_1h_liquidity_alerts(pin_df: pd.DataFrame, tolerance_pct: float = LIQUIDITY_ALERT_TOLERANCE_PCT) -> List[Dict[str, Any]]:
-    """Return alerts when current LTP reaches/crosses the 1H TOP/BOTTOM liquidity."""
-    alerts = []
-    if pin_df is None or pin_df.empty:
-        return alerts
-    required = {"Symbol", "LTP", "1H TOP LIQUIDITY LEVEL", "1H BOTTOM LIQUIDITY LEVEL"}
-    if not required.issubset(pin_df.columns):
-        return alerts
-    for _, row in pin_df.iterrows():
-        try:
-            symbol = str(row["Symbol"])
-            ltp = float(row["LTP"])
-            top = row.get("1H TOP LIQUIDITY LEVEL")
-            bottom = row.get("1H BOTTOM LIQUIDITY LEVEL")
-            if pd.notna(top):
-                top = float(top)
-                if ltp >= top or abs(ltp-top) / max(abs(top), 1e-9) * 100.0 <= tolerance_pct:
-                    alerts.append({"Symbol":symbol,"TYPE":"TOP BUY-SIDE","LEVEL":round(top,2),"ICON":"🟢"})
-            if pd.notna(bottom):
-                bottom = float(bottom)
-                if ltp <= bottom or abs(ltp-bottom) / max(abs(bottom), 1e-9) * 100.0 <= tolerance_pct:
-                    alerts.append({"Symbol":symbol,"TYPE":"BOTTOM SELL-SIDE","LEVEL":round(bottom,2),"ICON":"🔴"})
-        except Exception:
-            continue
-    return alerts
-
-
-def calculate_pin_rules(df_5m: pd.DataFrame, data_5m: Dict[str, Any], data_15m: Dict[str, Any], data_1h: Dict[str, Any], df_1h: Optional[pd.DataFrame] = None) -> Dict[str, Any]:
+def calculate_pin_rules(df_5m: pd.DataFrame, data_5m: Dict[str, Any], data_15m: Dict[str, Any], data_1h: Dict[str, Any]) -> Dict[str, Any]:
     """Rule-based implementation of the supplied Pine 'AI PRO v3' ideas.
     This is NOT machine-learning AI and it does not access the exchange order book.
     """
@@ -3216,11 +3121,6 @@ def calculate_pin_rules(df_5m: pd.DataFrame, data_5m: Dict[str, Any], data_15m: 
         "TOP LIQUIDITY SIDE": "BUY-SIDE", "TOP LIQUIDITY STATUS": "NONE",
         "BOTTOM LIQUIDITY": "NONE", "BOTTOM LIQUIDITY LEVEL": None,
         "BOTTOM LIQUIDITY SIDE": "SELL-SIDE", "BOTTOM LIQUIDITY STATUS": "NONE",
-        "1H TOP LIQUIDITY LEVEL": None, "1H BOTTOM LIQUIDITY LEVEL": None,
-        "1H BUY LIQUIDITY": "NONE", "1H SELL LIQUIDITY": "NONE",
-        "1H BUY LIQUIDITY SCORE": 0.0, "1H SELL LIQUIDITY SCORE": 0.0,
-        "1H TOP STATUS": "NONE", "1H BOTTOM STATUS": "NONE",
-        "1H TOP DISTANCE %": None, "1H BOTTOM DISTANCE %": None,
         "SWEEP": "NONE", "REVERSAL": "NONE", "EQUAL HIGH": "NO", "EQUAL LOW": "NO",
         "BIG MOVEMENT": "NO", "BIG MOVE SCORE": 0.0, "STRUCTURE": "NONE",
         "5M TREND": data_5m.get("structure_trend", "N/A"),
@@ -3236,7 +3136,6 @@ def calculate_pin_rules(df_5m: pd.DataFrame, data_5m: Dict[str, Any], data_15m: 
         d = df_5m.reset_index(drop=True).copy()
         last = d.iloc[-1]
         o, h, l, c, v = [float(last[x]) for x in ["Open", "High", "Low", "Close", "Volume"]]
-        liq_1h = _calculate_1h_liquidity_levels(df_1h, c)
         body = abs(c-o)
         rng = max(h-l, 1e-9)
         upper_wick = h-max(o,c)
@@ -3348,16 +3247,6 @@ def calculate_pin_rules(df_5m: pd.DataFrame, data_5m: Dict[str, Any], data_15m: 
             "BOTTOM LIQUIDITY LEVEL": round(float(last_lo), 2) if last_lo is not None else None,
             "BOTTOM LIQUIDITY SIDE": "SELL-SIDE",
             "BOTTOM LIQUIDITY STATUS": bottom_status,
-            "1H TOP LIQUIDITY LEVEL": round(float(liq_1h["top_level"]), 2) if liq_1h.get("top_level") is not None else None,
-            "1H BOTTOM LIQUIDITY LEVEL": round(float(liq_1h["bottom_level"]), 2) if liq_1h.get("bottom_level") is not None else None,
-            "1H BUY LIQUIDITY": "HIGH" if liq_1h.get("top_score", 0) >= 70 else "MEDIUM" if liq_1h.get("top_score", 0) >= 40 else "NONE",
-            "1H SELL LIQUIDITY": "HIGH" if liq_1h.get("bottom_score", 0) >= 70 else "MEDIUM" if liq_1h.get("bottom_score", 0) >= 40 else "NONE",
-            "1H BUY LIQUIDITY SCORE": round(float(liq_1h.get("top_score", 0)), 1),
-            "1H SELL LIQUIDITY SCORE": round(float(liq_1h.get("bottom_score", 0)), 1),
-            "1H TOP STATUS": "EQUAL+" if liq_1h.get("top_equal") else liq_1h.get("top_status", "NONE"),
-            "1H BOTTOM STATUS": "EQUAL+" if liq_1h.get("bottom_equal") else liq_1h.get("bottom_status", "NONE"),
-            "1H TOP DISTANCE %": round(float(liq_1h.get("top_distance_pct")), 3) if liq_1h.get("top_distance_pct") is not None else None,
-            "1H BOTTOM DISTANCE %": round(float(liq_1h.get("bottom_distance_pct")), 3) if liq_1h.get("bottom_distance_pct") is not None else None,
             "SWEEP": sweep, "REVERSAL": reversal,
             "EQUAL HIGH": "YES" if eq_hi else "NO", "EQUAL LOW": "YES" if eq_lo else "NO",
             "BIG MOVEMENT": bm.get("signal", "NO BIG MOVE"),
@@ -3459,10 +3348,9 @@ def _pin_stage2_confirm(fyers, candidate):
             a5.get("data", {}) or {},
             a15.get("data", {}) if a15.get("status") == "OK" else {},
             a1h.get("data", {}) if a1h.get("status") == "OK" else {},
-            a1h.get("df") if a1h.get("status") == "OK" else None,
         )
         pin["Symbol"] = display_symbol
-        pin["LTP"] = (a5.get("data", {}) or {}).get("last_close", "N/A")
+        pin["LTP"] = (a5.get("data", {}) or {}).get("close", "N/A")
         return pin, None
     except Exception as e:
         return None, f"{display_symbol}: {type(e).__name__}: {str(e)[:100]}"
@@ -4037,7 +3925,7 @@ def _show_live_order_flow_tab(fyers, all_symbols):
 
 def _show_pin_rules_tab(fyers, all_symbols=None, fo_symbols=None) -> None:
     """PIN Rules scanner. Runs independently from the main scanners."""
-    st.markdown("### 📌 PIN RULES — 1H BUY/SELL LIQUIDITY + TOP/BOTTOM + REVERSAL + BIG MOVEMENT")
+    st.markdown("### 📌 PIN RULES — Liquidity + Reversal + Big Movement")
     st.caption("Independent PIN scanner. It does not modify NSE, F&O, Momentum, or other scanner results.")
 
     source = st.selectbox(
@@ -4053,13 +3941,9 @@ def _show_pin_rules_tab(fyers, all_symbols=None, fo_symbols=None) -> None:
 
     with st.expander("📖 PIN Rules", expanded=False):
         st.markdown("""
-        **Liquidity:** TOP = Buy-side liquidity above the nearest confirmed 1H Pivot/Equal High; BOTTOM = Sell-side liquidity below the nearest confirmed 1H Pivot/Equal Low.
-
-        **1H PIN:** Uses confirmed 1H swing levels. It does not claim hidden institutional orders.
+        **Liquidity:** TOP = Buy-side liquidity above the latest confirmed Pivot/Equal High; BOTTOM = Sell-side liquidity below the latest confirmed Pivot/Equal Low.
 
         **Liquidity Status:** ACTIVE = not swept; SWEPT = current 5M candle crossed the liquidity level and closed back through it.
-
-        **Notification:** When current LTP reaches/crosses the 1H TOP/BOTTOM level or comes within the selected tolerance, a Streamlit + browser alert is generated.
         
         **Liquidity Score:** 0–100 setup-strength score based on confirmed level, equal-level confluence and current sweep evidence. It is not actual exchange quantity.
         
@@ -4103,14 +3987,6 @@ def _show_pin_rules_tab(fyers, all_symbols=None, fo_symbols=None) -> None:
 
     st.info(f"📊 Ready to scan ALL {total_available:,} available {source} symbols. No 100-stock limit.")
 
-    alert_col1, alert_col2, alert_col3 = st.columns(3)
-    with alert_col1:
-        liquidity_alerts_on = st.checkbox("🔔 1H TOP/BOTTOM ALERT", value=True, key="pin_liquidity_alerts")
-    with alert_col2:
-        alert_tolerance = st.number_input("Alert distance %", min_value=0.05, max_value=1.00, value=float(LIQUIDITY_ALERT_TOLERANCE_PCT), step=0.05, key="pin_alert_tolerance")
-    with alert_col3:
-        st.caption("🟢 TOP = BUY-SIDE liquidity\n🔴 BOTTOM = SELL-SIDE liquidity")
-
     if st.button("📌 RUN FULL PIN RULES SCAN", key="pin_run", type="primary", use_container_width=True):
         with st.spinner("Analyzing PIN liquidity, sweeps, reversals and big movement…"):
             result, errors = _run_pin_scan(
@@ -4125,37 +4001,24 @@ def _show_pin_rules_tab(fyers, all_symbols=None, fo_symbols=None) -> None:
 
     pin_df = st.session_state.get("pin_df")
     if isinstance(pin_df, pd.DataFrame) and not pin_df.empty:
-        if liquidity_alerts_on:
-            _emit_liquidity_browser_notification(_check_1h_liquidity_alerts(pin_df, float(alert_tolerance)))
-
-        st.markdown("### 🕐 1H LIQUIDITY MAP")
-        st.caption("Nearest confirmed 1H swing/equal HIGH above price = TOP BUY-SIDE liquidity | nearest confirmed 1H swing/equal LOW below price = BOTTOM SELL-SIDE liquidity.")
-        pc1, pc2, pc3, pc4, pc5 = st.columns(5)
+        pc1, pc2, pc3, pc4 = st.columns(4)
         signal_series = pin_df["PIN SIGNAL"].astype(str).str.upper() if "PIN SIGNAL" in pin_df.columns else pd.Series(dtype=str)
         sweep_series = pin_df["SWEEP"].astype(str) if "SWEEP" in pin_df.columns else pd.Series(dtype=str)
         pc1.metric("📌 PIN SETUPS", len(pin_df))
         pc2.metric("🟢 BUY", int(signal_series.str.contains("BUY", na=False).sum()))
         pc3.metric("🔴 SELL", int(signal_series.str.contains("SELL", na=False).sum()))
         pc4.metric("💧 SWEEPS", int((sweep_series != "NONE").sum()))
-        top_near = int((pd.to_numeric(pin_df.get("1H TOP DISTANCE %", pd.Series(dtype=float)), errors="coerce") <= float(alert_tolerance)).sum()) if "1H TOP DISTANCE %" in pin_df.columns else 0
-        pc5.metric("🕐 1H TOP NEAR", top_near)
 
         display_cols = [
             "Symbol", "LTP", "PIN SIGNAL", "PIN SCORE", "LIQUIDITY",
             "TOP LIQUIDITY", "TOP LIQUIDITY LEVEL", "TOP LIQUIDITY SIDE", "TOP LIQUIDITY STATUS",
             "BOTTOM LIQUIDITY", "BOTTOM LIQUIDITY LEVEL", "BOTTOM LIQUIDITY SIDE", "BOTTOM LIQUIDITY STATUS",
-            "1H TOP LIQUIDITY LEVEL", "1H BUY LIQUIDITY", "1H BUY LIQUIDITY SCORE", "1H TOP STATUS", "1H TOP DISTANCE %",
-            "1H BOTTOM LIQUIDITY LEVEL", "1H SELL LIQUIDITY", "1H SELL LIQUIDITY SCORE", "1H BOTTOM STATUS", "1H BOTTOM DISTANCE %",
             "BUY LIQUIDITY", "BUY LIQUIDITY SCORE", "SELL LIQUIDITY", "SELL LIQUIDITY SCORE",
             "SWEEP", "REVERSAL", "EQUAL HIGH", "EQUAL LOW", "BIG MOVEMENT", "BIG MOVE SCORE",
             "STRUCTURE", "5M TREND", "15M TREND", "1H TREND", "RVOL", "RSI",
             "PRESSURE", "AI CONFIDENCE %", "AI SIGNAL", "REASON"
         ]
         display_cols = [c for c in display_cols if c in pin_df.columns]
-        alert_cols = [c for c in ["Symbol", "LTP", "1H TOP LIQUIDITY LEVEL", "1H TOP DISTANCE %", "1H TOP STATUS", "1H BOTTOM LIQUIDITY LEVEL", "1H BOTTOM DISTANCE %", "1H BOTTOM STATUS"] if c in pin_df.columns]
-        if alert_cols:
-            st.markdown("#### 🎯 TOP / BOTTOM LEVELS")
-            st.dataframe(pin_df[alert_cols].sort_values(["1H TOP DISTANCE %"], na_position="last") if "1H TOP DISTANCE %" in alert_cols else pin_df[alert_cols], use_container_width=True, height=260)
         st.dataframe(pin_df[display_cols], use_container_width=True, height=500)
 
         try:
