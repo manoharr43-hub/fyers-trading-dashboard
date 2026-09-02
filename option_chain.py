@@ -2783,7 +2783,11 @@ def export_excel_report(df: pd.DataFrame, meta: dict, pcr: float, max_pain: floa
 
 
 def export_csv_bytes(df: pd.DataFrame) -> bytes:
-    return df.to_csv(index=False).encode("utf-8")
+    if df is None or df.empty:
+        return b""
+    out = df.copy()
+    out = out.replace([np.inf, -np.inf], np.nan)
+    return out.to_csv(index=False).encode("utf-8")
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -2884,10 +2888,10 @@ def _sidebar_config() -> dict:
         debug_mode = st.checkbox("Debug info", value=False, key="oc_debug_mode")
         col_free, col_live = st.columns(2)
         with col_free:
-            free_run = st.button("🆓 FREE RUN", use_container_width=True, type="primary",
+            free_run = st.button("🆓 FREE RUN", use_container_width=True, type="secondary",
                                  help="Runs the NSE option-chain scanner without requiring a FYERS client.")
         with col_live:
-            fetch_clicked = st.button("🔄 FETCH LIVE", use_container_width=True)
+            fetch_clicked = st.button("📡 FETCH LIVE", use_container_width=True)
 
     return {
         "is_index": is_index, "symbol": symbol, "strike_count": strike_count,
@@ -2933,8 +2937,11 @@ def _do_fetch_and_process(cfg: dict, fyers: Any = None) -> Optional[dict]:
         df = df_all
 
     expiry_label = meta["selected_expiry"]
-    atm_strike = float(df.iloc[(df["strike_price"] - spot).abs().argsort().iloc[0]]["strike_price"]) if spot else \
-        float(df["strike_price"].median())
+    if spot:
+        atm_pos = int((df["strike_price"] - float(spot)).abs().to_numpy().argmin())
+        atm_strike = float(df.iloc[atm_pos]["strike_price"])
+    else:
+        atm_strike = float(df["strike_price"].median())
 
     df = add_greeks_columns(df, spot, expiry_label)
     df = classify_buildup(df)
@@ -3070,7 +3077,22 @@ def run_dashboard(fyers: Any = None) -> None:
     _inject_css()
     st.markdown("## 📊 Options Chain + Price Action + Buy/Sell Pressure")
 
+    # Prominent Run button: keeps the dashboard usable even when the sidebar is collapsed.
+    run_col1, run_col2, run_col3 = st.columns([1.2, 1.2, 4.6])
+    with run_col1:
+        run_clicked = st.button("▶️ RUN SCANNER", use_container_width=True, type="primary",
+                                help="Fetch live option-chain data and run the scanner.")
+    with run_col2:
+        refresh_clicked = st.button("🔄 REFRESH NOW", use_container_width=True,
+                                    help="Fetch the latest available data now.")
+
     cfg = _sidebar_config()
+    cfg["fetch_clicked"] = bool(cfg.get("fetch_clicked") or run_clicked or refresh_clicked)
+    if run_clicked or refresh_clicked:
+        cfg["free_run"] = True
+        # Do not require FYERS just to run the NSE option-chain scanner.
+        if fyers is None:
+            cfg["analyze_price_action"] = False
 
     if cfg["symbol"] != st.session_state.get("oc_last_symbol"):
         st.session_state["oc_last_symbol"] = cfg["symbol"]
@@ -3078,7 +3100,7 @@ def run_dashboard(fyers: Any = None) -> None:
         st.session_state.pop("oc_selected_expiry", None)
 
     if cfg["fetch_clicked"] or cfg["auto_refresh"]:
-        # FREE RUN intentionally works with NSE-only option-chain data.
+        # RUN SCANNER / FREE RUN intentionally works with NSE-only option-chain data.
         # Price-action/MSS signals require a connected FYERS client.
         if cfg.get("free_run") and fyers is None:
             cfg["analyze_price_action"] = False
@@ -3134,7 +3156,10 @@ def run_dashboard(fyers: Any = None) -> None:
 
     source = state.get("data_source", "UNKNOWN")
     source_badge = "🟢 FYERS" if source == "FYERS" else ("🟡 NSE" if source == "NSE" else "⚪ Unknown")
-    st.caption(f"📡 Source: **{source_badge}** | Sentiment: {_pcr_sentiment_badge(state['pcr'])}", unsafe_allow_html=True)
+    st.caption(
+        f"📡 Source: **{source_badge}** | Sentiment: {_pcr_sentiment_badge(state['pcr'])} | "
+        f"Last update: **{meta.get('fetched_at', datetime.now()).strftime('%H:%M:%S')}**"
+    , unsafe_allow_html=True)
 
     for note in state.get("oi_shift_notes", []):
         st.info(f"🔀 {note}")
@@ -3233,6 +3258,13 @@ def run_dashboard(fyers: Any = None) -> None:
         move_view = df[move_cols].sort_values("movement_score", ascending=False).copy()
         top_n = st.slider("Top strikes", 5, min(30, max(5, len(move_view))), min(15, max(5, len(move_view))), key="movement_top_n") if len(move_view) >= 5 else len(move_view)
         if len(move_view):
+            best = move_view.iloc[0]
+            st.success(
+                f"🎯 TOP MOVEMENT: {float(best['strike_price']):,.0f} | "
+                f"{best.get('movement_bias', 'NEUTRAL')} | "
+                f"Score {float(best.get('movement_score', 0)):.0f}/100 | "
+                f"Strength {best.get('movement_strength', 'LOW')}"
+            )
             st.dataframe(move_view.head(top_n), use_container_width=True, hide_index=True)
             st.plotly_chart(chart_movement_score(df), use_container_width=True, config={"displayModeBar": False})
         else:
