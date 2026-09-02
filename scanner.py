@@ -2555,6 +2555,13 @@ def detect_block_order_activity(df: pd.DataFrame) -> Dict[str, Any]:
 
 
 def _pre_move_signal(df: pd.DataFrame, block: Dict[str, Any] = None) -> Dict[str, Any]:
+    """Enhanced PRE-MOVE engine.
+
+    Keeps the existing PRE-MOVE columns/statuses, but strengthens the early-warning
+    decision using volume buildup, price compression, breakout proximity, VWAP
+    pressure, short-term pressure, market structure and optional block activity.
+    PRE-MOVE is an early-warning model, not a guaranteed future-price prediction.
+    """
     out = {
         "status": "⚪ WAIT", "direction": "NONE", "score": 0.0,
         "buy_score": 0.0, "sell_score": 0.0, "score_gap": 0.0,
@@ -2565,54 +2572,173 @@ def _pre_move_signal(df: pd.DataFrame, block: Dict[str, Any] = None) -> Dict[str
         return out
     try:
         d = df.reset_index(drop=True).copy()
+        required = ["Open", "High", "Low", "Close", "Volume"]
+        if any(c not in d.columns for c in required):
+            out["reason"] = "Missing OHLCV columns"
+            return out
+
+        for c in required:
+            d[c] = pd.to_numeric(d[c], errors="coerce")
+        d = d.dropna(subset=required).reset_index(drop=True)
+        if len(d) < 30:
+            return out
+
         last = d.iloc[-1]
-        close, open_ = float(last["Close"]), float(last["Open"])
-        atr = _last_valid_atr(d, 14)
+        close = float(last["Close"])
+        open_ = float(last["Open"])
+        high = float(last["High"])
+        low = float(last["Low"])
+        if close <= 0:
+            out["reason"] = "Invalid price data"
+            return out
 
+        atr = max(float(_last_valid_atr(d, 14) or 0), close * 0.001)
+
+        # ------------------------- RANGE / COMPRESSION -------------------------
         recent = d.iloc[-10:]
-        rh, rl = float(recent["High"].max()), float(recent["Low"].min())
+        rh = float(recent["High"].max())
+        rl = float(recent["Low"].min())
         rsize = max(rh - rl, 1e-9)
-        compression = (rsize / max(atr, 1e-9)) <= 3.0
+        compression = (rsize / atr) <= 3.0
 
+        # Compare the latest range with the preceding range. Smaller recent
+        # ranges indicate energy being compressed before a possible expansion.
+        prev10 = d.iloc[-20:-10]
+        prev_range = float(prev10["High"].max() - prev10["Low"].min()) if len(prev10) else rsize
+        tight_compression = compression and rsize <= max(prev_range * 0.85, atr * 1.5)
+
+        # ---------------------------- VOLUME BUILDUP ----------------------------
         base = d["Volume"].iloc[-30:-5].astype(float)
         base_vol = float(base.mean()) if len(base) else 0.0
-        recent_vol = float(d["Volume"].iloc[-5:].astype(float).mean())
+        recent_vol_series = d["Volume"].iloc[-5:].astype(float)
+        recent_vol = float(recent_vol_series.mean()) if len(recent_vol_series) else 0.0
         last_vol = float(last["Volume"])
         rvol = last_vol / base_vol if base_vol > 0 else 0.0
+        recent_rvol = recent_vol / base_vol if base_vol > 0 else 0.0
         volume_building = base_vol > 0 and recent_vol >= base_vol * 1.15
+        strong_volume_building = base_vol > 0 and recent_vol >= base_vol * 1.35
 
+        # Volume acceleration: compare the latest 2 candles with the prior 3.
+        v_early = float(d["Volume"].iloc[-5:-2].mean()) if len(d) >= 5 else 0.0
+        v_late = float(d["Volume"].iloc[-2:].mean()) if len(d) >= 2 else 0.0
+        volume_accel = (v_late / v_early) if v_early > 0 else 1.0
+
+        # -------------------------- BREAKOUT PROXIMITY --------------------------
         pos = (close - rl) / rsize
-        near_high, near_low = pos >= 0.70, pos <= 0.30
-        ret5 = ((close / float(d["Close"].iloc[-6])) - 1.0) * 100.0
+        near_high = pos >= 0.70
+        near_low = pos <= 0.30
+        very_near_high = pos >= 0.88
+        very_near_low = pos <= 0.12
+        breakout_distance_pct = ((rh - close) / close) * 100.0
+        breakdown_distance_pct = ((close - rl) / close) * 100.0
 
+        # --------------------------- PRICE PRESSURE ----------------------------
+        ret5 = ((close / float(d["Close"].iloc[-6])) - 1.0) * 100.0
+        ret3 = ((close / float(d["Close"].iloc[-4])) - 1.0) * 100.0
+
+        # Candle-body pressure across recent candles. This is intentionally a
+        # simple OHLCV proxy, not a true exchange order-flow measurement.
+        recent20 = d.iloc[-20:]
+        up_vol = float(recent20.loc[recent20["Close"] > recent20["Open"], "Volume"].sum())
+        down_vol = float(recent20.loc[recent20["Close"] < recent20["Open"], "Volume"].sum())
+        eq_vol = float(recent20.loc[recent20["Close"] == recent20["Open"], "Volume"].sum())
+        total_dir_vol = up_vol + down_vol + eq_vol
+        buy_pressure = ((up_vol + eq_vol * 0.5) / total_dir_vol * 100.0) if total_dir_vol > 0 else 50.0
+        sell_pressure = 100.0 - buy_pressure
+
+        # Latest candle location in its own range.
+        candle_range = max(high - low, 1e-9)
+        close_location = (close - low) / candle_range
+
+        # ----------------------------- STRUCTURE -------------------------------
         ph, pl = _confirmed_pivots(d.tail(30), left=1, right=1)
         hh_hl = len(ph) >= 2 and len(pl) >= 2 and ph[-1][1] > ph[-2][1] and pl[-1][1] > pl[-2][1]
         lh_ll = len(ph) >= 2 and len(pl) >= 2 and ph[-1][1] < ph[-2][1] and pl[-1][1] < pl[-2][1]
 
+        # ------------------------------- VWAP ---------------------------------
+        typical = (d["High"] + d["Low"] + d["Close"]) / 3.0
+        vol_sum = d["Volume"].replace(0, pd.NA).cumsum()
+        pv = typical * d["Volume"]
+        cum_pv = pv.cumsum()
+        vwap_series = cum_pv / vol_sum
+        vwap = float(vwap_series.iloc[-1]) if pd.notna(vwap_series.iloc[-1]) else close
+        vwap_pct = ((close - vwap) / vwap) * 100.0 if vwap > 0 else 0.0
+        above_vwap = close > vwap * 1.0002
+        below_vwap = close < vwap * 0.9998
+
+        # --------------------------- SCORING -----------------------------------
         buy = sell = 0.0
         br, sr = [], []
 
+        # Neutral energy factors are added to both sides because they identify
+        # a potential expansion but do not predict its direction.
         if compression:
-            buy += 20; sell += 20
-            br.append("Compression"); sr.append("Compression")
-        if volume_building:
             buy += 15; sell += 15
-            br.append(f"Volume Building {rvol:.2f}x"); sr.append(f"Volume Building {rvol:.2f}x")
-        if rvol >= 1.50:
-            buy += 10; sell += 10
-        if near_high:
-            buy += 20; br.append("Near Breakout")
-        if near_low:
-            sell += 20; sr.append("Near Breakdown")
-        if ret5 > 0.10:
-            buy += 15; br.append("Buy Pressure")
-        elif ret5 < -0.10:
-            sell += 15; sr.append("Sell Pressure")
-        if hh_hl:
-            buy += 20; br.append("HH/HL")
-        if lh_ll:
-            sell += 20; sr.append("LH/LL")
+            br.append("Compression"); sr.append("Compression")
+        if tight_compression:
+            buy += 8; sell += 8
+            br.append("Tight Range"); sr.append("Tight Range")
 
+        if volume_building:
+            buy += 12; sell += 12
+            br.append(f"Volume Building {recent_rvol:.2f}x"); sr.append(f"Volume Building {recent_rvol:.2f}x")
+        if strong_volume_building:
+            buy += 8; sell += 8
+        if rvol >= 1.50:
+            buy += 8; sell += 8
+        if volume_accel >= 1.25:
+            buy += 5; sell += 5
+
+        # Directional breakout proximity.
+        if very_near_high:
+            buy += 22; br.append(f"Near Breakout {breakout_distance_pct:.2f}%")
+        elif near_high:
+            buy += 15; br.append("Near Breakout")
+        if very_near_low:
+            sell += 22; sr.append(f"Near Breakdown {breakdown_distance_pct:.2f}%")
+        elif near_low:
+            sell += 15; sr.append("Near Breakdown")
+
+        # Short-term price pressure.
+        if ret5 > 0.10:
+            buy += 8; br.append(f"5C Buy Pressure {ret5:+.2f}%")
+        elif ret5 < -0.10:
+            sell += 8; sr.append(f"5C Sell Pressure {ret5:+.2f}%")
+        if ret3 > 0.05:
+            buy += 5
+        elif ret3 < -0.05:
+            sell += 5
+
+        # OHLCV volume pressure.
+        if buy_pressure >= 65:
+            buy += 15; br.append(f"Buy Vol {buy_pressure:.0f}%")
+        elif buy_pressure >= 55:
+            buy += 8; br.append(f"Buy Vol {buy_pressure:.0f}%")
+        if sell_pressure >= 65:
+            sell += 15; sr.append(f"Sell Vol {sell_pressure:.0f}%")
+        elif sell_pressure >= 55:
+            sell += 8; sr.append(f"Sell Vol {sell_pressure:.0f}%")
+
+        # Latest candle closing location gives a small confirmation of pressure.
+        if close_location >= 0.75:
+            buy += 6; br.append("Strong Close")
+        elif close_location <= 0.25:
+            sell += 6; sr.append("Weak Close")
+
+        # Structure.
+        if hh_hl:
+            buy += 18; br.append("HH/HL")
+        if lh_ll:
+            sell += 18; sr.append("LH/LL")
+
+        # VWAP directional filter. Do not over-weight it because VWAP alone is
+        # not a breakout signal.
+        if above_vwap and (ret3 > 0 or near_high):
+            buy += 8; br.append(f"Above VWAP {vwap_pct:+.2f}%")
+        elif below_vwap and (ret3 < 0 or near_low):
+            sell += 8; sr.append(f"Below VWAP {vwap_pct:+.2f}%")
+
+        # Optional block/order activity already calculated by the existing app.
         if block:
             bsig = str(block.get("block_signal", "NONE")).upper()
             bside = str(block.get("block_side", "NONE")).upper()
@@ -2627,13 +2753,18 @@ def _pre_move_signal(df: pd.DataFrame, block: Dict[str, Any] = None) -> Dict[str
         score, gap = max(buy, sell), abs(buy - sell)
         direction, status, reasons = "NONE", "⚪ WAIT", ["No clear directional setup"]
 
-        # Direction requires both score and separation from the opposite side.
-        if score >= 60 and gap >= 10:
+        # Stronger direction filter: a side must lead by a meaningful margin.
+        if score >= 55 and gap >= 10:
             direction = "BUY" if buy > sell else "SELL"
             reasons = br if direction == "BUY" else sr
+            if not reasons:
+                reasons = ["Directional pressure detected"]
+
+            # Existing status names are preserved so the current UI/order logic
+            # continues to work without requiring another PRE-MOVE column.
             if score >= 85 and gap >= 20:
                 status = "🚀 PRE-BIG MOVE UP READY" if direction == "BUY" else "🚨 PRE-BIG MOVE DOWN READY"
-            elif score >= 75:
+            elif score >= 75 and gap >= 15:
                 status = "🟢 UP MOVE BUILDING" if direction == "BUY" else "🔴 DOWN MOVE BUILDING"
             else:
                 status = "🟡 POSSIBLE UP MOVE" if direction == "BUY" else "🟡 POSSIBLE DOWN MOVE"
@@ -2649,7 +2780,6 @@ def _pre_move_signal(df: pd.DataFrame, block: Dict[str, Any] = None) -> Dict[str
     except Exception as e:
         out["reason"] = f"PRE MOVE error: {type(e).__name__}"
         return out
-
 
 def detect_live_sudden_move(df: pd.DataFrame) -> Dict[str, Any]:
     """Detect CURRENT sudden 5M BUY/SELL movement. No consolidation required."""
