@@ -3252,7 +3252,11 @@ def run_momentum_scan(fyers, symbols, is_fo: bool = False):
                     res, err = future.result()
                 except Exception as e:
                     res, err = None, f"{symbol}: worker error: {str(e)[:100]}"
-                if res and (res.get("DIRECTION") in ("BUY", "SELL") or str(res.get("MOVEMENT STATUS","")).startswith("🟡") or str(res.get("MOVEMENT STATUS","")).endswith("WATCH")):
+                # Keep every successfully analyzed stock in the report.
+                # The previous filter discarded PRE-BIG/BUILDING/READY rows even
+                # though ScanStats counted them as successful, causing the UI to
+                # show Successful > 0 while the report table stayed empty.
+                if res:
                     results.append(res)
                 if err:
                     errors.append(err)
@@ -4523,7 +4527,15 @@ def show_scanner(fyers) -> None:
             st.markdown("### 🚦 MOVEMENT STATUS")
             st.dataframe(mdf,use_container_width=True,height=560)
             st.download_button("📊 Excel",_format_excel_output(mdf,"INTRADAY_MOVEMENT"),f"INTRADAY_MOVEMENT_{_now_ist().strftime('%Y%m%d_%H%M')}.xlsx","application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",key="momentum_xls")
-        else: st.info("Click SCAN INTRADAY MOVEMENT to start.")
+        else:
+            if "momentum_stats" in st.session_state:
+                st.warning("⚠️ Scan completed, but no report rows were returned. Check the Scan Errors below.")
+                momentum_errors = st.session_state.get("momentum_errors", [])
+                if momentum_errors:
+                    with st.expander(f"⚠️ Scan Errors ({len(momentum_errors)})", expanded=False):
+                        st.write(momentum_errors[:100])
+            else:
+                st.info("Click SCAN INTRADAY MOVEMENT to start.")
 
     # ════════════════════════════════════════════════════════════════════════════════
     # TAB 3: LIVE EXCHANGE ORDER BOOK
