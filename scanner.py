@@ -3381,54 +3381,48 @@ def fetch_live_market_depth(fyers, symbol: str) -> Dict[str, Any]:
         return empty
 
 
-def _depth_candidate_symbols(fyers, all_symbols, limit=30):
-    """Prefer current movement candidates, otherwise use the full NSE universe."""
-    universe = _validate_symbols(all_symbols or [])
-    limit = max(1, min(int(limit), len(universe) if universe else 1))
-    mdf = st.session_state.get("momentum_df")
-    if isinstance(mdf, pd.DataFrame) and not mdf.empty and "Symbol" in mdf.columns:
-        candidates = []
-        seen = set()
-        for _, row in mdf.sort_values("SCORE", ascending=False).iterrows():
-            raw = str(row.get("Symbol", "")).strip().upper()
-            sym = raw if raw.startswith("NSE:") else f"NSE:{raw}-EQ"
-            if _VALID_EQ_SYMBOL_RE.match(sym) and sym not in seen:
-                seen.add(sym)
-                candidates.append(sym)
-            if len(candidates) >= limit:
-                return candidates
+def _depth_candidate_symbols(fyers, all_symbols, limit=30, extra_symbols=None):
+    """Build depth universe without the old 50-symbol quotes bottleneck.
 
-    # Live quotes can rank only a small batch; direct depth can still use the full universe.
-    universe = list(universe)
+    If limit is 0, ALL NSE equity underlyings are returned. F&O stock
+    underlyings can be merged through extra_symbols; duplicates are removed.
+    For limited scans, current movement candidates are placed first, then the
+    remaining NSE/F&O universe is appended.
+    """
+    universe = _validate_symbols(list(all_symbols or []) + list(extra_symbols or []))
     if not universe:
         return []
-    try:
-        qresp = fyers.quotes({"symbols": ",".join(universe)})
-        rows = qresp.get("d", []) if isinstance(qresp, dict) else []
-        ranked = []
-        for row in rows if isinstance(rows, list) else []:
-            if not isinstance(row, dict):
-                continue
-            sym = str(row.get("n", row.get("symbol", ""))).strip().upper()
-            v = row.get("v", row)
-            if not isinstance(v, dict):
-                continue
-            chp = _safe_float(v.get("chp", v.get("change_pct", 0)))
-            if sym:
-                ranked.append((abs(chp), sym))
-        ranked.sort(reverse=True)
-        out = []
-        seen = set()
-        for _, sym in ranked:
-            if _VALID_EQ_SYMBOL_RE.match(sym) and sym not in seen:
-                seen.add(sym)
-                out.append(sym)
-            if len(out) >= limit:
-                break
-        return out or universe[:limit]
-    except Exception:
-        return universe[:limit]
 
+    requested_all = int(limit) == 0
+    target = len(universe) if requested_all else max(1, min(int(limit), len(universe)))
+
+    # Start with current movement candidates, but NEVER let a 50-row momentum
+    # table or quotes API response cap an ALL-NSE scan.
+    ordered = []
+    seen = set()
+    mdf = st.session_state.get("momentum_df")
+    if isinstance(mdf, pd.DataFrame) and not mdf.empty and "Symbol" in mdf.columns:
+        try:
+            miter = mdf.sort_values("SCORE", ascending=False).iterrows() if "SCORE" in mdf.columns else mdf.iterrows()
+            for _, row in miter:
+                raw = str(row.get("Symbol", "")).strip().upper()
+                sym = raw if raw.startswith("NSE:") else f"NSE:{raw}-EQ"
+                if sym in universe and sym not in seen:
+                    seen.add(sym)
+                    ordered.append(sym)
+        except Exception:
+            pass
+
+    # Append every remaining symbol. This is the important fix: ALL means ALL,
+    # not the 50 symbols returned by FYERS quotes.
+    for sym in universe:
+        if sym not in seen:
+            seen.add(sym)
+            ordered.append(sym)
+
+    if requested_all:
+        return ordered
+    return ordered[:target]
 
 def run_live_depth_scan(fyers, symbols, max_workers=4):
     """Fetch real FYERS market-depth snapshots with a small worker pool."""
@@ -3484,8 +3478,10 @@ def run_live_depth_scan(fyers, symbols, max_workers=4):
 
 def _show_live_order_flow_tab(fyers, all_symbols):
     """Actual FYERS exchange depth tab: current bid/ask book -> direction -> PIN."""
+    fo_symbols = st.session_state.get("fo_symbols", [])
     st.markdown("### 📖 LIVE EXCHANGE ORDER BOOK — NEXT DIRECTION + PIN")
     st.caption("Actual FYERS market-depth snapshot: bid/ask quantities and 5 visible depth levels. No TradingView footprint and no simulated order book.")
+    st.caption(f"🇮🇳 NSE stocks: {len(all_symbols)} | 📈 F&O stock underlyings: {len(fo_symbols)} | 🔗 Combined unique: {len(_validate_symbols(list(all_symbols) + list(fo_symbols)))}")
 
     c1, c2, c3 = st.columns(3)
     with c1:
@@ -3499,15 +3495,15 @@ def _show_live_order_flow_tab(fyers, all_symbols):
     with c2:
         st.metric("Depth API", "FYERS LIVE")
     with c3:
-        st.metric("NSE Available", len(all_symbols))
+        st.metric("NSE + F&O Available", len(_validate_symbols(list(all_symbols) + list(fo_symbols))))
 
     depth_universe_limit = len(all_symbols) if depth_limit == 0 else depth_limit
-    candidates = _depth_candidate_symbols(fyers, all_symbols, depth_universe_limit)
+    candidates = _depth_candidate_symbols(fyers, all_symbols, depth_universe_limit, extra_symbols=st.session_state.get("fo_symbols", []))
     if st.session_state.get("momentum_df") is not None and not st.session_state.get("momentum_df").empty and depth_limit != 0:
         st.info(f"Using current movement candidates first: {len(candidates)} symbols.")
     else:
         st.info(
-            f"Live depth candidates: {len(candidates)} / {len(all_symbols)} NSE symbols. "
+            f"Live depth candidates: {len(candidates)} / {len(_validate_symbols(list(all_symbols) + list(fo_symbols)))} NSE + F&O stock underlyings. "
             "FYERS REST depth is one symbol per request, so large scans can take longer."
         )
 
@@ -3691,6 +3687,7 @@ def show_scanner(fyers) -> None:
     try:
         all_symbols = load_nse_equity_symbols()
         fo_symbols = load_fo_stocks()
+        st.session_state["fo_symbols"] = fo_symbols
     except Exception as e:
         st.error(f"❌ Error loading symbols: {e}")
         logger.error(f"Symbol loading error: {e}")
@@ -3830,8 +3827,8 @@ def show_scanner(fyers) -> None:
         
         col1, col2 = st.columns([3, 1])
         with col1:
-            fo_limit = st.number_input("Scan limit (0=all)", min_value=0, max_value=len(fo_symbols),
-                                      value=min(200, len(fo_symbols)), step=25, key="fo_limit")
+            fo_limit = st.number_input("Scan limit (0=ALL F&O)", min_value=0, max_value=len(fo_symbols),
+                                      value=0, step=25, key="fo_limit")
         with col2:
             st.metric("Available", len(fo_symbols))
         
