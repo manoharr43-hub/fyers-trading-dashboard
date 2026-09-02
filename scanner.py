@@ -3066,6 +3066,8 @@ def calculate_pin_rules(df_5m: pd.DataFrame, data_5m: Dict[str, Any], data_15m: 
     """
     out = {
         "PIN SIGNAL": "WAIT", "PIN SCORE": 0.0, "LIQUIDITY": "NONE",
+        "BUY LIQUIDITY": "NONE", "SELL LIQUIDITY": "NONE",
+        "BUY LIQUIDITY SCORE": 0.0, "SELL LIQUIDITY SCORE": 0.0,
         "SWEEP": "NONE", "REVERSAL": "NONE", "EQUAL HIGH": "NO", "EQUAL LOW": "NO",
         "BIG MOVEMENT": "NO", "BIG MOVE SCORE": 0.0, "STRUCTURE": "NONE",
         "5M TREND": data_5m.get("structure_trend", "N/A"),
@@ -3141,11 +3143,42 @@ def calculate_pin_rules(df_5m: pd.DataFrame, data_5m: Dict[str, Any], data_15m: 
         bm = detect_big_move_setup(d)
         structure = bm.get("structure", "NONE")
         liquidity = "EQ HIGH" if eq_hi else "EQ LOW" if eq_lo else "HIGH" if last_hi is not None else "LOW" if last_lo is not None else "NONE"
+
+        # Buy-side liquidity normally sits above confirmed swing highs/equal highs;
+        # sell-side liquidity normally sits below confirmed swing lows/equal lows.
+        # Scores are setup-strength scores, not exchange order-book quantities.
+        buy_liq_score = 0.0
+        sell_liq_score = 0.0
+        if last_hi is not None:
+            buy_liq_score += 45
+            if eq_hi:
+                buy_liq_score += 30
+            if h >= last_hi:
+                buy_liq_score += 15
+            if bearish_sweep:
+                buy_liq_score += 10
+        if last_lo is not None:
+            sell_liq_score += 45
+            if eq_lo:
+                sell_liq_score += 30
+            if l <= last_lo:
+                sell_liq_score += 15
+            if bullish_sweep:
+                sell_liq_score += 10
+        buy_liq_score = min(100.0, buy_liq_score)
+        sell_liq_score = min(100.0, sell_liq_score)
+        buy_liq = ("HIGH" if buy_liq_score >= 70 else "MEDIUM" if buy_liq_score >= 40 else "LOW" if buy_liq_score > 0 else "NONE")
+        sell_liq = ("HIGH" if sell_liq_score >= 70 else "MEDIUM" if sell_liq_score >= 40 else "LOW" if sell_liq_score > 0 else "NONE")
+
         sweep = "🟢 LOW SWEPT" if bullish_sweep else "🔴 HIGH SWEPT" if bearish_sweep else "NONE"
         reversal = "🟢 BULL REVERSAL" if bullish_reversal else "🔴 BEAR REVERSAL" if bearish_reversal else "NONE"
         out.update({
             "PIN SIGNAL": pin_signal, "PIN SCORE": round(pin_score, 1),
-            "LIQUIDITY": liquidity, "SWEEP": sweep, "REVERSAL": reversal,
+            "LIQUIDITY": liquidity,
+            "BUY LIQUIDITY": buy_liq, "SELL LIQUIDITY": sell_liq,
+            "BUY LIQUIDITY SCORE": round(buy_liq_score, 1),
+            "SELL LIQUIDITY SCORE": round(sell_liq_score, 1),
+            "SWEEP": sweep, "REVERSAL": reversal,
             "EQUAL HIGH": "YES" if eq_hi else "NO", "EQUAL LOW": "YES" if eq_lo else "NO",
             "BIG MOVEMENT": bm.get("signal", "NO BIG MOVE"),
             "BIG MOVE SCORE": bm.get("score", 0.0), "STRUCTURE": structure,
@@ -3839,7 +3872,9 @@ def _show_pin_rules_tab(fyers, all_symbols=None, fo_symbols=None) -> None:
 
     with st.expander("📖 PIN Rules", expanded=False):
         st.markdown("""
-        **Liquidity:** confirmed Pivot High/Low → Equal High/Low → liquidity level.
+        **Liquidity:** Buy-side liquidity = above confirmed Pivot/Equal High; Sell-side liquidity = below confirmed Pivot/Equal Low.
+        
+        **Liquidity Score:** 0–100 setup-strength score based on confirmed level, equal-level confluence and current sweep evidence. It is not actual exchange quantity.
         
         **Sweep:** High breaks and closes back below = bearish; Low breaks and closes back above = bullish.
         
@@ -3904,8 +3939,9 @@ def _show_pin_rules_tab(fyers, all_symbols=None, fo_symbols=None) -> None:
         pc4.metric("💧 SWEEPS", int((sweep_series != "NONE").sum()))
 
         display_cols = [
-            "Symbol", "LTP", "PIN SIGNAL", "PIN SCORE", "LIQUIDITY", "SWEEP",
-            "REVERSAL", "EQUAL HIGH", "EQUAL LOW", "BIG MOVEMENT", "BIG MOVE SCORE",
+            "Symbol", "LTP", "PIN SIGNAL", "PIN SCORE", "LIQUIDITY",
+            "BUY LIQUIDITY", "BUY LIQUIDITY SCORE", "SELL LIQUIDITY", "SELL LIQUIDITY SCORE",
+            "SWEEP", "REVERSAL", "EQUAL HIGH", "EQUAL LOW", "BIG MOVEMENT", "BIG MOVE SCORE",
             "STRUCTURE", "5M TREND", "15M TREND", "1H TREND", "RVOL", "RSI",
             "PRESSURE", "AI CONFIDENCE %", "AI SIGNAL", "REASON"
         ]
@@ -4718,7 +4754,7 @@ def show_scanner(fyers) -> None:
         - ✅ Golden Cross / Death Cross detection
         - ✅ **⚡ NEW: MOMENTUM MOVERS Scanner**
         - ✅ **📖 NEW: LIVE FYERS EXCHANGE ORDER BOOK**
-        - ✅ Next Candle Bias + LIVE Depth Direction + BUY/SELL PIN
+        - ✅ Next Candle Bias + LIVE Depth Direction + BUY/SELL PIN + Buy/Sell Liquidity
         
         **Data Source:** Fyers Live API
         **Timeframes:** 5M, 15M, 1H, Daily
