@@ -2591,6 +2591,145 @@ def detect_block_order_activity(df: pd.DataFrame) -> Dict[str, Any]:
         return out
 
 
+
+def detect_premove_liquidity_reversal(df: pd.DataFrame) -> Dict[str, Any]:
+    """Detect top/bottom liquidity, pin bars, sweeps and reversal BEFORE expansion.
+
+    Uses only completed candles.  This is a rule-based early-warning model;
+    it does not guarantee the next move.
+    """
+    out = {
+        "top_liquidity": None, "bottom_liquidity": None,
+        "top_status": "NONE", "bottom_status": "NONE",
+        "equal_high": False, "equal_low": False,
+        "bullish_pin": False, "bearish_pin": False,
+        "bullish_sweep": False, "bearish_sweep": False,
+        "bullish_reversal": False, "bearish_reversal": False,
+        "score": 0.0, "direction": "NONE", "reason": "No liquidity setup"
+    }
+    if df is None or len(df) < 20:
+        return out
+    try:
+        d = df.reset_index(drop=True).copy()
+        for col in ["Open", "High", "Low", "Close", "Volume"]:
+            d[col] = pd.to_numeric(d[col], errors="coerce")
+        d = d.dropna(subset=["Open", "High", "Low", "Close", "Volume"]).reset_index(drop=True)
+        if len(d) < 20:
+            return out
+
+        # Current candle is evaluated against PRIOR confirmed pivots.
+        prior = d.iloc[:-1].copy()
+        last = d.iloc[-1]
+        o, h, l, c = map(float, [last["Open"], last["High"], last["Low"], last["Close"]])
+        rng = max(h - l, 1e-9)
+        body = abs(c - o)
+        upper = h - max(o, c)
+        lower = min(o, c) - l
+        close_loc = (c - l) / rng
+
+        atr = max(float(_last_valid_atr(prior, 14) or 0), c * 0.001)
+        ph, pl = _confirmed_pivots(prior, left=PREMOVE_LIQ_PIVOT_LEN, right=PREMOVE_LIQ_PIVOT_LEN)
+        last_hi = ph[-1][1] if ph else None
+        prev_hi = ph[-2][1] if len(ph) >= 2 else None
+        last_lo = pl[-1][1] if pl else None
+        prev_lo = pl[-2][1] if len(pl) >= 2 else None
+
+        eq_hi = bool(last_hi is not None and prev_hi is not None and
+                     abs(last_hi - prev_hi) <= atr * PREMOVE_LIQ_EQUAL_ATR_TOL)
+        eq_lo = bool(last_lo is not None and prev_lo is not None and
+                     abs(last_lo - prev_lo) <= atr * PREMOVE_LIQ_EQUAL_ATR_TOL)
+
+        bullish_sweep = bool(last_lo is not None and l < last_lo and c > last_lo)
+        bearish_sweep = bool(last_hi is not None and h > last_hi and c < last_hi)
+
+        bullish_pin = bool(
+            last_lo is not None and
+            l <= last_lo + atr * 0.15 and
+            lower >= max(body * PREMOVE_PIN_WICK_BODY_MULT, rng * PREMOVE_PIN_WICK_RANGE_PCT) and
+            close_loc >= 0.60
+        )
+        bearish_pin = bool(
+            last_hi is not None and
+            h >= last_hi - atr * 0.15 and
+            upper >= max(body * PREMOVE_PIN_WICK_BODY_MULT, rng * PREMOVE_PIN_WICK_RANGE_PCT) and
+            close_loc <= 0.40
+        )
+
+        # Simple VWAP/RSI confirmation from the same completed candle.
+        typical = (d["High"] + d["Low"] + d["Close"]) / 3.0
+        vol = d["Volume"].replace(0, np.nan)
+        vwap_s = (typical * d["Volume"]).cumsum() / vol.cumsum()
+        vwap = float(vwap_s.iloc[-1]) if pd.notna(vwap_s.iloc[-1]) else c
+        rsi_s = calculate_rsi(d["Close"], 14)
+        rsi = float(rsi_s.iloc[-1]) if len(rsi_s) and pd.notna(rsi_s.iloc[-1]) else 50.0
+
+        bullish_reversal = bool(
+            (bullish_sweep or bullish_pin) and c > vwap and rsi >= 45
+        )
+        bearish_reversal = bool(
+            (bearish_sweep or bearish_pin) and c < vwap and rsi <= 55
+        )
+
+        buy = sell = 0.0
+        br, sr = [], []
+
+        if last_hi is not None:
+            buy += 25
+            out["top_liquidity"] = float(last_hi)
+            out["top_status"] = "SWEPT" if bearish_sweep else "ACTIVE"
+        if last_lo is not None:
+            sell += 25
+            out["bottom_liquidity"] = float(last_lo)
+            out["bottom_status"] = "SWEPT" if bullish_sweep else "ACTIVE"
+
+        if eq_hi:
+            buy += 15; br.append("Equal High")
+        if eq_lo:
+            sell += 15; sr.append("Equal Low")
+        if bearish_pin:
+            sell += 18; sr.append("TOP PIN BAR")
+        if bullish_pin:
+            buy += 18; br.append("BOTTOM PIN BAR")
+        if bearish_sweep:
+            sell += 28; sr.append("HIGH LIQUIDITY SWEEP")
+        if bullish_sweep:
+            buy += 28; br.append("LOW LIQUIDITY SWEEP")
+        if bearish_reversal:
+            sell += 15; sr.append("BEAR REVERSAL")
+        if bullish_reversal:
+            buy += 15; br.append("BULL REVERSAL")
+
+        if c > vwap and bullish_reversal:
+            buy += 6; br.append("Above VWAP")
+        if c < vwap and bearish_reversal:
+            sell += 6; sr.append("Below VWAP")
+
+        buy = min(100.0, buy)
+        sell = min(100.0, sell)
+        score = max(buy, sell)
+        gap = abs(buy - sell)
+
+        direction = "NONE"
+        reason = "No clear liquidity reversal"
+        if score >= PREMOVE_REVERSAL_MIN_SCORE and gap >= 12:
+            direction = "BUY" if buy > sell else "SELL"
+            reason = " + ".join(br if direction == "BUY" else sr)
+
+        out.update({
+            "equal_high": eq_hi, "equal_low": eq_lo,
+            "bullish_pin": bullish_pin, "bearish_pin": bearish_pin,
+            "bullish_sweep": bullish_sweep, "bearish_sweep": bearish_sweep,
+            "bullish_reversal": bullish_reversal, "bearish_reversal": bearish_reversal,
+            "score": round(score, 1), "direction": direction,
+            "buy_score": round(buy, 1), "sell_score": round(sell, 1),
+            "score_gap": round(gap, 1), "reason": reason,
+        })
+        return out
+    except Exception as e:
+        out["reason"] = f"Liquidity reversal error: {type(e).__name__}"
+        return out
+
+
 def _pre_move_signal(df: pd.DataFrame, block: Dict[str, Any] = None) -> Dict[str, Any]:
     """Enhanced PRE-MOVE engine.
 
@@ -2630,6 +2769,9 @@ def _pre_move_signal(df: pd.DataFrame, block: Dict[str, Any] = None) -> Dict[str
             return out
 
         atr = max(float(_last_valid_atr(d, 14) or 0), close * 0.001)
+
+        # Liquidity/PIN/SWEEP reversal is an early-warning layer, not a breakout confirmation.
+        liq = detect_premove_liquidity_reversal(d)
 
         # ------------------------- RANGE / COMPRESSION -------------------------
         recent = d.iloc[-10:]
@@ -2706,6 +2848,21 @@ def _pre_move_signal(df: pd.DataFrame, block: Dict[str, Any] = None) -> Dict[str
         # --------------------------- SCORING -----------------------------------
         buy = sell = 0.0
         br, sr = [], []
+
+        # PRIORITY EARLY-WARNING: liquidity sweep / pin-bar reversal.
+        # These points are directional, unlike compression energy.
+        if liq.get("bullish_sweep"):
+            buy += 28; br.append("LOW LIQUIDITY SWEEP")
+        if liq.get("bearish_sweep"):
+            sell += 28; sr.append("HIGH LIQUIDITY SWEEP")
+        if liq.get("bullish_pin"):
+            buy += 18; br.append("BOTTOM PIN BAR")
+        if liq.get("bearish_pin"):
+            sell += 18; sr.append("TOP PIN BAR")
+        if liq.get("bullish_reversal"):
+            buy += 15; br.append("BULL REVERSAL")
+        if liq.get("bearish_reversal"):
+            sell += 15; sr.append("BEAR REVERSAL")
 
         # Compression/volume are setup energy only. They no longer create
         # artificial BUY+SELL scores; direction must come from price/structure.
@@ -2807,6 +2964,20 @@ def _pre_move_signal(df: pd.DataFrame, block: Dict[str, Any] = None) -> Dict[str
             "score_gap": round(gap, 1), "reason": " + ".join(reasons),
             "breakout_level": round(rh, 2), "breakdown_level": round(rl, 2),
             "rvol": round(rvol, 2),
+            "TOP LIQUIDITY LEVEL": round(liq["top_liquidity"], 2) if liq.get("top_liquidity") is not None else None,
+            "BOTTOM LIQUIDITY LEVEL": round(liq["bottom_liquidity"], 2) if liq.get("bottom_liquidity") is not None else None,
+            "TOP LIQUIDITY STATUS": liq.get("top_status", "NONE"),
+            "BOTTOM LIQUIDITY STATUS": liq.get("bottom_status", "NONE"),
+            "TOP PIN BAR": "YES" if liq.get("bearish_pin") else "NO",
+            "BOTTOM PIN BAR": "YES" if liq.get("bullish_pin") else "NO",
+            "HIGH LIQUIDITY SWEEP": "YES" if liq.get("bearish_sweep") else "NO",
+            "LOW LIQUIDITY SWEEP": "YES" if liq.get("bullish_sweep") else "NO",
+            "LIQUIDITY REVERSAL": (
+                "🟢 BULL REVERSAL" if liq.get("bullish_reversal")
+                else "🔴 BEAR REVERSAL" if liq.get("bearish_reversal")
+                else "NONE"
+            ),
+            "LIQUIDITY SCORE": liq.get("score", 0.0),
         })
         return out
     except Exception as e:
@@ -2984,7 +3155,7 @@ def _fetch_momentum_signal(fyers, symbol: str, is_fo: bool = False):
                 pre={**pre,"status":"⚪ WAIT","direction":"NONE","reason":f"No fresh movement <= {LIVE_MOVE_MAX_SIGNAL_AGE_MIN:.0f} min"}
 
         ltp=float(d["Close"].iloc[-1])
-        result={"Symbol":stock_ticker,"LTP":round(ltp,2),"SIGNAL TIME":pd.Timestamp(sig_time).strftime("%d-%b-%Y %H:%M:%S"),"SIGNAL AGE (MIN)":round(age,1),"SIGNAL":signal,"DIRECTION":direction,"MOVE %":mv.get("move_pct",0.0),"BODY %":mv.get("body_pct",0.0),"BODY / ATR":mv.get("body_atr",0.0),"RVOL":mv.get("rvol",0.0),"STRUCTURE":mv.get("structure","NONE"),"HH/HL":"✅" if mv.get("hh_hl") else "−","LH/LL":"✅" if mv.get("lh_ll") else "−","ACCELERATION":mv.get("price_acceleration",0.0),"VOLUME SPIKE":"🔥" if mv.get("volume_spike") else "−","SCORE":mv.get("score",0.0),"PRE-MOVE":pre["direction"],"PRE-MOVE SCORE":pre["score"],"PRE-MOVE STATUS":pre["status"],"PRE BUY SCORE":pre.get("buy_score",0),"PRE SELL SCORE":pre.get("sell_score",0),"PRE SCORE GAP":pre.get("score_gap",0),"PRE-MOVE REASON":pre["reason"],"BREAKOUT LEVEL":pre.get("breakout_level"),"BREAKDOWN LEVEL":pre.get("breakdown_level"),"PRE-MOVE RVOL":pre.get("rvol",0),"BLOCK ORDER SCORE":block["block_score"],"BLOCK ACTIVITY":block["block_signal"],"BLOCK SIDE":block["block_side"],"BLOCK LEVEL":block["block_level"],"BLOCK RVOL":block["block_rvol"],"BLOCK REASON":block["block_reason"],"REASON":mv.get("reason",pre["reason"]),"MOVEMENT STATUS":signal if direction in ("BUY","SELL") else pre["status"]}
+        result={"Symbol":stock_ticker,"LTP":round(ltp,2),"SIGNAL TIME":pd.Timestamp(sig_time).strftime("%d-%b-%Y %H:%M:%S"),"SIGNAL AGE (MIN)":round(age,1),"SIGNAL":signal,"DIRECTION":direction,"MOVE %":mv.get("move_pct",0.0),"BODY %":mv.get("body_pct",0.0),"BODY / ATR":mv.get("body_atr",0.0),"RVOL":mv.get("rvol",0.0),"STRUCTURE":mv.get("structure","NONE"),"HH/HL":"✅" if mv.get("hh_hl") else "−","LH/LL":"✅" if mv.get("lh_ll") else "−","ACCELERATION":mv.get("price_acceleration",0.0),"VOLUME SPIKE":"🔥" if mv.get("volume_spike") else "−","SCORE":mv.get("score",0.0),"PRE-MOVE":pre["direction"],"PRE-MOVE SCORE":pre["score"],"PRE-MOVE STATUS":pre["status"],"PRE BUY SCORE":pre.get("buy_score",0),"PRE SELL SCORE":pre.get("sell_score",0),"PRE SCORE GAP":pre.get("score_gap",0),"PRE-MOVE REASON":pre["reason"],"BREAKOUT LEVEL":pre.get("breakout_level"),"BREAKDOWN LEVEL":pre.get("breakdown_level"),"PRE-MOVE RVOL":pre.get("rvol",0),"TOP LIQUIDITY LEVEL":pre.get("TOP LIQUIDITY LEVEL"),"BOTTOM LIQUIDITY LEVEL":pre.get("BOTTOM LIQUIDITY LEVEL"),"TOP LIQUIDITY STATUS":pre.get("TOP LIQUIDITY STATUS","NONE"),"BOTTOM LIQUIDITY STATUS":pre.get("BOTTOM LIQUIDITY STATUS","NONE"),"TOP PIN BAR":pre.get("TOP PIN BAR","NO"),"BOTTOM PIN BAR":pre.get("BOTTOM PIN BAR","NO"),"HIGH LIQUIDITY SWEEP":pre.get("HIGH LIQUIDITY SWEEP","NO"),"LOW LIQUIDITY SWEEP":pre.get("LOW LIQUIDITY SWEEP","NO"),"LIQUIDITY REVERSAL":pre.get("LIQUIDITY REVERSAL","NONE"),"LIQUIDITY SCORE":pre.get("LIQUIDITY SCORE",0),"BLOCK ORDER SCORE":block["block_score"],"BLOCK ACTIVITY":block["block_signal"],"BLOCK SIDE":block["block_side"],"BLOCK LEVEL":block["block_level"],"BLOCK RVOL":block["block_rvol"],"BLOCK REASON":block["block_reason"],"REASON":mv.get("reason",pre["reason"]),"MOVEMENT STATUS":signal if direction in ("BUY","SELL") else pre["status"]}
         if is_fo and result["DIRECTION"] in ("BUY","SELL"):
             try:
                 od=fetch_options_chain_data(fyers,symbol); result["PCR"]=od.get("pcr","N/A"); result["OPTIONS BIAS"]=od.get("options_bias","N/A")
@@ -3107,6 +3278,14 @@ PIN_PIVOT_LEN = 5
 PIN_EQUAL_ATR_TOL = 0.15
 PIN_BIGMOVE_MIN_SCORE = 70
 PIN_MAX_SCAN = None  # Full NSE/F&O universe; no artificial 100-stock limit
+
+# PRE-MOVE LIQUIDITY / PIN-BAR / SWEEP REVERSAL ENGINE
+PREMOVE_LIQ_PIVOT_LEN = 3
+PREMOVE_LIQ_EQUAL_ATR_TOL = 0.20
+PREMOVE_PIN_WICK_BODY_MULT = 1.50
+PREMOVE_PIN_WICK_RANGE_PCT = 0.45
+PREMOVE_REVERSAL_MIN_SCORE = 72
+PREMOVE_REVERSAL_STRONG_SCORE = 85
 
 
 def calculate_pin_rules(df_5m: pd.DataFrame, data_5m: Dict[str, Any], data_15m: Dict[str, Any], data_1h: Dict[str, Any]) -> Dict[str, Any]:
@@ -4338,7 +4517,7 @@ def show_scanner(fyers) -> None:
         mdf=st.session_state.get("momentum_df")
         if mdf is not None and not mdf.empty:
             for col in ["SCORE","PRE-MOVE SCORE","RVOL","SIGNAL AGE (MIN)"]: mdf[col]=pd.to_numeric(mdf[col],errors="coerce") if col in mdf.columns else 0
-            status_order={"🔥 BIG BUY":0,"🔥 BIG SELL":0,"🟢 BIG BUY WATCH":1,"🔴 BIG SELL WATCH":1,"🟡 PRE-BIG BUY":2,"🟡 PRE-BIG SELL":2,"🟢 BUY":3,"🔴 SELL":3,"⚪ WAIT":9}
+            status_order={"🔥 BIG BUY":0,"🔥 BIG SELL":0,"🚨 PRE-BIG MOVE DOWN READY":1,"🚀 PRE-BIG MOVE UP READY":1,"🟢 UP MOVE BUILDING":2,"🔴 DOWN MOVE BUILDING":2,"🟢 BIG BUY WATCH":3,"🔴 BIG SELL WATCH":3,"🟡 PRE-BIG BUY":4,"🟡 PRE-BIG SELL":4,"🟢 BUY":5,"🔴 SELL":5,"⚪ WAIT":9}
             mdf["_order"]=mdf["MOVEMENT STATUS"].map(status_order).fillna(8)
             mdf=mdf.sort_values(["_order","SCORE","PRE-MOVE SCORE","RVOL"],ascending=[True,False,False,False]).drop(columns=["_order"])
             st.markdown("### 🚦 MOVEMENT STATUS")
