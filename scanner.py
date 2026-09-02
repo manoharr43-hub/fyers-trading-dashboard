@@ -3607,6 +3607,137 @@ def run_live_depth_scan(fyers, symbols, max_workers=4):
     return df, errors
 
 
+
+# ════════════════════════════════════════════════════════════════════════════════
+# MULTI-FACTOR FUTURE DIRECTION ENGINE
+# ════════════════════════════════════════════════════════════════════════════════
+def _future_direction_engine(depth_row: Dict[str, Any], momentum_row: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Estimate the next directional bias from independent live/technical factors.
+
+    This is a confidence score, NOT a guaranteed future-price prediction.
+    Factors: order-book depth, momentum score/direction, PRE-MOVE, RVOL, structure,
+    VWAP context (when available), and breakout/breakdown proximity.
+    """
+    buy = 0.0
+    sell = 0.0
+    buy_reasons, sell_reasons = [], []
+
+    d = depth_row or {}
+    m = momentum_row or {}
+
+    # 1) Live order-book pressure: strongest live factor.
+    imb = _safe_float(d.get("DEPTH IMBALANCE %", d.get("depth_imbalance", 0)))
+    if imb >= 35:
+        buy += 32; buy_reasons.append(f"strong bid depth +{imb:.1f}%")
+    elif imb >= 15:
+        buy += 20; buy_reasons.append(f"bid depth +{imb:.1f}%")
+    elif imb <= -35:
+        sell += 32; sell_reasons.append(f"strong ask depth {imb:.1f}%")
+    elif imb <= -15:
+        sell += 20; sell_reasons.append(f"ask depth {imb:.1f}%")
+
+    # 2) Existing intraday momentum engine.
+    md = str(m.get("DIRECTION", "")).upper()
+    ms = _safe_float(m.get("SCORE", 0))
+    if md in ("BUY", "UP"):
+        pts = min(22.0, max(0.0, ms * 0.22))
+        buy += pts; buy_reasons.append(f"momentum {ms:.0f}")
+    elif md in ("SELL", "DOWN"):
+        pts = min(22.0, max(0.0, ms * 0.22))
+        sell += pts; sell_reasons.append(f"momentum {ms:.0f}")
+
+    # 3) PRE-MOVE directional bias.
+    pm = str(m.get("PRE-MOVE", "")).upper()
+    pms = _safe_float(m.get("PRE-MOVE SCORE", 0))
+    gap = abs(_safe_float(m.get("PRE SCORE GAP", 0)))
+    if pm == "BUY":
+        pts = min(20.0, pms * 0.16 + min(gap, 20) * 0.20)
+        buy += pts; buy_reasons.append(f"pre-move BUY {pms:.0f}")
+    elif pm == "SELL":
+        pts = min(20.0, pms * 0.16 + min(gap, 20) * 0.20)
+        sell += pts; sell_reasons.append(f"pre-move SELL {pms:.0f}")
+
+    # 4) Volume participation / RVOL.
+    rvol = _safe_float(m.get("RVOL", m.get("PRE-MOVE RVOL", 0)))
+    if rvol >= 2.0:
+        if buy > sell: buy += 10; buy_reasons.append(f"RVOL {rvol:.2f}")
+        elif sell > buy: sell += 10; sell_reasons.append(f"RVOL {rvol:.2f}")
+    elif rvol >= 1.5:
+        if buy > sell: buy += 6; buy_reasons.append(f"RVOL {rvol:.2f}")
+        elif sell > buy: sell += 6; sell_reasons.append(f"RVOL {rvol:.2f}")
+
+    # 5) Structure.
+    structure = str(m.get("STRUCTURE", "")).upper()
+    if structure in ("HH/HL", "BULLISH", "UP") or str(m.get("HH/HL", "")) == "✅":
+        buy += 8; buy_reasons.append("HH/HL structure")
+    if structure in ("LH/LL", "BEARISH", "DOWN") or str(m.get("LH/LL", "")) == "✅":
+        sell += 8; sell_reasons.append("LH/LL structure")
+
+    # 6) Breakout / breakdown proximity from the PRE-MOVE engine.
+    ltp = _safe_float(d.get("LTP", 0))
+    bo = _safe_float(m.get("BREAKOUT LEVEL", 0))
+    bd = _safe_float(m.get("BREAKDOWN LEVEL", 0))
+    if ltp > 0 and bo > 0:
+        dist = abs(bo - ltp) / ltp * 100
+        if ltp <= bo and dist <= 0.35:
+            buy += 8; buy_reasons.append(f"near breakout {dist:.2f}%")
+    if ltp > 0 and bd > 0:
+        dist = abs(ltp - bd) / ltp * 100
+        if ltp >= bd and dist <= 0.35:
+            sell += 8; sell_reasons.append(f"near breakdown {dist:.2f}%")
+
+    buy = min(100.0, buy); sell = min(100.0, sell)
+    gap = abs(buy - sell)
+    lead = max(buy, sell)
+
+    # Require multi-factor agreement; conflicting evidence becomes WAIT.
+    if lead < 42 or gap < 12:
+        direction = "WAIT"
+        confidence = max(50.0, min(69.0, 50.0 + gap))
+        label = "WAIT"
+    elif buy > sell:
+        direction = "STRONG BUY" if buy >= 72 and gap >= 22 else "BUY"
+        confidence = min(95.0, 50.0 + gap * 1.45 + max(0.0, buy - 55) * 0.25)
+        label = direction
+    else:
+        direction = "STRONG SELL" if sell >= 72 and gap >= 22 else "SELL"
+        confidence = min(95.0, 50.0 + gap * 1.45 + max(0.0, sell - 55) * 0.25)
+        label = direction
+
+    reasons = buy_reasons if buy > sell else sell_reasons
+    if direction == "WAIT":
+        reasons = list(dict.fromkeys(buy_reasons + sell_reasons))[:4] or ["insufficient multi-factor agreement"]
+    return {
+        "direction": label,
+        "confidence": round(confidence, 1),
+        "buy_score": round(buy, 1),
+        "sell_score": round(sell, 1),
+        "reason": " | ".join(reasons),
+    }
+
+
+def _apply_future_direction_engine(depth_df: pd.DataFrame) -> pd.DataFrame:
+    """Add multi-factor future-direction columns to live depth output."""
+    if depth_df is None or depth_df.empty:
+        return depth_df
+    out = depth_df.copy()
+    mdf = st.session_state.get("momentum_df")
+    lookup = {}
+    if isinstance(mdf, pd.DataFrame) and not mdf.empty and "Symbol" in mdf.columns:
+        for _, r in mdf.iterrows():
+            lookup[str(r.get("Symbol", "")).strip().upper()] = r.to_dict()
+
+    results = []
+    for _, row in out.iterrows():
+        sym = str(row.get("Symbol", "")).strip().upper()
+        results.append(_future_direction_engine(row.to_dict(), lookup.get(sym, {})))
+    out["FUTURE DIRECTION"] = [x["direction"] for x in results]
+    out["FUTURE CONFIDENCE %"] = [x["confidence"] for x in results]
+    out["FUTURE BUY SCORE"] = [x["buy_score"] for x in results]
+    out["FUTURE SELL SCORE"] = [x["sell_score"] for x in results]
+    out["FUTURE REASON"] = [x["reason"] for x in results]
+    return out
+
 def _show_live_order_flow_tab(fyers, all_symbols):
     """Actual FYERS exchange depth tab: current bid/ask book -> direction -> PIN."""
     fo_symbols = st.session_state.get("fo_symbols", [])
@@ -3628,7 +3759,7 @@ def _show_live_order_flow_tab(fyers, all_symbols):
     with c3:
         st.metric("NSE + F&O Available", len(_validate_symbols(list(all_symbols) + list(fo_symbols))))
 
-    depth_universe_limit = len(all_symbols) if depth_limit == 0 else depth_limit
+    depth_universe_limit = 0 if depth_limit == 0 else depth_limit
     candidates = _depth_candidate_symbols(fyers, all_symbols, depth_universe_limit, extra_symbols=st.session_state.get("fo_symbols", []))
     if st.session_state.get("momentum_df") is not None and not st.session_state.get("momentum_df").empty and depth_limit != 0:
         st.info(f"Using current movement candidates first: {len(candidates)} symbols.")
@@ -3641,6 +3772,7 @@ def _show_live_order_flow_tab(fyers, all_symbols):
     if st.button("📖 SCAN LIVE EXCHANGE ORDER BOOK", key="depth_run", type="primary", use_container_width=True):
         with st.spinner(f"Reading live FYERS bid/ask market depth for {len(candidates)} symbols…"):
             depth_df, depth_errors = run_live_depth_scan(fyers, candidates)
+        depth_df = _apply_future_direction_engine(depth_df)
         st.session_state["depth_df"] = depth_df
         st.session_state["depth_errors"] = depth_errors
         st.session_state["depth_scanned_at"] = _generated_timestamp()
@@ -3648,8 +3780,8 @@ def _show_live_order_flow_tab(fyers, all_symbols):
 
     depth_df = st.session_state.get("depth_df")
     if isinstance(depth_df, pd.DataFrame) and not depth_df.empty:
-        buy_df = depth_df[depth_df["NEXT DIRECTION"] == "BUY"].copy()
-        sell_df = depth_df[depth_df["NEXT DIRECTION"] == "SELL"].copy()
+        buy_df = depth_df[depth_df["FUTURE DIRECTION"].astype(str).str.contains("BUY", na=False)].copy()
+        sell_df = depth_df[depth_df["FUTURE DIRECTION"].astype(str).str.contains("SELL", na=False)].copy()
         pins = depth_df[depth_df["PIN SIGNAL"].astype(str).str.contains("PIN", na=False)].copy()
 
         m1, m2, m3, m4 = st.columns(4)
@@ -3664,7 +3796,8 @@ def _show_live_order_flow_tab(fyers, all_symbols):
             depth_df[[
                 "Symbol", "LTP", "BEST BID", "BEST ASK", "TOTAL BUY QTY", "TOTAL SELL QTY",
                 "DEPTH IMBALANCE %", "BUY SCORE", "SELL SCORE", "NEXT DIRECTION",
-                "DIRECTION STRENGTH %", "PIN SIGNAL", "SPREAD %", "REASON"
+                "DIRECTION STRENGTH %", "FUTURE DIRECTION", "FUTURE CONFIDENCE %",
+                "FUTURE BUY SCORE", "FUTURE SELL SCORE", "PIN SIGNAL", "SPREAD %", "REASON", "FUTURE REASON"
             ]],
             use_container_width=True, height=500
         )
