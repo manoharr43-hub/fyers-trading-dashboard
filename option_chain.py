@@ -3364,5 +3364,73 @@ def show_option_chain(fyers: Any = None) -> None:
     run_dashboard(fyers)
 
 
+
+
+# ================= PERFORMANCE OPTIMIZATION PATCH =================
+
+_original_fetch_option_chain_raw = fetch_option_chain_raw
+@st.cache_data(ttl=10, show_spinner=False)
+def _cached_nse_chain(symbol):
+    return _original_fetch_option_chain_raw(symbol)
+def fetch_option_chain_raw(symbol):
+    return _cached_nse_chain(str(symbol).upper())
+
+_original_fetch_fyers_candles = fetch_fyers_candles
+def fetch_fyers_candles(fyers, symbol, resolution, range_from, range_to):
+    cache = st.session_state.setdefault("_oc_candle_cache", {})
+    key = (str(symbol), str(resolution), int(range_from), int(range_to))
+    now = time.time()
+    hit = cache.get(key)
+    if hit and now - hit[0] < 30:
+        return hit[1].copy() if isinstance(hit[1], pd.DataFrame) else hit[1]
+    result = _original_fetch_fyers_candles(fyers, symbol, resolution, range_from, range_to)
+    cache[key] = (now, result.copy() if isinstance(result, pd.DataFrame) else result)
+    return result
+
+def detect_hh_ll(df):
+    out = df.copy()
+    h = pd.to_numeric(out["high"], errors="coerce")
+    l = pd.to_numeric(out["low"], errors="coerce")
+    out["HH"] = h.gt(h.shift())
+    out["HL"] = l.gt(l.shift())
+    out["LH"] = h.lt(h.shift())
+    out["LL"] = l.lt(l.shift())
+    return out
+
+def calc_max_pain(df):
+    if df is None or df.empty:
+        return float("nan")
+    x = df.sort_values("strike_price")
+    k = pd.to_numeric(x["strike_price"], errors="coerce").to_numpy(float)
+    ce = pd.to_numeric(x.get("CE OI", 0), errors="coerce").fillna(0).to_numpy(float)
+    pe = pd.to_numeric(x.get("PE OI", 0), errors="coerce").fillna(0).to_numpy(float)
+    valid = np.isfinite(k)
+    k, ce, pe = k[valid], ce[valid], pe[valid]
+    if not len(k):
+        return float("nan")
+    cs_ce, cs_ce_k = np.cumsum(ce), np.cumsum(ce*k)
+    cs_pe, cs_pe_k = np.cumsum(pe), np.cumsum(pe*k)
+    call_pain = k*np.r_[0, cs_ce[:-1]] - np.r_[0, cs_ce_k[:-1]]
+    put_pain = (cs_pe_k[-1]-cs_pe_k) - k*(cs_pe[-1]-cs_pe)
+    return float(k[np.argmin(call_pain + put_pain)])
+
+def _render_ai_signal_cards(state, min_conf):
+    df = state["df"]
+    q = df.loc[df["AI Confidence %"] >= min_conf].nlargest(15, "AI Confidence %")
+    if q.empty:
+        st.info(f"No strikes meet the {min_conf:.0f}% AI confidence threshold.")
+        return
+    html = []
+    for _, r in q.iterrows():
+        signal = str(r["AI Signal"])
+        color = GREEN if "CE" in signal else (RED if "PE" in signal else AMBER)
+        html.append(f"""<div class="intel-card"><div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;"><div><b style="color:{TEXT_MAIN};">{r['strike_price']:,.0f}</b>&nbsp;<span style="color:{color};font-weight:700;">{_safe_cell(signal)}</span></div><div class="intel-label">Confidence <span style="color:{TEXT_MAIN};font-weight:700;font-size:15px;">{r['AI Confidence %']:.0f}%</span></div></div><div style="margin-top:8px;color:{TEXT_MUTED};font-size:12px;">CE Score {r['CE Score']:.1f} &nbsp;|&nbsp; PE Score {r['PE Score']:.1f}</div></div>""")
+    st.markdown("".join(html), unsafe_allow_html=True)
+
+_original_run_dashboard = run_dashboard
+def run_dashboard(fyers=None):
+    _original_run_dashboard(fyers)
+
+# ===================================================================
 if __name__ == "__main__":
     run_dashboard()
