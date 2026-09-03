@@ -424,6 +424,218 @@ def calculate_buying_selling_pressure(df) -> Dict[str, Any]:
     }
 
 # ════════════════════════════════════════════════════════════════════════════════
+# AMD — ACCUMULATION / MANIPULATION / DISTRIBUTION ENGINE
+# Rule-based inference from completed OHLCV candles.
+# IMPORTANT: this is a market-structure/volume heuristic, not proof of intent.
+# ════════════════════════════════════════════════════════════════════════════════
+AMD_LOOKBACK = 24
+AMD_MIN_BARS = 30
+AMD_RANGE_MAX_PCT = 3.0
+AMD_RVOL_HIGH = 1.50
+AMD_RVOL_EXTREME = 2.00
+AMD_SWEEP_TOL_PCT = 0.15
+AMD_MIN_SIGNAL_SCORE = 65.0
+
+
+def calculate_amd_signal(df_5m: pd.DataFrame, df_15m: Optional[pd.DataFrame] = None) -> Dict[str, Any]:
+    """Detect Accumulation / Manipulation / Distribution from completed candles.
+
+    Accumulation: tight range + relatively strong/steady volume + bullish acceptance.
+    Manipulation: sweep of a recent high/low followed by rejection back inside range.
+    Distribution: high-volume weakness + bearish acceptance / range breakdown.
+
+    The result is an inference from OHLCV, not a claim about actual institutional intent.
+    """
+    out = {
+        "AMD PHASE": "NEUTRAL",
+        "AMD SIGNAL": "WAIT",
+        "AMD SCORE": 0.0,
+        "AMD BUY SCORE": 0.0,
+        "AMD SELL SCORE": 0.0,
+        "AMD CONFIDENCE %": 0.0,
+        "AMD RANGE HIGH": None,
+        "AMD RANGE LOW": None,
+        "AMD SWEEP": "NONE",
+        "AMD RVOL": 0.0,
+        "AMD REASON": "Insufficient completed 5M data",
+    }
+    if df_5m is None or len(df_5m) < AMD_MIN_BARS:
+        return out
+
+    try:
+        d = _completed_candles(df_5m, 5)
+        if d is None or len(d) < AMD_MIN_BARS:
+            out["AMD REASON"] = "Waiting for completed 5M candles"
+            return out
+
+        d = d.copy()
+        for col in ["Open", "High", "Low", "Close", "Volume"]:
+            d[col] = pd.to_numeric(d[col], errors="coerce")
+        d = d.dropna(subset=["Open", "High", "Low", "Close", "Volume"]).reset_index(drop=True)
+        if len(d) < AMD_MIN_BARS:
+            return out
+
+        last = d.iloc[-1]
+        o, h, l, c, v = [float(last[x]) for x in ["Open", "High", "Low", "Close", "Volume"]]
+        if min(o, h, l, c) <= 0:
+            out["AMD REASON"] = "Invalid price data"
+            return out
+
+        # Recent range excludes the current candle so the current candle can sweep it.
+        w = d.iloc[-AMD_LOOKBACK-1:-1]
+        range_high = float(w["High"].max())
+        range_low = float(w["Low"].min())
+        mid = (range_high + range_low) / 2.0
+        range_pct = ((range_high - range_low) / mid * 100.0) if mid > 0 else 999.0
+
+        atr_s = calculate_atr(d, 14)
+        atr = float(atr_s.iloc[-1]) if len(atr_s) and pd.notna(atr_s.iloc[-1]) else max(c * 0.005, 0.01)
+        base_vol = float(d["Volume"].iloc[-21:-1].mean()) if len(d) >= 22 else float(d["Volume"].iloc[:-1].mean())
+        rvol = v / base_vol if base_vol > 0 else 0.0
+
+        rng = max(h - l, 1e-9)
+        body = abs(c - o)
+        body_pct = body / rng * 100.0
+        close_pos = (c - l) / rng
+        upper_wick = h - max(o, c)
+        lower_wick = min(o, c) - l
+
+        # Sweep = price temporarily breaks a prior range extreme but closes back inside.
+        high_sweep = h > range_high * (1.0 + AMD_SWEEP_TOL_PCT / 100.0) and c < range_high
+        low_sweep = l < range_low * (1.0 - AMD_SWEEP_TOL_PCT / 100.0) and c > range_low
+        sweep = "HIGH SWEEP" if high_sweep else "LOW SWEEP" if low_sweep else "NONE"
+
+        # Recent directional acceptance.
+        recent = d.tail(5)
+        recent_change = (float(recent["Close"].iloc[-1]) - float(recent["Close"].iloc[0])) / float(recent["Close"].iloc[0]) * 100.0
+        above_mid = c > mid
+        below_mid = c < mid
+
+        # Volume behavior inside the prior range.
+        vol_recent = float(d["Volume"].iloc[-6:-1].mean()) if len(d) >= 7 else base_vol
+        volume_stable = (vol_recent / base_vol) if base_vol > 0 else 1.0
+
+        buy = 0.0
+        sell = 0.0
+        manipulation = 0.0
+        buy_reasons = []
+        sell_reasons = []
+        manip_reasons = []
+
+        # ACCUMULATION evidence
+        if range_pct <= AMD_RANGE_MAX_PCT:
+            buy += 25; buy_reasons.append(f"tight range {range_pct:.2f}%")
+        if rvol >= 1.10 and close_pos >= 0.55:
+            buy += 15; buy_reasons.append(f"volume acceptance {rvol:.2f}x")
+        if recent_change >= 0.20:
+            buy += 15; buy_reasons.append(f"recent +{recent_change:.2f}%")
+        if lower_wick > upper_wick * 1.20:
+            buy += 10; buy_reasons.append("lower-wick rejection")
+        if c >= mid:
+            buy += 10
+        if volume_stable >= 1.0:
+            buy += 5
+
+        # DISTRIBUTION evidence
+        if range_pct <= AMD_RANGE_MAX_PCT:
+            sell += 15
+        if rvol >= 1.10 and close_pos <= 0.45:
+            sell += 15; sell_reasons.append(f"selling volume {rvol:.2f}x")
+        if recent_change <= -0.20:
+            sell += 15; sell_reasons.append(f"recent {recent_change:.2f}%")
+        if upper_wick > lower_wick * 1.20:
+            sell += 10; sell_reasons.append("upper-wick rejection")
+        if c <= mid:
+            sell += 10
+        if c < range_low:
+            sell += 20; sell_reasons.append("range breakdown")
+
+        # MANIPULATION / liquidity sweep evidence.
+        if high_sweep:
+            manipulation += 55
+            sell += 20
+            manip_reasons.append("high liquidity sweep + close back inside")
+            if rvol >= AMD_RVOL_HIGH:
+                manipulation += 15; manip_reasons.append(f"high RVOL {rvol:.2f}x")
+            if upper_wick >= max(body * 1.20, atr * 0.25):
+                manipulation += 15; manip_reasons.append("upper rejection")
+        elif low_sweep:
+            manipulation += 55
+            buy += 20
+            manip_reasons.append("low liquidity sweep + close back inside")
+            if rvol >= AMD_RVOL_HIGH:
+                manipulation += 15; manip_reasons.append(f"high RVOL {rvol:.2f}x")
+            if lower_wick >= max(body * 1.20, atr * 0.25):
+                manipulation += 15; manip_reasons.append("lower rejection")
+
+        # 15M confirmation, when available.
+        tf15 = "NEUTRAL"
+        if df_15m is not None and len(df_15m) >= 10:
+            try:
+                p = df_15m.copy()
+                for col in ["Open", "Close"]:
+                    p[col] = pd.to_numeric(p[col], errors="coerce")
+                p = p.dropna(subset=["Open", "Close"])
+                if len(p) >= 5:
+                    pchg = (float(p["Close"].iloc[-1]) - float(p["Close"].iloc[-4])) / float(p["Close"].iloc[-4]) * 100.0
+                    tf15 = "BULLISH" if pchg > 0.25 else "BEARISH" if pchg < -0.25 else "NEUTRAL"
+                    if tf15 == "BULLISH": buy += 5
+                    elif tf15 == "BEARISH": sell += 5
+            except Exception:
+                tf15 = "NEUTRAL"
+
+        buy = min(100.0, buy)
+        sell = min(100.0, sell)
+        manipulation = min(100.0, manipulation)
+
+        # Priority: a confirmed sweep is classified as manipulation; otherwise compare A vs D.
+        if manipulation >= 65 and sweep != "NONE":
+            phase = "MANIPULATION"
+            if sweep == "LOW SWEEP" and buy >= sell:
+                signal = "🟢 AMD BUY AFTER SWEEP"
+            elif sweep == "HIGH SWEEP" and sell >= buy:
+                signal = "🔴 AMD SELL AFTER SWEEP"
+            else:
+                signal = "🟠 AMD SWEEP — WAIT"
+            score = manipulation
+            reason = " + ".join(manip_reasons) or sweep
+        elif buy >= 65 and buy > sell + 8:
+            phase = "ACCUMULATION"
+            signal = "🟢 AMD ACCUMULATION BUY WATCH"
+            score = buy
+            reason = " + ".join(buy_reasons) or "Bullish accumulation evidence"
+        elif sell >= 65 and sell > buy + 8:
+            phase = "DISTRIBUTION"
+            signal = "🔴 AMD DISTRIBUTION SELL WATCH"
+            score = sell
+            reason = " + ".join(sell_reasons) or "Bearish distribution evidence"
+        else:
+            phase = "TRANSITION" if max(buy, sell, manipulation) >= 50 else "NEUTRAL"
+            signal = "🟡 AMD TRANSITION — WAIT" if phase == "TRANSITION" else "⚪ AMD WAIT"
+            score = max(buy, sell, manipulation)
+            reason = "Mixed AMD evidence"
+
+        confidence = min(100.0, round(max(0.0, score * 0.85), 1))
+        out.update({
+            "AMD PHASE": phase,
+            "AMD SIGNAL": signal,
+            "AMD SCORE": round(score, 1),
+            "AMD BUY SCORE": round(buy, 1),
+            "AMD SELL SCORE": round(sell, 1),
+            "AMD CONFIDENCE %": confidence,
+            "AMD RANGE HIGH": round(range_high, 2),
+            "AMD RANGE LOW": round(range_low, 2),
+            "AMD SWEEP": sweep,
+            "AMD RVOL": round(rvol, 2),
+            "AMD REASON": f"{reason} | 15M {tf15}",
+        })
+        return out
+    except Exception as e:
+        out["AMD REASON"] = f"AMD error: {type(e).__name__}"
+        return out
+
+
+# ════════════════════════════════════════════════════════════════════════════════
 # LIVE CANDLE / FRESHNESS SAFETY HELPERS
 # ════════════════════════════════════════════════════════════════════════════════
 def _completed_candles(df: pd.DataFrame, resolution_minutes: int = 5) -> pd.DataFrame:
@@ -2329,6 +2541,7 @@ def _fetch_nse_signal(fyers, symbol: str):
         data_5m = analysis_5m.get("data") if analysis_5m.get("status") == "OK" else {}
         data_15m = analysis_15m.get("data") if analysis_15m.get("status") == "OK" else {}
         data_1h = analysis_1h.get("data") if analysis_1h.get("status") == "OK" else {}
+        amd = calculate_amd_signal(analysis_5m.get("df"), analysis_15m.get("df"))
         
         return {
             "Symbol": stock_ticker,
@@ -2359,6 +2572,17 @@ def _fetch_nse_signal(fyers, symbol: str):
             "🟢 BUY PRESSURE %": data_5m.get("buying_pressure", "N/A"),
             "🔴 SELL PRESSURE %": data_5m.get("selling_pressure", "N/A"),
             "PRESSURE SIGNAL": data_5m.get("pressure_trend", "N/A"),
+            "AMD PHASE": amd.get("AMD PHASE", "NEUTRAL"),
+            "AMD SIGNAL": amd.get("AMD SIGNAL", "WAIT"),
+            "AMD SCORE": amd.get("AMD SCORE", 0),
+            "AMD BUY SCORE": amd.get("AMD BUY SCORE", 0),
+            "AMD SELL SCORE": amd.get("AMD SELL SCORE", 0),
+            "AMD CONFIDENCE %": amd.get("AMD CONFIDENCE %", 0),
+            "AMD SWEEP": amd.get("AMD SWEEP", "NONE"),
+            "AMD RANGE HIGH": amd.get("AMD RANGE HIGH"),
+            "AMD RANGE LOW": amd.get("AMD RANGE LOW"),
+            "AMD RVOL": amd.get("AMD RVOL", 0),
+            "AMD REASON": amd.get("AMD REASON", ""),
             "NEXT CANDLE BIAS": next_bias.get("bias", "NEUTRAL"),
             "NEXT CANDLE CONFIDENCE %": next_bias.get("confidence", 0.0),
             "AI SIGNAL": master["final_signal"],
@@ -2413,6 +2637,7 @@ def _fetch_fo_signal(fyers, symbol: str):
         data_5m = analysis_5m.get("data") if analysis_5m.get("status") == "OK" else {}
         data_15m = analysis_15m.get("data") if analysis_15m.get("status") == "OK" else {}
         data_1h = analysis_1h.get("data") if analysis_1h.get("status") == "OK" else {}
+        amd = calculate_amd_signal(analysis_5m.get("df"), analysis_15m.get("df"))
         
         return {
             "Symbol": stock_ticker,
@@ -2443,6 +2668,17 @@ def _fetch_fo_signal(fyers, symbol: str):
             "🟢 BUY PRESSURE %": data_5m.get("buying_pressure", "N/A"),
             "🔴 SELL PRESSURE %": data_5m.get("selling_pressure", "N/A"),
             "PRESSURE SIGNAL": data_5m.get("pressure_trend", "N/A"),
+            "AMD PHASE": amd.get("AMD PHASE", "NEUTRAL"),
+            "AMD SIGNAL": amd.get("AMD SIGNAL", "WAIT"),
+            "AMD SCORE": amd.get("AMD SCORE", 0),
+            "AMD BUY SCORE": amd.get("AMD BUY SCORE", 0),
+            "AMD SELL SCORE": amd.get("AMD SELL SCORE", 0),
+            "AMD CONFIDENCE %": amd.get("AMD CONFIDENCE %", 0),
+            "AMD SWEEP": amd.get("AMD SWEEP", "NONE"),
+            "AMD RANGE HIGH": amd.get("AMD RANGE HIGH"),
+            "AMD RANGE LOW": amd.get("AMD RANGE LOW"),
+            "AMD RVOL": amd.get("AMD RVOL", 0),
+            "AMD REASON": amd.get("AMD REASON", ""),
             "NEXT CANDLE BIAS": next_bias.get("bias", "NEUTRAL"),
             "NEXT CANDLE CONFIDENCE %": next_bias.get("confidence", 0.0),
             "ATM STRIKE": round(options_data.get("atm_strike", 0), 2) if options_data.get("atm_strike") else "N/A",
@@ -4266,7 +4502,8 @@ def show_scanner(fyers) -> None:
         "🧠 ADDITIONAL ANALYSIS",
         "📊 MARKET DASHBOARD",
         "⚙️ SETTINGS",
-        "📌 PIN RULES"
+        "📌 PIN RULES",
+        "🧩 AMD PHASE"
     ])
     
     # ════════════════════════════════════════════════════════════════════════════════
@@ -5031,6 +5268,64 @@ def show_scanner(fyers) -> None:
     with tabs[10]:
         _show_pin_rules_tab(fyers, all_symbols, fo_symbols)
     
+    # ════════════════════════════════════════════════════════════════════════════════
+    # TAB 11: AMD — ACCUMULATION / MANIPULATION / DISTRIBUTION
+    # Uses the same completed 5M + 15M data already collected by NSE/F&O scanners.
+    # ════════════════════════════════════════════════════════════════════════════════
+    with tabs[11]:
+        st.markdown("### 🧩 AMD — Accumulation / Manipulation / Distribution")
+        st.caption("Rule-based OHLCV inference: Accumulation → Manipulation/Sweep → Distribution. It is not proof of institutional intent.")
+
+        amd_source = st.radio("AMD Source", ["NSE Stocks", "F&O Stocks"], horizontal=True, key="amd_source")
+        amd_df = st.session_state.get("nse_df" if amd_source == "NSE Stocks" else "fo_df")
+
+        if amd_df is None or amd_df.empty:
+            st.info(f"👈 Run the {amd_source} scanner first. AMD columns are calculated during that scan.")
+        elif "AMD PHASE" not in amd_df.columns:
+            st.warning("⚠️ AMD columns are missing. Re-run the scanner once with this version.")
+        else:
+            phase_order = ["ACCUMULATION", "MANIPULATION", "DISTRIBUTION", "TRANSITION", "NEUTRAL"]
+            phase_counts = amd_df["AMD PHASE"].astype(str).value_counts()
+            c1, c2, c3, c4, c5 = st.columns(5)
+            c1.metric("🟢 ACCUMULATION", int(phase_counts.get("ACCUMULATION", 0)))
+            c2.metric("🟠 MANIPULATION", int(phase_counts.get("MANIPULATION", 0)))
+            c3.metric("🔴 DISTRIBUTION", int(phase_counts.get("DISTRIBUTION", 0)))
+            c4.metric("🟡 TRANSITION", int(phase_counts.get("TRANSITION", 0)))
+            c5.metric("⚪ NEUTRAL", int(phase_counts.get("NEUTRAL", 0)))
+
+            f1, f2, f3 = st.columns(3)
+            with f1:
+                amd_phase_filter = st.selectbox("Phase", ["ALL"] + phase_order, key="amd_phase_filter")
+            with f2:
+                amd_min_score = st.slider("Min AMD Score", 0, 100, 60, 5, key="amd_min_score")
+            with f3:
+                amd_show = st.selectbox("View", ["ALL", "ACTIONABLE ONLY", "SWEEPS ONLY"], key="amd_view")
+
+            view = amd_df.copy()
+            view["AMD SCORE NUM"] = pd.to_numeric(view["AMD SCORE"], errors="coerce").fillna(0)
+            view = view[view["AMD SCORE NUM"] >= amd_min_score]
+            if amd_phase_filter != "ALL":
+                view = view[view["AMD PHASE"].astype(str) == amd_phase_filter]
+            if amd_show == "ACTIONABLE ONLY":
+                view = view[view["AMD SIGNAL"].astype(str).str.contains("BUY|SELL", regex=True, na=False)]
+            elif amd_show == "SWEEPS ONLY":
+                view = view[view["AMD SWEEP"].astype(str) != "NONE"]
+
+            display_cols = [
+                "Symbol", "LTP", "AMD PHASE", "AMD SIGNAL", "AMD SCORE",
+                "AMD BUY SCORE", "AMD SELL SCORE", "AMD CONFIDENCE %", "AMD SWEEP",
+                "AMD RANGE HIGH", "AMD RANGE LOW", "AMD RVOL", "AMD REASON"
+            ]
+            display_cols = [c for c in display_cols if c in view.columns]
+            view = view.sort_values("AMD SCORE NUM", ascending=False).drop(columns=["AMD SCORE NUM"], errors="ignore")
+            st.dataframe(view[display_cols], use_container_width=True, height=520)
+
+            st.markdown("#### AMD interpretation")
+            st.write("🟢 Accumulation = range/volume evidence with bullish acceptance.  🟠 Manipulation = recent high/low sweep with rejection back inside.  🔴 Distribution = weakening acceptance/high-volume selling evidence.")
+            st.caption("Use AMD as confirmation with the existing AI signal, liquidity, MTF and risk controls; it should not be treated as a guaranteed direction predictor.")
+
+            _excel_download_button(view[display_cols], "AMD_PHASE", "amd_phase_excel")
+
     gc.collect()
 
 # ════════════════════════════════════════════════════════════════════════════════
