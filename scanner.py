@@ -3404,6 +3404,59 @@ def _fetch_momentum_signal(fyers, symbol: str, is_fo: bool = False):
 # ════════════════════════════════════════════════════════════════════════════════
 # THREADED SCAN FUNCTIONS
 # ════════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════════════
+# AMD STANDALONE SCANNER
+# ════════════════════════════════════════════════════════════════════════════════
+def _fetch_amd_signal(fyers, symbol: str, is_fo: bool = False):
+    """Fetch completed 5M/15M candles and calculate AMD independently."""
+    stock_ticker = symbol.replace("NSE:", "").replace("-EQ", "") if isinstance(symbol, str) else str(symbol)
+    if not isinstance(symbol, str) or not _VALID_EQ_SYMBOL_RE.match(symbol):
+        return None, f"{symbol}: invalid format"
+    try:
+        a5 = analyze_timeframe(fyers, symbol, "5")
+        a15 = analyze_timeframe(fyers, symbol, "15")
+        if a5.get("status") != "OK" or a5.get("df") is None:
+            return None, None
+        amd = calculate_amd_signal(a5.get("df"), a15.get("df") if a15.get("status") == "OK" else None)
+        if amd.get("AMD SCORE", 0) <= 0:
+            return None, None
+        ltp = a5.get("data", {}).get("last_close") if a5.get("data") else None
+        result = {"Symbol": stock_ticker, "LTP": round(float(ltp), 2) if ltp is not None else "N/A", **amd}
+        return result, None
+    except Exception as e:
+        logger.exception("AMD worker failed for %s", symbol)
+        return None, f"{symbol}: error ({type(e).__name__}: {str(e)[:120]})"
+
+
+def run_amd_scan(fyers, symbols, is_fo: bool = False):
+    """Threaded standalone AMD scan. Does not require NSE/F&O scanner first."""
+    symbols = _validate_symbols(symbols)
+    results, errors = [], []
+    total = len(symbols)
+    progress = st.progress(0.0, text=f"Scanning AMD 0 / {total}")
+    done = 0
+    for i in range(0, total, BATCH_SIZE):
+        batch = symbols[i:i + BATCH_SIZE]
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            futures = {executor.submit(_fetch_amd_signal, fyers, s, is_fo): s for s in batch}
+            for future in as_completed(futures):
+                try:
+                    res, err = future.result()
+                except Exception as e:
+                    res, err = None, f"{futures[future]}: worker error"
+                if res:
+                    results.append(res)
+                if err:
+                    errors.append(err)
+                done += 1
+                progress.progress(done / max(total, 1), text=f"Scanning AMD {done} / {total}")
+        if i + BATCH_SIZE < total:
+            time.sleep(BATCH_PAUSE_SECONDS)
+    progress.empty()
+    gc.collect()
+    return results, errors
+
+
 def run_nse_scan(fyers, symbols):
     """Threaded scan for NSE stocks."""
     symbols = _validate_symbols(symbols)
@@ -5277,12 +5330,25 @@ def show_scanner(fyers) -> None:
         st.caption("Rule-based OHLCV inference: Accumulation → Manipulation/Sweep → Distribution. It is not proof of institutional intent.")
 
         amd_source = st.radio("AMD Source", ["NSE Stocks", "F&O Stocks"], horizontal=True, key="amd_source")
-        amd_df = st.session_state.get("nse_df" if amd_source == "NSE Stocks" else "fo_df")
+        amd_symbols = all_symbols if amd_source == "NSE Stocks" else fo_symbols
 
+        c_run1, c_run2 = st.columns([3, 1])
+        with c_run1:
+            amd_limit = st.number_input("AMD Scan Limit (0 = ALL)", min_value=0, max_value=len(amd_symbols), value=0, step=50, key="amd_limit")
+        with c_run2:
+            st.metric("Available", len(amd_symbols))
+        amd_universe = amd_symbols if amd_limit == 0 else amd_symbols[:amd_limit]
+
+        if st.button(f"🚀 RUN AMD SCAN ({len(amd_universe)} stocks)", key="amd_run", type="primary", use_container_width=True):
+            with st.spinner(f"Running AMD analysis on {len(amd_universe)} symbols…"):
+                amd_results, amd_errors = run_amd_scan(fyers, amd_universe, is_fo=(amd_source == "F&O Stocks"))
+                st.session_state["amd_df"] = pd.DataFrame(amd_results) if amd_results else pd.DataFrame()
+                st.session_state["amd_errors"] = amd_errors or []
+                st.session_state["amd_source_done"] = amd_source
+
+        amd_df = st.session_state.get("amd_df")
         if amd_df is None or amd_df.empty:
-            st.info(f"👈 Run the {amd_source} scanner first. AMD columns are calculated during that scan.")
-        elif "AMD PHASE" not in amd_df.columns:
-            st.warning("⚠️ AMD columns are missing. Re-run the scanner once with this version.")
+            st.info("👈 Select NSE/F&O and click RUN AMD SCAN.")
         else:
             phase_order = ["ACCUMULATION", "MANIPULATION", "DISTRIBUTION", "TRANSITION", "NEUTRAL"]
             phase_counts = amd_df["AMD PHASE"].astype(str).value_counts()
@@ -5320,11 +5386,13 @@ def show_scanner(fyers) -> None:
             view = view.sort_values("AMD SCORE NUM", ascending=False).drop(columns=["AMD SCORE NUM"], errors="ignore")
             st.dataframe(view[display_cols], use_container_width=True, height=520)
 
+            st.markdown("### 📥 AMD DOWNLOAD")
+            _excel_download_button(view[display_cols], "AMD_PHASE", "amd_phase_excel", label="📊 DOWNLOAD AMD EXCEL")
+
             st.markdown("#### AMD interpretation")
             st.write("🟢 Accumulation = range/volume evidence with bullish acceptance.  🟠 Manipulation = recent high/low sweep with rejection back inside.  🔴 Distribution = weakening acceptance/high-volume selling evidence.")
             st.caption("Use AMD as confirmation with the existing AI signal, liquidity, MTF and risk controls; it should not be treated as a guaranteed direction predictor.")
 
-            _excel_download_button(view[display_cols], "AMD_PHASE", "amd_phase_excel")
 
     gc.collect()
 
