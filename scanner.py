@@ -4148,7 +4148,7 @@ def show_scanner(fyers) -> None:
                 intraday_signal_filter = st.selectbox("Signal", ["ALL", "BUY", "SELL"], key="intraday_sig_filter")
             with col_if3:
                 intraday_show_cols = st.multiselect("Show Columns", intraday_df.columns, 
-                                                   default=[c for c in ["Symbol", "LTP", "AI SIGNAL", "SIGNAL TIME", "LAST SEEN", "SIGNAL AGE", "AI CONFIDENCE %", "SIGNAL TIME", "LAST SEEN", "SIGNAL AGE", "RVOL", "🟢 BUY PRESSURE %", "🔴 SELL PRESSURE %"] if c in intraday_df.columns],
+                                                   default=list(dict.fromkeys([c for c in ["Symbol", "LTP", "AI SIGNAL", "SIGNAL TIME", "LAST SEEN", "SIGNAL AGE", "AI CONFIDENCE %", "RVOL", "🟢 BUY PRESSURE %", "🔴 SELL PRESSURE %"] if c in intraday_df.columns])),
                                                    key="intraday_cols")
             
             intraday_filtered = intraday_df.copy()
@@ -4167,8 +4167,10 @@ def show_scanner(fyers) -> None:
                 except:
                     pass
             
+            # Defensive fix: Streamlit/Arrow rejects duplicate column names.
+            intraday_show_cols = list(dict.fromkeys(intraday_show_cols))
             if intraday_show_cols:
-                st.dataframe(intraday_filtered[intraday_show_cols], use_container_width=True, height=400)
+                st.dataframe(intraday_filtered.loc[:, intraday_show_cols], use_container_width=True, height=400)
             else:
                 st.dataframe(intraday_filtered, use_container_width=True, height=400)
         else:
