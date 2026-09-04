@@ -286,27 +286,96 @@ def _now_ist() -> datetime:
 # Works with AI SIGNAL, AMD SIGNAL and PIN SIGNAL.
 # Existing scanner rules are not changed.
 # ============================================================
-def _add_signal_time_columns(df: pd.DataFrame, signal_col: str,
-                             symbol_col: str = "Symbol") -> pd.DataFrame:
-    """Keeps SIGNAL TIME fixed for the same active signal."""
+def _add_signal_time_columns(
+    df: pd.DataFrame,
+    signal_col: str,
+    symbol_col: str = "Symbol",
+    resolution: str = "5",
+    is_daily: bool = False,
+) -> pd.DataFrame:
+    """Add stable signal timing columns.
+
+    SIGNAL TIME = actual completed signal-candle CLOSE time.
+    LAST SEEN   = latest time this scanner detected the signal.
+    SIGNAL AGE  = how long the signal has been continuously detected.
+
+    The old implementation used the current scanner time as SIGNAL TIME,
+    which made a 10:15 candle appear as 10:27 when the scan ran at 10:27.
+    """
     if df is None or df.empty or signal_col not in df.columns:
         return df.copy() if isinstance(df, pd.DataFrame) else df
 
-    if symbol_col not in df.columns:
+    out = df.copy()
+
+    if symbol_col not in out.columns:
         for candidate in ("Symbol", "SYMBOL", "symbol"):
-            if candidate in df.columns:
+            if candidate in out.columns:
                 symbol_col = candidate
                 break
-    if symbol_col not in df.columns:
-        return df.copy()
+    if symbol_col not in out.columns:
+        return out
 
     if "scanner_signal_time_history" not in st.session_state:
         st.session_state["scanner_signal_time_history"] = {}
 
     history = st.session_state["scanner_signal_time_history"]
     now = _now_ist()
-    out = df.copy()
-    first_list, last_list, age_list = [], [], []
+
+    def _parse_candle_start(value):
+        """Parse Fyers candle timestamp safely (seconds/ms or datetime)."""
+        if value is None or (isinstance(value, str) and not value.strip()):
+            return None
+        try:
+            if isinstance(value, (int, float, np.integer, np.floating)) and not pd.isna(value):
+                # Fyers normally returns Unix seconds. Support milliseconds too.
+                v = float(value)
+                unit = "ms" if abs(v) >= 10**11 else "s"
+                ts = pd.to_datetime(v, unit=unit, errors="coerce", utc=True)
+            else:
+                ts = pd.to_datetime(value, errors="coerce", utc=True)
+            if pd.isna(ts):
+                return None
+            return ts.tz_convert(IST)
+        except Exception:
+            return None
+
+    def _get_signal_candle_close(row):
+        """Return completed candle close timestamp, or None if unavailable."""
+        # Prefer explicit close-time fields if a scanner supplies them.
+        for col in (
+            "SIGNAL CANDLE CLOSE",
+            "SIGNAL_CANDLE_CLOSE",
+            "CANDLE CLOSE TIME",
+            "CANDLE_CLOSE_TIME",
+        ):
+            if col in row.index:
+                ts = _parse_candle_start(row.get(col))
+                if ts is not None:
+                    return ts
+
+        # Otherwise use the Fyers candle start time + its timeframe.
+        raw = None
+        for col in ("Time", "TIMESTAMP", "Timestamp", "datetime", "Datetime", "DATE", "Date"):
+            if col in row.index:
+                value = row.get(col)
+                if value is not None and str(value) not in ("", "nan", "NaT", "None"):
+                    raw = value
+                    break
+
+        ts = _parse_candle_start(raw)
+        if ts is None:
+            return None
+
+        if is_daily:
+            return ts.replace(hour=15, minute=30, second=0, microsecond=0)
+
+        try:
+            minutes = int(row.get("Signal Resolution", resolution))
+        except Exception:
+            minutes = 5
+        return ts + pd.Timedelta(minutes=minutes)
+
+    signal_times, last_seen_list, age_list = [], [], []
 
     for _, row in out.iterrows():
         symbol = str(row.get(symbol_col, "")).strip()
@@ -314,20 +383,22 @@ def _add_signal_time_columns(df: pd.DataFrame, signal_col: str,
         active = bool(symbol) and ("BUY" in signal or "SELL" in signal)
 
         if not active:
-            first_list.append("-")
-            last_list.append("-")
+            signal_times.append("-")
+            last_seen_list.append("-")
             age_list.append("-")
             continue
 
-        key = f"{signal_col}::{symbol}::{signal}"
+        # BUY -> STRONG BUY and SELL -> STRONG SELL are the same direction.
+        # This prevents the timer from resetting just because signal strength changed.
+        direction = "BUY" if "BUY" in signal else "SELL"
+        key = f"{signal_col}::{symbol}::{direction}"
         prefix = f"{signal_col}::{symbol}::"
 
-        # Signal changed -> old timer is removed and new signal starts now.
+        # Remove the opposite direction for the same symbol/signal family.
         for old_key in list(history.keys()):
             if old_key.startswith(prefix) and old_key != key:
                 history.pop(old_key, None)
 
-        # Same signal -> NEVER overwrite first_seen.
         if key not in history:
             history[key] = {"first_seen": now, "last_seen": now}
         else:
@@ -344,12 +415,19 @@ def _add_signal_time_columns(df: pd.DataFrame, signal_col: str,
         else:
             age = f"{seconds // 3600}h {(seconds % 3600) // 60}m ago"
 
-        first_list.append(first_seen.strftime("%d-%b-%Y %I:%M:%S %p"))
-        last_list.append(last_seen.strftime("%d-%b-%Y %I:%M:%S %p"))
+        candle_close = _get_signal_candle_close(row)
+        if candle_close is not None:
+            signal_time = candle_close.strftime("%d-%b-%Y %I:%M:%S %p")
+        else:
+            # Fallback only when the worker did not provide candle time.
+            signal_time = first_seen.strftime("%d-%b-%Y %I:%M:%S %p")
+
+        signal_times.append(signal_time)
+        last_seen_list.append(last_seen.strftime("%d-%b-%Y %I:%M:%S %p"))
         age_list.append(age)
 
-    out["SIGNAL TIME"] = first_list
-    out["LAST SEEN"] = last_list
+    out["SIGNAL TIME"] = signal_times
+    out["LAST SEEN"] = last_seen_list
     out["SIGNAL AGE"] = age_list
     return out
 
@@ -2358,6 +2436,8 @@ def _fetch_nse_signal(fyers, symbol: str):
         
         return {
             "Symbol": stock_ticker,
+            "Time": analysis_5m["df"]["Time"].iloc[-1] if analysis_5m.get("df") is not None and not analysis_5m["df"].empty else None,
+            "Signal Resolution": "5",
             "LTP": round(float(ltp), 2),
             "Trend": data_5m.get("structure_trend", "N/A"),
             "5M Trend": data_5m.get("structure_trend", "N/A"),
@@ -2442,6 +2522,8 @@ def _fetch_fo_signal(fyers, symbol: str):
         
         return {
             "Symbol": stock_ticker,
+            "Time": analysis_5m["df"]["Time"].iloc[-1] if analysis_5m.get("df") is not None and not analysis_5m["df"].empty else None,
+            "Signal Resolution": "5",
             "LTP": round(float(ltp), 2),
             "Trend": data_5m.get("structure_trend", "N/A"),
             "5M Trend": data_5m.get("structure_trend", "N/A"),
@@ -2745,6 +2827,8 @@ def _fetch_momentum_signal(fyers, symbol: str, is_fo: bool = False):
         ltp = float(df5["Close"].iloc[-1])
         result = {
             "Symbol": stock_ticker,
+            "Time": df5["Time"].iloc[-1] if "Time" in df5.columns and not df5.empty else None,
+            "Signal Resolution": "5",
             "LTP": round(ltp, 2),
             "SIGNAL": move["signal"],
             "DIRECTION": move["direction"],
@@ -3384,6 +3468,8 @@ def _fetch_full_pin_signal(fyers, symbol: str, source: str):
         )
         d5 = a5.get("data", {}) or {}
         pin["Symbol"] = ticker
+        pin["Time"] = a5["df"]["Time"].iloc[-1] if a5.get("df") is not None and not a5["df"].empty else None
+        pin["Signal Resolution"] = "5"
         pin["SOURCE"] = source
         pin["LTP"] = d5.get("last_close", "N/A")
         pin["5M TREND"] = d5.get("structure_trend", "N/A")
@@ -3457,6 +3543,8 @@ def _fetch_amd_signal_full(fyers, symbol: str, source: str):
         d15 = a15.get("data", {}) or {}
         row = {
             "Symbol": ticker,
+            "Time": a5["df"]["Time"].iloc[-1] if a5.get("df") is not None and not a5["df"].empty else None,
+            "Signal Resolution": "5",
             "SOURCE": source,
             "LTP": d5.get("last_close", "N/A"),
             "AMD PHASE": amd.get("AMD PHASE", "NEUTRAL"),
