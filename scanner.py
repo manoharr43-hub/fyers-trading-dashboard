@@ -1404,110 +1404,186 @@ def load_nse_equity_symbols() -> List[str]:
 
 @st.cache_data(ttl=60 * 60 * 12, show_spinner=False)
 def load_fo_stocks() -> List[str]:
-    """Load NSE equity underlyings that currently have NSE-F&O contracts.
+    """Load NSE equity underlyings that have F&O contracts.
 
-    Uses the current FYERS JSON master first, then CSV fallback, then the
-    last-known-good local cache. This avoids fixed-column assumptions.
+    Robust against FYERS master column/order changes and temporary network
+    failures. Uses the NSE equity list as the final validity gate and stores
+    a last-known-good F&O universe on disk.
     """
-    def save_cache(symbols):
-        try:
-            os.makedirs(os.path.dirname(SYMBOL_CACHE_FILE) or ".", exist_ok=True)
-            with open(SYMBOL_CACHE_FILE, "r+" if os.path.exists(SYMBOL_CACHE_FILE) else "w", encoding="utf-8") as f:
-                data = {}
-                try:
-                    data = json.load(f) if f.tell() == 0 else {}
-                except Exception:
-                    data = {}
-                data["saved_at"] = _now_ist().isoformat()
-                data["nse_fo"] = symbols
-                f.seek(0); json.dump(data, f); f.truncate()
-        except Exception as e:
-            logger.warning("F&O symbol cache write failed: %s", e)
-
-    def read_cache():
+    def read_cache() -> List[str]:
         try:
             if os.path.exists(SYMBOL_CACHE_FILE):
                 with open(SYMBOL_CACHE_FILE, "r", encoding="utf-8") as f:
                     data = json.load(f)
-                return _validate_symbols(data.get("nse_fo", [])) if isinstance(data, dict) else []
+                return _validate_symbols(data.get("fo", [])) if isinstance(data, dict) else []
         except Exception as e:
             logger.warning("F&O symbol cache read failed: %s", e)
         return []
 
     cm_symbols = set(load_nse_equity_symbols())
     if not cm_symbols:
-        return read_cache()
+        cached = read_cache()
+        logger.warning("NSE equity universe empty; using cached F&O universe (%d)", len(cached))
+        return cached
 
-    # Preferred: current FYERS JSON symbol master.
     try:
         r = requests.get(
-            "https://public.fyers.in/sym_details/NSE_FO_sym_master.json",
+            FYERS_NSE_FO_SYMBOL_MASTER,
             timeout=(4, SYMBOL_HTTP_TIMEOUT),
-            headers={"User-Agent": "NSE-AI-PRO/17", "Accept": "application/json,*/*"},
+            headers={"User-Agent": "NSE-AI-PRO/17", "Accept": "text/csv,*/*"},
         )
         r.raise_for_status()
-        payload = r.json()
-        records = payload.values() if isinstance(payload, dict) else (payload if isinstance(payload, list) else [])
-        result = set()
-        for rec in records:
-            if not isinstance(rec, dict):
-                continue
-            ex = str(rec.get("exchange", "")).upper()
-            seg = str(rec.get("segment", "")).upper()
-            if ex not in {"10", "NSE"} or (seg and seg not in {"11", "FO"}):
-                continue
-            under = rec.get("underExSymbol") or rec.get("underlyingSymbol")
-            if not under:
-                ticker = str(rec.get("symTicker") or rec.get("exSymbol") or "").upper()
-                m = re.match(r"NSE:([A-Z0-9&\-]+?)(?:\d{2}[A-Z]{1,3}|\d{6,8}|FUT|\d+(?:\.\d+)?(?:CE|PE))", ticker)
-                if m:
-                    under = m.group(1)
-            if not under:
-                continue
-            under = str(under).strip().upper()
-            candidate = under if under.startswith("NSE:") else f"NSE:{under}"
-            if not candidate.endswith("-EQ"):
-                candidate += "-EQ"
-            if candidate in cm_symbols:
-                result.add(candidate)
-        result = sorted(result)
-        if result:
-            save_cache(result)
-            logger.info("Loaded %d NSE F&O underlyings from JSON", len(result))
-            return result
-        raise ValueError("JSON master returned zero F&O underlyings")
-    except Exception as e:
-        logger.warning("F&O JSON master failed: %s", e)
+        text = r.text or ""
+        if len(text) < 100:
+            raise ValueError("empty F&O symbol master")
 
-    # CSV fallback: scan every field for a ticker that exists in NSE CM.
-    try:
-        r = requests.get(
-            FYERS_NSE_FO_SYMBOL_MASTER, timeout=(4, SYMBOL_HTTP_TIMEOUT),
-            headers={"User-Agent": "Mozilla/5.0", "Accept": "text/csv,*/*"},
-        )
-        r.raise_for_status()
-        result = set()
-        for row in csv.reader(io.StringIO(r.text or "")):
-            for value in row:
-                x = str(value).strip().upper()
-                if x.startswith("NSE:") and x.endswith("-EQ") and x in cm_symbols:
-                    result.add(x)
-                elif re.fullmatch(r"[A-Z0-9&\-]{2,30}", x) and f"NSE:{x}-EQ" in cm_symbols:
-                    result.add(f"NSE:{x}-EQ")
-        result = sorted(result)
-        if result:
-            save_cache(result)
-            logger.info("Loaded %d NSE F&O underlyings from CSV", len(result))
-            return result
-        raise ValueError("CSV master returned zero F&O underlyings")
+        rows = list(csv.reader(io.StringIO(text)))
+        if not rows:
+            raise ValueError("no F&O rows")
+
+        # Detect useful columns from the actual CSV instead of hard-coding
+        # positions. We look for rows containing NSE contract symbols and
+        # possible underlying/short-name fields.
+        fo_underlyings = set()
+        for row in rows[1:]:
+            vals = [str(x).strip().upper() for x in row]
+            if not vals:
+                continue
+
+            candidates = set()
+            for v in vals:
+                if v.startswith("NSE:"):
+                    candidates.add(v)
+                elif re.fullmatch(r"[A-Z0-9&\-]{1,30}", v) and v in {x.replace("NSE:", "").replace("-EQ", "") for x in cm_symbols}:
+                    candidates.add(f"NSE:{v}-EQ")
+
+            # Direct equity symbol present in any field.
+            for c in candidates:
+                if c in cm_symbols:
+                    fo_underlyings.add(c)
+
+            # F&O contract symbol often embeds the underlying, e.g.
+            # NSE:RELIANCE26SEP...; derive only when it exactly matches a
+            # known CM underlying prefix and the row contains derivative-like
+            # fields (expiry/strike/option type/future).
+            for c in list(candidates):
+                base = c[4:-3] if c.startswith("NSE:") and c.endswith("-EQ") else ""
+                if base and f"NSE:{base}-EQ" in cm_symbols:
+                    fo_underlyings.add(f"NSE:{base}-EQ")
+
+            # Original FYERS layout fallback: short symbol at index 13 and
+            # contract symbol at index 9.
+            if len(vals) > 13:
+                short_sym = vals[13]
+                contract_symbol = vals[9] if len(vals) > 9 else ""
+                if short_sym and short_sym not in {"NONE", "NAN"} and contract_symbol.startswith("NSE:"):
+                    candidate = f"NSE:{short_sym}-EQ"
+                    if candidate in cm_symbols:
+                        fo_underlyings.add(candidate)
+
+        result = sorted(fo_underlyings)
+        if not result:
+            raise ValueError("no valid F&O equity underlyings found from symbol master")
+
+        try:
+            os.makedirs(os.path.dirname(SYMBOL_CACHE_FILE) or ".", exist_ok=True)
+            with open(SYMBOL_CACHE_FILE, "w", encoding="utf-8") as f:
+                json.dump({"saved_at": _now_ist().isoformat(), "fo": result}, f)
+        except Exception as e:
+            logger.warning("F&O symbol cache write failed: %s", e)
+
+        logger.info("Loaded %d NSE F&O equity underlyings", len(result))
+        return result
     except Exception as e:
         cached = read_cache()
         if cached:
-            logger.warning("Using cached F&O symbols: %s", e)
+            logger.warning("Using cached F&O symbols after master failure: %s", e)
             return cached
         logger.error("F&O symbol master unavailable: %s", e)
         return []
 
+# ════════════════════════════════════════════════════════════════════════════════
+# SAFE HISTORY FETCH (RETAINED)
+# ════════════════════════════════════════════════════════════════════════════════
+_HISTORY_MAX_RETRIES = 2
+_HISTORY_BASE_DELAY_SECONDS = 0.35
+_HISTORY_RETRYABLE_MESSAGES = ("rate", "limit", "timeout", "tempor", "busy", "gateway", "connection")
+
+def _safe_history(fyers, params: dict, max_retries: int = _HISTORY_MAX_RETRIES, base_delay: float = _HISTORY_BASE_DELAY_SECONDS):
+    symbol = params.get("symbol", "UNKNOWN")
+    last_err = "unknown error"
+    for attempt in range(1, max_retries + 1):
+        try:
+            resp = fyers.history(params)
+        except requests.exceptions.Timeout:
+            last_err = "timeout"
+        except requests.exceptions.ConnectionError:
+            last_err = "network error"
+        except requests.exceptions.RequestException as e:
+            last_err = f"request error: {e}"
+        except (ValueError, TypeError) as e:
+            last_err = f"invalid response: {e}"
+        except Exception as e:
+            last_err = f"unexpected error: {e}"
+        else:
+            if not isinstance(resp, dict):
+                last_err = "empty/invalid response"
+            else:
+                status = resp.get("s")
+                if status == "ok":
+                    candles = resp.get("candles")
+                    if not isinstance(candles, list):
+                        last_err = "malformed candle data"
+                    else:
+                        return resp, None
+                else:
+                    message = str(resp.get("message", status or "unknown"))
+                    if "rate" in message.lower() or "limit" in message.lower():
+                        last_err = f"rate limited: {message}"
+                        time.sleep(min(1.5, base_delay * attempt * 2))
+                        continue
+                    return None, message
+        if attempt < max_retries:
+            time.sleep(min(1.0, base_delay * attempt))
+    return None, f"{symbol}: {last_err} (after {max_retries} attempts)"
+
+# ════════════════════════════════════════════════════════════════════════════════
+# SCAN STATS (ORIGINAL)
+# ════════════════════════════════════════════════════════════════════════════════
+class ScanStats:
+    def __init__(self, total: int):
+        self.total = total
+        self.scanned = 0
+        self.successful = 0
+        self.skipped = 0
+        self.failed = 0
+        self._start = time.time()
+
+    def record(self, has_result: bool, has_error: bool) -> None:
+        self.scanned += 1
+        if has_result:
+            self.successful += 1
+        elif has_error:
+            self.failed += 1
+        else:
+            self.skipped += 1
+
+    @property
+    def elapsed_seconds(self) -> float:
+        return time.time() - self._start
+
+def _display_scan_summary(stats: "ScanStats") -> None:
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
+    c1.metric("Total Stocks", stats.total)
+    c2.metric("Scanned", stats.scanned)
+    c3.metric("Successful", stats.successful)
+    c4.metric("Skipped", stats.skipped)
+    c5.metric("Failed", stats.failed)
+    c6.metric("Scan Time", f"{stats.elapsed_seconds:.1f}s")
+
+# ════════════════════════════════════════════════════════════════════════════════
+# TIMEFRAME DATA FETCHER (NEW)
+# ════════════════════════════════════════════════════════════════════════════════
 def _fetch_timeframe_data(fyers, symbol, resolution: str, lookback_days: int = 30) -> Optional[pd.DataFrame]:
     """Fetch OHLCV data for a specific timeframe."""
     date_from = (datetime.today() - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
@@ -4720,8 +4796,6 @@ def show_scanner(fyers) -> None:
         
         if "fo_stats" in st.session_state:
             _display_scan_summary(st.session_state["fo_stats"])
-            if st.session_state.get("fo_errors") and st.session_state.get("fo_df", pd.DataFrame()).empty:
-                st.warning(f"⚠️ F&O scan returned 0 rows. First error: {st.session_state['fo_errors'][0]}")
         
         fo_df = st.session_state.get("fo_df")
         if fo_df is not None and not fo_df.empty:
