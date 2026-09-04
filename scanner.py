@@ -288,6 +288,7 @@ def _now_ist() -> datetime:
 # ============================================================
 def _add_signal_time_columns(df: pd.DataFrame, signal_col: str,
                              symbol_col: str = "Symbol") -> pd.DataFrame:
+    """Keeps SIGNAL TIME fixed for the same active signal."""
     if df is None or df.empty or signal_col not in df.columns:
         return df.copy() if isinstance(df, pd.DataFrame) else df
 
@@ -310,8 +311,6 @@ def _add_signal_time_columns(df: pd.DataFrame, signal_col: str,
     for _, row in out.iterrows():
         symbol = str(row.get(symbol_col, "")).strip()
         signal = str(row.get(signal_col, "")).strip().upper()
-
-        # Any actionable BUY/SELL signal gets a time.
         active = bool(symbol) and ("BUY" in signal or "SELL" in signal)
 
         if not active:
@@ -321,13 +320,14 @@ def _add_signal_time_columns(df: pd.DataFrame, signal_col: str,
             continue
 
         key = f"{signal_col}::{symbol}::{signal}"
-
-        # If direction changes, the old BUY/SELL timer is removed.
         prefix = f"{signal_col}::{symbol}::"
+
+        # Signal changed -> old timer is removed and new signal starts now.
         for old_key in list(history.keys()):
             if old_key.startswith(prefix) and old_key != key:
                 history.pop(old_key, None)
 
+        # Same signal -> NEVER overwrite first_seen.
         if key not in history:
             history[key] = {"first_seen": now, "last_seen": now}
         else:
