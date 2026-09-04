@@ -282,57 +282,51 @@ def _now_ist() -> datetime:
 
 
 # ============================================================
-# PERSISTENT SCANNER SIGNAL TIME TRACKER
-# Adds: SIGNAL TIME, LAST SEEN, SIGNAL AGE
-# Existing scanner logic remains unchanged.
+# UNIVERSAL SCANNER SIGNAL TIME
+# Works with AI SIGNAL, AMD SIGNAL and PIN SIGNAL.
+# Existing scanner rules are not changed.
 # ============================================================
-def _add_signal_time_columns(df: pd.DataFrame, signal_col: str = "AI SIGNAL",
+def _add_signal_time_columns(df: pd.DataFrame, signal_col: str,
                              symbol_col: str = "Symbol") -> pd.DataFrame:
-    if df is None or df.empty:
-        return df
+    if df is None or df.empty or signal_col not in df.columns:
+        return df.copy() if isinstance(df, pd.DataFrame) else df
 
     if symbol_col not in df.columns:
-        for candidate in ["SYMBOL", "Symbol", "symbol", "NSE Symbol"]:
+        for candidate in ("Symbol", "SYMBOL", "symbol"):
             if candidate in df.columns:
                 symbol_col = candidate
                 break
-
-    if signal_col not in df.columns:
-        for candidate in ["AI SIGNAL", "SIGNAL", "Signal"]:
-            if candidate in df.columns:
-                signal_col = candidate
-                break
-
-    if symbol_col not in df.columns or signal_col not in df.columns:
-        return df
+    if symbol_col not in df.columns:
+        return df.copy()
 
     if "scanner_signal_time_history" not in st.session_state:
         st.session_state["scanner_signal_time_history"] = {}
 
     history = st.session_state["scanner_signal_time_history"]
     now = _now_ist()
-    result = df.copy()
+    out = df.copy()
+    first_list, last_list, age_list = [], [], []
 
-    signal_times, last_seen_times, signal_ages = [], [], []
-
-    for _, row in result.iterrows():
+    for _, row in out.iterrows():
         symbol = str(row.get(symbol_col, "")).strip()
         signal = str(row.get(signal_col, "")).strip().upper()
 
-        is_active = ("BUY" in signal) or ("SELL" in signal)
-        key = f"{symbol}::{signal}"
+        # Any actionable BUY/SELL signal gets a time.
+        active = bool(symbol) and ("BUY" in signal or "SELL" in signal)
 
-        if not symbol or not is_active:
-            signal_times.append("-")
-            last_seen_times.append("-")
-            signal_ages.append("-")
+        if not active:
+            first_list.append("-")
+            last_list.append("-")
+            age_list.append("-")
             continue
 
-        # Remove old opposite signal records for this symbol.
-        prefix = f"{symbol}::"
+        key = f"{signal_col}::{symbol}::{signal}"
+
+        # If direction changes, the old BUY/SELL timer is removed.
+        prefix = f"{signal_col}::{symbol}::"
         for old_key in list(history.keys()):
             if old_key.startswith(prefix) and old_key != key:
-                del history[old_key]
+                history.pop(old_key, None)
 
         if key not in history:
             history[key] = {"first_seen": now, "last_seen": now}
@@ -341,23 +335,23 @@ def _add_signal_time_columns(df: pd.DataFrame, signal_col: str = "AI SIGNAL",
 
         first_seen = history[key]["first_seen"]
         last_seen = history[key]["last_seen"]
-        age_seconds = max(0, int((now - first_seen).total_seconds()))
+        seconds = max(0, int((now - first_seen).total_seconds()))
 
-        if age_seconds < 60:
-            age_text = "JUST NOW"
-        elif age_seconds < 3600:
-            age_text = f"{age_seconds // 60} min ago"
+        if seconds < 60:
+            age = "JUST NOW"
+        elif seconds < 3600:
+            age = f"{seconds // 60} min ago"
         else:
-            age_text = f"{age_seconds // 3600}h {(age_seconds % 3600) // 60}m ago"
+            age = f"{seconds // 3600}h {(seconds % 3600) // 60}m ago"
 
-        signal_times.append(first_seen.strftime("%I:%M:%S %p"))
-        last_seen_times.append(last_seen.strftime("%I:%M:%S %p"))
-        signal_ages.append(age_text)
+        first_list.append(first_seen.strftime("%d-%b-%Y %I:%M:%S %p"))
+        last_list.append(last_seen.strftime("%d-%b-%Y %I:%M:%S %p"))
+        age_list.append(age)
 
-    result["SIGNAL TIME"] = signal_times
-    result["LAST SEEN"] = last_seen_times
-    result["SIGNAL AGE"] = signal_ages
-    return result
+    out["SIGNAL TIME"] = first_list
+    out["LAST SEEN"] = last_list
+    out["SIGNAL AGE"] = age_list
+    return out
 
 def _ensure_app_folders() -> None:
     for folder in ("logs", "charts", "exports"):
@@ -3552,7 +3546,7 @@ def _show_pin_full_scan_tab(fyers, all_symbols, fo_symbols):
     if st.button(f"📌 RUN PIN SCANNER ({len(scan_pairs):,} STOCKS)", key="pin_full_run", type="primary", use_container_width=True):
         with st.spinner(f"Running PIN scanner on {len(scan_pairs):,} stocks…"):
             rows, errors, stats = _run_full_pin_scan(fyers, scan_pairs, pin_min=pin_min, pin_mode=pin_mode)
-        st.session_state["pin_full_df"] = pd.DataFrame(rows)
+        st.session_state["pin_full_df"] = _add_signal_time_columns(pd.DataFrame(rows), "PIN SIGNAL")
         st.session_state["pin_full_errors"] = errors
         st.session_state["pin_full_stats"] = stats
         st.session_state["pin_full_time"] = _generated_timestamp()
@@ -3563,6 +3557,8 @@ def _show_pin_full_scan_tab(fyers, all_symbols, fo_symbols):
 
     df = st.session_state.get("pin_full_df")
     if df is not None and not df.empty:
+        df = _add_signal_time_columns(df, "PIN SIGNAL")
+        st.session_state["pin_full_df"] = df
         buy_n = int(df.get("PIN SIGNAL", pd.Series(dtype=str)).astype(str).str.contains("BUY", na=False).sum())
         sell_n = int(df.get("PIN SIGNAL", pd.Series(dtype=str)).astype(str).str.contains("SELL", na=False).sum())
         sweep_n = int((df.get("SWEEP", pd.Series(dtype=str)).astype(str) != "NONE").sum()) if "SWEEP" in df.columns else 0
@@ -3605,7 +3601,7 @@ def _show_amd_scan_tab(fyers, all_symbols, fo_symbols):
     if st.button(f"🧠 RUN AMD SCANNER ({len(scan_pairs):,} STOCKS)", key="amd_run", type="primary", use_container_width=True):
         with st.spinner(f"Running AMD scanner on {len(scan_pairs):,} stocks…"):
             rows, errors, stats = _run_amd_scan(fyers, scan_pairs)
-        st.session_state["amd_df"] = pd.DataFrame(rows)
+        st.session_state["amd_df"] = _add_signal_time_columns(pd.DataFrame(rows), "AMD SIGNAL")
         st.session_state["amd_errors"] = errors
         st.session_state["amd_stats"] = stats
         st.session_state["amd_time"] = _generated_timestamp()
@@ -3616,6 +3612,8 @@ def _show_amd_scan_tab(fyers, all_symbols, fo_symbols):
 
     df = st.session_state.get("amd_df")
     if df is not None and not df.empty:
+        df = _add_signal_time_columns(df, "AMD SIGNAL")
+        st.session_state["amd_df"] = df
         out = df.copy()
         phase = out.get("AMD PHASE", pd.Series("", index=out.index)).astype(str)
         sig = out.get("AMD SIGNAL", pd.Series("", index=out.index)).astype(str)
@@ -3640,6 +3638,7 @@ def _show_amd_scan_tab(fyers, all_symbols, fo_symbols):
         if manip_n:
             st.info(f"🟠 MANIPULATION / SWEEP: {manip_n}")
 
+        st.caption(f"📄 AMD REPORT: {len(out)} rows shown")
         st.dataframe(out, use_container_width=True, height=550)
         _excel_download_button(out, "AMD_SCAN", "amd_excel", label="📥 DOWNLOAD AMD EXCEL")
     elif "amd_stats" in st.session_state:
@@ -3715,7 +3714,7 @@ def show_scanner(fyers) -> None:
         if st.button(f"🔍 SCAN NSE ({len(nse_universe)} stocks)", key="nse_run"):
             with st.spinner("Analyzing NSE stocks…"):
                 nse_results, nse_errors, nse_stats = run_nse_scan(fyers, nse_universe)
-                st.session_state["nse_df"] = _add_signal_time_columns(pd.DataFrame(nse_results) if nse_results else pd.DataFrame())
+                st.session_state["nse_df"] = pd.DataFrame(nse_results) if nse_results else pd.DataFrame()
                 st.session_state["nse_errors"] = nse_errors
                 st.session_state["nse_stats"] = nse_stats
         
@@ -3724,6 +3723,8 @@ def show_scanner(fyers) -> None:
         
         nse_df = st.session_state.get("nse_df")
         if nse_df is not None and not nse_df.empty:
+            nse_df = _add_signal_time_columns(nse_df, "AI SIGNAL")
+            st.session_state["nse_df"] = nse_df
             try:
                 st.info(f"📊 Loaded: {len(nse_df)} signals")
                 
@@ -3765,6 +3766,7 @@ def show_scanner(fyers) -> None:
                 except:
                     pass
                 
+                st.caption(f"📄 NSE REPORT: {len(nse_filtered)} rows shown")
                 st.dataframe(nse_filtered, use_container_width=True, height=500)
                 
                 st.markdown("### 📥 Download")
@@ -3826,7 +3828,7 @@ def show_scanner(fyers) -> None:
                 try:
                     fo_results, fo_errors, fo_stats = run_fo_scan(fyers, fo_universe)
                     st.session_state["fo_df"] = (
-                        _add_signal_time_columns(pd.DataFrame(fo_results) if fo_results else pd.DataFrame())
+                        pd.DataFrame(fo_results) if fo_results else pd.DataFrame()
                     )
                     st.session_state["fo_errors"] = fo_errors or []
                     st.session_state["fo_stats"] = fo_stats
@@ -3840,6 +3842,8 @@ def show_scanner(fyers) -> None:
         
         fo_df = st.session_state.get("fo_df")
         if fo_df is not None and not fo_df.empty:
+            fo_df = _add_signal_time_columns(fo_df, "AI SIGNAL")
+            st.session_state["fo_df"] = fo_df
             try:
                 st.info(f"📊 Loaded: {len(fo_df)} signals")
                 
@@ -3888,6 +3892,7 @@ def show_scanner(fyers) -> None:
                 except:
                     pass
                 
+                st.caption(f"📄 F&O REPORT: {len(fo_filtered)} rows shown")
                 st.dataframe(fo_filtered, use_container_width=True, height=500)
                 
                 st.markdown("### 📥 Download")
@@ -4016,11 +4021,13 @@ def show_scanner(fyers) -> None:
                     intraday_results, _, _ = run_fo_scan(fyers, intraday_symbols)
                 
                 if intraday_results:
-                    intraday_df = pd.DataFrame(intraday_results)
+                    intraday_df = _add_signal_time_columns(pd.DataFrame(intraday_results), "AI SIGNAL")
                     st.session_state["intraday_df"] = intraday_df
         
         intraday_df = st.session_state.get("intraday_df")
         if intraday_df is not None and not intraday_df.empty:
+            intraday_df = _add_signal_time_columns(intraday_df, "AI SIGNAL")
+            st.session_state["intraday_df"] = intraday_df
             st.success(f"✅ Live data: {len(intraday_df)} stocks")
             
             col_if1, col_if2, col_if3 = st.columns(3)
@@ -4030,7 +4037,7 @@ def show_scanner(fyers) -> None:
                 intraday_signal_filter = st.selectbox("Signal", ["ALL", "BUY", "SELL"], key="intraday_sig_filter")
             with col_if3:
                 intraday_show_cols = st.multiselect("Show Columns", intraday_df.columns, 
-                                                   default=["Symbol", "LTP", "AI SIGNAL", "AI CONFIDENCE %", "SIGNAL TIME", "LAST SEEN", "SIGNAL AGE", "RVOL", "🟢 BUY PRESSURE %", "🔴 SELL PRESSURE %"],
+                                                   default=[c for c in ["Symbol", "LTP", "AI SIGNAL", "AI CONFIDENCE %", "SIGNAL TIME", "LAST SEEN", "SIGNAL AGE", "RVOL", "🟢 BUY PRESSURE %", "🔴 SELL PRESSURE %"] if c in intraday_df.columns],
                                                    key="intraday_cols")
             
             intraday_filtered = intraday_df.copy()
@@ -4078,12 +4085,12 @@ def show_scanner(fyers) -> None:
                 universe = strong_universe_all if strong_limit == 0 else strong_universe_all[:strong_limit]
                 if strong_source == "NSE Stocks":
                     r, e, s = run_nse_scan(fyers, universe)
-                    st.session_state["nse_df"] = _add_signal_time_columns(pd.DataFrame(r) if r else pd.DataFrame())
+                    st.session_state["nse_df"] = _add_signal_time_columns(pd.DataFrame(r), "AI SIGNAL") if r else pd.DataFrame()
                     st.session_state["nse_errors"] = e
                     st.session_state["nse_stats"] = s
                 else:
                     r, e, s = run_fo_scan(fyers, universe)
-                    st.session_state["fo_df"] = _add_signal_time_columns(pd.DataFrame(r) if r else pd.DataFrame())
+                    st.session_state["fo_df"] = _add_signal_time_columns(pd.DataFrame(r), "AI SIGNAL") if r else pd.DataFrame()
                     st.session_state["fo_errors"] = e
                     st.session_state["fo_stats"] = s
 
@@ -4374,12 +4381,12 @@ def show_scanner(fyers) -> None:
                 universe = dash_universe_all if dash_limit == 0 else dash_universe_all[:dash_limit]
                 if dashboard_source == "NSE Stocks":
                     r, e, s = run_nse_scan(fyers, universe)
-                    st.session_state["nse_df"] = _add_signal_time_columns(pd.DataFrame(r) if r else pd.DataFrame())
+                    st.session_state["nse_df"] = _add_signal_time_columns(pd.DataFrame(r), "AI SIGNAL") if r else pd.DataFrame()
                     st.session_state["nse_errors"] = e
                     st.session_state["nse_stats"] = s
                 else:
                     r, e, s = run_fo_scan(fyers, universe)
-                    st.session_state["fo_df"] = _add_signal_time_columns(pd.DataFrame(r) if r else pd.DataFrame())
+                    st.session_state["fo_df"] = _add_signal_time_columns(pd.DataFrame(r), "AI SIGNAL") if r else pd.DataFrame()
                     st.session_state["fo_errors"] = e
                     st.session_state["fo_stats"] = s
 
