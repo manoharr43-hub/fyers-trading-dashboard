@@ -206,10 +206,13 @@ except ImportError:
 DATE_FROM = (datetime.today() - timedelta(days=365)).strftime("%Y-%m-%d")
 DATE_TO = datetime.today().strftime("%Y-%m-%d")
 FYERS_NSE_CM_SYMBOL_MASTER = "https://public.fyers.in/sym_details/NSE_CM.csv"
+FYERS_NSE_FO_SYMBOL_MASTER = "https://public.fyers.in/sym_details/NSE_FO.csv"
+SYMBOL_CACHE_FILE = os.path.join("logs", "symbol_master_cache.json")
+SYMBOL_HTTP_TIMEOUT = 10
 NIFTY_BENCHMARK_SYMBOL = "NSE:NIFTY50-INDEX"
-MAX_WORKERS = 8
-BATCH_SIZE = 50
-BATCH_PAUSE_SECONDS = 1.0
+MAX_WORKERS = 10
+BATCH_SIZE = 80
+BATCH_PAUSE_SECONDS = 0.25
 DEFAULT_SCAN_STOCKS = 2300
 FYERS_APP_ID = os.environ.get("FYERS_APP_ID", "")
 OPTIONS_STRIKE_COUNT = 10
@@ -422,6 +425,218 @@ def calculate_buying_selling_pressure(df) -> Dict[str, Any]:
         "pressure_ratio": round(pressure_ratio, 2) if pressure_ratio != float('inf') else 0,
         "trend": trend
     }
+
+# ════════════════════════════════════════════════════════════════════════════════
+# AMD — ACCUMULATION / MANIPULATION / DISTRIBUTION ENGINE
+# Rule-based inference from completed OHLCV candles.
+# IMPORTANT: this is a market-structure/volume heuristic, not proof of intent.
+# ════════════════════════════════════════════════════════════════════════════════
+AMD_LOOKBACK = 24
+AMD_MIN_BARS = 30
+AMD_RANGE_MAX_PCT = 3.0
+AMD_RVOL_HIGH = 1.50
+AMD_RVOL_EXTREME = 2.00
+AMD_SWEEP_TOL_PCT = 0.15
+AMD_MIN_SIGNAL_SCORE = 65.0
+
+
+def calculate_amd_signal(df_5m: pd.DataFrame, df_15m: Optional[pd.DataFrame] = None) -> Dict[str, Any]:
+    """Detect Accumulation / Manipulation / Distribution from completed candles.
+
+    Accumulation: tight range + relatively strong/steady volume + bullish acceptance.
+    Manipulation: sweep of a recent high/low followed by rejection back inside range.
+    Distribution: high-volume weakness + bearish acceptance / range breakdown.
+
+    The result is an inference from OHLCV, not a claim about actual institutional intent.
+    """
+    out = {
+        "AMD PHASE": "NEUTRAL",
+        "AMD SIGNAL": "WAIT",
+        "AMD SCORE": 0.0,
+        "AMD BUY SCORE": 0.0,
+        "AMD SELL SCORE": 0.0,
+        "AMD CONFIDENCE %": 0.0,
+        "AMD RANGE HIGH": None,
+        "AMD RANGE LOW": None,
+        "AMD SWEEP": "NONE",
+        "AMD RVOL": 0.0,
+        "AMD REASON": "Insufficient completed 5M data",
+    }
+    if df_5m is None or len(df_5m) < AMD_MIN_BARS:
+        return out
+
+    try:
+        d = _completed_candles(df_5m, 5)
+        if d is None or len(d) < AMD_MIN_BARS:
+            out["AMD REASON"] = "Waiting for completed 5M candles"
+            return out
+
+        d = d.copy()
+        for col in ["Open", "High", "Low", "Close", "Volume"]:
+            d[col] = pd.to_numeric(d[col], errors="coerce")
+        d = d.dropna(subset=["Open", "High", "Low", "Close", "Volume"]).reset_index(drop=True)
+        if len(d) < AMD_MIN_BARS:
+            return out
+
+        last = d.iloc[-1]
+        o, h, l, c, v = [float(last[x]) for x in ["Open", "High", "Low", "Close", "Volume"]]
+        if min(o, h, l, c) <= 0:
+            out["AMD REASON"] = "Invalid price data"
+            return out
+
+        # Recent range excludes the current candle so the current candle can sweep it.
+        w = d.iloc[-AMD_LOOKBACK-1:-1]
+        range_high = float(w["High"].max())
+        range_low = float(w["Low"].min())
+        mid = (range_high + range_low) / 2.0
+        range_pct = ((range_high - range_low) / mid * 100.0) if mid > 0 else 999.0
+
+        atr_s = calculate_atr(d, 14)
+        atr = float(atr_s.iloc[-1]) if len(atr_s) and pd.notna(atr_s.iloc[-1]) else max(c * 0.005, 0.01)
+        base_vol = float(d["Volume"].iloc[-21:-1].mean()) if len(d) >= 22 else float(d["Volume"].iloc[:-1].mean())
+        rvol = v / base_vol if base_vol > 0 else 0.0
+
+        rng = max(h - l, 1e-9)
+        body = abs(c - o)
+        body_pct = body / rng * 100.0
+        close_pos = (c - l) / rng
+        upper_wick = h - max(o, c)
+        lower_wick = min(o, c) - l
+
+        # Sweep = price temporarily breaks a prior range extreme but closes back inside.
+        high_sweep = h > range_high * (1.0 + AMD_SWEEP_TOL_PCT / 100.0) and c < range_high
+        low_sweep = l < range_low * (1.0 - AMD_SWEEP_TOL_PCT / 100.0) and c > range_low
+        sweep = "HIGH SWEEP" if high_sweep else "LOW SWEEP" if low_sweep else "NONE"
+
+        # Recent directional acceptance.
+        recent = d.tail(5)
+        recent_change = (float(recent["Close"].iloc[-1]) - float(recent["Close"].iloc[0])) / float(recent["Close"].iloc[0]) * 100.0
+        above_mid = c > mid
+        below_mid = c < mid
+
+        # Volume behavior inside the prior range.
+        vol_recent = float(d["Volume"].iloc[-6:-1].mean()) if len(d) >= 7 else base_vol
+        volume_stable = (vol_recent / base_vol) if base_vol > 0 else 1.0
+
+        buy = 0.0
+        sell = 0.0
+        manipulation = 0.0
+        buy_reasons = []
+        sell_reasons = []
+        manip_reasons = []
+
+        # ACCUMULATION evidence
+        if range_pct <= AMD_RANGE_MAX_PCT:
+            buy += 25; buy_reasons.append(f"tight range {range_pct:.2f}%")
+        if rvol >= 1.10 and close_pos >= 0.55:
+            buy += 15; buy_reasons.append(f"volume acceptance {rvol:.2f}x")
+        if recent_change >= 0.20:
+            buy += 15; buy_reasons.append(f"recent +{recent_change:.2f}%")
+        if lower_wick > upper_wick * 1.20:
+            buy += 10; buy_reasons.append("lower-wick rejection")
+        if c >= mid:
+            buy += 10
+        if volume_stable >= 1.0:
+            buy += 5
+
+        # DISTRIBUTION evidence
+        if range_pct <= AMD_RANGE_MAX_PCT:
+            sell += 15
+        if rvol >= 1.10 and close_pos <= 0.45:
+            sell += 15; sell_reasons.append(f"selling volume {rvol:.2f}x")
+        if recent_change <= -0.20:
+            sell += 15; sell_reasons.append(f"recent {recent_change:.2f}%")
+        if upper_wick > lower_wick * 1.20:
+            sell += 10; sell_reasons.append("upper-wick rejection")
+        if c <= mid:
+            sell += 10
+        if c < range_low:
+            sell += 20; sell_reasons.append("range breakdown")
+
+        # MANIPULATION / liquidity sweep evidence.
+        if high_sweep:
+            manipulation += 55
+            sell += 20
+            manip_reasons.append("high liquidity sweep + close back inside")
+            if rvol >= AMD_RVOL_HIGH:
+                manipulation += 15; manip_reasons.append(f"high RVOL {rvol:.2f}x")
+            if upper_wick >= max(body * 1.20, atr * 0.25):
+                manipulation += 15; manip_reasons.append("upper rejection")
+        elif low_sweep:
+            manipulation += 55
+            buy += 20
+            manip_reasons.append("low liquidity sweep + close back inside")
+            if rvol >= AMD_RVOL_HIGH:
+                manipulation += 15; manip_reasons.append(f"high RVOL {rvol:.2f}x")
+            if lower_wick >= max(body * 1.20, atr * 0.25):
+                manipulation += 15; manip_reasons.append("lower rejection")
+
+        # 15M confirmation, when available.
+        tf15 = "NEUTRAL"
+        if df_15m is not None and len(df_15m) >= 10:
+            try:
+                p = df_15m.copy()
+                for col in ["Open", "Close"]:
+                    p[col] = pd.to_numeric(p[col], errors="coerce")
+                p = p.dropna(subset=["Open", "Close"])
+                if len(p) >= 5:
+                    pchg = (float(p["Close"].iloc[-1]) - float(p["Close"].iloc[-4])) / float(p["Close"].iloc[-4]) * 100.0
+                    tf15 = "BULLISH" if pchg > 0.25 else "BEARISH" if pchg < -0.25 else "NEUTRAL"
+                    if tf15 == "BULLISH": buy += 5
+                    elif tf15 == "BEARISH": sell += 5
+            except Exception:
+                tf15 = "NEUTRAL"
+
+        buy = min(100.0, buy)
+        sell = min(100.0, sell)
+        manipulation = min(100.0, manipulation)
+
+        # Priority: a confirmed sweep is classified as manipulation; otherwise compare A vs D.
+        if manipulation >= 65 and sweep != "NONE":
+            phase = "MANIPULATION"
+            if sweep == "LOW SWEEP" and buy >= sell:
+                signal = "🟢 AMD BUY AFTER SWEEP"
+            elif sweep == "HIGH SWEEP" and sell >= buy:
+                signal = "🔴 AMD SELL AFTER SWEEP"
+            else:
+                signal = "🟠 AMD SWEEP — WAIT"
+            score = manipulation
+            reason = " + ".join(manip_reasons) or sweep
+        elif buy >= 65 and buy > sell + 8:
+            phase = "ACCUMULATION"
+            signal = "🟢 AMD ACCUMULATION BUY WATCH"
+            score = buy
+            reason = " + ".join(buy_reasons) or "Bullish accumulation evidence"
+        elif sell >= 65 and sell > buy + 8:
+            phase = "DISTRIBUTION"
+            signal = "🔴 AMD DISTRIBUTION SELL WATCH"
+            score = sell
+            reason = " + ".join(sell_reasons) or "Bearish distribution evidence"
+        else:
+            phase = "TRANSITION" if max(buy, sell, manipulation) >= 50 else "NEUTRAL"
+            signal = "🟡 AMD TRANSITION — WAIT" if phase == "TRANSITION" else "⚪ AMD WAIT"
+            score = max(buy, sell, manipulation)
+            reason = "Mixed AMD evidence"
+
+        confidence = min(100.0, round(max(0.0, score * 0.85), 1))
+        out.update({
+            "AMD PHASE": phase,
+            "AMD SIGNAL": signal,
+            "AMD SCORE": round(score, 1),
+            "AMD BUY SCORE": round(buy, 1),
+            "AMD SELL SCORE": round(sell, 1),
+            "AMD CONFIDENCE %": confidence,
+            "AMD RANGE HIGH": round(range_high, 2),
+            "AMD RANGE LOW": round(range_low, 2),
+            "AMD SWEEP": sweep,
+            "AMD RVOL": round(rvol, 2),
+            "AMD REASON": f"{reason} | 15M {tf15}",
+        })
+        return out
+    except Exception as e:
+        out["AMD REASON"] = f"AMD error: {type(e).__name__}"
+        return out
+
 
 # ════════════════════════════════════════════════════════════════════════════════
 # LIVE CANDLE / FRESHNESS SAFETY HELPERS
@@ -1115,179 +1330,184 @@ def _validate_symbols(symbols) -> List[str]:
         valid.append(s)
     return valid
 
-@st.cache_data(ttl=60 * 60 * 12)
+@st.cache_data(ttl=60 * 60 * 12, show_spinner=False)
 def load_nse_equity_symbols() -> List[str]:
-    try:
-        resp = requests.get(FYERS_NSE_CM_SYMBOL_MASTER, timeout=20)
-        resp.raise_for_status()
-    except Exception as e:
-        st.error(f"Could not download Fyers symbol master: {e}")
-        return []
-    lines = [ln for ln in resp.text.strip().split("\n") if ln.strip()]
-    if not lines:
-        return []
-    sample = lines[:min(500, len(lines))]
-    split_sample = [ln.split(",") for ln in sample]
-    max_cols = max((len(p) for p in split_sample), default=0)
-    best_col, best_hits = None, 0
-    for col_idx in range(max_cols):
-        hits = sum(1 for parts in split_sample if len(parts) > col_idx and parts[col_idx].strip().startswith("NSE:") and parts[col_idx].strip().endswith("-EQ"))
-        if hits > best_hits:
-            best_col, best_hits = col_idx, hits
-    if best_col is None or best_hits == 0:
-        st.error("Could not locate trading-symbol column.")
-        return []
-    symbols = []
-    for line in lines:
-        parts = line.split(",")
-        if len(parts) <= best_col:
-            continue
-        sym = parts[best_col].strip()
-        if sym.startswith("NSE:") and sym.endswith("-EQ"):
-            symbols.append(sym)
-    return sorted(set(_validate_symbols(symbols)))
+    """Fast/reliable NSE symbol loader with disk fallback.
 
-@st.cache_data(ttl=60 * 60 * 12)
-def load_fo_stocks() -> List[str]:
-    """Load NSE equity symbols that have active equity-derivative contracts."""
-    try:
-        cm_symbols = set(load_nse_equity_symbols())
-        if not cm_symbols:
-            return []
-
-        urls = [
-            "https://public.fyers.in/sym_details/NSE_FO.csv",
-            "http://public.fyers.in/sym_details/NSE_FO.csv",
-        ]
-        text = None
-        last_error = None
-        for url in urls:
-            try:
-                r = requests.get(
-                    url,
-                    timeout=30,
-                    headers={"User-Agent": "Mozilla/5.0", "Accept": "text/csv,*/*"},
-                )
-                r.raise_for_status()
-                if r.text and len(r.text) > 100:
-                    text = r.text
-                    break
-            except Exception as exc:
-                last_error = exc
-
-        if not text:
-            logging.warning("F&O symbol master unavailable: %s", last_error)
-            return []
-
-        fo_underlyings = set()
-        reader = csv.reader(io.StringIO(text))
-        for row in reader:
-            if len(row) < 14:
-                continue
-
-            short_sym = str(row[13]).strip().upper()
-            contract_symbol = str(row[9]).strip().upper() if len(row) > 9 else ""
-            exchange = str(row[10]).strip() if len(row) > 10 else ""
-
-            if exchange not in {"10", "NSE"}:
-                continue
-            if not short_sym or short_sym in {"NONE", "NAN"}:
-                continue
-
-            if contract_symbol.startswith("NSE:") and short_sym:
-                candidate = f"NSE:{short_sym}-EQ"
-                if candidate in cm_symbols:
-                    fo_underlyings.add(candidate)
-
-        result = sorted(fo_underlyings)
-        logging.info("Loaded %d NSE F&O equity underlyings", len(result))
-        return result
-
-    except Exception as e:
-        logging.exception("F&O symbol loading failed: %s", e)
-        return []
-
-# ════════════════════════════════════════════════════════════════════════════════
-# SAFE HISTORY FETCH (RETAINED)
-# ════════════════════════════════════════════════════════════════════════════════
-_HISTORY_MAX_RETRIES = 3
-_HISTORY_BASE_DELAY_SECONDS = 1.0
-
-def _safe_history(fyers, params: dict, max_retries: int = _HISTORY_MAX_RETRIES, base_delay: float = _HISTORY_BASE_DELAY_SECONDS):
-    symbol = params.get("symbol", "UNKNOWN")
-    last_err = "unknown error"
-    for attempt in range(1, max_retries + 1):
+    Network failure must not leave the whole Streamlit app stuck on Loading.
+    The last known-good symbol list is reused when FYERS symbol-master is
+    temporarily unavailable.
+    """
+    def read_cache() -> List[str]:
         try:
-            resp = fyers.history(params)
-        except requests.exceptions.Timeout:
-            last_err = "timeout"
-        except requests.exceptions.ConnectionError:
-            last_err = "network error"
-        except requests.exceptions.RequestException as e:
-            last_err = f"request error: {e}"
-        except (ValueError, TypeError) as e:
-            last_err = f"invalid response: {e}"
+            if os.path.exists(SYMBOL_CACHE_FILE):
+                with open(SYMBOL_CACHE_FILE, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                return _validate_symbols(data.get("nse", [])) if isinstance(data, dict) else []
         except Exception as e:
-            last_err = f"unexpected error: {e}"
-        else:
-            if not isinstance(resp, dict):
-                last_err = "empty/invalid response"
-            else:
-                status = resp.get("s")
-                if status == "ok":
-                    candles = resp.get("candles")
-                    if not isinstance(candles, list):
-                        last_err = "malformed candle data"
-                    else:
-                        return resp, None
-                else:
-                    message = str(resp.get("message", status or "unknown"))
-                    if "rate" in message.lower() or "limit" in message.lower():
-                        last_err = f"rate limited: {message}"
-                        time.sleep(base_delay * attempt * 2)
-                        continue
-                    return None, message
-        if attempt < max_retries:
-            time.sleep(base_delay * attempt)
-    return None, f"{symbol}: {last_err} (after {max_retries} attempts)"
+            logger.warning("NSE symbol cache read failed: %s", e)
+        return []
 
-# ════════════════════════════════════════════════════════════════════════════════
-# SCAN STATS (ORIGINAL)
-# ════════════════════════════════════════════════════════════════════════════════
-class ScanStats:
-    def __init__(self, total: int):
-        self.total = total
-        self.scanned = 0
-        self.successful = 0
-        self.skipped = 0
-        self.failed = 0
-        self._start = time.time()
+    try:
+        r = requests.get(
+            FYERS_NSE_CM_SYMBOL_MASTER,
+            timeout=(4, SYMBOL_HTTP_TIMEOUT),
+            headers={"User-Agent": "NSE-AI-PRO/17", "Accept": "text/csv,*/*"},
+        )
+        r.raise_for_status()
+        text = r.text or ""
+        if len(text) < 100:
+            raise ValueError("empty symbol master")
 
-    def record(self, has_result: bool, has_error: bool) -> None:
-        self.scanned += 1
-        if has_result:
-            self.successful += 1
-        elif has_error:
-            self.failed += 1
-        else:
-            self.skipped += 1
+        reader = csv.reader(io.StringIO(text))
+        rows = list(reader)
+        # Find the actual symbol column instead of assuming a fixed CSV index.
+        best_col, best_hits = None, 0
+        for col_idx in range(max((len(row) for row in rows[:500]), default=0)):
+            hits = sum(
+                1 for row in rows[:500]
+                if len(row) > col_idx
+                and row[col_idx].strip().upper().startswith("NSE:")
+                and row[col_idx].strip().upper().endswith("-EQ")
+            )
+            if hits > best_hits:
+                best_col, best_hits = col_idx, hits
+        if best_col is None or best_hits == 0:
+            raise ValueError("trading-symbol column not found")
 
-    @property
-    def elapsed_seconds(self) -> float:
-        return time.time() - self._start
+        symbols = []
+        for row in rows:
+            if len(row) <= best_col:
+                continue
+            sym = row[best_col].strip().upper()
+            if _VALID_EQ_SYMBOL_RE.match(sym):
+                symbols.append(sym)
+        symbols = sorted(set(_validate_symbols(symbols)))
+        if not symbols:
+            raise ValueError("no valid NSE equity symbols found")
 
-def _display_scan_summary(stats: "ScanStats") -> None:
-    c1, c2, c3, c4, c5, c6 = st.columns(6)
-    c1.metric("Total Stocks", stats.total)
-    c2.metric("Scanned", stats.scanned)
-    c3.metric("Successful", stats.successful)
-    c4.metric("Skipped", stats.skipped)
-    c5.metric("Failed", stats.failed)
-    c6.metric("Scan Time", f"{stats.elapsed_seconds:.1f}s")
+        try:
+            os.makedirs(os.path.dirname(SYMBOL_CACHE_FILE) or ".", exist_ok=True)
+            with open(SYMBOL_CACHE_FILE, "w", encoding="utf-8") as f:
+                json.dump({"saved_at": _now_ist().isoformat(), "nse": symbols}, f)
+        except Exception as e:
+            logger.warning("NSE symbol cache write failed: %s", e)
+        return symbols
+    except Exception as e:
+        cached = read_cache()
+        if cached:
+            logger.warning("Using cached NSE symbols after master download failure: %s", e)
+            return cached
+        logger.error("NSE symbol master unavailable: %s", e)
+        return []
 
-# ════════════════════════════════════════════════════════════════════════════════
-# TIMEFRAME DATA FETCHER (NEW)
-# ════════════════════════════════════════════════════════════════════════════════
+
+@st.cache_data(ttl=60 * 60 * 12, show_spinner=False)
+def load_fo_stocks() -> List[str]:
+    """Load NSE equity underlyings that currently have NSE-F&O contracts.
+
+    Uses the current FYERS JSON master first, then CSV fallback, then the
+    last-known-good local cache. This avoids fixed-column assumptions.
+    """
+    def save_cache(symbols):
+        try:
+            os.makedirs(os.path.dirname(SYMBOL_CACHE_FILE) or ".", exist_ok=True)
+            with open(SYMBOL_CACHE_FILE, "r+" if os.path.exists(SYMBOL_CACHE_FILE) else "w", encoding="utf-8") as f:
+                data = {}
+                try:
+                    data = json.load(f) if f.tell() == 0 else {}
+                except Exception:
+                    data = {}
+                data["saved_at"] = _now_ist().isoformat()
+                data["nse_fo"] = symbols
+                f.seek(0); json.dump(data, f); f.truncate()
+        except Exception as e:
+            logger.warning("F&O symbol cache write failed: %s", e)
+
+    def read_cache():
+        try:
+            if os.path.exists(SYMBOL_CACHE_FILE):
+                with open(SYMBOL_CACHE_FILE, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                return _validate_symbols(data.get("nse_fo", [])) if isinstance(data, dict) else []
+        except Exception as e:
+            logger.warning("F&O symbol cache read failed: %s", e)
+        return []
+
+    cm_symbols = set(load_nse_equity_symbols())
+    if not cm_symbols:
+        return read_cache()
+
+    # Preferred: current FYERS JSON symbol master.
+    try:
+        r = requests.get(
+            "https://public.fyers.in/sym_details/NSE_FO_sym_master.json",
+            timeout=(4, SYMBOL_HTTP_TIMEOUT),
+            headers={"User-Agent": "NSE-AI-PRO/17", "Accept": "application/json,*/*"},
+        )
+        r.raise_for_status()
+        payload = r.json()
+        records = payload.values() if isinstance(payload, dict) else (payload if isinstance(payload, list) else [])
+        result = set()
+        for rec in records:
+            if not isinstance(rec, dict):
+                continue
+            ex = str(rec.get("exchange", "")).upper()
+            seg = str(rec.get("segment", "")).upper()
+            if ex not in {"10", "NSE"} or (seg and seg not in {"11", "FO"}):
+                continue
+            under = rec.get("underExSymbol") or rec.get("underlyingSymbol")
+            if not under:
+                ticker = str(rec.get("symTicker") or rec.get("exSymbol") or "").upper()
+                m = re.match(r"NSE:([A-Z0-9&\-]+?)(?:\d{2}[A-Z]{1,3}|\d{6,8}|FUT|\d+(?:\.\d+)?(?:CE|PE))", ticker)
+                if m:
+                    under = m.group(1)
+            if not under:
+                continue
+            under = str(under).strip().upper()
+            candidate = under if under.startswith("NSE:") else f"NSE:{under}"
+            if not candidate.endswith("-EQ"):
+                candidate += "-EQ"
+            if candidate in cm_symbols:
+                result.add(candidate)
+        result = sorted(result)
+        if result:
+            save_cache(result)
+            logger.info("Loaded %d NSE F&O underlyings from JSON", len(result))
+            return result
+        raise ValueError("JSON master returned zero F&O underlyings")
+    except Exception as e:
+        logger.warning("F&O JSON master failed: %s", e)
+
+    # CSV fallback: scan every field for a ticker that exists in NSE CM.
+    try:
+        r = requests.get(
+            FYERS_NSE_FO_SYMBOL_MASTER, timeout=(4, SYMBOL_HTTP_TIMEOUT),
+            headers={"User-Agent": "Mozilla/5.0", "Accept": "text/csv,*/*"},
+        )
+        r.raise_for_status()
+        result = set()
+        for row in csv.reader(io.StringIO(r.text or "")):
+            for value in row:
+                x = str(value).strip().upper()
+                if x.startswith("NSE:") and x.endswith("-EQ") and x in cm_symbols:
+                    result.add(x)
+                elif re.fullmatch(r"[A-Z0-9&\-]{2,30}", x) and f"NSE:{x}-EQ" in cm_symbols:
+                    result.add(f"NSE:{x}-EQ")
+        result = sorted(result)
+        if result:
+            save_cache(result)
+            logger.info("Loaded %d NSE F&O underlyings from CSV", len(result))
+            return result
+        raise ValueError("CSV master returned zero F&O underlyings")
+    except Exception as e:
+        cached = read_cache()
+        if cached:
+            logger.warning("Using cached F&O symbols: %s", e)
+            return cached
+        logger.error("F&O symbol master unavailable: %s", e)
+        return []
+
 def _fetch_timeframe_data(fyers, symbol, resolution: str, lookback_days: int = 30) -> Optional[pd.DataFrame]:
     """Fetch OHLCV data for a specific timeframe."""
     date_from = (datetime.today() - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
@@ -2329,6 +2549,7 @@ def _fetch_nse_signal(fyers, symbol: str):
         data_5m = analysis_5m.get("data") if analysis_5m.get("status") == "OK" else {}
         data_15m = analysis_15m.get("data") if analysis_15m.get("status") == "OK" else {}
         data_1h = analysis_1h.get("data") if analysis_1h.get("status") == "OK" else {}
+        amd = calculate_amd_signal(analysis_5m.get("df"), analysis_15m.get("df"))
         
         return {
             "Symbol": stock_ticker,
@@ -2359,6 +2580,17 @@ def _fetch_nse_signal(fyers, symbol: str):
             "🟢 BUY PRESSURE %": data_5m.get("buying_pressure", "N/A"),
             "🔴 SELL PRESSURE %": data_5m.get("selling_pressure", "N/A"),
             "PRESSURE SIGNAL": data_5m.get("pressure_trend", "N/A"),
+            "AMD PHASE": amd.get("AMD PHASE", "NEUTRAL"),
+            "AMD SIGNAL": amd.get("AMD SIGNAL", "WAIT"),
+            "AMD SCORE": amd.get("AMD SCORE", 0),
+            "AMD BUY SCORE": amd.get("AMD BUY SCORE", 0),
+            "AMD SELL SCORE": amd.get("AMD SELL SCORE", 0),
+            "AMD CONFIDENCE %": amd.get("AMD CONFIDENCE %", 0),
+            "AMD SWEEP": amd.get("AMD SWEEP", "NONE"),
+            "AMD RANGE HIGH": amd.get("AMD RANGE HIGH"),
+            "AMD RANGE LOW": amd.get("AMD RANGE LOW"),
+            "AMD RVOL": amd.get("AMD RVOL", 0),
+            "AMD REASON": amd.get("AMD REASON", ""),
             "NEXT CANDLE BIAS": next_bias.get("bias", "NEUTRAL"),
             "NEXT CANDLE CONFIDENCE %": next_bias.get("confidence", 0.0),
             "AI SIGNAL": master["final_signal"],
@@ -2413,6 +2645,7 @@ def _fetch_fo_signal(fyers, symbol: str):
         data_5m = analysis_5m.get("data") if analysis_5m.get("status") == "OK" else {}
         data_15m = analysis_15m.get("data") if analysis_15m.get("status") == "OK" else {}
         data_1h = analysis_1h.get("data") if analysis_1h.get("status") == "OK" else {}
+        amd = calculate_amd_signal(analysis_5m.get("df"), analysis_15m.get("df"))
         
         return {
             "Symbol": stock_ticker,
@@ -2443,6 +2676,17 @@ def _fetch_fo_signal(fyers, symbol: str):
             "🟢 BUY PRESSURE %": data_5m.get("buying_pressure", "N/A"),
             "🔴 SELL PRESSURE %": data_5m.get("selling_pressure", "N/A"),
             "PRESSURE SIGNAL": data_5m.get("pressure_trend", "N/A"),
+            "AMD PHASE": amd.get("AMD PHASE", "NEUTRAL"),
+            "AMD SIGNAL": amd.get("AMD SIGNAL", "WAIT"),
+            "AMD SCORE": amd.get("AMD SCORE", 0),
+            "AMD BUY SCORE": amd.get("AMD BUY SCORE", 0),
+            "AMD SELL SCORE": amd.get("AMD SELL SCORE", 0),
+            "AMD CONFIDENCE %": amd.get("AMD CONFIDENCE %", 0),
+            "AMD SWEEP": amd.get("AMD SWEEP", "NONE"),
+            "AMD RANGE HIGH": amd.get("AMD RANGE HIGH"),
+            "AMD RANGE LOW": amd.get("AMD RANGE LOW"),
+            "AMD RVOL": amd.get("AMD RVOL", 0),
+            "AMD REASON": amd.get("AMD REASON", ""),
             "NEXT CANDLE BIAS": next_bias.get("bias", "NEUTRAL"),
             "NEXT CANDLE CONFIDENCE %": next_bias.get("confidence", 0.0),
             "ATM STRIKE": round(options_data.get("atm_strike", 0), 2) if options_data.get("atm_strike") else "N/A",
@@ -3168,6 +3412,59 @@ def _fetch_momentum_signal(fyers, symbol: str, is_fo: bool = False):
 # ════════════════════════════════════════════════════════════════════════════════
 # THREADED SCAN FUNCTIONS
 # ════════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════════════
+# AMD STANDALONE SCANNER
+# ════════════════════════════════════════════════════════════════════════════════
+def _fetch_amd_signal(fyers, symbol: str, is_fo: bool = False):
+    """Fetch completed 5M/15M candles and calculate AMD independently."""
+    stock_ticker = symbol.replace("NSE:", "").replace("-EQ", "") if isinstance(symbol, str) else str(symbol)
+    if not isinstance(symbol, str) or not _VALID_EQ_SYMBOL_RE.match(symbol):
+        return None, f"{symbol}: invalid format"
+    try:
+        a5 = analyze_timeframe(fyers, symbol, "5")
+        a15 = analyze_timeframe(fyers, symbol, "15")
+        if a5.get("status") != "OK" or a5.get("df") is None:
+            return None, None
+        amd = calculate_amd_signal(a5.get("df"), a15.get("df") if a15.get("status") == "OK" else None)
+        if amd.get("AMD SCORE", 0) <= 0:
+            return None, None
+        ltp = a5.get("data", {}).get("last_close") if a5.get("data") else None
+        result = {"Symbol": stock_ticker, "LTP": round(float(ltp), 2) if ltp is not None else "N/A", **amd}
+        return result, None
+    except Exception as e:
+        logger.exception("AMD worker failed for %s", symbol)
+        return None, f"{symbol}: error ({type(e).__name__}: {str(e)[:120]})"
+
+
+def run_amd_scan(fyers, symbols, is_fo: bool = False):
+    """Threaded standalone AMD scan. Does not require NSE/F&O scanner first."""
+    symbols = _validate_symbols(symbols)
+    results, errors = [], []
+    total = len(symbols)
+    progress = st.progress(0.0, text=f"Scanning AMD 0 / {total}")
+    done = 0
+    for i in range(0, total, BATCH_SIZE):
+        batch = symbols[i:i + BATCH_SIZE]
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            futures = {executor.submit(_fetch_amd_signal, fyers, s, is_fo): s for s in batch}
+            for future in as_completed(futures):
+                try:
+                    res, err = future.result()
+                except Exception as e:
+                    res, err = None, f"{futures[future]}: worker error"
+                if res:
+                    results.append(res)
+                if err:
+                    errors.append(err)
+                done += 1
+                progress.progress(done / max(total, 1), text=f"Scanning AMD {done} / {total}")
+        if i + BATCH_SIZE < total:
+            time.sleep(BATCH_PAUSE_SECONDS)
+    progress.empty()
+    gc.collect()
+    return results, errors
+
+
 def run_nse_scan(fyers, symbols):
     """Threaded scan for NSE stocks."""
     symbols = _validate_symbols(symbols)
@@ -4240,14 +4537,23 @@ def show_scanner(fyers) -> None:
     st.title("🚀 NSE AI PRO V17 — Professional Intraday + Swing Scanner")
     st.caption(f"🕒 Current Time (IST): {_now_ist().strftime('%d-%b-%Y %H:%M:%S')} IST | Multi-Timeframe + Momentum Engine")
     
-    try:
-        all_symbols = load_nse_equity_symbols()
-        fo_symbols = load_fo_stocks()
-        st.session_state["fo_symbols"] = fo_symbols
-    except Exception as e:
-        st.error(f"❌ Error loading symbols: {e}")
-        logger.error(f"Symbol loading error: {e}")
-        return
+    # Symbol masters are cached for 12h and also have a disk fallback.
+    # Keep the last successful lists in session state so Streamlit reruns do not
+    # repeatedly block the page while a remote CSV endpoint is slow.
+    all_symbols = st.session_state.get("all_symbols")
+    fo_symbols = st.session_state.get("fo_symbols")
+    if not all_symbols:
+        with st.spinner("Loading NSE symbol master…"):
+            all_symbols = load_nse_equity_symbols()
+        if all_symbols:
+            st.session_state["all_symbols"] = all_symbols
+    if not fo_symbols:
+        with st.spinner("Loading F&O symbol master…"):
+            fo_symbols = load_fo_stocks()
+        st.session_state["fo_symbols"] = fo_symbols or []
+
+    all_symbols = all_symbols or []
+    fo_symbols = fo_symbols or []
     
     if not all_symbols:
         st.error("❌ No symbols loaded — check FYERS API access.")
@@ -4266,7 +4572,8 @@ def show_scanner(fyers) -> None:
         "🧠 ADDITIONAL ANALYSIS",
         "📊 MARKET DASHBOARD",
         "⚙️ SETTINGS",
-        "📌 PIN RULES"
+        "📌 PIN RULES",
+        "🧩 AMD PHASE"
     ])
     
     # ════════════════════════════════════════════════════════════════════════════════
@@ -4413,6 +4720,8 @@ def show_scanner(fyers) -> None:
         
         if "fo_stats" in st.session_state:
             _display_scan_summary(st.session_state["fo_stats"])
+            if st.session_state.get("fo_errors") and st.session_state.get("fo_df", pd.DataFrame()).empty:
+                st.warning(f"⚠️ F&O scan returned 0 rows. First error: {st.session_state['fo_errors'][0]}")
         
         fo_df = st.session_state.get("fo_df")
         if fo_df is not None and not fo_df.empty:
@@ -4421,7 +4730,7 @@ def show_scanner(fyers) -> None:
                 
                 col_f1, col_f2, col_f3, col_f4 = st.columns(4)
                 with col_f1:
-                    fo_min_conf = st.slider("Min Confidence %", 0, 100, 70, step=5, key="fo_conf_filter")
+                    fo_min_conf = st.slider("Min Confidence %", 0, 100, 0, step=5, key="fo_conf_filter")
                 with col_f2:
                     fo_signal = st.selectbox("Signal", ["ALL", "BUY", "SELL", "STRONG ONLY"], key="fo_signal_filter")
                 with col_f3:
@@ -5031,6 +5340,79 @@ def show_scanner(fyers) -> None:
     with tabs[10]:
         _show_pin_rules_tab(fyers, all_symbols, fo_symbols)
     
+    # ════════════════════════════════════════════════════════════════════════════════
+    # TAB 11: AMD — ACCUMULATION / MANIPULATION / DISTRIBUTION
+    # Uses the same completed 5M + 15M data already collected by NSE/F&O scanners.
+    # ════════════════════════════════════════════════════════════════════════════════
+    with tabs[11]:
+        st.markdown("### 🧩 AMD — Accumulation / Manipulation / Distribution")
+        st.caption("Rule-based OHLCV inference: Accumulation → Manipulation/Sweep → Distribution. It is not proof of institutional intent.")
+
+        amd_source = st.radio("AMD Source", ["NSE Stocks", "F&O Stocks"], horizontal=True, key="amd_source")
+        amd_symbols = all_symbols if amd_source == "NSE Stocks" else fo_symbols
+
+        c_run1, c_run2 = st.columns([3, 1])
+        with c_run1:
+            amd_limit = st.number_input("AMD Scan Limit (0 = ALL)", min_value=0, max_value=len(amd_symbols), value=0, step=50, key="amd_limit")
+        with c_run2:
+            st.metric("Available", len(amd_symbols))
+        amd_universe = amd_symbols if amd_limit == 0 else amd_symbols[:amd_limit]
+
+        if st.button(f"🚀 RUN AMD SCAN ({len(amd_universe)} stocks)", key="amd_run", type="primary", use_container_width=True):
+            with st.spinner(f"Running AMD analysis on {len(amd_universe)} symbols…"):
+                amd_results, amd_errors = run_amd_scan(fyers, amd_universe, is_fo=(amd_source == "F&O Stocks"))
+                st.session_state["amd_df"] = pd.DataFrame(amd_results) if amd_results else pd.DataFrame()
+                st.session_state["amd_errors"] = amd_errors or []
+                st.session_state["amd_source_done"] = amd_source
+
+        amd_df = st.session_state.get("amd_df")
+        if amd_df is None or amd_df.empty:
+            st.info("👈 Select NSE/F&O and click RUN AMD SCAN.")
+        else:
+            phase_order = ["ACCUMULATION", "MANIPULATION", "DISTRIBUTION", "TRANSITION", "NEUTRAL"]
+            phase_counts = amd_df["AMD PHASE"].astype(str).value_counts()
+            c1, c2, c3, c4, c5 = st.columns(5)
+            c1.metric("🟢 ACCUMULATION", int(phase_counts.get("ACCUMULATION", 0)))
+            c2.metric("🟠 MANIPULATION", int(phase_counts.get("MANIPULATION", 0)))
+            c3.metric("🔴 DISTRIBUTION", int(phase_counts.get("DISTRIBUTION", 0)))
+            c4.metric("🟡 TRANSITION", int(phase_counts.get("TRANSITION", 0)))
+            c5.metric("⚪ NEUTRAL", int(phase_counts.get("NEUTRAL", 0)))
+
+            f1, f2, f3 = st.columns(3)
+            with f1:
+                amd_phase_filter = st.selectbox("Phase", ["ALL"] + phase_order, key="amd_phase_filter")
+            with f2:
+                amd_min_score = st.slider("Min AMD Score", 0, 100, 60, 5, key="amd_min_score")
+            with f3:
+                amd_show = st.selectbox("View", ["ALL", "ACTIONABLE ONLY", "SWEEPS ONLY"], key="amd_view")
+
+            view = amd_df.copy()
+            view["AMD SCORE NUM"] = pd.to_numeric(view["AMD SCORE"], errors="coerce").fillna(0)
+            view = view[view["AMD SCORE NUM"] >= amd_min_score]
+            if amd_phase_filter != "ALL":
+                view = view[view["AMD PHASE"].astype(str) == amd_phase_filter]
+            if amd_show == "ACTIONABLE ONLY":
+                view = view[view["AMD SIGNAL"].astype(str).str.contains("BUY|SELL", regex=True, na=False)]
+            elif amd_show == "SWEEPS ONLY":
+                view = view[view["AMD SWEEP"].astype(str) != "NONE"]
+
+            display_cols = [
+                "Symbol", "LTP", "AMD PHASE", "AMD SIGNAL", "AMD SCORE",
+                "AMD BUY SCORE", "AMD SELL SCORE", "AMD CONFIDENCE %", "AMD SWEEP",
+                "AMD RANGE HIGH", "AMD RANGE LOW", "AMD RVOL", "AMD REASON"
+            ]
+            display_cols = [c for c in display_cols if c in view.columns]
+            view = view.sort_values("AMD SCORE NUM", ascending=False).drop(columns=["AMD SCORE NUM"], errors="ignore")
+            st.dataframe(view[display_cols], use_container_width=True, height=520)
+
+            st.markdown("### 📥 AMD DOWNLOAD")
+            _excel_download_button(view[display_cols], "AMD_PHASE", "amd_phase_excel", label="📊 DOWNLOAD AMD EXCEL")
+
+            st.markdown("#### AMD interpretation")
+            st.write("🟢 Accumulation = range/volume evidence with bullish acceptance.  🟠 Manipulation = recent high/low sweep with rejection back inside.  🔴 Distribution = weakening acceptance/high-volume selling evidence.")
+            st.caption("Use AMD as confirmation with the existing AI signal, liquidity, MTF and risk controls; it should not be treated as a guaranteed direction predictor.")
+
+
     gc.collect()
 
 # ════════════════════════════════════════════════════════════════════════════════
