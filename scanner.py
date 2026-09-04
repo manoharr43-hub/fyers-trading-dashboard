@@ -3421,34 +3421,7 @@ def _fetch_amd_signal(fyers, symbol: str, is_fo: bool = False):
         if amd.get("AMD SCORE", 0) <= 0:
             return None, None
         ltp = a5.get("data", {}).get("last_close") if a5.get("data") else None
-        d5 = a5.get("data") or {}
-        d15 = a15.get("data") or {}
-        master = calculate_master_signal(symbol, a5, a15, a5)
-        next_bias = calculate_next_candle_bias(a5.get("df"), d5) if a5.get("df") is not None else {"bias": "NEUTRAL", "confidence": 0.0}
-
-        result = {
-            "Symbol": stock_ticker,
-            "LTP": round(float(ltp), 2) if ltp is not None else "N/A",
-            **amd,
-            "5M TREND": d5.get("structure_trend", "N/A"),
-            "15M TREND": d15.get("structure_trend", "N/A"),
-            "VWAP": round(float(d5.get("vwap")), 2) if d5.get("vwap") is not None else "N/A",
-            "RSI": round(float(d5.get("rsi", 50)), 1),
-            "MACD": "🟢" if d5.get("macd_bullish") else "🔴",
-            "RVOL CONFIRM": d5.get("rvol", amd.get("AMD RVOL", 0)),
-            "BUY PRESSURE %": d5.get("buying_pressure", "N/A"),
-            "SELL PRESSURE %": d5.get("selling_pressure", "N/A"),
-            "PRESSURE SIGNAL": d5.get("pressure_trend", "N/A"),
-            "NEXT CANDLE BIAS": next_bias.get("bias", "NEUTRAL"),
-            "NEXT CANDLE CONFIDENCE %": next_bias.get("confidence", 0.0),
-            "AI SIGNAL": master.get("final_signal", "N/A"),
-            "AI CONFIDENCE %": master.get("confidence", 0.0),
-            "ENTRY": master.get("entry", "N/A"),
-            "STOP LOSS": master.get("stop_loss", "N/A"),
-            "TARGET 1": master.get("target1", "N/A"),
-            "TARGET 2": master.get("target2", "N/A"),
-            "RISK:REWARD": master.get("rr_ratio", "N/A"),
-        }
+        result = {"Symbol": stock_ticker, "LTP": round(float(ltp), 2) if ltp is not None else "N/A", **amd}
         return result, None
     except Exception as e:
         logger.exception("AMD worker failed for %s", symbol)
@@ -5407,12 +5380,7 @@ def show_scanner(fyers) -> None:
             display_cols = [
                 "Symbol", "LTP", "AMD PHASE", "AMD SIGNAL", "AMD SCORE",
                 "AMD BUY SCORE", "AMD SELL SCORE", "AMD CONFIDENCE %", "AMD SWEEP",
-                "AMD RANGE HIGH", "AMD RANGE LOW", "AMD RVOL", "AMD REASON",
-                "5M TREND", "15M TREND", "VWAP", "RSI", "MACD",
-                "BUY PRESSURE %", "SELL PRESSURE %", "PRESSURE SIGNAL",
-                "NEXT CANDLE BIAS", "NEXT CANDLE CONFIDENCE %",
-                "AI SIGNAL", "AI CONFIDENCE %", "ENTRY", "STOP LOSS",
-                "TARGET 1", "TARGET 2", "RISK:REWARD"
+                "AMD RANGE HIGH", "AMD RANGE LOW", "AMD RVOL", "AMD REASON"
             ]
             display_cols = [c for c in display_cols if c in view.columns]
             view = view.sort_values("AMD SCORE NUM", ascending=False).drop(columns=["AMD SCORE NUM"], errors="ignore")
@@ -5420,18 +5388,6 @@ def show_scanner(fyers) -> None:
 
             st.markdown("### 📥 AMD DOWNLOAD")
             _excel_download_button(view[display_cols], "AMD_PHASE", "amd_phase_excel", label="📊 DOWNLOAD AMD EXCEL")
-
-            st.markdown("#### 📌 AMD + Confirmation Summary")
-            actionable = view[view["AMD SIGNAL"].astype(str).str.contains("BUY|SELL", regex=True, na=False)] if not view.empty else view
-            if not actionable.empty:
-                buy_count = int(actionable["AMD SIGNAL"].astype(str).str.contains("BUY", na=False).sum())
-                sell_count = int(actionable["AMD SIGNAL"].astype(str).str.contains("SELL", na=False).sum())
-                s1, s2, s3 = st.columns(3)
-                s1.metric("Actionable BUY", buy_count)
-                s2.metric("Actionable SELL", sell_count)
-                s3.metric("Rows Shown", len(view))
-            else:
-                st.info("No actionable AMD BUY/SELL rows match the current filters.")
 
             st.markdown("#### AMD interpretation")
             st.write("🟢 Accumulation = range/volume evidence with bullish acceptance.  🟠 Manipulation = recent high/low sweep with rejection back inside.  🔴 Distribution = weakening acceptance/high-volume selling evidence.")
