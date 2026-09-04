@@ -2814,6 +2814,30 @@ def run_momentum_scan(fyers, symbols, is_fo: bool = False):
 # Existing scanner logic is intentionally untouched. This tab runs only when used.
 # ════════════════════════════════════════════════════════════════════════════════
 # ════════════════════════════════════════════════════════════════════════════════
+# AMD SUPPORT HELPER — COMPLETED CANDLES
+# Added only for AMD/PIN modules; existing scanner logic is unchanged.
+def _completed_candles(df: pd.DataFrame, resolution_minutes: int = 5) -> pd.DataFrame:
+    """Return completed OHLCV candles only. Safe when Time is missing/invalid."""
+    if df is None or len(df) == 0:
+        return df
+    d = df.copy()
+    if "Time" not in d.columns:
+        return d.reset_index(drop=True)
+    try:
+        t = pd.to_datetime(d["Time"], errors="coerce", utc=True)
+        now_ist = _now_ist()
+        cutoff = pd.Timestamp(now_ist)
+        if cutoff.tzinfo is None:
+            cutoff = cutoff.tz_localize("Asia/Kolkata")
+        cutoff = cutoff.tz_convert("UTC")
+        mask = t.notna() & ((t + pd.Timedelta(minutes=resolution_minutes)) <= cutoff)
+        out = d.loc[mask].copy()
+        out["Time"] = t.loc[mask].values
+        return out.reset_index(drop=True)
+    except Exception:
+        return d.reset_index(drop=True)
+
+
 # AMD — ACCUMULATION / MANIPULATION / DISTRIBUTION ENGINE
 # Rule-based inference from completed OHLCV candles.
 # IMPORTANT: this is a market-structure/volume heuristic, not proof of intent.
@@ -3144,6 +3168,22 @@ def _show_pin_rules_tab(fyers) -> None:
     source_key = "nse_df" if source == "NSE Stocks" else "fo_df"
     base_df = st.session_state.get(source_key)
 
+    # PIN RULES can run independently. If the main NSE/F&O scanner has not
+    # been run yet, build candidates directly from the loaded symbol universe.
+    if base_df is None or base_df.empty:
+        raw_symbols = (
+            st.session_state.get("all_symbols", [])
+            if source == "NSE Stocks"
+            else st.session_state.get("fo_symbols", [])
+        )
+        if raw_symbols:
+            base_df = pd.DataFrame({
+                "Symbol": [str(x).replace("NSE:", "").replace("-EQ", "") for x in raw_symbols],
+                "LTP": ["N/A"] * len(raw_symbols),
+            })
+        else:
+            base_df = pd.DataFrame(columns=["Symbol", "LTP"])
+
     with st.expander("📖 PIN Rules", expanded=False):
         st.markdown("""
         **Liquidity:** confirmed Pivot High/Low → Equal High/Low → liquidity level.
@@ -3154,7 +3194,7 @@ def _show_pin_rules_tab(fyers) -> None:
         """)
 
     if base_df is None or base_df.empty:
-        st.info(f"👈 Run the {source} Scanner first, then open this tab.")
+        st.warning(f"⚠️ No {source} symbols are available. Check the symbol master.")
         return
 
     max_scan = min(PIN_MAX_SCAN, len(base_df))
@@ -3548,6 +3588,10 @@ def show_scanner(fyers) -> None:
     try:
         all_symbols = load_nse_equity_symbols()
         fo_symbols = load_fo_stocks()
+        # Keep universes available to independent PIN/AMD tabs without
+        # requiring the main scanner to be executed first.
+        st.session_state["all_symbols"] = all_symbols
+        st.session_state["fo_symbols"] = fo_symbols
     except Exception as e:
         st.error(f"❌ Error loading symbols: {e}")
         logger.error(f"Symbol loading error: {e}")
