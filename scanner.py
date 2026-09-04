@@ -3678,25 +3678,13 @@ def _run_full_pin_scan(fyers, universe, pin_min=70, pin_mode="ALL"):
             time.sleep(BATCH_PAUSE_SECONDS)
     progress.empty()
 
+    # IMPORTANT: keep ALL successfully analysed rows here.
+    # Filtering is done only in the UI so a selection such as BUY ONLY +
+    # score 75 cannot erase the successful scan report.
     df = pd.DataFrame(results)
-    if not df.empty:
-        df["__score"] = pd.to_numeric(df.get("PIN SCORE", 0), errors="coerce").fillna(0)
-        sig = df.get("PIN SIGNAL", pd.Series("", index=df.index)).astype(str)
-        if pin_mode == "PRE-MOVE / PRE-SWEEP":
-            # Early-warning mode intentionally does not require the confirmed PIN score.
-            df = df[df.get("SETUP STATUS", pd.Series("", index=df.index)).astype(str).str.contains("PRE-", na=False)].copy()
-        else:
-            df = df[df["__score"] >= float(pin_min)].copy()
-            sig = df.get("PIN SIGNAL", pd.Series("", index=df.index)).astype(str)
-            if pin_mode == "BUY ONLY":
-                df = df[sig.str.contains("BUY", na=False)]
-            elif pin_mode == "SELL ONLY":
-                df = df[sig.str.contains("SELL", na=False)]
-            elif pin_mode == "STRONG ONLY":
-                df = df[sig.str.contains("STRONG", na=False)]
-        df = df.drop(columns=["__score"], errors="ignore")
-        if "PIN SCORE" in df.columns:
-            df = df.sort_values("PIN SCORE", ascending=False)
+    if not df.empty and "PIN SCORE" in df.columns:
+        df["PIN SCORE"] = pd.to_numeric(df["PIN SCORE"], errors="coerce").fillna(0)
+        df = df.sort_values("PIN SCORE", ascending=False, kind="stable")
     return df.to_dict("records") if not df.empty else [], errors, stats
 
 
@@ -3817,22 +3805,74 @@ def _show_pin_full_scan_tab(fyers, all_symbols, fo_symbols):
 
     df = st.session_state.get("pin_full_df")
     if df is not None and not df.empty:
+        # Always preserve/display the complete successful scan.
+        # The Show selector is only a presentation filter.
         df = _add_signal_time_columns(df, "PIN SIGNAL")
         st.session_state["pin_full_df"] = df
-        buy_n = int(df.get("PIN SIGNAL", pd.Series(dtype=str)).astype(str).str.contains("BUY", na=False).sum())
-        sell_n = int(df.get("PIN SIGNAL", pd.Series(dtype=str)).astype(str).str.contains("SELL", na=False).sum())
-        sweep_n = int((df.get("SWEEP", pd.Series(dtype=str)).astype(str) != "NONE").sum()) if "SWEEP" in df.columns else 0
-        c1, c2, c3 = st.columns(3)
-        c1.metric("📌 PIN SETUPS", len(df))
+
+        full_df = df.copy()
+        full_sig = full_df.get("PIN SIGNAL", pd.Series("", index=full_df.index)).astype(str)
+        full_phase = full_df.get("SETUP STATUS", pd.Series("", index=full_df.index)).astype(str)
+        full_score = pd.to_numeric(full_df.get("PIN SCORE", 0), errors="coerce").fillna(0)
+
+        buy_n = int(full_sig.str.contains("BUY", na=False).sum())
+        sell_n = int(full_sig.str.contains("SELL", na=False).sum())
+        sweep_n = int((full_df.get("SWEEP", pd.Series("NONE", index=full_df.index)).astype(str) != "NONE").sum())
+        pre_n = int(full_phase.str.contains("PRE-", na=False).sum())
+
+        c1, c2, c3, c4, c5 = st.columns(5)
+        c1.metric("📌 SUCCESSFUL", len(full_df))
         c2.metric("🟢 BUY", buy_n)
         c3.metric("🔴 SELL", sell_n)
-        preferred_pin = ["Symbol", "SOURCE", "LTP", "SETUP STATUS", "RADAR DIRECTION", "PRE-MOVE SCORE", "PRE-SWEEP SCORE", "LIQUIDITY TYPE", "LIQUIDITY LEVEL", "DISTANCE TO LIQUIDITY %", "PIN SIGNAL", "PIN SCORE", "SWEEP", "REVERSAL", "SIGNAL TIME", "LAST SEEN", "SIGNAL AGE"]
-        pin_cols = [c for c in preferred_pin if c in df.columns] + [c for c in df.columns if c not in preferred_pin]
-        pin_cols = list(dict.fromkeys(pin_cols))
-        st.dataframe(df[pin_cols], use_container_width=True, height=550)
-        _excel_download_button(df, "PIN_FULL_SCAN", "pin_full_excel", label="📥 DOWNLOAD PIN EXCEL")
+        c4.metric("💧 SWEEPS", sweep_n)
+        c5.metric("🟡 PRE-MOVE", pre_n)
+
+        preferred_pin = [
+            "Symbol", "SOURCE", "LTP", "SETUP STATUS", "RADAR DIRECTION",
+            "PRE-MOVE SCORE", "PRE-SWEEP SCORE", "LIQUIDITY TYPE",
+            "LIQUIDITY LEVEL", "DISTANCE TO LIQUIDITY %", "COMPRESSION %",
+            "PIN SIGNAL", "PIN SCORE", "SWEEP", "REVERSAL",
+            "EQUAL HIGH", "EQUAL LOW", "BIG MOVEMENT", "BIG MOVE SCORE",
+            "5M TREND", "15M TREND", "1H TREND", "RVOL", "RSI", "PRESSURE",
+            "SIGNAL TIME", "LAST SEEN", "SIGNAL AGE", "REASON"
+        ]
+        def _pin_cols(frame):
+            cols = [c for c in preferred_pin if c in frame.columns]
+            cols += [c for c in frame.columns if c not in cols]
+            return list(dict.fromkeys(cols))
+
+        # Full successful report — never disappears because of the selected filter.
+        st.markdown(f"### 📄 PIN FULL REPORT — ALL SUCCESSFUL ({len(full_df)})")
+        st.dataframe(full_df[_pin_cols(full_df)], use_container_width=True, height=500)
+
+        # Optional filtered report.
+        filtered = full_df.copy()
+        if pin_mode == "PRE-MOVE / PRE-SWEEP":
+            filtered = filtered[filtered.get("SETUP STATUS", pd.Series("", index=filtered.index)).astype(str).str.contains("PRE-", na=False)]
+        else:
+            filtered = filtered[full_score >= float(pin_min)]
+            fsig = filtered.get("PIN SIGNAL", pd.Series("", index=filtered.index)).astype(str)
+            if pin_mode == "BUY ONLY":
+                filtered = filtered[fsig.str.contains("BUY", na=False)]
+            elif pin_mode == "SELL ONLY":
+                filtered = filtered[fsig.str.contains("SELL", na=False)]
+            elif pin_mode == "STRONG ONLY":
+                filtered = filtered[fsig.str.contains("STRONG", na=False)]
+
+        st.markdown(f"### 🔎 FILTERED REPORT — {pin_mode} | {len(filtered)} rows")
+        if not filtered.empty:
+            st.dataframe(filtered[_pin_cols(filtered)], use_container_width=True, height=450)
+        else:
+            st.info(
+                f"No rows matched: {pin_mode} with minimum PIN score {pin_min}. "
+                f"The ALL SUCCESSFUL report above contains all {len(full_df)} analyzable stocks, so the scan result is not lost."
+            )
+
+        _excel_download_button(full_df, "PIN_FULL_SCAN_ALL_SUCCESSFUL", "pin_full_excel_all", label="📥 DOWNLOAD ALL SUCCESSFUL PIN EXCEL")
+        if not filtered.empty:
+            _excel_download_button(filtered, "PIN_FULL_SCAN_FILTERED", "pin_full_excel_filtered", label="📥 DOWNLOAD FILTERED PIN EXCEL")
     elif "pin_full_stats" in st.session_state:
-        st.warning("PIN scan completed — no rows matched the selected PIN score/filter.")
+        st.warning("PIN scan completed — no analyzable rows returned. Check the PIN scan errors below.")
 
     errors = st.session_state.get("pin_full_errors", [])
     if errors:
