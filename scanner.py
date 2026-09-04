@@ -280,6 +280,85 @@ MASTER_SIGNAL_LOOKBACK_DAYS = 10
 def _now_ist() -> datetime:
     return datetime.now(IST)
 
+
+# ============================================================
+# PERSISTENT SCANNER SIGNAL TIME TRACKER
+# Adds: SIGNAL TIME, LAST SEEN, SIGNAL AGE
+# Existing scanner logic remains unchanged.
+# ============================================================
+def _add_signal_time_columns(df: pd.DataFrame, signal_col: str = "AI SIGNAL",
+                             symbol_col: str = "Symbol") -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+
+    if symbol_col not in df.columns:
+        for candidate in ["SYMBOL", "Symbol", "symbol", "NSE Symbol"]:
+            if candidate in df.columns:
+                symbol_col = candidate
+                break
+
+    if signal_col not in df.columns:
+        for candidate in ["AI SIGNAL", "SIGNAL", "Signal"]:
+            if candidate in df.columns:
+                signal_col = candidate
+                break
+
+    if symbol_col not in df.columns or signal_col not in df.columns:
+        return df
+
+    if "scanner_signal_time_history" not in st.session_state:
+        st.session_state["scanner_signal_time_history"] = {}
+
+    history = st.session_state["scanner_signal_time_history"]
+    now = _now_ist()
+    result = df.copy()
+
+    signal_times, last_seen_times, signal_ages = [], [], []
+
+    for _, row in result.iterrows():
+        symbol = str(row.get(symbol_col, "")).strip()
+        signal = str(row.get(signal_col, "")).strip().upper()
+
+        is_active = ("BUY" in signal) or ("SELL" in signal)
+        key = f"{symbol}::{signal}"
+
+        if not symbol or not is_active:
+            signal_times.append("-")
+            last_seen_times.append("-")
+            signal_ages.append("-")
+            continue
+
+        # Remove old opposite signal records for this symbol.
+        prefix = f"{symbol}::"
+        for old_key in list(history.keys()):
+            if old_key.startswith(prefix) and old_key != key:
+                del history[old_key]
+
+        if key not in history:
+            history[key] = {"first_seen": now, "last_seen": now}
+        else:
+            history[key]["last_seen"] = now
+
+        first_seen = history[key]["first_seen"]
+        last_seen = history[key]["last_seen"]
+        age_seconds = max(0, int((now - first_seen).total_seconds()))
+
+        if age_seconds < 60:
+            age_text = "JUST NOW"
+        elif age_seconds < 3600:
+            age_text = f"{age_seconds // 60} min ago"
+        else:
+            age_text = f"{age_seconds // 3600}h {(age_seconds % 3600) // 60}m ago"
+
+        signal_times.append(first_seen.strftime("%I:%M:%S %p"))
+        last_seen_times.append(last_seen.strftime("%I:%M:%S %p"))
+        signal_ages.append(age_text)
+
+    result["SIGNAL TIME"] = signal_times
+    result["LAST SEEN"] = last_seen_times
+    result["SIGNAL AGE"] = signal_ages
+    return result
+
 def _ensure_app_folders() -> None:
     for folder in ("logs", "charts", "exports"):
         os.makedirs(folder, exist_ok=True)
@@ -3636,7 +3715,7 @@ def show_scanner(fyers) -> None:
         if st.button(f"🔍 SCAN NSE ({len(nse_universe)} stocks)", key="nse_run"):
             with st.spinner("Analyzing NSE stocks…"):
                 nse_results, nse_errors, nse_stats = run_nse_scan(fyers, nse_universe)
-                st.session_state["nse_df"] = pd.DataFrame(nse_results) if nse_results else pd.DataFrame()
+                st.session_state["nse_df"] = _add_signal_time_columns(pd.DataFrame(nse_results) if nse_results else pd.DataFrame())
                 st.session_state["nse_errors"] = nse_errors
                 st.session_state["nse_stats"] = nse_stats
         
@@ -3747,7 +3826,7 @@ def show_scanner(fyers) -> None:
                 try:
                     fo_results, fo_errors, fo_stats = run_fo_scan(fyers, fo_universe)
                     st.session_state["fo_df"] = (
-                        pd.DataFrame(fo_results) if fo_results else pd.DataFrame()
+                        _add_signal_time_columns(pd.DataFrame(fo_results) if fo_results else pd.DataFrame())
                     )
                     st.session_state["fo_errors"] = fo_errors or []
                     st.session_state["fo_stats"] = fo_stats
@@ -3951,7 +4030,7 @@ def show_scanner(fyers) -> None:
                 intraday_signal_filter = st.selectbox("Signal", ["ALL", "BUY", "SELL"], key="intraday_sig_filter")
             with col_if3:
                 intraday_show_cols = st.multiselect("Show Columns", intraday_df.columns, 
-                                                   default=["Symbol", "LTP", "AI SIGNAL", "AI CONFIDENCE %", "RVOL", "🟢 BUY PRESSURE %", "🔴 SELL PRESSURE %"],
+                                                   default=["Symbol", "LTP", "AI SIGNAL", "AI CONFIDENCE %", "SIGNAL TIME", "LAST SEEN", "SIGNAL AGE", "RVOL", "🟢 BUY PRESSURE %", "🔴 SELL PRESSURE %"],
                                                    key="intraday_cols")
             
             intraday_filtered = intraday_df.copy()
@@ -3999,12 +4078,12 @@ def show_scanner(fyers) -> None:
                 universe = strong_universe_all if strong_limit == 0 else strong_universe_all[:strong_limit]
                 if strong_source == "NSE Stocks":
                     r, e, s = run_nse_scan(fyers, universe)
-                    st.session_state["nse_df"] = pd.DataFrame(r) if r else pd.DataFrame()
+                    st.session_state["nse_df"] = _add_signal_time_columns(pd.DataFrame(r) if r else pd.DataFrame())
                     st.session_state["nse_errors"] = e
                     st.session_state["nse_stats"] = s
                 else:
                     r, e, s = run_fo_scan(fyers, universe)
-                    st.session_state["fo_df"] = pd.DataFrame(r) if r else pd.DataFrame()
+                    st.session_state["fo_df"] = _add_signal_time_columns(pd.DataFrame(r) if r else pd.DataFrame())
                     st.session_state["fo_errors"] = e
                     st.session_state["fo_stats"] = s
 
@@ -4295,12 +4374,12 @@ def show_scanner(fyers) -> None:
                 universe = dash_universe_all if dash_limit == 0 else dash_universe_all[:dash_limit]
                 if dashboard_source == "NSE Stocks":
                     r, e, s = run_nse_scan(fyers, universe)
-                    st.session_state["nse_df"] = pd.DataFrame(r) if r else pd.DataFrame()
+                    st.session_state["nse_df"] = _add_signal_time_columns(pd.DataFrame(r) if r else pd.DataFrame())
                     st.session_state["nse_errors"] = e
                     st.session_state["nse_stats"] = s
                 else:
                     r, e, s = run_fo_scan(fyers, universe)
-                    st.session_state["fo_df"] = pd.DataFrame(r) if r else pd.DataFrame()
+                    st.session_state["fo_df"] = _add_signal_time_columns(pd.DataFrame(r) if r else pd.DataFrame())
                     st.session_state["fo_errors"] = e
                     st.session_state["fo_stats"] = s
 
