@@ -3767,6 +3767,48 @@ def _run_amd_scan(fyers, universe):
     return results, errors, stats
 
 
+def _radar_top_lists(frame: pd.DataFrame, n: int = 10):
+    """Return top early-warning candidates split by radar direction.
+    Uses only rows that have a directional radar signal; this is a watchlist,
+    not a trade recommendation or guaranteed prediction.
+    """
+    if frame is None or frame.empty:
+        return pd.DataFrame(), pd.DataFrame()
+    d = frame.copy()
+    for col in ["PRE-MOVE SCORE", "PRE-SWEEP SCORE", "DISTANCE TO LIQUIDITY %", "VOLUME BUILD"]:
+        if col in d.columns:
+            d[col] = pd.to_numeric(d[col], errors="coerce")
+    direction = d.get("RADAR DIRECTION", pd.Series("NONE", index=d.index)).astype(str).str.upper()
+    status = d.get("SETUP STATUS", pd.Series("", index=d.index)).astype(str)
+    d = d[direction.isin(["BUY", "SELL"]) & status.str.contains("PRE-", na=False)].copy()
+    if d.empty:
+        return pd.DataFrame(), pd.DataFrame()
+    # Score liquidity proximity + pre-sweep + pre-move; lower distance is better.
+    d["RADAR RANK SCORE"] = (
+        d.get("PRE-SWEEP SCORE", 0).fillna(0) * 0.50
+        + d.get("PRE-MOVE SCORE", 0).fillna(0) * 0.35
+        + d.get("VOLUME BUILD", 100).fillna(100).clip(lower=0, upper=250) * 0.10
+        + (100 - d.get("DISTANCE TO LIQUIDITY %", 100).fillna(100).clip(lower=0, upper=100)) * 0.05
+    )
+    buy = d[direction.loc[d.index] == "BUY"].sort_values(["RADAR RANK SCORE", "PRE-SWEEP SCORE"], ascending=False).head(n)
+    sell = d[direction.loc[d.index] == "SELL"].sort_values(["RADAR RANK SCORE", "PRE-SWEEP SCORE"], ascending=False).head(n)
+    return buy, sell
+
+
+def _radar_top_columns(frame: pd.DataFrame):
+    preferred = [
+        "Symbol", "SOURCE", "LTP", "SETUP STATUS", "RADAR DIRECTION",
+        "PRE-SWEEP SCORE", "PRE-MOVE SCORE", "RADAR RANK SCORE",
+        "LIQUIDITY TYPE", "LIQUIDITY LEVEL", "DISTANCE TO LIQUIDITY %",
+        "COMPRESSION %", "VOLUME BUILD", "PRESSURE", "RADAR 5M", "RADAR 15M",
+        "PIN SIGNAL", "PIN SCORE", "AMD PHASE", "AMD SIGNAL", "AMD SCORE",
+        "SWEEP", "REVERSAL", "SIGNAL TIME", "LAST SEEN", "SIGNAL AGE"
+    ]
+    cols = [c for c in preferred if c in frame.columns]
+    cols += [c for c in frame.columns if c not in cols]
+    return list(dict.fromkeys(cols))
+
+
 def _show_pin_full_scan_tab(fyers, all_symbols, fo_symbols):
     st.markdown("### 📌 PIN SCANNER — FULL NSE + F&O UNIVERSE")
     st.caption("Independent full-universe PIN scan. Existing PIN rules are unchanged; PRE-MOVE / PRE-SWEEP radar is additive.")
@@ -3844,6 +3886,23 @@ def _show_pin_full_scan_tab(fyers, all_symbols, fo_symbols):
         # Full successful report — never disappears because of the selected filter.
         st.markdown(f"### 📄 PIN FULL REPORT — ALL SUCCESSFUL ({len(full_df)})")
         st.dataframe(full_df[_pin_cols(full_df)], use_container_width=True, height=500)
+
+        # Top 10 PIN early-warning watchlists.
+        pin_buy_top, pin_sell_top = _radar_top_lists(full_df, 10)
+        st.markdown("### 🔥 TOP 10 PIN PRE-SWEEP / PRE-MOVE WATCH")
+        pc1, pc2 = st.columns(2)
+        with pc1:
+            st.markdown(f"#### 🟢 BUY WATCH — {len(pin_buy_top)}")
+            if not pin_buy_top.empty:
+                st.dataframe(pin_buy_top[_radar_top_columns(pin_buy_top)], use_container_width=True, height=380)
+            else:
+                st.info("No directional PIN BUY watch candidates.")
+        with pc2:
+            st.markdown(f"#### 🔴 SELL WATCH — {len(pin_sell_top)}")
+            if not pin_sell_top.empty:
+                st.dataframe(pin_sell_top[_radar_top_columns(pin_sell_top)], use_container_width=True, height=380)
+            else:
+                st.info("No directional PIN SELL watch candidates.")
 
         # Optional filtered report.
         filtered = full_df.copy()
@@ -3957,6 +4016,25 @@ def _show_amd_scan_tab(fyers, all_symbols, fo_symbols):
         visible = [c for c in preferred if c in out.columns] + [c for c in out.columns if c not in preferred]
         st.caption(f"📄 AMD REPORT: {len(out)} rows shown")
         st.dataframe(out[visible], use_container_width=True, height=550)
+
+        # Top 10 AMD early-warning watchlists.
+        amd_buy_top, amd_sell_top = _radar_top_lists(df, 10)
+        st.markdown("### 🔥 TOP 10 AMD PRE-SWEEP / PRE-MOVE WATCH")
+        st.caption("AMD phase remains the original engine; the radar ranking is an additive early-warning layer.")
+        ac1, ac2 = st.columns(2)
+        with ac1:
+            st.markdown(f"#### 🟢 BUY WATCH — {len(amd_buy_top)}")
+            if not amd_buy_top.empty:
+                st.dataframe(amd_buy_top[_radar_top_columns(amd_buy_top)], use_container_width=True, height=380)
+            else:
+                st.info("No directional AMD BUY watch candidates.")
+        with ac2:
+            st.markdown(f"#### 🔴 SELL WATCH — {len(amd_sell_top)}")
+            if not amd_sell_top.empty:
+                st.dataframe(amd_sell_top[_radar_top_columns(amd_sell_top)], use_container_width=True, height=380)
+            else:
+                st.info("No directional AMD SELL watch candidates.")
+
         _excel_download_button(out, "AMD_SCAN", "amd_excel", label="📥 DOWNLOAD AMD EXCEL")
     elif "amd_stats" in st.session_state:
         st.warning("AMD scan completed — no analyzable rows returned.")
@@ -4330,6 +4408,24 @@ def show_scanner(fyers) -> None:
                 st.dataframe(pre.sort_values(["PRE-SWEEP SCORE", "PRE-MOVE SCORE"], ascending=False)[pre_cols], use_container_width=True, height=350)
             else:
                 st.info("No PRE-MOVE / PRE-SWEEP setup in this scan.")
+
+            # Top 10 directional early-warning lists.
+            top_buy, top_sell = _radar_top_lists(report, 10)
+            st.markdown("### 🔥 TOP 10 PRE-SWEEP / PRE-MOVE WATCH")
+            st.caption("Ranking is an early-warning watchlist. It is not a guaranteed prediction or entry signal.")
+            tc1, tc2 = st.columns(2)
+            with tc1:
+                st.markdown(f"#### 🟢 BUY WATCH — {len(top_buy)}")
+                if not top_buy.empty:
+                    st.dataframe(top_buy[_radar_top_columns(top_buy)], use_container_width=True, height=380)
+                else:
+                    st.info("No directional BUY watch candidates.")
+            with tc2:
+                st.markdown(f"#### 🔴 SELL WATCH — {len(top_sell)}")
+                if not top_sell.empty:
+                    st.dataframe(top_sell[_radar_top_columns(top_sell)], use_container_width=True, height=380)
+                else:
+                    st.info("No directional SELL watch candidates.")
 
             # Separate actionable sections
             c1, c2 = st.columns(2)
