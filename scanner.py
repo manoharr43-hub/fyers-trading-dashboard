@@ -2933,7 +2933,11 @@ def run_fo_scan(fyers, symbols):
     return results, errors, stats
 
 def run_momentum_scan(fyers, symbols, is_fo: bool = False):
-    """Threaded LIVE sudden movement scan. Returns BUY/SELL only."""
+    """Threaded LIVE sudden movement scan. Returns every successful analysis row.
+
+    DIRECTION is BUY/SELL/NONE; the report keeps NO MOVE rows so the user can
+    see all successfully analysed stocks instead of an empty report.
+    """
     symbols = _validate_symbols(symbols)
     results, errors = [], []
     stats = ScanStats(total=len(symbols))
@@ -2950,7 +2954,9 @@ def run_momentum_scan(fyers, symbols, is_fo: bool = False):
                     res, err = future.result()
                 except Exception as e:
                     res, err = None, f"{symbol}: worker error: {str(e)[:100]}"
-                if res and res.get("DIRECTION") in ("BUY", "SELL"):
+                # Keep every successful analysis row, including NO MOVE.
+                # This makes the report match the Successful scan count.
+                if res:
                     results.append(res)
                 if err:
                     errors.append(err)
@@ -4067,20 +4073,50 @@ def show_scanner(fyers) -> None:
 
         mdf = st.session_state.get("momentum_df")
         if mdf is not None and not mdf.empty:
-            buy = mdf[mdf["DIRECTION"] == "BUY"].copy().sort_values(["SCORE", "RVOL"], ascending=False)
-            sell = mdf[mdf["DIRECTION"] == "SELL"].copy().sort_values(["SCORE", "RVOL"], ascending=False)
+            # Full successful scan report
+            report = mdf.copy()
+            report["DIRECTION"] = report.get("DIRECTION", "NONE").astype(str).str.upper()
+            report = report.sort_values(
+                ["DIRECTION", "SCORE", "RVOL"],
+                ascending=[True, False, False],
+                kind="stable"
+            )
 
+            buy = report[report["DIRECTION"] == "BUY"].copy().sort_values(["SCORE", "RVOL"], ascending=False)
+            sell = report[report["DIRECTION"] == "SELL"].copy().sort_values(["SCORE", "RVOL"], ascending=False)
+
+            st.markdown("### 📄 LIVE MOVEMENT REPORT")
+            st.caption(
+                f"{len(report)} successfully analysed rows — "
+                f"BUY: {len(buy)} | SELL: {len(sell)} | NO MOVE: {len(report) - len(buy) - len(sell)}"
+            )
+
+            # Put the most useful columns first, then retain all other analysis columns.
+            preferred = [
+                "Symbol", "DIRECTION", "SIGNAL", "LTP", "MOVE %", "SCORE", "RVOL",
+                "BODY %", "BODY / ATR", "STRUCTURE", "HH/HL", "LH/LL",
+                "ACCELERATION", "VOLUME SPIKE", "BLOCK ORDER SCORE",
+                "BLOCK ACTIVITY", "BLOCK SIDE", "BLOCK LEVEL", "REASON",
+                "SIGNAL TIME", "LAST SEEN", "SIGNAL AGE"
+            ]
+            report_cols = [c for c in preferred if c in report.columns]
+            report_cols += [c for c in report.columns if c not in report_cols]
+            report_cols = list(dict.fromkeys(report_cols))
+
+            st.dataframe(report.loc[:, report_cols], use_container_width=True, height=500)
+
+            # Separate actionable sections
             c1, c2 = st.columns(2)
             with c1:
                 st.markdown(f"### 🟢 BUY — {len(buy)}")
                 if not buy.empty:
-                    st.dataframe(buy, use_container_width=True, height=430)
+                    st.dataframe(buy, use_container_width=True, height=350)
                 else:
                     st.info("No current BUY movement found.")
             with c2:
                 st.markdown(f"### 🔴 SELL — {len(sell)}")
                 if not sell.empty:
-                    st.dataframe(sell, use_container_width=True, height=430)
+                    st.dataframe(sell, use_container_width=True, height=350)
                 else:
                     st.info("No current SELL movement found.")
 
@@ -4088,7 +4124,7 @@ def show_scanner(fyers) -> None:
             try:
                 st.download_button(
                     "📊 Excel",
-                    _format_excel_output(mdf, "LIVE_MOVEMENT"),
+                    _format_excel_output(report, "LIVE_MOVEMENT"),
                     f"LIVE_MOVEMENT_{_now_ist().strftime('%Y%m%d_%H%M')}.xlsx",
                     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     key="momentum_xls",
@@ -4096,10 +4132,16 @@ def show_scanner(fyers) -> None:
             except Exception as e:
                 st.error(f"Excel export error: {e}")
         elif "momentum_stats" in st.session_state:
-            st.warning("Scan completed — no current BUY/SELL movement matched the live thresholds.")
+            stats = st.session_state.get("momentum_stats")
+            successful = getattr(stats, "successful", getattr(stats, "success", 0))
+            failed = getattr(stats, "failed", 0)
+            st.warning(
+                f"Scan completed, but no analyzable rows were returned. "
+                f"Successful: {successful} | Failed: {failed}"
+            )
             st.markdown("### 📄 LIVE MOVEMENT REPORT")
-            empty_cols = ["Symbol", "DIRECTION", "AI SIGNAL", "SIGNAL TIME", "LAST SEEN", "SIGNAL AGE", "SCORE", "RVOL"]
-            st.caption("0 actionable rows — report is shown even when no signal matches.")
+            empty_cols = ["Symbol", "DIRECTION", "SIGNAL", "SIGNAL TIME", "LAST SEEN", "SIGNAL AGE", "LTP", "MOVE %", "SCORE", "RVOL", "REASON"]
+            st.caption("No successful rows are available for this scan.")
             st.dataframe(pd.DataFrame(columns=empty_cols), use_container_width=True, height=180)
         else:
             st.info("👈 Click 'SCAN LIVE MOVEMENT' to find stocks moving NOW.")
