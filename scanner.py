@@ -2824,6 +2824,7 @@ def _fetch_momentum_signal(fyers, symbol: str, is_fo: bool = False):
 
         move = detect_live_sudden_move(df5)
         block = detect_block_order_activity(df5)
+        radar = detect_pre_move_radar(df5)
         ltp = float(df5["Close"].iloc[-1])
         result = {
             "Symbol": stock_ticker,
@@ -2849,6 +2850,7 @@ def _fetch_momentum_signal(fyers, symbol: str, is_fo: bool = False):
             "BLOCK RVOL": block["block_rvol"],
             "BLOCK REASON": block["block_reason"],
             "REASON": move["reason"],
+            **radar,
         }
         if is_fo and move["direction"] in ("BUY", "SELL"):
             try:
@@ -2862,6 +2864,161 @@ def _fetch_momentum_signal(fyers, symbol: str, is_fo: bool = False):
     except Exception as e:
         logger.exception("LIVE MOMENTUM worker failed for %s", symbol)
         return None, f"{symbol}: error ({type(e).__name__}: {str(e)[:120]})"
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# EARLY WARNING RADAR — PRE-MOVE / PRE-SWEEP
+# Additive only: existing movement / PIN / AMD calculations remain intact.
+# This is a probability-style setup detector, NOT a guaranteed prediction.
+# ════════════════════════════════════════════════════════════════════════════════
+def detect_pre_move_radar(df5: pd.DataFrame, df15: Optional[pd.DataFrame] = None) -> Dict[str, Any]:
+    """Detect early compression/pressure near liquidity before a large move/sweep."""
+    out = {
+        "SETUP STATUS": "NO SETUP",
+        "PRE-MOVE SCORE": 0.0,
+        "PRE-SWEEP SCORE": 0.0,
+        "RADAR DIRECTION": "NONE",
+        "LIQUIDITY TYPE": "NONE",
+        "LIQUIDITY LEVEL": None,
+        "DISTANCE TO LIQUIDITY %": None,
+        "COMPRESSION %": None,
+        "VOLUME BUILD": 0.0,
+        "PRESSURE": "NEUTRAL",
+        "RADAR 5M": "NEUTRAL",
+        "RADAR 15M": "NEUTRAL",
+        "RADAR REASON": "Insufficient data",
+    }
+    try:
+        d = _completed_candles(df5, 5) if df5 is not None else None
+        if d is None or len(d) < 25:
+            return out
+        d = d.copy()
+        for col in ["Open", "High", "Low", "Close", "Volume"]:
+            d[col] = pd.to_numeric(d[col], errors="coerce")
+        d = d.dropna(subset=["Open", "High", "Low", "Close", "Volume"]).reset_index(drop=True)
+        if len(d) < 25:
+            return out
+
+        last = d.iloc[-1]
+        c = float(last["Close"]); h = float(last["High"]); l = float(last["Low"]); o = float(last["Open"])
+        if c <= 0:
+            return out
+
+        look = d.iloc[-13:-1]
+        if len(look) < 8:
+            return out
+        rh = float(look["High"].max()); rl = float(look["Low"].min())
+        mid = (rh + rl) / 2.0
+        range_pct = ((rh - rl) / mid * 100.0) if mid > 0 else 999.0
+        atr_s = calculate_atr(d, 14)
+        atr = float(atr_s.iloc[-1]) if len(atr_s) and pd.notna(atr_s.iloc[-1]) else max(c * 0.005, 0.01)
+
+        base_vol = float(d["Volume"].iloc[-21:-1].mean()) if len(d) >= 22 else float(d["Volume"].iloc[:-1].mean())
+        rvol = float(last["Volume"]) / base_vol if base_vol > 0 else 0.0
+        prior_vol = float(d["Volume"].iloc[-6:-1].mean()) if len(d) >= 7 else base_vol
+        volume_build = (float(last["Volume"]) / prior_vol * 100.0) if prior_vol > 0 else 100.0
+
+        # EMA/VWAP/RSI pressure from the completed 5M series.
+        close = d["Close"]
+        ema9 = close.ewm(span=9, adjust=False).mean().iloc[-1]
+        ema21 = close.ewm(span=21, adjust=False).mean().iloc[-1]
+        typical = (d["High"] + d["Low"] + d["Close"]) / 3.0
+        vwap = (typical * d["Volume"]).cumsum() / d["Volume"].replace(0, np.nan).cumsum()
+        vwap_now = float(vwap.iloc[-1]) if pd.notna(vwap.iloc[-1]) else c
+        delta = (c - o) / max(h - l, 1e-9)
+
+        # Lightweight RSI.
+        rsi_s = calculate_rsi(close, 14)
+        rsi = float(rsi_s.iloc[-1]) if len(rsi_s) and pd.notna(rsi_s.iloc[-1]) else 50.0
+
+        bull_pressure = (c > ema9) + (ema9 > ema21) + (c > vwap_now) + (rsi >= 52) + (delta > 0.15)
+        bear_pressure = (c < ema9) + (ema9 < ema21) + (c < vwap_now) + (rsi <= 48) + (delta < -0.15)
+        direction = "BUY" if bull_pressure >= 3 and bull_pressure > bear_pressure else "SELL" if bear_pressure >= 3 and bear_pressure > bull_pressure else "NONE"
+        pressure = "BULLISH" if direction == "BUY" else "BEARISH" if direction == "SELL" else "NEUTRAL"
+
+        # Liquidity proximity: recent range extremes. Equal highs/lows get priority.
+        recent_highs = look["High"].astype(float).tolist()
+        recent_lows = look["Low"].astype(float).tolist()
+        eq_tol = max(atr * 0.18, c * 0.0015)
+        high_clusters = [x for x in recent_highs if abs(x - rh) <= eq_tol]
+        low_clusters = [x for x in recent_lows if abs(x - rl) <= eq_tol]
+        buy_liq = rl
+        sell_liq = rh
+        if len(low_clusters) >= 2:
+            buy_liq = float(np.mean(low_clusters))
+        if len(high_clusters) >= 2:
+            sell_liq = float(np.mean(high_clusters))
+
+        dist_low = abs(c - buy_liq) / c * 100.0
+        dist_high = abs(c - sell_liq) / c * 100.0
+        # For bullish pressure watch a downside liquidity sweep; for bearish pressure watch upside liquidity.
+        if direction == "BUY":
+            liq_level, liq_type, dist = buy_liq, ("EQUAL LOW" if len(low_clusters) >= 2 else "RECENT LOW"), dist_low
+        elif direction == "SELL":
+            liq_level, liq_type, dist = sell_liq, ("EQUAL HIGH" if len(high_clusters) >= 2 else "RECENT HIGH"), dist_high
+        else:
+            liq_level, liq_type, dist = (buy_liq, "RECENT LOW", dist_low) if dist_low <= dist_high else (sell_liq, "RECENT HIGH", dist_high)
+
+        # Compression is strongest when recent range is small relative to ATR/price.
+        compression = max(0.0, min(100.0, 100.0 - (range_pct / 3.0) * 100.0))
+        near_liq = max(0.0, min(100.0, 100.0 - (dist / max(0.8, (atr / c * 100.0) * 2.5)) * 100.0))
+        volume_score = max(0.0, min(100.0, (rvol - 0.8) * 100.0))
+        pressure_score = (max(bull_pressure, bear_pressure) / 5.0) * 100.0
+        pre_move = round(min(100.0, compression * 0.25 + near_liq * 0.25 + volume_score * 0.15 + pressure_score * 0.20 + (20 if direction != "NONE" else 0)), 1)
+        pre_sweep = round(min(100.0, near_liq * 0.35 + compression * 0.20 + volume_score * 0.15 + pressure_score * 0.20 + (10 if "EQUAL" in liq_type else 0)), 1)
+
+        tf15 = "NEUTRAL"
+        if df15 is not None and len(df15) >= 8:
+            p15 = df15.copy()
+            p15["Close"] = pd.to_numeric(p15["Close"], errors="coerce")
+            p15 = p15.dropna(subset=["Close"])
+            if len(p15) >= 5:
+                chg15 = (float(p15["Close"].iloc[-1]) - float(p15["Close"].iloc[-4])) / float(p15["Close"].iloc[-4]) * 100.0
+                tf15 = "BULLISH" if chg15 > 0.20 else "BEARISH" if chg15 < -0.20 else "NEUTRAL"
+        align_bonus = (tf15 == "BULLISH" and direction == "BUY") or (tf15 == "BEARISH" and direction == "SELL")
+        if align_bonus:
+            pre_move = min(100.0, pre_move + 8)
+            pre_sweep = min(100.0, pre_sweep + 5)
+
+        # Do not label a setup as pre-sweep after it has already swept and closed back.
+        swept_high = h > rh and c < rh
+        swept_low = l < rl and c > rl
+        if direction == "BUY" and not swept_low and pre_sweep >= 58 and dist_low <= max(0.45, atr / c * 100.0 * 1.8):
+            status = "PRE-SWEEP BUY WATCH"
+        elif direction == "SELL" and not swept_high and pre_sweep >= 58 and dist_high <= max(0.45, atr / c * 100.0 * 1.8):
+            status = "PRE-SWEEP SELL WATCH"
+        elif direction == "BUY" and pre_move >= 55:
+            status = "PRE-MOVE BUY"
+        elif direction == "SELL" and pre_move >= 55:
+            status = "PRE-MOVE SELL"
+        else:
+            status = "NO SETUP"
+
+        reasons = [f"compression {range_pct:.2f}%", f"RVOL {rvol:.2f}x", f"liquidity {dist:.2f}% away"]
+        if "EQUAL" in liq_type:
+            reasons.append(liq_type)
+        if align_bonus:
+            reasons.append(f"15M {tf15} aligned")
+
+        out.update({
+            "SETUP STATUS": status,
+            "PRE-MOVE SCORE": pre_move,
+            "PRE-SWEEP SCORE": pre_sweep,
+            "RADAR DIRECTION": direction,
+            "LIQUIDITY TYPE": liq_type,
+            "LIQUIDITY LEVEL": round(liq_level, 2),
+            "DISTANCE TO LIQUIDITY %": round(dist, 3),
+            "COMPRESSION %": round(range_pct, 3),
+            "VOLUME BUILD": round(volume_build, 1),
+            "PRESSURE": pressure,
+            "RADAR 5M": pressure,
+            "RADAR 15M": tf15,
+            "RADAR REASON": " | ".join(reasons),
+        })
+        return out
+    except Exception as e:
+        out["RADAR REASON"] = f"Radar error: {type(e).__name__}"
+        return out
 
 # ════════════════════════════════════════════════════════════════════════════════
 # THREADED SCAN FUNCTIONS
@@ -3472,6 +3629,8 @@ def _fetch_full_pin_signal(fyers, symbol: str, source: str):
             a5.get("df"), a5.get("data", {}),
             a15.get("data", {}), a1h.get("data", {})
         )
+        radar = detect_pre_move_radar(a5.get("df"), a15.get("df"))
+        pin.update(radar)
         d5 = a5.get("data", {}) or {}
         pin["Symbol"] = ticker
         pin["Time"] = a5["df"]["Time"].iloc[-1] if a5.get("df") is not None and not a5["df"].empty else None
@@ -3522,14 +3681,19 @@ def _run_full_pin_scan(fyers, universe, pin_min=70, pin_mode="ALL"):
     df = pd.DataFrame(results)
     if not df.empty:
         df["__score"] = pd.to_numeric(df.get("PIN SCORE", 0), errors="coerce").fillna(0)
-        df = df[df["__score"] >= float(pin_min)].copy()
         sig = df.get("PIN SIGNAL", pd.Series("", index=df.index)).astype(str)
-        if pin_mode == "BUY ONLY":
-            df = df[sig.str.contains("BUY", na=False)]
-        elif pin_mode == "SELL ONLY":
-            df = df[sig.str.contains("SELL", na=False)]
-        elif pin_mode == "STRONG ONLY":
-            df = df[sig.str.contains("STRONG", na=False)]
+        if pin_mode == "PRE-MOVE / PRE-SWEEP":
+            # Early-warning mode intentionally does not require the confirmed PIN score.
+            df = df[df.get("SETUP STATUS", pd.Series("", index=df.index)).astype(str).str.contains("PRE-", na=False)].copy()
+        else:
+            df = df[df["__score"] >= float(pin_min)].copy()
+            sig = df.get("PIN SIGNAL", pd.Series("", index=df.index)).astype(str)
+            if pin_mode == "BUY ONLY":
+                df = df[sig.str.contains("BUY", na=False)]
+            elif pin_mode == "SELL ONLY":
+                df = df[sig.str.contains("SELL", na=False)]
+            elif pin_mode == "STRONG ONLY":
+                df = df[sig.str.contains("STRONG", na=False)]
         df = df.drop(columns=["__score"], errors="ignore")
         if "PIN SCORE" in df.columns:
             df = df.sort_values("PIN SCORE", ascending=False)
@@ -3545,6 +3709,7 @@ def _fetch_amd_signal_full(fyers, symbol: str, source: str):
             return None, f"{ticker}: 5M data unavailable"
         a15 = analyze_timeframe(fyers, symbol, "15")
         amd = calculate_amd_signal(a5.get("df"), a15.get("df"))
+        radar = detect_pre_move_radar(a5.get("df"), a15.get("df"))
         d5 = a5.get("data", {}) or {}
         d15 = a15.get("data", {}) or {}
         row = {
@@ -3570,6 +3735,7 @@ def _fetch_amd_signal_full(fyers, symbol: str, source: str):
             "5M RVOL": d5.get("rvol", 0),
             "BUY PRESSURE %": d5.get("buying_pressure", "N/A"),
             "SELL PRESSURE %": d5.get("selling_pressure", "N/A"),
+            **radar,
         }
         return row, None
     except Exception as e:
@@ -3615,7 +3781,7 @@ def _run_amd_scan(fyers, universe):
 
 def _show_pin_full_scan_tab(fyers, all_symbols, fo_symbols):
     st.markdown("### 📌 PIN SCANNER — FULL NSE + F&O UNIVERSE")
-    st.caption("Independent full-universe PIN scan. Existing scanner tabs and rules are unchanged.")
+    st.caption("Independent full-universe PIN scan. Existing PIN rules are unchanged; PRE-MOVE / PRE-SWEEP radar is additive.")
 
     source = st.radio(
         "PIN Universe",
@@ -3634,7 +3800,7 @@ def _show_pin_full_scan_tab(fyers, all_symbols, fo_symbols):
     with c2:
         pin_min = st.slider("Minimum PIN score", 50, 100, PIN_MIN_CONFIDENCE, 1, key="pin_full_min")
     with c3:
-        pin_mode = st.selectbox("Show", ["ALL", "BUY ONLY", "SELL ONLY", "STRONG ONLY"], key="pin_full_mode")
+        pin_mode = st.selectbox("Show", ["ALL", "BUY ONLY", "SELL ONLY", "STRONG ONLY", "PRE-MOVE / PRE-SWEEP"], key="pin_full_mode")
 
     scan_pairs = universe if pin_limit == 0 else universe[:int(pin_limit)]
     if st.button(f"📌 RUN PIN SCANNER ({len(scan_pairs):,} STOCKS)", key="pin_full_run", type="primary", use_container_width=True):
@@ -3660,7 +3826,10 @@ def _show_pin_full_scan_tab(fyers, all_symbols, fo_symbols):
         c1.metric("📌 PIN SETUPS", len(df))
         c2.metric("🟢 BUY", buy_n)
         c3.metric("🔴 SELL", sell_n)
-        st.dataframe(df, use_container_width=True, height=550)
+        preferred_pin = ["Symbol", "SOURCE", "LTP", "SETUP STATUS", "RADAR DIRECTION", "PRE-MOVE SCORE", "PRE-SWEEP SCORE", "LIQUIDITY TYPE", "LIQUIDITY LEVEL", "DISTANCE TO LIQUIDITY %", "PIN SIGNAL", "PIN SCORE", "SWEEP", "REVERSAL", "SIGNAL TIME", "LAST SEEN", "SIGNAL AGE"]
+        pin_cols = [c for c in preferred_pin if c in df.columns] + [c for c in df.columns if c not in preferred_pin]
+        pin_cols = list(dict.fromkeys(pin_cols))
+        st.dataframe(df[pin_cols], use_container_width=True, height=550)
         _excel_download_button(df, "PIN_FULL_SCAN", "pin_full_excel", label="📥 DOWNLOAD PIN EXCEL")
     elif "pin_full_stats" in st.session_state:
         st.warning("PIN scan completed — no rows matched the selected PIN score/filter.")
@@ -3673,7 +3842,7 @@ def _show_pin_full_scan_tab(fyers, all_symbols, fo_symbols):
 
 def _show_amd_scan_tab(fyers, all_symbols, fo_symbols):
     st.markdown("### 🧠 AMD SCANNER — ACCUMULATION / MANIPULATION / DISTRIBUTION")
-    st.caption("Fresh completed-candle AMD inference for NSE equities and F&O stocks. This is a rule-based market-structure heuristic, not proof of institutional intent.")
+    st.caption("Fresh completed-candle AMD inference for NSE equities and F&O stocks. Existing AMD rules are unchanged; PRE-MOVE / PRE-SWEEP radar is additive and probabilistic.")
 
     source = st.radio(
         "AMD Universe",
@@ -3689,7 +3858,7 @@ def _show_amd_scan_tab(fyers, all_symbols, fo_symbols):
     with c1:
         amd_limit = st.number_input("AMD scan limit (0 = ALL)", 0, max(total, 1), min(total, 300), 25, key="amd_limit") if total else 0
     with c2:
-        amd_show = st.selectbox("Show AMD", ["ALL", "ACCUMULATION", "MANIPULATION", "DISTRIBUTION", "BUY SIGNALS", "SELL SIGNALS"], key="amd_show")
+        amd_show = st.selectbox("Show AMD", ["ALL", "ACCUMULATION", "MANIPULATION", "DISTRIBUTION", "BUY SIGNALS", "SELL SIGNALS", "PRE-MOVE / PRE-SWEEP"], key="amd_show")
 
     scan_pairs = universe if amd_limit == 0 else universe[:int(amd_limit)]
     if st.button(f"🧠 RUN AMD SCANNER ({len(scan_pairs):,} STOCKS)", key="amd_run", type="primary", use_container_width=True):
@@ -3717,6 +3886,8 @@ def _show_amd_scan_tab(fyers, all_symbols, fo_symbols):
             out = out[sig.str.contains("BUY", na=False)]
         elif amd_show == "SELL SIGNALS":
             out = out[sig.str.contains("SELL", na=False)]
+        elif amd_show == "PRE-MOVE / PRE-SWEEP":
+            out = out[out.get("SETUP STATUS", pd.Series("", index=out.index)).astype(str).str.contains("PRE-", na=False)]
 
         buy_n = int(sig.str.contains("BUY", na=False).sum())
         sell_n = int(sig.str.contains("SELL", na=False).sum())
@@ -3724,11 +3895,14 @@ def _show_amd_scan_tab(fyers, all_symbols, fo_symbols):
         manip_n = int((phase == "MANIPULATION").sum())
         dist_n = int((phase == "DISTRIBUTION").sum())
         c1, c2, c3, c4, c5 = st.columns(5)
+        pre_n = int(df.get("SETUP STATUS", pd.Series("", index=df.index)).astype(str).str.contains("PRE-", na=False).sum())
         c1.metric("TOTAL", len(df))
         c2.metric("🟢 BUY", buy_n)
         c3.metric("🔴 SELL", sell_n)
         c4.metric("📥 ACCUMULATION", acc_n)
         c5.metric("📤 DISTRIBUTION", dist_n)
+        if pre_n:
+            st.info(f"🟡 PRE-MOVE / PRE-SWEEP WATCH: {pre_n}")
         if manip_n:
             st.info(f"🟠 MANIPULATION / SWEEP: {manip_n}")
 
@@ -3736,8 +3910,9 @@ def _show_amd_scan_tab(fyers, all_symbols, fo_symbols):
         for _c in time_cols:
             if _c not in out.columns:
                 out[_c] = "-"
-        preferred = ["Symbol", "SOURCE", "LTP", "AMD PHASE", "AMD SIGNAL",
-                     "SIGNAL TIME", "LAST SEEN", "SIGNAL AGE",
+        preferred = ["Symbol", "SOURCE", "LTP", "SETUP STATUS", "RADAR DIRECTION", "PRE-MOVE SCORE", "PRE-SWEEP SCORE",
+                     "LIQUIDITY TYPE", "LIQUIDITY LEVEL", "DISTANCE TO LIQUIDITY %", "COMPRESSION %",
+                     "AMD PHASE", "AMD SIGNAL", "SIGNAL TIME", "LAST SEEN", "SIGNAL AGE",
                      "AMD SCORE", "AMD BUY SCORE", "AMD SELL SCORE"]
         visible = [c for c in preferred if c in out.columns] + [c for c in out.columns if c not in preferred]
         st.caption(f"📄 AMD REPORT: {len(out)} rows shown")
@@ -4041,8 +4216,8 @@ def show_scanner(fyers) -> None:
     # TAB 2: MOMENTUM MOVERS — LIVE SUDDEN BUY / SELL
     # ════════════════════════════════════════════════════════════════════════════════
     with tabs[2]:
-        st.markdown("### ⚡ LIVE SUDDEN MOVEMENT — BUY / SELL")
-        st.caption("Only recent 5M price action + volume + acceleration + HH/HL or LH/LL. No previous consolidation, 15M, 1H or EMA confirmation.")
+        st.markdown("### ⚡ LIVE SUDDEN MOVEMENT + PRE-MOVE RADAR")
+        st.caption("Existing sudden-move engine is retained. Added early-warning radar for compression, liquidity proximity, volume build-up and 5M/15M pressure before a large move or sweep.")
 
         col_m1, col_m2, col_m3 = st.columns([2, 2, 1])
         with col_m1:
@@ -4093,7 +4268,9 @@ def show_scanner(fyers) -> None:
 
             # Put the most useful columns first, then retain all other analysis columns.
             preferred = [
-                "Symbol", "DIRECTION", "SIGNAL", "LTP", "MOVE %", "SCORE", "RVOL",
+                "Symbol", "SETUP STATUS", "RADAR DIRECTION", "PRE-MOVE SCORE", "PRE-SWEEP SCORE",
+                "LIQUIDITY TYPE", "LIQUIDITY LEVEL", "DISTANCE TO LIQUIDITY %", "COMPRESSION %",
+                "VOLUME BUILD", "PRESSURE", "RADAR 15M", "DIRECTION", "SIGNAL", "LTP", "MOVE %", "SCORE", "RVOL",
                 "BODY %", "BODY / ATR", "STRUCTURE", "HH/HL", "LH/LL",
                 "ACCELERATION", "VOLUME SPIKE", "BLOCK ORDER SCORE",
                 "BLOCK ACTIVITY", "BLOCK SIDE", "BLOCK LEVEL", "REASON",
@@ -4104,6 +4281,15 @@ def show_scanner(fyers) -> None:
             report_cols = list(dict.fromkeys(report_cols))
 
             st.dataframe(report.loc[:, report_cols], use_container_width=True, height=500)
+
+            # Early-warning sections: these are watched before confirmed movement.
+            pre = report[report.get("SETUP STATUS", pd.Series("", index=report.index)).astype(str).str.contains("PRE-", na=False)].copy()
+            if not pre.empty:
+                st.markdown(f"### 🟡 PRE-MOVE / PRE-SWEEP WATCH — {len(pre)}")
+                pre_cols = [c for c in ["Symbol", "SETUP STATUS", "RADAR DIRECTION", "PRE-MOVE SCORE", "PRE-SWEEP SCORE", "LIQUIDITY TYPE", "LIQUIDITY LEVEL", "DISTANCE TO LIQUIDITY %", "COMPRESSION %", "VOLUME BUILD", "PRESSURE", "RADAR 15M", "LTP", "SIGNAL TIME"] if c in pre.columns]
+                st.dataframe(pre.sort_values(["PRE-SWEEP SCORE", "PRE-MOVE SCORE"], ascending=False)[pre_cols], use_container_width=True, height=350)
+            else:
+                st.info("No PRE-MOVE / PRE-SWEEP setup in this scan.")
 
             # Separate actionable sections
             c1, c2 = st.columns(2)
