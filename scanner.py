@@ -3795,6 +3795,32 @@ def _radar_top_lists(frame: pd.DataFrame, n: int = 10):
     return buy, sell
 
 
+def _radar_overall_top(frame: pd.DataFrame, n: int = 10):
+    """Fallback top early-warning list when there are not yet enough directional BUY/SELL candidates.
+    This keeps the radar useful: WAIT/NONE rows are shown as candidates to monitor, not entries.
+    """
+    if frame is None or frame.empty:
+        return pd.DataFrame()
+    d = frame.copy()
+    for col in ["PRE-MOVE SCORE", "PRE-SWEEP SCORE", "DISTANCE TO LIQUIDITY %", "VOLUME BUILD"]:
+        if col not in d.columns:
+            d[col] = 0.0
+        d[col] = pd.to_numeric(d[col], errors="coerce").fillna(0.0)
+    status = d.get("SETUP STATUS", pd.Series("", index=d.index)).astype(str)
+    d = d[status.str.contains("PRE-|NO SETUP", na=False)].copy()
+    if d.empty:
+        return pd.DataFrame()
+    d["RADAR RANK SCORE"] = (
+        d["PRE-SWEEP SCORE"] * 0.50
+        + d["PRE-MOVE SCORE"] * 0.35
+        + d["VOLUME BUILD"].clip(lower=0, upper=250) * 0.10
+        + (100 - d["DISTANCE TO LIQUIDITY %"].clip(lower=0, upper=100)) * 0.05
+    )
+    d["WATCH BIAS"] = d.get("RADAR DIRECTION", pd.Series("NONE", index=d.index)).astype(str).str.upper()
+    d["WATCH BIAS"] = d["WATCH BIAS"].replace({"NONE": "WAIT", "NAN": "WAIT"})
+    return d.sort_values(["RADAR RANK SCORE", "PRE-SWEEP SCORE", "PRE-MOVE SCORE"], ascending=False).head(n)
+
+
 def _radar_top_columns(frame: pd.DataFrame):
     preferred = [
         "Symbol", "SOURCE", "LTP", "SETUP STATUS", "RADAR DIRECTION",
@@ -3903,6 +3929,14 @@ def _show_pin_full_scan_tab(fyers, all_symbols, fo_symbols):
                 st.dataframe(pin_sell_top[_radar_top_columns(pin_sell_top)], use_container_width=True, height=380)
             else:
                 st.info("No directional PIN SELL watch candidates.")
+        if pin_buy_top.empty and pin_sell_top.empty:
+            pin_overall_top = _radar_overall_top(full_df, 10)
+            st.markdown(f"### 🟡 TOP 10 EARLY-WARNING WATCH — {len(pin_overall_top)}")
+            st.caption("No directional BUY/SELL confirmation yet. These are WAIT candidates ranked by pre-sweep/pre-move conditions; they are not entry signals.")
+            if not pin_overall_top.empty:
+                st.dataframe(pin_overall_top[_radar_top_columns(pin_overall_top)], use_container_width=True, height=380)
+            else:
+                st.info("No usable early-warning candidates in this scan.")
 
         # Optional filtered report.
         filtered = full_df.copy()
@@ -4034,6 +4068,14 @@ def _show_amd_scan_tab(fyers, all_symbols, fo_symbols):
                 st.dataframe(amd_sell_top[_radar_top_columns(amd_sell_top)], use_container_width=True, height=380)
             else:
                 st.info("No directional AMD SELL watch candidates.")
+        if amd_buy_top.empty and amd_sell_top.empty:
+            amd_overall_top = _radar_overall_top(df, 10)
+            st.markdown(f"### 🟡 TOP 10 AMD EARLY-WARNING WATCH — {len(amd_overall_top)}")
+            st.caption("No directional BUY/SELL confirmation yet. WAIT candidates are ranked by AMD + pre-sweep/pre-move conditions.")
+            if not amd_overall_top.empty:
+                st.dataframe(amd_overall_top[_radar_top_columns(amd_overall_top)], use_container_width=True, height=380)
+            else:
+                st.info("No usable AMD early-warning candidates in this scan.")
 
         _excel_download_button(out, "AMD_SCAN", "amd_excel", label="📥 DOWNLOAD AMD EXCEL")
     elif "amd_stats" in st.session_state:
@@ -4426,6 +4468,15 @@ def show_scanner(fyers) -> None:
                     st.dataframe(top_sell[_radar_top_columns(top_sell)], use_container_width=True, height=380)
                 else:
                     st.info("No directional SELL watch candidates.")
+
+            if top_buy.empty and top_sell.empty:
+                overall_top = _radar_overall_top(report, 10)
+                st.markdown(f"### 🟡 TOP 10 EARLY-WARNING WATCH — {len(overall_top)}")
+                st.caption("No directional BUY/SELL confirmation yet. WAIT candidates are ranked by pre-sweep/pre-move conditions.")
+                if not overall_top.empty:
+                    st.dataframe(overall_top[_radar_top_columns(overall_top)], use_container_width=True, height=380)
+                else:
+                    st.info("No usable early-warning candidates in this scan.")
 
             # Separate actionable sections
             c1, c2 = st.columns(2)
