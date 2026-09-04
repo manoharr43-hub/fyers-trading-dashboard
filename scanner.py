@@ -3638,8 +3638,16 @@ def _show_amd_scan_tab(fyers, all_symbols, fo_symbols):
         if manip_n:
             st.info(f"🟠 MANIPULATION / SWEEP: {manip_n}")
 
+        time_cols = ["SIGNAL TIME", "LAST SEEN", "SIGNAL AGE"]
+        for _c in time_cols:
+            if _c not in out.columns:
+                out[_c] = "-"
+        preferred = ["Symbol", "SOURCE", "LTP", "AMD PHASE", "AMD SIGNAL",
+                     "SIGNAL TIME", "LAST SEEN", "SIGNAL AGE",
+                     "AMD SCORE", "AMD BUY SCORE", "AMD SELL SCORE"]
+        visible = [c for c in preferred if c in out.columns] + [c for c in out.columns if c not in preferred]
         st.caption(f"📄 AMD REPORT: {len(out)} rows shown")
-        st.dataframe(out, use_container_width=True, height=550)
+        st.dataframe(out[visible], use_container_width=True, height=550)
         _excel_download_button(out, "AMD_SCAN", "amd_excel", label="📥 DOWNLOAD AMD EXCEL")
     elif "amd_stats" in st.session_state:
         st.warning("AMD scan completed — no analyzable rows returned.")
@@ -3768,7 +3776,11 @@ def show_scanner(fyers) -> None:
                 
                 st.caption(f"📄 NSE REPORT: {len(nse_filtered)} rows shown")
                 st.dataframe(nse_filtered, use_container_width=True, height=500)
-                
+
+                st.markdown("### 📋 FULL NSE SCAN REPORT")
+                st.caption(f"All scanned/analyzable rows: {len(nse_df)} — this report stays visible even if filters return 0 rows.")
+                st.dataframe(nse_df, use_container_width=True, height=350)
+
                 st.markdown("### 📥 Download")
                 col_d1, col_d2, col_d3 = st.columns(3)
                 
@@ -3894,7 +3906,11 @@ def show_scanner(fyers) -> None:
                 
                 st.caption(f"📄 F&O REPORT: {len(fo_filtered)} rows shown")
                 st.dataframe(fo_filtered, use_container_width=True, height=500)
-                
+
+                st.markdown("### 📋 FULL F&O SCAN REPORT")
+                st.caption(f"All scanned/analyzable rows: {len(fo_df)} — this report stays visible even if filters return 0 rows.")
+                st.dataframe(fo_df, use_container_width=True, height=350)
+
                 st.markdown("### 📥 Download")
                 col_d1, col_d2, col_d3 = st.columns(3)
                 
@@ -3949,6 +3965,9 @@ def show_scanner(fyers) -> None:
                 is_fo = momentum_type == "F&O Stocks"
                 momentum_results, momentum_errors, momentum_stats = run_momentum_scan(fyers, momentum_symbols, is_fo=is_fo)
                 mdf = pd.DataFrame(momentum_results) if momentum_results else pd.DataFrame()
+                if not mdf.empty and "DIRECTION" in mdf.columns:
+                    mdf["AI SIGNAL"] = mdf["DIRECTION"].astype(str)
+                    mdf = _add_signal_time_columns(mdf, "AI SIGNAL")
                 st.session_state["momentum_df"] = mdf
                 st.session_state["momentum_errors"] = momentum_errors
                 st.session_state["momentum_stats"] = momentum_stats
@@ -3990,6 +4009,10 @@ def show_scanner(fyers) -> None:
                 st.error(f"Excel export error: {e}")
         elif "momentum_stats" in st.session_state:
             st.warning("Scan completed — no current BUY/SELL movement matched the live thresholds.")
+            st.markdown("### 📄 LIVE MOVEMENT REPORT")
+            empty_cols = ["Symbol", "DIRECTION", "AI SIGNAL", "SIGNAL TIME", "LAST SEEN", "SIGNAL AGE", "SCORE", "RVOL"]
+            st.caption("0 actionable rows — report is shown even when no signal matches.")
+            st.dataframe(pd.DataFrame(columns=empty_cols), use_container_width=True, height=180)
         else:
             st.info("👈 Click 'SCAN LIVE MOVEMENT' to find stocks moving NOW.")
 
@@ -4037,7 +4060,7 @@ def show_scanner(fyers) -> None:
                 intraday_signal_filter = st.selectbox("Signal", ["ALL", "BUY", "SELL"], key="intraday_sig_filter")
             with col_if3:
                 intraday_show_cols = st.multiselect("Show Columns", intraday_df.columns, 
-                                                   default=[c for c in ["Symbol", "LTP", "AI SIGNAL", "AI CONFIDENCE %", "SIGNAL TIME", "LAST SEEN", "SIGNAL AGE", "RVOL", "🟢 BUY PRESSURE %", "🔴 SELL PRESSURE %"] if c in intraday_df.columns],
+                                                   default=[c for c in ["Symbol", "LTP", "AI SIGNAL", "SIGNAL TIME", "LAST SEEN", "SIGNAL AGE", "AI CONFIDENCE %", "SIGNAL TIME", "LAST SEEN", "SIGNAL AGE", "RVOL", "🟢 BUY PRESSURE %", "🔴 SELL PRESSURE %"] if c in intraday_df.columns],
                                                    key="intraday_cols")
             
             intraday_filtered = intraday_df.copy()
