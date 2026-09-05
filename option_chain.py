@@ -321,15 +321,18 @@ def _fyers_call_optionchain(fyers: Any, symbol: str, strikecount: int, timestamp
 
 
 def _fyers_call_history(fyers: Any, symbol: str, resolution: str, count: int = 100) -> Optional[dict]:
-    """Fetches OHLCV candle data from FYERS."""
+    """Fetch OHLCV candles from FYERS using a valid historical date range."""
     try:
+        end_dt = datetime.now(timezone.utc)
+        start_dt = end_dt - timedelta(days=7)
+
         req = {
             "symbol": symbol,
             "resolution": str(resolution),
             "date_format": "1",
-            "range_from": "0",
-            "range_to": "0",
-            "cont_flag": "1"
+            "range_from": str(int(start_dt.timestamp())),
+            "range_to": str(int(end_dt.timestamp())),
+            "cont_flag": "1",
         }
         return fyers.history(data=req)
     except Exception as e:
@@ -343,6 +346,8 @@ def fetch_fyers_candles(fyers: Any, symbol: str, timeframe_minutes: int, count: 
         return None
 
     resolution_map = {
+        1: "1",
+        3: "3",
         5: "5",
         15: "15",
         30: "30",
@@ -382,7 +387,7 @@ def fetch_fyers_candles(fyers: Any, symbol: str, timeframe_minutes: int, count: 
 
     df = pd.DataFrame(rows)
     df = df.sort_values("timestamp").reset_index(drop=True)
-    return df
+    return df.tail(max(1, int(count))).reset_index(drop=True)
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -745,7 +750,7 @@ def _render_scalping_panel(scalp: dict[str, Any]) -> None:
         unsafe_allow_html=True,
     )
     if not scalp or not scalp.get("enabled"):
-        st.info("Scalping mode needs FYERS 1M/3M/5M candle data.")
+        st.info("Scalping mode is waiting for FYERS 1M/3M/5M/15M candle data.")
         return
 
     status, direction = scalp.get("status", "WAIT"), scalp.get("direction", "NEUTRAL")
@@ -3210,15 +3215,47 @@ def _do_fetch_and_process(cfg: dict, fyers: Any = None) -> Optional[dict]:
         fyers_symbol_candidates = (
             _fyers_index_candidates(cfg["symbol"]) if cfg["is_index"] else fyers_stock_symbol_candidates(stock_name)
         )
-        scalping_symbol = fyers_symbol_candidates[0] if fyers_symbol_candidates else None
-        if scalping_symbol:
-            scalp_dict = {}
+
+        # Try every resolved FYERS symbol variant instead of only the first one.
+        scalp_dict = {}
+        scalping_symbol = None
+        for candidate in fyers_symbol_candidates:
+            test_dict = {}
             for tf_name, tf_mins in SCALPING_TIMEFRAMES.items():
-                scalp_dict[tf_name] = fetch_fyers_candles(
-                    fyers, scalping_symbol, tf_mins, count=120
+                test_dict[tf_name] = fetch_fyers_candles(
+                    fyers, candidate, tf_mins, count=120
                 )
+
+            usable = sum(
+                1 for df_tf in test_dict.values()
+                if isinstance(df_tf, pd.DataFrame) and not df_tf.empty
+            )
+            if usable:
+                scalping_symbol = candidate
+                scalp_dict = test_dict
+                break
+
+        if scalp_dict:
             scalping_data = compute_scalping_early_warning(scalp_dict, spot)
             scalping_data["df_dict"] = scalp_dict
+            scalping_data["fyers_symbol"] = scalping_symbol
+        else:
+            scalping_data = {
+                "enabled": False,
+                "trigger": "FYERS candle fetch failed",
+                "score": 0.0,
+                "confidence": 0.0,
+                "direction": "WATCH",
+                "entry": None,
+                "sl": None,
+                "targets": [],
+                "reasons": [
+                    "FYERS returned no usable 1M/3M/5M/15M candles.",
+                    "Check the FYERS symbol/permissions and market-data availability.",
+                ],
+                "df_dict": {},
+                "fyers_symbol": None,
+            }
 
     po3_price_df = None
     if price_action_data and price_action_data.get("df_dict"):
