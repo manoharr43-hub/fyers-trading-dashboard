@@ -136,6 +136,13 @@ SCALP_ATR_PERIOD = 14
 SCALP_BREAKOUT_LOOKBACK = 12
 SCALP_EARLY_SCORE_THRESHOLD = 70.0
 
+# MOVEMENT-BEFORE-IT-HAPPENS HISTORY
+MOVEMENT_HISTORY_KEY = "oc_movement_history"
+MOVEMENT_HISTORY_MAX = 60
+MOVEMENT_EARLY_THRESHOLD = 65.0
+MOVEMENT_STRONG_THRESHOLD = 78.0
+MOVEMENT_MIN_RISING_SCANS = 2
+
 DEFAULT_RSI_PERIOD = 14
 DEFAULT_EMA_PERIODS = {"fast": 9, "slow": 21}
 DEFAULT_MACD_PARAMS = {"fast": 12, "slow": 26, "signal": 9}
@@ -2277,6 +2284,216 @@ def add_strike_movement_score(df: pd.DataFrame) -> pd.DataFrame:
     return d
 
 
+def _movement_history_key(symbol: str, expiry_label: str, strike: float) -> str:
+    return f"{symbol}|{expiry_label}|{float(strike):.4f}"
+
+
+def compute_movement_early_warning(
+    df: pd.DataFrame, symbol: str, expiry_label: str, spot: float
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """Track movement-score acceleration across live scans.
+
+    This adds a *build-up* layer to the existing movement ranking. It does not
+    predict an exact future price. It looks for repeated score improvement,
+    directional pressure and option activity before the current movement score
+    becomes extreme.
+    """
+    d = df.copy()
+    default_summary = {
+        "status": "WAIT", "direction": "NEUTRAL", "strike": None,
+        "early_score": 0.0, "current_score": 0.0, "score_delta": 0.0,
+        "score_acceleration": 0.0, "rising_scans": 0, "confidence": 0.0,
+        "volume": 0.0, "oi_change": 0.0, "pressure": 50.0,
+        "reason": "Waiting for repeated scans"
+    }
+    if d.empty or "movement_score" not in d.columns:
+        for c, default in {
+            "early_movement_score": 0.0,
+            "movement_score_delta": 0.0,
+            "movement_score_acceleration": 0.0,
+            "movement_rising_scans": 0,
+            "early_movement_status": "WAIT",
+            "early_movement_confidence": 0.0,
+        }.items():
+            d[c] = default
+        return d, default_summary
+
+    history = st.session_state.setdefault(MOVEMENT_HISTORY_KEY, {})
+    now = datetime.now()
+
+    # Save the current snapshot strike-by-strike.
+    for _, row in d.iterrows():
+        strike = float(row.get("strike_price", 0) or 0)
+        if strike <= 0:
+            continue
+        key = _movement_history_key(symbol, expiry_label, strike)
+        series = history.get(key, [])
+        series.append({
+            "ts": now,
+            "score": float(row.get("movement_score", 0) or 0),
+            "ce_score": float(row.get("ce_movement_score", 0) or 0),
+            "pe_score": float(row.get("pe_movement_score", 0) or 0),
+            "buy": float(row.get("buy_pressure", 50) or 50),
+            "sell": float(row.get("sell_pressure", 50) or 50),
+            "volume": float(row.get("total_volume", 0) or 0),
+            "oi": float(abs(row.get("ce_chng_oi", 0) or 0) + abs(row.get("pe_chng_oi", 0) or 0)),
+        })
+        history[key] = series[-MOVEMENT_HISTORY_MAX:]
+
+    st.session_state[MOVEMENT_HISTORY_KEY] = history
+
+    early_scores = []
+    deltas = []
+    accels = []
+    rising_counts = []
+    statuses = []
+    confidences = []
+
+    for _, row in d.iterrows():
+        strike = float(row.get("strike_price", 0) or 0)
+        key = _movement_history_key(symbol, expiry_label, strike)
+        series = history.get(key, [])
+        scores = [float(x.get("score", 0)) for x in series]
+        current = scores[-1] if scores else float(row.get("movement_score", 0) or 0)
+
+        delta = scores[-1] - scores[-2] if len(scores) >= 2 else 0.0
+        prev_delta = scores[-2] - scores[-3] if len(scores) >= 3 else 0.0
+        accel = delta - prev_delta if len(scores) >= 3 else 0.0
+
+        rising = 0
+        for i in range(len(scores) - 1, 0, -1):
+            if scores[i] > scores[i - 1] + 0.5:
+                rising += 1
+            else:
+                break
+
+        ce = float(row.get("ce_movement_score", 0) or 0)
+        pe = float(row.get("pe_movement_score", 0) or 0)
+        directional_gap = abs(ce - pe)
+        pressure_gap = abs(float(row.get("buy_pressure", 50) or 50) - float(row.get("sell_pressure", 50) or 50))
+
+        # Build-up score: current activity + improving score + acceleration + direction.
+        delta_component = float(np.clip(50.0 + delta * 2.5, 0, 100))
+        accel_component = float(np.clip(50.0 + accel * 4.0, 0, 100))
+        direction_component = float(np.clip(50.0 + directional_gap * 1.2 + pressure_gap * 0.25, 0, 100))
+        early = float(np.clip(
+            current * 0.50 + delta_component * 0.20 + accel_component * 0.10 + direction_component * 0.20,
+            0, 100
+        ))
+
+        if rising >= MOVEMENT_MIN_RISING_SCANS and early >= MOVEMENT_STRONG_THRESHOLD:
+            status = "STRONG MOVE"
+        elif rising >= MOVEMENT_MIN_RISING_SCANS and early >= MOVEMENT_EARLY_THRESHOLD:
+            status = "EARLY MOVE"
+        elif rising >= 1 and delta > 0:
+            status = "BUILDING"
+        else:
+            status = "WAIT"
+
+        confidence = float(np.clip(
+            35 + early * 0.45 + min(rising, 4) * 5 + min(directional_gap, 30) * 0.2,
+            0, 95
+        ))
+
+        early_scores.append(round(early, 1))
+        deltas.append(round(delta, 1))
+        accels.append(round(accel, 1))
+        rising_counts.append(rising)
+        statuses.append(status)
+        confidences.append(round(confidence, 1))
+
+    d["early_movement_score"] = early_scores
+    d["movement_score_delta"] = deltas
+    d["movement_score_acceleration"] = accels
+    d["movement_rising_scans"] = rising_counts
+    d["early_movement_status"] = statuses
+    d["early_movement_confidence"] = confidences
+
+    # Pick the best candidate only after it has some evidence of building.
+    candidates = d[d["early_movement_status"].isin(["BUILDING", "EARLY MOVE", "STRONG MOVE"])].copy()
+    if candidates.empty:
+        candidates = d.sort_values("early_movement_score", ascending=False).head(1)
+    if candidates.empty:
+        return d, default_summary
+
+    best = candidates.sort_values(
+        ["early_movement_score", "movement_score_delta"], ascending=False
+    ).iloc[0]
+    ce = float(best.get("ce_movement_score", 0) or 0)
+    pe = float(best.get("pe_movement_score", 0) or 0)
+    direction = "CE / UP" if ce > pe + 7 else ("PE / DOWN" if pe > ce + 7 else "BOTH / CHOP")
+    reasons = []
+    if float(best.get("movement_score_delta", 0) or 0) > 0:
+        reasons.append(f"score +{float(best['movement_score_delta']):.1f}")
+    if float(best.get("movement_score_acceleration", 0) or 0) > 0:
+        reasons.append("acceleration positive")
+    if int(best.get("movement_rising_scans", 0) or 0) >= 2:
+        reasons.append(f"{int(best['movement_rising_scans'])} rising scans")
+    if bool(best.get("volume_spike", False)):
+        reasons.append("volume spike")
+    if bool(best.get("oi_surge", False)):
+        reasons.append("OI surge")
+    if abs(float(best.get("buy_pressure", 50) or 50) - float(best.get("sell_pressure", 50) or 50)) >= 15:
+        reasons.append("pressure imbalance")
+
+    return d, {
+        "status": str(best.get("early_movement_status", "WAIT")),
+        "direction": direction,
+        "strike": float(best.get("strike_price", 0) or 0),
+        "early_score": float(best.get("early_movement_score", 0) or 0),
+        "current_score": float(best.get("movement_score", 0) or 0),
+        "score_delta": float(best.get("movement_score_delta", 0) or 0),
+        "score_acceleration": float(best.get("movement_score_acceleration", 0) or 0),
+        "rising_scans": int(best.get("movement_rising_scans", 0) or 0),
+        "confidence": float(best.get("early_movement_confidence", 0) or 0),
+        "volume": float(best.get("total_volume", 0) or 0),
+        "oi_change": float(abs(best.get("ce_chng_oi", 0) or 0) + abs(best.get("pe_chng_oi", 0) or 0)),
+        "pressure": max(float(best.get("buy_pressure", 50) or 50), float(best.get("sell_pressure", 50) or 50)),
+        "reason": ", ".join(reasons) if reasons else "Activity building",
+    }
+
+
+def _render_movement_early_warning(early: dict[str, Any]) -> None:
+    st.markdown('<div class="block-title">🚨 MOVEMENT BEFORE IT HAPPENS — EARLY WARNING</div>', unsafe_allow_html=True)
+    if not early:
+        st.info("Waiting for live movement history.")
+        return
+
+    status = str(early.get("status", "WAIT"))
+    direction = str(early.get("direction", "NEUTRAL"))
+    score = float(early.get("early_score", 0) or 0)
+    confidence = float(early.get("confidence", 0) or 0)
+
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("STATUS", status)
+    c2.metric("DIRECTION", direction)
+    c3.metric("EARLY SCORE", f"{score:.0f}/100")
+    c4.metric("CONFIDENCE", f"{confidence:.0f}%")
+    c5.metric("RISING SCANS", str(int(early.get("rising_scans", 0) or 0)))
+
+    c6, c7, c8, c9 = st.columns(4)
+    c6.metric("STRIKE", f"{float(early.get('strike', 0) or 0):,.0f}" if early.get("strike") else "—")
+    c7.metric("CURRENT MOVE", f"{float(early.get('current_score', 0) or 0):.0f}")
+    c8.metric("SCORE Δ", f"{float(early.get('score_delta', 0) or 0):+.1f}")
+    c9.metric("ACCELERATION", f"{float(early.get('score_acceleration', 0) or 0):+.1f}")
+
+    if status == "STRONG MOVE":
+        st.error(f"🔴 STRONG MOVE BUILDING — {direction} near {float(early.get('strike', 0) or 0):,.0f}")
+    elif status == "EARLY MOVE":
+        st.warning(f"🟠 EARLY MOVE — {direction} near {float(early.get('strike', 0) or 0):,.0f}")
+    elif status == "BUILDING":
+        st.info(f"🟡 BUILDING — {direction} near {float(early.get('strike', 0) or 0):,.0f}")
+    else:
+        st.success("🟢 No confirmed build-up yet. Continue monitoring repeated scans.")
+
+    st.caption(
+        f"Reasons: {early.get('reason', '—')} | "
+        f"OI activity: {float(early.get('oi_change', 0) or 0):,.0f} | "
+        f"Pressure: {float(early.get('pressure', 50) or 50):.0f}"
+    )
+    st.caption("⚠️ Early Warning is probabilistic: it detects rising activity/pressure across scans; it cannot guarantee the next move.")
+
+
 def add_pressure_analysis(df: pd.DataFrame, spot: float, lot_size: int = 1) -> tuple[pd.DataFrame, MarketPressure]:
     """Full pressure analysis pipeline."""
     d = df.copy()
@@ -3168,6 +3385,9 @@ def _do_fetch_and_process(cfg: dict, fyers: Any = None) -> Optional[dict]:
     # ✅ ADD PRESSURE ANALYSIS
     df, market_pressure = add_pressure_analysis(df, spot, cfg["lot_size"])
     df = add_strike_movement_score(df)
+    df, movement_early_warning = compute_movement_early_warning(
+        df, cfg["symbol"], meta["selected_expiry"], spot
+    )
 
     pcr = calc_pcr(df)
     max_pain = calc_max_pain(df)
@@ -3273,6 +3493,7 @@ def _do_fetch_and_process(cfg: dict, fyers: Any = None) -> Optional[dict]:
         "po3_intelligence": po3_intelligence,
         "final_signal": po3_intelligence.get("final_signal", {}),
         "scalping_data": scalping_data,
+        "movement_early_warning": movement_early_warning,
     }
 
 
@@ -3418,6 +3639,8 @@ def run_dashboard(fyers: Any = None) -> None:
             )
             st.warning(alert_text)
 
+    _render_movement_early_warning(state.get("movement_early_warning") or {})
+
     if cfg.get("scalping_mode"):
         _render_scalping_panel(state.get("scalping_data") or {})
 
@@ -3533,6 +3756,16 @@ def run_dashboard(fyers: Any = None) -> None:
                 f"Score {float(best.get('movement_score', 0)):.0f}/100 | "
                 f"Strength {best.get('movement_strength', 'LOW')}"
             )
+            early_cols = [c for c in [
+                "strike_price", "early_movement_score", "early_movement_status",
+                "movement_score_delta", "movement_score_acceleration",
+                "movement_rising_scans", "early_movement_confidence"
+            ] if c in move_view.columns]
+            if early_cols:
+                st.dataframe(
+                    move_view.sort_values("early_movement_score", ascending=False).head(top_n)[early_cols],
+                    use_container_width=True, hide_index=True
+                )
             st.dataframe(move_view.head(top_n), use_container_width=True, hide_index=True)
             st.plotly_chart(chart_movement_score(df), use_container_width=True, config={"displayModeBar": False})
         else:
