@@ -121,6 +121,21 @@ TIMEFRAMES = {
     "1D": 24 * 60 * 60,
 }
 
+# ══════════════════════════════════════════════════════════════════════════
+# SCALPING / BIG-MOVEMENT EARLY WARNING (ADDITIVE - ORIGINAL LOGIC UNCHANGED)
+# ══════════════════════════════════════════════════════════════════════════
+SCALPING_TIMEFRAMES = {
+    "1M": 1,
+    "3M": 3,
+    "5M": 5,
+    "15M": 15,
+}
+SCALPING_MIN_CANDLES = 30
+SCALP_RVOL_THRESHOLD = 1.30
+SCALP_ATR_PERIOD = 14
+SCALP_BREAKOUT_LOOKBACK = 12
+SCALP_EARLY_SCORE_THRESHOLD = 70.0
+
 DEFAULT_RSI_PERIOD = 14
 DEFAULT_EMA_PERIODS = {"fast": 9, "slow": 21}
 DEFAULT_MACD_PARAMS = {"fast": 12, "slow": 26, "signal": 9}
@@ -569,6 +584,193 @@ def detect_mss(df_list: dict[str, pd.DataFrame]) -> dict[str, dict]:
 # ══════════════════════════════════════════════════════════════════════════
 # 7. TRADE SIGNAL GENERATION (ORIGINAL - UNMODIFIED)
 # ══════════════════════════════════════════════════════════════════════════
+
+
+def calculate_atr(df: pd.DataFrame, period: int = SCALP_ATR_PERIOD) -> pd.Series:
+    """ATR for short-term volatility/range detection."""
+    if df.empty or not all(c in df.columns for c in ("high", "low", "close")):
+        return pd.Series(index=df.index, dtype=float)
+    prev_close = df["close"].shift(1)
+    tr = pd.concat(
+        [
+            df["high"] - df["low"],
+            (df["high"] - prev_close).abs(),
+            (df["low"] - prev_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+    return tr.rolling(period, min_periods=1).mean()
+
+
+def compute_scalping_early_warning(df_dict: dict[str, pd.DataFrame], spot: float) -> dict[str, Any]:
+    """
+    Additive early-warning model for a possible large short-term move.
+    It ranks compression/range expansion, RVOL, EMA, VWAP and breakout proximity.
+    It is an alert model, not a guaranteed prediction.
+    """
+    result = {
+        "enabled": True, "status": "WAIT", "direction": "NEUTRAL",
+        "score": 0.0, "confidence": 0.0, "trigger": "No setup",
+        "reasons": [], "timeframe": "1M/3M/5M",
+        "entry": 0.0, "stop_loss": 0.0, "target_1": 0.0,
+        "target_2": 0.0, "target_3": 0.0,
+    }
+    if not df_dict:
+        result.update(enabled=False, trigger="No FYERS candle data")
+        return result
+
+    df = next(
+        (df_dict.get(tf) for tf in ("1M", "3M", "5M")
+         if isinstance(df_dict.get(tf), pd.DataFrame) and not df_dict[tf].empty),
+        None,
+    )
+    if df is None or len(df) < SCALPING_MIN_CANDLES:
+        result.update(enabled=False, trigger="Insufficient scalping candles")
+        return result
+
+    d = df.copy()
+    d["atr"] = calculate_atr(d)
+    d["rvol"] = calculate_rvol(d, 20)
+    d["ema_9"] = calculate_ema(d, 9)
+    d["ema_21"] = calculate_ema(d, 21)
+    d["vwap"] = calculate_vwap(d)
+
+    last, prev = d.iloc[-1], d.iloc[-2]
+    recent = d.iloc[-(SCALP_BREAKOUT_LOOKBACK + 1):-1]
+    if recent.empty:
+        recent = d.iloc[:-1].tail(SCALP_BREAKOUT_LOOKBACK)
+
+    close = float(last["close"])
+    atr = max(float(last["atr"]), 1e-9)
+    rvol = float(last["rvol"])
+    candle_range = float(last["high"] - last["low"])
+    body_ratio = abs(float(last["close"] - last["open"])) / max(candle_range, 1e-9)
+    ema9, ema21, vwap = float(last["ema_9"]), float(last["ema_21"]), float(last["vwap"])
+    recent_high = float(recent["high"].max()) if not recent.empty else float(last["high"])
+    recent_low = float(recent["low"].min()) if not recent.empty else float(last["low"])
+
+    score_up = score_down = 0.0
+    up_reasons, down_reasons = [], []
+
+    if candle_range >= atr * 1.15 and body_ratio >= 0.55:
+        if close > float(last["open"]):
+            score_up += 20; up_reasons.append("range expansion")
+        else:
+            score_down += 20; down_reasons.append("range expansion")
+
+    if rvol >= SCALP_RVOL_THRESHOLD:
+        if close >= float(last["open"]):
+            score_up += 20; up_reasons.append(f"RVOL {rvol:.1f}x")
+        else:
+            score_down += 20; down_reasons.append(f"RVOL {rvol:.1f}x")
+
+    if ema9 > ema21:
+        score_up += 15; up_reasons.append("EMA 9 > EMA 21")
+    elif ema9 < ema21:
+        score_down += 15; down_reasons.append("EMA 9 < EMA 21")
+
+    if close > vwap:
+        score_up += 10; up_reasons.append("price above VWAP")
+    elif close < vwap:
+        score_down += 10; down_reasons.append("price below VWAP")
+
+    distance_up_atr = (recent_high - close) / atr
+    distance_down_atr = (close - recent_low) / atr
+    if close > recent_high:
+        score_up += 25; up_reasons.append("recent high breakout")
+    elif close < recent_low:
+        score_down += 25; down_reasons.append("recent low breakdown")
+    elif 0 <= distance_up_atr <= 0.35:
+        score_up += 10; up_reasons.append("near resistance")
+    elif 0 <= distance_down_atr <= 0.35:
+        score_down += 10; down_reasons.append("near support")
+
+    if close > float(last["open"]) and float(prev["close"]) >= float(prev["open"]):
+        score_up += 10; up_reasons.append("2-candle momentum")
+    elif close < float(last["open"]) and float(prev["close"]) <= float(prev["open"]):
+        score_down += 10; down_reasons.append("2-candle momentum")
+
+    if score_up >= score_down and score_up >= SCALP_EARLY_SCORE_THRESHOLD:
+        direction, score, reasons = "UP", score_up, up_reasons
+    elif score_down > score_up and score_down >= SCALP_EARLY_SCORE_THRESHOLD:
+        direction, score, reasons = "DOWN", score_down, down_reasons
+    else:
+        direction, score, reasons = "NEUTRAL", max(score_up, score_down), (
+            up_reasons if score_up >= score_down else down_reasons
+        )
+
+    tf5 = df_dict.get("5M")
+    if isinstance(tf5, pd.DataFrame) and len(tf5) >= 21 and direction in ("UP", "DOWN"):
+        htf = tf5.copy()
+        htf["ema_9"] = calculate_ema(htf, 9)
+        htf["ema_21"] = calculate_ema(htf, 21)
+        htf_up = float(htf["ema_9"].iloc[-1]) > float(htf["ema_21"].iloc[-1])
+        htf_down = float(htf["ema_9"].iloc[-1]) < float(htf["ema_21"].iloc[-1])
+        aligned = (direction == "UP" and htf_up) or (direction == "DOWN" and htf_down)
+        if aligned:
+            score = min(100.0, score + 5); reasons.append("5M trend aligned")
+        else:
+            score = max(0.0, score - 5); reasons.append("5M trend not aligned")
+
+    if direction in ("UP", "DOWN"):
+        risk = max(atr * 0.8, close * 0.001)
+        if direction == "UP":
+            entry, sl = close, close - risk
+            t1, t2, t3 = close + risk, close + 1.5 * risk, close + 2.0 * risk
+        else:
+            entry, sl = close, close + risk
+            t1, t2, t3 = close - risk, close - 1.5 * risk, close - 2.0 * risk
+        result.update(
+            status="EARLY BUY" if direction == "UP" else "EARLY SELL",
+            direction=direction, score=round(min(score, 100.0), 1),
+            confidence=round(min(max(score, 0.0), 95.0), 1),
+            trigger=" + ".join(dict.fromkeys(reasons)) or "Short-term momentum",
+            reasons=list(dict.fromkeys(reasons)), entry=round(entry, 2),
+            stop_loss=round(sl, 2), target_1=round(t1, 2),
+            target_2=round(t2, 2), target_3=round(t3, 2),
+        )
+    else:
+        result.update(
+            status="WATCH", score=round(min(score, 100.0), 1),
+            confidence=round(min(score, 95.0), 1),
+            trigger=" + ".join(dict.fromkeys(reasons)) or "Waiting for expansion",
+            reasons=list(dict.fromkeys(reasons)),
+        )
+    return result
+
+
+def _render_scalping_panel(scalp: dict[str, Any]) -> None:
+    st.markdown(
+        '<div class="block-title">⚡ SCALPING MODE — BIG-MOVEMENT EARLY WARNING</div>',
+        unsafe_allow_html=True,
+    )
+    if not scalp or not scalp.get("enabled"):
+        st.info("Scalping mode needs FYERS 1M/3M/5M candle data.")
+        return
+
+    status, direction = scalp.get("status", "WAIT"), scalp.get("direction", "NEUTRAL")
+    score = float(scalp.get("score", 0) or 0)
+    cols = st.columns(5)
+    cols[0].metric("SCALP STATUS", status)
+    cols[1].metric("DIRECTION", direction)
+    cols[2].metric("EARLY SCORE", f"{score:.0f}/100")
+    cols[3].metric("ENTRY", f"₹{float(scalp.get('entry', 0) or 0):,.2f}" if scalp.get("entry") else "—")
+    cols[4].metric("SL", f"₹{float(scalp.get('stop_loss', 0) or 0):,.2f}" if scalp.get("stop_loss") else "—")
+
+    if status == "EARLY BUY":
+        st.success("🟢 Early BUY setup — wait for breakout/volume confirmation before acting.")
+    elif status == "EARLY SELL":
+        st.error("🔴 Early SELL setup — wait for breakdown/volume confirmation before acting.")
+    else:
+        st.warning("🟡 WATCH — no strong short-term expansion setup yet.")
+
+    st.caption("Reasons: " + (", ".join(scalp.get("reasons", [])) or "Waiting for confirmation"))
+    if scalp.get("entry"):
+        st.caption(
+            f"Targets: T1 ₹{scalp['target_1']:,.2f} | "
+            f"T2 ₹{scalp['target_2']:,.2f} | T3 ₹{scalp['target_3']:,.2f}"
+        )
+
 
 @dataclass
 class TradeSignal:
@@ -2878,6 +3080,14 @@ def _sidebar_config() -> dict:
         st.markdown("### 📊 Price Action Analysis")
         analyze_price_action = st.checkbox("Fetch & Analyze Price Action (requires FYERS)", value=False, key="oc_price_action")
 
+        # ADDITIVE: optional scalping layer; old price-action logic remains untouched.
+        scalping_mode = st.checkbox(
+            "⚡ Enable Scalping Mode (FYERS)",
+            value=False,
+            key="oc_scalping_mode",
+            help="Adds 1M/3M/5M early-warning analysis without changing the existing MTF signal.",
+        )
+
         st.divider()
         st.markdown("### 🔄 Auto Refresh")
         auto_refresh = st.checkbox("Enable auto-refresh", value=False, key="oc_auto_refresh")
@@ -2900,6 +3110,7 @@ def _sidebar_config() -> dict:
         "debug_mode": debug_mode, "fetch_clicked": (fetch_clicked or free_run),
         "free_run": free_run,
         "analyze_price_action": analyze_price_action,
+        "scalping_mode": scalping_mode,
     }
 
 
@@ -2994,6 +3205,21 @@ def _do_fetch_and_process(cfg: dict, fyers: Any = None) -> Optional[dict]:
                     "trade_signal": trade_signal,
                 }
 
+    scalping_data = None
+    if cfg.get("scalping_mode") and fyers is not None:
+        fyers_symbol_candidates = (
+            _fyers_index_candidates(cfg["symbol"]) if cfg["is_index"] else fyers_stock_symbol_candidates(stock_name)
+        )
+        scalping_symbol = fyers_symbol_candidates[0] if fyers_symbol_candidates else None
+        if scalping_symbol:
+            scalp_dict = {}
+            for tf_name, tf_mins in SCALPING_TIMEFRAMES.items():
+                scalp_dict[tf_name] = fetch_fyers_candles(
+                    fyers, scalping_symbol, tf_mins, count=120
+                )
+            scalping_data = compute_scalping_early_warning(scalp_dict, spot)
+            scalping_data["df_dict"] = scalp_dict
+
     po3_price_df = None
     if price_action_data and price_action_data.get("df_dict"):
         po3_price_df = price_action_data["df_dict"].get("5M")
@@ -3009,6 +3235,7 @@ def _do_fetch_and_process(cfg: dict, fyers: Any = None) -> Optional[dict]:
         "market_pressure": market_pressure,
         "po3_intelligence": po3_intelligence,
         "final_signal": po3_intelligence.get("final_signal", {}),
+        "scalping_data": scalping_data,
     }
 
 
@@ -3154,10 +3381,14 @@ def run_dashboard(fyers: Any = None) -> None:
             )
             st.warning(alert_text)
 
+    if cfg.get("scalping_mode"):
+        _render_scalping_panel(state.get("scalping_data") or {})
+
     source = state.get("data_source", "UNKNOWN")
     source_badge = "🟢 FYERS" if source == "FYERS" else ("🟡 NSE" if source == "NSE" else "⚪ Unknown")
+    mode_badge = "⚡ SCALPING ON" if cfg.get("scalping_mode") else "NORMAL MODE"
     st.caption(
-        f"📡 Source: **{source_badge}** | Sentiment: {_pcr_sentiment_badge(state['pcr'])} | "
+        f"📡 Source: **{source_badge}** | Mode: **{mode_badge}** | Sentiment: {_pcr_sentiment_badge(state['pcr'])} | "
         f"Last update: **{meta.get('fetched_at', datetime.now()).strftime('%H:%M:%S')}**"
     , unsafe_allow_html=True)
 
