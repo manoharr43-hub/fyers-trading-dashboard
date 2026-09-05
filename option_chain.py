@@ -2381,11 +2381,24 @@ def compute_movement_early_warning(
             0, 100
         ))
 
-        if rising >= MOVEMENT_MIN_RISING_SCANS and early >= MOVEMENT_STRONG_THRESHOLD:
+        volume_spike = bool(row.get("volume_spike", False))
+        oi_surge = bool(row.get("oi_surge", False))
+        confirmation = (
+            volume_spike
+            or oi_surge
+            or pressure_gap >= 15
+            or directional_gap >= 12
+        )
+
+        # If the current movement is already very strong and has confirmation,
+        # do not show WAIT just because this is the first scan in the session.
+        if early >= MOVEMENT_STRONG_THRESHOLD and confirmation:
             status = "STRONG MOVE"
-        elif rising >= MOVEMENT_MIN_RISING_SCANS and early >= MOVEMENT_EARLY_THRESHOLD:
+        elif rising >= MOVEMENT_MIN_RISING_SCANS and early >= MOVEMENT_STRONG_THRESHOLD:
+            status = "STRONG MOVE"
+        elif early >= MOVEMENT_EARLY_THRESHOLD and (rising >= MOVEMENT_MIN_RISING_SCANS or confirmation):
             status = "EARLY MOVE"
-        elif rising >= 1 and delta > 0:
+        elif (rising >= 1 and delta > 0) or (early >= 55 and confirmation):
             status = "BUILDING"
         else:
             status = "WAIT"
@@ -2478,7 +2491,10 @@ def _render_movement_early_warning(early: dict[str, Any]) -> None:
     c9.metric("ACCELERATION", f"{float(early.get('score_acceleration', 0) or 0):+.1f}")
 
     if status == "STRONG MOVE":
-        st.error(f"🔴 STRONG MOVE BUILDING — {direction} near {float(early.get('strike', 0) or 0):,.0f}")
+        st.error(
+            f"🔴 STRONG MOVE CONFIRMED — {direction} near "
+            f"{float(early.get('strike', 0) or 0):,.0f}"
+        )
     elif status == "EARLY MOVE":
         st.warning(f"🟠 EARLY MOVE — {direction} near {float(early.get('strike', 0) or 0):,.0f}")
     elif status == "BUILDING":
@@ -3756,17 +3772,35 @@ def run_dashboard(fyers: Any = None) -> None:
                 f"Score {float(best.get('movement_score', 0)):.0f}/100 | "
                 f"Strength {best.get('movement_strength', 'LOW')}"
             )
+            # IMPORTANT: early-warning columns are added to df, not move_view.
+            # Build a separate view from df so missing columns can never cause
+            # KeyError("early_movement_score").
             early_cols = [c for c in [
                 "strike_price", "early_movement_score", "early_movement_status",
                 "movement_score_delta", "movement_score_acceleration",
                 "movement_rising_scans", "early_movement_confidence"
-            ] if c in move_view.columns]
-            if early_cols:
+            ] if c in df.columns]
+
+            if "early_movement_score" in df.columns and early_cols:
+                early_view = df[early_cols].copy()
+                early_view["early_movement_score"] = pd.to_numeric(
+                    early_view["early_movement_score"], errors="coerce"
+                ).fillna(0.0)
+                early_view = early_view.sort_values(
+                    "early_movement_score", ascending=False
+                ).head(top_n)
+                st.markdown("#### 🚨 Early Movement Ranking")
                 st.dataframe(
-                    move_view.sort_values("early_movement_score", ascending=False).head(top_n)[early_cols],
-                    use_container_width=True, hide_index=True
+                    early_view,
+                    use_container_width=True,
+                    hide_index=True
                 )
-            st.dataframe(move_view.head(top_n), use_container_width=True, hide_index=True)
+
+            st.dataframe(
+                move_view.head(top_n),
+                use_container_width=True,
+                hide_index=True
+            )
             st.plotly_chart(chart_movement_score(df), use_container_width=True, config={"displayModeBar": False})
         else:
             st.info("No strike movement data available.")
