@@ -3,6 +3,7 @@ option_chain.py (ENHANCED VERSION)
 ==================================
 NSE India Options Chain Dashboard with AI-Powered Price Action Signals
 + Institutional Buy/Sell Pressure Analysis
++ ADD-ON: Pre-Move Detector + 5M Scalping Engine (original logic preserved)
 
 Data Source: FYERS (Primary) → NSE (Fallback for option chain only)
 Live Signals: MSS, HH/HL/LH/LL, BOS, CHoCH, VWAP, EMA, RSI, MACD, Volume, RVOL
@@ -2994,6 +2995,12 @@ def _do_fetch_and_process(cfg: dict, fyers: Any = None) -> Optional[dict]:
                     "trade_signal": trade_signal,
                 }
 
+    premove_scalping = None
+    if price_action_data and price_action_data.get("df_dict"):
+        premove_scalping = detect_premove_scalping(
+            price_action_data["df_dict"].get("5M"), df, float(spot or 0)
+        )
+
     po3_price_df = None
     if price_action_data and price_action_data.get("df_dict"):
         po3_price_df = price_action_data["df_dict"].get("5M")
@@ -3007,9 +3014,292 @@ def _do_fetch_and_process(cfg: dict, fyers: Any = None) -> Optional[dict]:
         "oi_shift_notes": oi_shift_notes, "data_source": data_source,
         "price_action_data": price_action_data, "trade_signal": trade_signal,
         "market_pressure": market_pressure,
+        "premove_scalping": premove_scalping,
         "po3_intelligence": po3_intelligence,
         "final_signal": po3_intelligence.get("final_signal", {}),
     }
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 18A. PRE-MOVE + SCALPING ENGINE (ADDITIONAL — ORIGINAL LOGIC UNCHANGED)
+# ══════════════════════════════════════════════════════════════════════════
+
+def detect_premove_scalping(df_5m: Optional[pd.DataFrame],
+                            option_df: Optional[pd.DataFrame],
+                            spot: float) -> dict:
+    """
+    Add-on engine for early movement detection and 5M scalping.
+    It does NOT modify generate_trade_signal() or any original calculations.
+
+    Concept:
+      compression -> liquidity sweep -> reclaim/MSS -> VWAP/EMA alignment
+      -> RVOL/volume expansion -> option OI/pressure confirmation
+      -> PRE-MOVE READY / SCALP BUY / SCALP SELL / WAIT
+    """
+    result = {
+        "status": "WAIT",
+        "direction": "NEUTRAL",
+        "score": 0.0,
+        "confidence": 0.0,
+        "setup": "WAIT",
+        "reasons": [],
+        "entry": None,
+        "stop_loss": None,
+        "target_1": None,
+        "target_2": None,
+        "liquidity_sweep": "NONE",
+        "compression": False,
+        "volume_expansion": False,
+        "option_confirmation": "NONE",
+    }
+
+    if df_5m is None or df_5m.empty or len(df_5m) < 25:
+        result["reasons"] = ["Need at least 25 completed 5M candles."]
+        return result
+
+    d = df_5m.copy()
+    for col in ["open", "high", "low", "close", "volume"]:
+        if col not in d.columns:
+            result["reasons"] = [f"Missing candle column: {col}"]
+            return result
+        d[col] = pd.to_numeric(d[col], errors="coerce")
+    d = d.dropna(subset=["open", "high", "low", "close"]).reset_index(drop=True)
+    if len(d) < 25:
+        result["reasons"] = ["Insufficient clean 5M candles."]
+        return result
+
+    # Indicators are read if already present; otherwise calculate locally.
+    if "ema_9" not in d.columns:
+        d["ema_9"] = calculate_ema(d, 9)
+    if "ema_21" not in d.columns:
+        d["ema_21"] = calculate_ema(d, 21)
+    if "vwap" not in d.columns:
+        d["vwap"] = calculate_vwap(d)
+    if "rsi" not in d.columns:
+        d["rsi"] = calculate_rsi(d)
+    if "rvol" not in d.columns:
+        d["rvol"] = calculate_rvol(d)
+
+    last = d.iloc[-1]
+    prev = d.iloc[-2]
+    recent = d.iloc[-7:-1]
+    prior = d.iloc[-21:-7]
+
+    close = float(last["close"])
+    high = float(last["high"])
+    low = float(last["low"])
+    open_ = float(last["open"])
+    atr_like = float((d["high"] - d["low"]).rolling(14, min_periods=5).mean().iloc[-1])
+    atr_like = max(atr_like, close * 0.001)
+
+    # 1) Compression: recent range materially tighter than prior range.
+    recent_range = float(recent["high"].max() - recent["low"].min())
+    prior_range = float(prior["high"].max() - prior["low"].min()) if not prior.empty else recent_range
+    compression = prior_range > 0 and recent_range <= prior_range * 0.65
+    result["compression"] = bool(compression)
+
+    # 2) Liquidity sweep / rejection around the recent 6-bar extremes.
+    recent_high = float(d["high"].iloc[-7:-1].max())
+    recent_low = float(d["low"].iloc[-7:-1].min())
+    bull_sweep = low < recent_low and close > recent_low
+    bear_sweep = high > recent_high and close < recent_high
+
+    if bull_sweep:
+        result["liquidity_sweep"] = "BULLISH LOW SWEEP"
+    elif bear_sweep:
+        result["liquidity_sweep"] = "BEARISH HIGH SWEEP"
+
+    # 3) Momentum/structure confirmation.
+    ema9 = float(last["ema_9"])
+    ema21 = float(last["ema_21"])
+    vwap = float(last["vwap"])
+    rsi = float(last["rsi"])
+    rvol = float(last["rvol"])
+
+    bullish_reclaim = close > ema9 and close > vwap
+    bearish_reclaim = close < ema9 and close < vwap
+    bullish_momentum = ema9 >= ema21 and rsi >= 52
+    bearish_momentum = ema9 <= ema21 and rsi <= 48
+
+    # 4) Volume expansion after compression/sweep.
+    avg_prev_vol = float(d["volume"].iloc[-21:-1].mean()) if len(d) >= 22 else 0.0
+    volume_expansion = avg_prev_vol > 0 and float(last["volume"]) >= avg_prev_vol * 1.35
+    result["volume_expansion"] = bool(volume_expansion)
+
+    # 5) Candle rejection quality.
+    candle_range = max(high - low, 1e-9)
+    upper_wick = high - max(open_, close)
+    lower_wick = min(open_, close) - low
+    bull_rejection = lower_wick >= candle_range * 0.35 and close >= open_
+    bear_rejection = upper_wick >= candle_range * 0.35 and close <= open_
+
+    buy_score = 0.0
+    sell_score = 0.0
+    buy_reasons = []
+    sell_reasons = []
+
+    if compression:
+        buy_score += 10
+        sell_score += 10
+        buy_reasons.append("Compression")
+        sell_reasons.append("Compression")
+
+    if bull_sweep:
+        buy_score += 25
+        buy_reasons.append("Liquidity low sweep + reclaim")
+    if bear_sweep:
+        sell_score += 25
+        sell_reasons.append("Liquidity high sweep + rejection")
+
+    if bullish_reclaim:
+        buy_score += 15
+        buy_reasons.append("Price above EMA9 + VWAP")
+    if bearish_reclaim:
+        sell_score += 15
+        sell_reasons.append("Price below EMA9 + VWAP")
+
+    if bullish_momentum:
+        buy_score += 15
+        buy_reasons.append("EMA9/21 + RSI bullish")
+    if bearish_momentum:
+        sell_score += 15
+        sell_reasons.append("EMA9/21 + RSI bearish")
+
+    if volume_expansion:
+        if close >= open_:
+            buy_score += 15
+            buy_reasons.append("Volume expansion")
+        else:
+            sell_score += 15
+            sell_reasons.append("Volume expansion")
+
+    if bull_rejection:
+        buy_score += 10
+        buy_reasons.append("Bullish rejection candle")
+    if bear_rejection:
+        sell_score += 10
+        sell_reasons.append("Bearish rejection candle")
+
+    # 6) Option-chain confirmation around ATM.
+    option_bias = "NONE"
+    if option_df is not None and not option_df.empty:
+        try:
+            od = option_df.copy()
+            atm_i = int((od["strike_price"] - float(spot)).abs().to_numpy().argmin()) if spot else len(od) // 2
+            lo_i = max(0, atm_i - 3)
+            hi_i = min(len(od), atm_i + 4)
+            near = od.iloc[lo_i:hi_i].copy()
+
+            call_pressure = float(pd.to_numeric(near.get("buy_pressure", 0), errors="coerce").fillna(0).mean())
+            put_pressure = float(pd.to_numeric(near.get("sell_pressure", 0), errors="coerce").fillna(0).mean())
+            ce_oi_chg = float(pd.to_numeric(near.get("ce_chng_oi", 0), errors="coerce").fillna(0).sum())
+            pe_oi_chg = float(pd.to_numeric(near.get("pe_chng_oi", 0), errors="coerce").fillna(0).sum())
+
+            if call_pressure > put_pressure * 1.15 and ce_oi_chg >= 0:
+                option_bias = "CALL PRESSURE"
+                buy_score += 10
+                buy_reasons.append("ATM option pressure confirms")
+            elif put_pressure > call_pressure * 1.15 and pe_oi_chg >= 0:
+                option_bias = "PUT PRESSURE"
+                sell_score += 10
+                sell_reasons.append("ATM option pressure confirms")
+            else:
+                option_bias = "MIXED"
+        except Exception:
+            option_bias = "UNAVAILABLE"
+
+    result["option_confirmation"] = option_bias
+
+    # Direction and state. PRE-MOVE requires setup evidence; SCALP requires stronger confirmation.
+    if buy_score > sell_score and buy_score >= 45:
+        direction = "UP"
+        score = buy_score
+        reasons = buy_reasons
+    elif sell_score > buy_score and sell_score >= 45:
+        direction = "DOWN"
+        score = sell_score
+        reasons = sell_reasons
+    else:
+        direction = "NEUTRAL"
+        score = max(buy_score, sell_score)
+        reasons = buy_reasons if buy_score >= sell_score else sell_reasons
+
+    pre_move_ready = compression and (
+        bull_sweep or bear_sweep or volume_expansion
+    ) and score >= 45
+
+    scalp_ready = score >= 70 and (
+        (direction == "UP" and bullish_reclaim) or
+        (direction == "DOWN" and bearish_reclaim)
+    )
+
+    result["direction"] = direction
+    result["score"] = min(score, 100.0)
+    result["confidence"] = min(50.0 + score * 0.5, 95.0)
+    result["reasons"] = reasons or ["No strong pre-move structure"]
+
+    if direction == "UP":
+        result["setup"] = "SCALP BUY" if scalp_ready else ("PRE-MOVE UP READY" if pre_move_ready else "WATCH UP")
+        if scalp_ready:
+            result["entry"] = close
+            result["stop_loss"] = min(low, close - atr_like * 0.8)
+            risk = max(close - result["stop_loss"], atr_like * 0.5)
+            result["target_1"] = close + risk
+            result["target_2"] = close + risk * 1.8
+    elif direction == "DOWN":
+        result["setup"] = "SCALP SELL" if scalp_ready else ("PRE-MOVE DOWN READY" if pre_move_ready else "WATCH DOWN")
+        if scalp_ready:
+            result["entry"] = close
+            result["stop_loss"] = max(high, close + atr_like * 0.8)
+            risk = max(result["stop_loss"] - close, atr_like * 0.5)
+            result["target_1"] = close - risk
+            result["target_2"] = close - risk * 1.8
+    else:
+        result["setup"] = "WAIT"
+
+    result["status"] = result["setup"]
+    return result
+
+
+def _render_premove_scalping(state: dict) -> None:
+    """Standalone UI for the additive pre-move + scalping engine."""
+    pa = state.get("price_action_data") or {}
+    df_dict = pa.get("df_dict") or {}
+    df_5m = df_dict.get("5M")
+    if df_5m is None or df_5m.empty:
+        st.info("⚡ Enable **Fetch & Analyze Price Action** with a FYERS connection to run the pre-move/scalping engine.")
+        return
+
+    pm = detect_premove_scalping(df_5m, state.get("df"), float(state.get("spot") or 0))
+    score = float(pm.get("score", 0) or 0)
+
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("PRE-MOVE SCORE", f"{score:.0f}/100")
+    c2.metric("DIRECTION", pm.get("direction", "NEUTRAL"))
+    c3.metric("SETUP", pm.get("setup", "WAIT"))
+    c4.metric("LIQUIDITY", pm.get("liquidity_sweep", "NONE"))
+    c5.metric("OPTION CONFIRM", pm.get("option_confirmation", "NONE"))
+
+    if "SCALP" in str(pm.get("setup", "")):
+        st.success(
+            f"⚡ {pm['setup']} | Confidence {float(pm.get('confidence', 0)):.0f}% | "
+            f"Entry ₹{float(pm['entry']):,.2f} | SL ₹{float(pm['stop_loss']):,.2f} | "
+            f"T1 ₹{float(pm['target_1']):,.2f} | T2 ₹{float(pm['target_2']):,.2f}"
+        )
+    elif "PRE-MOVE" in str(pm.get("setup", "")):
+        st.warning(
+            f"🚨 {pm['setup']} | Score {score:.0f}/100 | "
+            f"Wait for trigger/confirmation before entry."
+        )
+    else:
+        st.info(f"🟡 {pm.get('setup', 'WAIT')} | Score {score:.0f}/100")
+
+    reason_text = " • ".join(pm.get("reasons", []))
+    st.markdown(f"**Evidence:** {reason_text}")
+    st.caption(
+        "Logic: compression → liquidity sweep/rejection → EMA/VWAP → RSI → volume expansion → "
+        "ATM option pressure. This is an early-warning heuristic, not a guaranteed prediction."
+    )
 
 
 def _render_summary_cards(state: dict) -> None:
@@ -3154,6 +3444,25 @@ def run_dashboard(fyers: Any = None) -> None:
             )
             st.warning(alert_text)
 
+    # Add-on early warning: does not replace the original BIG MOVEMENT alert.
+    pm_state = state.get("premove_scalping")
+    if pm_state:
+        pm_setup = str(pm_state.get("setup", "WAIT"))
+        pm_score = float(pm_state.get("score", 0) or 0)
+        if "PRE-MOVE" in pm_setup:
+            st.warning(
+                f"⚡ PRE-MOVE ALERT: {pm_setup} | "
+                f"Score {pm_score:.0f}/100 | "
+                f"Liquidity: {pm_state.get('liquidity_sweep', 'NONE')} | "
+                f"Option: {pm_state.get('option_confirmation', 'NONE')}"
+            )
+        elif "SCALP" in pm_setup:
+            st.success(
+                f"⚡ SCALPING SETUP: {pm_setup} | "
+                f"Score {pm_score:.0f}/100 | "
+                f"Entry ₹{float(pm_state.get('entry') or 0):,.2f}"
+            )
+
     source = state.get("data_source", "UNKNOWN")
     source_badge = "🟢 FYERS" if source == "FYERS" else ("🟡 NSE" if source == "NSE" else "⚪ Unknown")
     st.caption(
@@ -3176,8 +3485,8 @@ def run_dashboard(fyers: Any = None) -> None:
     st.divider()
 
     if state.get("price_action_data") and state["price_action_data"].get("df_dict"):
-        tab_chain, tab_charts, tab_pressure, tab_movement, tab_greeks, tab_ai, tab_gex, tab_po3, tab_price_action, tab_export = st.tabs([
-            "📋 Chain", "📈 OI", "💪 Pressure", "🎯 Strike Movement", "🧮 Greeks", "🤖 AI", "⚡ GEX", "🧠 PO3 Intelligence", "💹 Price Action", "📥 Export",
+        tab_chain, tab_charts, tab_pressure, tab_movement, tab_greeks, tab_ai, tab_gex, tab_po3, tab_premove, tab_price_action, tab_export = st.tabs([
+            "📋 Chain", "📈 OI", "💪 Pressure", "🎯 Strike Movement", "🧮 Greeks", "🤖 AI", "⚡ GEX", "🧠 PO3 Intelligence", "⚡ Pre-Move + Scalping", "💹 Price Action", "📥 Export",
         ])
     else:
         tab_chain, tab_charts, tab_pressure, tab_movement, tab_greeks, tab_ai, tab_gex, tab_po3, tab_export = st.tabs([
@@ -3282,6 +3591,10 @@ def run_dashboard(fyers: Any = None) -> None:
     with tab_ai:
         st.markdown('<div class="block-title">🤖 AI Trade Signals</div>', unsafe_allow_html=True)
         _render_ai_signal_cards(state, cfg["min_ai_conf"])
+
+    with tab_premove:
+        st.markdown('<div class="block-title">⚡ PRE-MOVE DETECTOR + SCALPING</div>', unsafe_allow_html=True)
+        _render_premove_scalping(state)
 
     with tab_gex:
         e1, e2, e3 = st.columns(3)
