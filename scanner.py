@@ -4087,6 +4087,206 @@ def _show_amd_scan_tab(fyers, all_symbols, fo_symbols):
             st.dataframe(pd.DataFrame({"Error": errors}), use_container_width=True)
 
 # ════════════════════════════════════════════════════════════════════════════════
+# AI FINAL CONFIRMATION — ADDITIVE ONLY
+# Uses the scanner's existing features as a weighted confirmation layer.
+# This is a score, NOT a guaranteed prediction/accuracy percentage.
+# ════════════════════════════════════════════════════════════════════════════════
+def _build_ai_final_confirmation(df: pd.DataFrame) -> pd.DataFrame:
+    """Build an additive AI-style confirmation score from existing scanner fields."""
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    out = df.copy()
+    rows = []
+
+    def num(v, default=np.nan):
+        try:
+            if isinstance(v, str):
+                v = v.replace('%', '').replace('x', '').strip()
+            x = pd.to_numeric(v, errors='coerce')
+            return float(x) if pd.notna(x) else default
+        except Exception:
+            return default
+
+    def norm(v):
+        return normalize_signal(str(v)) if v is not None else "NEUTRAL"
+
+    for _, r in out.iterrows():
+        buy = sell = 0.0
+        reasons = []
+
+        # 1) Existing AI confidence: strongest base input (40 points).
+        conf = np.clip(num(r.get("AI CONFIDENCE %", 0), 0), 0, 100)
+        base = conf * 0.40
+        sig = norm(r.get("AI SIGNAL", "NEUTRAL"))
+        if sig == "BUY":
+            buy += base
+        elif sig == "SELL":
+            sell += base
+        else:
+            buy += base * 0.5; sell += base * 0.5
+
+        # 2) Multi-timeframe trend alignment (20 points).
+        trends = [str(r.get(c, "")).upper() for c in ["5M Trend", "15M Trend", "1H Trend"]]
+        bull = sum(1 for x in trends if any(k in x for k in ["BULL", "UP", "HH/HL", "BUY"]))
+        bear = sum(1 for x in trends if any(k in x for k in ["BEAR", "DOWN", "LH/LL", "SELL"]))
+        if bull > bear:
+            buy += 20 * (bull / 3); reasons.append(f"MTF BUY {bull}/3")
+        elif bear > bull:
+            sell += 20 * (bear / 3); reasons.append(f"MTF SELL {bear}/3")
+        else:
+            buy += 20 * 0.5; sell += 20 * 0.5
+
+        # 3) Pressure confirmation (15 points).
+        bp = num(r.get("🟢 BUY PRESSURE %", np.nan))
+        sp = num(r.get("🔴 SELL PRESSURE %", np.nan))
+        if pd.notna(bp) and pd.notna(sp):
+            total_p = max(abs(bp) + abs(sp), 1.0)
+            pbuy = 15 * np.clip(bp / total_p * 2, 0, 1)
+            psell = 15 * np.clip(sp / total_p * 2, 0, 1)
+            if bp > sp: reasons.append(f"BUY pressure {bp:.0f}%")
+            elif sp > bp: reasons.append(f"SELL pressure {sp:.0f}%")
+            buy += pbuy; sell += psell
+        else:
+            ps = str(r.get("PRESSURE SIGNAL", "")).upper()
+            if "BUY" in ps or "BULL" in ps: buy += 15
+            elif "SELL" in ps or "BEAR" in ps: sell += 15
+            else: buy += 7.5; sell += 7.5
+
+        # 4) Next-candle bias (10 points).
+        nb = norm(r.get("NEXT CANDLE BIAS", "NEUTRAL"))
+        nc = np.clip(num(r.get("NEXT CANDLE CONFIDENCE %", 0), 0), 0, 100)
+        nb_points = 10 * nc / 100
+        if nb == "BUY": buy += nb_points; reasons.append(f"Next candle BUY {nc:.0f}%")
+        elif nb == "SELL": sell += nb_points; reasons.append(f"Next candle SELL {nc:.0f}%")
+        else: buy += nb_points * 0.5; sell += nb_points * 0.5
+
+        # 5) VWAP / RSI / MACD confluence (10 points total).
+        ltp = num(r.get("LTP", np.nan))
+        vwap = num(r.get("VWAP", np.nan))
+        rsi = num(r.get("RSI", np.nan))
+        macd = str(r.get("MACD", "")).upper()
+        con_buy = con_sell = 0.0
+        if pd.notna(ltp) and pd.notna(vwap) and vwap > 0:
+            if ltp > vwap: con_buy += 3.5
+            elif ltp < vwap: con_sell += 3.5
+        if pd.notna(rsi):
+            if 52 <= rsi <= 70: con_buy += 2.0
+            elif 30 <= rsi <= 48: con_sell += 2.0
+        if "GREEN" in macd or "🟢" in macd or "BULL" in macd: con_buy += 4.5
+        elif "RED" in macd or "🔴" in macd or "BEAR" in macd: con_sell += 4.5
+        buy += con_buy; sell += con_sell
+        if con_buy > con_sell: reasons.append("VWAP/RSI/MACD BUY confluence")
+        elif con_sell > con_buy: reasons.append("VWAP/RSI/MACD SELL confluence")
+
+        # 6) Options bias for F&O rows (5 points), neutral otherwise.
+        ob = str(r.get("OPTIONS BIAS", "")).upper()
+        if "BULL" in ob or "BUY" in ob:
+            buy += 5; reasons.append("Options bullish")
+        elif "BEAR" in ob or "SELL" in ob:
+            sell += 5; reasons.append("Options bearish")
+        else:
+            buy += 2.5; sell += 2.5
+
+        buy = float(np.clip(buy, 0, 100))
+        sell = float(np.clip(sell, 0, 100))
+        final_score = max(buy, sell)
+        direction = "BUY" if buy > sell + 2 else "SELL" if sell > buy + 2 else "WAIT"
+
+        if direction == "BUY" and final_score >= 80:
+            final_signal = "🟢 AI STRONG BUY"
+        elif direction == "SELL" and final_score >= 80:
+            final_signal = "🔴 AI STRONG SELL"
+        elif direction == "BUY" and final_score >= 70:
+            final_signal = "🟢 AI BUY"
+        elif direction == "SELL" and final_score >= 70:
+            final_signal = "🔴 AI SELL"
+        else:
+            final_signal = "🟡 AI WAIT"
+
+        rows.append({
+            "AI FINAL SIGNAL": final_signal,
+            "AI FINAL SCORE": round(final_score, 1),
+            "AI BUY SCORE": round(buy, 1),
+            "AI SELL SCORE": round(sell, 1),
+            "AI DIRECTION": direction,
+            "AI CONFIRMATION": " | ".join(reasons[:6]) if reasons else "No strong confluence",
+        })
+
+    ai_df = pd.DataFrame(rows, index=out.index)
+    out = pd.concat([out, ai_df], axis=1)
+    return out
+
+
+def _show_ai_final_confirmation_tab(fyers, all_symbols, fo_symbols) -> None:
+    st.markdown("### 🧠 AI FINAL CONFIRMATION")
+    st.caption("Additive layer only — combines existing AI, MTF, pressure, next-candle, VWAP/RSI/MACD and F&O options inputs.")
+
+    source = st.radio("Source", ["NSE Stocks", "F&O Stocks"], horizontal=True, key="ai_final_source")
+    source_key = "nse_df" if source == "NSE Stocks" else "fo_df"
+    df = st.session_state.get(source_key)
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        min_score = st.slider("Minimum AI Final Score", 50, 100, 70, 5, key="ai_final_min_score")
+    with c2:
+        mode = st.selectbox("Signal", ["ALL", "BUY", "SELL", "STRONG ONLY", "WAIT"], key="ai_final_mode")
+    with c3:
+        st.metric("Rows Available", 0 if df is None else len(df))
+
+    if st.button("🧠 RUN AI FINAL CONFIRMATION", key="run_ai_final", type="primary", use_container_width=True):
+        if df is None or df.empty:
+            st.warning(f"Run the {source} scanner first.")
+        else:
+            st.session_state["ai_final_df"] = _build_ai_final_confirmation(df)
+
+    ai_df = st.session_state.get("ai_final_df")
+    if ai_df is None or ai_df.empty:
+        st.info("👈 Run the selected NSE/F&O scanner, then click AI FINAL CONFIRMATION.")
+        return
+
+    # Rebuild if the selected source changed.
+    source_symbols = set((df["Symbol"].astype(str) if df is not None and "Symbol" in df.columns else pd.Series(dtype=str)).tolist())
+    ai_symbols = set((ai_df["Symbol"].astype(str) if "Symbol" in ai_df.columns else pd.Series(dtype=str)).tolist())
+    if source_symbols and source_symbols != ai_symbols:
+        ai_df = _build_ai_final_confirmation(df)
+        st.session_state["ai_final_df"] = ai_df
+
+    filtered = ai_df.copy()
+    score_num = pd.to_numeric(filtered["AI FINAL SCORE"], errors="coerce").fillna(0)
+    filtered = filtered[score_num >= min_score]
+
+    if mode != "ALL":
+        if mode == "STRONG ONLY":
+            filtered = filtered[filtered["AI FINAL SIGNAL"].astype(str).str.contains("STRONG", na=False)]
+        elif mode == "WAIT":
+            filtered = filtered[filtered["AI DIRECTION"].eq("WAIT")]
+        else:
+            filtered = filtered[filtered["AI DIRECTION"].eq(mode)]
+
+    filtered = filtered.sort_values("AI FINAL SCORE", ascending=False)
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("🧠 AI SETUPS", len(filtered))
+    m2.metric("🟢 BUY", int((filtered["AI DIRECTION"] == "BUY").sum()))
+    m3.metric("🔴 SELL", int((filtered["AI DIRECTION"] == "SELL").sum()))
+    m4.metric("🔥 STRONG", int(filtered["AI FINAL SIGNAL"].astype(str).str.contains("STRONG", na=False).sum()))
+
+    preferred = [
+        "Symbol", "LTP", "AI FINAL SIGNAL", "AI FINAL SCORE", "AI BUY SCORE", "AI SELL SCORE",
+        "AI DIRECTION", "AI CONFIDENCE %", "AI SIGNAL", "5M Trend", "15M Trend", "1H Trend",
+        "🟢 BUY PRESSURE %", "🔴 SELL PRESSURE %", "NEXT CANDLE BIAS", "NEXT CANDLE CONFIDENCE %",
+        "VWAP", "RSI", "MACD", "RVOL", "OPTIONS BIAS", "ENTRY", "STOP LOSS", "TARGET 1", "TARGET 2",
+        "RISK:REWARD", "AI CONFIRMATION"
+    ]
+    display = [c for c in preferred if c in filtered.columns]
+    st.dataframe(filtered[display] if display else filtered, use_container_width=True, height=520)
+
+    _excel_download_button(filtered, "AI_FINAL_CONFIRMATION", "ai_final_excel", label="📥 DOWNLOAD AI FINAL EXCEL")
+
+    st.info("⚠️ AI FINAL SCORE is a rule-based confirmation score from existing market data; it is not a guaranteed accuracy percentage or profit signal.")
+
+# ════════════════════════════════════════════════════════════════════════════════
 # MAIN APP - V17 WITH NEW MOMENTUM MOVERS TAB
 # ════════════════════════════════════════════════════════════════════════════════
 def show_scanner(fyers) -> None:
@@ -4130,7 +4330,8 @@ def show_scanner(fyers) -> None:
         "⚙️ SETTINGS",
         "📌 PIN RULES",
         "📌 PIN FULL SCAN",
-        "🧠 AMD SCAN"
+        "🧠 AMD SCAN",
+        "🧠 AI FINAL CONFIRMATION"
     ])
     
     # ════════════════════════════════════════════════════════════════════════════════
@@ -5024,6 +5225,12 @@ def show_scanner(fyers) -> None:
     # ════════════════════════════════════════════════════════════════════════════════
     with tabs[11]:
         _show_amd_scan_tab(fyers, all_symbols, fo_symbols)
+
+    # ════════════════════════════════════════════════════════════════════════════════
+    # TAB 12: AI FINAL CONFIRMATION — ADDITIVE ONLY
+    # ════════════════════════════════════════════════════════════════════════════════
+    with tabs[12]:
+        _show_ai_final_confirmation_tab(fyers, all_symbols, fo_symbols)
     
     gc.collect()
 
