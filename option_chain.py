@@ -3160,7 +3160,9 @@ def export_excel_report(df: pd.DataFrame, meta: dict, pcr: float, max_pain: floa
                          symbol: str, expiry_label: str, iv_rank: float,
                          iv_percentile: float, gex_dex: dict, market_pressure: Optional[MarketPressure] = None,
                          trade_signal: Optional[TradeSignal] = None,
-                         po3_intelligence: Optional[dict] = None) -> io.BytesIO:
+                         po3_intelligence: Optional[dict] = None,
+                         order_flow: Optional[dict] = None,
+                         final_signal: Optional[dict] = None) -> io.BytesIO:
     wb = Workbook()
 
     ws_summary = wb.active
@@ -3191,6 +3193,31 @@ def export_excel_report(df: pd.DataFrame, meta: dict, pcr: float, max_pain: floa
             ("OI Accumulation", market_pressure.oi_accumulation_detected),
         ])
     
+    # ORDER FLOW + MARKET DIRECTION (ADDITIVE EXPORT ONLY)
+    if order_flow and isinstance(order_flow, dict):
+        summary_rows.extend([
+            ("", ""),
+            ("ORDER FLOW", ""),
+            ("Order Flow Bias", order_flow.get("order_flow_bias", order_flow.get("bias", "NEUTRAL"))),
+            ("Bullish Flow", order_flow.get("bullish_flow", 0.0)),
+            ("Bearish Flow", order_flow.get("bearish_flow", 0.0)),
+            ("Net Order Flow", order_flow.get("net_order_flow", 0.0)),
+            ("Order Flow Strength", order_flow.get("order_flow_strength", order_flow.get("strength", 0.0))),
+            ("Strongest Bullish Strike", order_flow.get("strongest_bullish_strike")),
+            ("Strongest Bearish Strike", order_flow.get("strongest_bearish_strike")),
+        ])
+
+    if final_signal and isinstance(final_signal, dict):
+        summary_rows.extend([
+            ("", ""),
+            ("FINAL MARKET DIRECTION", ""),
+            ("Final Signal", final_signal.get("signal", "WAIT")),
+            ("Next Candle", final_signal.get("next_candle", "WAIT")),
+            ("Market Status", final_signal.get("market_status", "NEUTRAL")),
+            ("Confidence", final_signal.get("confidence", 0.0)),
+            ("Reason", final_signal.get("reason", "")),
+        ])
+
     if trade_signal:
         summary_rows.extend([
             ("", ""),
@@ -3263,6 +3290,18 @@ def export_excel_report(df: pd.DataFrame, meta: dict, pcr: float, max_pain: floa
         sig_df = df[signal_cols].sort_values("AI Confidence %", ascending=False) if "AI Confidence %" in df.columns else df[signal_cols]
         _write_dataframe(ws_signals, sig_df)
     
+    # Order Flow sheet (safe optional export)
+    order_flow_cols = [c for c in [
+        "strike_price", "ce_volume", "ce_aggressor", "ce_volume_delta",
+        "ce_book_imbalance", "pe_volume", "pe_aggressor", "pe_volume_delta",
+        "pe_book_imbalance", "bullish_flow", "bearish_flow", "net_order_flow",
+        "total_order_volume", "order_flow_strength", "order_flow_bias"
+    ] if c in df.columns]
+    if order_flow_cols:
+        ws_order = wb.create_sheet("Order Flow")
+        of_df = df[order_flow_cols].sort_values("net_order_flow", ascending=False) if "net_order_flow" in df.columns else df[order_flow_cols]
+        _write_dataframe(ws_order, of_df)
+
     if "buy_pressure" in df.columns:
         ws_pressure = wb.create_sheet("Buy-Sell Pressure")
         pressure_cols = [c for c in [
@@ -3998,6 +4037,8 @@ def run_dashboard(fyers: Any = None) -> None:
                     market_pressure=state.get("market_pressure"),
                     trade_signal=state.get("trade_signal"),
                     po3_intelligence=state.get("po3_intelligence", {}),
+                    order_flow=state.get("order_flow", {}),
+                    final_signal=state.get("final_signal", {}),
                 )
                 st.download_button(
                     "📥 Excel", data=excel_buf,
