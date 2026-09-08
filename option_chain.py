@@ -2527,6 +2527,95 @@ def add_pressure_analysis(df: pd.DataFrame, spot: float, lot_size: int = 1) -> t
 
 
 # ══════════════════════════════════════════════════════════════════════════
+# ORDER FLOW ANALYSIS — ADDITIVE ONLY
+# ══════════════════════════════════════════════════════════════════════════
+
+def _estimate_aggressor(ltp: float, bid: float, ask: float) -> float:
+    """Estimate aggressor direction from option-chain LTP vs bid/ask."""
+    try:
+        ltp, bid, ask = float(ltp or 0), float(bid or 0), float(ask or 0)
+        if ltp <= 0:
+            return 0.0
+        if ask > 0 and ltp >= ask:
+            return 1.0
+        if bid > 0 and ltp <= bid:
+            return -1.0
+        if ask > bid > 0:
+            mid = (bid + ask) / 2.0
+            half_spread = (ask - bid) / 2.0
+            if half_spread > 0:
+                return float(np.clip((ltp - mid) / half_spread, -1.0, 1.0))
+        return 0.0
+    except Exception:
+        return 0.0
+
+
+def calculate_order_flow(df: pd.DataFrame, spot: float) -> tuple[pd.DataFrame, dict]:
+    """Add estimated directional order-flow columns without changing old logic."""
+    d = df.copy()
+    defaults = {
+        "ce_ltp": 0.0, "ce_bid": 0.0, "ce_ask": 0.0,
+        "ce_bid_qty": 0.0, "ce_ask_qty": 0.0, "ce_volume": 0.0,
+        "pe_ltp": 0.0, "pe_bid": 0.0, "pe_ask": 0.0,
+        "pe_bid_qty": 0.0, "pe_ask_qty": 0.0, "pe_volume": 0.0,
+    }
+    for col, default in defaults.items():
+        if col not in d.columns:
+            d[col] = default
+        d[col] = pd.to_numeric(d[col], errors="coerce").fillna(0.0)
+
+    d["ce_aggressor"] = [_estimate_aggressor(a, b, c) for a, b, c in zip(d.ce_ltp, d.ce_bid, d.ce_ask)]
+    d["pe_aggressor"] = [_estimate_aggressor(a, b, c) for a, b, c in zip(d.pe_ltp, d.pe_bid, d.pe_ask)]
+    d["ce_volume_delta"] = d.ce_volume * d.ce_aggressor
+    d["pe_volume_delta"] = d.pe_volume * d.pe_aggressor
+
+    ce_qty = d.ce_bid_qty + d.ce_ask_qty
+    pe_qty = d.pe_bid_qty + d.pe_ask_qty
+    d["ce_book_imbalance"] = np.where(ce_qty > 0, (d.ce_bid_qty - d.ce_ask_qty) / ce_qty, 0.0)
+    d["pe_book_imbalance"] = np.where(pe_qty > 0, (d.pe_bid_qty - d.pe_ask_qty) / pe_qty, 0.0)
+
+    # CE buy + PE sell = bullish; CE sell + PE buy = bearish.
+    d["bullish_flow"] = d.ce_volume_delta.clip(lower=0) + (-d.pe_volume_delta).clip(lower=0)
+    d["bearish_flow"] = (-d.ce_volume_delta).clip(lower=0) + d.pe_volume_delta.clip(lower=0)
+    d["net_order_flow"] = d.bullish_flow - d.bearish_flow
+    d["total_order_volume"] = d.ce_volume + d.pe_volume
+    d["order_flow_strength"] = np.where(
+        d.total_order_volume > 0,
+        d.net_order_flow.abs() / d.total_order_volume * 100.0,
+        0.0,
+    ).clip(0, 100)
+    d["order_flow_bias"] = np.select(
+        [d.net_order_flow > 0, d.net_order_flow < 0],
+        ["BULLISH", "BEARISH"],
+        default="NEUTRAL",
+    )
+
+    bullish = float(d.bullish_flow.sum())
+    bearish = float(d.bearish_flow.sum())
+    total = bullish + bearish
+    score = float(np.clip((bullish - bearish) / total * 100.0, -100, 100)) if total > 0 else 0.0
+    market_bias = "🟢 BULLISH" if score >= 20 else ("🔴 BEARISH" if score <= -20 else "🟡 NEUTRAL")
+
+    bullish_strike = bearish_strike = None
+    if not d.empty and "strike_price" in d.columns:
+        b = d.loc[d.net_order_flow.idxmax()]
+        s = d.loc[d.net_order_flow.idxmin()]
+        bullish_strike = {"strike": float(b.strike_price), "flow": float(b.net_order_flow)}
+        bearish_strike = {"strike": float(s.strike_price), "flow": float(s.net_order_flow)}
+
+    return d, {
+        "bullish_flow": bullish,
+        "bearish_flow": bearish,
+        "net_order_flow": bullish - bearish,
+        "flow_bias_score": score,
+        "market_bias": market_bias,
+        "average_strength": float(d.order_flow_strength.mean()) if not d.empty else 0.0,
+        "bullish_strike": bullish_strike,
+        "bearish_strike": bearish_strike,
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════
 # 16. CHARTS (ORIGINAL - UNMODIFIED + NEW PRESSURE CHARTS)
 # ══════════════════════════════════════════════════════════════════════════
 
@@ -3398,8 +3487,13 @@ def _do_fetch_and_process(cfg: dict, fyers: Any = None) -> Optional[dict]:
     df = compute_ai_scores(df, spot, atm_strike, calc_max_pain(df), calc_pcr(df))
     df = detect_institutional_smart_money(df)
     
-    # ✅ ADD PRESSURE ANALYSIS
+    # ✅ ADD PRESSURE ANALYSIS — ORIGINAL CODE PRESERVED
     df, market_pressure = add_pressure_analysis(df, spot, cfg["lot_size"])
+
+    # 📊 ADD ORDER FLOW — ADDITIVE ONLY
+    df, order_flow = calculate_order_flow(df, spot)
+
+    # EXISTING MOVEMENT ENGINE — UNCHANGED
     df = add_strike_movement_score(df)
     df, movement_early_warning = compute_movement_early_warning(
         df, cfg["symbol"], meta["selected_expiry"], spot
@@ -3506,6 +3600,7 @@ def _do_fetch_and_process(cfg: dict, fyers: Any = None) -> Optional[dict]:
         "oi_shift_notes": oi_shift_notes, "data_source": data_source,
         "price_action_data": price_action_data, "trade_signal": trade_signal,
         "market_pressure": market_pressure,
+        "order_flow": order_flow,
         "po3_intelligence": po3_intelligence,
         "final_signal": po3_intelligence.get("final_signal", {}),
         "scalping_data": scalping_data,
@@ -3683,12 +3778,12 @@ def run_dashboard(fyers: Any = None) -> None:
     st.divider()
 
     if state.get("price_action_data") and state["price_action_data"].get("df_dict"):
-        tab_chain, tab_charts, tab_pressure, tab_movement, tab_greeks, tab_ai, tab_gex, tab_po3, tab_price_action, tab_export = st.tabs([
-            "📋 Chain", "📈 OI", "💪 Pressure", "🎯 Strike Movement", "🧮 Greeks", "🤖 AI", "⚡ GEX", "🧠 PO3 Intelligence", "💹 Price Action", "📥 Export",
+        tab_chain, tab_charts, tab_pressure, tab_orderflow, tab_movement, tab_greeks, tab_ai, tab_gex, tab_po3, tab_price_action, tab_export = st.tabs([
+            "📋 Chain", "📈 OI", "💪 Pressure", "📊 Order Flow", "🎯 Strike Movement", "🧮 Greeks", "🤖 AI", "⚡ GEX", "🧠 PO3 Intelligence", "💹 Price Action", "📥 Export",
         ])
     else:
-        tab_chain, tab_charts, tab_pressure, tab_movement, tab_greeks, tab_ai, tab_gex, tab_po3, tab_export = st.tabs([
-            "📋 Chain", "📈 OI", "💪 Pressure", "🎯 Strike Movement", "🧮 Greeks", "🤖 AI", "⚡ GEX", "🧠 PO3 Intelligence", "📥 Export",
+        tab_chain, tab_charts, tab_pressure, tab_orderflow, tab_movement, tab_greeks, tab_ai, tab_gex, tab_po3, tab_export = st.tabs([
+            "📋 Chain", "📈 OI", "💪 Pressure", "📊 Order Flow", "🎯 Strike Movement", "🧮 Greeks", "🤖 AI", "⚡ GEX", "🧠 PO3 Intelligence", "📥 Export",
         ])
 
     with tab_chain:
@@ -3752,6 +3847,49 @@ def run_dashboard(fyers: Any = None) -> None:
                 st.plotly_chart(chart_net_pressure(df, state["spot"]), use_container_width=True, config={"displayModeBar": False})
             with col_agg:
                 st.plotly_chart(chart_aggression_level(df), use_container_width=True, config={"displayModeBar": False})
+
+    # NEW: Order Flow Tab — existing Pressure tab remains untouched.
+    with tab_orderflow:
+        st.markdown('<div class="block-title">📊 Institutional Order Flow</div>', unsafe_allow_html=True)
+        of = state.get("order_flow", {})
+        if not of:
+            st.info("Order Flow data is not available.")
+        else:
+            a, b, c, dcol = st.columns(4)
+            a.metric("🟢 Bullish Flow", f"{of.get('bullish_flow', 0):,.0f}")
+            b.metric("🔴 Bearish Flow", f"{of.get('bearish_flow', 0):,.0f}")
+            c.metric("⚡ Net Order Flow", f"{of.get('net_order_flow', 0):+,.0f}")
+            dcol.metric("Order Flow Bias", of.get("market_bias", "🟡 NEUTRAL"), delta=f"{of.get('flow_bias_score', 0):+.1f}")
+
+            st.divider()
+            a, b, c = st.columns(3)
+            a.metric("Flow Strength", f"{of.get('average_strength', 0):.1f}/100")
+            bull = of.get("bullish_strike")
+            bear = of.get("bearish_strike")
+            b.metric("Strongest Bullish Strike", f"{bull['strike']:,.0f}" if bull else "—", delta=f"{bull['flow']:+,.0f}" if bull else None)
+            c.metric("Strongest Bearish Strike", f"{bear['strike']:,.0f}" if bear else "—", delta=f"{bear['flow']:+,.0f}" if bear else None)
+
+            score = float(of.get("flow_bias_score", 0))
+            if score >= 40:
+                st.success("🟢 STRONG BULLISH ORDER FLOW — CE buying / PE selling is dominating.")
+            elif score >= 20:
+                st.info("🟢 BULLISH ORDER FLOW — Buy-side directional activity is stronger.")
+            elif score <= -40:
+                st.error("🔴 STRONG BEARISH ORDER FLOW — PE buying / CE selling is dominating.")
+            elif score <= -20:
+                st.warning("🔴 BEARISH ORDER FLOW — Sell-side directional activity is stronger.")
+            else:
+                st.warning("🟡 NEUTRAL ORDER FLOW — No strong directional dominance detected.")
+
+            cols = [c for c in [
+                "strike_price", "ce_volume", "ce_aggressor", "ce_volume_delta",
+                "pe_volume", "pe_aggressor", "pe_volume_delta", "bullish_flow",
+                "bearish_flow", "net_order_flow", "order_flow_strength", "order_flow_bias"
+            ] if c in df.columns]
+            if cols:
+                st.markdown("### 🔎 Strike-wise Order Flow")
+                st.dataframe(df[cols].sort_values("net_order_flow", ascending=False), use_container_width=True, hide_index=True)
+            st.caption("⚠️ Estimated from option-chain LTP/Bid/Ask/Volume. Not a true tick-by-tick exchange aggressor feed.")
 
     with tab_movement:
         st.markdown('<div class="block-title">🎯 Strike Movement Scanner</div>', unsafe_allow_html=True)
