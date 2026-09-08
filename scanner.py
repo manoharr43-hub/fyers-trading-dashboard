@@ -1771,7 +1771,7 @@ def calculate_master_signal(symbol: str, analysis_5m: Dict, analysis_15m: Dict, 
                 "pressure": 50,
                 "options": 50,
             },
-            "signal_reason": f"VWAP conflict: Price {last_close:.2f} vs VWAP {vwap:.2f if vwap else 'N/A'}",
+            "signal_reason": f"VWAP conflict: Price {last_close:.2f} vs VWAP {(f'{vwap:.2f}' if vwap else 'N/A')}",
         }
     
     ema_trend = data_5m.get("ema_trend", "NEUTRAL")
