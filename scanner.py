@@ -4289,6 +4289,401 @@ def _show_ai_final_confirmation_tab(fyers, all_symbols, fo_symbols) -> None:
 # ════════════════════════════════════════════════════════════════════════════════
 # MAIN APP - V17 WITH NEW MOMENTUM MOVERS TAB
 # ════════════════════════════════════════════════════════════════════════════════
+
+# ════════════════════════════════════════════════════════════════════════════════
+# HISTORICAL BACKTEST — ADDITIVE ONLY
+# Replays completed 5M candles and evaluates:
+# AI FINAL -> PIN -> MOMENTUM, then checks forward target/stop outcome.
+# No future candles are used to build the signal at the evaluation candle.
+# ════════════════════════════════════════════════════════════════════════════════
+
+def _fetch_history_range(fyers, symbol: str, resolution: str, date_from: str, date_to: str) -> Optional[pd.DataFrame]:
+    """Fetch a user-selected historical range without removing completed candles."""
+    resp, err = _safe_history(fyers, {
+        "symbol": symbol,
+        "resolution": resolution,
+        "date_format": "1",
+        "range_from": date_from,
+        "range_to": date_to,
+        "cont_flag": "1",
+    })
+    if err or not resp or not resp.get("candles"):
+        return None
+    try:
+        d = pd.DataFrame(resp["candles"], columns=["Time", "Open", "High", "Low", "Close", "Volume"])
+        d["Time"] = pd.to_datetime(d["Time"], unit="s", errors="coerce", utc=True).dt.tz_convert(IST)
+        d[["Open", "High", "Low", "Close", "Volume"]] = d[["Open", "High", "Low", "Close", "Volume"]].apply(
+            pd.to_numeric, errors="coerce"
+        )
+        d = d.dropna(subset=["Time", "Open", "High", "Low", "Close"]).sort_values("Time").drop_duplicates("Time").reset_index(drop=True)
+        return d if len(d) >= 80 else None
+    except Exception:
+        return None
+
+
+def _analyze_dataframe_local(df: pd.DataFrame, resolution: str) -> Dict[str, Any]:
+    """Same core indicator/structure calculations as analyze_timeframe(), on a replay slice."""
+    if df is None or len(df) < 10:
+        return {"timeframe": resolution, "status": "DATA_UNAVAILABLE", "data": None, "df": df}
+    try:
+        d = df.reset_index(drop=True).copy()
+        rsi = calculate_rsi(d["Close"])
+        macd_line, macd_sig, macd_hist = calculate_macd(d["Close"])
+        atr = calculate_atr(d)
+        vwap = calculate_vwap(d)
+        ema9 = calculate_ema(d["Close"], 9)
+        ema21 = calculate_ema(d["Close"], 21)
+        ema50 = calculate_ema(d["Close"], 50)
+        ema200 = calculate_ema(d["Close"], 200)
+        pressure = calculate_buying_selling_pressure(d)
+        structure = detect_structure(d)
+        choch = detect_choch(d)
+        mss = detect_mss(d)
+        cisd = detect_cisd(d)
+        swings = find_swing_highs_lows(d)
+        vol_avg20 = float(d["Volume"].tail(20).mean()) if "Volume" in d.columns else 0
+        last_vol = float(d["Volume"].iloc[-1]) if "Volume" in d.columns else 0
+        rvol = round(last_vol / vol_avg20, 2) if vol_avg20 > 0 else 0.0
+        last_close = float(d["Close"].iloc[-1])
+        last_high = float(d["High"].iloc[-1])
+        last_low = float(d["Low"].iloc[-1])
+        last_open = float(d["Open"].iloc[-1])
+        ema_trend = (
+            "BULLISH" if ema9.iloc[-1] > ema21.iloc[-1] > ema50.iloc[-1]
+            else "BEARISH" if ema9.iloc[-1] < ema21.iloc[-1] < ema50.iloc[-1]
+            else "NEUTRAL"
+        )
+        return {
+            "timeframe": resolution,
+            "status": "OK",
+            "data": {
+                "last_close": last_close, "last_high": last_high, "last_low": last_low, "last_open": last_open,
+                "structure_type": structure["type"], "structure_trend": structure["trend"],
+                "structure_strength": round(structure.get("strength", 0), 1),
+                "current_high": structure["current_high"], "current_low": structure["current_low"],
+                "prev_high": structure["prev_high"], "prev_low": structure["prev_low"],
+                "bullish_choch": choch["bullish_choch"], "bearish_choch": choch["bearish_choch"],
+                "choch_price": choch["choch_price"], "choch_type": choch["choch_type"],
+                "bullish_mss": mss["bullish_mss"], "bearish_mss": mss["bearish_mss"],
+                "mss_type": mss["mss_type"],
+                "bullish_cisd": cisd["bullish_cisd"], "bearish_cisd": cisd["bearish_cisd"],
+                "cisd_type": cisd["cisd_type"], "cisd_price": cisd["cisd_price"],
+                "swing_high": swings["swing_high"], "swing_low": swings["swing_low"],
+                "swing_high_bars_ago": swings["swing_high_bars_ago"],
+                "swing_low_bars_ago": swings["swing_low_bars_ago"],
+                "vwap": float(vwap.iloc[-1]) if len(vwap) else None,
+                "ema9": float(ema9.iloc[-1]), "ema21": float(ema21.iloc[-1]),
+                "ema50": float(ema50.iloc[-1]), "ema200": float(ema200.iloc[-1]),
+                "ema_trend": ema_trend,
+                "rsi": round(float(rsi.iloc[-1]), 1),
+                "rsi_overbought": bool(rsi.iloc[-1] > 70), "rsi_oversold": bool(rsi.iloc[-1] < 30),
+                "macd_bullish": bool(macd_line.iloc[-1] > macd_sig.iloc[-1]),
+                "macd_value": round(float(macd_line.iloc[-1]), 4),
+                "macd_hist": round(float(macd_hist.iloc[-1]), 4),
+                "rvol": rvol, "atr": round(float(atr.iloc[-1]), 2),
+                "buying_pressure": pressure["buying_pressure"], "selling_pressure": pressure["selling_pressure"],
+                "pressure_trend": pressure["trend"],
+                "buying_volume": pressure["buying_volume"], "selling_volume": pressure["selling_volume"],
+                "pressure_ratio": pressure["pressure_ratio"],
+            },
+            "df": d,
+        }
+    except Exception:
+        return {"timeframe": resolution, "status": "ERROR", "data": None, "df": df}
+
+
+def _resample_ohlcv_until(df5: pd.DataFrame, cutoff: pd.Timestamp, minutes: int) -> pd.DataFrame:
+    """Build higher timeframe candles using only 5M candles <= cutoff."""
+    d = df5[df5["Time"] <= cutoff].copy()
+    if d.empty:
+        return pd.DataFrame(columns=["Time", "Open", "High", "Low", "Close", "Volume"])
+    d = d.set_index("Time")
+    rule = f"{minutes}min"
+    r = d.resample(rule, label="right", closed="right").agg({
+        "Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"
+    }).dropna(subset=["Open", "High", "Low", "Close"]).reset_index()
+    return r
+
+
+def _backtest_signal_at(df5: pd.DataFrame, idx: int) -> Dict[str, Any]:
+    """Create one point-in-time signal using only data through idx."""
+    cutoff = df5["Time"].iloc[idx]
+    d5 = df5.iloc[:idx + 1].copy()
+    d15 = _resample_ohlcv_until(df5, cutoff, 15)
+    d1h = _resample_ohlcv_until(df5, cutoff, 60)
+
+    a5 = _analyze_dataframe_local(d5, "5")
+    a15 = _analyze_dataframe_local(d15, "15")
+    a1h = _analyze_dataframe_local(d1h, "60")
+    if any(a.get("status") != "OK" for a in (a5, a15, a1h)):
+        return {"valid": False}
+
+    master = calculate_master_signal("BACKTEST", a5, a15, a1h)
+    next_bias = calculate_next_candle_bias(d5, a5)
+    d5data, d15data, d1hdata = a5["data"], a15["data"], a1h["data"]
+
+    row = {
+        "Symbol": "BACKTEST",
+        "Time": cutoff,
+        "LTP": d5data["last_close"],
+        "5M Trend": d5data["structure_trend"],
+        "15M Trend": d15data["structure_trend"],
+        "1H Trend": d1hdata["structure_trend"],
+        "VWAP": d5data.get("vwap"),
+        "RSI": d5data.get("rsi"),
+        "MACD": "🟢" if d5data.get("macd_bullish") else "🔴",
+        "RVOL": d5data.get("rvol", 0),
+        "🟢 BUY PRESSURE %": d5data.get("buying_pressure"),
+        "🔴 SELL PRESSURE %": d5data.get("selling_pressure"),
+        "PRESSURE SIGNAL": d5data.get("pressure_trend"),
+        "NEXT CANDLE BIAS": next_bias.get("bias", "NEUTRAL"),
+        "NEXT CANDLE CONFIDENCE %": next_bias.get("confidence", 0),
+        "AI SIGNAL": master.get("final_signal", "🟡 NEUTRAL"),
+        "AI CONFIDENCE %": master.get("confidence", 0),
+    }
+    ai = _build_ai_final_confirmation(pd.DataFrame([row])).iloc[0].to_dict()
+    pin = calculate_pin_rules(d5, d5data, d15data, d1hdata)
+    move = calculate_movement_metrics(d5)
+
+    ai_dir = ai.get("AI DIRECTION", "WAIT")
+    pin_sig = str(pin.get("PIN SIGNAL", "WAIT")).upper()
+    pin_dir = "BUY" if "BUY" in pin_sig else "SELL" if "SELL" in pin_sig else "WAIT"
+
+    if ai_dir in ("BUY", "SELL"):
+        momentum = calculate_momentum_score(
+            a5, a15, a1h, move, is_bullish=(ai_dir == "BUY")
+        )
+    else:
+        momentum = {"score": 0, "status": "NONE"}
+
+    mom_status = str(momentum.get("status", "NONE")).upper()
+    mom_dir = "BUY" if "BUY" in mom_status else "SELL" if "SELL" in mom_status else "WAIT"
+
+    # Full sequence gate: all three layers must agree.
+    sequence_ok = (
+        ai_dir in ("BUY", "SELL")
+        and pin_dir == ai_dir
+        and mom_dir == ai_dir
+    )
+
+    return {
+        "valid": True, "time": cutoff, "entry": float(d5data["last_close"]),
+        "ai_direction": ai_dir, "ai_score": float(ai.get("AI FINAL SCORE", 0) or 0),
+        "pin_direction": pin_dir, "pin_score": float(pin.get("PIN SCORE", 0) or 0),
+        "momentum_direction": mom_dir, "momentum_score": float(momentum.get("score", 0) or 0),
+        "sequence_ok": bool(sequence_ok),
+        "ai_signal": ai.get("AI FINAL SIGNAL", "🟡 AI WAIT"),
+        "pin_signal": pin.get("PIN SIGNAL", "🟡 WAIT"),
+        "momentum_signal": momentum.get("status", "NONE"),
+    }
+
+
+def _evaluate_forward_outcome(df5: pd.DataFrame, signal_idx: int, direction: str,
+                              target_pct: float, stop_pct: float, horizon_bars: int) -> str:
+    """Conservative forward outcome: first target/stop wins; same-bar touch is AMBIGUOUS."""
+    if direction not in ("BUY", "SELL"):
+        return "NO SIGNAL"
+    entry = float(df5["Close"].iloc[signal_idx])
+    end = min(len(df5), signal_idx + 1 + horizon_bars)
+    if end <= signal_idx + 1:
+        return "NO HIT"
+
+    if direction == "BUY":
+        target = entry * (1 + target_pct / 100)
+        stop = entry * (1 - stop_pct / 100)
+    else:
+        target = entry * (1 - target_pct / 100)
+        stop = entry * (1 + stop_pct / 100)
+
+    for j in range(signal_idx + 1, end):
+        hi, lo = float(df5["High"].iloc[j]), float(df5["Low"].iloc[j])
+        if direction == "BUY":
+            hit_t = hi >= target
+            hit_s = lo <= stop
+        else:
+            hit_t = lo <= target
+            hit_s = hi >= stop
+
+        if hit_t and hit_s:
+            return "AMBIGUOUS"
+        if hit_t:
+            return "WIN"
+        if hit_s:
+            return "LOSS"
+    return "NO HIT"
+
+
+def _run_historical_backtest(fyers, symbols: List[str], date_from: str, date_to: str,
+                             min_ai: float, min_pin: float, min_momentum: float,
+                             target_pct: float, stop_pct: float, horizon_bars: int,
+                             max_signals_per_symbol: int = 80):
+    """Run point-in-time replay. Uses only historical candles and forward outcomes."""
+    all_rows, errors = [], []
+    for n, symbol in enumerate(symbols, 1):
+        ticker = symbol.replace("NSE:", "").replace("-EQ", "")
+        d = _fetch_history_range(fyers, symbol, "5", date_from, date_to)
+        if d is None or len(d) < 100:
+            errors.append(f"{ticker}: insufficient 5M historical data")
+            continue
+
+        # Warm-up keeps indicators/structure stable; evaluate every 5M completed candle.
+        start = 80
+        candidates = []
+        for idx in range(start, max(start, len(d) - horizon_bars)):
+            sig = _backtest_signal_at(d, idx)
+            if not sig.get("valid"):
+                continue
+            if sig["ai_score"] < min_ai or sig["pin_score"] < min_pin or sig["momentum_score"] < min_momentum:
+                continue
+            if not sig["sequence_ok"]:
+                continue
+            outcome = _evaluate_forward_outcome(
+                d, idx, sig["ai_direction"], target_pct, stop_pct, horizon_bars
+            )
+            candidates.append({
+                "Symbol": ticker, "Signal Time": sig["time"],
+                "Direction": sig["ai_direction"], "Entry": round(sig["entry"], 2),
+                "AI Final Score": round(sig["ai_score"], 1),
+                "PIN Score": round(sig["pin_score"], 1),
+                "Momentum Score": round(sig["momentum_score"], 1),
+                "AI Final": sig["ai_signal"], "PIN": sig["pin_signal"],
+                "Momentum": sig["momentum_signal"], "Outcome": outcome,
+            })
+
+        # Keep the strongest setups if a single symbol creates a very large report.
+        if max_signals_per_symbol and len(candidates) > max_signals_per_symbol:
+            candidates = sorted(
+                candidates,
+                key=lambda x: (x["AI Final Score"] + x["PIN Score"] + x["Momentum Score"]),
+                reverse=True
+            )[:max_signals_per_symbol]
+        all_rows.extend(candidates)
+
+    return pd.DataFrame(all_rows), errors
+
+
+def _show_historical_backtest_tab(fyers, all_symbols, fo_symbols) -> None:
+    st.markdown("### 📚 HISTORICAL BACKTEST — AI FINAL → PIN → MOMENTUM")
+    st.caption("Point-in-time replay on completed 5M candles. Signals use data available at that candle; future candles are used only to score WIN/LOSS.")
+
+    source = st.radio(
+        "Backtest Universe", ["NSE Stocks", "F&O Stocks"], horizontal=True, key="bt_source"
+    )
+    universe = all_symbols if source == "NSE Stocks" else fo_symbols
+    if not universe:
+        st.warning("No symbols available.")
+        return
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        date_from = st.date_input("From", value=datetime.today().date() - timedelta(days=10), key="bt_from")
+    with c2:
+        date_to = st.date_input("To", value=datetime.today().date(), key="bt_to")
+    with c3:
+        limit = st.number_input(
+            "Stocks (0 = ALL)", min_value=0, max_value=max(len(universe), 1),
+            value=min(5, len(universe)), step=1, key="bt_limit"
+        )
+
+    c4, c5, c6, c7 = st.columns(4)
+    with c4:
+        min_ai = st.slider("Min AI Final", 50, 100, 70, 5, key="bt_ai")
+    with c5:
+        min_pin = st.slider("Min PIN", 50, 100, 70, 1, key="bt_pin")
+    with c6:
+        min_momentum = st.slider("Min Momentum", 50, 100, 70, 1, key="bt_mom")
+    with c7:
+        horizon = st.number_input("Forward 5M bars", 1, 24, 6, 1, key="bt_horizon")
+
+    c8, c9, c10 = st.columns(3)
+    with c8:
+        target_pct = st.number_input("Target %", 0.10, 5.0, 0.50, 0.05, key="bt_target")
+    with c9:
+        stop_pct = st.number_input("Stop %", 0.10, 5.0, 0.30, 0.05, key="bt_stop")
+    with c10:
+        max_per_symbol = st.number_input("Max signals / stock", 10, 500, 80, 10, key="bt_max")
+
+    st.info(
+        "WIN = target hit before stop. LOSS = stop hit before target. "
+        "AMBIGUOUS = both touched in the same candle. NO HIT = neither reached within the selected horizon. "
+        "Hit rate excludes AMBIGUOUS and NO HIT."
+    )
+
+    scan_pairs = universe if int(limit) == 0 else universe[:int(limit)]
+    if date_from > date_to:
+        st.error("From date must be on or before To date.")
+        return
+
+    if st.button(
+        f"📚 RUN HISTORICAL BACKTEST ({len(scan_pairs):,} STOCKS)",
+        key="bt_run", type="primary", use_container_width=True
+    ):
+        with st.spinner("Running historical point-in-time backtest…"):
+            result_df, errors = _run_historical_backtest(
+                fyers, scan_pairs, str(date_from), str(date_to),
+                float(min_ai), float(min_pin), float(min_momentum),
+                float(target_pct), float(stop_pct), int(horizon), int(max_per_symbol)
+            )
+        st.session_state["bt_df"] = result_df
+        st.session_state["bt_errors"] = errors
+        st.session_state["bt_time"] = _generated_timestamp()
+
+    df = st.session_state.get("bt_df")
+    if df is None:
+        st.info("Choose the date range/settings and run the backtest.")
+        return
+    if df.empty:
+        st.warning("No setups passed all three filters. Lower thresholds or use a longer date range.")
+        return
+
+    outcomes = df["Outcome"].astype(str)
+    wins = int((outcomes == "WIN").sum())
+    losses = int((outcomes == "LOSS").sum())
+    ambiguous = int((outcomes == "AMBIGUOUS").sum())
+    no_hit = int((outcomes == "NO HIT").sum())
+    decided = wins + losses
+    hit_rate = (wins / decided * 100) if decided else 0.0
+
+    m1, m2, m3, m4, m5 = st.columns(5)
+    m1.metric("QUALIFIED SETUPS", len(df))
+    m2.metric("WIN", wins)
+    m3.metric("LOSS", losses)
+    m4.metric("HIT RATE", f"{hit_rate:.1f}%")
+    m5.metric("AMBIGUOUS / NO HIT", f"{ambiguous} / {no_hit}")
+
+    st.caption(
+        f"Last run: {st.session_state.get('bt_time', 'N/A')} | "
+        f"Target {target_pct:.2f}% | Stop {stop_pct:.2f}% | Horizon {horizon} × 5M"
+    )
+
+    summary = pd.DataFrame({
+        "Metric": [
+            "Qualified setups", "Wins", "Losses", "Decided trades",
+            "Hit rate", "Ambiguous", "No hit"
+        ],
+        "Value": [
+            len(df), wins, losses, decided, f"{hit_rate:.1f}%",
+            ambiguous, no_hit
+        ]
+    })
+    st.dataframe(summary, use_container_width=True, hide_index=True)
+
+    st.markdown("#### Signal-by-signal results")
+    show_cols = [
+        "Symbol", "Signal Time", "Direction", "Entry",
+        "AI Final Score", "PIN Score", "Momentum Score",
+        "AI Final", "PIN", "Momentum", "Outcome"
+    ]
+    st.dataframe(df[[c for c in show_cols if c in df.columns]], use_container_width=True, height=500)
+    _excel_download_button(df, "HISTORICAL_BACKTEST_AI_PIN_MOMENTUM", "bt_excel")
+
+    errors = st.session_state.get("bt_errors", [])
+    if errors:
+        with st.expander(f"⚠️ Backtest data errors ({len(errors)})", expanded=False):
+            st.dataframe(pd.DataFrame({"Error": errors}), use_container_width=True)
+
+
+
 def show_scanner(fyers) -> None:
     """Streamlit main app - NSE AI PRO V17 with MOMENTUM MOVERS"""
     
@@ -4331,7 +4726,8 @@ def show_scanner(fyers) -> None:
         "📌 PIN RULES",
         "📌 PIN FULL SCAN",
         "🧠 AMD SCAN",
-        "🧠 AI FINAL CONFIRMATION"
+        "🧠 AI FINAL CONFIRMATION",
+        "📚 HISTORICAL BACKTEST"
     ])
     
     # ════════════════════════════════════════════════════════════════════════════════
@@ -5231,6 +5627,12 @@ def show_scanner(fyers) -> None:
     # ════════════════════════════════════════════════════════════════════════════════
     with tabs[12]:
         _show_ai_final_confirmation_tab(fyers, all_symbols, fo_symbols)
+
+    # ════════════════════════════════════════════════════════════════════════════════
+    # TAB 13: HISTORICAL BACKTEST — ADDITIONAL ONLY
+    # ════════════════════════════════════════════════════════════════════════════════
+    with tabs[13]:
+        _show_historical_backtest_tab(fyers, all_symbols, fo_symbols)
     
     gc.collect()
 
