@@ -1771,7 +1771,7 @@ def calculate_master_signal(symbol: str, analysis_5m: Dict, analysis_15m: Dict, 
                 "pressure": 50,
                 "options": 50,
             },
-            "signal_reason": f"VWAP conflict: Price {last_close:.2f} vs VWAP {(f'{vwap:.2f}' if vwap else 'N/A')}",
+            "signal_reason": f"VWAP conflict: Price {last_close:.2f} vs VWAP {vwap:.2f if vwap else 'N/A'}",
         }
     
     ema_trend = data_5m.get("ema_trend", "NEUTRAL")
@@ -2576,6 +2576,37 @@ def _fetch_fo_signal(fyers, symbol: str):
 # ════════════════════════════════════════════════════════════════════════════════
 # MOMENTUM SCANNER WORKER (NEW)
 # ════════════════════════════════════════════════════════════════════════════════
+def detect_order_block_zone(df: pd.DataFrame) -> Dict[str, Any]:
+    """Heuristic 5M order-block zone using only candles available at scan time."""
+    out={"ob_score":0.0,"ob_signal":"NONE","ob_side":"NONE","ob_high":None,"ob_low":None,"ob_mid":None,"ob_distance_pct":None,"ob_reason":"Insufficient data"}
+    if df is None or len(df)<30: return out
+    try:
+        d=df.reset_index(drop=True).copy(); req=["Open","High","Low","Close","Volume"]
+        if any(c not in d.columns for c in req): out["ob_reason"]="Missing OHLCV columns"; return out
+        price=float(d["Close"].iloc[-1]); base=float(d["Volume"].tail(21).iloc[:-1].mean())
+        candidates=[]
+        for i in range(max(3,len(d)-14),len(d)-2):
+            o,h,l,c=map(float,[d["Open"].iloc[i],d["High"].iloc[i],d["Low"].iloc[i],d["Close"].iloc[i]])
+            rng=max(h-l,1e-9)
+            if abs(c-o)/rng>0.65: continue
+            f=d.iloc[i+1:min(i+4,len(d))]
+            if len(f)<2: continue
+            up=(float(f["Close"].max())-c)/c*100; dn=(c-float(f["Close"].min()))/c*100
+            rv=float(d["Volume"].iloc[i])/base if base>0 else 0
+            if c<o and up>=0.35: candidates.append(("BUY",up,h,l,i,rv))
+            if c>o and dn>=0.35: candidates.append(("SELL",dn,h,l,i,rv))
+        if not candidates: out["ob_reason"]="No recent displacement-based order block"; return out
+        candidates.sort(key=lambda x:x[4],reverse=True); side,disp,h,l,idx,rv=candidates[0]
+        mid=(h+l)/2; dist=abs(price-mid)/price*100
+        score=45+min(25,disp*25)+(10 if rv>=1.5 else 5 if rv>=1.2 else 0)
+        score += 20 if dist<=0.5 else 12 if dist<=1 else 5 if dist<=2 else -10
+        score=max(0,min(100,score))
+        signal=("🔥 STRONG BUY OB" if side=="BUY" and score>=80 else "🟢 BUY OB" if side=="BUY" and score>=60 else "🔥 STRONG SELL OB" if side=="SELL" and score>=80 else "🔴 SELL OB" if side=="SELL" and score>=60 else "🟡 WEAK OB")
+        out.update({"ob_score":round(score,1),"ob_signal":signal,"ob_side":side,"ob_high":round(h,2),"ob_low":round(l,2),"ob_mid":round(mid,2),"ob_distance_pct":round(dist,3),"ob_reason":f"{side} OB | displacement {disp:.2f}% | base RVOL {rv:.2f}x | distance {dist:.2f}%"})
+        return out
+    except Exception as e: out["ob_reason"]=f"ERROR: {str(e)[:120]}"; return out
+
+
 def detect_block_order_activity(df: pd.DataFrame) -> Dict[str, Any]:
     """Estimate institutional/block-order activity from OHLCV only.
 
@@ -4444,6 +4475,7 @@ def _backtest_signal_at(df5: pd.DataFrame, idx: int) -> Dict[str, Any]:
     ai = _build_ai_final_confirmation(pd.DataFrame([row])).iloc[0].to_dict()
     pin = calculate_pin_rules(d5, d5data, d15data, d1hdata)
     move = calculate_movement_metrics(d5)
+    ob = detect_order_block_zone(d5)
 
     ai_dir = ai.get("AI DIRECTION", "WAIT")
     pin_sig = str(pin.get("PIN SIGNAL", "WAIT")).upper()
@@ -4471,6 +4503,9 @@ def _backtest_signal_at(df5: pd.DataFrame, idx: int) -> Dict[str, Any]:
         "ai_direction": ai_dir, "ai_score": float(ai.get("AI FINAL SCORE", 0) or 0),
         "pin_direction": pin_dir, "pin_score": float(pin.get("PIN SCORE", 0) or 0),
         "momentum_direction": mom_dir, "momentum_score": float(momentum.get("score", 0) or 0),
+        "ob_side": ob.get("ob_side", "NONE"), "ob_score": float(ob.get("ob_score", 0) or 0),
+        "ob_signal": ob.get("ob_signal", "NONE"), "ob_high": ob.get("ob_high"), "ob_low": ob.get("ob_low"),
+        "ob_distance_pct": ob.get("ob_distance_pct"),
         "sequence_ok": bool(sequence_ok),
         "ai_signal": ai.get("AI FINAL SIGNAL", "🟡 AI WAIT"),
         "pin_signal": pin.get("PIN SIGNAL", "🟡 WAIT"),
@@ -4516,6 +4551,7 @@ def _evaluate_forward_outcome(df5: pd.DataFrame, signal_idx: int, direction: str
 def _run_historical_backtest(fyers, symbols: List[str], date_from: str, date_to: str,
                              min_ai: float, min_pin: float, min_momentum: float,
                              target_pct: float, stop_pct: float, horizon_bars: int,
+                             use_ob: bool = True, min_ob: float = 60.0,
                              max_signals_per_symbol: int = 80):
     """Run point-in-time replay. Uses only historical candles and forward outcomes."""
     all_rows, errors = [], []
@@ -4535,6 +4571,8 @@ def _run_historical_backtest(fyers, symbols: List[str], date_from: str, date_to:
                 continue
             if sig["ai_score"] < min_ai or sig["pin_score"] < min_pin or sig["momentum_score"] < min_momentum:
                 continue
+            if use_ob and (sig.get("ob_score", 0) < min_ob or sig.get("ob_side", "NONE") != sig.get("ai_direction", "WAIT")):
+                continue
             if not sig["sequence_ok"]:
                 continue
             outcome = _evaluate_forward_outcome(
@@ -4546,6 +4584,8 @@ def _run_historical_backtest(fyers, symbols: List[str], date_from: str, date_to:
                 "AI Final Score": round(sig["ai_score"], 1),
                 "PIN Score": round(sig["pin_score"], 1),
                 "Momentum Score": round(sig["momentum_score"], 1),
+                "Order Block Score": round(sig.get("ob_score", 0), 1), "Order Block": sig.get("ob_signal", "NONE"),
+                "OB Side": sig.get("ob_side", "NONE"),
                 "AI Final": sig["ai_signal"], "PIN": sig["pin_signal"],
                 "Momentum": sig["momentum_signal"], "Outcome": outcome,
             })
@@ -4560,6 +4600,37 @@ def _run_historical_backtest(fyers, symbols: List[str], date_from: str, date_to:
         all_rows.extend(candidates)
 
     return pd.DataFrame(all_rows), errors
+
+
+def _show_order_block_tab(fyers, all_symbols, fo_symbols) -> None:
+    st.markdown("### 🧱 ORDER BLOCK SCANNER — PRICE + VOLUME CONFIRMATION")
+    st.caption("Recent 5M displacement-based order-block zones. Heuristic only; not a direct institutional order-flow feed.")
+    source = st.radio("Universe", ["NSE Stocks", "F&O Stocks"], horizontal=True, key="ob_source")
+    universe = all_symbols if source == "NSE Stocks" else fo_symbols
+    if not universe:
+        st.warning("No symbols available."); return
+    c1,c2=st.columns(2)
+    with c1: limit=st.number_input("Stocks (0 = ALL)",0,max(len(universe),1),min(50,len(universe)),10,key="ob_limit")
+    with c2: min_score=st.slider("Minimum OB Score",50,100,60,5,key="ob_min_score")
+    pairs=universe if int(limit)==0 else universe[:int(limit)]
+    if st.button(f"🧱 SCAN ORDER BLOCK ({len(pairs):,} STOCKS)",key="ob_run",type="primary",use_container_width=True):
+        rows=[]; errors=[]; progress=st.progress(0.0)
+        for i,symbol in enumerate(pairs,1):
+            try:
+                d5=_fetch_timeframe_data(fyers,symbol,"5",lookback_days=2); ob=detect_order_block_zone(d5)
+                if ob.get("ob_score",0)>=float(min_score) and ob.get("ob_side") in ("BUY","SELL"):
+                    rows.append({"Symbol":symbol.replace("NSE:","").replace("-EQ",""),"Time":d5["Time"].iloc[-1] if d5 is not None and not d5.empty and "Time" in d5.columns else None,"LTP":round(float(d5["Close"].iloc[-1]),2) if d5 is not None and not d5.empty else None,"OB SIGNAL":ob["ob_signal"],"OB SIDE":ob["ob_side"],"OB SCORE":ob["ob_score"],"OB HIGH":ob["ob_high"],"OB LOW":ob["ob_low"],"OB MID":ob["ob_mid"],"DISTANCE %":ob["ob_distance_pct"],"REASON":ob["ob_reason"]})
+            except Exception as e: errors.append(f"{symbol}: {str(e)[:120]}")
+            progress.progress(i/max(len(pairs),1))
+        df=pd.DataFrame(rows).sort_values("OB SCORE",ascending=False) if rows else pd.DataFrame(); st.session_state["ob_df"]=df; st.session_state["ob_errors"]=errors
+    df=st.session_state.get("ob_df")
+    if df is None: st.info("Set the score and run the Order Block scan."); return
+    if df.empty: st.warning("No Order Block setups passed the selected score."); return
+    m1,m2,m3=st.columns(3); m1.metric("OB SETUPS",len(df)); m2.metric("BUY OB",int((df["OB SIDE"]=="BUY").sum())); m3.metric("SELL OB",int((df["OB SIDE"]=="SELL").sum()))
+    st.dataframe(df,use_container_width=True,height=500); _excel_download_button(df,"ORDER_BLOCK_SCAN","ob_excel")
+    errors=st.session_state.get("ob_errors",[])
+    if errors:
+        with st.expander(f"⚠️ Errors ({len(errors)})"): st.dataframe(pd.DataFrame({"Error":errors}),use_container_width=True)
 
 
 def _show_historical_backtest_tab(fyers, all_symbols, fo_symbols) -> None:
@@ -4603,6 +4674,12 @@ def _show_historical_backtest_tab(fyers, all_symbols, fo_symbols) -> None:
     with c10:
         max_per_symbol = st.number_input("Max signals / stock", 10, 500, 80, 10, key="bt_max")
 
+    ob_c1, ob_c2 = st.columns(2)
+    with ob_c1:
+        use_ob = st.checkbox("🧱 Use Order Block confirmation", value=True, key="bt_use_ob")
+    with ob_c2:
+        min_ob = st.slider("Min Order Block Score", 50, 100, 60, 5, key="bt_ob")
+
     st.info(
         "WIN = target hit before stop. LOSS = stop hit before target. "
         "AMBIGUOUS = both touched in the same candle. NO HIT = neither reached within the selected horizon. "
@@ -4622,7 +4699,7 @@ def _show_historical_backtest_tab(fyers, all_symbols, fo_symbols) -> None:
             result_df, errors = _run_historical_backtest(
                 fyers, scan_pairs, str(date_from), str(date_to),
                 float(min_ai), float(min_pin), float(min_momentum),
-                float(target_pct), float(stop_pct), int(horizon), int(max_per_symbol)
+                float(target_pct), float(stop_pct), int(horizon), bool(use_ob), float(min_ob), int(max_per_symbol)
             )
         st.session_state["bt_df"] = result_df
         st.session_state["bt_errors"] = errors
@@ -4727,7 +4804,8 @@ def show_scanner(fyers) -> None:
         "📌 PIN FULL SCAN",
         "🧠 AMD SCAN",
         "🧠 AI FINAL CONFIRMATION",
-        "📚 HISTORICAL BACKTEST"
+        "📚 HISTORICAL BACKTEST",
+        "🧱 ORDER BLOCK"
     ])
     
     # ════════════════════════════════════════════════════════════════════════════════
@@ -5633,6 +5711,10 @@ def show_scanner(fyers) -> None:
     # ════════════════════════════════════════════════════════════════════════════════
     with tabs[13]:
         _show_historical_backtest_tab(fyers, all_symbols, fo_symbols)
+
+    # TAB 14: ORDER BLOCK — ADDITIVE ONLY
+    with tabs[14]:
+        _show_order_block_tab(fyers, all_symbols, fo_symbols)
     
     gc.collect()
 
