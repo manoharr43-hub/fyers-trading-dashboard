@@ -3617,6 +3617,137 @@ def calculate_pin_rules(df_5m: pd.DataFrame, data_5m: Dict[str, Any], data_15m: 
         return out
 
 
+
+def calculate_pine_pro_v3(df_5m: pd.DataFrame, data_5m: Dict[str, Any]) -> Dict[str, Any]:
+    """Pine AI PRO v3 parity layer for the PIN scanner.
+
+    Mirrors the supplied TradingView logic as closely as the available OHLCV
+    Python data permits. It is intentionally additive: existing PIN rules are
+    left untouched and these values are exposed as separate PINE_* fields.
+    """
+    out = {
+        "PINE SIGNAL": "⚪ WAIT", "PINE SCORE": 0.0,
+        "PINE BUY SCORE": 0.0, "PINE SELL SCORE": 0.0,
+        "PINE MOVEMENT": "⚪ NO MOVE", "PINE BIG BUY SCORE": 0.0,
+        "PINE BIG SELL SCORE": 0.0, "PINE CONSOLIDATION": "NO",
+        "PINE STRUCTURE": "—", "PINE SWEEP": "NO SWEEP",
+        "PINE REVERSAL": "—", "PINE LIQUIDITY": "NONE",
+        "PINE REASON": ""
+    }
+    if df_5m is None or len(df_5m) < 40:
+        out["PINE REASON"] = "Insufficient 5M candles"
+        return out
+    try:
+        d = df_5m.reset_index(drop=True).copy()
+        last = d.iloc[-1]
+        o, h, l, c, v = [float(last[x]) for x in ["Open", "High", "Low", "Close", "Volume"]]
+        body = abs(c-o); rng = max(h-l, 1e-9)
+        upper_wick = h - max(o,c); lower_wick = min(o,c) - l
+        atr_s = calculate_atr(d, 14)
+        atr = float(atr_s.iloc[-1]) if pd.notna(atr_s.iloc[-1]) else max(c*0.005, 0.01)
+        vwap_s = calculate_vwap(d)
+        vwap = float(vwap_s.iloc[-1]) if len(vwap_s) and pd.notna(vwap_s.iloc[-1]) else c
+        rsi = float(data_5m.get("rsi", 50) or 50)
+        rvol = float(data_5m.get("rvol", 0) or 0)
+        macd_bull = bool(data_5m.get("macd_bullish", False))
+        macd_hist = float(data_5m.get("macd_hist", 0) or 0)
+        ema_trend = str(data_5m.get("ema_trend", "NEUTRAL")).upper()
+        structure_trend = str(data_5m.get("structure_trend", "NEUTRAL")).upper()
+        bull = c > o; bear = c < o
+        strong_bull = bull and body/rng*100 >= 55
+        strong_bear = bear and body/rng*100 >= 55
+        high_volume = rvol >= 1.5
+
+        # Pine liquidity pivots: pivot high/low with left=right=5.
+        ph, pl = _confirmed_pivots(d, left=5, right=5)
+        last_hi = ph[-1][1] if ph else None; prev_hi = ph[-2][1] if len(ph) >= 2 else None
+        last_lo = pl[-1][1] if pl else None; prev_lo = pl[-2][1] if len(pl) >= 2 else None
+        eq_hi = last_hi is not None and prev_hi is not None and abs(last_hi-prev_hi) <= atr*0.15
+        eq_lo = last_lo is not None and prev_lo is not None and abs(last_lo-prev_lo) <= atr*0.15
+        sweep_buy_side = last_hi is not None and h > last_hi and c < last_hi and upper_wick > body
+        sweep_sell_side = last_lo is not None and l < last_lo and c > last_lo and lower_wick > body
+        bullish_sweep = sweep_sell_side
+        bearish_sweep = sweep_buy_side
+        bullish_reversal = bullish_sweep and bull and c > vwap and rsi > 45
+        bearish_reversal = bearish_sweep and bear and c < vwap and rsi < 55
+
+        # AI PRO v3 confluence: 25 + 15 + 15 + 20 + 10 + 5 + sweep/reversal bonus.
+        buy = 0.0; sell = 0.0
+        buy += 25 if ema_trend == "BULLISH" and structure_trend == "BULLISH" else 15 if structure_trend == "BULLISH" else 0
+        sell += 25 if ema_trend == "BEARISH" and structure_trend == "BEARISH" else 15 if structure_trend == "BEARISH" else 0
+        buy += 15 if rsi >= 55 else 7 if rsi >= 50 else 0
+        sell += 15 if rsi <= 45 else 7 if rsi <= 50 else 0
+        buy += 15 if c > vwap else 0; sell += 15 if c < vwap else 0
+        buy += 20 if macd_bull and macd_hist > 0 else 10 if macd_bull else 0
+        sell += 20 if (not macd_bull) and macd_hist < 0 else 10 if not macd_bull else 0
+        buy += 10 if high_volume and bull else 0; sell += 10 if high_volume and bear else 0
+        buy += 5 if strong_bull else 0; sell += 5 if strong_bear else 0
+        buy += 10 if bullish_sweep else 0; sell += 10 if bearish_sweep else 0
+        buy += 10 if bullish_reversal else 0; sell += 10 if bearish_reversal else 0
+        buy = min(buy, 100); sell = min(sell, 100)
+        pine_score = max(buy, sell)
+        direction = "BUY" if buy > sell else "SELL" if sell > buy else "WAIT"
+        if direction == "BUY" and buy >= 82: pine_signal = "🟢 STRONG BUY"
+        elif direction == "SELL" and sell >= 82: pine_signal = "🔴 STRONG SELL"
+        elif direction == "BUY" and buy >= 70: pine_signal = "🟢 BUY"
+        elif direction == "SELL" and sell >= 70: pine_signal = "🔴 SELL"
+        else: pine_signal = "⚪ WAIT"
+
+        # Pine Big Movement: consolidation(20) -> breakout candle -> volume -> structure -> momentum.
+        con_hi = float(d["High"].rolling(20).max().iloc[-2]) if len(d) >= 21 else float("nan")
+        con_lo = float(d["Low"].rolling(20).min().iloc[-2]) if len(d) >= 21 else float("nan")
+        con_range = con_hi - con_lo if pd.notna(con_hi) and pd.notna(con_lo) else float("nan")
+        consolidation = pd.notna(con_range) and con_range <= atr * 2.5
+        bull_break_candle = bull and body >= atr * 0.8
+        bear_break_candle = bear and body >= atr * 0.8
+        bull_range_break = consolidation and c > con_hi
+        bear_range_break = consolidation and c < con_lo
+        # Structure from latest confirmed 5/5 pivots, matching HH/LH/HL/LL idea.
+        move_is_hh = last_hi is not None and prev_hi is not None and last_hi > prev_hi
+        move_is_lh = last_hi is not None and prev_hi is not None and last_hi < prev_hi
+        move_is_hl = last_lo is not None and prev_lo is not None and last_lo > prev_lo
+        move_is_ll = last_lo is not None and prev_lo is not None and last_lo < prev_lo
+        bull_structure = move_is_hh or move_is_hl or (ema_trend == "BULLISH" and structure_trend == "BULLISH")
+        bear_structure = move_is_lh or move_is_ll or (ema_trend == "BEARISH" and structure_trend == "BEARISH")
+        bull_momentum = c > vwap and macd_bull and rsi >= 55
+        bear_momentum = c < vwap and (not macd_bull) and rsi <= 45
+        big_volume = rvol >= 1.8
+        big_buy = (30 if bull_range_break else 0) + (20 if bull_break_candle else 0) + (20 if big_volume and bull else 0) + (15 if bull_structure else 0) + (15 if bull_momentum else 0)
+        big_sell = (30 if bear_range_break else 0) + (20 if bear_break_candle else 0) + (20 if big_volume and bear else 0) + (15 if bear_structure else 0) + (15 if bear_momentum else 0)
+        big_buy = min(big_buy, 100); big_sell = min(big_sell, 100)
+        big_buy_raw = big_buy >= 70 and big_buy > big_sell
+        big_sell_raw = big_sell >= 70 and big_sell > big_buy
+        movement = "🚀 BIG BUY" if big_buy_raw else "🚀 BIG SELL" if big_sell_raw else "🟡 BUY WATCH" if big_buy > big_sell and big_buy >= 45 else "🟡 SELL WATCH" if big_sell > big_buy and big_sell >= 45 else "⚪ NO MOVE"
+        structure = "HH" if move_is_hh else "HL" if move_is_hl else "LH" if move_is_lh else "LL" if move_is_ll else "—"
+        liquidity = "EQ HIGH" if eq_hi else "EQ LOW" if eq_lo else "HIGH" if last_hi is not None else "LOW" if last_lo is not None else "NONE"
+        sweep = "🟢 LOW SWEPT" if bullish_sweep else "🔴 HIGH SWEPT" if bearish_sweep else "NO SWEEP"
+        reversal = "🟢 BULL REVERSAL" if bullish_reversal else "🔴 BEAR REVERSAL" if bearish_reversal else "—"
+        reasons = []
+        if consolidation: reasons.append("CONSOLIDATION")
+        if eq_hi: reasons.append("EQ HIGH")
+        if eq_lo: reasons.append("EQ LOW")
+        if bullish_sweep: reasons.append("LOW SWEEP")
+        if bearish_sweep: reasons.append("HIGH SWEEP")
+        if bullish_reversal: reasons.append("BULL REVERSAL")
+        if bearish_reversal: reasons.append("BEAR REVERSAL")
+        if big_buy_raw: reasons.append("BIG BUY CONFIRMED")
+        if big_sell_raw: reasons.append("BIG SELL CONFIRMED")
+        if not reasons and direction != "WAIT": reasons.append(f"{direction} CONFLUENCE")
+        out.update({
+            "PINE SIGNAL": pine_signal, "PINE SCORE": round(pine_score, 1),
+            "PINE BUY SCORE": round(buy, 1), "PINE SELL SCORE": round(sell, 1),
+            "PINE MOVEMENT": movement, "PINE BIG BUY SCORE": round(big_buy, 1),
+            "PINE BIG SELL SCORE": round(big_sell, 1),
+            "PINE CONSOLIDATION": "YES" if consolidation else "NO",
+            "PINE STRUCTURE": structure, "PINE SWEEP": sweep,
+            "PINE REVERSAL": reversal, "PINE LIQUIDITY": liquidity,
+            "PINE REASON": " | ".join(reasons) or "No Pine confirmation"
+        })
+        return out
+    except Exception as e:
+        out["PINE REASON"] = f"Pine error: {type(e).__name__}"
+        return out
+
 def _show_pin_rules_tab(fyers) -> None:
     st.markdown("### 📌 PIN RULES — Liquidity + Reversal + Big Movement")
     st.caption("Additional analysis only. Existing Scanner tabs and scanner logic are not modified.")
@@ -3661,7 +3792,7 @@ def _show_pin_rules_tab(fyers) -> None:
     with c2:
         pin_min = st.slider("Minimum PIN score", 50, 100, PIN_MIN_CONFIDENCE, 1, key="pin_min_score")
     with c3:
-        pin_mode = st.selectbox("Show", ["ALL", "BUY ONLY", "SELL ONLY", "STRONG ONLY"], key="pin_mode")
+        pin_mode = st.selectbox("Show", ["ALL", "BUY ONLY", "SELL ONLY", "STRONG ONLY", "PINE SIGNALS", "PINE PRE-BIG", "PINE BIG MOVE"], key="pin_mode")
 
     candidates = base_df.copy()
     if "AI CONFIDENCE %" in candidates.columns:
@@ -3685,6 +3816,8 @@ def _show_pin_rules_tab(fyers) -> None:
                     progress.progress(n / max(total, 1))
                     continue
                 pin = calculate_pin_rules(a5.get("df"), a5.get("data", {}), a15.get("data", {}), a1h.get("data", {}))
+                pine = calculate_pine_pro_v3(a5.get("df"), a5.get("data", {}))
+                pin.update(pine)
                 pin["Symbol"] = symbol.replace("NSE:", "").replace("-EQ", "")
                 pin["LTP"] = row.get("LTP", "N/A")
                 pin["AI CONFIDENCE %"] = row.get("AI CONFIDENCE %", "N/A")
@@ -3704,7 +3837,20 @@ def _show_pin_rules_tab(fyers) -> None:
                 result = result[result["PIN SIGNAL"].astype(str).str.contains("SELL", na=False)]
             elif pin_mode == "STRONG ONLY":
                 result = result[result["PIN SIGNAL"].astype(str).str.contains("STRONG", na=False)]
-            result = result.drop(columns=["__score"], errors="ignore")
+            elif pin_mode == "PINE SIGNALS":
+                result = result[result["PINE SIGNAL"].astype(str).str.contains("BUY|SELL", regex=True, na=False)]
+            elif pin_mode == "PINE PRE-BIG":
+                result = result[result["PINE MOVEMENT"].astype(str).str.contains("WATCH", na=False)]
+            elif pin_mode == "PINE BIG MOVE":
+                result = result[result["PINE MOVEMENT"].astype(str).str.contains("BIG BUY|BIG SELL", regex=True, na=False)]
+            # One stock = one final row, strongest Pine/Pin context first.
+            result["__pine_rank"] = pd.to_numeric(result.get("PINE SCORE", 0), errors="coerce").fillna(0)
+            result["__big_rank"] = pd.to_numeric(result.get("PINE BIG BUY SCORE", 0), errors="coerce").fillna(0).combine(
+                pd.to_numeric(result.get("PINE BIG SELL SCORE", 0), errors="coerce").fillna(0), max
+            )
+            result = result.sort_values(["__big_rank", "__pine_rank", "__score"], ascending=False, kind="stable")
+            result = result.drop_duplicates(subset=["Symbol"], keep="first")
+            result = result.drop(columns=["__score", "__pine_rank", "__big_rank"], errors="ignore")
         st.session_state["pin_df"] = result
         st.session_state["pin_errors"] = errors
 
@@ -3715,7 +3861,11 @@ def _show_pin_rules_tab(fyers) -> None:
         pc2.metric("🟢 BUY", int(pin_df["PIN SIGNAL"].astype(str).str.contains("BUY", na=False).sum()))
         pc3.metric("🔴 SELL", int(pin_df["PIN SIGNAL"].astype(str).str.contains("SELL", na=False).sum()))
         pc4.metric("💧 SWEEPS", int((pin_df["SWEEP"].astype(str) != "NONE").sum()))
-        display_cols = [c for c in ["Symbol","LTP","PIN SIGNAL","PIN SCORE","LIQUIDITY","SWEEP","REVERSAL","EQUAL HIGH","EQUAL LOW","BIG MOVEMENT","BIG MOVE SCORE","STRUCTURE","5M TREND","15M TREND","1H TREND","RVOL","RSI","PRESSURE","AI CONFIDENCE %","AI SIGNAL","REASON"] if c in pin_df.columns]
+        p5, p6, p7 = st.columns(3)
+        p5.metric("🟡 PINE PRE-BIG", int(pin_df["PINE MOVEMENT"].astype(str).str.contains("WATCH", na=False).sum()))
+        p6.metric("🚀 PINE BIG MOVE", int(pin_df["PINE MOVEMENT"].astype(str).str.contains("BIG BUY|BIG SELL", regex=True, na=False).sum()))
+        p7.metric("📈 PINE SIGNALS", int(pin_df["PINE SIGNAL"].astype(str).str.contains("BUY|SELL", regex=True, na=False).sum()))
+        display_cols = [c for c in ["Symbol","LTP","PINE SIGNAL","PINE SCORE","PINE MOVEMENT","PINE BIG BUY SCORE","PINE BIG SELL SCORE","PINE CONSOLIDATION","PINE STRUCTURE","PINE LIQUIDITY","PINE SWEEP","PINE REVERSAL","PIN SIGNAL","PIN SCORE","LIQUIDITY","SWEEP","REVERSAL","EQUAL HIGH","EQUAL LOW","BIG MOVEMENT","BIG MOVE SCORE","STRUCTURE","5M TREND","15M TREND","1H TREND","RVOL","RSI","PRESSURE","AI CONFIDENCE %","AI SIGNAL","PINE REASON","REASON"] if c in pin_df.columns]
         st.dataframe(pin_df[display_cols], use_container_width=True, height=500)
         st.download_button("📥 DOWNLOAD PIN RULES EXCEL", _format_excel_output(pin_df, "PIN_RULES"), f"PIN_RULES_{_now_ist().strftime('%Y%m%d_%H%M')}.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="pin_excel")
     elif "pin_df" in st.session_state:
