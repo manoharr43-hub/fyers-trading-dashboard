@@ -264,6 +264,20 @@ VOL_BIGMOVE_MIN_RVOL = 2.5
 VOL_BIGMOVE_MIN_BODY_PCT = 0.8
 VOL_BIGMOVE_LOOKBACK = 20
 
+# BIG MOVE SETUP CONSTANTS
+# These names are used by detect_last_consolidation() and
+# detect_big_move_setup(). They were referenced but not defined.
+BIGMOVE_LOOKBACK_BARS = 30
+BIGMOVE_CONSOLIDATION_MIN_BARS = 4
+BIGMOVE_CONSOLIDATION_MAX_BARS = 12
+BIGMOVE_MAX_RANGE_PCT = 1.5
+BIGMOVE_MAX_BAR_ATR_MULT = 1.20
+BIGMOVE_MIN_BODY_ATR = 1.00
+BIGMOVE_MIN_BODY_PCT = 60.0
+BIGMOVE_MIN_RVOL = 1.50
+BIGMOVE_MIN_BREAK_PCT = 0.15
+BIGMOVE_STRONG_SCORE = 85.0
+
 # ════════════════════════════════════════════════════════════════════════════════
 # MULTI-TIMEFRAME CONSTANTS (NEW)
 # ════════════════════════════════════════════════════════════════════════════════
@@ -5793,12 +5807,17 @@ if __name__ == "__main__":
             st.info("Please set: export FYERS_ACCESS_TOKEN='your_token_here'")
             st.stop()
         
+        # FYERS SDK compatibility: prefer the current v3 package, then fall back
+        # to the legacy package if an existing environment still uses it.
         try:
-            from fyers_api import fyersModel
-        except ImportError as ie:
-            st.error("❌ fyers-api not installed")
-            st.code("pip install fyers-api", language="bash")
-            st.stop()
+            from fyers_apiv3 import fyersModel
+        except ImportError:
+            try:
+                from fyers_api import fyersModel
+            except ImportError:
+                st.error("❌ FYERS SDK not installed")
+                st.code("pip install fyers-apiv3", language="bash")
+                st.stop()
         
         app_id = os.environ.get("FYERS_APP_ID", "DEMO")
         
