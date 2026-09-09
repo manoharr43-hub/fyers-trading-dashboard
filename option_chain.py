@@ -3707,6 +3707,332 @@ def _render_ai_signal_cards(state: dict, min_conf: float) -> None:
         """, unsafe_allow_html=True)
 
 
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# NEW PIN ANALYSIS LAYER — ADDITIVE ONLY
+# ══════════════════════════════════════════════════════════════════════════
+# PIN = Option-chain based Price/Institutional Intelligence layer.
+# This section is intentionally standalone. Existing option-chain functions,
+# widgets and calculations are not replaced or renamed.
+
+PIN_MIN_STRONG_SCORE = 72.0
+PIN_MIN_WATCH_SCORE = 58.0
+PIN_MIN_CONFIDENCE = 55.0
+
+
+def _pin_num(value: Any, default: float = 0.0) -> float:
+    try:
+        if value is None:
+            return default
+        x = float(value)
+        return default if not math.isfinite(x) else x
+    except (TypeError, ValueError):
+        return default
+
+
+def _pin_col_sum(df: pd.DataFrame, column: str) -> float:
+    if column not in df.columns:
+        return 0.0
+    return float(pd.to_numeric(df[column], errors="coerce").fillna(0.0).sum())
+
+
+def calculate_pin_signal(
+    df: pd.DataFrame,
+    spot: float,
+    pcr: float = 0.0,
+    market_pressure: Optional[MarketPressure] = None,
+    order_flow: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    """Calculate an additive PIN signal from the already-loaded option chain.
+
+    No additional API request is made. Missing columns simply contribute zero
+    evidence instead of breaking the existing Option Chain dashboard.
+    """
+    result: dict[str, Any] = {
+        "direction": "WAIT",
+        "score": 0.0,
+        "confidence": 0.0,
+        "status": "PIN DATA UNAVAILABLE",
+        "reason": "No usable option-chain data",
+        "bull_score": 0.0,
+        "bear_score": 0.0,
+        "support": 0.0,
+        "resistance": 0.0,
+        "atm": 0.0,
+        "pcr": _pin_num(pcr),
+    }
+    if not isinstance(df, pd.DataFrame) or df.empty or "strike_price" not in df.columns:
+        return result
+
+    d = df.copy()
+    d["strike_price"] = pd.to_numeric(d["strike_price"], errors="coerce")
+    d = d.dropna(subset=["strike_price"])
+    if d.empty:
+        return result
+
+    spot = _pin_num(spot)
+    if spot <= 0:
+        spot = _pin_num(d["strike_price"].median())
+    if spot <= 0:
+        return result
+
+    # Use OI concentration to derive option-chain support/resistance.
+    ce_oi = pd.to_numeric(d.get("ce_oi", 0), errors="coerce").fillna(0.0) if "ce_oi" in d else pd.Series(0.0, index=d.index)
+    pe_oi = pd.to_numeric(d.get("pe_oi", 0), errors="coerce").fillna(0.0) if "pe_oi" in d else pd.Series(0.0, index=d.index)
+    def _pin_series(primary: str, fallback: str) -> pd.Series:
+        if primary in d.columns:
+            return pd.to_numeric(d[primary], errors="coerce").fillna(0.0)
+        if fallback in d.columns:
+            return pd.to_numeric(d[fallback], errors="coerce").fillna(0.0)
+        return pd.Series(0.0, index=d.index)
+
+    ce_doi = _pin_series("ce_chng_oi", "ce_oi_change")
+    pe_doi = _pin_series("pe_chng_oi", "pe_oi_change")
+    ce_vol = _pin_series("ce_volume", "ce_vol")
+    pe_vol = _pin_series("pe_volume", "pe_vol")
+
+    atm_idx = (d["strike_price"] - spot).abs().idxmin()
+    atm = _pin_num(d.loc[atm_idx, "strike_price"])
+    result["atm"] = atm
+
+    call_oi_idx = ce_oi.idxmax() if len(ce_oi) else None
+    put_oi_idx = pe_oi.idxmax() if len(pe_oi) else None
+    resistance = _pin_num(d.loc[call_oi_idx, "strike_price"]) if call_oi_idx is not None else 0.0
+    support = _pin_num(d.loc[put_oi_idx, "strike_price"]) if put_oi_idx is not None else 0.0
+    result["support"] = support
+    result["resistance"] = resistance
+
+    bull = 0.0
+    bear = 0.0
+    bull_reasons: list[str] = []
+    bear_reasons: list[str] = []
+
+    # PCR confirmation — deliberately capped so PCR alone cannot create a signal.
+    pcr_value = _pin_num(pcr)
+    result["pcr"] = pcr_value
+    if pcr_value >= 1.10:
+        bull += 12; bull_reasons.append(f"PCR {pcr_value:.2f} bullish")
+    elif pcr_value <= 0.90 and pcr_value > 0:
+        bear += 12; bear_reasons.append(f"PCR {pcr_value:.2f} bearish")
+
+    total_pe_doi = float(pe_doi.clip(lower=0).sum())
+    total_ce_doi = float(ce_doi.clip(lower=0).sum())
+    total_pe_unwind = float((-pe_doi).clip(lower=0).sum())
+    total_ce_unwind = float((-ce_doi).clip(lower=0).sum())
+
+    if total_pe_doi > total_ce_doi * 1.10 and total_pe_doi > 0:
+        bull += 20; bull_reasons.append("PE OI accumulation stronger")
+    elif total_ce_doi > total_pe_doi * 1.10 and total_ce_doi > 0:
+        bear += 20; bear_reasons.append("CE OI accumulation stronger")
+
+    if total_ce_unwind > total_pe_unwind * 1.10 and total_ce_unwind > 0:
+        bull += 10; bull_reasons.append("CE OI unwinding")
+    elif total_pe_unwind > total_ce_unwind * 1.10 and total_pe_unwind > 0:
+        bear += 10; bear_reasons.append("PE OI unwinding")
+
+    ce_volume = float(ce_vol.sum())
+    pe_volume = float(pe_vol.sum())
+    if pe_volume > ce_volume * 1.15 and pe_volume > 0:
+        bull += 15; bull_reasons.append("PE volume dominance")
+    elif ce_volume > pe_volume * 1.15 and ce_volume > 0:
+        bear += 15; bear_reasons.append("CE volume dominance")
+
+    # Reuse existing pressure engine if available.
+    if isinstance(market_pressure, MarketPressure):
+        bias = _pin_num(market_pressure.net_market_bias)
+        if bias >= 15:
+            bull += 15; bull_reasons.append("existing buy pressure aligned")
+        elif bias <= -15:
+            bear += 15; bear_reasons.append("existing sell pressure aligned")
+
+    # Reuse existing order-flow engine if available.
+    if isinstance(order_flow, dict):
+        flow_score = _pin_num(order_flow.get("flow_bias_score", 0))
+        if flow_score >= 20:
+            bull += 13; bull_reasons.append("order flow bullish")
+        elif flow_score <= -20:
+            bear += 13; bear_reasons.append("order flow bearish")
+
+    # Support/resistance positioning.
+    if support > 0 and spot >= support and spot > atm * 0.998:
+        bull += 5; bull_reasons.append("price holding option support")
+    if resistance > 0 and spot <= resistance and spot < atm * 1.002:
+        bear += 5; bear_reasons.append("price below option resistance")
+
+    # Existing per-strike pressure/score columns, if present.
+    if "ce_pressure" in d.columns and "pe_pressure" in d.columns:
+        ce_pressure = _pin_col_sum(d, "ce_pressure")
+        pe_pressure = _pin_col_sum(d, "pe_pressure")
+        if pe_pressure > ce_pressure * 1.08:
+            bull += 10; bull_reasons.append("put-side pressure dominant")
+        elif ce_pressure > pe_pressure * 1.08:
+            bear += 10; bear_reasons.append("call-side pressure dominant")
+
+    bull = min(100.0, bull)
+    bear = min(100.0, bear)
+    top = max(bull, bear)
+    gap = abs(bull - bear)
+
+    # Confidence rewards both strength and directional separation.
+    confidence = min(100.0, max(0.0, top * 0.72 + gap * 0.28))
+
+    if bull >= PIN_MIN_STRONG_SCORE and bull > bear + 10 and confidence >= PIN_MIN_CONFIDENCE:
+        direction = "BUY"
+        status = "🟢 PIN BUY"
+        reason = " + ".join(dict.fromkeys(bull_reasons)) or "Bullish option-chain confluence"
+    elif bear >= PIN_MIN_STRONG_SCORE and bear > bull + 10 and confidence >= PIN_MIN_CONFIDENCE:
+        direction = "SELL"
+        status = "🔴 PIN SELL"
+        reason = " + ".join(dict.fromkeys(bear_reasons)) or "Bearish option-chain confluence"
+    elif bull >= PIN_MIN_WATCH_SCORE and bull > bear + 6:
+        direction = "BUY"
+        status = "🟡 PIN BUY WATCH"
+        reason = " + ".join(dict.fromkeys(bull_reasons)) or "Developing bullish evidence"
+    elif bear >= PIN_MIN_WATCH_SCORE and bear > bull + 6:
+        direction = "SELL"
+        status = "🟠 PIN SELL WATCH"
+        reason = " + ".join(dict.fromkeys(bear_reasons)) or "Developing bearish evidence"
+    else:
+        direction = "WAIT"
+        status = "⚪ PIN WAIT"
+        reason = "Conflicting option-chain evidence / insufficient confirmation"
+
+    result.update(
+        direction=direction,
+        score=round(top, 1),
+        confidence=round(confidence, 1),
+        status=status,
+        reason=reason,
+        bull_score=round(bull, 1),
+        bear_score=round(bear, 1),
+    )
+    return result
+
+
+def build_pin_confluence(
+    df: pd.DataFrame,
+    state: dict[str, Any],
+) -> dict[str, Any]:
+    """Combine new PIN output with existing dashboard signals without replacing them."""
+    pin = calculate_pin_signal(
+        df=df,
+        spot=_pin_num(state.get("spot")),
+        pcr=_pin_num(state.get("pcr")),
+        market_pressure=state.get("market_pressure"),
+        order_flow=state.get("order_flow"),
+    )
+
+    existing = state.get("final_signal", {}) or {}
+    existing_signal = str(existing.get("signal", "WAIT")).upper()
+    existing_conf = _pin_num(existing.get("confidence", 0))
+
+    # Existing price-action signal contributes only as confirmation; it is never overwritten.
+    final_direction = pin["direction"]
+    final_score = pin["score"]
+    final_confidence = pin["confidence"]
+    final_status = pin["status"]
+    final_reason = pin["reason"]
+
+    if existing_signal in ("BUY", "SELL") and pin["direction"] == existing_signal:
+        final_score = min(100.0, pin["score"] * 0.65 + existing_conf * 0.35)
+        final_confidence = min(100.0, pin["confidence"] * 0.65 + existing_conf * 0.35 + 5.0)
+        if final_score >= PIN_MIN_STRONG_SCORE and final_confidence >= 70:
+            final_status = "🔥 BIG BUY" if final_direction == "BUY" else "🔥 BIG SELL"
+        else:
+            final_status = "🟢 BUY WATCH" if final_direction == "BUY" else "🔴 SELL WATCH"
+        final_reason += f" | Existing Price Action {existing_signal} aligned"
+    elif existing_signal in ("BUY", "SELL") and pin["direction"] in ("BUY", "SELL") and existing_signal != pin["direction"]:
+        final_direction = "WAIT"
+        final_score = round(max(pin["score"], existing_conf), 1)
+        final_confidence = round(min(pin["confidence"], existing_conf), 1)
+        final_status = "⚪ CONFLICT / WAIT"
+        final_reason = f"PIN {pin['direction']} conflicts with existing {existing_signal} signal"
+    elif pin["direction"] in ("BUY", "SELL") and pin["score"] >= 78 and pin["confidence"] >= 65:
+        final_status = "🟡 PRE-BIG"
+        final_reason += " | Strong PIN setup awaiting full price-action confirmation"
+    elif pin["direction"] == "WAIT":
+        final_status = "⚪ CONFLICT / WAIT"
+
+    return {
+        "pin": pin,
+        "final_direction": final_direction,
+        "final_score": round(float(final_score), 1),
+        "final_confidence": round(float(final_confidence), 1),
+        "final_status": final_status,
+        "final_reason": final_reason,
+    }
+
+
+def render_pin_confluence(df: pd.DataFrame, state: dict[str, Any], symbol: str = "") -> dict[str, Any]:
+    """Render the new PIN section after the existing dashboard UI."""
+    try:
+        confluence = build_pin_confluence(df, state)
+        pin = confluence["pin"]
+
+        st.markdown('<div class="block-title">🧠 PIN + OPTION CHAIN CONFLUENCE</div>', unsafe_allow_html=True)
+        st.caption("Additive PIN layer — existing Option Chain, Price Action, Pressure and Order Flow logic is preserved.")
+
+        c1, c2, c3, c4, c5 = st.columns(5)
+        c1.metric("PIN DIRECTION", pin["direction"])
+        c2.metric("PIN SCORE", f"{pin['score']:.0f}/100")
+        c3.metric("PIN CONFIDENCE", f"{pin['confidence']:.0f}%")
+        c4.metric("ATM", f"{pin['atm']:,.0f}" if pin["atm"] else "—")
+        c5.metric("PCR", f"{pin['pcr']:.2f}" if pin["pcr"] else "—")
+
+        f1, f2, f3 = st.columns(3)
+        f1.metric("SUPPORT", f"{pin['support']:,.0f}" if pin["support"] else "—")
+        f2.metric("RESISTANCE", f"{pin['resistance']:,.0f}" if pin["resistance"] else "—")
+        f3.metric("FINAL STATUS", confluence["final_status"])
+
+        if confluence["final_status"] == "🔥 BIG BUY":
+            st.success("🔥 BIG BUY — PIN and existing Price Action confirmation are aligned.")
+        elif confluence["final_status"] == "🔥 BIG SELL":
+            st.error("🔥 BIG SELL — PIN and existing Price Action confirmation are aligned.")
+        elif confluence["final_status"] == "🟡 PRE-BIG":
+            st.warning("🟡 PRE-BIG — strong PIN setup detected; wait for full confirmation.")
+        elif confluence["final_status"] == "⚪ CONFLICT / WAIT":
+            st.warning("⚪ WAIT — confirmation is conflicting or insufficient.")
+        elif confluence["final_direction"] == "BUY":
+            st.info("🟢 BUY WATCH — bullish evidence is developing.")
+        elif confluence["final_direction"] == "SELL":
+            st.info("🔴 SELL WATCH — bearish evidence is developing.")
+        else:
+            st.info("⚪ PIN WAIT — no clean directional edge yet.")
+
+        st.markdown("### 🔎 PIN Evidence")
+        evidence = pd.DataFrame([
+            {"Metric": "PIN Direction", "Value": pin["direction"]},
+            {"Metric": "PIN Score", "Value": f"{pin['score']:.1f}/100"},
+            {"Metric": "PIN Confidence", "Value": f"{pin['confidence']:.1f}%"},
+            {"Metric": "Bull Score", "Value": f"{pin['bull_score']:.1f}"},
+            {"Metric": "Bear Score", "Value": f"{pin['bear_score']:.1f}"},
+            {"Metric": "Support", "Value": f"{pin['support']:,.0f}" if pin["support"] else "—"},
+            {"Metric": "Resistance", "Value": f"{pin['resistance']:,.0f}" if pin["resistance"] else "—"},
+            {"Metric": "Final Direction", "Value": confluence["final_direction"]},
+            {"Metric": "Final Score", "Value": f"{confluence['final_score']:.1f}/100"},
+            {"Metric": "Final Confidence", "Value": f"{confluence['final_confidence']:.1f}%"},
+            {"Metric": "Reason", "Value": confluence["final_reason"]},
+        ])
+        st.dataframe(evidence, use_container_width=True, hide_index=True)
+
+        st.caption(f"Symbol: {symbol or state.get('symbol', 'OPTION_CHAIN')} | PIN uses already-loaded data; no extra API call.")
+        return confluence
+    except Exception as exc:
+        logger.exception("PIN confluence render failed: %s", exc)
+        st.warning(f"PIN layer unavailable — existing Option Chain remains active. ({exc})")
+        return {
+            "pin": {"direction": "WAIT", "score": 0.0, "confidence": 0.0,
+                     "status": "PIN DATA UNAVAILABLE", "reason": str(exc)},
+            "final_direction": "WAIT", "final_score": 0.0,
+            "final_confidence": 0.0, "final_status": "⚪ CONFLICT / WAIT",
+            "final_reason": str(exc),
+        }
+
+# ══════════════════════════════════════════════════════════════════════════
+# END PIN ANALYSIS LAYER
+# ══════════════════════════════════════════════════════════════════════════
+
 def run_dashboard(fyers: Any = None) -> None:
     _configure_page()
     _inject_css()
@@ -4058,6 +4384,11 @@ def run_dashboard(fyers: Any = None) -> None:
                 )
             except Exception as e:
                 st.error(f"CSV export failed: {e}")
+
+    # NEW: PIN + Option Chain Confluence — additive only.
+    # Existing tabs/export/refresh logic above remain untouched.
+    pin_confluence = render_pin_confluence(df, state, cfg.get("symbol", "OPTION_CHAIN"))
+    state["pin_confluence"] = pin_confluence
 
     st.caption(
         f"**NSE Options + FYERS Price Action + Buy/Sell Pressure** | Last: {meta.get('fetched_at', datetime.now()).strftime('%H:%M:%S')} | "
