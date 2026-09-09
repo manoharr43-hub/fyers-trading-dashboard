@@ -4602,35 +4602,161 @@ def _run_historical_backtest(fyers, symbols: List[str], date_from: str, date_to:
     return pd.DataFrame(all_rows), errors
 
 
+def _scan_order_block_symbol(fyers, symbol, min_score):
+    """Single-symbol Order Block scan for parallel execution."""
+    try:
+        d5 = _fetch_timeframe_data(fyers, symbol, "5", lookback_days=2)
+        if d5 is None or d5.empty:
+            return None, None
+
+        ob = detect_order_block_zone(d5)
+        side = ob.get("ob_side", "NONE")
+        score = float(ob.get("ob_score", 0) or 0)
+
+        if side not in ("BUY", "SELL") or score < float(min_score):
+            return None, None
+
+        signal_time = d5["Time"].iloc[-1] if "Time" in d5.columns and not d5.empty else None
+        ltp = round(float(d5["Close"].iloc[-1]), 2) if "Close" in d5.columns and not d5.empty else None
+
+        return {
+            "Symbol": symbol.replace("NSE:", "").replace("-EQ", ""),
+            "Time": signal_time,
+            "LTP": ltp,
+            "OB SIGNAL": ob.get("ob_signal", "NONE"),
+            "OB SIDE": side,
+            "OB SCORE": score,
+            "OB HIGH": ob.get("ob_high"),
+            "OB LOW": ob.get("ob_low"),
+            "OB MID": ob.get("ob_mid"),
+            "DISTANCE %": ob.get("ob_distance_pct"),
+            "REASON": ob.get("ob_reason", ""),
+        }, None
+    except Exception as e:
+        return None, f"{symbol}: {type(e).__name__}: {str(e)[:120]}"
+
+
+def _run_order_block_scan(fyers, pairs, min_score):
+    """Threaded Order Block scan using the existing scanner batch settings."""
+    pairs = list(pairs or [])
+    total = len(pairs)
+    rows, errors = [], []
+
+    if not total:
+        return pd.DataFrame(), errors
+
+    progress = st.progress(0.0, text=f"🧱 Order Block Scan 0 / {total}")
+    done = 0
+
+    for start in range(0, total, BATCH_SIZE):
+        batch = pairs[start:start + BATCH_SIZE]
+
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            futures = {
+                executor.submit(_scan_order_block_symbol, fyers, symbol, min_score): symbol
+                for symbol in batch
+            }
+
+            for future in as_completed(futures):
+                symbol = futures[future]
+                try:
+                    row, err = future.result()
+                except Exception as e:
+                    row = None
+                    err = f"{symbol}: {type(e).__name__}: {str(e)[:120]}"
+
+                if row is not None:
+                    rows.append(row)
+                if err:
+                    errors.append(err)
+
+                done += 1
+                progress.progress(
+                    done / max(total, 1),
+                    text=f"🧱 Order Block Scan {done:,} / {total:,}"
+                )
+
+        if start + BATCH_SIZE < total:
+            time.sleep(BATCH_PAUSE_SECONDS)
+
+    progress.empty()
+
+    if rows:
+        df = pd.DataFrame(rows)
+        if "OB SCORE" in df.columns:
+            df["OB SCORE"] = pd.to_numeric(df["OB SCORE"], errors="coerce").fillna(0)
+            df = df.sort_values("OB SCORE", ascending=False).reset_index(drop=True)
+    else:
+        df = pd.DataFrame()
+
+    return df, errors
+
+
 def _show_order_block_tab(fyers, all_symbols, fo_symbols) -> None:
+    """Order Block tab. Existing detection logic is preserved; only scan execution is parallelized."""
     st.markdown("### 🧱 ORDER BLOCK SCANNER — PRICE + VOLUME CONFIRMATION")
     st.caption("Recent 5M displacement-based order-block zones. Heuristic only; not a direct institutional order-flow feed.")
+
     source = st.radio("Universe", ["NSE Stocks", "F&O Stocks"], horizontal=True, key="ob_source")
     universe = all_symbols if source == "NSE Stocks" else fo_symbols
     if not universe:
-        st.warning("No symbols available."); return
-    c1,c2=st.columns(2)
-    with c1: limit=st.number_input("Stocks (0 = ALL)",0,max(len(universe),1),min(50,len(universe)),10,key="ob_limit")
-    with c2: min_score=st.slider("Minimum OB Score",50,100,60,5,key="ob_min_score")
-    pairs=universe if int(limit)==0 else universe[:int(limit)]
-    if st.button(f"🧱 SCAN ORDER BLOCK ({len(pairs):,} STOCKS)",key="ob_run",type="primary",use_container_width=True):
-        rows=[]; errors=[]; progress=st.progress(0.0)
-        for i,symbol in enumerate(pairs,1):
-            try:
-                d5=_fetch_timeframe_data(fyers,symbol,"5",lookback_days=2); ob=detect_order_block_zone(d5)
-                if ob.get("ob_score",0)>=float(min_score) and ob.get("ob_side") in ("BUY","SELL"):
-                    rows.append({"Symbol":symbol.replace("NSE:","").replace("-EQ",""),"Time":d5["Time"].iloc[-1] if d5 is not None and not d5.empty and "Time" in d5.columns else None,"LTP":round(float(d5["Close"].iloc[-1]),2) if d5 is not None and not d5.empty else None,"OB SIGNAL":ob["ob_signal"],"OB SIDE":ob["ob_side"],"OB SCORE":ob["ob_score"],"OB HIGH":ob["ob_high"],"OB LOW":ob["ob_low"],"OB MID":ob["ob_mid"],"DISTANCE %":ob["ob_distance_pct"],"REASON":ob["ob_reason"]})
-            except Exception as e: errors.append(f"{symbol}: {str(e)[:120]}")
-            progress.progress(i/max(len(pairs),1))
-        df=pd.DataFrame(rows).sort_values("OB SCORE",ascending=False) if rows else pd.DataFrame(); st.session_state["ob_df"]=df; st.session_state["ob_errors"]=errors
-    df=st.session_state.get("ob_df")
-    if df is None: st.info("Set the score and run the Order Block scan."); return
-    if df.empty: st.warning("No Order Block setups passed the selected score."); return
-    m1,m2,m3=st.columns(3); m1.metric("OB SETUPS",len(df)); m2.metric("BUY OB",int((df["OB SIDE"]=="BUY").sum())); m3.metric("SELL OB",int((df["OB SIDE"]=="SELL").sum()))
-    st.dataframe(df,use_container_width=True,height=500); _excel_download_button(df,"ORDER_BLOCK_SCAN","ob_excel")
-    errors=st.session_state.get("ob_errors",[])
+        st.warning("No symbols available.")
+        return
+
+    c1, c2 = st.columns(2)
+    with c1:
+        limit = st.number_input(
+            "Stocks (0 = ALL)",
+            min_value=0,
+            max_value=max(len(universe), 1),
+            value=min(50, len(universe)),
+            step=10,
+            key="ob_limit"
+        )
+    with c2:
+        min_score = st.slider("Minimum OB Score", 50, 100, 60, 5, key="ob_min_score")
+
+    pairs = list(universe) if int(limit) == 0 else list(universe[:int(limit)])
+
+    if st.button(
+        f"🧱 SCAN ORDER BLOCK ({len(pairs):,} STOCKS)",
+        key="ob_run",
+        type="primary",
+        use_container_width=True,
+    ):
+        st.session_state["ob_df"] = None
+        st.session_state["ob_errors"] = []
+
+        df, errors = _run_order_block_scan(fyers, pairs, min_score)
+
+        st.session_state["ob_df"] = df
+        st.session_state["ob_errors"] = errors
+
+    df = st.session_state.get("ob_df")
+    if df is None:
+        st.info("Set the score and run the Order Block scan.")
+        return
+
+    if df.empty:
+        st.warning("No Order Block setups passed the selected score.")
+        errors = st.session_state.get("ob_errors", [])
+        if errors:
+            with st.expander(f"⚠️ Errors ({len(errors)})"):
+                st.dataframe(pd.DataFrame({"Error": errors}), use_container_width=True)
+        return
+
+    m1, m2, m3 = st.columns(3)
+    m1.metric("OB SETUPS", len(df))
+    m2.metric("BUY OB", int((df["OB SIDE"] == "BUY").sum()))
+    m3.metric("SELL OB", int((df["OB SIDE"] == "SELL").sum()))
+
+    st.dataframe(df, use_container_width=True, height=500)
+    _excel_download_button(df, "ORDER_BLOCK_SCAN", "ob_excel")
+
+    errors = st.session_state.get("ob_errors", [])
     if errors:
-        with st.expander(f"⚠️ Errors ({len(errors)})"): st.dataframe(pd.DataFrame({"Error":errors}),use_container_width=True)
+        with st.expander(f"⚠️ Errors ({len(errors)})"):
+            st.dataframe(pd.DataFrame({"Error": errors}), use_container_width=True)
 
 
 def _show_historical_backtest_tab(fyers, all_symbols, fo_symbols) -> None:
