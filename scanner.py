@@ -5405,24 +5405,35 @@ def show_scanner(fyers) -> None:
 
         mdf = st.session_state.get("momentum_df")
         if mdf is not None and not mdf.empty:
-            # Full successful scan report
+            # FULL SUCCESSFUL SCAN REPORT — never hide successfully analysed rows.
+            # The actionable/watch filter is kept as a separate view below.
             report = mdf.copy()
             report["DIRECTION"] = report.get("DIRECTION", "NONE").astype(str).str.upper()
             raw_report_count = len(report)
-            report = _apply_single_signal_layer(report, latest_only=True)
+
+            # Separate actionable/watch view. This must NOT replace the full report.
+            actionable_report = _apply_single_signal_layer(report.copy(), latest_only=True)
+
+            # Sort the full successful report safely.
+            for _col in ["SCORE", "RVOL"]:
+                if _col not in report.columns:
+                    report[_col] = 0.0
+                report[_col] = pd.to_numeric(report[_col], errors="coerce").fillna(0.0)
             report = report.sort_values(
-                ["FINAL PRIORITY", "SCORE", "RVOL"],
-                ascending=[False, False, False],
+                ["SCORE", "RVOL"],
+                ascending=[False, False],
                 kind="stable"
-            )
+            ).reset_index(drop=True)
 
-            buy = report[report["DIRECTION"] == "BUY"].copy().sort_values(["SCORE", "RVOL"], ascending=False)
-            sell = report[report["DIRECTION"] == "SELL"].copy().sort_values(["SCORE", "RVOL"], ascending=False)
+            # BUY / SELL sections show actionable/watch rows only.
+            buy = actionable_report[actionable_report["DIRECTION"] == "BUY"].copy() if not actionable_report.empty and "DIRECTION" in actionable_report.columns else pd.DataFrame()
+            sell = actionable_report[actionable_report["DIRECTION"] == "SELL"].copy() if not actionable_report.empty and "DIRECTION" in actionable_report.columns else pd.DataFrame()
 
-            st.markdown("### 📄 LIVE MOVEMENT REPORT")
+            st.markdown("### 📄 LIVE MOVEMENT REPORT — ALL SUCCESSFUL STOCKS")
             st.caption(
-                f"{len(report)} unique actionable/watch stocks from {raw_report_count} analysed rows — "
-                f"BUY: {len(buy)} | SELL: {len(sell)} | NO SIGNAL hidden | one stock = one signal"
+                f"{len(report)} successful stocks from {raw_report_count} analysed rows — "
+                f"ACTIONABLE/WATCH: {len(actionable_report)} | BUY WATCH: {len(buy)} | SELL WATCH: {len(sell)} | "
+                f"NO SIGNAL rows are retained here"
             )
 
             # Put the most useful columns first, then retain all other analysis columns.
@@ -5440,6 +5451,14 @@ def show_scanner(fyers) -> None:
             report_cols = list(dict.fromkeys(report_cols))
 
             st.dataframe(report.loc[:, report_cols], use_container_width=True, height=500)
+
+            # Separate actionable/watch report — filtered rows are shown here only.
+            st.markdown(f"### 🎯 ACTIONABLE / WATCH REPORT — {len(actionable_report)}")
+            if not actionable_report.empty:
+                action_cols = [c for c in report_cols if c in actionable_report.columns]
+                st.dataframe(actionable_report[action_cols], use_container_width=True, height=400)
+            else:
+                st.info("No confirmed/pre-move/pre-sweep setup currently. The full successful report above is still available.")
 
             # Early-warning sections: these are watched before confirmed movement.
             pre = report[report.get("SETUP STATUS", pd.Series("", index=report.index)).astype(str).str.contains("PRE-", na=False)].copy()
