@@ -207,9 +207,12 @@ DATE_FROM = (datetime.today() - timedelta(days=365)).strftime("%Y-%m-%d")
 DATE_TO = datetime.today().strftime("%Y-%m-%d")
 FYERS_NSE_CM_SYMBOL_MASTER = "https://public.fyers.in/sym_details/NSE_CM.csv"
 NIFTY_BENCHMARK_SYMBOL = "NSE:NIFTY50-INDEX"
-MAX_WORKERS = 8
-BATCH_SIZE = 50
-BATCH_PAUSE_SECONDS = 1.0
+MAX_WORKERS = 12
+BATCH_SIZE = 100
+BATCH_PAUSE_SECONDS = 0.25
+# Fast mode: enough history for EMA200/structure while reducing API payload size.
+TIMEFRAME_LOOKBACK_DAYS = {"5": 10, "15": 20, "60": 60}
+HISTORY_CACHE_TTL_SECONDS = 15
 DEFAULT_SCAN_STOCKS = 2300
 FYERS_APP_ID = os.environ.get("FYERS_APP_ID", "")
 OPTIONS_STRIKE_COUNT = 10
@@ -1392,11 +1395,35 @@ def _display_scan_summary(stats: "ScanStats") -> None:
 # ════════════════════════════════════════════════════════════════════════════════
 # TIMEFRAME DATA FETCHER (NEW)
 # ════════════════════════════════════════════════════════════════════════════════
+_HISTORY_CACHE = {}
+_HISTORY_CACHE_LOCK = __import__("threading").Lock()
+
+def _history_cache_get(key):
+    now = time.time()
+    with _HISTORY_CACHE_LOCK:
+        item = _HISTORY_CACHE.get(key)
+        if item and (now - item["ts"]) <= HISTORY_CACHE_TTL_SECONDS:
+            return item["df"].copy(deep=True)
+        if item:
+            _HISTORY_CACHE.pop(key, None)
+    return None
+
+def _history_cache_put(key, df):
+    with _HISTORY_CACHE_LOCK:
+        _HISTORY_CACHE[key] = {"ts": time.time(), "df": df.copy(deep=True)}
+
 def _fetch_timeframe_data(fyers, symbol, resolution: str, lookback_days: int = 30) -> Optional[pd.DataFrame]:
-    """Fetch OHLCV data for a specific timeframe."""
+    """Fetch OHLCV data with a short TTL cache to avoid duplicate API calls."""
+    lookback_days = TIMEFRAME_LOOKBACK_DAYS.get(str(resolution), lookback_days)
+    cache_key = (str(symbol), str(resolution), lookback_days, _now_ist().date().isoformat())
+
+    cached = _history_cache_get(cache_key)
+    if cached is not None:
+        return cached
+
     date_from = (datetime.today() - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
     date_to = datetime.today().strftime("%Y-%m-%d")
-    
+
     resp, err = _safe_history(fyers, {
         "symbol": symbol,
         "resolution": resolution,
@@ -1405,36 +1432,53 @@ def _fetch_timeframe_data(fyers, symbol, resolution: str, lookback_days: int = 3
         "range_to": date_to,
         "cont_flag": "1",
     })
-    
+
     if err or not resp:
         return None
-    
+
     candles = resp.get("candles")
     if not candles or len(candles) < 10:
         return None
-    
+
     try:
-        df = pd.DataFrame(candles, columns=["Time", "Open", "High", "Low", "Close", "Volume"])
-        df["Time"] = pd.to_datetime(df["Time"], unit="s", utc=True).dt.tz_convert("Asia/Kolkata")
-        df[["Open", "High", "Low", "Close", "Volume"]] = df[["Open", "High", "Low", "Close", "Volume"]].apply(pd.to_numeric, errors="coerce")
-        df = df.dropna(subset=["Open", "High", "Low", "Close"]).sort_values("Time").reset_index(drop=True)
-        
+        df = pd.DataFrame(
+            candles,
+            columns=["Time", "Open", "High", "Low", "Close", "Volume"]
+        )
+        df["Time"] = pd.to_datetime(
+            df["Time"], unit="s", utc=True
+        ).dt.tz_convert("Asia/Kolkata")
+        numeric_cols = ["Open", "High", "Low", "Close", "Volume"]
+        df[numeric_cols] = df[numeric_cols].apply(
+            pd.to_numeric, errors="coerce"
+        )
+        df = (
+            df.dropna(subset=["Open", "High", "Low", "Close"])
+              .sort_values("Time")
+              .reset_index(drop=True)
+        )
+
         if len(df) < 10:
             return None
-        
+
+        # Ignore the currently forming candle.
         if len(df) > 1:
             last_time = df["Time"].iloc[-1]
             candle_age = (_now_ist() - last_time).total_seconds() / 60
-            res_minutes = int(resolution)
+            try:
+                res_minutes = int(resolution)
+            except Exception:
+                res_minutes = 5
             if candle_age < res_minutes + 1:
                 df = df.iloc[:-1].reset_index(drop=True)
-        
+
         if len(df) < 10:
             return None
-        
+
+        _history_cache_put(cache_key, df)
         return df
-    
-    except Exception as e:
+
+    except Exception:
         return None
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -1442,7 +1486,7 @@ def _fetch_timeframe_data(fyers, symbol, resolution: str, lookback_days: int = 3
 # ════════════════════════════════════════════════════════════════════════════════
 def analyze_timeframe(fyers, symbol: str, resolution: str) -> Dict[str, Any]:
     """Analyze a specific timeframe."""
-    df = _fetch_timeframe_data(fyers, symbol, resolution, lookback_days=30)
+    df = _fetch_timeframe_data(fyers, symbol, resolution, lookback_days=TIMEFRAME_LOOKBACK_DAYS.get(str(resolution), 30))
     
     if df is None or len(df) < 10:
         return {
@@ -3055,597 +3099,139 @@ def detect_pre_move_radar(df5: pd.DataFrame, df15: Optional[pd.DataFrame] = None
 # THREADED SCAN FUNCTIONS
 # ════════════════════════════════════════════════════════════════════════════════
 def run_nse_scan(fyers, symbols):
-    """Threaded scan for NSE stocks."""
+    """Fast threaded NSE scan with stable error handling and reduced UI overhead."""
     symbols = _validate_symbols(symbols)
     results, errors = [], []
     stats = ScanStats(total=len(symbols))
+    if not symbols:
+        return results, errors, stats
+
     progress = st.progress(0.0, text=f"Scanning NSE Stocks 0 / {len(symbols)}")
     done = 0
-    
-    for i in range(0, len(symbols), BATCH_SIZE):
-        batch = symbols[i:i + BATCH_SIZE]
-        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+    update_every = max(10, min(50, len(symbols) // 50 or 10))
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        for i in range(0, len(symbols), BATCH_SIZE):
+            batch = symbols[i:i + BATCH_SIZE]
             futures = {executor.submit(_fetch_nse_signal, fyers, s): s for s in batch}
+
             for future in as_completed(futures):
                 try:
                     res, err = future.result()
                 except Exception as e:
-                    res, err = None, f"{futures[future]}: worker error"
-                
+                    res, err = None, f"{futures[future]}: worker error: {type(e).__name__}"
+
                 if res:
                     results.append(res)
                 if err:
                     errors.append(err)
                 stats.record(has_result=bool(res), has_error=bool(err))
                 done += 1
-                progress.progress(done / max(len(symbols), 1), text=f"Scanning NSE {done} / {len(symbols)}")
-        
-        if i + BATCH_SIZE < len(symbols):
-            time.sleep(BATCH_PAUSE_SECONDS)
-    
+
+                if done == len(symbols) or done % update_every == 0:
+                    progress.progress(
+                        done / max(len(symbols), 1),
+                        text=f"Scanning NSE {done} / {len(symbols)}"
+                    )
+
+            if i + BATCH_SIZE < len(symbols) and BATCH_PAUSE_SECONDS > 0:
+                time.sleep(BATCH_PAUSE_SECONDS)
+
     progress.empty()
-    gc.collect()
     return results, errors, stats
 
 def run_fo_scan(fyers, symbols):
-    """Threaded scan for F&O stocks."""
+    """Fast threaded F&O scan with stable error handling and reduced UI overhead."""
     symbols = _validate_symbols(symbols)
     results, errors = [], []
     stats = ScanStats(total=len(symbols))
+    if not symbols:
+        return results, errors, stats
+
     progress = st.progress(0.0, text=f"Scanning F&O Stocks 0 / {len(symbols)}")
     done = 0
-    
-    for i in range(0, len(symbols), BATCH_SIZE):
-        batch = symbols[i:i + BATCH_SIZE]
-        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+    update_every = max(10, min(50, len(symbols) // 50 or 10))
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        for i in range(0, len(symbols), BATCH_SIZE):
+            batch = symbols[i:i + BATCH_SIZE]
             futures = {executor.submit(_fetch_fo_signal, fyers, s): s for s in batch}
+
             for future in as_completed(futures):
                 try:
                     res, err = future.result()
                 except Exception as e:
-                    res, err = None, f"{futures[future]}: worker error"
-                
+                    res, err = None, f"{futures[future]}: worker error: {type(e).__name__}"
+
                 if res:
                     results.append(res)
                 if err:
                     errors.append(err)
                 stats.record(has_result=bool(res), has_error=bool(err))
                 done += 1
-                progress.progress(done / max(len(symbols), 1), text=f"Scanning F&O {done} / {len(symbols)}")
-        
-        if i + BATCH_SIZE < len(symbols):
-            time.sleep(BATCH_PAUSE_SECONDS)
-    
+
+                if done == len(symbols) or done % update_every == 0:
+                    progress.progress(
+                        done / max(len(symbols), 1),
+                        text=f"Scanning F&O {done} / {len(symbols)}"
+                    )
+
+            if i + BATCH_SIZE < len(symbols) and BATCH_PAUSE_SECONDS > 0:
+                time.sleep(BATCH_PAUSE_SECONDS)
+
     progress.empty()
-    gc.collect()
     return results, errors, stats
 
 def run_momentum_scan(fyers, symbols, is_fo: bool = False):
-    """Threaded LIVE sudden movement scan. Returns every successful analysis row.
-
-    DIRECTION is BUY/SELL/NONE; the report keeps NO MOVE rows so the user can
-    see all successfully analysed stocks instead of an empty report.
-    """
+    """Fast threaded LIVE movement scan; keeps every successful analysis row."""
     symbols = _validate_symbols(symbols)
     results, errors = [], []
     stats = ScanStats(total=len(symbols))
+    if not symbols:
+        return results, errors, stats
+
     progress = st.progress(0.0, text=f"Scanning Live Movement 0 / {len(symbols)}")
     done = 0
+    update_every = max(10, min(50, len(symbols) // 50 or 10))
 
-    for i in range(0, len(symbols), BATCH_SIZE):
-        batch = symbols[i:i + BATCH_SIZE]
-        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            futures = {executor.submit(_fetch_momentum_signal, fyers, s, is_fo): s for s in batch}
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        for i in range(0, len(symbols), BATCH_SIZE):
+            batch = symbols[i:i + BATCH_SIZE]
+            futures = {
+                executor.submit(_fetch_momentum_signal, fyers, s, is_fo): s
+                for s in batch
+            }
+
             for future in as_completed(futures):
                 symbol = futures[future]
                 try:
                     res, err = future.result()
                 except Exception as e:
-                    res, err = None, f"{symbol}: worker error: {str(e)[:100]}"
-                # Keep every successful analysis row, including NO MOVE.
-                # This makes the report match the Successful scan count.
+                    res, err = None, f"{symbol}: worker error: {type(e).__name__}"
+
                 if res:
                     results.append(res)
                 if err:
                     errors.append(err)
                 stats.record(has_result=bool(res), has_error=bool(err))
                 done += 1
-                progress.progress(done / max(len(symbols), 1), text=f"Live Movement {done} / {len(symbols)}")
-        if i + BATCH_SIZE < len(symbols):
-            time.sleep(BATCH_PAUSE_SECONDS)
+
+                if done == len(symbols) or done % update_every == 0:
+                    progress.progress(
+                        done / max(len(symbols), 1),
+                        text=f"Live Movement {done} / {len(symbols)}"
+                    )
+
+            if i + BATCH_SIZE < len(symbols) and BATCH_PAUSE_SECONDS > 0:
+                time.sleep(BATCH_PAUSE_SECONDS)
 
     progress.empty()
-    gc.collect()
-    results.sort(key=lambda x: (float(x.get("SCORE", 0)), abs(float(x.get("MOVE %", 0))), float(x.get("RVOL", 0))), reverse=True)
+    results.sort(key=lambda x: (
+        float(x.get("SCORE", 0) or 0),
+        abs(float(x.get("MOVE %", 0) or 0)),
+        float(x.get("RVOL", 0) or 0)
+    ), reverse=True)
     return results, errors, stats
-
-
-# ════════════════════════════════════════════════════════════════════════════════
-# PIN RULES — ADDITIONAL LIQUIDITY / REVERSAL / BIG-MOVE ANALYSIS
-# Existing scanner logic is intentionally untouched. This tab runs only when used.
-# ════════════════════════════════════════════════════════════════════════════════
-# ════════════════════════════════════════════════════════════════════════════════
-# AMD SUPPORT HELPER — COMPLETED CANDLES
-# Added only for AMD/PIN modules; existing scanner logic is unchanged.
-def _completed_candles(df: pd.DataFrame, resolution_minutes: int = 5) -> pd.DataFrame:
-    """Return completed OHLCV candles only. Safe when Time is missing/invalid."""
-    if df is None or len(df) == 0:
-        return df
-    d = df.copy()
-    if "Time" not in d.columns:
-        return d.reset_index(drop=True)
-    try:
-        t = pd.to_datetime(d["Time"], errors="coerce", utc=True)
-        now_ist = _now_ist()
-        cutoff = pd.Timestamp(now_ist)
-        if cutoff.tzinfo is None:
-            cutoff = cutoff.tz_localize("Asia/Kolkata")
-        cutoff = cutoff.tz_convert("UTC")
-        mask = t.notna() & ((t + pd.Timedelta(minutes=resolution_minutes)) <= cutoff)
-        out = d.loc[mask].copy()
-        out["Time"] = t.loc[mask].values
-        return out.reset_index(drop=True)
-    except Exception:
-        return d.reset_index(drop=True)
-
-
-# AMD — ACCUMULATION / MANIPULATION / DISTRIBUTION ENGINE
-# Rule-based inference from completed OHLCV candles.
-# IMPORTANT: this is a market-structure/volume heuristic, not proof of intent.
-# ════════════════════════════════════════════════════════════════════════════════
-AMD_LOOKBACK = 24
-AMD_MIN_BARS = 30
-AMD_RANGE_MAX_PCT = 3.0
-AMD_RVOL_HIGH = 1.50
-AMD_RVOL_EXTREME = 2.00
-AMD_SWEEP_TOL_PCT = 0.15
-AMD_MIN_SIGNAL_SCORE = 65.0
-
-
-def calculate_amd_signal(df_5m: pd.DataFrame, df_15m: Optional[pd.DataFrame] = None) -> Dict[str, Any]:
-    """Detect Accumulation / Manipulation / Distribution from completed candles.
-
-    Accumulation: tight range + relatively strong/steady volume + bullish acceptance.
-    Manipulation: sweep of a recent high/low followed by rejection back inside range.
-    Distribution: high-volume weakness + bearish acceptance / range breakdown.
-
-    The result is an inference from OHLCV, not a claim about actual institutional intent.
-    """
-    out = {
-        "AMD PHASE": "NEUTRAL",
-        "AMD SIGNAL": "WAIT",
-        "AMD SCORE": 0.0,
-        "AMD BUY SCORE": 0.0,
-        "AMD SELL SCORE": 0.0,
-        "AMD CONFIDENCE %": 0.0,
-        "AMD RANGE HIGH": None,
-        "AMD RANGE LOW": None,
-        "AMD SWEEP": "NONE",
-        "AMD RVOL": 0.0,
-        "AMD REASON": "Insufficient completed 5M data",
-    }
-    if df_5m is None or len(df_5m) < AMD_MIN_BARS:
-        return out
-
-    try:
-        d = _completed_candles(df_5m, 5)
-        if d is None or len(d) < AMD_MIN_BARS:
-            out["AMD REASON"] = "Waiting for completed 5M candles"
-            return out
-
-        d = d.copy()
-        for col in ["Open", "High", "Low", "Close", "Volume"]:
-            d[col] = pd.to_numeric(d[col], errors="coerce")
-        d = d.dropna(subset=["Open", "High", "Low", "Close", "Volume"]).reset_index(drop=True)
-        if len(d) < AMD_MIN_BARS:
-            return out
-
-        last = d.iloc[-1]
-        o, h, l, c, v = [float(last[x]) for x in ["Open", "High", "Low", "Close", "Volume"]]
-        if min(o, h, l, c) <= 0:
-            out["AMD REASON"] = "Invalid price data"
-            return out
-
-        # Recent range excludes the current candle so the current candle can sweep it.
-        w = d.iloc[-AMD_LOOKBACK-1:-1]
-        range_high = float(w["High"].max())
-        range_low = float(w["Low"].min())
-        mid = (range_high + range_low) / 2.0
-        range_pct = ((range_high - range_low) / mid * 100.0) if mid > 0 else 999.0
-
-        atr_s = calculate_atr(d, 14)
-        atr = float(atr_s.iloc[-1]) if len(atr_s) and pd.notna(atr_s.iloc[-1]) else max(c * 0.005, 0.01)
-        base_vol = float(d["Volume"].iloc[-21:-1].mean()) if len(d) >= 22 else float(d["Volume"].iloc[:-1].mean())
-        rvol = v / base_vol if base_vol > 0 else 0.0
-
-        rng = max(h - l, 1e-9)
-        body = abs(c - o)
-        body_pct = body / rng * 100.0
-        close_pos = (c - l) / rng
-        upper_wick = h - max(o, c)
-        lower_wick = min(o, c) - l
-
-        # Sweep = price temporarily breaks a prior range extreme but closes back inside.
-        high_sweep = h > range_high * (1.0 + AMD_SWEEP_TOL_PCT / 100.0) and c < range_high
-        low_sweep = l < range_low * (1.0 - AMD_SWEEP_TOL_PCT / 100.0) and c > range_low
-        sweep = "HIGH SWEEP" if high_sweep else "LOW SWEEP" if low_sweep else "NONE"
-
-        # Recent directional acceptance.
-        recent = d.tail(5)
-        recent_change = (float(recent["Close"].iloc[-1]) - float(recent["Close"].iloc[0])) / float(recent["Close"].iloc[0]) * 100.0
-        above_mid = c > mid
-        below_mid = c < mid
-
-        # Volume behavior inside the prior range.
-        vol_recent = float(d["Volume"].iloc[-6:-1].mean()) if len(d) >= 7 else base_vol
-        volume_stable = (vol_recent / base_vol) if base_vol > 0 else 1.0
-
-        buy = 0.0
-        sell = 0.0
-        manipulation = 0.0
-        buy_reasons = []
-        sell_reasons = []
-        manip_reasons = []
-
-        # ACCUMULATION evidence
-        if range_pct <= AMD_RANGE_MAX_PCT:
-            buy += 25; buy_reasons.append(f"tight range {range_pct:.2f}%")
-        if rvol >= 1.10 and close_pos >= 0.55:
-            buy += 15; buy_reasons.append(f"volume acceptance {rvol:.2f}x")
-        if recent_change >= 0.20:
-            buy += 15; buy_reasons.append(f"recent +{recent_change:.2f}%")
-        if lower_wick > upper_wick * 1.20:
-            buy += 10; buy_reasons.append("lower-wick rejection")
-        if c >= mid:
-            buy += 10
-        if volume_stable >= 1.0:
-            buy += 5
-
-        # DISTRIBUTION evidence
-        if range_pct <= AMD_RANGE_MAX_PCT:
-            sell += 15
-        if rvol >= 1.10 and close_pos <= 0.45:
-            sell += 15; sell_reasons.append(f"selling volume {rvol:.2f}x")
-        if recent_change <= -0.20:
-            sell += 15; sell_reasons.append(f"recent {recent_change:.2f}%")
-        if upper_wick > lower_wick * 1.20:
-            sell += 10; sell_reasons.append("upper-wick rejection")
-        if c <= mid:
-            sell += 10
-        if c < range_low:
-            sell += 20; sell_reasons.append("range breakdown")
-
-        # MANIPULATION / liquidity sweep evidence.
-        if high_sweep:
-            manipulation += 55
-            sell += 20
-            manip_reasons.append("high liquidity sweep + close back inside")
-            if rvol >= AMD_RVOL_HIGH:
-                manipulation += 15; manip_reasons.append(f"high RVOL {rvol:.2f}x")
-            if upper_wick >= max(body * 1.20, atr * 0.25):
-                manipulation += 15; manip_reasons.append("upper rejection")
-        elif low_sweep:
-            manipulation += 55
-            buy += 20
-            manip_reasons.append("low liquidity sweep + close back inside")
-            if rvol >= AMD_RVOL_HIGH:
-                manipulation += 15; manip_reasons.append(f"high RVOL {rvol:.2f}x")
-            if lower_wick >= max(body * 1.20, atr * 0.25):
-                manipulation += 15; manip_reasons.append("lower rejection")
-
-        # 15M confirmation, when available.
-        tf15 = "NEUTRAL"
-        if df_15m is not None and len(df_15m) >= 10:
-            try:
-                p = df_15m.copy()
-                for col in ["Open", "Close"]:
-                    p[col] = pd.to_numeric(p[col], errors="coerce")
-                p = p.dropna(subset=["Open", "Close"])
-                if len(p) >= 5:
-                    pchg = (float(p["Close"].iloc[-1]) - float(p["Close"].iloc[-4])) / float(p["Close"].iloc[-4]) * 100.0
-                    tf15 = "BULLISH" if pchg > 0.25 else "BEARISH" if pchg < -0.25 else "NEUTRAL"
-                    if tf15 == "BULLISH": buy += 5
-                    elif tf15 == "BEARISH": sell += 5
-            except Exception:
-                tf15 = "NEUTRAL"
-
-        buy = min(100.0, buy)
-        sell = min(100.0, sell)
-        manipulation = min(100.0, manipulation)
-
-        # Priority: a confirmed sweep is classified as manipulation; otherwise compare A vs D.
-        if manipulation >= 65 and sweep != "NONE":
-            phase = "MANIPULATION"
-            if sweep == "LOW SWEEP" and buy >= sell:
-                signal = "🟢 AMD BUY AFTER SWEEP"
-            elif sweep == "HIGH SWEEP" and sell >= buy:
-                signal = "🔴 AMD SELL AFTER SWEEP"
-            else:
-                signal = "🟠 AMD SWEEP — WAIT"
-            score = manipulation
-            reason = " + ".join(manip_reasons) or sweep
-        elif buy >= 65 and buy > sell + 8:
-            phase = "ACCUMULATION"
-            signal = "🟢 AMD ACCUMULATION BUY WATCH"
-            score = buy
-            reason = " + ".join(buy_reasons) or "Bullish accumulation evidence"
-        elif sell >= 65 and sell > buy + 8:
-            phase = "DISTRIBUTION"
-            signal = "🔴 AMD DISTRIBUTION SELL WATCH"
-            score = sell
-            reason = " + ".join(sell_reasons) or "Bearish distribution evidence"
-        else:
-            phase = "TRANSITION" if max(buy, sell, manipulation) >= 50 else "NEUTRAL"
-            signal = "🟡 AMD TRANSITION — WAIT" if phase == "TRANSITION" else "⚪ AMD WAIT"
-            score = max(buy, sell, manipulation)
-            reason = "Mixed AMD evidence"
-
-        confidence = min(100.0, round(max(0.0, score * 0.85), 1))
-        out.update({
-            "AMD PHASE": phase,
-            "AMD SIGNAL": signal,
-            "AMD SCORE": round(score, 1),
-            "AMD BUY SCORE": round(buy, 1),
-            "AMD SELL SCORE": round(sell, 1),
-            "AMD CONFIDENCE %": confidence,
-            "AMD RANGE HIGH": round(range_high, 2),
-            "AMD RANGE LOW": round(range_low, 2),
-            "AMD SWEEP": sweep,
-            "AMD RVOL": round(rvol, 2),
-            "AMD REASON": f"{reason} | 15M {tf15}",
-        })
-        return out
-    except Exception as e:
-        out["AMD REASON"] = f"AMD error: {type(e).__name__}"
-        return out
-
-
-
-PIN_MIN_CONFIDENCE = 70
-PIN_STRONG_CONFIDENCE = 82
-PIN_PIVOT_LEN = 5
-PIN_EQUAL_ATR_TOL = 0.15
-PIN_BIGMOVE_MIN_SCORE = 70
-PIN_MAX_SCAN = 100
-
-
-def calculate_pin_rules(df_5m: pd.DataFrame, data_5m: Dict[str, Any], data_15m: Dict[str, Any], data_1h: Dict[str, Any]) -> Dict[str, Any]:
-    """Rule-based implementation of the supplied Pine 'AI PRO v3' ideas.
-    This is NOT machine-learning AI and it does not access the exchange order book.
-    """
-    out = {
-        "PIN SIGNAL": "WAIT", "PIN SCORE": 0.0, "LIQUIDITY": "NONE",
-        "SWEEP": "NONE", "REVERSAL": "NONE", "EQUAL HIGH": "NO", "EQUAL LOW": "NO",
-        "BIG MOVEMENT": "NO", "BIG MOVE SCORE": 0.0, "STRUCTURE": "NONE",
-        "5M TREND": data_5m.get("structure_trend", "N/A"),
-        "15M TREND": data_15m.get("structure_trend", "N/A"),
-        "1H TREND": data_1h.get("structure_trend", "N/A"),
-        "RVOL": data_5m.get("rvol", 0), "RSI": data_5m.get("rsi", 50),
-        "PRESSURE": data_5m.get("pressure_trend", "N/A"), "REASON": ""
-    }
-    if df_5m is None or len(df_5m) < 30:
-        out["REASON"] = "Insufficient 5M candles"
-        return out
-    try:
-        d = df_5m.reset_index(drop=True).copy()
-        last = d.iloc[-1]
-        o, h, l, c, v = [float(last[x]) for x in ["Open", "High", "Low", "Close", "Volume"]]
-        body = abs(c-o)
-        rng = max(h-l, 1e-9)
-        upper_wick = h-max(o,c)
-        lower_wick = min(o,c)-l
-        atr_s = calculate_atr(d, 14)
-        atr = float(atr_s.iloc[-1]) if pd.notna(atr_s.iloc[-1]) else max(c*0.005, 0.01)
-        vwap_s = calculate_vwap(d)
-        vwap = float(vwap_s.iloc[-1]) if len(vwap_s) else c
-        rsi = float(data_5m.get("rsi", 50) or 50)
-        rvol = float(data_5m.get("rvol", 0) or 0)
-        macd_bull = bool(data_5m.get("macd_bullish", False))
-        ema_trend = data_5m.get("ema_trend", "NEUTRAL")
-        structure_trend = data_5m.get("structure_trend", "NEUTRAL")
-        bull = c > o; bear = c < o
-        strong_bull = bull and body/rng*100 >= 55
-        strong_bear = bear and body/rng*100 >= 55
-
-        # Confirmed liquidity pivots. Current candle is never used as a pivot.
-        ph, pl = _confirmed_pivots(d, left=PIN_PIVOT_LEN, right=PIN_PIVOT_LEN)
-        last_hi = ph[-1][1] if ph else None
-        prev_hi = ph[-2][1] if len(ph) >= 2 else None
-        last_lo = pl[-1][1] if pl else None
-        prev_lo = pl[-2][1] if len(pl) >= 2 else None
-        eq_hi = last_hi is not None and prev_hi is not None and abs(last_hi-prev_hi) <= atr*PIN_EQUAL_ATR_TOL
-        eq_lo = last_lo is not None and prev_lo is not None and abs(last_lo-prev_lo) <= atr*PIN_EQUAL_ATR_TOL
-        sweep_buy = last_hi is not None and h > last_hi and c < last_hi and upper_wick > body
-        sweep_sell = last_lo is not None and l < last_lo and c > last_lo and lower_wick > body
-        bullish_sweep = sweep_sell
-        bearish_sweep = sweep_buy
-
-        bullish_reversal = bullish_sweep and bull and c > vwap and rsi > 45
-        bearish_reversal = bearish_sweep and bear and c < vwap and rsi < 55
-
-        # Pine-style confluence score.
-        buy = 0.0; sell = 0.0
-        buy += 25 if ema_trend == "BULLISH" and structure_trend == "BULLISH" else 15 if structure_trend == "BULLISH" else 0
-        sell += 25 if ema_trend == "BEARISH" and structure_trend == "BEARISH" else 15 if structure_trend == "BEARISH" else 0
-        buy += 15 if rsi >= 55 else 7 if rsi >= 50 else 0
-        sell += 15 if rsi <= 45 else 7 if rsi <= 50 else 0
-        buy += 15 if c > vwap else 0; sell += 15 if c < vwap else 0
-        buy += 20 if macd_bull and float(data_5m.get("macd_hist", 0) or 0) > 0 else 10 if macd_bull else 0
-        sell += 20 if (not macd_bull) and float(data_5m.get("macd_hist", 0) or 0) < 0 else 10 if not macd_bull else 0
-        buy += 10 if rvol >= 1.5 and bull else 0
-        sell += 10 if rvol >= 1.5 and bear else 0
-        buy += 5 if strong_bull else 0; sell += 5 if strong_bear else 0
-        buy += 10 if bullish_sweep else 0; sell += 10 if bearish_sweep else 0
-        buy += 10 if bullish_reversal else 0; sell += 10 if bearish_reversal else 0
-        pin_score = min(100.0, max(buy, sell))
-        direction = "BUY" if buy > sell else "SELL" if sell > buy else "WAIT"
-        if pin_score >= PIN_STRONG_CONFIDENCE and direction != "WAIT":
-            pin_signal = f"{'🟢 STRONG BUY' if direction=='BUY' else '🔴 STRONG SELL'}"
-        elif pin_score >= PIN_MIN_CONFIDENCE and direction != "WAIT":
-            pin_signal = f"{'🟢 BUY' if direction=='BUY' else '🔴 SELL'}"
-        else:
-            pin_signal = "🟡 WAIT"
-
-        # Existing BIG MOVE engine is reused; no duplicate scan logic.
-        bm = detect_big_move_setup(d)
-        structure = bm.get("structure", "NONE")
-        liquidity = "EQ HIGH" if eq_hi else "EQ LOW" if eq_lo else "HIGH" if last_hi is not None else "LOW" if last_lo is not None else "NONE"
-        sweep = "🟢 LOW SWEPT" if bullish_sweep else "🔴 HIGH SWEPT" if bearish_sweep else "NONE"
-        reversal = "🟢 BULL REVERSAL" if bullish_reversal else "🔴 BEAR REVERSAL" if bearish_reversal else "NONE"
-        out.update({
-            "PIN SIGNAL": pin_signal, "PIN SCORE": round(pin_score, 1),
-            "LIQUIDITY": liquidity, "SWEEP": sweep, "REVERSAL": reversal,
-            "EQUAL HIGH": "YES" if eq_hi else "NO", "EQUAL LOW": "YES" if eq_lo else "NO",
-            "BIG MOVEMENT": bm.get("signal", "NO BIG MOVE"),
-            "BIG MOVE SCORE": bm.get("score", 0.0), "STRUCTURE": structure,
-            "REASON": " | ".join([x for x in [
-                "EQ HIGH" if eq_hi else "", "EQ LOW" if eq_lo else "",
-                "LOW SWEEP" if bullish_sweep else "HIGH SWEEP" if bearish_sweep else "",
-                "BULL REVERSAL" if bullish_reversal else "BEAR REVERSAL" if bearish_reversal else "",
-                "BIG MOVE" if bm.get("direction") in ["UP", "DOWN"] else ""
-            ] if x]) or "No PIN confirmation"
-        })
-        return out
-    except Exception as e:
-        out["REASON"] = f"PIN error: {type(e).__name__}"
-        return out
-
-
-def _show_pin_rules_tab(fyers) -> None:
-    st.markdown("### 📌 PIN RULES — Liquidity + Reversal + Big Movement")
-    st.caption("Additional analysis only. Existing Scanner tabs and scanner logic are not modified.")
-
-    source = st.selectbox("Source", ["NSE Stocks", "F&O Stocks"], key="pin_source")
-    source_key = "nse_df" if source == "NSE Stocks" else "fo_df"
-    base_df = st.session_state.get(source_key)
-
-    # PIN RULES can run independently. If the main NSE/F&O scanner has not
-    # been run yet, build candidates directly from the loaded symbol universe.
-    if base_df is None or base_df.empty:
-        raw_symbols = (
-            st.session_state.get("all_symbols", [])
-            if source == "NSE Stocks"
-            else st.session_state.get("fo_symbols", [])
-        )
-        if raw_symbols:
-            base_df = pd.DataFrame({
-                "Symbol": [str(x).replace("NSE:", "").replace("-EQ", "") for x in raw_symbols],
-                "LTP": ["N/A"] * len(raw_symbols),
-            })
-        else:
-            base_df = pd.DataFrame(columns=["Symbol", "LTP"])
-
-    with st.expander("📖 PIN Rules", expanded=False):
-        st.markdown("""
-        **Liquidity:** confirmed Pivot High/Low → Equal High/Low → liquidity level.
-        **Sweep:** High breaks and closes back below = bearish; Low breaks and closes back above = bullish.
-        **Reversal:** Sweep + candle direction + VWAP + RSI confirmation.
-        **Confluence:** Trend + RSI + VWAP + MACD + RVOL + candle + sweep + reversal.
-        **Big Movement:** existing consolidation-breakout + candle + RVOL + structure engine.
-        """)
-
-    if base_df is None or base_df.empty:
-        st.warning(f"⚠️ No {source} symbols are available. Check the symbol master.")
-        return
-
-    max_scan = min(PIN_MAX_SCAN, len(base_df))
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        pin_limit = st.number_input("PIN scan limit", 1, max_scan, min(30, max_scan), 1, key="pin_limit")
-    with c2:
-        pin_min = st.slider("Minimum PIN score", 50, 100, PIN_MIN_CONFIDENCE, 1, key="pin_min_score")
-    with c3:
-        pin_mode = st.selectbox("Show", ["ALL", "BUY ONLY", "SELL ONLY", "STRONG ONLY"], key="pin_mode")
-
-    candidates = base_df.copy()
-    if "AI CONFIDENCE %" in candidates.columns:
-        candidates["__conf"] = pd.to_numeric(candidates["AI CONFIDENCE %"], errors="coerce").fillna(0)
-        candidates = candidates.sort_values("__conf", ascending=False)
-    candidates = candidates.head(int(pin_limit))
-
-    if st.button("📌 RUN PIN RULES", key="pin_run", use_container_width=True):
-        rows = []; errors = []
-        progress = st.progress(0.0)
-        total = len(candidates)
-        for n, (_, row) in enumerate(candidates.iterrows(), 1):
-            symbol = str(row.get("Symbol", "")).strip()
-            fyers_symbol = symbol if symbol.startswith("NSE:") else f"NSE:{symbol}-EQ"
-            try:
-                a5 = analyze_timeframe(fyers, fyers_symbol, "5")
-                a15 = analyze_timeframe(fyers, fyers_symbol, "15")
-                a1h = analyze_timeframe(fyers, fyers_symbol, "60")
-                if a5.get("status") != "OK" or a5.get("df") is None:
-                    errors.append(f"{symbol}: 5M data unavailable")
-                    progress.progress(n / max(total, 1))
-                    continue
-                pin = calculate_pin_rules(a5.get("df"), a5.get("data", {}), a15.get("data", {}), a1h.get("data", {}))
-                pin["Symbol"] = symbol.replace("NSE:", "").replace("-EQ", "")
-                pin["LTP"] = row.get("LTP", "N/A")
-                pin["AI CONFIDENCE %"] = row.get("AI CONFIDENCE %", "N/A")
-                pin["AI SIGNAL"] = row.get("AI SIGNAL", "N/A")
-                rows.append(pin)
-            except Exception as e:
-                errors.append(f"{symbol}: {type(e).__name__}")
-            progress.progress(n / max(total, 1))
-        progress.empty()
-        result = pd.DataFrame(rows)
-        if not result.empty:
-            result["__score"] = pd.to_numeric(result["PIN SCORE"], errors="coerce").fillna(0)
-            result = result[result["__score"] >= pin_min]
-            if pin_mode == "BUY ONLY":
-                result = result[result["PIN SIGNAL"].astype(str).str.contains("BUY", na=False)]
-            elif pin_mode == "SELL ONLY":
-                result = result[result["PIN SIGNAL"].astype(str).str.contains("SELL", na=False)]
-            elif pin_mode == "STRONG ONLY":
-                result = result[result["PIN SIGNAL"].astype(str).str.contains("STRONG", na=False)]
-            result = result.drop(columns=["__score"], errors="ignore")
-        st.session_state["pin_df"] = result
-        st.session_state["pin_errors"] = errors
-
-    pin_df = st.session_state.get("pin_df")
-    if pin_df is not None and not pin_df.empty:
-        pc1, pc2, pc3, pc4 = st.columns(4)
-        pc1.metric("📌 PIN SETUPS", len(pin_df))
-        pc2.metric("🟢 BUY", int(pin_df["PIN SIGNAL"].astype(str).str.contains("BUY", na=False).sum()))
-        pc3.metric("🔴 SELL", int(pin_df["PIN SIGNAL"].astype(str).str.contains("SELL", na=False).sum()))
-        pc4.metric("💧 SWEEPS", int((pin_df["SWEEP"].astype(str) != "NONE").sum()))
-        display_cols = [c for c in ["Symbol","LTP","PIN SIGNAL","PIN SCORE","LIQUIDITY","SWEEP","REVERSAL","EQUAL HIGH","EQUAL LOW","BIG MOVEMENT","BIG MOVE SCORE","STRUCTURE","5M TREND","15M TREND","1H TREND","RVOL","RSI","PRESSURE","AI CONFIDENCE %","AI SIGNAL","REASON"] if c in pin_df.columns]
-        st.dataframe(pin_df[display_cols], use_container_width=True, height=500)
-        st.download_button("📥 DOWNLOAD PIN RULES EXCEL", _format_excel_output(pin_df, "PIN_RULES"), f"PIN_RULES_{_now_ist().strftime('%Y%m%d_%H%M')}.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="pin_excel")
-    elif "pin_df" in st.session_state:
-        st.warning("No stocks matched the selected PIN rules.")
-    if st.session_state.get("pin_errors"):
-        st.caption(f"⚠️ {len(st.session_state['pin_errors'])} symbols could not be analyzed.")
-
-
-# ════════════════════════════════════════════════════════════════════════════════
-# ADDITIONAL FULL-UNIVERSE PIN + AMD SCANNERS
-# These are additive only. Existing NSE/F&O/Momentum/PIN Rules code is retained.
-# ════════════════════════════════════════════════════════════════════════════════
-
-def _scan_universe_map(all_symbols, fo_symbols, source):
-    """Build a de-duplicated NSE/F&O universe without changing the original lists."""
-    nse = _validate_symbols(all_symbols or [])
-    fo = _validate_symbols(fo_symbols or [])
-    if source == "NSE Stocks":
-        return [(s, "NSE") for s in nse]
-    if source == "F&O Stocks":
-        return [(s, "F&O") for s in fo]
-
-    # ALL = union, with F&O label taking priority for overlapping symbols.
-    fo_set = set(fo)
-    ordered = []
-    seen = set()
-    for s in fo:
-        if s not in seen:
-            seen.add(s)
-            ordered.append((s, "F&O"))
-    for s in nse:
-        if s not in seen:
-            seen.add(s)
-            ordered.append((s, "NSE"))
-    return ordered
-
 
 def _fetch_full_pin_signal(fyers, symbol: str, source: str):
     """Worker: fresh 5M/15M/1H data -> existing PIN rules engine."""
@@ -3680,7 +3266,7 @@ def _fetch_full_pin_signal(fyers, symbol: str, source: str):
 
 
 def _run_full_pin_scan(fyers, universe, pin_min=70, pin_mode="ALL"):
-    """Threaded full-universe PIN scanner. Existing PIN calculation is reused."""
+    """Fast threaded full-universe PIN scanner. Existing PIN rules are reused."""
     pairs = list(universe or [])
     stats = ScanStats(total=len(pairs))
     results, errors = [], []
@@ -3689,35 +3275,47 @@ def _run_full_pin_scan(fyers, universe, pin_min=70, pin_mode="ALL"):
 
     progress = st.progress(0.0, text=f"PIN Scan 0 / {len(pairs)}")
     done = 0
-    for i in range(0, len(pairs), BATCH_SIZE):
-        batch = pairs[i:i + BATCH_SIZE]
-        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+    update_every = max(10, min(50, len(pairs) // 50 or 10))
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        for i in range(0, len(pairs), BATCH_SIZE):
+            batch = pairs[i:i + BATCH_SIZE]
             futures = {
                 executor.submit(_fetch_full_pin_signal, fyers, symbol, source): (symbol, source)
                 for symbol, source in batch
             }
+
             for future in as_completed(futures):
-                res, err = future.result()
+                try:
+                    res, err = future.result()
+                except Exception as e:
+                    symbol, source = futures[future]
+                    res, err = None, f"{symbol}: worker error: {type(e).__name__}"
+
                 if res:
                     results.append(res)
                 if err:
                     errors.append(err)
                 stats.record(has_result=bool(res), has_error=bool(err))
                 done += 1
-                progress.progress(done / max(len(pairs), 1), text=f"PIN Scan {done} / {len(pairs)}")
-        if i + BATCH_SIZE < len(pairs):
-            time.sleep(BATCH_PAUSE_SECONDS)
+
+                if done == len(pairs) or done % update_every == 0:
+                    progress.progress(
+                        done / max(len(pairs), 1),
+                        text=f"PIN Scan {done} / {len(pairs)}"
+                    )
+
+            if i + BATCH_SIZE < len(pairs) and BATCH_PAUSE_SECONDS > 0:
+                time.sleep(BATCH_PAUSE_SECONDS)
+
     progress.empty()
 
-    # IMPORTANT: keep ALL successfully analysed rows here.
-    # Filtering is done only in the UI so a selection such as BUY ONLY +
-    # score 75 cannot erase the successful scan report.
+    # Keep ALL successful rows; UI filtering remains unchanged.
     df = pd.DataFrame(results)
     if not df.empty and "PIN SCORE" in df.columns:
         df["PIN SCORE"] = pd.to_numeric(df["PIN SCORE"], errors="coerce").fillna(0)
         df = df.sort_values("PIN SCORE", ascending=False, kind="stable")
     return df.to_dict("records") if not df.empty else [], errors, stats
-
 
 def _fetch_amd_signal_full(fyers, symbol: str, source: str):
     """Worker: fresh completed 5M + 15M data -> AMD inference engine."""
