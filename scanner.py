@@ -3066,6 +3066,92 @@ def detect_pre_move_radar(df5: pd.DataFrame, df15: Optional[pd.DataFrame] = None
         return out
 
 # ════════════════════════════════════════════════════════════════════════════════
+# SINGLE SIGNAL PRESENTATION LAYER — ADDITIVE ONLY
+# Existing calculations are NOT changed. This layer only decides what to display.
+# Priority: confirmed BIG MOVE > PRE-SWEEP > PRE-MOVE > hide NO SIGNAL.
+# ════════════════════════════════════════════════════════════════════════════════
+def _apply_single_signal_layer(df: pd.DataFrame, latest_only: bool = True) -> pd.DataFrame:
+    """Create one final actionable/watch signal per stock without changing source logic."""
+    if df is None or df.empty:
+        return df.copy() if isinstance(df, pd.DataFrame) else pd.DataFrame()
+
+    d = df.copy()
+    status = d.get("SETUP STATUS", pd.Series("", index=d.index)).astype(str).str.upper()
+    direction = d.get("DIRECTION", pd.Series("NONE", index=d.index)).astype(str).str.upper()
+    radar_dir = d.get("RADAR DIRECTION", pd.Series("NONE", index=d.index)).astype(str).str.upper()
+    signal = d.get("SIGNAL", pd.Series("", index=d.index)).astype(str).str.upper()
+
+    # Confirmed move gets highest priority.
+    big_buy = signal.str.contains("BIG BUY", na=False) | ((direction == "BUY") & d.get("SCORE", pd.Series(0, index=d.index)).fillna(0).astype(float).ge(LIVE_MOVE_STRONG_SCORE))
+    big_sell = signal.str.contains("BIG SELL", na=False) | ((direction == "SELL") & d.get("SCORE", pd.Series(0, index=d.index)).fillna(0).astype(float).ge(LIVE_MOVE_STRONG_SCORE))
+
+    pre_sweep_buy = status.str.contains("PRE-SWEEP BUY", na=False) & (radar_dir == "BUY")
+    pre_sweep_sell = status.str.contains("PRE-SWEEP SELL", na=False) & (radar_dir == "SELL")
+    pre_move_buy = status.str.contains("PRE-MOVE BUY", na=False) & (radar_dir == "BUY")
+    pre_move_sell = status.str.contains("PRE-MOVE SELL", na=False) & (radar_dir == "SELL")
+
+    d["FINAL SIGNAL"] = ""
+    d.loc[pre_move_buy, "FINAL SIGNAL"] = "🟡 PRE-BIG MOVE BUY WATCH"
+    d.loc[pre_move_sell, "FINAL SIGNAL"] = "🟡 PRE-BIG MOVE SELL WATCH"
+    d.loc[pre_sweep_buy, "FINAL SIGNAL"] = "🟠 PRE-LIQUIDITY SWEEP BUY"
+    d.loc[pre_sweep_sell, "FINAL SIGNAL"] = "🟠 PRE-LIQUIDITY SWEEP SELL"
+    d.loc[big_buy, "FINAL SIGNAL"] = "🔥 BIG BUY CONFIRMED"
+    d.loc[big_sell, "FINAL SIGNAL"] = "🔥 BIG SELL CONFIRMED"
+
+    d["FINAL PRIORITY"] = 0
+    d.loc[pre_move_buy | pre_move_sell, "FINAL PRIORITY"] = 1
+    d.loc[pre_sweep_buy | pre_sweep_sell, "FINAL PRIORITY"] = 2
+    d.loc[big_buy | big_sell, "FINAL PRIORITY"] = 3
+
+    # Keep only meaningful directional signals. NO MOVE / NO SETUP are hidden.
+    d = d[d["FINAL PRIORITY"] > 0].copy()
+    if d.empty:
+        return d
+
+    # Normalize symbol so NSE:ABC / ABC-EQ / ABC cannot create duplicate display rows.
+    if "Symbol" in d.columns:
+        d["_SYMBOL_KEY"] = (
+            d["Symbol"].astype(str).str.upper()
+            .str.replace("NSE:", "", regex=False)
+            .str.replace("-EQ", "", regex=False)
+            .str.strip()
+        )
+
+    score = pd.to_numeric(d.get("SCORE", 0), errors="coerce").fillna(0)
+    pre_score = pd.to_numeric(d.get("PRE-SWEEP SCORE", 0), errors="coerce").fillna(0) + pd.to_numeric(d.get("PRE-MOVE SCORE", 0), errors="coerce").fillna(0)
+    d["_DISPLAY_SCORE"] = score + pre_score * 0.5
+
+    # One stock = one signal. Prefer priority first, then stronger score, then latest time.
+    if latest_only and "_SYMBOL_KEY" in d.columns:
+        if "SIGNAL TIME" in d.columns:
+            d["_SORT_TIME"] = pd.to_datetime(d["SIGNAL TIME"], errors="coerce")
+        elif "Time" in d.columns:
+            d["_SORT_TIME"] = pd.to_datetime(d["Time"], errors="coerce")
+        else:
+            d["_SORT_TIME"] = pd.NaT
+        d = d.sort_values(["_SYMBOL_KEY", "FINAL PRIORITY", "_DISPLAY_SCORE", "_SORT_TIME"], ascending=[True, False, False, False], kind="stable")
+        d = d.drop_duplicates("_SYMBOL_KEY", keep="first")
+        d = d.drop(columns=["_SYMBOL_KEY", "_SORT_TIME"], errors="ignore")
+
+    return d.sort_values(["FINAL PRIORITY", "_DISPLAY_SCORE"], ascending=[False, False], kind="stable").drop(columns=["_DISPLAY_SCORE"], errors="ignore").reset_index(drop=True)
+
+
+def _latest_history_per_symbol(df: pd.DataFrame) -> pd.DataFrame:
+    """Display helper: one latest historical setup per stock; raw backtest data stays unchanged."""
+    if df is None or df.empty or "Symbol" not in df.columns:
+        return df.copy() if isinstance(df, pd.DataFrame) else pd.DataFrame()
+    d = df.copy()
+    d["_SYMBOL_KEY"] = d["Symbol"].astype(str).str.upper().str.replace("NSE:", "", regex=False).str.replace("-EQ", "", regex=False).str.strip()
+    if "Signal Time" in d.columns:
+        d["_SORT_TIME"] = pd.to_datetime(d["Signal Time"], errors="coerce")
+    else:
+        d["_SORT_TIME"] = pd.NaT
+    d = d.sort_values(["_SYMBOL_KEY", "_SORT_TIME"], ascending=[True, False], kind="stable")
+    d = d.drop_duplicates("_SYMBOL_KEY", keep="first")
+    return d.drop(columns=["_SYMBOL_KEY", "_SORT_TIME"], errors="ignore").reset_index(drop=True)
+
+
+# ════════════════════════════════════════════════════════════════════════════════
 # THREADED SCAN FUNCTIONS
 # ════════════════════════════════════════════════════════════════════════════════
 def run_nse_scan(fyers, symbols):
@@ -4823,13 +4909,15 @@ def _show_historical_backtest_tab(fyers, all_symbols, fo_symbols) -> None:
     })
     st.dataframe(summary, use_container_width=True, hide_index=True)
 
-    st.markdown("#### Signal-by-signal results")
+    st.markdown("#### Latest signal per stock")
+    display_df = _latest_history_per_symbol(df)
+    st.caption(f"Showing {len(display_df)} unique stocks. If a stock generated multiple historical signals, only its latest signal is displayed; raw backtest results remain available in the Excel export.")
     show_cols = [
         "Symbol", "Signal Time", "Direction", "Entry",
         "AI Final Score", "PIN Score", "Momentum Score",
         "AI Final", "PIN", "Momentum", "Outcome"
     ]
-    st.dataframe(df[[c for c in show_cols if c in df.columns]], use_container_width=True, height=500)
+    st.dataframe(display_df[[c for c in show_cols if c in display_df.columns]], use_container_width=True, height=500)
     _excel_download_button(df, "HISTORICAL_BACKTEST_AI_PIN_MOMENTUM", "bt_excel")
 
     errors = st.session_state.get("bt_errors", [])
@@ -5164,9 +5252,11 @@ def show_scanner(fyers) -> None:
             # Full successful scan report
             report = mdf.copy()
             report["DIRECTION"] = report.get("DIRECTION", "NONE").astype(str).str.upper()
+            raw_report_count = len(report)
+            report = _apply_single_signal_layer(report, latest_only=True)
             report = report.sort_values(
-                ["DIRECTION", "SCORE", "RVOL"],
-                ascending=[True, False, False],
+                ["FINAL PRIORITY", "SCORE", "RVOL"],
+                ascending=[False, False, False],
                 kind="stable"
             )
 
@@ -5175,13 +5265,13 @@ def show_scanner(fyers) -> None:
 
             st.markdown("### 📄 LIVE MOVEMENT REPORT")
             st.caption(
-                f"{len(report)} successfully analysed rows — "
-                f"BUY: {len(buy)} | SELL: {len(sell)} | NO MOVE: {len(report) - len(buy) - len(sell)}"
+                f"{len(report)} unique actionable/watch stocks from {raw_report_count} analysed rows — "
+                f"BUY: {len(buy)} | SELL: {len(sell)} | NO SIGNAL hidden | one stock = one signal"
             )
 
             # Put the most useful columns first, then retain all other analysis columns.
             preferred = [
-                "Symbol", "SETUP STATUS", "RADAR DIRECTION", "PRE-MOVE SCORE", "PRE-SWEEP SCORE",
+                "Symbol", "FINAL SIGNAL", "SETUP STATUS", "RADAR DIRECTION", "PRE-MOVE SCORE", "PRE-SWEEP SCORE",
                 "LIQUIDITY TYPE", "LIQUIDITY LEVEL", "DISTANCE TO LIQUIDITY %", "COMPRESSION %",
                 "VOLUME BUILD", "PRESSURE", "RADAR 15M", "DIRECTION", "SIGNAL", "LTP", "MOVE %", "SCORE", "RVOL",
                 "BODY %", "BODY / ATR", "STRUCTURE", "HH/HL", "LH/LL",
