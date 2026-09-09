@@ -3028,14 +3028,20 @@ def detect_pre_move_radar(df5: pd.DataFrame, df15: Optional[pd.DataFrame] = None
         # Do not label a setup as pre-sweep after it has already swept and closed back.
         swept_high = h > rh and c < rh
         swept_low = l < rl and c > rl
-        if direction == "BUY" and not swept_low and pre_sweep >= 58 and dist_low <= max(0.45, atr / c * 100.0 * 1.8):
+        if direction == "BUY" and not swept_low and pre_sweep >= 48 and dist_low <= max(0.75, atr / c * 100.0 * 2.5):
             status = "PRE-SWEEP BUY WATCH"
-        elif direction == "SELL" and not swept_high and pre_sweep >= 58 and dist_high <= max(0.45, atr / c * 100.0 * 1.8):
+        elif direction == "SELL" and not swept_high and pre_sweep >= 48 and dist_high <= max(0.75, atr / c * 100.0 * 2.5):
             status = "PRE-SWEEP SELL WATCH"
-        elif direction == "BUY" and pre_move >= 55:
+        elif direction == "BUY" and pre_move >= 42:
             status = "PRE-MOVE BUY"
-        elif direction == "SELL" and pre_move >= 55:
+        elif direction == "SELL" and pre_move >= 42:
             status = "PRE-MOVE SELL"
+        elif direction == "BUY" and (pressure_score >= 60 or rvol >= 1.0) and (near_liq >= 25 or compression >= 35):
+            status = "PRE-BIG MOVE BUY WATCH"
+            pre_move = max(pre_move, 40.0)
+        elif direction == "SELL" and (pressure_score >= 60 or rvol >= 1.0) and (near_liq >= 25 or compression >= 35):
+            status = "PRE-BIG MOVE SELL WATCH"
+            pre_move = max(pre_move, 40.0)
         else:
             status = "NO SETUP"
 
@@ -3087,8 +3093,8 @@ def _apply_single_signal_layer(df: pd.DataFrame, latest_only: bool = True) -> pd
 
     pre_sweep_buy = status.str.contains("PRE-SWEEP BUY", na=False) & (radar_dir == "BUY")
     pre_sweep_sell = status.str.contains("PRE-SWEEP SELL", na=False) & (radar_dir == "SELL")
-    pre_move_buy = status.str.contains("PRE-MOVE BUY", na=False) & (radar_dir == "BUY")
-    pre_move_sell = status.str.contains("PRE-MOVE SELL", na=False) & (radar_dir == "SELL")
+    pre_move_buy = status.str.contains("PRE-MOVE BUY|PRE-BIG MOVE BUY WATCH", regex=True, na=False) & (radar_dir == "BUY")
+    pre_move_sell = status.str.contains("PRE-MOVE SELL|PRE-BIG MOVE SELL WATCH", regex=True, na=False) & (radar_dir == "SELL")
 
     d["FINAL SIGNAL"] = ""
     d.loc[pre_move_buy, "FINAL SIGNAL"] = "🟡 PRE-BIG MOVE BUY WATCH"
