@@ -784,6 +784,139 @@ def detect_big_move_setup(df: pd.DataFrame) -> Dict[str, Any]:
         out["reason"] = f"BIG MOVE error: {type(e).__name__}"
         return out
 
+def calculate_bigmove_reversal_zones(df: pd.DataFrame, bm: Dict[str, Any]) -> Dict[str, Any]:
+    """Additive BIG MOVE reversal/zone layer.
+
+    Uses completed 5M candles, ATR, breakout level and recent swing liquidity to
+    estimate watch zones. It does NOT guarantee the exact reversal price/time.
+    """
+    out = {
+        "BUY ZONE": "-",
+        "SELL ZONE": "-",
+        "REVERSAL ZONE": "-",
+        "REVERSAL SCORE": 0.0,
+        "REVERSAL PROBABILITY": "LOW",
+        "REVERSAL TYPE": "WAIT",
+        "REVERSAL TRIGGER": "-",
+        "REVERSAL REASON": "No BIG MOVE"
+    }
+    try:
+        if df is None or len(df) < 25:
+            return out
+        d = _completed_candles(df, 5)
+        if d is None or len(d) < 25:
+            return out
+        d = d.copy().reset_index(drop=True)
+        for col in ["Open", "High", "Low", "Close", "Volume"]:
+            d[col] = pd.to_numeric(d[col], errors="coerce")
+        d = d.dropna(subset=["Open", "High", "Low", "Close", "Volume"]).reset_index(drop=True)
+        if len(d) < 25:
+            return out
+
+        direction = str(bm.get("direction", "NONE")).upper()
+        if direction not in ("UP", "DOWN"):
+            return out
+
+        price = float(d["Close"].iloc[-1])
+        atr_s = calculate_atr(d, 14)
+        atr = float(atr_s.iloc[-1]) if pd.notna(atr_s.iloc[-1]) else max(price * 0.005, 0.01)
+        if atr <= 0 or price <= 0:
+            return out
+
+        c = bm.get("consolidation") or {}
+        break_level = bm.get("breakout_level")
+        break_level = float(break_level) if break_level is not None and pd.notna(break_level) else np.nan
+
+        # Recent completed liquidity references. The current candle is excluded.
+        ref = d.iloc[:-1].tail(20)
+        recent_high = float(ref["High"].max()) if not ref.empty else price
+        recent_low = float(ref["Low"].min()) if not ref.empty else price
+        eq_high = recent_high
+        eq_low = recent_low
+
+        def zone(a, b):
+            lo, hi = sorted([float(a), float(b)])
+            return f"₹{lo:.2f}–₹{hi:.2f}"
+
+        score = 0.0
+        reasons = []
+        if float(bm.get("score", 0) or 0) >= 85:
+            score += 20; reasons.append("strong BIG MOVE")
+        elif float(bm.get("score", 0) or 0) >= 70:
+            score += 12; reasons.append("strong momentum")
+        if str(bm.get("structure", "")) in ("HH/HL", "LH/LL"):
+            score += 10; reasons.append(str(bm.get("structure")))
+        if float(bm.get("rvol", 0) or 0) >= 2.5:
+            score += 10; reasons.append("high RVOL")
+
+        if direction == "UP":
+            # Pullback/support watch zone around the breakout level.
+            anchor = break_level if np.isfinite(break_level) else price - 0.5 * atr
+            buy_lo = anchor - 0.35 * atr
+            buy_hi = anchor + 0.10 * atr
+            if buy_hi >= price:
+                buy_hi = price - 0.05 * atr
+                buy_lo = buy_hi - 0.45 * atr
+            out["BUY ZONE"] = zone(max(0.01, buy_lo), max(0.01, buy_hi))
+
+            # Reversal/sell watch zone: recent liquidity high or ATR extension,
+            # whichever is farther above price, but never below current price.
+            ext = price + max(1.0 * atr, abs(price - anchor) * 0.60)
+            sell_anchor = max(recent_high, ext)
+            sell_lo = sell_anchor - 0.25 * atr
+            sell_hi = sell_anchor + 0.25 * atr
+            out["SELL ZONE"] = zone(sell_lo, sell_hi)
+            out["REVERSAL ZONE"] = out["SELL ZONE"]
+            out["REVERSAL TYPE"] = "🔴 BEARISH REVERSAL WATCH"
+            trigger = max(sell_lo, recent_high - 0.15 * atr)
+            out["REVERSAL TRIGGER"] = f"Close below ₹{trigger:.2f} + rejection"
+            if recent_high >= price + 0.50 * atr:
+                score += 20; reasons.append("near upside liquidity")
+            if price >= recent_high - 0.50 * atr:
+                score += 15; reasons.append("near recent high")
+            if break_level == break_level and price > break_level:
+                score += 10; reasons.append("extended above breakout")
+        else:
+            # Pullback/resistance watch zone around the breakdown level.
+            anchor = break_level if np.isfinite(break_level) else price + 0.5 * atr
+            sell_hi = anchor + 0.10 * atr
+            sell_lo = anchor - 0.35 * atr
+            if sell_lo <= price:
+                sell_lo = price + 0.05 * atr
+                sell_hi = sell_lo + 0.45 * atr
+            out["SELL ZONE"] = zone(max(0.01, sell_lo), max(0.01, sell_hi))
+
+            ext = price - max(1.0 * atr, abs(price - anchor) * 0.60)
+            buy_anchor = min(recent_low, ext)
+            buy_lo = buy_anchor - 0.25 * atr
+            buy_hi = buy_anchor + 0.25 * atr
+            out["BUY ZONE"] = zone(max(0.01, buy_lo), max(0.01, buy_hi))
+            out["REVERSAL ZONE"] = out["BUY ZONE"]
+            out["REVERSAL TYPE"] = "🟢 BULLISH REVERSAL WATCH"
+            trigger = min(buy_hi, recent_low + 0.15 * atr)
+            out["REVERSAL TRIGGER"] = f"Close above ₹{trigger:.2f} + rejection"
+            if recent_low <= price - 0.50 * atr:
+                score += 20; reasons.append("near downside liquidity")
+            if price <= recent_low + 0.50 * atr:
+                score += 15; reasons.append("near recent low")
+            if break_level == break_level and price < break_level:
+                score += 10; reasons.append("extended below breakdown")
+
+        score = min(100.0, score)
+        if score >= 70:
+            prob = "HIGH"
+        elif score >= 45:
+            prob = "MEDIUM"
+        else:
+            prob = "LOW"
+        out["REVERSAL SCORE"] = round(score, 1)
+        out["REVERSAL PROBABILITY"] = prob
+        out["REVERSAL REASON"] = " | ".join(reasons) if reasons else "Normal extension; wait for rejection"
+        return out
+    except Exception as e:
+        out["REVERSAL REASON"] = f"Zone error: {type(e).__name__}"
+        return out
+
 def calculate_momentum_score(analysis_5m: Dict, analysis_15m: Dict, analysis_1h: Dict, movement_metrics: Dict, is_bullish: bool) -> Dict[str, Any]:
     """Calculate momentum score (0-100) based on multiple factors."""
     data_5m = analysis_5m.get("data", {})
@@ -2870,6 +3003,9 @@ def _fetch_momentum_signal(fyers, symbol: str, is_fo: bool = False):
         move = detect_live_sudden_move(df5)
         block = detect_block_order_activity(df5)
         radar = detect_pre_move_radar(df5)
+        # Existing BIG MOVE engine is reused; reversal zones are additive only.
+        bm = detect_big_move_setup(df5)
+        reversal_zones = calculate_bigmove_reversal_zones(df5, bm)
         ltp = float(df5["Close"].iloc[-1])
         result = {
             "Symbol": stock_ticker,
@@ -2894,6 +3030,10 @@ def _fetch_momentum_signal(fyers, symbol: str, is_fo: bool = False):
             "BLOCK LEVEL": block["block_level"],
             "BLOCK RVOL": block["block_rvol"],
             "BLOCK REASON": block["block_reason"],
+            "BIG MOVE": bm.get("signal", "NO BIG MOVE"),
+            "BIG MOVE SCORE": bm.get("score", 0.0),
+            "BIG MOVE DIRECTION": bm.get("direction", "NONE"),
+            **reversal_zones,
             "REASON": move["reason"],
             **radar,
         }
@@ -5443,7 +5583,11 @@ def show_scanner(fyers) -> None:
                 "VOLUME BUILD", "PRESSURE", "RADAR 15M", "DIRECTION", "SIGNAL", "LTP", "MOVE %", "SCORE", "RVOL",
                 "BODY %", "BODY / ATR", "STRUCTURE", "HH/HL", "LH/LL",
                 "ACCELERATION", "VOLUME SPIKE", "BLOCK ORDER SCORE",
-                "BLOCK ACTIVITY", "BLOCK SIDE", "BLOCK LEVEL", "REASON",
+                "BLOCK ACTIVITY", "BLOCK SIDE", "BLOCK LEVEL",
+                "BIG MOVE", "BIG MOVE SCORE", "BIG MOVE DIRECTION",
+                "BUY ZONE", "SELL ZONE", "REVERSAL ZONE", "REVERSAL SCORE",
+                "REVERSAL PROBABILITY", "REVERSAL TYPE", "REVERSAL TRIGGER",
+                "REVERSAL REASON", "REASON",
                 "SIGNAL TIME", "LAST SEEN", "SIGNAL AGE"
             ]
             report_cols = [c for c in preferred if c in report.columns]
