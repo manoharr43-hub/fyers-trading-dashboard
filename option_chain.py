@@ -3910,6 +3910,155 @@ def calculate_pin_signal(
     return result
 
 
+
+# ══════════════════════════════════════════════════════════════════════════
+# OPTION-CHAIN REVERSAL ENGINE (ADDITIVE)
+# ══════════════════════════════════════════════════════════════════════════
+def calculate_option_chain_reversal(
+    df: pd.DataFrame,
+    spot: float,
+    pcr: float = 0.0,
+    order_flow: Optional[dict] = None,
+) -> dict[str, Any]:
+    """Estimate possible option-chain reversal from OI/volume/price pressure.
+
+    This is an early-warning/confluence model, not a guaranteed prediction.
+    It uses already-loaded option-chain data and makes no extra API call.
+    """
+    result = {
+        "status": "NO REVERSAL WARNING",
+        "direction": "NONE",
+        "score": 0.0,
+        "probability": 0.0,
+        "type": "NONE",
+        "trigger": "Waiting for reversal evidence",
+        "reason": "Insufficient option-chain reversal evidence",
+        "atm_strike": float(spot or 0.0),
+        "reversal_zone": 0.0,
+    }
+    if df is None or df.empty:
+        return result
+
+    d = df.copy()
+    needed = [
+        "strike_price", "ce_oi", "pe_oi", "ce_chng_oi", "pe_chng_oi",
+        "ce_volume", "pe_volume", "ce_change", "pe_change"
+    ]
+    for col in needed:
+        if col not in d.columns:
+            d[col] = 0.0
+        d[col] = pd.to_numeric(d[col], errors="coerce").fillna(0.0)
+
+    ref = float(spot or d["strike_price"].median())
+    if ref <= 0:
+        ref = float(d["strike_price"].median())
+    if ref <= 0:
+        return result
+
+    atm_idx = (d["strike_price"] - ref).abs().idxmin()
+    atm = float(d.loc[atm_idx, "strike_price"])
+    d["distance"] = (d["strike_price"] - atm).abs()
+    near = d.nsmallest(max(3, min(7, len(d))), "distance")
+
+    # Option-chain directional clues:
+    # Rising PE OI / PE volume supports downside protection or bullish positioning;
+    # rising CE OI supports resistance/bearish positioning. Price change helps detect
+    # unwinding: falling option price with falling OI can indicate position reduction.
+    ce_oi_chg = float(near["ce_chng_oi"].sum())
+    pe_oi_chg = float(near["pe_chng_oi"].sum())
+    ce_vol = float(near["ce_volume"].sum())
+    pe_vol = float(near["pe_volume"].sum())
+    ce_px = float(near["ce_change"].mean())
+    pe_px = float(near["pe_change"].mean())
+
+    bull = 0.0
+    bear = 0.0
+    bull_reasons: list[str] = []
+    bear_reasons: list[str] = []
+
+    if pe_oi_chg > 0 and ce_oi_chg < 0:
+        bull += 25; bull_reasons.append("PE OI rising + CE OI falling")
+    elif ce_oi_chg > 0 and pe_oi_chg < 0:
+        bear += 25; bear_reasons.append("CE OI rising + PE OI falling")
+    elif pe_oi_chg > ce_oi_chg * 1.15 and pe_oi_chg > 0:
+        bull += 15; bull_reasons.append("PE OI stronger")
+    elif ce_oi_chg > pe_oi_chg * 1.15 and ce_oi_chg > 0:
+        bear += 15; bear_reasons.append("CE OI stronger")
+
+    if pe_vol > ce_vol * 1.20 and pe_vol > 0:
+        bull += 15; bull_reasons.append("PE volume surge")
+    elif ce_vol > pe_vol * 1.20 and ce_vol > 0:
+        bear += 15; bear_reasons.append("CE volume surge")
+
+    # A sharp option-price move against the prevailing OI side is treated as
+    # possible unwinding/reversal evidence.
+    if pe_px > 0 and pe_oi_chg < 0:
+        bull += 20; bull_reasons.append("PE premium rising on OI reduction")
+    if ce_px > 0 and ce_oi_chg < 0:
+        bull += 10; bull_reasons.append("CE premium rising on OI reduction")
+    if ce_px > 0 and ce_oi_chg > 0:
+        bear += 10; bear_reasons.append("CE premium rising with OI build-up")
+    if pe_px > 0 and pe_oi_chg > 0:
+        bear += 10; bear_reasons.append("PE premium rising with OI build-up")
+
+    # PCR is only a supporting clue; it never decides reversal alone.
+    if pcr > 1.15:
+        bear += 8; bear_reasons.append(f"PCR high {pcr:.2f}")
+    elif 0 < pcr < 0.85:
+        bull += 8; bull_reasons.append(f"PCR low {pcr:.2f}")
+
+    # Reversal is stronger when current option-chain flow disagrees with
+    # the existing directional flow.
+    flow_score = _pin_num((order_flow or {}).get("flow_bias_score", 0))
+    if flow_score <= -25 and bull > bear:
+        bull += 12; bull_reasons.append("bearish flow weakening vs bullish reversal clues")
+    elif flow_score >= 25 and bear > bull:
+        bear += 12; bear_reasons.append("bullish flow weakening vs bearish reversal clues")
+
+    bull = float(np.clip(bull, 0, 100))
+    bear = float(np.clip(bear, 0, 100))
+    score = max(bull, bear)
+    direction = "BUY" if bull > bear else ("SELL" if bear > bull else "NONE")
+    reasons = bull_reasons if direction == "BUY" else bear_reasons
+
+    # "NOW" requires multiple aligned clues; "EARLY WARNING" is intentionally
+    # easier to trigger so the dashboard can flag developing reversal pressure.
+    if direction in ("BUY", "SELL") and score >= 75:
+        status = "🔴 REVERSAL NOW"
+        rtype = "BULLISH REVERSAL" if direction == "BUY" else "BEARISH REVERSAL"
+        trigger = " + ".join(dict.fromkeys(reasons[:4])) or "Multiple reversal clues aligned"
+    elif direction in ("BUY", "SELL") and score >= 50:
+        status = "🟡 REVERSAL EARLY WARNING"
+        rtype = "EARLY BULLISH REVERSAL" if direction == "BUY" else "EARLY BEARISH REVERSAL"
+        trigger = " + ".join(dict.fromkeys(reasons[:3])) or "Developing reversal clues"
+    else:
+        status = "NO REVERSAL WARNING"
+        rtype = "NONE"
+        direction = "NONE"
+        trigger = "Waiting for stronger confirmation"
+
+    zone_rows = d[(d["distance"] <= (abs(atm - float(d["strike_price"]).median()) * 2 + 1))]
+    reversal_zone = float(zone_rows["strike_price"].mean()) if not zone_rows.empty else atm
+
+    return {
+        "status": status,
+        "direction": direction,
+        "score": round(score, 1),
+        "probability": round(float(min(95.0, max(0.0, score))), 1),
+        "type": rtype,
+        "trigger": trigger,
+        "reason": " | ".join(dict.fromkeys(reasons)) or "No strong reversal evidence",
+        "atm_strike": atm,
+        "reversal_zone": round(reversal_zone, 2),
+        "bull_score": round(bull, 1),
+        "bear_score": round(bear, 1),
+        "ce_oi_change": round(ce_oi_chg, 2),
+        "pe_oi_change": round(pe_oi_chg, 2),
+        "ce_volume": round(ce_vol, 2),
+        "pe_volume": round(pe_vol, 2),
+    }
+
+
 def build_pin_confluence(
     df: pd.DataFrame,
     state: dict[str, Any],
@@ -3920,6 +4069,13 @@ def build_pin_confluence(
         spot=_pin_num(state.get("spot")),
         pcr=_pin_num(state.get("pcr")),
         market_pressure=state.get("market_pressure"),
+        order_flow=state.get("order_flow"),
+    )
+
+    reversal = calculate_option_chain_reversal(
+        df=df,
+        spot=_pin_num(state.get("spot")),
+        pcr=_pin_num(state.get("pcr")),
         order_flow=state.get("order_flow"),
     )
 
@@ -3961,6 +4117,7 @@ def build_pin_confluence(
         "final_confidence": round(float(final_confidence), 1),
         "final_status": final_status,
         "final_reason": final_reason,
+        "reversal": reversal,
     }
 
 
@@ -4000,6 +4157,25 @@ def render_pin_confluence(df: pd.DataFrame, state: dict[str, Any], symbol: str =
         else:
             st.info("⚪ PIN WAIT — no clean directional edge yet.")
 
+        reversal = confluence.get("reversal", {})
+        st.markdown("### 🔄 OPTION CHAIN REVERSAL")
+        r1, r2, r3, r4, r5 = st.columns(5)
+        r1.metric("REVERSAL STATUS", reversal.get("status", "NO REVERSAL WARNING"))
+        r2.metric("REVERSAL DIRECTION", reversal.get("direction", "NONE"))
+        r3.metric("REVERSAL SCORE", f"{float(reversal.get('score', 0) or 0):.0f}/100")
+        r4.metric("REVERSAL TYPE", reversal.get("type", "NONE"))
+        r5.metric("REVERSAL ZONE", f"{float(reversal.get('reversal_zone', 0) or 0):,.0f}" if reversal.get("reversal_zone") else "—")
+        if reversal.get("status") == "🔴 REVERSAL NOW":
+            st.error("🔴 REVERSAL NOW — multiple option-chain reversal clues are aligned. This is a warning, not certainty.")
+        elif reversal.get("status") == "🟡 REVERSAL EARLY WARNING":
+            st.warning("🟡 REVERSAL EARLY WARNING — reversal pressure is developing; wait for confirmation.")
+        else:
+            st.info("⚪ NO REVERSAL WARNING — no strong option-chain reversal setup detected.")
+        st.caption(
+            "Trigger: " + str(reversal.get("trigger", "Waiting for confirmation")) +
+            " | Reason: " + str(reversal.get("reason", "—"))
+        )
+
         st.markdown("### 🔎 PIN Evidence")
         evidence = pd.DataFrame([
             {"Metric": "PIN Direction", "Value": pin["direction"]},
@@ -4013,6 +4189,10 @@ def render_pin_confluence(df: pd.DataFrame, state: dict[str, Any], symbol: str =
             {"Metric": "Final Score", "Value": f"{confluence['final_score']:.1f}/100"},
             {"Metric": "Final Confidence", "Value": f"{confluence['final_confidence']:.1f}%"},
             {"Metric": "Reason", "Value": confluence["final_reason"]},
+            {"Metric": "Reversal Status", "Value": reversal.get("status", "NO REVERSAL WARNING")},
+            {"Metric": "Reversal Direction", "Value": reversal.get("direction", "NONE")},
+            {"Metric": "Reversal Score", "Value": f"{float(reversal.get('score', 0) or 0):.1f}/100"},
+            {"Metric": "Reversal Type", "Value": reversal.get("type", "NONE")},
         ])
         st.dataframe(evidence, use_container_width=True, hide_index=True)
 
@@ -4027,6 +4207,8 @@ def render_pin_confluence(df: pd.DataFrame, state: dict[str, Any], symbol: str =
             "final_direction": "WAIT", "final_score": 0.0,
             "final_confidence": 0.0, "final_status": "⚪ CONFLICT / WAIT",
             "final_reason": str(exc),
+            "reversal": {"status": "NO REVERSAL WARNING", "direction": "NONE", "score": 0.0,
+                         "probability": 0.0, "type": "NONE", "reason": str(exc), "trigger": "Unavailable"},
         }
 
 # ══════════════════════════════════════════════════════════════════════════
