@@ -2062,7 +2062,7 @@ def detect_swing_long_move(fyers, symbol: str) -> Dict[str, Any]:
              "trend": "WAIT", "return20": None, "return60": None, "rvol": None,
              "score": 0, "status": "DATA UNAVAILABLE", "reason": "DATA_UNAVAILABLE"}
     try:
-        date_from = (datetime.today() - timedelta(days=420)).strftime("%Y-%m-%d")
+        date_from = (datetime.today() - timedelta(days=365)).strftime("%Y-%m-%d")
         date_to = datetime.today().strftime("%Y-%m-%d")
         resp, err = _safe_history(fyers, {
             "symbol": symbol, "resolution": "1D", "date_format": "1",
@@ -4505,15 +4505,19 @@ def show_scanner(fyers) -> None:
                 with st.spinner("Scanning daily trend, EMA structure, momentum and volume…"):
                     for idx, symbol in enumerate(swing_symbols):
                         r = detect_swing_long_move(fyers, symbol)
-                        if r.get("ltp") is not None:
-                            results.append(r)
+                        # Keep both successful and failed rows so the user can see why a symbol was skipped.
+                        results.append(r)
                         prog.progress((idx + 1) / max(len(swing_symbols),1))
                 prog.empty()
-                if results:
-                    df_long = pd.DataFrame(results).sort_values(["score","return60"], ascending=False)
-                    st.session_state["swing_long_df"] = df_long
+                df_long = pd.DataFrame(results)
+                if not df_long.empty:
+                    usable = df_long[df_long["ltp"].notna()].copy()
+                    if not usable.empty:
+                        usable = usable.sort_values(["score","return60"], ascending=False, na_position="last")
+                    st.session_state["swing_long_df"] = usable if not usable.empty else df_long
+                    st.success(f"✅ Swing scan complete: {len(usable)} stocks with usable daily data out of {len(df_long)} scanned.")
                 else:
-                    st.warning("No usable daily data returned.")
+                    st.warning("No symbols were scanned. Check the NSE symbol list / API connection.")
         with b2:
             if st.button(f"📈 DETECT CROSSOVERS ({len(swing_symbols)} stocks)", key="swing_run", use_container_width=True):
                 swing_results = []
@@ -4545,10 +4549,17 @@ def show_scanner(fyers) -> None:
             view = long_df.copy()
             if long_filter != "ALL": view = view[view["status"] == long_filter]
             if trend_filter != "ALL": view = view[view["trend"] == trend_filter]
-            st.dataframe(view.head(30), use_container_width=True, hide_index=True)
+            st.dataframe(view.head(50), use_container_width=True, hide_index=True)
+            _excel_download_button(view, "SWING_LONG_MOVE", "download_swing_long_move_excel")
             st.caption("Higher score means more conditions are aligned; it does not mean the stock will definitely rise.")
         else:
             st.info("👈 Click RUN SWING LONG-MOVE to find stocks with stronger daily trend/momentum alignment.")
+
+        if long_df is not None and not long_df.empty and "reason" in long_df.columns:
+            bad = long_df[long_df["ltp"].isna()].copy() if "ltp" in long_df.columns else pd.DataFrame()
+            if not bad.empty:
+                with st.expander(f"⚠️ Daily data unavailable / skipped: {len(bad)} stocks", expanded=False):
+                    st.dataframe(bad[[c for c in ["symbol","status","reason"] if c in bad.columns]].head(100), use_container_width=True, hide_index=True)
 
         swing_df = st.session_state.get("swing_df")
         if swing_df is not None and not swing_df.empty:
