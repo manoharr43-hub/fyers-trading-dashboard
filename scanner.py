@@ -3072,6 +3072,8 @@ def detect_pre_move_radar(df5: pd.DataFrame, df15: Optional[pd.DataFrame] = None
         "RADAR 5M": "NEUTRAL",
         "RADAR 15M": "NEUTRAL",
         "RADAR REASON": "Insufficient data",
+        "PRE-MOVE ALERT": "WAIT",
+        "EARLY ALERT SCORE": 0.0,
     }
     try:
         d = _completed_candles(df5, 5) if df5 is not None else None
@@ -3191,9 +3193,34 @@ def detect_pre_move_radar(df5: pd.DataFrame, df15: Optional[pd.DataFrame] = None
         if align_bonus:
             reasons.append(f"15M {tf15} aligned")
 
+        # Dedicated early-alert layer: additive only.
+        # It warns before the confirmed BIG MOVE conditions are reached.
+        if direction == "BUY":
+            if pre_move >= 70:
+                early_alert = "🟢 EARLY BUY ALERT"
+            elif pre_move >= 55:
+                early_alert = "🟡 BUY BUILDING"
+            elif pre_move >= 42:
+                early_alert = "🟡 BUY WATCH"
+            else:
+                early_alert = "WAIT"
+        elif direction == "SELL":
+            if pre_move >= 70:
+                early_alert = "🔴 EARLY SELL ALERT"
+            elif pre_move >= 55:
+                early_alert = "🟠 SELL BUILDING"
+            elif pre_move >= 42:
+                early_alert = "🟠 SELL WATCH"
+            else:
+                early_alert = "WAIT"
+        else:
+            early_alert = "WAIT"
+
         out.update({
             "SETUP STATUS": status,
             "PRE-MOVE SCORE": pre_move,
+            "PRE-MOVE ALERT": early_alert,
+            "EARLY ALERT SCORE": round(pre_move, 1),
             "PRE-SWEEP SCORE": pre_sweep,
             "RADAR DIRECTION": direction,
             "LIQUIDITY TYPE": liq_type,
@@ -4251,7 +4278,7 @@ def _radar_overall_top(frame: pd.DataFrame, n: int = 10):
 def _radar_top_columns(frame: pd.DataFrame):
     preferred = [
         "Symbol", "SOURCE", "LTP", "SETUP STATUS", "RADAR DIRECTION",
-        "PRE-SWEEP SCORE", "PRE-MOVE SCORE", "RADAR RANK SCORE",
+        "PRE-SWEEP SCORE", "PRE-MOVE SCORE", "PRE-MOVE ALERT", "EARLY ALERT SCORE", "RADAR RANK SCORE",
         "LIQUIDITY TYPE", "LIQUIDITY LEVEL", "DISTANCE TO LIQUIDITY %",
         "COMPRESSION %", "VOLUME BUILD", "PRESSURE", "RADAR 5M", "RADAR 15M",
         "PIN SIGNAL", "PIN SCORE", "AMD PHASE", "AMD SIGNAL", "AMD SCORE",
@@ -4470,7 +4497,7 @@ def _show_amd_scan_tab(fyers, all_symbols, fo_symbols):
         for _c in time_cols:
             if _c not in out.columns:
                 out[_c] = "-"
-        preferred = ["Symbol", "SOURCE", "LTP", "SETUP STATUS", "RADAR DIRECTION", "PRE-MOVE SCORE", "PRE-SWEEP SCORE",
+        preferred = ["Symbol", "SOURCE", "LTP", "SETUP STATUS", "RADAR DIRECTION", "PRE-MOVE SCORE", "PRE-SWEEP SCORE", "PRE-MOVE ALERT", "EARLY ALERT SCORE",
                      "LIQUIDITY TYPE", "LIQUIDITY LEVEL", "DISTANCE TO LIQUIDITY %", "COMPRESSION %",
                      "AMD PHASE", "AMD SIGNAL", "SIGNAL TIME", "LAST SEEN", "SIGNAL AGE",
                      "AMD SCORE", "AMD BUY SCORE", "AMD SELL SCORE"]
@@ -5578,7 +5605,7 @@ def show_scanner(fyers) -> None:
 
             # Put the most useful columns first, then retain all other analysis columns.
             preferred = [
-                "Symbol", "FINAL SIGNAL", "SETUP STATUS", "RADAR DIRECTION", "PRE-MOVE SCORE", "PRE-SWEEP SCORE",
+                "Symbol", "FINAL SIGNAL", "SETUP STATUS", "RADAR DIRECTION", "PRE-MOVE SCORE", "PRE-SWEEP SCORE", "PRE-MOVE ALERT", "EARLY ALERT SCORE",
                 "LIQUIDITY TYPE", "LIQUIDITY LEVEL", "DISTANCE TO LIQUIDITY %", "COMPRESSION %",
                 "VOLUME BUILD", "PRESSURE", "RADAR 15M", "DIRECTION", "SIGNAL", "LTP", "MOVE %", "SCORE", "RVOL",
                 "BODY %", "BODY / ATR", "STRUCTURE", "HH/HL", "LH/LL",
@@ -5608,7 +5635,7 @@ def show_scanner(fyers) -> None:
             pre = report[report.get("SETUP STATUS", pd.Series("", index=report.index)).astype(str).str.contains("PRE-", na=False)].copy()
             if not pre.empty:
                 st.markdown(f"### 🟡 PRE-MOVE / PRE-SWEEP WATCH — {len(pre)}")
-                pre_cols = [c for c in ["Symbol", "SETUP STATUS", "RADAR DIRECTION", "PRE-MOVE SCORE", "PRE-SWEEP SCORE", "LIQUIDITY TYPE", "LIQUIDITY LEVEL", "DISTANCE TO LIQUIDITY %", "COMPRESSION %", "VOLUME BUILD", "PRESSURE", "RADAR 15M", "LTP", "SIGNAL TIME"] if c in pre.columns]
+                pre_cols = [c for c in ["Symbol", "SETUP STATUS", "RADAR DIRECTION", "PRE-MOVE ALERT", "EARLY ALERT SCORE", "PRE-MOVE SCORE", "PRE-SWEEP SCORE", "LIQUIDITY TYPE", "LIQUIDITY LEVEL", "DISTANCE TO LIQUIDITY %", "COMPRESSION %", "VOLUME BUILD", "PRESSURE", "RADAR 15M", "LTP", "SIGNAL TIME"] if c in pre.columns]
                 st.dataframe(pre.sort_values(["PRE-SWEEP SCORE", "PRE-MOVE SCORE"], ascending=False)[pre_cols], use_container_width=True, height=350)
             else:
                 st.info("No PRE-MOVE / PRE-SWEEP setup in this scan.")
