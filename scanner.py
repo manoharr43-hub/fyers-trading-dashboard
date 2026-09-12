@@ -2836,6 +2836,59 @@ def _pre_move_signal(df: pd.DataFrame, block: Dict[str, Any] = None) -> Dict[str
         return out
 
 
+def _before_move_signal(df: pd.DataFrame, pre: Dict[str, Any] = None) -> Dict[str, Any]:
+    """Dedicated early-warning signal; existing PRE-MOVE/live signals stay unchanged."""
+    out = {"signal":"🟡 WAIT","direction":"NONE","score":0.0,"reason":"No high-quality setup","trigger":""}
+    try:
+        if df is None or len(df) < 30: return out
+        d=df.reset_index(drop=True).copy()
+        for c in ["Open","High","Low","Close","Volume"]:
+            if c not in d.columns: return out
+            d[c]=pd.to_numeric(d[c],errors="coerce")
+        d=d.dropna(subset=["Open","High","Low","Close","Volume"]).reset_index(drop=True)
+        if len(d)<30: return out
+        p=pre if isinstance(pre,dict) else _pre_move_signal(d)
+        buy=float(p.get("buy_score",0) or 0); sell=float(p.get("sell_score",0) or 0)
+        gap=abs(buy-sell); direction="BUY" if buy>sell else "SELL" if sell>buy else "NONE"
+        score=max(buy,sell); close=float(d["Close"].iloc[-1]); high=float(d["High"].iloc[-1]); low=float(d["Low"].iloc[-1])
+        atr_s=calculate_atr(d,14); atr=float(atr_s.iloc[-1]) if len(atr_s) and pd.notna(atr_s.iloc[-1]) else max(close*0.003,0.01)
+        rh=float(d["High"].iloc[-10:].max()); rl=float(d["Low"].iloc[-10:].min()); rng=max(rh-rl,1e-9); pos=(close-rl)/rng
+        cr=max(high-low,1e-9); close_loc=(close-low)/cr
+        prev_rng=float(d["High"].iloc[-20:-10].max()-d["Low"].iloc[-20:-10].min())
+        compression=rng<=atr*3.0; tightening=compression and rng<=max(prev_rng*0.90,atr*1.6)
+        base_vol=float(d["Volume"].iloc[-30:-5].mean()); recent_vol=float(d["Volume"].iloc[-5:].mean())
+        vol_build=base_vol>0 and recent_vol>=base_vol*1.12
+        early=float(d["Volume"].iloc[-5:-2].mean()); late=float(d["Volume"].iloc[-2:].mean()); vol_accel=late/early if early>0 else 1.0
+        ret3=((close/float(d["Close"].iloc[-4]))-1)*100
+        typical=(d["High"]+d["Low"]+d["Close"])/3; vwap_s=(typical*d["Volume"]).cumsum()/d["Volume"].replace(0,pd.NA).cumsum(); vwap=float(vwap_s.iloc[-1]) if pd.notna(vwap_s.iloc[-1]) else close
+        above=close>vwap*1.0002; below=close<vwap*0.9998
+        ph,pl=_confirmed_pivots(d.tail(30),left=1,right=1); hh_hl=len(ph)>=2 and len(pl)>=2 and ph[-1][1]>ph[-2][1] and pl[-1][1]>pl[-2][1]; lh_ll=len(ph)>=2 and len(pl)>=2 and ph[-1][1]<ph[-2][1] and pl[-1][1]<pl[-2][1]
+        reasons=[]
+        if compression: score+=5; reasons.append("Compression")
+        if tightening: score+=5; reasons.append("Tightening")
+        if vol_build: score+=5; reasons.append("Volume Build")
+        if vol_accel>=1.15: score+=4; reasons.append("Volume Acceleration")
+        if direction=="BUY":
+            if pos>=0.72: score+=7; reasons.append("Near Breakout")
+            if ret3>0: score+=4; reasons.append("Short-term Up")
+            if above: score+=4; reasons.append("Above VWAP")
+            if close_loc>=0.65: score+=3; reasons.append("Strong Close")
+            if hh_hl: score+=5; reasons.append("HH/HL")
+        elif direction=="SELL":
+            if pos<=0.28: score+=7; reasons.append("Near Breakdown")
+            if ret3<0: score+=4; reasons.append("Short-term Down")
+            if below: score+=4; reasons.append("Below VWAP")
+            if close_loc<=0.35: score+=3; reasons.append("Weak Close")
+            if lh_ll: score+=5; reasons.append("LH/LL")
+        score=min(100.0,score)
+        if direction=="BUY" and score>=72 and gap>=12 and (compression or vol_build): out.update(signal="🟢 BUY BEFORE MOVE",direction="BUY",trigger=f"Breakout > {rh:.2f}")
+        elif direction=="SELL" and score>=72 and gap>=12 and (compression or vol_build): out.update(signal="🔴 SELL BEFORE MOVE",direction="SELL",trigger=f"Breakdown < {rl:.2f}")
+        out["score"]=round(score,1); out["reason"]=" + ".join(reasons[:7]) if reasons else "Waiting for directional energy"
+        return out
+    except Exception as e:
+        out["reason"]=f"BEFORE MOVE error: {type(e).__name__}"; return out
+
+
 def detect_live_sudden_move(df: pd.DataFrame) -> Dict[str, Any]:
     """Detect CURRENT sudden 5M BUY/SELL movement. No consolidation required."""
     result = {
@@ -2964,6 +3017,7 @@ def _fetch_momentum_signal(fyers, symbol: str, is_fo: bool = False):
         d=df5.reset_index(drop=True).copy()
         block=detect_block_order_activity(d)
         pre=_pre_move_signal(d, block=block)
+        before=_before_move_signal(d, pre)
         # Search the latest 12 completed candles so a signal is not lost on the next candle.
         candidates=[]
         for idx in range(max(12,len(d)-12),len(d)):
@@ -2990,7 +3044,7 @@ def _fetch_momentum_signal(fyers, symbol: str, is_fo: bool = False):
             age=max(0,(_now_ist()-sig_time).total_seconds()/60)
             signal=pre["status"] if pre["direction"] in ("BUY","SELL") else "NO MOVE"
         ltp=float(d["Close"].iloc[-1])
-        result={"Symbol":stock_ticker,"LTP":round(ltp,2),"SIGNAL TIME":sig_time.strftime("%d-%b-%Y %H:%M:%S"),"SIGNAL AGE (MIN)":round(age,1),"SIGNAL":signal,"DIRECTION":mv.get("direction") if candidates else pre["direction"],"MOVE %":mv.get("move_pct",0.0),"BODY %":mv.get("body_pct",0.0),"BODY / ATR":mv.get("body_atr",0.0),"RVOL":mv.get("rvol",0.0),"STRUCTURE":mv.get("structure", "NONE"),"HH/HL":"✅" if mv.get("hh_hl") else "−","LH/LL":"✅" if mv.get("lh_ll") else "−","ACCELERATION":mv.get("price_acceleration",0.0),"VOLUME SPIKE":"🔥" if mv.get("volume_spike") else "−","SCORE":mv.get("score",0.0),"PRE-MOVE":pre["direction"],"PRE-MOVE SCORE":pre["score"],"PRE-MOVE STATUS":pre["status"],"PRE BUY SCORE":pre.get("buy_score",0),"PRE SELL SCORE":pre.get("sell_score",0),"PRE SCORE GAP":pre.get("score_gap",0),"PRE-MOVE REASON":pre["reason"],"BREAKOUT LEVEL":pre.get("breakout_level"),"BREAKDOWN LEVEL":pre.get("breakdown_level"),"PRE-MOVE RVOL":pre.get("rvol",0),"BLOCK ORDER SCORE":block["block_score"],"BLOCK ACTIVITY":block["block_signal"],"BLOCK SIDE":block["block_side"],"BLOCK LEVEL":block["block_level"],"BLOCK RVOL":block["block_rvol"],"BLOCK REASON":block["block_reason"],"REASON":mv.get("reason",pre["reason"]),"MOVEMENT STATUS": signal if candidates else pre["status"]}
+        result={"Symbol":stock_ticker,"LTP":round(ltp,2),"SIGNAL TIME":sig_time.strftime("%d-%b-%Y %H:%M:%S"),"SIGNAL AGE (MIN)":round(age,1),"SIGNAL":signal,"DIRECTION":mv.get("direction") if candidates else pre["direction"],"MOVE %":mv.get("move_pct",0.0),"BODY %":mv.get("body_pct",0.0),"BODY / ATR":mv.get("body_atr",0.0),"RVOL":mv.get("rvol",0.0),"STRUCTURE":mv.get("structure", "NONE"),"HH/HL":"✅" if mv.get("hh_hl") else "−","LH/LL":"✅" if mv.get("lh_ll") else "−","ACCELERATION":mv.get("price_acceleration",0.0),"VOLUME SPIKE":"🔥" if mv.get("volume_spike") else "−","SCORE":mv.get("score",0.0),"BEFORE MOVE SIGNAL":before["signal"],"BEFORE MOVE DIRECTION":before["direction"],"BEFORE MOVE SCORE":before["score"],"BEFORE MOVE REASON":before["reason"],"BEFORE MOVE TRIGGER":before["trigger"],"PRE-MOVE":pre["direction"],"PRE-MOVE SCORE":pre["score"],"PRE-MOVE STATUS":pre["status"],"PRE BUY SCORE":pre.get("buy_score",0),"PRE SELL SCORE":pre.get("sell_score",0),"PRE SCORE GAP":pre.get("score_gap",0),"PRE-MOVE REASON":pre["reason"],"BREAKOUT LEVEL":pre.get("breakout_level"),"BREAKDOWN LEVEL":pre.get("breakdown_level"),"PRE-MOVE RVOL":pre.get("rvol",0),"BLOCK ORDER SCORE":block["block_score"],"BLOCK ACTIVITY":block["block_signal"],"BLOCK SIDE":block["block_side"],"BLOCK LEVEL":block["block_level"],"BLOCK RVOL":block["block_rvol"],"BLOCK REASON":block["block_reason"],"REASON":mv.get("reason",pre["reason"]),"MOVEMENT STATUS": signal if candidates else pre["status"]}
         if is_fo and result["DIRECTION"] in ("BUY","SELL"):
             try:
                 od=fetch_options_chain_data(fyers,symbol); result["PCR"]=od.get("pcr","N/A"); result["OPTIONS BIAS"]=od.get("options_bias","N/A")
@@ -4343,8 +4397,8 @@ def show_scanner(fyers) -> None:
             _display_scan_summary(st.session_state["momentum_stats"]); st.caption(f"Last scan: {st.session_state.get('momentum_scanned_at','N/A')}")
         mdf=st.session_state.get("momentum_df")
         if mdf is not None and not mdf.empty:
-            for col in ["SCORE","PRE-MOVE SCORE","RVOL","SIGNAL AGE (MIN)"]: mdf[col]=pd.to_numeric(mdf[col],errors="coerce") if col in mdf.columns else 0
-            status_order={"🔥 BIG BUY":0,"🔥 BIG SELL":0,"🟢 BIG BUY WATCH":1,"🔴 BIG SELL WATCH":1,"🟡 PRE-BIG BUY":2,"🟡 PRE-BIG SELL":2,"🟢 BUY":3,"🔴 SELL":3,"⚪ WAIT":9}
+            for col in ["SCORE","PRE-MOVE SCORE","BEFORE MOVE SCORE","RVOL","SIGNAL AGE (MIN)"]: mdf[col]=pd.to_numeric(mdf[col],errors="coerce") if col in mdf.columns else 0
+            status_order={"🔥 BIG BUY":0,"🔥 BIG SELL":0,"🟢 BUY BEFORE MOVE":1,"🔴 SELL BEFORE MOVE":1,"🟢 BIG BUY WATCH":2,"🔴 BIG SELL WATCH":2,"🟡 PRE-BIG BUY":3,"🟡 PRE-BIG SELL":3,"🟢 BUY":4,"🔴 SELL":4,"⚪ WAIT":9}
             mdf["_order"]=mdf["MOVEMENT STATUS"].map(status_order).fillna(8)
             mdf=mdf.sort_values(["_order","SCORE","PRE-MOVE SCORE","RVOL"],ascending=[True,False,False,False]).drop(columns=["_order"])
             st.markdown("### 🚦 MOVEMENT STATUS")
