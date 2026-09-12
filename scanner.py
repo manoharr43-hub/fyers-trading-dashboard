@@ -5277,7 +5277,6 @@ def show_scanner(fyers) -> None:
 
             st.session_state["direct_reversal_df"] = reversal_df
             st.session_state["direct_reversal_errors"] = reversal_errors
-            st.session_state["direct_reversal_source"] = rev_source
             st.session_state["direct_reversal_scanned_at"] = _generated_timestamp()
             st.session_state["direct_reversal_stats"] = reversal_stats
 
