@@ -4135,6 +4135,7 @@ def show_scanner(fyers) -> None:
         "🇮🇳 NSE STOCKS",
         "📊 F&O STOCKS",
         "⚡ MOMENTUM MOVERS",
+        "🚦 BEFORE MOVE",
         "📖 LIVE ORDER BOOK",
         "⚡ LIVE INTRADAY",
         "🔥 STRONG SIGNALS",
@@ -4407,15 +4408,35 @@ def show_scanner(fyers) -> None:
         else: st.info("Click SCAN INTRADAY MOVEMENT to start.")
 
     # ════════════════════════════════════════════════════════════════════════════════
-    # TAB 3: LIVE EXCHANGE ORDER BOOK
+    # TAB 3: BEFORE MOVE — EARLY WARNING SIGNAL
     # ════════════════════════════════════════════════════════════════════════════════
     with tabs[3]:
+        st.markdown("### 🚦 BEFORE MOVE — EARLY WARNING SIGNAL")
+        st.caption("Separate early-warning tab. Old Momentum / NSE / F&O signals remain unchanged.")
+        bdf = st.session_state.get("momentum_df")
+        if bdf is not None and not bdf.empty:
+            cols = [c for c in ["SYMBOL", "LTP", "BEFORE MOVE SIGNAL", "BEFORE MOVE SCORE", "PRE-MOVE SCORE", "PRE-MOVE STATUS", "PRE BUY/SELL SCORE", "PRE SCORE GAP", "BREAKOUT LEVEL", "BREAKDOWN LEVEL", "PRE-MOVE RVOL", "PRE-MOVE REASON"] if c in bdf.columns]
+            view = bdf[cols].copy() if cols else bdf.copy()
+            if "BEFORE MOVE SIGNAL" in view.columns:
+                order = {"🟢 BUY BEFORE MOVE": 0, "🔴 SELL BEFORE MOVE": 1, "🟡 WAIT": 2}
+                view["_sort"] = view["BEFORE MOVE SIGNAL"].map(order).fillna(9)
+                score_col = "BEFORE MOVE SCORE" if "BEFORE MOVE SCORE" in view.columns else "PRE-MOVE SCORE"
+                view = view.sort_values(["_sort", score_col], ascending=[True, False]).drop(columns=["_sort"])
+            st.dataframe(view, use_container_width=True, height=560)
+            st.download_button("📊 Download BEFORE MOVE", _format_excel_output(view, "BEFORE_MOVE"), f"BEFORE_MOVE_{_now_ist().strftime('%Y%m%d_%H%M')}.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="before_move_xls")
+        else:
+            st.info("Run SCAN INTRADAY MOVEMENT first. The separate BEFORE MOVE tab will then show the early-warning signals.")
+
+    # ════════════════════════════════════════════════════════════════════════════════
+    # TAB 3: LIVE EXCHANGE ORDER BOOK
+    # ════════════════════════════════════════════════════════════════════════════════
+    with tabs[4]:
         _show_live_order_flow_tab(fyers, all_symbols)
 
     # ════════════════════════════════════════════════════════════════════════════════
     # TAB 4: LIVE INTRADAY
     # ════════════════════════════════════════════════════════════════════════════════
-    with tabs[4]:
+    with tabs[5]:
         st.markdown("### ⚡ Live Intraday Scanner\nReal-time multi-timeframe analysis (5M, 15M, 1H)")
         
         col1, col2 = st.columns(2)
@@ -4480,7 +4501,7 @@ def show_scanner(fyers) -> None:
     # ════════════════════════════════════════════════════════════════════════════════
     # TAB 5: STRONG SIGNALS
     # ════════════════════════════════════════════════════════════════════════════════
-    with tabs[5]:
+    with tabs[6]:
         st.markdown("### 🔥 Strong Signals Only\nHigh-confidence setups (≥70%)")
         strong_source = st.radio("Source", ["NSE Stocks", "F&O Stocks"], horizontal=True, key="strong_source")
 
@@ -4539,7 +4560,7 @@ def show_scanner(fyers) -> None:
     # ════════════════════════════════════════════════════════════════════════════════
     # TAB 6: SWING — CROSS + LONG-MOVE RADAR
     # ════════════════════════════════════════════════════════════════════════════════
-    with tabs[6]:
+    with tabs[7]:
         st.markdown("### 📈 Swing Trading — Long-Move Radar + Golden/Death Cross")
         st.caption("Daily closed-candle trend scanner. LONG-MOVE WATCH is a setup filter, not a guaranteed forecast.")
 
@@ -4623,7 +4644,7 @@ def show_scanner(fyers) -> None:
     # ════════════════════════════════════════════════════════════════════════════════
     # TAB 7: ADDITIONAL ANALYSIS
     # ════════════════════════════════════════════════════════════════════════════════
-    with tabs[7]:
+    with tabs[8]:
         st.markdown("### 🧠 Additional Analysis - Deep Dive on Single Stock")
         
         col1, col2 = st.columns(2)
@@ -4776,7 +4797,7 @@ def show_scanner(fyers) -> None:
     # ════════════════════════════════════════════════════════════════════════════════
     # TAB 8: MARKET DASHBOARD
     # ════════════════════════════════════════════════════════════════════════════════
-    with tabs[8]:
+    with tabs[9]:
         st.markdown("### 📊 Market Dashboard - Statistics & Sentiment")
         dashboard_source = st.radio("Data Source", ["NSE Stocks", "F&O Stocks"], horizontal=True, key="dash_source")
 
@@ -4852,7 +4873,7 @@ def show_scanner(fyers) -> None:
     # ════════════════════════════════════════════════════════════════════════════════
     # TAB 9: SETTINGS
     # ════════════════════════════════════════════════════════════════════════════════
-    with tabs[9]:
+    with tabs[10]:
         st.markdown("### ⚙️ Scanner Settings & Configuration")
         
         st.markdown("#### 🎯 Signal Filtering")
@@ -4897,13 +4918,13 @@ def show_scanner(fyers) -> None:
     # ════════════════════════════════════════════════════════════════════════════════
     # TAB 10: PIN RULES — ADDITIONAL ONLY
     # ════════════════════════════════════════════════════════════════════════════════
-    with tabs[10]:
+    with tabs[11]:
         _show_pin_rules_tab(fyers, all_symbols, fo_symbols)
     
     # ════════════════════════════════════════════════════════════════════════════════
     # TAB 11: F&O OPTION CHECK — LIVE RUN
     # ════════════════════════════════════════════════════════════════════════════════
-    with tabs[11]:
+    with tabs[12]:
         st.markdown("### 🎯 F&O OPTION CHECK")
         st.caption("RUN LIVE CHECK fetches the current FYERS option-chain data. CE/PE is shown as WATCH, not an order instruction.")
         fo_pick = st.selectbox("Select F&O stock", fo_symbols if fo_symbols else all_symbols, key="fo_option_check_symbol")
