@@ -2052,6 +2052,60 @@ def detect_golden_death_cross(fyers, symbol: str) -> Dict[str, Any]:
         empty["reason"] = f"ERROR: {str(e)}"
         return empty
 
+
+# ════════════════════════════════════════════════════════════════════════════════
+# SWING LONG-MOVE RADAR — DAILY TREND / MOMENTUM
+# ════════════════════════════════════════════════════════════════════════════════
+def detect_swing_long_move(fyers, symbol: str) -> Dict[str, Any]:
+    """Educational swing radar using daily closed candles; no guaranteed forecast."""
+    empty = {"symbol": symbol, "ltp": None, "ema20": None, "ema50": None, "ema200": None,
+             "trend": "WAIT", "return20": None, "return60": None, "rvol": None,
+             "score": 0, "status": "DATA UNAVAILABLE", "reason": "DATA_UNAVAILABLE"}
+    try:
+        date_from = (datetime.today() - timedelta(days=365)).strftime("%Y-%m-%d")
+        date_to = datetime.today().strftime("%Y-%m-%d")
+        resp, err = _safe_history(fyers, {
+            "symbol": symbol, "resolution": "1D", "date_format": "1",
+            "range_from": date_from, "range_to": date_to, "cont_flag": "1",
+        })
+        if err or not resp or not resp.get("candles"):
+            return empty
+        df = pd.DataFrame(resp["candles"], columns=["Time","Open","High","Low","Close","Volume"])
+        df["Close"] = pd.to_numeric(df["Close"], errors="coerce")
+        df["Volume"] = pd.to_numeric(df["Volume"], errors="coerce")
+        df = df.dropna(subset=["Close"]).sort_values("Time").reset_index(drop=True)
+        if len(df) < 210:
+            empty["reason"] = "INSUFFICIENT_DATA"
+            return empty
+        c = df["Close"]
+        e20, e50, e200 = calculate_ema(c,20), calculate_ema(c,50), calculate_ema(c,200)
+        ltp = float(c.iloc[-1])
+        r20 = (ltp / float(c.iloc[-21]) - 1) * 100 if len(c) > 21 else 0.0
+        r60 = (ltp / float(c.iloc[-61]) - 1) * 100 if len(c) > 61 else 0.0
+        vol_now = float(df["Volume"].iloc[-1]) if "Volume" in df and pd.notna(df["Volume"].iloc[-1]) else 0.0
+        vol_base = float(df["Volume"].iloc[-21:-1].mean()) if len(df) > 21 else 0.0
+        rvol = vol_now / vol_base if vol_base > 0 else 0.0
+        score = 0
+        reasons = []
+        if ltp > float(e20.iloc[-1]): score += 15; reasons.append("Price>EMA20")
+        if float(e20.iloc[-1]) > float(e50.iloc[-1]): score += 20; reasons.append("EMA20>EMA50")
+        if float(e50.iloc[-1]) > float(e200.iloc[-1]): score += 20; reasons.append("EMA50>EMA200")
+        if r20 > 3: score += 15; reasons.append("20D momentum")
+        if r60 > 5: score += 15; reasons.append("60D momentum")
+        if rvol >= 1.2: score += 10; reasons.append("Volume building")
+        if ltp >= float(c.tail(20).max()) * 0.98: score += 5; reasons.append("Near 20D high")
+        if ltp > float(e50.iloc[-1]) and float(e50.iloc[-1]) > float(e200.iloc[-1]): trend = "BULLISH"
+        elif ltp < float(e50.iloc[-1]) and float(e50.iloc[-1]) < float(e200.iloc[-1]): trend = "BEARISH"
+        else: trend = "NEUTRAL"
+        status = "🟢 LONG-MOVE WATCH" if score >= 70 and trend == "BULLISH" else ("🟡 EARLY WATCH" if score >= 55 else "⚪ WAIT")
+        return {"symbol": symbol.replace("NSE:","").replace("-EQ","").replace("-INDEX","") , "ltp": round(ltp,2),
+                "ema20": round(float(e20.iloc[-1]),2), "ema50": round(float(e50.iloc[-1]),2), "ema200": round(float(e200.iloc[-1]),2),
+                "trend": trend, "return20": round(r20,2), "return60": round(r60,2), "rvol": round(rvol,2),
+                "score": int(min(score,100)), "status": status, "reason": " | ".join(reasons) or "No strong trend"}
+    except Exception as e:
+        empty["reason"] = f"ERROR: {str(e)[:120]}"
+        return empty
+
 # ════════════════════════════════════════════════════════════════════════════════
 # MARKET STATISTICS
 # ════════════════════════════════════════════════════════════════════════════════
@@ -3997,120 +4051,6 @@ def _show_pin_rules_tab(fyers, all_symbols=None, fo_symbols=None) -> None:
 # ════════════════════════════════════════════════════════════════════════════════
 # MAIN APP - V17 WITH NEW MOMENTUM MOVERS TAB
 # ════════════════════════════════════════════════════════════════════════════════
-
-def _amd_calc(df5: pd.DataFrame, df15: Optional[pd.DataFrame] = None) -> Dict[str, Any]:
-    """Lightweight AMD phase engine using completed OHLCV candles.
-    Additive analysis only; not a guaranteed prediction.
-    """
-    out = {"AMD PHASE":"NEUTRAL","AMD SIGNAL":"⚪ AMD WAIT","AMD SCORE":0.0,
-           "AMD BUY SCORE":0.0,"AMD SELL SCORE":0.0,"AMD CONFIDENCE %":0.0,
-           "AMD SWEEP":"NONE","AMD RANGE HIGH":None,"AMD RANGE LOW":None,
-           "AMD RVOL":0.0,"AMD REASON":""}
-    try:
-        d=df5.copy()
-        for c in ["Open","High","Low","Close","Volume"]:
-            d[c]=pd.to_numeric(d[c],errors="coerce")
-        d=d.dropna(subset=["Open","High","Low","Close"])
-        if len(d)<25: return out
-        c=float(d["Close"].iloc[-1]); o=float(d["Open"].iloc[-1]); h=float(d["High"].iloc[-1]); l=float(d["Low"].iloc[-1])
-        recent=d.iloc[-20:]
-        rh=float(recent["High"].max()); rl=float(recent["Low"].min())
-        vol=float(d["Volume"].iloc[-1]) if "Volume" in d else 0.0
-        vbase=float(d["Volume"].iloc[-21:-1].mean()) if len(d)>=21 else 0.0
-        rvol=vol/vbase if vbase>0 else 0.0
-        ema9=d["Close"].ewm(span=9,adjust=False).mean().iloc[-1]
-        ema21=d["Close"].ewm(span=21,adjust=False).mean().iloc[-1]
-        rng=max(h-l,1e-9); body=abs(c-o)/rng
-        buy=sell=0.0; reasons=[]
-        if c>ema9: buy+=15; reasons.append("close above EMA9")
-        if ema9>ema21: buy+=15; reasons.append("EMA9 above EMA21")
-        if c<ema9: sell+=15; reasons.append("close below EMA9")
-        if ema9<ema21: sell+=15; reasons.append("EMA9 below EMA21")
-        if body>=0.55 and c>o: buy+=12
-        if body>=0.55 and c<o: sell+=12
-        if rvol>=1.5 and c>o: buy+=15; reasons.append(f"RVOL {rvol:.2f}x")
-        if rvol>=1.5 and c<o: sell+=15; reasons.append(f"RVOL {rvol:.2f}x")
-        # Accumulation/distribution proxy: quiet range + improving directional pressure.
-        width=(rh-rl)/max(c,1e-9)*100
-        if width<4.0 and buy>=sell+8: buy+=20; phase="ACCUMULATION"
-        elif width<4.0 and sell>=buy+8: sell+=20; phase="DISTRIBUTION"
-        else: phase="TRANSITION"
-        sweep="NONE"
-        prev_high=float(d["High"].iloc[-2]); prev_low=float(d["Low"].iloc[-2])
-        if h>prev_high and c<prev_high: sweep="HIGH SWEEP"; sell+=12
-        elif l<prev_low and c>prev_low: sweep="LOW SWEEP"; buy+=12
-        tf15="NEUTRAL"
-        if df15 is not None and len(df15)>=5:
-            p=pd.to_numeric(df15["Close"],errors="coerce").dropna()
-            if len(p)>=5:
-                ch=(float(p.iloc[-1])-float(p.iloc[-4]))/max(float(p.iloc[-4]),1e-9)*100
-                tf15="BULLISH" if ch>0.2 else "BEARISH" if ch<-0.2 else "NEUTRAL"
-                if tf15=="BULLISH": buy+=10
-                elif tf15=="BEARISH": sell+=10
-        if sweep=="LOW SWEEP" and buy>=sell: signal="🟢 AMD BUY AFTER SWEEP"; phase="MANIPULATION"
-        elif sweep=="HIGH SWEEP" and sell>=buy: signal="🔴 AMD SELL AFTER SWEEP"; phase="MANIPULATION"
-        elif buy>=65 and buy>sell+8: signal="🟢 AMD ACCUMULATION BUY WATCH"; phase="ACCUMULATION"
-        elif sell>=65 and sell>buy+8: signal="🔴 AMD DISTRIBUTION SELL WATCH"; phase="DISTRIBUTION"
-        elif max(buy,sell)>=50: signal="🟡 AMD TRANSITION — WAIT"; phase="TRANSITION"
-        else: signal="⚪ AMD WAIT"; phase="NEUTRAL"
-        score=min(100.0,max(buy,sell)); conf=min(100.0,round(score*0.85,1))
-        out.update({"AMD PHASE":phase,"AMD SIGNAL":signal,"AMD SCORE":round(score,1),
-                    "AMD BUY SCORE":round(buy,1),"AMD SELL SCORE":round(sell,1),
-                    "AMD CONFIDENCE %":conf,"AMD SWEEP":sweep,"AMD RANGE HIGH":round(rh,2),
-                    "AMD RANGE LOW":round(rl,2),"AMD RVOL":round(rvol,2),
-                    "AMD REASON":f"{' + '.join(reasons) or 'Mixed evidence'} | 15M {tf15}"})
-        return out
-    except Exception as e:
-        out["AMD REASON"]=f"AMD error: {type(e).__name__}"
-        return out
-
-
-def _show_amd_tab(fyers, all_symbols, fo_symbols):
-    st.markdown("### 🧠 AMD SCANNER — ACCUMULATION / MANIPULATION / DISTRIBUTION")
-    st.caption("AMD is a confirmation/watch layer. It does not guarantee a future move.")
-    source=st.radio("AMD Universe",["NSE Stocks","F&O Stocks"],horizontal=True,key="amd_source_final")
-    universe=list(all_symbols if source=="NSE Stocks" else fo_symbols)
-    total=len(universe)
-    st.metric("AVAILABLE STOCKS",f"{total:,}")
-    limit=st.number_input("AMD scan limit (0 = ALL)",0,max(total,1),min(total,200),25,key="amd_limit_final") if total else 0
-    pairs=universe if limit==0 else universe[:int(limit)]
-    show=st.selectbox("Show AMD",["ALL","ACCUMULATION","MANIPULATION","DISTRIBUTION","BUY SIGNALS","SELL SIGNALS"],key="amd_show_final")
-    if st.button(f"🧠 RUN AMD SCAN ({len(pairs):,} STOCKS)",key="amd_run_final",type="primary",use_container_width=True):
-        rows=[]; errors=[]
-        prog=st.progress(0.0,text=f"AMD Scan 0 / {len(pairs)}")
-        for i,symbol in enumerate(pairs,1):
-            try:
-                a5=analyze_timeframe(fyers,symbol,"5")
-                if a5.get("status")!="OK" or a5.get("df") is None or a5.get("df").empty:
-                    errors.append(f"{symbol}: 5M data unavailable"); continue
-                a15=analyze_timeframe(fyers,symbol,"15")
-                amd=_amd_calc(a5["df"],a15.get("df"))
-                d5=a5.get("data",{}) or {}
-                rows.append({"Symbol":symbol.replace("NSE:","").replace("-EQ",""),"SOURCE":source,
-                             "LTP":d5.get("last_close","N/A"),"AMD PHASE":amd["AMD PHASE"],
-                             "AMD SIGNAL":amd["AMD SIGNAL"],"AMD SCORE":amd["AMD SCORE"],
-                             "AMD BUY SCORE":amd["AMD BUY SCORE"],"AMD SELL SCORE":amd["AMD SELL SCORE"],
-                             "AMD CONFIDENCE %":amd["AMD CONFIDENCE %"],"AMD SWEEP":amd["AMD SWEEP"],
-                             "AMD RANGE HIGH":amd["AMD RANGE HIGH"],"AMD RANGE LOW":amd["AMD RANGE LOW"],
-                             "AMD RVOL":amd["AMD RVOL"],"AMD REASON":amd["AMD REASON"],
-                             "5M TREND":d5.get("structure_trend","N/A"),
-                             "15M TREND":(a15.get("data",{}) or {}).get("structure_trend","N/A")})
-            except Exception as e: errors.append(f"{symbol}: {type(e).__name__}: {str(e)[:100]}")
-            if i==len(pairs) or i%10==0: prog.progress(i/max(len(pairs),1),text=f"AMD Scan {i} / {len(pairs)}")
-        prog.empty(); st.session_state["amd_final_df"]=pd.DataFrame(rows); st.session_state["amd_final_errors"]=errors
-    df=st.session_state.get("amd_final_df")
-    if df is None: st.info("Click RUN AMD SCAN to start."); return
-    if df.empty: st.warning("AMD scan completed, but no usable rows returned."); return
-    out=df.copy(); sig=out["AMD SIGNAL"].astype(str); phase=out["AMD PHASE"].astype(str)
-    if show in ["ACCUMULATION","MANIPULATION","DISTRIBUTION"]: out=out[phase==show]
-    elif show=="BUY SIGNALS": out=out[sig.str.contains("BUY",na=False)]
-    elif show=="SELL SIGNALS": out=out[sig.str.contains("SELL",na=False)]
-    st.success(f"AMD REPORT: {len(out)} rows")
-    st.dataframe(out.sort_values("AMD SCORE",ascending=False),use_container_width=True,height=520)
-    if st.session_state.get("amd_final_errors"):
-        with st.expander(f"⚠️ AMD errors ({len(st.session_state['amd_final_errors'])})"):
-            st.dataframe(pd.DataFrame({"Error":st.session_state["amd_final_errors"]}),use_container_width=True)
-
 def show_scanner(fyers) -> None:
     """Streamlit main app - NSE AI PRO V17 with MOMENTUM MOVERS"""
     
@@ -4149,7 +4089,7 @@ def show_scanner(fyers) -> None:
         "📊 MARKET DASHBOARD",
         "⚙️ SETTINGS",
         "📌 PIN RULES",
-        "🧠 AMD SCAN"
+        "🎯 F&O OPTION CHECK"
     ])
     
     # ════════════════════════════════════════════════════════════════════════════════
@@ -4543,89 +4483,89 @@ def show_scanner(fyers) -> None:
             st.info(f"👈 Run '{strong_source}' scanner first")
     
     # ════════════════════════════════════════════════════════════════════════════════
-    # TAB 6: SWING (GOLDEN CROSS / DEATH CROSS)
+    # TAB 6: SWING — CROSS + LONG-MOVE RADAR
     # ════════════════════════════════════════════════════════════════════════════════
     with tabs[6]:
-        st.markdown("### 📈 Swing Analysis - Golden Cross & Death Cross Detection\nDaily EMA50/EMA200 crossovers")
-        
+        st.markdown("### 📈 Swing Trading — Long-Move Radar + Golden/Death Cross")
+        st.caption("Daily closed-candle trend scanner. LONG-MOVE WATCH is a setup filter, not a guaranteed forecast.")
+
         col1, col2 = st.columns([3, 1])
         with col1:
-            swing_limit = st.number_input("Scan limit", min_value=10, max_value=len(all_symbols),
+            swing_limit = st.number_input("Scan limit (0 = ALL NSE)", min_value=10, max_value=len(all_symbols),
                                          value=min(100, len(all_symbols)), step=25, key="swing_limit")
         with col2:
             st.metric("Available", len(all_symbols))
-        
-        swing_symbols = all_symbols[:swing_limit]
-        
-        if st.button(f"📈 DETECT CROSSOVERS ({len(swing_symbols)} stocks)", key="swing_run"):
-            with st.spinner("Analyzing daily charts for Golden/Death Cross…"):
+        swing_symbols = all_symbols if swing_limit == 0 else all_symbols[:swing_limit]
+
+        b1, b2 = st.columns(2)
+        with b1:
+            if st.button(f"🚀 RUN SWING LONG-MOVE ({len(swing_symbols)} stocks)", key="swing_long_run", type="primary", use_container_width=True):
+                results = []
+                prog = st.progress(0)
+                with st.spinner("Scanning daily trend, EMA structure, momentum and volume…"):
+                    for idx, symbol in enumerate(swing_symbols):
+                        r = detect_swing_long_move(fyers, symbol)
+                        # Keep both successful and failed rows so the user can see why a symbol was skipped.
+                        results.append(r)
+                        prog.progress((idx + 1) / max(len(swing_symbols),1))
+                prog.empty()
+                df_long = pd.DataFrame(results)
+                if not df_long.empty:
+                    usable = df_long[df_long["ltp"].notna()].copy()
+                    if not usable.empty:
+                        usable = usable.sort_values(["score","return60"], ascending=False, na_position="last")
+                    st.session_state["swing_long_df"] = usable if not usable.empty else df_long
+                    st.success(f"✅ Swing scan complete: {len(usable)} stocks with usable daily data out of {len(df_long)} scanned.")
+                else:
+                    st.warning("No symbols were scanned. Check the NSE symbol list / API connection.")
+        with b2:
+            if st.button(f"📈 DETECT CROSSOVERS ({len(swing_symbols)} stocks)", key="swing_run", use_container_width=True):
                 swing_results = []
                 swing_progress = st.progress(0)
-                
-                for idx, symbol in enumerate(swing_symbols):
-                    try:
-                        cc_data = detect_golden_death_cross(fyers, symbol)
-                        if cc_data.get("reason") == "OK":
-                            ticker = symbol.replace("NSE:", "").replace("-EQ", "")
-                            swing_results.append({
-                                "Symbol": ticker,
-                                "LTP": cc_data.get("ltp", "N/A"),
-                                "EMA50": cc_data.get("ema50", "N/A"),
-                                "EMA200": cc_data.get("ema200", "N/A"),
-                                "EMA Trend": cc_data.get("ema_trend", "N/A"),
-                                "Signal": cc_data.get("signal", "NONE"),
-                                "Signal Date": cc_data.get("signal_date", "N/A"),
-                            })
-                    except:
-                        pass
-                    
-                    swing_progress.progress((idx + 1) / len(swing_symbols))
-                
+                with st.spinner("Analyzing daily charts for Golden/Death Cross…"):
+                    for idx, symbol in enumerate(swing_symbols):
+                        try:
+                            cc_data = detect_golden_death_cross(fyers, symbol)
+                            if cc_data.get("reason") == "OK":
+                                ticker = symbol.replace("NSE:", "").replace("-EQ", "")
+                                swing_results.append({"Symbol": ticker, "LTP": cc_data.get("ltp", "N/A"), "EMA50": cc_data.get("ema50", "N/A"),
+                                                      "EMA200": cc_data.get("ema200", "N/A"), "EMA Trend": cc_data.get("ema_trend", "N/A"),
+                                                      "Signal": cc_data.get("signal", "NONE"), "Signal Date": cc_data.get("signal_date", "N/A")})
+                        except Exception:
+                            pass
+                        swing_progress.progress((idx + 1) / max(len(swing_symbols),1))
                 swing_progress.empty()
-                
                 if swing_results:
-                    swing_df = pd.DataFrame(swing_results)
-                    st.session_state["swing_df"] = swing_df
-        
+                    st.session_state["swing_df"] = pd.DataFrame(swing_results)
+
+        long_df = st.session_state.get("swing_long_df")
+        if long_df is not None and not long_df.empty:
+            st.success(f"✅ Swing Long-Move scan complete: {len(long_df)} stocks")
+            fcol1, fcol2 = st.columns(2)
+            with fcol1:
+                long_filter = st.selectbox("Long-Move Status", ["ALL", "🟢 LONG-MOVE WATCH", "🟡 EARLY WATCH", "⚪ WAIT"], key="swing_long_filter")
+            with fcol2:
+                trend_filter = st.selectbox("Daily Trend", ["ALL", "BULLISH", "NEUTRAL", "BEARISH"], key="swing_long_trend")
+            view = long_df.copy()
+            if long_filter != "ALL": view = view[view["status"] == long_filter]
+            if trend_filter != "ALL": view = view[view["trend"] == trend_filter]
+            st.dataframe(view.head(50), use_container_width=True, hide_index=True)
+            _excel_download_button(view, "SWING_LONG_MOVE", "download_swing_long_move_excel")
+            st.caption("Higher score means more conditions are aligned; it does not mean the stock will definitely rise.")
+        else:
+            st.info("👈 Click RUN SWING LONG-MOVE to find stocks with stronger daily trend/momentum alignment.")
+
+        if long_df is not None and not long_df.empty and "reason" in long_df.columns:
+            bad = long_df[long_df["ltp"].isna()].copy() if "ltp" in long_df.columns else pd.DataFrame()
+            if not bad.empty:
+                with st.expander(f"⚠️ Daily data unavailable / skipped: {len(bad)} stocks", expanded=False):
+                    st.dataframe(bad[[c for c in ["symbol","status","reason"] if c in bad.columns]].head(100), use_container_width=True, hide_index=True)
+
         swing_df = st.session_state.get("swing_df")
         if swing_df is not None and not swing_df.empty:
-            st.success(f"✅ Analysis Complete: {len(swing_df)} stocks analyzed")
-            
-            col_s1, col_s2 = st.columns(2)
-            with col_s1:
-                swing_signal_filter = st.selectbox("Signal Type", ["ALL", "🟢 GOLDEN CROSS", "🔴 DEATH CROSS"], key="swing_sig_filter")
-            with col_s2:
-                swing_trend_filter = st.selectbox("EMA Trend", ["ALL", "BULLISH", "BEARISH", "NEUTRAL"], key="swing_trend_filter")
-            
-            swing_filtered = swing_df.copy()
-            
-            if swing_signal_filter != "ALL":
-                swing_filtered = swing_filtered[swing_filtered["Signal"] == swing_signal_filter]
-            
-            if swing_trend_filter != "ALL":
-                swing_filtered = swing_filtered[swing_filtered["EMA Trend"] == swing_trend_filter]
-            
-            if len(swing_filtered) > 0:
-                golden = swing_filtered[swing_filtered["Signal"] == "🟢 GOLDEN CROSS"]
-                death = swing_filtered[swing_filtered["Signal"] == "🔴 DEATH CROSS"]
-                other = swing_filtered[swing_filtered["Signal"] == "NONE"]
-                
-                if len(golden) > 0:
-                    st.subheader(f"🟢 Golden Cross ({len(golden)})")
-                    st.dataframe(golden, use_container_width=True, height=250)
-                
-                if len(death) > 0:
-                    st.subheader(f"🔴 Death Cross ({len(death)})")
-                    st.dataframe(death, use_container_width=True, height=250)
-                
-                if len(other) > 0:
-                    with st.expander(f"📊 Other ({len(other)})"):
-                        st.dataframe(other, use_container_width=True, height=200)
-            else:
-                st.warning("No signals match current filters")
-        else:
-            st.info("👈 Click 'DETECT CROSSOVERS' to start swing analysis")
-    
+            st.markdown("#### Golden / Death Cross results")
+            st.dataframe(swing_df, use_container_width=True, hide_index=True)
+
     # ════════════════════════════════════════════════════════════════════════════════
     # TAB 7: ADDITIONAL ANALYSIS
     # ════════════════════════════════════════════════════════════════════════════════
@@ -4905,13 +4845,68 @@ def show_scanner(fyers) -> None:
     # ════════════════════════════════════════════════════════════════════════════════
     with tabs[10]:
         _show_pin_rules_tab(fyers, all_symbols, fo_symbols)
-
+    
     # ════════════════════════════════════════════════════════════════════════════════
-    # TAB 11: AMD SCAN
+    # TAB 11: F&O OPTION CHECK — LIVE RUN
     # ════════════════════════════════════════════════════════════════════════════════
     with tabs[11]:
-        _show_amd_tab(fyers, all_symbols, fo_symbols)
-    
+        st.markdown("### 🎯 F&O OPTION CHECK")
+        st.caption("RUN LIVE CHECK fetches the current FYERS option-chain data. CE/PE is shown as WATCH, not an order instruction.")
+        fo_pick = st.selectbox("Select F&O stock", fo_symbols if fo_symbols else all_symbols, key="fo_option_check_symbol")
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            strike_input = st.number_input("Strike", min_value=0.0, value=1150.0, step=50.0, key="fo_strike_example")
+        with c2:
+            option_side = st.selectbox("Option side", ["CE", "PE"], key="fo_option_side")
+        with c3:
+            st.write("")
+            run_live = st.button("▶ RUN LIVE OPTION CHECK", key="fo_option_live_run", type="primary", use_container_width=True)
+
+        if run_live:
+            with st.spinner(f"Fetching live option chain for {fo_pick}…"):
+                live_opt = fetch_options_chain_data(fyers, fo_pick)
+            st.session_state["fo_option_live"] = live_opt
+            st.session_state["fo_option_live_symbol"] = fo_pick
+
+        live_opt = st.session_state.get("fo_option_live")
+        if live_opt:
+            if live_opt.get("status") == "OK":
+                spot = live_opt.get("spot")
+                if spot is None: spot = 0.0
+                if option_side == "CE":
+                    moneyness = "ITM" if spot > strike_input else ("ATM" if spot == strike_input else "OTM")
+                    intrinsic = max(spot-strike_input,0)
+                else:
+                    moneyness = "ITM" if spot < strike_input else ("ATM" if spot == strike_input else "OTM")
+                    intrinsic = max(strike_input-spot,0)
+                m1,m2,m3,m4 = st.columns(4)
+                m1.metric("LIVE SPOT / LTP", f"₹{spot:,.2f}")
+                m2.metric("STRIKE", f"₹{strike_input:,.2f}")
+                m3.metric("MONEYNESS", moneyness)
+                m4.metric("INTRINSIC", f"₹{intrinsic:,.2f}")
+                s1,s2,s3,s4 = st.columns(4)
+                s1.metric("PCR", f"{live_opt.get('pcr'):.2f}" if live_opt.get('pcr') is not None else "—")
+                s2.metric("CE VOLUME", f"{live_opt.get('ce_volume',0):,.0f}")
+                s3.metric("PE VOLUME", f"{live_opt.get('pe_volume',0):,.0f}")
+                s4.metric("OPTIONS BIAS", str(live_opt.get('options_bias','—')))
+                chain = live_opt.get("chain") or []
+                if chain:
+                    rows=[]
+                    for x in chain:
+                        try:
+                            k=float(x.get("strike_price")); typ=x.get("option_type")
+                            if abs(k-strike_input) <= max(1.0, abs(strike_input)*0.08):
+                                rows.append({"Strike":k,"Type":typ,"LTP":x.get("ltp"),"OI":x.get("oi"),"OI Change":x.get("oich"),"Volume":x.get("volume"),"IV":x.get("iv")})
+                        except Exception: pass
+                    if rows:
+                        st.markdown("#### Nearby option strikes")
+                        st.dataframe(pd.DataFrame(rows).sort_values(["Strike","Type"]), use_container_width=True, hide_index=True)
+                st.info("Use the live stock direction/PIN/order-flow tabs as confirmation. Option-chain data alone should not be treated as a guaranteed direction signal.")
+            else:
+                st.error(f"Option-chain data unavailable: {live_opt.get('message','Unknown error')}")
+        else:
+            st.info("👆 Select an F&O stock and click RUN LIVE OPTION CHECK to refresh the current spot and option-chain data.")
+
     gc.collect()
 
 # ════════════════════════════════════════════════════════════════════════════════
