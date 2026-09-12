@@ -4103,6 +4103,51 @@ def _show_pin_rules_tab(fyers, all_symbols=None, fo_symbols=None) -> None:
                 st.caption(f"Showing first 100 of {len(errors)} errors.")
 
 # ════════════════════════════════════════════════════════════════════════════════
+# REVERSAL REPORT ENGINE — uses stocks already scanned in NSE / F&O / MOMENTUM / SWING
+# and calculates a practical reversal watch-zone from the latest available scan values.
+def _build_reversal_report_from_scans() -> pd.DataFrame:
+    frames = []
+    for key, source in [("nse_df", "NSE"), ("fo_df", "F&O"), ("momentum_df", "MOMENTUM"), ("swing_long_df", "SWING")]:
+        df = st.session_state.get(key)
+        if isinstance(df, pd.DataFrame) and not df.empty:
+            x = df.copy()
+            x["SCAN SOURCE"] = source
+            frames.append(x)
+    if not frames:
+        return pd.DataFrame()
+    raw = pd.concat(frames, ignore_index=True, sort=False)
+    symbol_col = next((c for c in ["STOCK NAME", "SYMBOL", "Symbol", "symbol"] if c in raw.columns), None)
+    if symbol_col is None:
+        return pd.DataFrame()
+    raw["STOCK NAME"] = raw[symbol_col].astype(str).str.replace("NSE:", "", regex=False).str.replace("-EQ", "", regex=False)
+    raw["LTP"] = pd.to_numeric(raw.get("LTP", raw.get("ltp")), errors="coerce")
+    if "LTP" not in raw.columns or raw["LTP"].isna().all():
+        raw["LTP"] = pd.to_numeric(raw.get("ltp"), errors="coerce")
+    def num(col, default=0.0):
+        return pd.to_numeric(raw[col], errors="coerce").fillna(default) if col in raw.columns else pd.Series(default, index=raw.index)
+    rsi = num("RSI", 50)
+    rvol = num("RVOL", 1)
+    conf = num("AI CONFIDENCE %", 0)
+    atr = num("ATR", 0)
+    if (atr <= 0).all():
+        atr = raw["LTP"].abs() * 0.01
+    vwap = num("VWAP", 0)
+    move = raw.get("DIRECTION", raw.get("MOVEMENT STATUS", raw.get("Signal", ""))).astype(str).str.upper()
+    buy_rev = ((rsi <= 35) | (move.str.contains("SELL|DOWN|BEAR", regex=True)) | ((vwap > 0) & (raw["LTP"] > vwap * 1.01))).astype(int)
+    sell_rev = ((rsi >= 65) | (move.str.contains("BUY|UP|BULL", regex=True)) | ((vwap > 0) & (raw["LTP"] < vwap * 0.99))).astype(int)
+    raw["REVERSAL SCORE"] = (50 + buy_rev * 10 + sell_rev * 10 + (rvol >= 1.3).astype(int) * 10 + (conf >= 70).astype(int) * 10).clip(0, 100)
+    raw["REVERSAL DIRECTION"] = np.where(buy_rev > sell_rev, "BUY REVERSAL", np.where(sell_rev > buy_rev, "SELL REVERSAL", "WAIT"))
+    raw["REVERSAL LEVEL"] = np.where(raw["REVERSAL DIRECTION"].eq("BUY REVERSAL"), raw["LTP"] - atr * 0.50, np.where(raw["REVERSAL DIRECTION"].eq("SELL REVERSAL"), raw["LTP"] + atr * 0.50, raw["LTP"]))
+    raw["ZONE LOW"] = np.where(raw["REVERSAL DIRECTION"].eq("BUY REVERSAL"), raw["LTP"] - atr, raw["LTP"])
+    raw["ZONE HIGH"] = np.where(raw["REVERSAL DIRECTION"].eq("SELL REVERSAL"), raw["LTP"] + atr, raw["LTP"])
+    raw["RSI"] = rsi.round(1)
+    raw["RVOL"] = rvol.round(2)
+    raw["REASON"] = np.where(raw["REVERSAL DIRECTION"].eq("BUY REVERSAL"), "Down move/oversold + reversal zone watch", np.where(raw["REVERSAL DIRECTION"].eq("SELL REVERSAL"), "Up move/overbought + reversal zone watch", "No clear reversal confluence"))
+    out = raw[["STOCK NAME","SCAN SOURCE","LTP","REVERSAL DIRECTION","REVERSAL SCORE","REVERSAL LEVEL","ZONE LOW","ZONE HIGH","RSI","RVOL","REASON"]].copy()
+    out = out.dropna(subset=["LTP"]).drop_duplicates(subset=["STOCK NAME"], keep="first")
+    return out.sort_values(["REVERSAL SCORE","RVOL"], ascending=[False,False]).reset_index(drop=True)
+
+
 # MAIN APP - V17 WITH NEW MOMENTUM MOVERS TAB
 # ════════════════════════════════════════════════════════════════════════════════
 def show_scanner(fyers) -> None:
@@ -4136,6 +4181,7 @@ def show_scanner(fyers) -> None:
         "📊 F&O STOCKS",
         "⚡ MOMENTUM MOVERS",
         "🚦 BEFORE MOVE",
+        "🔄 REVERSAL REPORT",
         "📖 LIVE ORDER BOOK",
         "⚡ LIVE INTRADAY",
         "🔥 STRONG SIGNALS",
@@ -4445,15 +4491,36 @@ def show_scanner(fyers) -> None:
             st.info("Run SCAN INTRADAY MOVEMENT first. The separate BEFORE MOVE tab will then show the early-warning signals.")
 
     # ════════════════════════════════════════════════════════════════════════════════
-    # TAB 3: LIVE EXCHANGE ORDER BOOK
+    # TAB 4: REVERSAL REPORT — after NSE / F&O / MOMENTUM / SWING scans
     # ════════════════════════════════════════════════════════════════════════════════
     with tabs[4]:
+        st.markdown("### 🔄 REVERSAL REPORT — MOVEMENT AFTER REVERSAL ZONES")
+        st.caption("Uses stocks already scanned in NSE, F&O, Momentum Movers and Swing. Reversal levels are watch zones, not guaranteed predictions.")
+        scanned = any(isinstance(st.session_state.get(k), pd.DataFrame) and not st.session_state.get(k).empty for k in ["nse_df","fo_df","momentum_df","swing_long_df"])
+        if st.button("🔄 BUILD REVERSAL REPORT", key="reversal_report_run", type="primary", use_container_width=True):
+            st.session_state["reversal_report_df"] = _build_reversal_report_from_scans()
+        rdf = st.session_state.get("reversal_report_df")
+        if isinstance(rdf, pd.DataFrame) and not rdf.empty:
+            rf = st.selectbox("Reversal Filter", ["ALL", "BUY REVERSAL", "SELL REVERSAL", "WAIT"], key="reversal_filter")
+            view = rdf.copy()
+            if rf != "ALL": view = view[view["REVERSAL DIRECTION"] == rf]
+            st.dataframe(view, use_container_width=True, height=560, hide_index=True)
+            _excel_download_button(view, "REVERSAL_REPORT", "download_reversal_report_excel")
+        elif not scanned:
+            st.info("First run NSE / F&O / Momentum Movers / Swing scan. Then click BUILD REVERSAL REPORT.")
+        else:
+            st.info("Click BUILD REVERSAL REPORT to create the report from your scanned stocks.")
+
+    # ════════════════════════════════════════════════════════════════════════════════
+    # TAB 5: LIVE EXCHANGE ORDER BOOK
+    # ════════════════════════════════════════════════════════════════════════════════
+    with tabs[5]:
         _show_live_order_flow_tab(fyers, all_symbols)
 
     # ════════════════════════════════════════════════════════════════════════════════
     # TAB 4: LIVE INTRADAY
     # ════════════════════════════════════════════════════════════════════════════════
-    with tabs[5]:
+    with tabs[6]:
         st.markdown("### ⚡ Live Intraday Scanner\nReal-time multi-timeframe analysis (5M, 15M, 1H)")
         
         col1, col2 = st.columns(2)
@@ -4518,7 +4585,7 @@ def show_scanner(fyers) -> None:
     # ════════════════════════════════════════════════════════════════════════════════
     # TAB 5: STRONG SIGNALS
     # ════════════════════════════════════════════════════════════════════════════════
-    with tabs[6]:
+    with tabs[7]:
         st.markdown("### 🔥 Strong Signals Only\nHigh-confidence setups (≥70%)")
         strong_source = st.radio("Source", ["NSE Stocks", "F&O Stocks"], horizontal=True, key="strong_source")
 
@@ -4577,7 +4644,7 @@ def show_scanner(fyers) -> None:
     # ════════════════════════════════════════════════════════════════════════════════
     # TAB 6: SWING — CROSS + LONG-MOVE RADAR
     # ════════════════════════════════════════════════════════════════════════════════
-    with tabs[7]:
+    with tabs[8]:
         st.markdown("### 📈 Swing Trading — Long-Move Radar + Golden/Death Cross")
         st.caption("Daily closed-candle trend scanner. LONG-MOVE WATCH is a setup filter, not a guaranteed forecast.")
 
@@ -4661,7 +4728,7 @@ def show_scanner(fyers) -> None:
     # ════════════════════════════════════════════════════════════════════════════════
     # TAB 7: ADDITIONAL ANALYSIS
     # ════════════════════════════════════════════════════════════════════════════════
-    with tabs[8]:
+    with tabs[9]:
         st.markdown("### 🧠 Additional Analysis - Deep Dive on Single Stock")
         
         col1, col2 = st.columns(2)
@@ -4814,7 +4881,7 @@ def show_scanner(fyers) -> None:
     # ════════════════════════════════════════════════════════════════════════════════
     # TAB 8: MARKET DASHBOARD
     # ════════════════════════════════════════════════════════════════════════════════
-    with tabs[9]:
+    with tabs[10]:
         st.markdown("### 📊 Market Dashboard - Statistics & Sentiment")
         dashboard_source = st.radio("Data Source", ["NSE Stocks", "F&O Stocks"], horizontal=True, key="dash_source")
 
@@ -4890,7 +4957,7 @@ def show_scanner(fyers) -> None:
     # ════════════════════════════════════════════════════════════════════════════════
     # TAB 9: SETTINGS
     # ════════════════════════════════════════════════════════════════════════════════
-    with tabs[10]:
+    with tabs[11]:
         st.markdown("### ⚙️ Scanner Settings & Configuration")
         
         st.markdown("#### 🎯 Signal Filtering")
@@ -4935,13 +5002,13 @@ def show_scanner(fyers) -> None:
     # ════════════════════════════════════════════════════════════════════════════════
     # TAB 10: PIN RULES — ADDITIONAL ONLY
     # ════════════════════════════════════════════════════════════════════════════════
-    with tabs[11]:
+    with tabs[12]:
         _show_pin_rules_tab(fyers, all_symbols, fo_symbols)
     
     # ════════════════════════════════════════════════════════════════════════════════
     # TAB 11: F&O OPTION CHECK — LIVE RUN
     # ════════════════════════════════════════════════════════════════════════════════
-    with tabs[12]:
+    with tabs[13]:
         st.markdown("### 🎯 F&O OPTION CHECK")
         st.caption("RUN LIVE CHECK fetches the current FYERS option-chain data. CE/PE is shown as WATCH, not an order instruction.")
         fo_pick = st.selectbox("Select F&O stock", fo_symbols if fo_symbols else all_symbols, key="fo_option_check_symbol")
