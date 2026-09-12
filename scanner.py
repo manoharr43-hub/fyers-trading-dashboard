@@ -2649,7 +2649,12 @@ def _pre_move_signal(df: pd.DataFrame, block: Dict[str, Any] = None) -> Dict[str
         atr = max(float(_last_valid_atr(d, 14) or 0), close * 0.001)
 
         # ------------------------- RANGE / COMPRESSION -------------------------
-        recent = d.iloc[-10:]
+        # IMPORTANT: breakout/breakdown reference must come from the PRIOR
+        # completed range. Including the current candle makes BREAKOUT LEVEL
+        # frequently equal to LTP and can create a false PRE-MOVE signal.
+        recent = d.iloc[-11:-1] if len(d) >= 11 else d.iloc[:-1]
+        if len(recent) < 5:
+            return out
         rh = float(recent["High"].max())
         rl = float(recent["Low"].min())
         rsize = max(rh - rl, 1e-9)
@@ -2852,7 +2857,14 @@ def _before_move_signal(df: pd.DataFrame, pre: Dict[str, Any] = None) -> Dict[st
         gap=abs(buy-sell); direction="BUY" if buy>sell else "SELL" if sell>buy else "NONE"
         score=max(buy,sell); close=float(d["Close"].iloc[-1]); high=float(d["High"].iloc[-1]); low=float(d["Low"].iloc[-1])
         atr_s=calculate_atr(d,14); atr=float(atr_s.iloc[-1]) if len(atr_s) and pd.notna(atr_s.iloc[-1]) else max(close*0.003,0.01)
-        rh=float(d["High"].iloc[-10:].max()); rl=float(d["Low"].iloc[-10:].min()); rng=max(rh-rl,1e-9); pos=(close-rl)/rng
+        # Use the prior completed 10-candle range as the trigger reference.
+        ref=d.iloc[-11:-1] if len(d)>=11 else d.iloc[:-1]
+        if len(ref)<5: return out
+        rh=float(ref["High"].max()); rl=float(ref["Low"].min()); rng=max(rh-rl,1e-9); pos=(close-rl)/rng
+        # BEFORE MOVE is only an early-warning state. Once price has already
+        # broken the reference level, do not call it BEFORE MOVE.
+        already_breakout = close >= rh
+        already_breakdown = close <= rl
         cr=max(high-low,1e-9); close_loc=(close-low)/cr
         prev_rng=float(d["High"].iloc[-20:-10].max()-d["Low"].iloc[-20:-10].min())
         compression=rng<=atr*3.0; tightening=compression and rng<=max(prev_rng*0.90,atr*1.6)
@@ -2881,8 +2893,12 @@ def _before_move_signal(df: pd.DataFrame, pre: Dict[str, Any] = None) -> Dict[st
             if close_loc<=0.35: score+=3; reasons.append("Weak Close")
             if lh_ll: score+=5; reasons.append("LH/LL")
         score=min(100.0,score)
-        if direction=="BUY" and score>=72 and gap>=12 and (compression or vol_build): out.update(signal="🟢 BUY BEFORE MOVE",direction="BUY",trigger=f"Breakout > {rh:.2f}")
-        elif direction=="SELL" and score>=72 and gap>=12 and (compression or vol_build): out.update(signal="🔴 SELL BEFORE MOVE",direction="SELL",trigger=f"Breakdown < {rl:.2f}")
+        if direction=="BUY" and score>=72 and gap>=12 and (compression or vol_build) and not already_breakout:
+            out.update(signal="🟢 BUY BEFORE MOVE",direction="BUY",trigger=f"Breakout > {rh:.2f}")
+        elif direction=="SELL" and score>=72 and gap>=12 and (compression or vol_build) and not already_breakdown:
+            out.update(signal="🔴 SELL BEFORE MOVE",direction="SELL",trigger=f"Breakdown < {rl:.2f}")
+        elif already_breakout or already_breakdown:
+            out["reason"] = "Breakout/breakdown already triggered; not a BEFORE MOVE setup"
         out["score"]=round(score,1); out["reason"]=" + ".join(reasons[:7]) if reasons else "Waiting for directional energy"
         return out
     except Exception as e:
@@ -3026,21 +3042,25 @@ def _fetch_momentum_signal(fyers, symbol: str, is_fo: bool = False):
             if mv.get("direction") in ("BUY","SELL"):
                 candidates.append((idx,mv))
         if candidates:
-            idx,mv=max(candidates,key=lambda x:x[0]); sig_time=d.index[idx] if not isinstance(d.index,pd.RangeIndex) else None
-            if sig_time is None: sig_time=_now_ist()
+            idx,mv=max(candidates,key=lambda x:x[0])
+            # Always use the actual completed candle timestamp. d has a
+            # RangeIndex after reset_index(), so d.index[idx] is NOT time.
+            sig_time=d["Time"].iloc[idx] if "Time" in d.columns else _now_ist()
             try:
                 sig_time=pd.Timestamp(sig_time).to_pydatetime()
                 if sig_time.tzinfo is None: sig_time=sig_time.replace(tzinfo=_now_ist().tzinfo)
-            except: sig_time=_now_ist()
+            except Exception: sig_time=_now_ist()
             age=max(0,( _now_ist()-sig_time).total_seconds()/60)
             signal=mv["signal"]
         else:
             mv=detect_live_sudden_move(d)
-            idx=len(d)-1; sig_time=d.index[-1] if not isinstance(d.index,pd.RangeIndex) else _now_ist()
+            idx=len(d)-1
+            # Latest completed candle timestamp, not scanner refresh time.
+            sig_time=d["Time"].iloc[-1] if "Time" in d.columns else _now_ist()
             try:
                 sig_time=pd.Timestamp(sig_time).to_pydatetime()
                 if sig_time.tzinfo is None: sig_time=sig_time.replace(tzinfo=_now_ist().tzinfo)
-            except: sig_time=_now_ist()
+            except Exception: sig_time=_now_ist()
             age=max(0,(_now_ist()-sig_time).total_seconds()/60)
             signal=pre["status"] if pre["direction"] in ("BUY","SELL") else "NO MOVE"
         ltp=float(d["Close"].iloc[-1])
@@ -3049,6 +3069,28 @@ def _fetch_momentum_signal(fyers, symbol: str, is_fo: bool = False):
             try:
                 od=fetch_options_chain_data(fyers,symbol); result["PCR"]=od.get("pcr","N/A"); result["OPTIONS BIAS"]=od.get("options_bias","N/A")
             except: result["PCR"]="N/A"; result["OPTIONS BIAS"]="N/A"
+        # Explicitly label price/options conflicts instead of silently mixing
+        # two independent signals.
+        price_dir=str(result.get("DIRECTION", "NONE")).upper()
+        opt_bias=str(result.get("OPTIONS BIAS", "N/A")).upper()
+        if price_dir in ("BUY","SELL") and opt_bias not in ("N/A","NONE",""):
+            opt_dir = "BUY" if "BULL" in opt_bias or "CALL" in opt_bias else "SELL" if "BEAR" in opt_bias or "PUT" in opt_bias else "NONE"
+            if opt_dir == price_dir:
+                result["COMBINED BIAS"] = f"{price_dir} + OPTIONS CONFIRM"
+            elif opt_dir in ("BUY","SELL"):
+                result["COMBINED BIAS"] = f"PRICE {price_dir} / OPTIONS {opt_dir} CONFLICT"
+            else:
+                result["COMBINED BIAS"] = f"PRICE {price_dir} / OPTIONS {opt_bias}"
+        else:
+            result["COMBINED BIAS"] = price_dir if price_dir in ("BUY","SELL") else "WAIT"
+        # Classify opposite-structure trades as reversals for clarity.
+        structure=str(result.get("STRUCTURE", "NONE")).upper()
+        if price_dir == "BUY" and structure == "LH/LL":
+            result["SIGNAL TYPE"] = "BUY REVERSAL"
+        elif price_dir == "SELL" and structure == "HH/HL":
+            result["SIGNAL TYPE"] = "SELL REVERSAL"
+        else:
+            result["SIGNAL TYPE"] = price_dir if price_dir in ("BUY","SELL") else "WAIT"
         return result,None
     except Exception as e:
         logger.exception("LIVE MOMENTUM worker failed for %s",symbol); return None,f"{symbol}: error ({type(e).__name__}: {str(e)[:120]})"
@@ -4143,8 +4185,38 @@ def _add_reversal_columns(df: pd.DataFrame) -> pd.DataFrame:
     x["REVERSAL SIGNAL"] = direction
     raw_rev_score = np.maximum(buy, sell) * 18 + (rvol >= 1.30).astype(int) * 8 + (conf >= 70).astype(int) * 5
     x["REVERSAL SCORE"] = np.where(np.array(direction) == "WAIT", np.minimum(raw_rev_score, 59), np.minimum(raw_rev_score, 100)).round(1)
-    x["REVERSAL LEVEL"] = np.where(np.array(direction) == "BUY REVERSAL", ltp - atr * 0.50, np.where(np.array(direction) == "SELL REVERSAL", ltp + atr * 0.50, ltp)).round(2)
-    x["REVERSAL ZONE"] = np.where(np.array(direction) == "BUY REVERSAL", (ltp - atr).round(2).astype(str) + " - " + ltp.round(2).astype(str), np.where(np.array(direction) == "SELL REVERSAL", ltp.round(2).astype(str) + " - " + (ltp + atr).round(2).astype(str), ltp.round(2).astype(str)))
+    # WAIT rows must NOT display LTP as a fake reversal price.
+    # Prefer the existing breakout/breakdown reference when available.
+    breakout_level = num(["BREAKOUT LEVEL", "breakout_level"], np.nan)
+    breakdown_level = num(["BREAKDOWN LEVEL", "breakdown_level"], np.nan)
+
+    buy_reversal_price = np.where(
+        breakdown_level.notna() & (breakdown_level > 0),
+        breakdown_level + (atr * 0.20),
+        ltp - (atr * 0.50)
+    )
+    sell_reversal_price = np.where(
+        breakout_level.notna() & (breakout_level > 0),
+        breakout_level - (atr * 0.20),
+        ltp + (atr * 0.50)
+    )
+
+    x["REVERSAL LEVEL"] = np.where(
+        np.array(direction) == "BUY REVERSAL", buy_reversal_price,
+        np.where(np.array(direction) == "SELL REVERSAL", sell_reversal_price, np.nan)
+    )
+    x["REVERSAL LEVEL"] = pd.to_numeric(x["REVERSAL LEVEL"], errors="coerce").round(2)
+    x["REVERSAL ZONE"] = np.where(
+        np.array(direction) == "BUY REVERSAL",
+        (x["REVERSAL LEVEL"] - atr * 0.50).round(2).astype(str) + " - " +
+        (x["REVERSAL LEVEL"] + atr * 0.25).round(2).astype(str),
+        np.where(
+            np.array(direction) == "SELL REVERSAL",
+            (x["REVERSAL LEVEL"] - atr * 0.25).round(2).astype(str) + " - " +
+            (x["REVERSAL LEVEL"] + atr * 0.50).round(2).astype(str),
+            "N/A"
+        )
+    )
     x["REVERSAL REASON"] = np.where(np.array(direction) == "BUY REVERSAL", "Down context + oversold/rejection + VWAP/volume confirmation", np.where(np.array(direction) == "SELL REVERSAL", "Up context + overbought/rejection + VWAP/volume confirmation", "No 3-factor reversal confluence"))
     return x
 
@@ -4481,7 +4553,7 @@ def show_scanner(fyers) -> None:
             elif "STOCK NAME" not in view.columns:
                 view.insert(0, "STOCK NAME", "N/A")
             view = _add_reversal_columns(view)
-            _before_cols = ["STOCK NAME", "LTP", "BEFORE MOVE SIGNAL", "BEFORE MOVE SCORE", "PRE-MOVE SCORE", "PRE-MOVE STATUS", "PRE BUY/SELL SCORE", "PRE SCORE GAP", "BREAKOUT LEVEL", "BREAKDOWN LEVEL", "PRE-MOVE RVOL", "PRE-MOVE REASON", "REVERSAL SIGNAL", "REVERSAL SCORE", "REVERSAL LEVEL", "REVERSAL ZONE", "REVERSAL REASON"]
+            _before_cols = ["STOCK NAME", "LTP", "BEFORE MOVE SIGNAL", "BEFORE MOVE SCORE", "PRE-MOVE SCORE", "PRE-MOVE STATUS", "PRE BUY/SELL SCORE", "PRE SCORE GAP", "BREAKOUT LEVEL", "BREAKDOWN LEVEL", "PRE-MOVE RVOL", "PRE-MOVE REASON", "REVERSAL SIGNAL", "REVERSAL SCORE", "REVERSAL LEVEL", "REVERSAL ZONE", "REVERSAL REASON", "SIGNAL TYPE", "COMBINED BIAS"]
             cols = [c for c in _before_cols if c in view.columns]
             view = view[cols].copy() if cols else view.copy()
             if "BEFORE MOVE SIGNAL" in view.columns:
