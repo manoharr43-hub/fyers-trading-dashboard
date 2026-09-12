@@ -4080,6 +4080,194 @@ def calculate_option_chain_reversal(
     }
 
 
+def calculate_sell_edge(df: pd.DataFrame, state: dict[str, Any], reversal: Optional[dict] = None) -> dict[str, Any]:
+    """Additive SELL-EDGE layer. Ranks bearish evidence without changing existing signals."""
+    try:
+        if df is None or df.empty:
+            return {"score": 0.0, "status": "NO EDGE", "direction": "NONE",
+                    "bear_score": 0.0, "buy_score": 0.0, "reason": "No option-chain data"}
+
+        mp = state.get("market_pressure")
+        of = state.get("order_flow") or {}
+        sell_components = []
+        buy_components = []
+
+        # Market pressure: sell pressure is direct bearish evidence.
+        sell_p = float(getattr(mp, "total_put_pressure", 0.0)) if mp else 0.0
+        buy_p = float(getattr(mp, "total_call_pressure", 0.0)) if mp else 0.0
+        sell_components.append(min(max(sell_p, 0.0), 100.0) * 0.30)
+        buy_components.append(min(max(buy_p, 0.0), 100.0) * 0.30)
+
+        # Order-flow bias: negative = bearish, positive = bullish.
+        flow = _pin_num(of.get("flow_bias_score", 0))
+        sell_components.append(max(0.0, min(100.0, 50.0 - flow)) * 0.25)
+        buy_components.append(max(0.0, min(100.0, 50.0 + flow)) * 0.25)
+
+        # Option-chain PIN scores.
+        pin = calculate_pin_signal(
+            df=df,
+            spot=_pin_num(state.get("spot")),
+            pcr=_pin_num(state.get("pcr")),
+            market_pressure=mp,
+            order_flow=of,
+        )
+        bear_pin = _pin_num(pin.get("bear_score", 0))
+        bull_pin = _pin_num(pin.get("bull_score", 0))
+        sell_components.append(min(max(bear_pin, 0.0), 100.0) * 0.30)
+        buy_components.append(min(max(bull_pin, 0.0), 100.0) * 0.30)
+
+        # Reversal engine adds only as confirmation.
+        rev_bear = 0.0
+        rev_bull = 0.0
+        if reversal:
+            rev_bear = _pin_num(reversal.get("bear_score", 0))
+            rev_bull = _pin_num(reversal.get("bull_score", 0))
+        sell_components.append(min(max(rev_bear, 0.0), 100.0) * 0.15)
+        buy_components.append(min(max(rev_bull, 0.0), 100.0) * 0.15)
+
+        sell_score = round(float(sum(sell_components)), 1)
+        buy_score = round(float(sum(buy_components)), 1)
+        edge = round(float(np.clip(sell_score - buy_score + 50.0, 0.0, 100.0)), 1)
+
+        reasons = []
+        if sell_p >= 60: reasons.append(f"Sell Pressure {sell_p:.0f}")
+        if flow <= -20: reasons.append(f"Bearish Order Flow {flow:+.0f}")
+        if bear_pin >= 60: reasons.append(f"PIN Bear Score {bear_pin:.0f}")
+        if rev_bear >= 50: reasons.append(f"Bearish Reversal {rev_bear:.0f}")
+
+        if edge >= 75 and sell_score > buy_score:
+            status = "🔴 STRONG SELL EDGE"
+            direction = "SELL"
+        elif edge >= 60 and sell_score > buy_score:
+            status = "🟠 SELL EDGE"
+            direction = "SELL"
+        elif edge <= 40 and buy_score > sell_score:
+            status = "🟢 BUY EDGE"
+            direction = "BUY"
+        else:
+            status = "⚪ NO CLEAR EDGE"
+            direction = "NONE"
+
+        return {
+            "score": edge,
+            "status": status,
+            "direction": direction,
+            "bear_score": sell_score,
+            "buy_score": buy_score,
+            "reason": " + ".join(reasons) if reasons else "Mixed / insufficient bearish evidence",
+        }
+    except Exception as exc:
+        logger.exception("SELL EDGE calculation failed: %s", exc)
+        return {"score": 0.0, "status": "EDGE ERROR", "direction": "NONE",
+                "bear_score": 0.0, "buy_score": 0.0, "reason": str(exc)}
+
+
+
+
+
+def calculate_sell_confirmation(df: pd.DataFrame, state: dict[str, Any],
+                                reversal: Optional[dict] = None,
+                                sell_edge: Optional[dict] = None) -> dict[str, Any]:
+    """Additive SELL CONFIRMATION layer for the option-chain dashboard.
+
+    Combines existing bearish evidence only; it does not alter the original
+    option-chain, PIN, reversal, pressure, or order-flow calculations.
+    """
+    try:
+        if df is None or df.empty:
+            return {"score": 0.0, "status": "WAIT CONFIRM", "confirmed": False,
+                    "reason": "No option-chain data", "bear_factors": 0}
+
+        if sell_edge is None:
+            sell_edge = calculate_sell_edge(df, state, reversal)
+
+        mp = state.get("market_pressure")
+        of = state.get("order_flow") or {}
+        pin = calculate_pin_signal(
+            df=df,
+            spot=_pin_num(state.get("spot")),
+            pcr=_pin_num(state.get("pcr")),
+            market_pressure=mp,
+            order_flow=of,
+        )
+
+        checks = []
+        reasons = []
+
+        # 1) Existing SELL EDGE
+        edge_score = _pin_num(sell_edge.get("score", 0))
+        edge_ok = sell_edge.get("direction") == "SELL" and edge_score >= 60
+        checks.append(edge_ok)
+        if edge_ok:
+            reasons.append(f"SELL EDGE {edge_score:.0f}")
+
+        # 2) PIN bearish confirmation
+        bear = _pin_num(pin.get("bear_score", 0))
+        bull = _pin_num(pin.get("bull_score", 0))
+        pin_ok = bear >= 60 and bear > bull + 8
+        checks.append(pin_ok)
+        if pin_ok:
+            reasons.append(f"PIN BEAR {bear:.0f}")
+
+        # 3) Order-flow confirmation
+        flow = _pin_num(of.get("flow_bias_score", 0))
+        flow_ok = flow <= -20
+        checks.append(flow_ok)
+        if flow_ok:
+            reasons.append(f"BEARISH FLOW {flow:+.0f}")
+
+        # 4) Option-chain pressure confirmation
+        sell_pressure = float(getattr(mp, "total_put_pressure", 0.0)) if mp else 0.0
+        buy_pressure = float(getattr(mp, "total_call_pressure", 0.0)) if mp else 0.0
+        pressure_ok = sell_pressure >= 55 and sell_pressure > buy_pressure + 5
+        checks.append(pressure_ok)
+        if pressure_ok:
+            reasons.append(f"PUT PRESSURE {sell_pressure:.0f}")
+
+        # 5) Reversal confirmation, when available
+        rev_bear = _pin_num((reversal or {}).get("bear_score", 0))
+        rev_dir = str((reversal or {}).get("direction", "NONE")).upper()
+        reversal_ok = rev_dir == "SELL" and rev_bear >= 50
+        checks.append(reversal_ok)
+        if reversal_ok:
+            reasons.append(f"SELL REVERSAL {rev_bear:.0f}")
+
+        passed = sum(bool(x) for x in checks)
+        score = round(float(np.clip(
+            edge_score * 0.30 + bear * 0.25 + max(0.0, min(100.0, 50.0 - flow)) * 0.15
+            + max(0.0, min(100.0, sell_pressure)) * 0.20
+            + rev_bear * 0.10,
+            0.0, 100.0
+        )), 1)
+
+        # Confirmation requires multiple independent bearish checks.
+        confirmed = passed >= 3 and score >= 65 and bear > bull
+        if confirmed:
+            status = "🔴 SELL CONFIRMED"
+        elif passed >= 2 and score >= 55:
+            status = "🟠 SELL EARLY CONFIRM"
+        else:
+            status = "⚪ WAIT SELL CONFIRM"
+
+        return {
+            "score": score,
+            "status": status,
+            "confirmed": confirmed,
+            "reason": " + ".join(reasons) if reasons else "Bearish confirmation is incomplete",
+            "bear_factors": passed,
+            "edge_score": edge_score,
+            "pin_bear": bear,
+            "pin_bull": bull,
+            "flow_score": flow,
+            "sell_pressure": sell_pressure,
+            "buy_pressure": buy_pressure,
+            "reversal_bear": rev_bear,
+        }
+    except Exception as exc:
+        logger.exception("SELL CONFIRMATION calculation failed: %s", exc)
+        return {"score": 0.0, "status": "CONFIRM ERROR", "confirmed": False,
+                "reason": str(exc), "bear_factors": 0}
+
 def build_pin_confluence(
     df: pd.DataFrame,
     state: dict[str, Any],
@@ -4207,6 +4395,22 @@ def render_pin_confluence(df: pd.DataFrame, state: dict[str, Any], symbol: str =
             " | Reason: " + str(reversal.get("reason", "—"))
         )
 
+        # ADDITIVE SELL EDGE — existing PIN / Reversal / Option Chain logic is preserved.
+        sell_edge = calculate_sell_edge(df, state, reversal)
+        st.markdown("### 🎯 SELL EDGE")
+        se1, se2, se3, se4 = st.columns(4)
+        se1.metric("SELL EDGE", f"{sell_edge['score']:.0f}/100")
+        se2.metric("EDGE STATUS", sell_edge["status"])
+        se3.metric("BEAR SCORE", f"{sell_edge['bear_score']:.0f}")
+        se4.metric("BUY SCORE", f"{sell_edge['buy_score']:.0f}")
+        if sell_edge["direction"] == "SELL":
+            st.warning("🔴 SELL EDGE detected — bearish evidence is stronger, but this is a confirmation layer, not a guaranteed outcome.")
+        elif sell_edge["direction"] == "BUY":
+            st.info("🟢 BUY EDGE detected — bearish evidence is not dominant.")
+        else:
+            st.info("⚪ NO CLEAR EDGE — buy/sell evidence is mixed.")
+        st.caption("SELL EDGE = pressure + order-flow + PIN + reversal confirmation. It does not replace the existing signal.")
+
         st.markdown("### 🔎 PIN Evidence")
         evidence = pd.DataFrame([
             {"Metric": "PIN Direction", "Value": pin["direction"]},
@@ -4224,6 +4428,9 @@ def render_pin_confluence(df: pd.DataFrame, state: dict[str, Any], symbol: str =
             {"Metric": "Reversal Direction", "Value": reversal.get("direction", "NONE")},
             {"Metric": "Reversal Score", "Value": f"{float(reversal.get('score', 0) or 0):.1f}/100"},
             {"Metric": "Reversal Type", "Value": reversal.get("type", "NONE")},
+            {"Metric": "SELL EDGE", "Value": f"{sell_edge['score']:.1f}/100"},
+            {"Metric": "SELL EDGE STATUS", "Value": sell_edge["status"]},
+            {"Metric": "SELL EDGE Reason", "Value": sell_edge["reason"]},
         ])
         st.dataframe(evidence, use_container_width=True, hide_index=True)
 
@@ -4356,12 +4563,12 @@ def run_dashboard(fyers: Any = None) -> None:
     st.divider()
 
     if state.get("price_action_data") and state["price_action_data"].get("df_dict"):
-        tab_chain, tab_charts, tab_pressure, tab_orderflow, tab_movement, tab_greeks, tab_ai, tab_gex, tab_po3, tab_price_action, tab_export = st.tabs([
-            "📋 Chain", "📈 OI", "💪 Pressure", "📊 Order Flow", "🎯 Strike Movement", "🧮 Greeks", "🤖 AI", "⚡ GEX", "🧠 PO3 Intelligence", "💹 Price Action", "📥 Export",
+        tab_chain, tab_charts, tab_pressure, tab_orderflow, tab_movement, tab_greeks, tab_ai, tab_gex, tab_po3, tab_price_action, tab_sell_confirm, tab_export = st.tabs([
+            "📋 Chain", "📈 OI", "💪 Pressure", "📊 Order Flow", "🎯 Strike Movement", "🧮 Greeks", "🤖 AI", "⚡ GEX", "🧠 PO3 Intelligence", "💹 Price Action", "🔴 SELL CONFIRM", "📥 Export",
         ])
     else:
-        tab_chain, tab_charts, tab_pressure, tab_orderflow, tab_movement, tab_greeks, tab_ai, tab_gex, tab_po3, tab_export = st.tabs([
-            "📋 Chain", "📈 OI", "💪 Pressure", "📊 Order Flow", "🎯 Strike Movement", "🧮 Greeks", "🤖 AI", "⚡ GEX", "🧠 PO3 Intelligence", "📥 Export",
+        tab_chain, tab_charts, tab_pressure, tab_orderflow, tab_movement, tab_greeks, tab_ai, tab_gex, tab_po3, tab_sell_confirm, tab_export = st.tabs([
+            "📋 Chain", "📈 OI", "💪 Pressure", "📊 Order Flow", "🎯 Strike Movement", "🧮 Greeks", "🤖 AI", "⚡ GEX", "🧠 PO3 Intelligence", "🔴 SELL CONFIRM", "📥 Export",
         ])
 
     with tab_chain:
@@ -4555,6 +4762,65 @@ def run_dashboard(fyers: Any = None) -> None:
                     with st.expander(f"📊 {tf_name}", expanded=(tf_name == "5M")):
                         st.plotly_chart(chart_price_action(df_tf, title=f"{tf_name}"),
                                        use_container_width=True, config={"displayModeBar": False})
+
+
+    with tab_sell_confirm:
+        st.markdown('<div class="block-title">🔴 SELL CONFIRMATION</div>', unsafe_allow_html=True)
+        st.caption("Additive bearish confirmation tab using the existing PIN, SELL EDGE, option-chain pressure, order flow and reversal data.")
+
+        reversal_for_confirm = calculate_option_chain_reversal(
+            df=df,
+            spot=_pin_num(state.get("spot")),
+            pcr=_pin_num(state.get("pcr")),
+            order_flow=state.get("order_flow", {}),
+        )
+        sell_edge_for_confirm = calculate_sell_edge(df, state, reversal_for_confirm)
+        sell_confirm = calculate_sell_confirmation(df, state, reversal_for_confirm, sell_edge_for_confirm)
+
+        sc1, sc2, sc3, sc4 = st.columns(4)
+        sc1.metric("SELL CONFIRM SCORE", f"{sell_confirm['score']:.0f}/100")
+        sc2.metric("STATUS", sell_confirm["status"])
+        sc3.metric("BEAR FACTORS", f"{sell_confirm['bear_factors']}/5")
+        sc4.metric("SELL EDGE", f"{sell_confirm['edge_score']:.0f}/100")
+
+        if sell_confirm["confirmed"]:
+            st.error("🔴 SELL CONFIRMED — multiple bearish confirmation factors are aligned. This is a confirmation/warning layer, not a guaranteed outcome.")
+        elif sell_confirm["status"] == "🟠 SELL EARLY CONFIRM":
+            st.warning("🟠 SELL EARLY CONFIRM — bearish evidence is developing; confirmation is not complete.")
+        else:
+            st.info("⚪ WAIT SELL CONFIRM — bearish factors are not sufficiently aligned yet.")
+
+        st.markdown("### 🔎 SELL Confirmation Factors")
+        factor_df = pd.DataFrame([
+            {"Factor": "SELL EDGE", "Value": f"{sell_confirm['edge_score']:.0f}/100", "Confirm": "YES" if sell_confirm['edge_score'] >= 60 else "NO"},
+            {"Factor": "PIN Bear Score", "Value": f"{sell_confirm['pin_bear']:.0f}", "Confirm": "YES" if sell_confirm['pin_bear'] >= 60 and sell_confirm['pin_bear'] > sell_confirm['pin_bull'] + 8 else "NO"},
+            {"Factor": "Order Flow", "Value": f"{sell_confirm['flow_score']:+.0f}", "Confirm": "YES" if sell_confirm['flow_score'] <= -20 else "NO"},
+            {"Factor": "Put/Sell Pressure", "Value": f"{sell_confirm['sell_pressure']:.0f} vs {sell_confirm['buy_pressure']:.0f}", "Confirm": "YES" if sell_confirm['sell_pressure'] >= 55 and sell_confirm['sell_pressure'] > sell_confirm['buy_pressure'] + 5 else "NO"},
+            {"Factor": "Reversal Bear Score", "Value": f"{sell_confirm['reversal_bear']:.0f}", "Confirm": "YES" if sell_confirm['reversal_bear'] >= 50 else "NO"},
+        ])
+        st.dataframe(factor_df, use_container_width=True, hide_index=True)
+        st.caption("Reason: " + sell_confirm["reason"])
+
+        # Bearish option-side ranking for observation; no automatic order is placed.
+        rank_cols = [c for c in [
+            "strike_price", "pe_ltp", "pe_oi", "pe_chng_oi", "pe_volume",
+            "pe_movement_score", "ce_ltp", "ce_oi", "ce_chng_oi", "ce_volume",
+            "movement_score", "movement_bias"
+        ] if c in df.columns]
+        if rank_cols:
+            rank = df[rank_cols].copy()
+            score_parts = []
+            for col, weight in [("pe_movement_score", 0.45), ("pe_volume", 0.20), ("pe_chng_oi", 0.15), ("sell_pressure", 0.20)]:
+                if col in rank.columns:
+                    x = pd.to_numeric(rank[col], errors="coerce").fillna(0.0)
+                    if col != "pe_movement_score":
+                        x = (x.rank(pct=True) * 100.0).fillna(0.0)
+                    score_parts.append(x * weight)
+            if score_parts:
+                rank["sell_watch_score"] = sum(score_parts).round(1)
+                rank = rank.sort_values("sell_watch_score", ascending=False).head(10)
+                st.markdown("### 📌 Top 10 Bearish Option-Chain Watch")
+                st.dataframe(rank, use_container_width=True, hide_index=True)
 
     with tab_export:
         st.markdown('<div class="block-title">📥 Export</div>', unsafe_allow_html=True)
