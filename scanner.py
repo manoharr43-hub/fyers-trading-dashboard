@@ -4106,7 +4106,12 @@ def _show_pin_rules_tab(fyers, all_symbols=None, fo_symbols=None) -> None:
 # REVERSAL REPORT ENGINE — uses stocks already scanned in NSE / F&O / MOMENTUM / SWING
 # and calculates a practical reversal watch-zone from the latest available scan values.
 def _add_reversal_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """Attach reversal watch signal/score/zone to an existing scan report."""
+    """Attach a conservative reversal watch signal/score/zone to an existing scan report.
+
+    A normal BUY/SELL momentum signal is not reversal evidence. Reversal needs
+    opposing context plus oversold/overbought, sweep/rejection, VWAP or volume
+    confirmation, so ordinary BUY/SELL rows do not get mislabeled as reversals.
+    """
     if not isinstance(df, pd.DataFrame) or df.empty:
         return df
     x = df.copy()
@@ -4121,18 +4126,26 @@ def _add_reversal_columns(df: pd.DataFrame) -> pd.DataFrame:
     conf = num(["AI CONFIDENCE %", "BEFORE MOVE SCORE", "SCORE", "score"], 0)
     atr = num(["ATR", "atr"], 0).where(lambda s: s > 0, ltp.abs() * 0.01)
     vwap = num(["VWAP", "vwap"], 0)
+    valid_vwap = (vwap > 0) & ltp.notna()
     text = pd.Series("", index=x.index, dtype=str)
-    for col in ["BEFORE MOVE DIRECTION", "DIRECTION", "MOVEMENT STATUS", "AI SIGNAL", "Signal", "trend", "REVERSAL", "SWEEP", "REASON", "reason"]:
+    for col in ["BEFORE MOVE DIRECTION", "PRE-MOVE", "DIRECTION", "MOVEMENT STATUS", "AI SIGNAL", "Signal", "trend", "REVERSAL", "SWEEP", "REASON", "reason"]:
         if col in x.columns:
             text = text + " " + x[col].astype(str).str.upper()
-    buy = ((rsi <= 35).astype(int) + text.str.contains("SELL|DOWN|BEAR|LOW SWEPT|BULL REVERSAL|BULLISH SWEEP", regex=True, na=False).astype(int) + ((vwap > 0) & (ltp > vwap * 1.01)).astype(int))
-    sell = ((rsi >= 65).astype(int) + text.str.contains("BUY|UP|BULL|HIGH SWEPT|BEAR REVERSAL|BEARISH SWEEP", regex=True, na=False).astype(int) + ((vwap > 0) & (ltp < vwap * 0.99)).astype(int))
-    direction = np.where(buy > sell, "BUY REVERSAL", np.where(sell > buy, "SELL REVERSAL", "WAIT"))
+    down_context = text.str.contains("DOWN|BEAR|SELL BEFORE MOVE|PRE-MOVE SELL|LOW SWEPT|BULL REVERSAL|BULLISH SWEEP|SELL REVERSAL", regex=True, na=False)
+    up_context = text.str.contains("UP|BULL|BUY BEFORE MOVE|PRE-MOVE BUY|HIGH SWEPT|BEAR REVERSAL|BEARISH SWEEP|BUY REVERSAL", regex=True, na=False)
+    bull_rejection = text.str.contains("LOW SWEPT|BULL REVERSAL|BULLISH SWEEP|BULLISH REJECTION|HAMMER", regex=True, na=False)
+    bear_rejection = text.str.contains("HIGH SWEPT|BEAR REVERSAL|BEARISH SWEEP|BEARISH REJECTION|SHOOTING STAR", regex=True, na=False)
+    buy = ((rsi <= 35).astype(int) + down_context.astype(int) + bull_rejection.astype(int) + ((valid_vwap) & (ltp >= vwap)).astype(int) + ((rvol >= 1.30) & down_context).astype(int))
+    sell = ((rsi >= 65).astype(int) + up_context.astype(int) + bear_rejection.astype(int) + ((valid_vwap) & (ltp <= vwap)).astype(int) + ((rvol >= 1.30) & up_context).astype(int))
+    buy_ready = (buy >= 3) & (buy > sell) & down_context
+    sell_ready = (sell >= 3) & (sell > buy) & up_context
+    direction = np.where(buy_ready, "BUY REVERSAL", np.where(sell_ready, "SELL REVERSAL", "WAIT"))
     x["REVERSAL SIGNAL"] = direction
-    x["REVERSAL SCORE"] = (45 + np.maximum(buy, sell) * 12 + (rvol >= 1.30).astype(int) * 8 + (conf >= 70).astype(int) * 8).clip(0, 100).round(1)
+    raw_rev_score = np.maximum(buy, sell) * 18 + (rvol >= 1.30).astype(int) * 8 + (conf >= 70).astype(int) * 5
+    x["REVERSAL SCORE"] = np.where(np.array(direction) == "WAIT", np.minimum(raw_rev_score, 59), np.minimum(raw_rev_score, 100)).round(1)
     x["REVERSAL LEVEL"] = np.where(np.array(direction) == "BUY REVERSAL", ltp - atr * 0.50, np.where(np.array(direction) == "SELL REVERSAL", ltp + atr * 0.50, ltp)).round(2)
     x["REVERSAL ZONE"] = np.where(np.array(direction) == "BUY REVERSAL", (ltp - atr).round(2).astype(str) + " - " + ltp.round(2).astype(str), np.where(np.array(direction) == "SELL REVERSAL", ltp.round(2).astype(str) + " - " + (ltp + atr).round(2).astype(str), ltp.round(2).astype(str)))
-    x["REVERSAL REASON"] = np.where(np.array(direction) == "BUY REVERSAL", "Down move/oversold + liquidity/VWAP watch", np.where(np.array(direction) == "SELL REVERSAL", "Up move/overbought + liquidity/VWAP watch", "No clear reversal confluence"))
+    x["REVERSAL REASON"] = np.where(np.array(direction) == "BUY REVERSAL", "Down context + oversold/rejection + VWAP/volume confirmation", np.where(np.array(direction) == "SELL REVERSAL", "Up context + overbought/rejection + VWAP/volume confirmation", "No 3-factor reversal confluence"))
     return x
 
 
@@ -4693,7 +4706,9 @@ def show_scanner(fyers) -> None:
         swing_df = st.session_state.get("swing_df")
         if swing_df is not None and not swing_df.empty:
             st.markdown("#### Golden / Death Cross results")
-            st.dataframe(swing_df, use_container_width=True, hide_index=True)
+            swing_report = _add_reversal_columns(swing_df.copy())
+            st.dataframe(swing_report, use_container_width=True, hide_index=True)
+            _excel_download_button(swing_report, "SWING_CROSS_REVERSAL", "download_swing_cross_reversal_excel")
 
     # ════════════════════════════════════════════════════════════════════════════════
     # TAB 7: ADDITIONAL ANALYSIS
