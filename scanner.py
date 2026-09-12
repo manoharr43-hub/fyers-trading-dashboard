@@ -4201,21 +4201,51 @@ def _add_reversal_columns(df: pd.DataFrame) -> pd.DataFrame:
         ltp + (atr * 0.50)
     )
 
-    x["REVERSAL LEVEL"] = np.where(
-        np.array(direction) == "BUY REVERSAL", buy_reversal_price,
-        np.where(np.array(direction) == "SELL REVERSAL", sell_reversal_price, np.nan)
-    )
-    x["REVERSAL LEVEL"] = pd.to_numeric(x["REVERSAL LEVEL"], errors="coerce").round(2)
-    x["REVERSAL ZONE"] = np.where(
+    # REVERSAL LEVEL should always be a usable reference price.
+    # Even when REVERSAL SIGNAL = WAIT, do not show N/A.
+    # Use the prevailing direction/context to choose the correct side.
+    dir_text = x["DIRECTION"].astype(str).str.upper() if "DIRECTION" in x.columns else pd.Series("", index=x.index)
+
+    reversal_level = np.where(
         np.array(direction) == "BUY REVERSAL",
-        (x["REVERSAL LEVEL"] - atr * 0.50).round(2).astype(str) + " - " +
-        (x["REVERSAL LEVEL"] + atr * 0.25).round(2).astype(str),
+        buy_reversal_price,
         np.where(
             np.array(direction) == "SELL REVERSAL",
-            (x["REVERSAL LEVEL"] - atr * 0.25).round(2).astype(str) + " - " +
-            (x["REVERSAL LEVEL"] + atr * 0.50).round(2).astype(str),
-            "N/A"
+            sell_reversal_price,
+            np.where(
+                dir_text.str.contains("SELL", na=False),
+                np.where(
+                    breakdown_level.notna() & (breakdown_level > 0),
+                    breakdown_level + (atr * 0.20),
+                    ltp + (atr * 0.50)
+                ),
+                np.where(
+                    breakout_level.notna() & (breakout_level > 0),
+                    breakout_level - (atr * 0.20),
+                    ltp - (atr * 0.50)
+                )
+            )
         )
+    )
+
+    # Final fallback: if any price is still invalid, use ATR-based reference,
+    # never LTP itself and never N/A.
+    reversal_level = pd.to_numeric(reversal_level, errors="coerce")
+    reversal_level = reversal_level.fillna(
+        np.where(
+            dir_text.str.contains("SELL", na=False),
+            ltp + (atr * 0.50),
+            ltp - (atr * 0.50)
+        )
+    )
+    x["REVERSAL LEVEL"] = reversal_level.round(2)
+
+    x["REVERSAL ZONE"] = np.where(
+        dir_text.str.contains("SELL", na=False),
+        (x["REVERSAL LEVEL"] - atr * 0.25).round(2).astype(str) + " - " +
+        (x["REVERSAL LEVEL"] + atr * 0.50).round(2).astype(str),
+        (x["REVERSAL LEVEL"] - atr * 0.50).round(2).astype(str) + " - " +
+        (x["REVERSAL LEVEL"] + atr * 0.25).round(2).astype(str)
     )
     x["REVERSAL REASON"] = np.where(np.array(direction) == "BUY REVERSAL", "Down context + oversold/rejection + VWAP/volume confirmation", np.where(np.array(direction) == "SELL REVERSAL", "Up context + overbought/rejection + VWAP/volume confirmation", "No 3-factor reversal confluence"))
     return x
