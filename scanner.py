@@ -4308,190 +4308,6 @@ def show_scanner(fyers) -> None:
     ])
     
     # ════════════════════════════════════════════════════════════════════════════════
-    # TAB 13: REVERSAL
-    # Separate reversal view. Uses the already scanned NSE/F&O data so it does not
-    # trigger another API scan and does not disturb the existing scanner tabs.
-    # ════════════════════════════════════════════════════════════════════════════════
-    with tabs[13]:
-        st.markdown("### 🔄 REVERSAL SCANNER")
-        st.caption("🎯 Separate reversal view for scalping — based on the latest NSE/F&O scan results.")
-
-        reversal_source = st.radio(
-            "Source",
-            ["NSE STOCKS", "F&O STOCKS", "BOTH"],
-            horizontal=True,
-            key="reversal_source"
-        )
-
-        source_frames = []
-        if reversal_source in ("NSE STOCKS", "BOTH"):
-            nse_reversal_df = st.session_state.get("nse_df")
-            if isinstance(nse_reversal_df, pd.DataFrame) and not nse_reversal_df.empty:
-                tmp = nse_reversal_df.copy()
-                tmp["MARKET"] = "NSE"
-                source_frames.append(tmp)
-
-        if reversal_source in ("F&O STOCKS", "BOTH"):
-            fo_reversal_df = st.session_state.get("fo_df")
-            if isinstance(fo_reversal_df, pd.DataFrame) and not fo_reversal_df.empty:
-                tmp = fo_reversal_df.copy()
-                tmp["MARKET"] = "F&O"
-                source_frames.append(tmp)
-
-        if not source_frames:
-            st.info("👈 First run the NSE or F&O scanner, then open this REVERSAL tab.")
-        else:
-            try:
-                reversal_df = pd.concat(source_frames, ignore_index=True, sort=False)
-                reversal_df = _add_reversal_columns(reversal_df)
-
-                # Normalize reversal fields safely.
-                rev_signal = reversal_df.get(
-                    "REVERSAL SIGNAL",
-                    pd.Series("WAIT", index=reversal_df.index, dtype="object")
-                ).astype(str).str.upper()
-
-                direction_text = reversal_df.get(
-                    "DIRECTION",
-                    pd.Series("", index=reversal_df.index, dtype="object")
-                ).astype(str).str.upper()
-
-                # Prefer explicit reversal signal. If a row has a BUY/SELL direction
-                # but the reversal engine says WAIT, keep it in WAIT instead of
-                # falsely promoting it to a reversal.
-                reversal_df["_REV_STATUS"] = np.where(
-                    rev_signal.str.contains("BUY REVERSAL", na=False),
-                    "BUY REVERSAL",
-                    np.where(
-                        rev_signal.str.contains("SELL REVERSAL", na=False),
-                        "SELL REVERSAL",
-                        "WAIT"
-                    )
-                )
-
-                # Filters
-                c1, c2, c3, c4 = st.columns(4)
-                with c1:
-                    rev_filter = st.selectbox(
-                        "Reversal Signal",
-                        ["ALL", "BUY REVERSAL", "SELL REVERSAL", "WAIT"],
-                        key="reversal_signal_filter"
-                    )
-                with c2:
-                    min_rev_score = st.slider(
-                        "Min Reversal Score",
-                        0, 100, 0, 5,
-                        key="reversal_score_filter"
-                    )
-                with c3:
-                    market_filter = st.selectbox(
-                        "Market",
-                        ["ALL", "NSE", "F&O"],
-                        key="reversal_market_filter"
-                    )
-                with c4:
-                    rev_sort = st.selectbox(
-                        "Sort By",
-                        ["REVERSAL SCORE", "LTP", "AI CONFIDENCE %"],
-                        key="reversal_sort_filter"
-                    )
-
-                view = reversal_df.copy()
-
-                if rev_filter != "ALL":
-                    view = view[view["_REV_STATUS"] == rev_filter]
-
-                try:
-                    score_num = pd.to_numeric(view["REVERSAL SCORE"], errors="coerce").fillna(0)
-                    view = view[score_num >= min_rev_score]
-                except Exception:
-                    pass
-
-                if market_filter != "ALL":
-                    view = view[view["MARKET"].astype(str).str.upper() == market_filter]
-
-                try:
-                    if rev_sort == "LTP":
-                        view = view.sort_values("LTP", ascending=False, na_position="last")
-                    elif rev_sort == "AI CONFIDENCE %":
-                        view = view.sort_values("AI CONFIDENCE %", ascending=False, na_position="last")
-                    else:
-                        view = view.sort_values("REVERSAL SCORE", ascending=False, na_position="last")
-                except Exception:
-                    pass
-
-                # Summary cards
-                buy_count = int((view["_REV_STATUS"] == "BUY REVERSAL").sum())
-                sell_count = int((view["_REV_STATUS"] == "SELL REVERSAL").sum())
-                wait_count = int((view["_REV_STATUS"] == "WAIT").sum())
-
-                m1, m2, m3, m4 = st.columns(4)
-                m1.metric("🟢 BUY REVERSAL", buy_count)
-                m2.metric("🔴 SELL REVERSAL", sell_count)
-                m3.metric("⚪ WAIT", wait_count)
-                m4.metric("📊 TOTAL", len(view))
-
-                # Keep the important scalping columns first when available.
-                preferred = [
-                    "MARKET", "SYMBOL", "LTP", "DIRECTION",
-                    "REVERSAL SIGNAL", "REVERSAL SCORE",
-                    "REVERSAL LEVEL", "REVERSAL ZONE",
-                    "REVERSAL REASON", "SIGNAL TYPE",
-                    "COMBINED BIAS", "AI CONFIDENCE %",
-                    "RSI", "VWAP", "STRUCTURE"
-                ]
-                display_cols = [c for c in preferred if c in view.columns]
-                remaining = [c for c in view.columns if c not in display_cols and c != "_REV_STATUS"]
-                display_df = view[display_cols + remaining].copy()
-
-                st.dataframe(
-                    display_df,
-                    use_container_width=True,
-                    height=520,
-                    hide_index=True
-                )
-
-                # Clear trade interpretation
-                st.markdown("### 🧭 REVERSAL READ")
-                if buy_count:
-                    st.success("🟢 BUY REVERSAL = LONG-side reversal setup. Check REVERSAL LEVEL / ZONE before entry.")
-                if sell_count:
-                    st.error("🔴 SELL REVERSAL = SHORT-side reversal setup. Check REVERSAL LEVEL / ZONE before entry.")
-                if buy_count == 0 and sell_count == 0:
-                    st.info("⚪ No confirmed reversal confluence in the current filtered results. WAIT is intentional.")
-
-                # Downloads
-                st.markdown("### 📥 Download REVERSAL")
-                d1, d2 = st.columns(2)
-                with d1:
-                    try:
-                        excel_data = _format_excel_output(display_df, "REVERSAL")
-                        st.download_button(
-                            "📊 Excel",
-                            excel_data,
-                            f"REVERSAL_{_now_ist().strftime('%Y%m%d_%H%M')}.xlsx",
-                            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                            key="reversal_xls"
-                        )
-                    except Exception as e:
-                        st.error(f"❌ Excel: {str(e)[:100]}")
-                with d2:
-                    try:
-                        st.download_button(
-                            "📄 CSV",
-                            to_csv_bytes(display_df),
-                            f"REVERSAL_{_now_ist().strftime('%Y%m%d_%H%M')}.csv",
-                            "text/csv",
-                            key="reversal_csv"
-                        )
-                    except Exception as e:
-                        st.error(f"❌ CSV: {str(e)[:100]}")
-
-            except Exception as e:
-                st.error(f"❌ Reversal tab error: {type(e).__name__}: {str(e)[:180]}")
-                logger.error(f"Reversal tab error: {e}", exc_info=True)
-
-    # ════════════════════════════════════════════════════════════════════════════════
     # TAB 0: NSE STOCKS
     # ════════════════════════════════════════════════════════════════════════════════
     with tabs[0]:
@@ -5348,6 +5164,249 @@ def show_scanner(fyers) -> None:
                 st.error(f"Option-chain data unavailable: {live_opt.get('message','Unknown error')}")
         else:
             st.info("👆 Select an F&O stock and click RUN LIVE OPTION CHECK to refresh the current spot and option-chain data.")
+
+    # ════════════════════════════════════════════════════════════════════════════════
+    # TAB 13: DIRECT REVERSAL SCANNER — RUN WITHOUT PRE-SCANNING NSE/F&O
+    # ════════════════════════════════════════════════════════════════════════════════
+    with tabs[13]:
+        st.markdown("### 🔄 REVERSAL SCANNER")
+        st.caption(
+            "Direct reversal scan for NSE / F&O / BOTH. "
+            "This tab runs the required scan itself — no need to run NSE/F&O first."
+        )
+
+        rev_source = st.radio(
+            "Source",
+            ["NSE STOCKS", "F&O STOCKS", "BOTH"],
+            horizontal=True,
+            key="direct_reversal_source",
+        )
+
+        rev_c1, rev_c2 = st.columns(2)
+        with rev_c1:
+            rev_nse_limit = st.number_input(
+                "NSE Scan Limit (0 = ALL)",
+                min_value=0,
+                max_value=len(all_symbols),
+                value=min(500, len(all_symbols)),
+                step=50,
+                key="direct_reversal_nse_limit",
+            )
+        with rev_c2:
+            rev_fo_limit = st.number_input(
+                "F&O Scan Limit (0 = ALL)",
+                min_value=0,
+                max_value=len(fo_symbols),
+                value=min(200, len(fo_symbols)),
+                step=25,
+                key="direct_reversal_fo_limit",
+            )
+
+        rev_nse_symbols = all_symbols if rev_nse_limit == 0 else all_symbols[:rev_nse_limit]
+        rev_fo_symbols = fo_symbols if rev_fo_limit == 0 else fo_symbols[:rev_fo_limit]
+
+        if st.button(
+            "🔄 RUN REVERSAL SCAN",
+            key="direct_reversal_run",
+            type="primary",
+            use_container_width=True,
+        ):
+            reversal_frames = []
+            reversal_errors = []
+            reversal_stats = []
+
+            with st.spinner("🔄 Running direct reversal scan…"):
+                # NSE scan
+                if rev_source in ["NSE STOCKS", "BOTH"]:
+                    try:
+                        nse_results, nse_errors, nse_stats = run_nse_scan(
+                            fyers, rev_nse_symbols
+                        )
+                        reversal_errors.extend(nse_errors or [])
+                        if nse_stats:
+                            reversal_stats.append(("NSE", nse_stats))
+                        if nse_results:
+                            nse_rev = pd.DataFrame(nse_results)
+                            if not nse_rev.empty:
+                                nse_rev = _add_reversal_columns(nse_rev)
+                                nse_rev["SOURCE"] = "NSE"
+                                reversal_frames.append(nse_rev)
+                    except Exception as e:
+                        reversal_errors.append(
+                            f"NSE direct reversal scan error: {type(e).__name__}: {str(e)[:180]}"
+                        )
+
+                # F&O scan
+                if rev_source in ["F&O STOCKS", "BOTH"]:
+                    try:
+                        fo_results, fo_errors, fo_stats = run_fo_scan(
+                            fyers, rev_fo_symbols
+                        )
+                        reversal_errors.extend(fo_errors or [])
+                        if fo_stats:
+                            reversal_stats.append(("F&O", fo_stats))
+                        if fo_results:
+                            fo_rev = pd.DataFrame(fo_results)
+                            if not fo_rev.empty:
+                                fo_rev = _add_reversal_columns(fo_rev)
+                                fo_rev["SOURCE"] = "F&O"
+                                reversal_frames.append(fo_rev)
+                    except Exception as e:
+                        reversal_errors.append(
+                            f"F&O direct reversal scan error: {type(e).__name__}: {str(e)[:180]}"
+                        )
+
+            if reversal_frames:
+                reversal_df = pd.concat(reversal_frames, ignore_index=True)
+
+                if "REVERSAL SCORE" in reversal_df.columns:
+                    reversal_df["REVERSAL SCORE"] = pd.to_numeric(
+                        reversal_df["REVERSAL SCORE"], errors="coerce"
+                    ).fillna(0)
+
+                # Strongest reversal setups first.
+                sort_cols = [c for c in ["REVERSAL SCORE", "AI CONFIDENCE %"] if c in reversal_df.columns]
+                if sort_cols:
+                    reversal_df = reversal_df.sort_values(
+                        sort_cols,
+                        ascending=[False] * len(sort_cols),
+                        na_position="last",
+                    )
+            else:
+                reversal_df = pd.DataFrame()
+
+            st.session_state["direct_reversal_df"] = reversal_df
+            st.session_state["direct_reversal_errors"] = reversal_errors
+            st.session_state["direct_reversal_source"] = rev_source
+            st.session_state["direct_reversal_scanned_at"] = _generated_timestamp()
+            st.session_state["direct_reversal_stats"] = reversal_stats
+
+            if reversal_df.empty:
+                st.warning("⚠️ No reversal data returned. Check the FYERS API/data availability.")
+            else:
+                st.success(
+                    f"✅ Direct reversal scan complete — {len(reversal_df)} stocks analyzed."
+                )
+
+        reversal_df = st.session_state.get("direct_reversal_df")
+
+        if isinstance(reversal_df, pd.DataFrame) and not reversal_df.empty:
+            # Normalize symbol/name for display.
+            display_df = reversal_df.copy()
+            symbol_col = next(
+                (c for c in ["STOCK NAME", "SYMBOL", "Symbol", "symbol"] if c in display_df.columns),
+                None,
+            )
+            if symbol_col and symbol_col != "STOCK NAME":
+                display_df = display_df.rename(columns={symbol_col: "STOCK NAME"})
+            if "STOCK NAME" not in display_df.columns:
+                display_df.insert(0, "STOCK NAME", "N/A")
+
+            # Summary counts.
+            signal_text = (
+                display_df["REVERSAL SIGNAL"].astype(str).str.upper()
+                if "REVERSAL SIGNAL" in display_df.columns
+                else pd.Series("WAIT", index=display_df.index)
+            )
+            buy_count = int(signal_text.eq("BUY REVERSAL").sum())
+            sell_count = int(signal_text.eq("SELL REVERSAL").sum())
+            wait_count = int(signal_text.eq("WAIT").sum())
+
+            st.markdown("### 🎯 REVERSAL RESULTS")
+            s1, s2, s3, s4 = st.columns(4)
+            s1.metric("📊 TOTAL", len(display_df))
+            s2.metric("🟢 BUY REVERSAL", buy_count)
+            s3.metric("🔴 SELL REVERSAL", sell_count)
+            s4.metric("⏳ WAIT", wait_count)
+
+            # User-selectable minimum reversal score.
+            min_rev_score = st.slider(
+                "Minimum Reversal Score",
+                min_value=0,
+                max_value=100,
+                value=50,
+                step=5,
+                key="direct_reversal_min_score",
+            )
+
+            view = display_df.copy()
+            if "REVERSAL SCORE" in view.columns:
+                score = pd.to_numeric(view["REVERSAL SCORE"], errors="coerce").fillna(0)
+                view = view[score >= min_rev_score].copy()
+
+            # Put actionable reversal columns first, while retaining all data.
+            preferred = [
+                "STOCK NAME", "SOURCE", "LTP", "DIRECTION",
+                "REVERSAL SIGNAL", "REVERSAL SCORE", "REVERSAL LEVEL",
+                "REVERSAL ZONE", "REVERSAL REASON", "RSI", "RVOL", "VWAP",
+                "AI SIGNAL", "AI CONFIDENCE %", "REASON",
+            ]
+            preferred_existing = [c for c in preferred if c in view.columns]
+            remaining = [c for c in view.columns if c not in preferred_existing]
+            view = view[preferred_existing + remaining]
+
+            st.markdown(f"### 🔥 REVERSAL WATCH LIST ({len(view)})")
+            if view.empty:
+                st.info("No rows meet the selected minimum reversal score.")
+            else:
+                st.dataframe(
+                    view,
+                    use_container_width=True,
+                    height=560,
+                    hide_index=True,
+                )
+
+                d1, d2, d3 = st.columns(3)
+                with d1:
+                    _excel_download_button(
+                        view,
+                        "DIRECT_REVERSAL",
+                        "direct_reversal_excel",
+                        label="📊 Excel",
+                    )
+                with d2:
+                    try:
+                        st.download_button(
+                            "📄 CSV",
+                            to_csv_bytes(view),
+                            f"DIRECT_REVERSAL_{_now_ist().strftime('%Y%m%d_%H%M')}.csv",
+                            "text/csv",
+                            key="direct_reversal_csv",
+                            use_container_width=True,
+                        )
+                    except Exception as e:
+                        st.error(f"❌ CSV export failed: {str(e)[:100]}")
+                with d3:
+                    try:
+                        st.download_button(
+                            "📋 JSON",
+                            to_json_bytes(view),
+                            f"DIRECT_REVERSAL_{_now_ist().strftime('%Y%m%d_%H%M')}.json",
+                            "application/json",
+                            key="direct_reversal_json",
+                            use_container_width=True,
+                        )
+                    except Exception as e:
+                        st.error(f"❌ JSON export failed: {str(e)[:100]}")
+
+            st.caption(
+                f"Last direct reversal scan: "
+                f"{st.session_state.get('direct_reversal_scanned_at', 'N/A')}"
+            )
+
+        else:
+            st.info("👆 Select NSE/F&O/BOTH and click **RUN REVERSAL SCAN**.")
+
+        direct_reversal_errors = st.session_state.get("direct_reversal_errors", [])
+        if direct_reversal_errors:
+            with st.expander(
+                f"⚠️ {len(direct_reversal_errors)} scan errors",
+                expanded=False,
+            ):
+                for err in direct_reversal_errors[:100]:
+                    st.write(f"• {err}")
+                if len(direct_reversal_errors) > 100:
+                    st.caption("Showing first 100 errors.")
 
     gc.collect()
 
