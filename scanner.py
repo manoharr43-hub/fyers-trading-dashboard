@@ -5344,9 +5344,56 @@ def show_scanner(fyers) -> None:
             remaining = [c for c in view.columns if c not in preferred_existing]
             view = view[preferred_existing + remaining]
 
+            # FULL REPORT — ALWAYS SHOW ALL SCANNED ROWS.
+            # The score slider controls only the Watch List below.
+            st.markdown(f"### 📋 FULL REVERSAL REPORT ({len(display_df)})")
+            st.dataframe(
+                display_df,
+                use_container_width=True,
+                height=560,
+                hide_index=True,
+            )
+
+            r1, r2, r3 = st.columns(3)
+            with r1:
+                _excel_download_button(
+                    display_df,
+                    "DIRECT_REVERSAL_FULL_REPORT",
+                    "direct_reversal_full_excel",
+                    label="📊 Download Full Excel",
+                )
+            with r2:
+                try:
+                    st.download_button(
+                        "📄 Full CSV",
+                        to_csv_bytes(display_df),
+                        f"DIRECT_REVERSAL_FULL_{_now_ist().strftime('%Y%m%d_%H%M')}.csv",
+                        "text/csv",
+                        key="direct_reversal_full_csv",
+                        use_container_width=True,
+                    )
+                except Exception as e:
+                    st.error(f"❌ Full CSV export failed: {str(e)[:100]}")
+            with r3:
+                try:
+                    st.download_button(
+                        "📋 Full JSON",
+                        to_json_bytes(display_df),
+                        f"DIRECT_REVERSAL_FULL_{_now_ist().strftime('%Y%m%d_%H%M')}.json",
+                        "application/json",
+                        key="direct_reversal_full_json",
+                        use_container_width=True,
+                    )
+                except Exception as e:
+                    st.error(f"❌ Full JSON export failed: {str(e)[:100]}")
+
+            # FILTERED WATCH LIST — SCORE FILTER ONLY.
             st.markdown(f"### 🔥 REVERSAL WATCH LIST ({len(view)})")
             if view.empty:
-                st.info("No rows meet the selected minimum reversal score.")
+                st.info(
+                    f"No rows meet the selected minimum reversal score ({min_rev_score}). "
+                    "The FULL REVERSAL REPORT above still contains every scanned stock."
+                )
             else:
                 st.dataframe(
                     view,
