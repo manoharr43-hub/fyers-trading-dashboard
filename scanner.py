@@ -4402,8 +4402,16 @@ def show_scanner(fyers) -> None:
             status_order={"🔥 BIG BUY":0,"🔥 BIG SELL":0,"🟢 BUY BEFORE MOVE":1,"🔴 SELL BEFORE MOVE":1,"🟢 BIG BUY WATCH":2,"🔴 BIG SELL WATCH":2,"🟡 PRE-BIG BUY":3,"🟡 PRE-BIG SELL":3,"🟢 BUY":4,"🔴 SELL":4,"⚪ WAIT":9}
             mdf["_order"]=mdf["MOVEMENT STATUS"].map(status_order).fillna(8)
             mdf=mdf.sort_values(["_order","SCORE","PRE-MOVE SCORE","RVOL"],ascending=[True,False,False,False]).drop(columns=["_order"])
+            # Keep stock name as the first visible column in the movement table.
+            _momentum_symbol_col = next((c for c in ["SYMBOL", "Symbol", "symbol"] if c in mdf.columns), None)
+            if _momentum_symbol_col is not None and _momentum_symbol_col != "STOCK NAME":
+                mdf=mdf.rename(columns={_momentum_symbol_col:"STOCK NAME"})
+            if "STOCK NAME" not in mdf.columns:
+                mdf.insert(0,"STOCK NAME","N/A")
+            _momentum_cols=["STOCK NAME"]+[c for c in mdf.columns if c!="STOCK NAME"]
+            mdf=mdf[_momentum_cols]
             st.markdown("### 🚦 MOVEMENT STATUS")
-            st.dataframe(mdf,use_container_width=True,height=560)
+            st.dataframe(mdf,use_container_width=True,height=560,hide_index=True)
             st.download_button("📊 Excel",_format_excel_output(mdf,"INTRADAY_MOVEMENT"),f"INTRADAY_MOVEMENT_{_now_ist().strftime('%Y%m%d_%H%M')}.xlsx","application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",key="momentum_xls")
         else: st.info("Click SCAN INTRADAY MOVEMENT to start.")
 
@@ -4415,14 +4423,23 @@ def show_scanner(fyers) -> None:
         st.caption("Separate early-warning tab. Old Momentum / NSE / F&O signals remain unchanged.")
         bdf = st.session_state.get("momentum_df")
         if bdf is not None and not bdf.empty:
-            cols = [c for c in ["SYMBOL", "LTP", "BEFORE MOVE SIGNAL", "BEFORE MOVE SCORE", "PRE-MOVE SCORE", "PRE-MOVE STATUS", "PRE BUY/SELL SCORE", "PRE SCORE GAP", "BREAKOUT LEVEL", "BREAKDOWN LEVEL", "PRE-MOVE RVOL", "PRE-MOVE REASON"] if c in bdf.columns]
-            view = bdf[cols].copy() if cols else bdf.copy()
+            view = bdf.copy()
+            # Always expose the stock name first; FYERS/session data may use
+            # SYMBOL, Symbol or symbol depending on the scan path.
+            _symbol_col = next((c for c in ["SYMBOL", "Symbol", "symbol"] if c in view.columns), None)
+            if _symbol_col is not None:
+                view = view.rename(columns={_symbol_col: "STOCK NAME"})
+            elif "STOCK NAME" not in view.columns:
+                view.insert(0, "STOCK NAME", "N/A")
+            _before_cols = ["STOCK NAME", "LTP", "BEFORE MOVE SIGNAL", "BEFORE MOVE SCORE", "PRE-MOVE SCORE", "PRE-MOVE STATUS", "PRE BUY/SELL SCORE", "PRE SCORE GAP", "BREAKOUT LEVEL", "BREAKDOWN LEVEL", "PRE-MOVE RVOL", "PRE-MOVE REASON"]
+            cols = [c for c in _before_cols if c in view.columns]
+            view = view[cols].copy() if cols else view.copy()
             if "BEFORE MOVE SIGNAL" in view.columns:
                 order = {"🟢 BUY BEFORE MOVE": 0, "🔴 SELL BEFORE MOVE": 1, "🟡 WAIT": 2}
                 view["_sort"] = view["BEFORE MOVE SIGNAL"].map(order).fillna(9)
                 score_col = "BEFORE MOVE SCORE" if "BEFORE MOVE SCORE" in view.columns else "PRE-MOVE SCORE"
                 view = view.sort_values(["_sort", score_col], ascending=[True, False]).drop(columns=["_sort"])
-            st.dataframe(view, use_container_width=True, height=560)
+            st.dataframe(view, use_container_width=True, height=560, hide_index=True)
             st.download_button("📊 Download BEFORE MOVE", _format_excel_output(view, "BEFORE_MOVE"), f"BEFORE_MOVE_{_now_ist().strftime('%Y%m%d_%H%M')}.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="before_move_xls")
         else:
             st.info("Run SCAN INTRADAY MOVEMENT first. The separate BEFORE MOVE tab will then show the early-warning signals.")
