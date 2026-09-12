@@ -4303,9 +4303,194 @@ def show_scanner(fyers) -> None:
         "📊 MARKET DASHBOARD",
         "⚙️ SETTINGS",
         "📌 PIN RULES",
-        "🎯 F&O OPTION CHECK"
+        "🎯 F&O OPTION CHECK",
+        "🔄 REVERSAL"
     ])
     
+    # ════════════════════════════════════════════════════════════════════════════════
+    # TAB 13: REVERSAL
+    # Separate reversal view. Uses the already scanned NSE/F&O data so it does not
+    # trigger another API scan and does not disturb the existing scanner tabs.
+    # ════════════════════════════════════════════════════════════════════════════════
+    with tabs[13]:
+        st.markdown("### 🔄 REVERSAL SCANNER")
+        st.caption("🎯 Separate reversal view for scalping — based on the latest NSE/F&O scan results.")
+
+        reversal_source = st.radio(
+            "Source",
+            ["NSE STOCKS", "F&O STOCKS", "BOTH"],
+            horizontal=True,
+            key="reversal_source"
+        )
+
+        source_frames = []
+        if reversal_source in ("NSE STOCKS", "BOTH"):
+            nse_reversal_df = st.session_state.get("nse_df")
+            if isinstance(nse_reversal_df, pd.DataFrame) and not nse_reversal_df.empty:
+                tmp = nse_reversal_df.copy()
+                tmp["MARKET"] = "NSE"
+                source_frames.append(tmp)
+
+        if reversal_source in ("F&O STOCKS", "BOTH"):
+            fo_reversal_df = st.session_state.get("fo_df")
+            if isinstance(fo_reversal_df, pd.DataFrame) and not fo_reversal_df.empty:
+                tmp = fo_reversal_df.copy()
+                tmp["MARKET"] = "F&O"
+                source_frames.append(tmp)
+
+        if not source_frames:
+            st.info("👈 First run the NSE or F&O scanner, then open this REVERSAL tab.")
+        else:
+            try:
+                reversal_df = pd.concat(source_frames, ignore_index=True, sort=False)
+                reversal_df = _add_reversal_columns(reversal_df)
+
+                # Normalize reversal fields safely.
+                rev_signal = reversal_df.get(
+                    "REVERSAL SIGNAL",
+                    pd.Series("WAIT", index=reversal_df.index, dtype="object")
+                ).astype(str).str.upper()
+
+                direction_text = reversal_df.get(
+                    "DIRECTION",
+                    pd.Series("", index=reversal_df.index, dtype="object")
+                ).astype(str).str.upper()
+
+                # Prefer explicit reversal signal. If a row has a BUY/SELL direction
+                # but the reversal engine says WAIT, keep it in WAIT instead of
+                # falsely promoting it to a reversal.
+                reversal_df["_REV_STATUS"] = np.where(
+                    rev_signal.str.contains("BUY REVERSAL", na=False),
+                    "BUY REVERSAL",
+                    np.where(
+                        rev_signal.str.contains("SELL REVERSAL", na=False),
+                        "SELL REVERSAL",
+                        "WAIT"
+                    )
+                )
+
+                # Filters
+                c1, c2, c3, c4 = st.columns(4)
+                with c1:
+                    rev_filter = st.selectbox(
+                        "Reversal Signal",
+                        ["ALL", "BUY REVERSAL", "SELL REVERSAL", "WAIT"],
+                        key="reversal_signal_filter"
+                    )
+                with c2:
+                    min_rev_score = st.slider(
+                        "Min Reversal Score",
+                        0, 100, 0, 5,
+                        key="reversal_score_filter"
+                    )
+                with c3:
+                    market_filter = st.selectbox(
+                        "Market",
+                        ["ALL", "NSE", "F&O"],
+                        key="reversal_market_filter"
+                    )
+                with c4:
+                    rev_sort = st.selectbox(
+                        "Sort By",
+                        ["REVERSAL SCORE", "LTP", "AI CONFIDENCE %"],
+                        key="reversal_sort_filter"
+                    )
+
+                view = reversal_df.copy()
+
+                if rev_filter != "ALL":
+                    view = view[view["_REV_STATUS"] == rev_filter]
+
+                try:
+                    score_num = pd.to_numeric(view["REVERSAL SCORE"], errors="coerce").fillna(0)
+                    view = view[score_num >= min_rev_score]
+                except Exception:
+                    pass
+
+                if market_filter != "ALL":
+                    view = view[view["MARKET"].astype(str).str.upper() == market_filter]
+
+                try:
+                    if rev_sort == "LTP":
+                        view = view.sort_values("LTP", ascending=False, na_position="last")
+                    elif rev_sort == "AI CONFIDENCE %":
+                        view = view.sort_values("AI CONFIDENCE %", ascending=False, na_position="last")
+                    else:
+                        view = view.sort_values("REVERSAL SCORE", ascending=False, na_position="last")
+                except Exception:
+                    pass
+
+                # Summary cards
+                buy_count = int((view["_REV_STATUS"] == "BUY REVERSAL").sum())
+                sell_count = int((view["_REV_STATUS"] == "SELL REVERSAL").sum())
+                wait_count = int((view["_REV_STATUS"] == "WAIT").sum())
+
+                m1, m2, m3, m4 = st.columns(4)
+                m1.metric("🟢 BUY REVERSAL", buy_count)
+                m2.metric("🔴 SELL REVERSAL", sell_count)
+                m3.metric("⚪ WAIT", wait_count)
+                m4.metric("📊 TOTAL", len(view))
+
+                # Keep the important scalping columns first when available.
+                preferred = [
+                    "MARKET", "SYMBOL", "LTP", "DIRECTION",
+                    "REVERSAL SIGNAL", "REVERSAL SCORE",
+                    "REVERSAL LEVEL", "REVERSAL ZONE",
+                    "REVERSAL REASON", "SIGNAL TYPE",
+                    "COMBINED BIAS", "AI CONFIDENCE %",
+                    "RSI", "VWAP", "STRUCTURE"
+                ]
+                display_cols = [c for c in preferred if c in view.columns]
+                remaining = [c for c in view.columns if c not in display_cols and c != "_REV_STATUS"]
+                display_df = view[display_cols + remaining].copy()
+
+                st.dataframe(
+                    display_df,
+                    use_container_width=True,
+                    height=520,
+                    hide_index=True
+                )
+
+                # Clear trade interpretation
+                st.markdown("### 🧭 REVERSAL READ")
+                if buy_count:
+                    st.success("🟢 BUY REVERSAL = LONG-side reversal setup. Check REVERSAL LEVEL / ZONE before entry.")
+                if sell_count:
+                    st.error("🔴 SELL REVERSAL = SHORT-side reversal setup. Check REVERSAL LEVEL / ZONE before entry.")
+                if buy_count == 0 and sell_count == 0:
+                    st.info("⚪ No confirmed reversal confluence in the current filtered results. WAIT is intentional.")
+
+                # Downloads
+                st.markdown("### 📥 Download REVERSAL")
+                d1, d2 = st.columns(2)
+                with d1:
+                    try:
+                        excel_data = _format_excel_output(display_df, "REVERSAL")
+                        st.download_button(
+                            "📊 Excel",
+                            excel_data,
+                            f"REVERSAL_{_now_ist().strftime('%Y%m%d_%H%M')}.xlsx",
+                            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                            key="reversal_xls"
+                        )
+                    except Exception as e:
+                        st.error(f"❌ Excel: {str(e)[:100]}")
+                with d2:
+                    try:
+                        st.download_button(
+                            "📄 CSV",
+                            to_csv_bytes(display_df),
+                            f"REVERSAL_{_now_ist().strftime('%Y%m%d_%H%M')}.csv",
+                            "text/csv",
+                            key="reversal_csv"
+                        )
+                    except Exception as e:
+                        st.error(f"❌ CSV: {str(e)[:100]}")
+
+            except Exception as e:
+                st.error(f"❌ Reversal tab error: {type(e).__name__}: {str(e)[:180]}")
+                logger.error(f"Reversal tab error: {e}", exc_info=True)
+
     # ════════════════════════════════════════════════════════════════════════════════
     # TAB 0: NSE STOCKS
     # ════════════════════════════════════════════════════════════════════════════════
