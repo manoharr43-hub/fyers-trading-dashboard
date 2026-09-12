@@ -4230,14 +4230,25 @@ def _add_reversal_columns(df: pd.DataFrame) -> pd.DataFrame:
 
     # Final fallback: if any price is still invalid, use ATR-based reference,
     # never LTP itself and never N/A.
-    reversal_level = pd.to_numeric(reversal_level, errors="coerce")
-    reversal_level = reversal_level.fillna(
+    # IMPORTANT: np.where() returns a NumPy ndarray.
+    # Convert it back to a pandas Series before using .fillna().
+    reversal_level = pd.Series(
+        pd.to_numeric(reversal_level, errors="coerce"),
+        index=x.index,
+        dtype="float64"
+    )
+
+    fallback_level = pd.Series(
         np.where(
             dir_text.str.contains("SELL", na=False),
             ltp + (atr * 0.50),
             ltp - (atr * 0.50)
-        )
+        ),
+        index=x.index,
+        dtype="float64"
     )
+
+    reversal_level = reversal_level.fillna(fallback_level)
     x["REVERSAL LEVEL"] = reversal_level.round(2)
 
     x["REVERSAL ZONE"] = np.where(
