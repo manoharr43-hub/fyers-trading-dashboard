@@ -13,3 +13,4 @@ gunicorn>=21.2.0
 python-dotenv>=1.0.0
 xgboost>=2.1.0
 yfinance>=0.2.40
+streamlit-paste-button==0.1.2
