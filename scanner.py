@@ -4454,9 +4454,9 @@ def _show_ai_chart_analysis_tab(fyers, all_symbols, fo_symbols):
 
     pasted_chart_bytes = st.session_state.get("ai_chart_pasted_bytes")
     if uploaded_chart is not None:
-        st.image(uploaded_chart, caption="Uploaded chart", use_container_width=True)
+        st.image(uploaded_chart, caption="Uploaded chart")
     elif pasted_chart_bytes:
-        st.image(pasted_chart_bytes, caption="Pasted chart screenshot", use_container_width=True)
+        st.image(pasted_chart_bytes, caption="Pasted chart screenshot")
 
 
     c1, c2 = st.columns(2)
