@@ -15,6 +15,14 @@ from datetime import datetime, timedelta
 from typing import List, Optional, Tuple, Dict, Any
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+# Optional clipboard-image support for the AI Chart Analysis tab.
+try:
+    from streamlit_paste_button import paste_image_button
+    PASTE_IMAGE_AVAILABLE = True
+except Exception:
+    paste_image_button = None
+    PASTE_IMAGE_AVAILABLE = False
+
 
 # ============================================================
 # INDEPENDENT STRONG SIGNALS / MARKET DASHBOARD HELPERS
@@ -4415,16 +4423,41 @@ def _show_ai_chart_analysis_tab(fyers, all_symbols, fo_symbols):
     st.markdown("### 🤖 AI CHART ANALYSIS — Multi-Factor Direction Scanner")
     st.caption("5M chart + 15M/1H confirmation + VWAP + EMA + RSI + MACD + RVOL + structure. This is analytical scoring, not a guaranteed forecast.")
 
-    # Optional chart screenshot upload — does not disturb the live Fyers scanner.
-    st.markdown("#### 📤 Upload Chart Screenshot")
+    # Chart screenshot input: normal upload + direct clipboard paste.
+    # This does not disturb the live Fyers scanner.
+    st.markdown("#### 📤 Chart Screenshot")
+    st.caption("Upload a screenshot OR copy a chart image and paste it from your clipboard.")
+
     uploaded_chart = st.file_uploader(
-        "Upload a chart image for reference",
+        "📁 Upload chart screenshot",
         type=["png", "jpg", "jpeg", "webp"],
         key="ai_chart_upload",
-        help="Upload a TradingView/Fyers chart screenshot. The image is shown here for reference; live AI scoring below still uses Fyers market data."
+        help="Upload a TradingView/Fyers chart screenshot. Live AI scoring below still uses Fyers market data."
     )
+
+    if PASTE_IMAGE_AVAILABLE:
+        st.markdown("**📋 Paste screenshot from clipboard**")
+        paste_result = paste_image_button(
+            "📋 PASTE CHART SCREENSHOT",
+            key="ai_chart_paste_button",
+            errors="ignore",
+        )
+        if paste_result is not None and paste_result.image_data is not None:
+            try:
+                pasted_buffer = io.BytesIO()
+                paste_result.image_data.save(pasted_buffer, format="PNG")
+                st.session_state["ai_chart_pasted_bytes"] = pasted_buffer.getvalue()
+            except Exception as paste_err:
+                st.warning(f"Could not read pasted image: {paste_err}")
+    else:
+        st.info("📋 Clipboard paste needs the `streamlit-paste-button` package in requirements.txt. The upload button above still works.")
+
+    pasted_chart_bytes = st.session_state.get("ai_chart_pasted_bytes")
     if uploaded_chart is not None:
         st.image(uploaded_chart, caption="Uploaded chart", use_container_width=True)
+    elif pasted_chart_bytes:
+        st.image(pasted_chart_bytes, caption="Pasted chart screenshot", use_container_width=True)
+
 
     c1, c2 = st.columns(2)
     with c1:
