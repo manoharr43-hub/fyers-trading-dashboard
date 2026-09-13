@@ -5769,269 +5769,38 @@ def show_scanner(fyers) -> None:
     gc.collect()
 
 # ════════════════════════════════════════════════════════════════════════════════
-# FYERS API V3 AUTHENTICATION LAYER
-# ADDITIVE ONLY — EXISTING SCANNER / OPTION CHAIN / PIN LOGIC IS PRESERVED
-# ════════════════════════════════════════════════════════════════════════════════
-
-def _get_fyers_config(name: str, default: str = "") -> str:
-    """Read FYERS configuration from environment first, then Streamlit secrets."""
-    value = os.environ.get(name, "")
-    if value:
-        return str(value).strip()
-    try:
-        value = st.secrets.get(name, default)
-        return str(value).strip() if value is not None else default
-    except Exception:
-        return default
-
-
-def _get_fyers_session_credentials() -> Tuple[str, str, str]:
-    """Return App ID, Secret Key and Redirect URI without hard-coding credentials."""
-    app_id = _get_fyers_config("FYERS_APP_ID")
-    secret_key = _get_fyers_config("FYERS_SECRET_KEY")
-    redirect_uri = _get_fyers_config("FYERS_REDIRECT_URI")
-    return app_id, secret_key, redirect_uri
-
-
-def _build_fyers_v3_client(access_token: str):
-    """Create the modern FYERS API v3 client used by the existing application."""
-    from fyers_apiv3 import fyersModel
-
-    app_id, _, _ = _get_fyers_session_credentials()
-    if not app_id:
-        raise RuntimeError("FYERS_APP_ID is not configured.")
-    if not access_token:
-        raise RuntimeError("FYERS access token is empty.")
-
-    return fyersModel.FyersModel(
-        client_id=app_id,
-        token=access_token,
-        is_async=False,
-        log_path="",
-    )
-
-
-def _get_saved_fyers_token() -> str:
-    """Get an already available token. Session state has priority over environment."""
-    session_token = st.session_state.get("fyers_access_token", "")
-    if session_token:
-        return str(session_token).strip()
-
-    env_token = _get_fyers_config("FYERS_ACCESS_TOKEN")
-    if env_token:
-        st.session_state["fyers_access_token"] = env_token
-        return env_token
-
-    return ""
-
-
-def _fyers_auth_url() -> str:
-    """Generate the official FYERS API v3 login URL."""
-    from fyers_apiv3 import fyersModel
-
-    app_id, secret_key, redirect_uri = _get_fyers_session_credentials()
-    if not app_id:
-        raise RuntimeError("FYERS_APP_ID is missing.")
-    if not secret_key:
-        raise RuntimeError("FYERS_SECRET_KEY is missing.")
-    if not redirect_uri:
-        raise RuntimeError("FYERS_REDIRECT_URI is missing.")
-
-    session = fyersModel.SessionModel(
-        client_id=app_id,
-        secret_key=secret_key,
-        redirect_uri=redirect_uri,
-        response_type="code",
-        grant_type="authorization_code",
-        state="nse_ai_pro_v17",
-    )
-    return session.generate_authcode()
-
-
-def _exchange_fyers_auth_code(auth_code: str) -> str:
-    """Exchange the FYERS callback auth_code for an access token."""
-    from fyers_apiv3 import fyersModel
-
-    app_id, secret_key, redirect_uri = _get_fyers_session_credentials()
-    if not app_id or not secret_key or not redirect_uri:
-        raise RuntimeError(
-            "FYERS_APP_ID, FYERS_SECRET_KEY and FYERS_REDIRECT_URI are required."
-        )
-
-    session = fyersModel.SessionModel(
-        client_id=app_id,
-        secret_key=secret_key,
-        redirect_uri=redirect_uri,
-        response_type="code",
-        grant_type="authorization_code",
-        state="nse_ai_pro_v17",
-    )
-    session.set_token(auth_code.strip())
-    response = session.generate_token()
-
-    if not isinstance(response, dict):
-        raise RuntimeError(f"Unexpected FYERS token response: {response}")
-
-    access_token = str(response.get("access_token") or "").strip()
-    if not access_token:
-        message = response.get("message") or response.get("code") or str(response)
-        raise RuntimeError(f"FYERS token generation failed: {message}")
-
-    return access_token
-
-
-def _clear_fyers_callback_params() -> None:
-    """Remove one-time callback parameters after successful token exchange."""
-    try:
-        # Streamlit modern query-param API.
-        for key in ("auth_code", "code", "state"):
-            try:
-                if key in st.query_params:
-                    del st.query_params[key]
-            except Exception:
-                pass
-    except Exception:
-        pass
-
-
-def _show_fyers_login_layer():
-    """
-    Authenticate with FYERS API v3 and return a FyersModel client.
-
-    Existing FYERS_ACCESS_TOKEN remains supported as a fallback. This layer only
-    handles authentication; it does not modify scanner, option-chain, PIN or signal logic.
-    """
-    # 1) Existing token path — preserves current deployments.
-    access_token = _get_saved_fyers_token()
-    if access_token:
-        try:
-            fyers = _build_fyers_v3_client(access_token)
-            st.session_state["fyers_connected"] = True
-            return fyers
-        except Exception as token_error:
-            st.session_state["fyers_connected"] = False
-            st.warning(f"⚠️ Existing FYERS token could not be used: {str(token_error)[:180]}")
-            # Continue to the interactive login flow.
-
-    app_id, secret_key, redirect_uri = _get_fyers_session_credentials()
-
-    if not app_id or not secret_key or not redirect_uri:
-        st.error("❌ FYERS API v3 credentials are not configured.")
-        st.info(
-            "Set FYERS_APP_ID, FYERS_SECRET_KEY and FYERS_REDIRECT_URI in "
-            "Streamlit Secrets or environment variables. Do not hard-code the Secret Key."
-        )
-        with st.expander("🔧 Required FYERS configuration", expanded=True):
-            st.code(
-                "FYERS_APP_ID=YOUR_NEW_APP_ID_200\n"
-                "FYERS_SECRET_KEY=YOUR_SECRET_KEY\n"
-                "FYERS_REDIRECT_URI=https://YOUR-STREAMLIT-APP.streamlit.app/\n"
-                "# Optional: FYERS_ACCESS_TOKEN=...",
-                language="text",
-            )
-        return None
-
-    # 2) Handle the auth_code returned by FYERS after login.
-    auth_code = ""
-    try:
-        auth_code = str(st.query_params.get("auth_code", "") or "").strip()
-        if not auth_code:
-            auth_code = str(st.query_params.get("code", "") or "").strip()
-    except Exception:
-        pass
-
-    if auth_code:
-        try:
-            with st.spinner("🔐 Connecting to FYERS and generating access token..."):
-                new_token = _exchange_fyers_auth_code(auth_code)
-                st.session_state["fyers_access_token"] = new_token
-                st.session_state["fyers_connected"] = True
-                _clear_fyers_callback_params()
-                st.success("✅ FYERS connected successfully.")
-                st.rerun()
-        except Exception as auth_error:
-            st.session_state["fyers_connected"] = False
-            st.error(f"❌ FYERS authentication failed: {str(auth_error)[:500]}")
-            st.caption(
-                "Check that the App ID, Secret Key and Redirect URI exactly match the FYERS API dashboard."
-            )
-            return None
-
-    # 3) Interactive login link.
-    try:
-        login_url = _fyers_auth_url()
-        st.markdown("### 🔐 FYERS API Connection")
-        st.caption(
-            "FYERS shows 'Not Connected' when there is no active access-token session. "
-            "Use the button below to create the session."
-        )
-        st.link_button(
-            "🔐 LOGIN TO FYERS",
-            login_url,
-            use_container_width=True,
-        )
-        st.caption(
-            "After FYERS login, you must be redirected to the exact FYERS_REDIRECT_URI configured in your API app."
-        )
-
-        # Optional manual callback support for redirect URLs that do not return to Streamlit.
-        with st.expander("📋 Manual auth_code option", expanded=False):
-            st.caption(
-                "Use this only if your configured redirect URL does not return to this Streamlit app. "
-                "Paste the auth_code received after FYERS login."
-            )
-            manual_code = st.text_input(
-                "FYERS auth_code",
-                value="",
-                type="password",
-                key="fyers_manual_auth_code",
-                placeholder="Paste auth_code here",
-            )
-            if st.button("✅ CONNECT WITH AUTH CODE", key="connect_fyers_auth_code", use_container_width=True):
-                if not manual_code.strip():
-                    st.warning("Please enter the auth_code first.")
-                else:
-                    try:
-                        with st.spinner("Connecting to FYERS..."):
-                            new_token = _exchange_fyers_auth_code(manual_code.strip())
-                            st.session_state["fyers_access_token"] = new_token
-                            st.session_state["fyers_connected"] = True
-                            st.success("✅ FYERS connected successfully.")
-                            st.rerun()
-                    except Exception as manual_error:
-                        st.session_state["fyers_connected"] = False
-                        st.error(f"❌ Auth-code connection failed: {str(manual_error)[:500]}")
-    except Exception as login_error:
-        st.error(f"❌ Could not generate FYERS login URL: {str(login_error)[:500]}")
-        return None
-
-    return None
-
-
-# ════════════════════════════════════════════════════════════════════════════════
 # ENTRY POINT
 # ════════════════════════════════════════════════════════════════════════════════
 if __name__ == "__main__":
     try:
-        # IMPORTANT: Existing scanner UI/data logic is untouched.
-        # Only the FYERS connection layer is upgraded from legacy fyers_api to API v3.
+        access_token = os.environ.get("FYERS_ACCESS_TOKEN")
+        if not access_token:
+            st.error("❌ FYERS_ACCESS_TOKEN not set in environment variables")
+            st.info("Please set: export FYERS_ACCESS_TOKEN='your_token_here'")
+            st.stop()
+        
         try:
-            fyers = _show_fyers_login_layer()
-        except ImportError:
-            st.error("❌ FYERS API v3 package is not installed.")
-            st.code("pip install fyers-apiv3", language="bash")
+            from fyers_api import fyersModel
+        except ImportError as ie:
+            st.error("❌ fyers-api not installed")
+            st.code("pip install fyers-api", language="bash")
             st.stop()
-        except Exception as auth_init_error:
-            st.error(f"❌ FYERS connection error: {str(auth_init_error)[:500]}")
-            logger.error("FYERS connection error", exc_info=True)
-            st.stop()
-
-        if fyers is not None:
-            logger.info("FYERS API v3 client initialized successfully")
+        
+        app_id = os.environ.get("FYERS_APP_ID", "DEMO")
+        
+        try:
+            fyers = fyersModel.FyersModel(client_id=app_id, token=access_token, log_path="")
+            logger.info("Fyers client initialized successfully")
             show_scanner(fyers)
-        else:
-            st.info("👆 Connect FYERS above to start the NSE AI PRO V17 scanner.")
-
+        except Exception as init_error:
+            st.error(f"❌ Failed to initialize Fyers API: {str(init_error)}")
+            logger.error(f"Fyers initialization error: {init_error}", exc_info=True)
+            
+            with st.expander("Debug Information"):
+                st.write(f"App ID: {app_id}")
+                st.write(f"Token set: {bool(access_token)}")
+                st.write(f"Error: {init_error}")
+    
     except Exception as e:
         st.error(f"❌ Unexpected Error: {e}")
         logger.error(f"Unexpected error: {e}", exc_info=True)
