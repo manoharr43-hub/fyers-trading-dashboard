@@ -5773,10 +5773,30 @@ def show_scanner(fyers) -> None:
 # ════════════════════════════════════════════════════════════════════════════════
 if __name__ == "__main__":
     try:
-        access_token = os.environ.get("FYERS_ACCESS_TOKEN")
+        # Read credentials from environment first, then Streamlit Secrets.
+        access_token = os.environ.get("FYERS_ACCESS_TOKEN", "").strip()
+        app_id = os.environ.get("FYERS_APP_ID", "").strip()
+
         if not access_token:
-            st.error("❌ FYERS_ACCESS_TOKEN not set in environment variables")
-            st.info("Please set: export FYERS_ACCESS_TOKEN='your_token_here'")
+            try:
+                access_token = str(st.secrets.get("FYERS_ACCESS_TOKEN", "")).strip()
+            except Exception:
+                access_token = ""
+
+        if not app_id:
+            try:
+                app_id = str(st.secrets.get("FYERS_APP_ID", "")).strip()
+            except Exception:
+                app_id = ""
+
+        if not access_token:
+            st.error("❌ FYERS access token not configured")
+            st.info("For Streamlit Cloud, add FYERS_ACCESS_TOKEN in App → Settings → Secrets. Do not paste your token in chat.")
+            st.stop()
+
+        if not app_id:
+            st.error("❌ FYERS_APP_ID not configured")
+            st.info("Add FYERS_APP_ID in Streamlit Secrets or environment variables.")
             st.stop()
         
         try:
@@ -5785,8 +5805,6 @@ if __name__ == "__main__":
             st.error("❌ fyers-api not installed")
             st.code("pip install fyers-api", language="bash")
             st.stop()
-        
-        app_id = os.environ.get("FYERS_APP_ID", "DEMO")
         
         try:
             fyers = fyersModel.FyersModel(client_id=app_id, token=access_token, log_path="")
@@ -5797,8 +5815,8 @@ if __name__ == "__main__":
             logger.error(f"Fyers initialization error: {init_error}", exc_info=True)
             
             with st.expander("Debug Information"):
-                st.write(f"App ID: {app_id}")
-                st.write(f"Token set: {bool(access_token)}")
+                st.write(f"App ID configured: {bool(app_id)}")
+                st.write(f"Token configured: {bool(access_token)}")
                 st.write(f"Error: {init_error}")
     
     except Exception as e:
