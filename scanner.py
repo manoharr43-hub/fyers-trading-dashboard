@@ -3129,12 +3129,6 @@ def run_nse_scan(fyers, symbols):
     
     progress.empty()
 
-    # ════════════════════════════════════════════════════════════════════════════════
-    # TAB 14: AI CHART ANALYSIS — ADDITIONAL ONLY
-    # ════════════════════════════════════════════════════════════════════════════════
-    with tabs[14]:
-        _show_ai_chart_analysis_tab(fyers, all_symbols, fo_symbols)
-
     gc.collect()
     return results, errors, stats
 
@@ -5732,6 +5726,12 @@ def show_scanner(fyers) -> None:
                     st.write(f"• {err}")
                 if len(direct_reversal_errors) > 100:
                     st.caption("Showing first 100 errors.")
+
+    # ════════════════════════════════════════════════════════════════════════════════
+    # TAB 14: AI CHART ANALYSIS — MUST RENDER INSIDE show_scanner
+    # ════════════════════════════════════════════════════════════════════════════════
+    with tabs[14]:
+        _show_ai_chart_analysis_tab(fyers, all_symbols, fo_symbols)
 
     gc.collect()
 
