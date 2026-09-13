@@ -4421,6 +4421,17 @@ def _show_ai_chart_analysis_tab(fyers, all_symbols, fo_symbols):
     st.markdown("### 🤖 AI CHART ANALYSIS — Multi-Factor Direction Scanner")
     st.caption("5M chart + 15M/1H confirmation + VWAP + EMA + RSI + MACD + RVOL + structure. This is analytical scoring, not a guaranteed forecast.")
 
+    # Optional chart screenshot upload — does not disturb the live Fyers scanner.
+    st.markdown("#### 📤 Upload Chart Screenshot")
+    uploaded_chart = st.file_uploader(
+        "Upload a chart image for reference",
+        type=["png", "jpg", "jpeg", "webp"],
+        key="ai_chart_upload",
+        help="Upload a TradingView/Fyers chart screenshot. The image is shown here for reference; live AI scoring below still uses Fyers market data."
+    )
+    if uploaded_chart is not None:
+        st.image(uploaded_chart, caption="Uploaded chart", use_container_width=True)
+
     c1, c2 = st.columns(2)
     with c1:
         source = st.radio("Universe", ["NSE", "F&O"], horizontal=True, key="ai_chart_source")
