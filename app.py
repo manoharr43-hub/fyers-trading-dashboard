@@ -4453,42 +4453,11 @@ def _show_ai_chart_analysis_tab(fyers, all_symbols, fo_symbols):
         st.info("📋 Clipboard paste needs the `streamlit-paste-button` package in requirements.txt. The upload button above still works.")
 
     pasted_chart_bytes = st.session_state.get("ai_chart_pasted_bytes")
-    chart_ready = uploaded_chart is not None or bool(pasted_chart_bytes)
-
     if uploaded_chart is not None:
-        # Persist uploaded bytes so the Submit button survives Streamlit reruns.
-        try:
-            st.session_state["ai_chart_uploaded_bytes"] = uploaded_chart.getvalue()
-        except Exception:
-            pass
         st.image(uploaded_chart, caption="Uploaded chart")
     elif pasted_chart_bytes:
         st.image(pasted_chart_bytes, caption="Pasted chart screenshot")
 
-    # Explicit submit/confirm step requested by the user.
-    submit_col1, submit_col2 = st.columns([3, 1])
-    with submit_col1:
-        if st.button(
-            "📤 SUBMIT CHART FOR AI ANALYSIS",
-            key="ai_chart_submit",
-            type="primary",
-            use_container_width=True,
-            disabled=not chart_ready,
-        ):
-            if uploaded_chart is not None:
-                st.session_state["ai_chart_submitted_bytes"] = uploaded_chart.getvalue()
-            elif pasted_chart_bytes:
-                st.session_state["ai_chart_submitted_bytes"] = pasted_chart_bytes
-            st.session_state["ai_chart_submitted"] = True
-            st.session_state["ai_chart_submit_time"] = _generated_timestamp()
-            st.success("✅ Chart submitted successfully. Now select the stock and run AI analysis.")
-    with submit_col2:
-        if st.session_state.get("ai_chart_submitted"):
-            st.success("SUBMITTED")
-
-    submitted_chart_bytes = st.session_state.get("ai_chart_submitted_bytes")
-    if submitted_chart_bytes:
-        st.caption("✅ Submitted chart is ready for analysis")
 
     c1, c2 = st.columns(2)
     with c1:
