@@ -3128,6 +3128,13 @@ def run_nse_scan(fyers, symbols):
             time.sleep(BATCH_PAUSE_SECONDS)
     
     progress.empty()
+
+    # ════════════════════════════════════════════════════════════════════════════════
+    # TAB 14: AI CHART ANALYSIS — ADDITIONAL ONLY
+    # ════════════════════════════════════════════════════════════════════════════════
+    with tabs[14]:
+        _show_ai_chart_analysis_tab(fyers, all_symbols, fo_symbols)
+
     gc.collect()
     return results, errors, stats
 
@@ -4262,6 +4269,266 @@ def _add_reversal_columns(df: pd.DataFrame) -> pd.DataFrame:
     return x
 
 
+
+# ════════════════════════════════════════════════════════════════════════════════
+# AI CHART ANALYSIS — ADDITIONAL TAB ONLY
+# ════════════════════════════════════════════════════════════════════════════════
+def _ai_chart_signal(analysis_5m: Dict[str, Any],
+                     analysis_15m: Dict[str, Any],
+                     analysis_1h: Dict[str, Any]) -> Dict[str, Any]:
+    """Rule-based AI-style chart synthesis using the scanner's existing indicators.
+    This does not claim to predict the future with certainty.
+    """
+    d5 = analysis_5m.get("data", {}) or {}
+    d15 = analysis_15m.get("data", {}) or {}
+    d1h = analysis_1h.get("data", {}) or {}
+    if not d5:
+        return {"direction": "WAIT", "confidence": 0.0, "buy_score": 0.0,
+                "sell_score": 0.0, "reason": "5M data unavailable"}
+
+    buy = 0.0
+    sell = 0.0
+    buy_reasons, sell_reasons = [], []
+
+    def add_trend(data, weight):
+        nonlocal buy, sell
+        trend = str(data.get("structure_trend", "NEUTRAL")).upper()
+        if trend == "BULLISH":
+            buy += weight
+            buy_reasons.append(f"Bullish {weight:.0f}x trend")
+        elif trend == "BEARISH":
+            sell += weight
+            sell_reasons.append(f"Bearish {weight:.0f}x trend")
+
+    add_trend(d5, 25)
+    add_trend(d15, 20)
+    add_trend(d1h, 15)
+
+    # VWAP + EMA
+    price = float(d5.get("last_close", 0) or 0)
+    vwap = d5.get("vwap")
+    if vwap is not None and price:
+        if price > float(vwap):
+            buy += 10; buy_reasons.append("Price above VWAP")
+        elif price < float(vwap):
+            sell += 10; sell_reasons.append("Price below VWAP")
+
+    ema = str(d5.get("ema_trend", "NEUTRAL")).upper()
+    if ema == "BULLISH":
+        buy += 8; buy_reasons.append("EMA alignment bullish")
+    elif ema == "BEARISH":
+        sell += 8; sell_reasons.append("EMA alignment bearish")
+
+    pressure = str(d5.get("pressure_trend", "NEUTRAL")).upper()
+    if pressure == "STRONG_BUYING":
+        buy += 10; buy_reasons.append("Strong buying pressure")
+    elif pressure == "BUYING":
+        buy += 6; buy_reasons.append("Buying pressure")
+    elif pressure == "STRONG_SELLING":
+        sell += 10; sell_reasons.append("Strong selling pressure")
+    elif pressure == "SELLING":
+        sell += 6; sell_reasons.append("Selling pressure")
+
+    rvol = float(d5.get("rvol", 1.0) or 1.0)
+    if rvol >= 2.0:
+        if buy >= sell:
+            buy += 7; buy_reasons.append(f"High RVOL {rvol:.2f}x")
+        else:
+            sell += 7; sell_reasons.append(f"High RVOL {rvol:.2f}x")
+    elif rvol >= 1.5:
+        if buy >= sell:
+            buy += 4; buy_reasons.append(f"RVOL {rvol:.2f}x")
+        else:
+            sell += 4; sell_reasons.append(f"RVOL {rvol:.2f}x")
+
+    rsi = float(d5.get("rsi", 50) or 50)
+    if 55 <= rsi < 70:
+        buy += 5; buy_reasons.append(f"RSI {rsi:.1f} bullish zone")
+    elif 30 < rsi <= 45:
+        sell += 5; sell_reasons.append(f"RSI {rsi:.1f} bearish zone")
+
+    if d5.get("macd_bullish"):
+        buy += 5; buy_reasons.append("MACD bullish")
+    else:
+        sell += 5; sell_reasons.append("MACD bearish")
+
+    # Confirmed structure events
+    if d5.get("bullish_choch") or d5.get("bullish_mss") or d5.get("bullish_cisd"):
+        buy += 8; buy_reasons.append("Bullish structure event")
+    if d5.get("bearish_choch") or d5.get("bearish_mss") or d5.get("bearish_cisd"):
+        sell += 8; sell_reasons.append("Bearish structure event")
+
+    total = max(buy + sell, 1.0)
+    gap = abs(buy - sell)
+    confidence = min(98.0, 50.0 + (gap / total) * 48.0)
+
+    if buy >= sell and gap >= 12:
+        direction = "🟢 BUY"
+        reasons = buy_reasons
+    elif sell > buy and gap >= 12:
+        direction = "🔴 SELL"
+        reasons = sell_reasons
+    else:
+        direction = "🟡 WAIT"
+        reasons = list(dict.fromkeys(buy_reasons + sell_reasons))[:5] or ["Mixed signals"]
+
+    return {
+        "direction": direction,
+        "confidence": round(confidence, 1),
+        "buy_score": round(buy, 1),
+        "sell_score": round(sell, 1),
+        "reason": " | ".join(reasons[:6]),
+    }
+
+
+def _plot_ai_candles(df: pd.DataFrame, ticker: str, signal: Dict[str, Any]):
+    """Simple dependency-light OHLC chart with EMA/VWAP overlays."""
+    if not MATPLOTLIB_AVAILABLE or df is None or df.empty:
+        st.warning("Chart library/data unavailable.")
+        return
+
+    d = df.tail(100).copy().reset_index(drop=True)
+    close = pd.to_numeric(d["Close"], errors="coerce")
+    ema9 = close.ewm(span=9, adjust=False).mean()
+    ema21 = close.ewm(span=21, adjust=False).mean()
+    vwap = calculate_vwap(d)
+
+    fig, ax = plt.subplots(figsize=(13, 5.5))
+    for i, row in d.iterrows():
+        o, h, l, c = map(float, [row["Open"], row["High"], row["Low"], row["Close"]])
+        ax.vlines(i, l, h, linewidth=1)
+        bottom = min(o, c)
+        height = max(abs(c-o), max((h-l)*0.01, 0.000001))
+        rect = plt.Rectangle((i-0.32, bottom), 0.64, height,
+                             fill=False if c >= o else True, linewidth=1)
+        ax.add_patch(rect)
+
+    ax.plot(range(len(d)), ema9, linewidth=1.3, label="EMA 9")
+    ax.plot(range(len(d)), ema21, linewidth=1.3, label="EMA 21")
+    ax.plot(range(len(d)), vwap, linewidth=1.1, label="VWAP")
+
+    ax.set_title(f"{ticker} — 5M AI Chart Analysis | {signal.get('direction','WAIT')} | {signal.get('confidence',0):.1f}%")
+    ax.set_xlabel("Recent 5M candles")
+    ax.set_ylabel("Price")
+    ax.grid(alpha=0.2)
+    ax.legend(loc="upper left")
+    st.pyplot(fig, use_container_width=True)
+    plt.close(fig)
+
+
+def _show_ai_chart_analysis_tab(fyers, all_symbols, fo_symbols):
+    """Independent AI chart-analysis tab. Existing scanners/session data remain unchanged."""
+    st.markdown("### 🤖 AI CHART ANALYSIS — Multi-Factor Direction Scanner")
+    st.caption("5M chart + 15M/1H confirmation + VWAP + EMA + RSI + MACD + RVOL + structure. This is analytical scoring, not a guaranteed forecast.")
+
+    c1, c2 = st.columns(2)
+    with c1:
+        source = st.radio("Universe", ["NSE", "F&O"], horizontal=True, key="ai_chart_source")
+    with c2:
+        universe = all_symbols if source == "NSE" else fo_symbols
+        if not universe:
+            st.error(f"No {source} symbols available.")
+            return
+        symbol = st.selectbox("Select stock", universe, key="ai_chart_symbol")
+
+    if st.button("🤖 RUN AI CHART ANALYSIS", key="ai_chart_run", type="primary", use_container_width=True):
+        with st.spinner(f"Analyzing {symbol} across 5M / 15M / 1H…"):
+            try:
+                a5 = analyze_timeframe(fyers, symbol, "5")
+                a15 = analyze_timeframe(fyers, symbol, "15")
+                a1h = analyze_timeframe(fyers, symbol, "60")
+                if a5.get("status") != "OK" or a5.get("df") is None:
+                    raise ValueError("5M chart data unavailable")
+                signal = _ai_chart_signal(a5, a15, a1h)
+                next_bias = calculate_next_candle_bias(a5["df"], a5)
+                movement = calculate_movement_metrics(a5["df"])
+                big_move = detect_big_move_setup(a5["df"])
+                st.session_state["ai_chart_analysis"] = {
+                    "symbol": symbol, "a5": a5, "a15": a15, "a1h": a1h,
+                    "signal": signal, "next_bias": next_bias,
+                    "movement": movement, "big_move": big_move,
+                    "scanned_at": _generated_timestamp(),
+                }
+            except Exception as e:
+                st.session_state["ai_chart_analysis"] = None
+                st.error(f"❌ AI chart analysis failed: {type(e).__name__}: {str(e)[:180]}")
+
+    result = st.session_state.get("ai_chart_analysis")
+    if not result:
+        st.info("👈 Select a stock and click RUN AI CHART ANALYSIS.")
+        return
+
+    ticker = str(result["symbol"]).replace("NSE:", "").replace("-EQ", "")
+    sig = result["signal"]
+    nb = result["next_bias"]
+    mv = result["movement"]
+    bm = result["big_move"]
+    d5 = result["a5"].get("data", {}) or {}
+    d15 = result["a15"].get("data", {}) or {}
+    d1h = result["a1h"].get("data", {}) or {}
+
+    if "BUY" in sig["direction"]:
+        st.success(f"{ticker}: {sig['direction']} — Confidence {sig['confidence']:.1f}%")
+    elif "SELL" in sig["direction"]:
+        st.error(f"{ticker}: {sig['direction']} — Confidence {sig['confidence']:.1f}%")
+    else:
+        st.warning(f"{ticker}: {sig['direction']} — Confidence {sig['confidence']:.1f}%")
+
+    m1, m2, m3, m4, m5 = st.columns(5)
+    m1.metric("AI BUY SCORE", f"{sig['buy_score']:.1f}")
+    m2.metric("AI SELL SCORE", f"{sig['sell_score']:.1f}")
+    m3.metric("NEXT CANDLE", str(nb.get("bias", "NEUTRAL")))
+    m4.metric("NEXT CONFIDENCE", f"{nb.get('confidence', 0):.1f}%")
+    m5.metric("RVOL", f"{float(d5.get('rvol', 0) or 0):.2f}x")
+
+    _plot_ai_candles(result["a5"]["df"], ticker, sig)
+
+    st.markdown("### ⏱️ MTF Confirmation")
+    t1, t2, t3 = st.columns(3)
+    with t1:
+        st.metric("5M TREND", str(d5.get("structure_trend", "N/A")))
+        st.caption(f"Structure: {d5.get('structure_type', 'N/A')}")
+    with t2:
+        st.metric("15M TREND", str(d15.get("structure_trend", "N/A")))
+        st.caption(f"EMA: {d15.get('ema_trend', 'N/A')}")
+    with t3:
+        st.metric("1H TREND", str(d1h.get("structure_trend", "N/A")))
+        st.caption(f"EMA50/200: {d1h.get('ema50', 'N/A')} / {d1h.get('ema200', 'N/A')}")
+
+    st.markdown("### ⚡ Pre-Move / Big-Move Check")
+    p1, p2, p3, p4 = st.columns(4)
+    p1.metric("5M MOVE %", f"{mv.get('move_5m_pct', 0):.2f}%")
+    p2.metric("15M MOVE %", f"{mv.get('move_15m_pct', 0):.2f}%")
+    p3.metric("BIG MOVE SCORE", f"{bm.get('score', 0):.1f}")
+    p4.metric("BIG MOVE", str(bm.get("signal", "NO BIG MOVE")))
+
+    st.markdown("### 🧠 AI Reason")
+    st.info(sig.get("reason", "No explanation available."))
+
+    detail = pd.DataFrame([{
+        "STOCK": ticker,
+        "AI DIRECTION": sig["direction"],
+        "AI CONFIDENCE %": sig["confidence"],
+        "BUY SCORE": sig["buy_score"],
+        "SELL SCORE": sig["sell_score"],
+        "NEXT CANDLE": nb.get("bias"),
+        "NEXT CONFIDENCE %": nb.get("confidence"),
+        "5M TREND": d5.get("structure_trend"),
+        "15M TREND": d15.get("structure_trend"),
+        "1H TREND": d1h.get("structure_trend"),
+        "RSI": d5.get("rsi"),
+        "RVOL": d5.get("rvol"),
+        "VWAP": d5.get("vwap"),
+        "PRESSURE": d5.get("pressure_trend"),
+        "BIG MOVE": bm.get("signal"),
+        "BIG MOVE SCORE": bm.get("score"),
+        "REASON": sig.get("reason"),
+    }])
+    st.dataframe(detail, use_container_width=True, hide_index=True)
+    _excel_download_button(detail, "AI_CHART_ANALYSIS", "ai_chart_excel")
+
+    st.caption(f"Last AI chart analysis: {result.get('scanned_at', 'N/A')}")
+
 # MAIN APP - V17 WITH NEW MOMENTUM MOVERS TAB
 # ════════════════════════════════════════════════════════════════════════════════
 def show_scanner(fyers) -> None:
@@ -4304,7 +4571,8 @@ def show_scanner(fyers) -> None:
         "⚙️ SETTINGS",
         "📌 PIN RULES",
         "🎯 F&O OPTION CHECK",
-        "🔄 REVERSAL"
+        "🔄 REVERSAL",
+        "🤖 AI CHART ANALYSIS"
     ])
     
     # ════════════════════════════════════════════════════════════════════════════════
