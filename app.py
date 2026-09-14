@@ -242,6 +242,7 @@ def call_entry(fn: Callable, fyers: Any = None) -> bool:
 def load_scanner_module():
     """Prefer the user's current V17 scanner implementation."""
     candidates = (
+        "scanner_v17_pin_rules_button_fixed",
         "scanner_v17",
         "scanner_v17_pin_amd_all_fixed",
         "NSE_AI_PRO_V17_FIXED",
@@ -303,11 +304,13 @@ menu = [
     "⚙️ SETTINGS",
 ]
 
+# Use a new state key so an old Streamlit session that was sitting on
+# OPTION CHAIN cannot keep reopening that page after this app.py is deployed.
 selected = st.sidebar.radio(
     "SCANNER MENU",
     menu,
-    index=0,
-    key="main_app_menu",
+    index=1,
+    key="main_app_menu_v2",
 )
 
 
