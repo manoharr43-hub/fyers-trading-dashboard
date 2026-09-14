@@ -4794,25 +4794,16 @@ def _parse_chart_vision_report(report_text: str) -> Dict[str, Any]:
 
 
 def _show_ai_chart_analysis_tab(fyers, all_symbols, fo_symbols):
-    """AI Chart Analysis tab: screenshot vision is independent of stock selection."""
+    """AI Chart Analysis tab. Screenshot submission is always available and independent.
+
+    The existing NSE/F&O stock analysis is retained below as a separate optional section.
+    """
     st.markdown("### 🤖 AI CHART ANALYSIS")
-    st.info(
-        "📷 Screenshot mode is independent: the NSE/F&O Universe and Select Stock are NOT used "
-        "when a chart image is submitted."
+    st.success(
+        "📷 INDEPENDENT CHART MODE — Upload or paste a chart, then click "
+        "🧠 SUBMIT CHART → ANALYZE. Only that exact image is sent to AI. "
+        "NSE/F&O Universe, Select Stock and FYERS data are NOT used."
     )
-
-    # Keep the existing live/Fyers AI analysis available as a separate mode, but make
-    # screenshot analysis the default. The screenshot submit action never calls it.
-    mode = st.radio(
-        "Analysis Type",
-        ["📷 CHART SCREENSHOT ANALYSIS", "📊 EXISTING STOCK ANALYSIS"],
-        horizontal=True,
-        key="ai_chart_analysis_mode_v2",
-    )
-
-    if mode == "📊 EXISTING STOCK ANALYSIS":
-        _show_legacy_ai_chart_analysis_tab(fyers, all_symbols, fo_symbols)
-        return
 
     st.markdown("#### 📷 PASTE / UPLOAD CHART")
     st.caption(
@@ -5059,6 +5050,14 @@ def _show_ai_chart_analysis_tab(fyers, all_symbols, fo_symbols):
         "This report is based only on the submitted screenshot. Values that were not readable were returned as N/A. "
         "Educational analysis only; not a guarantee of market movement."
     )
+
+
+    # Existing scanner/stock AI analysis is preserved as an optional section.
+    # It is intentionally below the independent screenshot workflow so the user
+    # never needs to select NSE/F&O just to submit a chart image.
+    st.markdown("---")
+    with st.expander("📊 EXISTING NSE/F&O STOCK AI ANALYSIS — OPTIONAL", expanded=False):
+        _show_legacy_ai_chart_analysis_tab(fyers, all_symbols, fo_symbols)
 
 
 def show_scanner(fyers) -> None:
