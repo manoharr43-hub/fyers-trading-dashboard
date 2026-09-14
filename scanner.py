@@ -4418,21 +4418,165 @@ def _plot_ai_candles(df: pd.DataFrame, ticker: str, signal: Dict[str, Any]):
     plt.close(fig)
 
 
-def _show_ai_chart_analysis_tab(fyers, all_symbols, fo_symbols):
-    """Independent AI chart-analysis tab. Existing scanners/session data remain unchanged."""
-    st.markdown("### 🤖 AI CHART ANALYSIS — Multi-Factor Direction Scanner")
-    st.caption("5M chart + 15M/1H confirmation + VWAP + EMA + RSI + MACD + RVOL + structure. This is analytical scoring, not a guaranteed forecast.")
+def _chart_image_mime(image_bytes: bytes) -> str:
+    """Detect common chart screenshot MIME types without adding dependencies."""
+    if image_bytes.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if image_bytes.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if image_bytes[:4] == b"RIFF" and image_bytes[8:12] == b"WEBP":
+        return "image/webp"
+    return "image/png"
 
-    # Chart screenshot input: normal upload + direct clipboard paste.
-    # This does not disturb the live Fyers scanner.
+
+def _extract_openai_response_text(payload: dict) -> str:
+    """Safely extract output text from a Responses API JSON response."""
+    direct = payload.get("output_text")
+    if isinstance(direct, str) and direct.strip():
+        return direct.strip()
+
+    parts = []
+    for item in payload.get("output", []) or []:
+        if not isinstance(item, dict):
+            continue
+        for content in item.get("content", []) or []:
+            if not isinstance(content, dict):
+                continue
+            text = content.get("text")
+            if isinstance(text, str) and text.strip():
+                parts.append(text.strip())
+    return "\n\n".join(parts).strip()
+
+
+def _analyze_submitted_chart_image(image_bytes: bytes) -> str:
+    """Analyze the submitted screenshot itself with a vision-capable OpenAI model."""
+    if not image_bytes:
+        raise ValueError("No submitted chart image found.")
+
+    api_key = str(st.secrets.get("OPENAI_API_KEY", "")).strip()
+    if not api_key:
+        raise ValueError(
+            "OPENAI_API_KEY is missing in Streamlit Secrets. Add it to analyze pasted/uploaded charts."
+        )
+
+    model = str(st.secrets.get("OPENAI_MODEL", "gpt-5.6-luna")).strip() or "gpt-5.6-luna"
+    mime = _chart_image_mime(image_bytes)
+    import base64
+    image_b64 = base64.b64encode(image_bytes).decode("ascii")
+
+    prompt = """
+You are an expert technical-chart analyst. Analyze ONLY the chart screenshot attached to this request.
+Do NOT use a stock dropdown, FYERS symbol, external market data, or assumptions about what the chart is.
+The screenshot itself is the source of truth.
+
+Important anti-hallucination rules:
+- Identify the instrument/symbol and timeframe only if visibly readable in the screenshot; otherwise write Unknown.
+- Read price levels only when they are actually visible. If a level cannot be read reliably, write N/A rather than inventing it.
+- Distinguish clearly between OBSERVED chart facts and INFERRED technical interpretation.
+- Do not claim certainty or guaranteed future price movement.
+- If indicators are visible, analyze them (EMA/VWAP/RSI/MACD/volume/support-resistance/liquidity/market structure, etc.).
+- If an indicator is not visible, say Not visible instead of assuming its value.
+- For CALL/PUT, give the directional interpretation from the visible chart only; do not invent an option strike or premium.
+
+Return a practical intraday/scalping report in this exact structure:
+
+## 📊 CHART IDENTIFICATION
+- Instrument:
+- Timeframe:
+- Chart source (if visible):
+- Current/last visible price:
+
+## 🧭 MARKET DIRECTION
+- Trend: BULLISH / BEARISH / SIDEWAYS / UNCLEAR
+- Bias: BUY / SELL / WAIT
+- Confidence: 0-100% (confidence in the chart interpretation, not a guarantee)
+- Market structure:
+
+## 🔍 VISIBLE EVIDENCE
+- Candlestick/price action:
+- EMA/VWAP:
+- RSI:
+- MACD:
+- Volume/RVOL:
+- Support/Resistance:
+- Liquidity / sweep / breakout / reversal signs:
+
+## 🎯 SCALPING PLAN
+- Preferred side: CALL / PUT / NO TRADE
+- Entry zone: only if readable or logically derived from visible levels; otherwise N/A
+- Stop-loss zone: only if supportable from visible structure; otherwise N/A
+- Target 1:
+- Target 2:
+- Invalidation condition:
+
+## ⚡ NEXT MOVE
+- Immediate bias for the next few candles:
+- What would confirm the move:
+- What would invalidate it:
+
+## ⚠️ RISK CHECK
+- Key warning:
+- Avoid trade if:
+
+## 📝 FINAL REPORT
+Give a concise 3-5 sentence conclusion. State explicitly when the screenshot is insufficient for a reliable trade setup.
+""".strip()
+
+    url = "https://api.openai.com/v1/responses"
+    body = {
+        "model": model,
+        "input": [{
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": prompt},
+                {
+                    "type": "input_image",
+                    "image_url": f"data:{mime};base64,{image_b64}",
+                },
+            ],
+        }],
+    }
+
+    response = requests.post(
+        url,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        json=body,
+        timeout=120,
+    )
+
+    if not response.ok:
+        try:
+            err = response.json()
+        except Exception:
+            err = response.text
+        raise RuntimeError(f"OpenAI API error {response.status_code}: {str(err)[:500]}")
+
+    payload = response.json()
+    report = _extract_openai_response_text(payload)
+    if not report:
+        raise RuntimeError("OpenAI returned an empty chart-analysis report.")
+    return report
+
+
+def _show_ai_chart_analysis_tab(fyers, all_symbols, fo_symbols):
+    """AI chart-image analysis. Existing scanners/session data remain unchanged."""
+    st.markdown("### 🤖 AI CHART ANALYSIS — PASTE ANY CHART → GET REPORT")
+    st.caption(
+        "Upload/paste any visible trading chart. The screenshot itself is analyzed — "
+        "no stock selection and no FYERS symbol is used for the chart report."
+    )
+
     st.markdown("#### 📤 Chart Screenshot")
-    st.caption("Upload a screenshot OR copy a chart image and paste it from your clipboard.")
+    st.caption("Upload a TradingView/Fyers chart screenshot OR paste a copied chart image.")
 
     uploaded_chart = st.file_uploader(
         "📁 Upload chart screenshot",
         type=["png", "jpg", "jpeg", "webp"],
         key="ai_chart_upload",
-        help="Upload a TradingView/Fyers chart screenshot. Live AI scoring below still uses Fyers market data."
+        help="Any chart screenshot: NIFTY, BANKNIFTY, stock, crypto, commodity, etc.",
     )
 
     if PASTE_IMAGE_AVAILABLE:
@@ -4447,25 +4591,27 @@ def _show_ai_chart_analysis_tab(fyers, all_symbols, fo_symbols):
                 pasted_buffer = io.BytesIO()
                 paste_result.image_data.save(pasted_buffer, format="PNG")
                 st.session_state["ai_chart_pasted_bytes"] = pasted_buffer.getvalue()
+                st.session_state["ai_chart_submitted"] = False
             except Exception as paste_err:
                 st.warning(f"Could not read pasted image: {paste_err}")
     else:
-        st.info("📋 Clipboard paste needs the `streamlit-paste-button` package in requirements.txt. The upload button above still works.")
+        st.info(
+            "📋 Clipboard paste needs the `streamlit-paste-button` package in requirements.txt. "
+            "The upload button above still works."
+        )
 
     pasted_chart_bytes = st.session_state.get("ai_chart_pasted_bytes")
     chart_ready = uploaded_chart is not None or bool(pasted_chart_bytes)
 
     if uploaded_chart is not None:
-        # Persist uploaded bytes so the Submit button survives Streamlit reruns.
         try:
             st.session_state["ai_chart_uploaded_bytes"] = uploaded_chart.getvalue()
         except Exception:
             pass
-        st.image(uploaded_chart, caption="Uploaded chart")
+        st.image(uploaded_chart, caption="Uploaded chart", use_container_width=True)
     elif pasted_chart_bytes:
-        st.image(pasted_chart_bytes, caption="Pasted chart screenshot")
+        st.image(pasted_chart_bytes, caption="Pasted chart screenshot", use_container_width=True)
 
-    # Explicit submit/confirm step requested by the user.
     submit_col1, submit_col2 = st.columns([3, 1])
     with submit_col1:
         if st.button(
@@ -4481,122 +4627,54 @@ def _show_ai_chart_analysis_tab(fyers, all_symbols, fo_symbols):
                 st.session_state["ai_chart_submitted_bytes"] = pasted_chart_bytes
             st.session_state["ai_chart_submitted"] = True
             st.session_state["ai_chart_submit_time"] = _generated_timestamp()
-            st.success("✅ Chart submitted successfully. Now select the stock and run AI analysis.")
+            st.session_state["ai_chart_vision_report"] = None
+            st.success("✅ Chart submitted. Now click RUN AI CHART ANALYSIS.")
     with submit_col2:
         if st.session_state.get("ai_chart_submitted"):
             st.success("SUBMITTED")
 
     submitted_chart_bytes = st.session_state.get("ai_chart_submitted_bytes")
-    if submitted_chart_bytes:
-        st.caption("✅ Submitted chart is ready for analysis")
-
-    c1, c2 = st.columns(2)
-    with c1:
-        source = st.radio("Universe", ["NSE", "F&O"], horizontal=True, key="ai_chart_source")
-    with c2:
-        universe = all_symbols if source == "NSE" else fo_symbols
-        if not universe:
-            st.error(f"No {source} symbols available.")
-            return
-        symbol = st.selectbox("Select stock", universe, key="ai_chart_symbol")
-
-    if st.button("🤖 RUN AI CHART ANALYSIS", key="ai_chart_run", type="primary", use_container_width=True):
-        with st.spinner(f"Analyzing {symbol} across 5M / 15M / 1H…"):
-            try:
-                a5 = analyze_timeframe(fyers, symbol, "5")
-                a15 = analyze_timeframe(fyers, symbol, "15")
-                a1h = analyze_timeframe(fyers, symbol, "60")
-                if a5.get("status") != "OK" or a5.get("df") is None:
-                    raise ValueError("5M chart data unavailable")
-                signal = _ai_chart_signal(a5, a15, a1h)
-                next_bias = calculate_next_candle_bias(a5["df"], a5)
-                movement = calculate_movement_metrics(a5["df"])
-                big_move = detect_big_move_setup(a5["df"])
-                st.session_state["ai_chart_analysis"] = {
-                    "symbol": symbol, "a5": a5, "a15": a15, "a1h": a1h,
-                    "signal": signal, "next_bias": next_bias,
-                    "movement": movement, "big_move": big_move,
-                    "scanned_at": _generated_timestamp(),
-                }
-            except Exception as e:
-                st.session_state["ai_chart_analysis"] = None
-                st.error(f"❌ AI chart analysis failed: {type(e).__name__}: {str(e)[:180]}")
-
-    result = st.session_state.get("ai_chart_analysis")
-    if not result:
-        st.info("👈 Select a stock and click RUN AI CHART ANALYSIS.")
+    if not submitted_chart_bytes:
+        st.info("👆 Upload/paste a chart and click SUBMIT CHART FOR AI ANALYSIS.")
         return
 
-    ticker = str(result["symbol"]).replace("NSE:", "").replace("-EQ", "")
-    sig = result["signal"]
-    nb = result["next_bias"]
-    mv = result["movement"]
-    bm = result["big_move"]
-    d5 = result["a5"].get("data", {}) or {}
-    d15 = result["a15"].get("data", {}) or {}
-    d1h = result["a1h"].get("data", {}) or {}
+    st.caption("✅ Submitted chart is ready. No stock selection is required.")
 
-    if "BUY" in sig["direction"]:
-        st.success(f"{ticker}: {sig['direction']} — Confidence {sig['confidence']:.1f}%")
-    elif "SELL" in sig["direction"]:
-        st.error(f"{ticker}: {sig['direction']} — Confidence {sig['confidence']:.1f}%")
-    else:
-        st.warning(f"{ticker}: {sig['direction']} — Confidence {sig['confidence']:.1f}%")
+    if st.button(
+        "🤖 RUN AI CHART ANALYSIS",
+        key="ai_chart_run",
+        type="primary",
+        use_container_width=True,
+    ):
+        with st.spinner("🔎 Reading the submitted chart and generating the report…"):
+            try:
+                report = _analyze_submitted_chart_image(submitted_chart_bytes)
+                st.session_state["ai_chart_vision_report"] = report
+                st.session_state["ai_chart_report_time"] = _generated_timestamp()
+            except Exception as e:
+                st.session_state["ai_chart_vision_report"] = None
+                st.error(f"❌ Chart AI analysis failed: {type(e).__name__}: {str(e)[:700]}")
 
-    m1, m2, m3, m4, m5 = st.columns(5)
-    m1.metric("AI BUY SCORE", f"{sig['buy_score']:.1f}")
-    m2.metric("AI SELL SCORE", f"{sig['sell_score']:.1f}")
-    m3.metric("NEXT CANDLE", str(nb.get("bias", "NEUTRAL")))
-    m4.metric("NEXT CONFIDENCE", f"{nb.get('confidence', 0):.1f}%")
-    m5.metric("RVOL", f"{float(d5.get('rvol', 0) or 0):.2f}x")
+    report = st.session_state.get("ai_chart_vision_report")
+    if not report:
+        st.info("👈 Click RUN AI CHART ANALYSIS to analyze the submitted screenshot.")
+        return
 
-    _plot_ai_candles(result["a5"]["df"], ticker, sig)
+    st.markdown("---")
+    st.markdown("## 📋 AI CHART REPORT")
+    st.markdown(report)
+    st.caption(
+        f"Report generated: {st.session_state.get('ai_chart_report_time', 'N/A')} | "
+        "Educational analysis only — confirm live price/action before trading."
+    )
 
-    st.markdown("### ⏱️ MTF Confirmation")
-    t1, t2, t3 = st.columns(3)
-    with t1:
-        st.metric("5M TREND", str(d5.get("structure_trend", "N/A")))
-        st.caption(f"Structure: {d5.get('structure_type', 'N/A')}")
-    with t2:
-        st.metric("15M TREND", str(d15.get("structure_trend", "N/A")))
-        st.caption(f"EMA: {d15.get('ema_trend', 'N/A')}")
-    with t3:
-        st.metric("1H TREND", str(d1h.get("structure_trend", "N/A")))
-        st.caption(f"EMA50/200: {d1h.get('ema50', 'N/A')} / {d1h.get('ema200', 'N/A')}")
-
-    st.markdown("### ⚡ Pre-Move / Big-Move Check")
-    p1, p2, p3, p4 = st.columns(4)
-    p1.metric("5M MOVE %", f"{mv.get('move_5m_pct', 0):.2f}%")
-    p2.metric("15M MOVE %", f"{mv.get('move_15m_pct', 0):.2f}%")
-    p3.metric("BIG MOVE SCORE", f"{bm.get('score', 0):.1f}")
-    p4.metric("BIG MOVE", str(bm.get("signal", "NO BIG MOVE")))
-
-    st.markdown("### 🧠 AI Reason")
-    st.info(sig.get("reason", "No explanation available."))
-
-    detail = pd.DataFrame([{
-        "STOCK": ticker,
-        "AI DIRECTION": sig["direction"],
-        "AI CONFIDENCE %": sig["confidence"],
-        "BUY SCORE": sig["buy_score"],
-        "SELL SCORE": sig["sell_score"],
-        "NEXT CANDLE": nb.get("bias"),
-        "NEXT CONFIDENCE %": nb.get("confidence"),
-        "5M TREND": d5.get("structure_trend"),
-        "15M TREND": d15.get("structure_trend"),
-        "1H TREND": d1h.get("structure_trend"),
-        "RSI": d5.get("rsi"),
-        "RVOL": d5.get("rvol"),
-        "VWAP": d5.get("vwap"),
-        "PRESSURE": d5.get("pressure_trend"),
-        "BIG MOVE": bm.get("signal"),
-        "BIG MOVE SCORE": bm.get("score"),
-        "REASON": sig.get("reason"),
+    report_df = pd.DataFrame([{
+        "REPORT TIME": st.session_state.get("ai_chart_report_time", "N/A"),
+        "ANALYSIS SOURCE": "Submitted chart screenshot",
+        "REPORT": report,
     }])
-    st.dataframe(detail, use_container_width=True, hide_index=True)
-    _excel_download_button(detail, "AI_CHART_ANALYSIS", "ai_chart_excel")
+    _excel_download_button(report_df, "AI_CHART_VISION_REPORT", "ai_chart_vision_excel")
 
-    st.caption(f"Last AI chart analysis: {result.get('scanned_at', 'N/A')}")
 
 # MAIN APP - V17 WITH NEW MOMENTUM MOVERS TAB
 # ════════════════════════════════════════════════════════════════════════════════
