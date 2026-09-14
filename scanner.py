@@ -4615,23 +4615,43 @@ def _show_ai_chart_analysis_tab(fyers, all_symbols, fo_symbols):
     submit_col1, submit_col2 = st.columns([3, 1])
     with submit_col1:
         if st.button(
-            "📤 SUBMIT CHART FOR AI ANALYSIS",
+            "🧠 SMART SUBMIT → ANALYZE CHART",
             key="ai_chart_submit",
             type="primary",
             use_container_width=True,
             disabled=not chart_ready,
+            help="Submits the pasted/uploaded screenshot and immediately sends that exact image for AI chart analysis.",
         ):
-            if uploaded_chart is not None:
-                st.session_state["ai_chart_submitted_bytes"] = uploaded_chart.getvalue()
-            elif pasted_chart_bytes:
-                st.session_state["ai_chart_submitted_bytes"] = pasted_chart_bytes
-            st.session_state["ai_chart_submitted"] = True
-            st.session_state["ai_chart_submit_time"] = _generated_timestamp()
-            st.session_state["ai_chart_vision_report"] = None
-            st.success("✅ Chart submitted. Now click RUN AI CHART ANALYSIS.")
+            try:
+                if uploaded_chart is not None:
+                    submitted_bytes = uploaded_chart.getvalue()
+                elif pasted_chart_bytes:
+                    submitted_bytes = pasted_chart_bytes
+                else:
+                    submitted_bytes = None
+
+                if not submitted_bytes:
+                    raise ValueError("No chart image was found. Please upload or paste a chart first.")
+
+                st.session_state["ai_chart_submitted_bytes"] = submitted_bytes
+                st.session_state["ai_chart_submitted"] = True
+                st.session_state["ai_chart_submit_time"] = _generated_timestamp()
+                st.session_state["ai_chart_vision_report"] = None
+
+                with st.spinner("🧠 SMART AI is reading the submitted chart…"):
+                    report = _analyze_submitted_chart_image(submitted_bytes)
+
+                st.session_state["ai_chart_vision_report"] = report
+                st.session_state["ai_chart_report_time"] = _generated_timestamp()
+                st.success("✅ Chart submitted + AI analysis completed successfully.")
+            except Exception as e:
+                st.session_state["ai_chart_submitted"] = False
+                st.session_state["ai_chart_vision_report"] = None
+                st.error(f"❌ Smart chart analysis failed: {type(e).__name__}: {str(e)[:700]}")
+
     with submit_col2:
         if st.session_state.get("ai_chart_submitted"):
-            st.success("SUBMITTED")
+            st.success("✅ SUBMITTED")
 
     submitted_chart_bytes = st.session_state.get("ai_chart_submitted_bytes")
     if not submitted_chart_bytes:
