@@ -4749,11 +4749,12 @@ Give a concise 3-5 sentence conclusion. State explicitly when the screenshot is 
 def _show_ai_chart_analysis_tab(fyers, all_symbols, fo_symbols):
     """ADDITION only: keep the old NSE/F&O stock analysis and add screenshot analysis."""
     st.markdown("### 🤖 AI CHART ANALYSIS")
+    st.success("📷 DEFAULT: Paste / Upload your chart here — NSE/F&O stock selection is NOT used for screenshot analysis.")
     mode = st.radio(
         "Analysis Type",
         ["📷 CHART SCREENSHOT ANALYSIS", "📊 EXISTING STOCK ANALYSIS"],
         horizontal=True,
-        key="ai_chart_analysis_mode",
+        key="ai_chart_analysis_mode_v2",
     )
 
     if mode == "📊 EXISTING STOCK ANALYSIS":
