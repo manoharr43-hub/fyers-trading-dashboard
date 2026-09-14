@@ -4453,11 +4453,42 @@ def _show_ai_chart_analysis_tab(fyers, all_symbols, fo_symbols):
         st.info("📋 Clipboard paste needs the `streamlit-paste-button` package in requirements.txt. The upload button above still works.")
 
     pasted_chart_bytes = st.session_state.get("ai_chart_pasted_bytes")
+    chart_ready = uploaded_chart is not None or bool(pasted_chart_bytes)
+
     if uploaded_chart is not None:
+        # Persist uploaded bytes so the Submit button survives Streamlit reruns.
+        try:
+            st.session_state["ai_chart_uploaded_bytes"] = uploaded_chart.getvalue()
+        except Exception:
+            pass
         st.image(uploaded_chart, caption="Uploaded chart")
     elif pasted_chart_bytes:
         st.image(pasted_chart_bytes, caption="Pasted chart screenshot")
 
+    # Explicit submit/confirm step requested by the user.
+    submit_col1, submit_col2 = st.columns([3, 1])
+    with submit_col1:
+        if st.button(
+            "📤 SUBMIT CHART FOR AI ANALYSIS",
+            key="ai_chart_submit",
+            type="primary",
+            use_container_width=True,
+            disabled=not chart_ready,
+        ):
+            if uploaded_chart is not None:
+                st.session_state["ai_chart_submitted_bytes"] = uploaded_chart.getvalue()
+            elif pasted_chart_bytes:
+                st.session_state["ai_chart_submitted_bytes"] = pasted_chart_bytes
+            st.session_state["ai_chart_submitted"] = True
+            st.session_state["ai_chart_submit_time"] = _generated_timestamp()
+            st.success("✅ Chart submitted successfully. Now select the stock and run AI analysis.")
+    with submit_col2:
+        if st.session_state.get("ai_chart_submitted"):
+            st.success("SUBMITTED")
+
+    submitted_chart_bytes = st.session_state.get("ai_chart_submitted_bytes")
+    if submitted_chart_bytes:
+        st.caption("✅ Submitted chart is ready for analysis")
 
     c1, c2 = st.columns(2)
     with c1:
@@ -5773,30 +5804,10 @@ def show_scanner(fyers) -> None:
 # ════════════════════════════════════════════════════════════════════════════════
 if __name__ == "__main__":
     try:
-        # Read credentials from environment first, then Streamlit Secrets.
-        access_token = os.environ.get("FYERS_ACCESS_TOKEN", "").strip()
-        app_id = os.environ.get("FYERS_APP_ID", "").strip()
-
+        access_token = os.environ.get("FYERS_ACCESS_TOKEN")
         if not access_token:
-            try:
-                access_token = str(st.secrets.get("FYERS_ACCESS_TOKEN", "")).strip()
-            except Exception:
-                access_token = ""
-
-        if not app_id:
-            try:
-                app_id = str(st.secrets.get("FYERS_APP_ID", "")).strip()
-            except Exception:
-                app_id = ""
-
-        if not access_token:
-            st.error("❌ FYERS access token not configured")
-            st.info("For Streamlit Cloud, add FYERS_ACCESS_TOKEN in App → Settings → Secrets. Do not paste your token in chat.")
-            st.stop()
-
-        if not app_id:
-            st.error("❌ FYERS_APP_ID not configured")
-            st.info("Add FYERS_APP_ID in Streamlit Secrets or environment variables.")
+            st.error("❌ FYERS_ACCESS_TOKEN not set in environment variables")
+            st.info("Please set: export FYERS_ACCESS_TOKEN='your_token_here'")
             st.stop()
         
         try:
@@ -5805,6 +5816,8 @@ if __name__ == "__main__":
             st.error("❌ fyers-api not installed")
             st.code("pip install fyers-api", language="bash")
             st.stop()
+        
+        app_id = os.environ.get("FYERS_APP_ID", "DEMO")
         
         try:
             fyers = fyersModel.FyersModel(client_id=app_id, token=access_token, log_path="")
@@ -5815,8 +5828,8 @@ if __name__ == "__main__":
             logger.error(f"Fyers initialization error: {init_error}", exc_info=True)
             
             with st.expander("Debug Information"):
-                st.write(f"App ID configured: {bool(app_id)}")
-                st.write(f"Token configured: {bool(access_token)}")
+                st.write(f"App ID: {app_id}")
+                st.write(f"Token set: {bool(access_token)}")
                 st.write(f"Error: {init_error}")
     
     except Exception as e:
