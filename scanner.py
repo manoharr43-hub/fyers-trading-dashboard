@@ -5052,13 +5052,6 @@ def _show_ai_chart_analysis_tab(fyers, all_symbols, fo_symbols):
     )
 
 
-    # Existing scanner/stock AI analysis is preserved as an optional section.
-    # It is intentionally below the independent screenshot workflow so the user
-    # never needs to select NSE/F&O just to submit a chart image.
-    st.markdown("---")
-    with st.expander("📊 EXISTING NSE/F&O STOCK AI ANALYSIS — OPTIONAL", expanded=False):
-        _show_legacy_ai_chart_analysis_tab(fyers, all_symbols, fo_symbols)
-
 
 def show_scanner(fyers) -> None:
     """Streamlit main app - NSE AI PRO V17 with MOMENTUM MOVERS"""
