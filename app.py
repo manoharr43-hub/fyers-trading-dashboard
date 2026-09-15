@@ -318,8 +318,15 @@ with st.sidebar:
     current = st.session_state.get("main_navigation", items[0])
     if current not in items:
         current = items[0]
-    st.session_state["main_navigation"] = st.radio(
-        "Navigation", items, index=items.index(current), key="main_navigation"
+    # IMPORTANT: Do not assign the widget value back to the same
+    # session_state key in the same statement. Streamlit raises:
+    # StreamlitAPIException: st.session_state["main_navigation"] cannot be
+    # modified after the widget with key "main_navigation" is instantiated.
+    st.radio(
+        "Navigation",
+        items,
+        index=items.index(current),
+        key="main_navigation",
     )
     st.divider()
     st.caption("Main entry point: app.py")
