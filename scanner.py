@@ -4651,7 +4651,7 @@ def _show_ai_chart_analysis_tab():
         st.image(
             candidate_bytes,
             caption=f"Preview — {candidate_source} (this exact image will be submitted)",
-            use_container_width=True,
+            width="stretch",
         )
 
     chart_ready = bool(candidate_bytes)
@@ -4726,7 +4726,7 @@ def _show_ai_chart_analysis_tab():
     st.image(
         submitted_bytes,
         caption=f"Exact submitted chart image • {st.session_state.get('ai_chart_vision_submit_time_v3', 'N/A')}",
-        use_container_width=True,
+        width="stretch",
     )
 
     def _r(key: str, default: str = "N/A") -> str:
