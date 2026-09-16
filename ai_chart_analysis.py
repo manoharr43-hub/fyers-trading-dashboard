@@ -1,747 +1,564 @@
 import base64
+import os
 import requests
 import streamlit as st
-import pandas as pd
-import numpy as np
 from datetime import datetime
-import plotly.graph_objects as go
-from streamlit_autorefresh import rerun_script
-import os
-from dotenv import load_dotenv
 
 
 # ============================================================
-# LOAD ENVIRONMENT
+# 🤖 AI CHART ANALYSIS
+# IMPORTANT:
+# - FYERS IS NOT USED HERE
+# - SCANNER IS NOT USED HERE
+# - ONLY CHART IMAGE IS SENT TO AI
 # ============================================================
 
-load_dotenv()
+OLLAMA_URL = os.getenv(
+    "OLLAMA_URL",
+    "http://localhost:11434/api/chat"
+)
 
-
-# ============================================================
-# PAGE CONFIG
-# ============================================================
-
-st.set_page_config(
-    page_title="🤖 AI Chart Analysis",
-    page_icon="📊",
-    layout="wide",
-    initial_sidebar_state="expanded"
+OLLAMA_MODEL = os.getenv(
+    "OLLAMA_MODEL",
+    "qwen2.5vl:7b"
 )
 
 
 # ============================================================
-# CUSTOM STYLING
-# ============================================================
-
-st.markdown("""
-<style>
-    .main {
-        padding: 2rem;
-    }
-    .stButton>button {
-        width: 100%;
-        border-radius: 5px;
-        font-weight: 600;
-    }
-    .header-text {
-        color: #1f77b4;
-        font-weight: 700;
-    }
-</style>
-""", unsafe_allow_html=True)
-
-
-# ============================================================
-# OPENAI CONFIG
-# ============================================================
-
-OPENAI_API_URL = "https://api.openai.com/v1/messages"
-
-
-# ============================================================
-# STREAMLIT SECRETS HELPER
+# HELPERS
 # ============================================================
 
 def _secret(name, default=""):
-    """Safely retrieve secrets from Streamlit config or environment."""
     try:
-        # Try Streamlit secrets first
-        value = st.secrets.get(name, None)
+        value = st.secrets.get(name, default)
         if value:
-            return str(value).strip()
+            return value
     except Exception:
         pass
-    
-    # Try environment variables
-    value = os.getenv(name, default)
-    if value:
-        return str(value).strip()
-    
-    return default
+
+    return os.getenv(name, default)
 
 
-# ============================================================
-# IMAGE MIME DETECTION
-# ============================================================
-
-def _chart_image_mime(image_bytes):
-    """
-    Detect image MIME type from actual file bytes.
-    Supports: PNG, JPEG, WebP
-    """
-    if not image_bytes:
+def _get_mime(file_name):
+    if not file_name:
         return "image/png"
 
-    # PNG signature
-    if image_bytes.startswith(b"\x89PNG\r\n\x1a\n"):
-        return "image/png"
+    name = file_name.lower()
 
-    # JPEG signature
-    if image_bytes.startswith(b"\xff\xd8\xff"):
+    if name.endswith(".jpg") or name.endswith(".jpeg"):
         return "image/jpeg"
 
-    # WebP signature
-    if (
-        image_bytes.startswith(b"RIFF")
-        and len(image_bytes) >= 12
-        and image_bytes[8:12] == b"WEBP"
-    ):
+    if name.endswith(".webp"):
         return "image/webp"
 
-    # Default fallback
     return "image/png"
 
 
-# ============================================================
-# OUTPUT TEXT EXTRACTOR
-# ============================================================
+def _extract_ai_text(data):
+    try:
+        return data["message"]["content"]
+    except Exception:
+        pass
 
-def _output_text(data):
-    """
-    Extract text from OpenAI API response.
-    Handles both new and legacy response formats.
-    """
-    # New API response format
-    if isinstance(data, dict) and data.get("content"):
-        parts = []
-        for content_block in data.get("content", []):
-            if isinstance(content_block, dict) and content_block.get("type") == "text":
-                text = content_block.get("text", "")
-                if text:
-                    parts.append(text)
-        return "\n".join(parts).strip()
-    
-    # Legacy format
-    if data.get("output_text"):
-        return str(data["output_text"]).strip()
+    try:
+        return data["response"]
+    except Exception:
+        pass
 
-    parts = []
-    for item in data.get("output", []):
-        if not isinstance(item, dict):
-            continue
-
-        for content in item.get("content", []):
-            if not isinstance(content, dict):
-                continue
-
-            if content.get("type") == "text":
-                text = content.get("text")
-                if text:
-                    parts.append(str(text))
-
-    return "\n".join(parts).strip()
+    return ""
 
 
 # ============================================================
-# OPENAI CHART ANALYSIS
+# AI PROMPT
 # ============================================================
 
-def _analyze(image_bytes, mime=None):
-    """
-    Submit chart image to OpenAI for technical analysis.
-    Returns detailed chart analysis report.
-    """
+AI_SYSTEM_PROMPT = """
+You are an AI chart-analysis assistant.
 
-    if not image_bytes:
-        raise RuntimeError("❌ No chart image was supplied.")
+IMPORTANT RULES:
 
-    # --------------------------------------------------------
-    # API KEY VALIDATION
-    # --------------------------------------------------------
+1. Analyze ONLY the supplied chart image.
+2. DO NOT use FYERS data.
+3. DO NOT use NSE scanner data.
+4. DO NOT request or assume live market data.
+5. Do not invent price values.
+6. If a value is not readable, write N/A.
+7. Clearly separate visible chart facts from interpretation.
+8. Do not claim certainty.
+9. Do not guarantee profit.
+10. If the chart is unclear, say WAIT / INSUFFICIENT DATA.
+11. Analyze candles, trend structure, support, resistance,
+    volume if visible, momentum, breakout/breakdown,
+    liquidity sweep, and price action.
+12. Use only information visible in the image.
 
-    key = _secret("OPENAI_API_KEY")
+Return a practical structured analysis.
+"""
 
-    if not key:
-        raise RuntimeError(
-            "❌ OPENAI_API_KEY is missing. "
-            "Add OPENAI_API_KEY to environment or Streamlit Secrets."
-        )
 
-    # --------------------------------------------------------
-    # MODEL SELECTION
-    # --------------------------------------------------------
+AI_USER_PROMPT = """
+Analyze this chart screenshot.
 
-    model = _secret("OPENAI_MODEL", "gpt-4-vision")
-
-    # --------------------------------------------------------
-    # MIME TYPE DETECTION
-    # --------------------------------------------------------
-
-    detected_mime = _chart_image_mime(image_bytes)
-    mime = detected_mime if (not mime or not str(mime).startswith("image/")) else mime
-    mime = detected_mime  # Always trust actual file bytes
-
-    # --------------------------------------------------------
-    # BASE64 ENCODING
-    # --------------------------------------------------------
-
-    image64 = base64.b64encode(image_bytes).decode("utf-8")
-
-    # --------------------------------------------------------
-    # TECHNICAL ANALYSIS PROMPT
-    # --------------------------------------------------------
-
-    system_prompt = """You are an expert technical chart analyst with 20+ years of trading experience in NSE, BSE, F&O, and international markets.
-
-CRITICAL RULES:
-1. Analyze ONLY the supplied chart image - no external data
-2. Do NOT assume instrument if not visible
-3. Do NOT invent prices, levels, or candle values
-4. If information is unclear or unreadable, write "N/A"
-5. Separate visible FACTS from INFERENCE clearly
-6. Never claim certainty about future price movement
-7. Give practical analysis based only on visible information
-8. If chart is too unclear, recommend NOT to trade"""
-
-    analysis_prompt = """Analyze this trading chart and provide a comprehensive technical analysis report:
+Give the result in the following format:
 
 1. INSTRUMENT
-   - What is being traded? (Stock, Index, Commodity, etc.)
-
 2. TIMEFRAME
-   - What is the chart timeframe? (1min, 5min, 15min, 1H, 4H, 1D, etc.)
-
 3. CURRENT PRICE
-   - What is the latest visible price?
-   - Is this a high/low/close price?
-
 4. MARKET DIRECTION
-   - BULLISH (uptrend)
-   - BEARISH (downtrend)
-   - SIDEWAYS (range/consolidation)
-
 5. TREND STRUCTURE
-   - Higher High / Higher Low (uptrend)
-   - Lower High / Lower Low (downtrend)
-   - Range/Consolidation
-   - Trend change if visible
+6. SWING HIGH
+7. SWING LOW
+8. SUPPORT LEVELS
+9. RESISTANCE LEVELS
+10. BREAKOUT STATUS
+11. BREAKDOWN STATUS
+12. LIQUIDITY / STOP HUNT
+13. VOLUME OBSERVATION
+14. MOMENTUM
+15. CANDLE PATTERN
+16. CALL / PUT BIAS
+17. SCALPING SETUP
+18. ENTRY ZONE
+19. STOP LOSS
+20. TARGET 1
+21. TARGET 2
+22. RISK / REWARD
+23. NEXT PROBABLE MOVE
+24. CONFIRMATION REQUIRED
+25. WARNING SIGNALS
+26. CONFIDENCE
+27. FINAL ACTION
 
-6. SUPPORT LEVELS
-   - Key support price levels (use N/A if unreadable)
+For FINAL ACTION use only one:
 
-7. RESISTANCE LEVELS
-   - Key resistance price levels (use N/A if unreadable)
+BUY CALL
+BUY PUT
+SELL CALL
+SELL PUT
+WAIT
 
-8. BREAKOUT/BREAKDOWN STATUS
-   - Confirmed breakout (with volume)
-   - Confirmed breakdown (with volume)
-   - Possible breakout/breakdown
-   - None visible
+If the chart does not provide enough information,
+use WAIT.
 
-9. LIQUIDITY PATTERNS
-   - Liquidity sweeps visible?
-   - Rejection zones?
-   - Stop hunts?
-
-10. VOLUME ANALYSIS
-    - Is volume confirming price action?
-    - High volume breakout/breakdown?
-
-11. MOMENTUM INDICATORS
-    - RSI, MACD, Stochastic, or other visible indicators
-    - What does momentum show?
-
-12. CALL/PUT BIAS (For F&O traders)
-    - Should I buy CALLS or PUTS?
-    - Why? (Technical reasoning)
-
-13. SCALPING SETUP
-    - Is this a good scalp setup?
-    - If yes, how many points target?
-    - If no, why not?
-
-14. ENTRY POINT
-    - EXACT entry price (only if clearly derivable)
-    - Or write "N/A" if unclear
-
-15. STOP LOSS
-    - Where should SL be placed?
-    - Points above/below current price?
-
-16. TARGET 1 (First profit taking)
-    - Target price or points?
-
-17. TARGET 2 (Second profit taking)
-    - Target price or points?
-
-18. RISK/REWARD RATIO
-    - Calculate: (Target - Entry) / (Entry - SL)
-    - Should be minimum 1:2
-
-19. HOLDING TIME
-    - How long should this trade be held?
-    - Scalp (seconds to minutes)
-    - Swing (hours to days)
-    - Position (days to weeks)
-
-20. NEXT LIKELY MOVE
-    - What's the next expected price action?
-    - Probability-based reasoning (not certainty)
-
-21. CONFLUENCE
-    - How many technical indicators confirm this setup?
-    - Is there confluence with multiple timeframes?
-
-22. CONFIDENCE LEVEL
-    - LOW (unclear setup, conflicting signals)
-    - MEDIUM (some confirmation, moderate risk)
-    - HIGH (strong confluence, clear signals)
-
-23. WARNING SIGNALS
-    - Any signals suggesting to AVOID this trade?
-    - Divergences? Weak volume? Unconfirmed breakout?
-
-24. FINAL ACTION
-    Choose EXACTLY ONE:
-    ✅ BUY CALL (for upside)
-    ✅ BUY PUT (for downside)
-    ✅ SELL CALL (for downside, advanced)
-    ✅ SELL PUT (for upside, advanced)
-    ❌ WAIT (if setup is unclear or risky)
-
-CRITICAL REMINDERS:
-- Never hallucinate exact price levels
-- If anything is unreadable, use "N/A"
-- If setup is unclear, FINAL ACTION must be WAIT
-- This is technical analysis only - NOT financial advice
-- Always verify before trading
-- Risk management is critical"""
-
-    # --------------------------------------------------------
-    # OPENAI API PAYLOAD
-    # --------------------------------------------------------
-
-    payload = {
-        "model": model,
-        "max_tokens": 3000,
-        "system": system_prompt,
-        "messages": [
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "text",
-                        "text": analysis_prompt
-                    },
-                    {
-                        "type": "image",
-                        "source": {
-                            "type": "base64",
-                            "media_type": mime,
-                            "data": image64
-                        }
-                    }
-                ]
-            }
-        ]
-    }
-
-    # --------------------------------------------------------
-    # API REQUEST
-    # --------------------------------------------------------
-
-    try:
-        response = requests.post(
-            OPENAI_API_URL,
-            headers={
-                "Authorization": f"Bearer {key}",
-                "Content-Type": "application/json"
-            },
-            json=payload,
-            timeout=120
-        )
-
-    except requests.exceptions.Timeout:
-        raise RuntimeError("⏱️ OpenAI request timed out. Please try again.")
-    except requests.exceptions.ConnectionError:
-        raise RuntimeError("🌐 Could not connect to OpenAI API. Check internet connection.")
-    except requests.exceptions.RequestException as e:
-        raise RuntimeError(f"🔗 Connection error: {str(e)[:200]}")
-
-    # --------------------------------------------------------
-    # API ERROR HANDLING
-    # --------------------------------------------------------
-
-    if response.status_code >= 400:
-        try:
-            error_data = response.json()
-            error_message = error_data.get("error", {}).get("message", "")
-            if error_message:
-                raise RuntimeError(f"OpenAI API Error {response.status_code}: {error_message}")
-        except ValueError:
-            pass
-        raise RuntimeError(f"OpenAI API Error {response.status_code}: {response.text[:500]}")
-
-    # --------------------------------------------------------
-    # PARSE JSON RESPONSE
-    # --------------------------------------------------------
-
-    try:
-        data = response.json()
-    except ValueError:
-        raise RuntimeError("OpenAI returned invalid JSON response.")
-
-    # --------------------------------------------------------
-    # EXTRACT ANALYSIS REPORT
-    # --------------------------------------------------------
-
-    report = _output_text(data)
-
-    if not report:
-        raise RuntimeError("AI returned empty analysis report.")
-
-    return report
+Do not invent numbers.
+"""
 
 
 # ============================================================
-# IMAGE UPLOAD HANDLER
+# LOCAL AI ANALYSIS
+# ============================================================
+
+def _analyze_chart(image_bytes, mime_type):
+    if not image_bytes:
+        return "❌ Chart image not found."
+
+    try:
+        # Convert image to Base64
+        image_b64 = base64.b64encode(image_bytes).decode("utf-8")
+
+        payload = {
+            "model": OLLAMA_MODEL,
+            "stream": False,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": AI_SYSTEM_PROMPT
+                },
+                {
+                    "role": "user",
+                    "content": AI_USER_PROMPT,
+                    "images": [image_b64]
+                }
+            ]
+        }
+
+        response = requests.post(
+            OLLAMA_URL,
+            json=payload,
+            timeout=180
+        )
+
+        if response.status_code != 200:
+            return (
+                "❌ AI connection error.\n\n"
+                f"HTTP Status: {response.status_code}\n\n"
+                f"{response.text[:1000]}"
+            )
+
+        data = response.json()
+
+        report = _extract_ai_text(data)
+
+        if not report:
+            return "❌ AI returned an empty analysis."
+
+        return report
+
+    except requests.exceptions.ConnectionError:
+        return """
+❌ LOCAL AI CONNECT AVVALÉDU
+
+Ollama running లేదు.
+
+Terminal లో:
+
+ollama serve
+
+అని run చేసి Streamlit app ని మళ్లీ start చేయండి.
+"""
+
+    except requests.exceptions.Timeout:
+        return """
+❌ AI ANALYSIS TIMEOUT
+
+Chart analysis ఎక్కువ సమయం తీసుకుంది.
+
+కొంచెం చిన్న chart screenshot upload చేసి మళ్లీ Analyze చేయండి.
+"""
+
+    except Exception as e:
+        return f"""
+❌ AI ANALYSIS ERROR
+
+{str(e)}
+"""
+
+
+# ============================================================
+# IMAGE UPLOAD
 # ============================================================
 
 def _get_uploaded_image():
-    """Handle chart image upload."""
     uploaded = st.file_uploader(
-        "📷 Upload chart screenshot",
+        "📷 Upload Chart Screenshot",
         type=["png", "jpg", "jpeg", "webp"],
-        key="ai_chart_upload_main"
+        key="ai_chart_upload"
     )
 
-    if uploaded is not None:
-        try:
-            image_bytes = uploaded.getvalue()
-            if image_bytes:
-                mime = _chart_image_mime(image_bytes)
-                return image_bytes, mime
-        except Exception as e:
-            st.error(f"❌ Error reading image: {e}")
+    if uploaded is None:
+        return None, None
 
-    return None, None
+    return uploaded.getvalue(), _get_mime(uploaded.name)
 
 
 # ============================================================
-# CLIPBOARD PASTE HANDLER
+# PASTE IMAGE
 # ============================================================
 
 def _get_pasted_image():
-    """Handle chart image paste from clipboard."""
     try:
         from streamlit_paste_button import paste_image_button
 
         pasted = paste_image_button(
-            label="📋 Paste chart from clipboard",
-            key="ai_chart_paste_main"
+            label="📋 Paste Chart",
+            key="ai_chart_paste"
         )
 
-        if pasted:
-            if isinstance(pasted, dict):
-                image_bytes = pasted.get("bytes") or pasted.get("image")
-                if image_bytes:
-                    detected = _chart_image_mime(image_bytes)
-                    return image_bytes, detected
+        if pasted is not None:
+            if hasattr(pasted, "image_data"):
+                return pasted.image_data, "image/png"
 
-    except ImportError:
-        st.caption("💡 Clipboard paste plugin not installed.")
-    except Exception as e:
-        st.warning(f"⚠️ Clipboard error: {e}")
+            if isinstance(pasted, bytes):
+                return pasted, "image/png"
+
+    except Exception:
+        pass
 
     return None, None
 
 
 # ============================================================
-# MAIN APPLICATION
+# MAIN PAGE
 # ============================================================
 
-def show_ai_chart_analysis():
-    """Main chart analysis interface."""
+def show_ai_chart_analysis(client=None):
+    """
+    IMPORTANT:
 
-    # ========================================================
-    # HEADER
-    # ========================================================
+    client parameter is accepted only for compatibility
+    with existing app.py.
 
-    col1, col2 = st.columns([3, 1])
-    with col1:
-        st.markdown("# 🤖 AI CHART ANALYSIS")
-    with col2:
-        st.caption(f"⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    FYERS client is NOT used.
+    Scanner is NOT used.
+    """
 
-    st.markdown("---")
-
-    st.info(
-        "📊 **Upload your trading chart** (TradingView, MT5, Fyers, etc.) for AI-powered technical analysis. "
-        "NSE, BSE, F&O, Crypto - all supported!"
+    st.markdown(
+        """
+        <div style="
+            padding:18px;
+            border-radius:15px;
+            background:linear-gradient(135deg,#111827,#1f2937);
+            margin-bottom:20px;
+        ">
+            <h1 style="margin:0;">🤖 AI CHART ANALYSIS</h1>
+            <p style="margin-top:8px;">
+                Chart Image → AI Analysis
+            </p>
+        </div>
+        """,
+        unsafe_allow_html=True
     )
 
-    # ========================================================
-    # INITIALIZE SESSION STATE
-    # ========================================================
+    st.info(
+        "ℹ️ ఈ module లో FYERS LIVE DATA ఉపయోగించబడదు. "
+        "Scanner data కూడా ఉపయోగించబడదు. "
+        "మీరు ఇచ్చిన Chart Image మాత్రమే AI analyze చేస్తుంది."
+    )
+
+    # --------------------------------------------------------
+    # SESSION STATE
+    # --------------------------------------------------------
 
     if "ai_chart_report" not in st.session_state:
-        st.session_state["ai_chart_report"] = ""
+        st.session_state.ai_chart_report = ""
 
     if "ai_chart_image" not in st.session_state:
-        st.session_state["ai_chart_image"] = None
+        st.session_state.ai_chart_image = None
 
     if "ai_chart_mime" not in st.session_state:
-        st.session_state["ai_chart_mime"] = None
+        st.session_state.ai_chart_mime = None
 
-    if "analysis_timestamp" not in st.session_state:
-        st.session_state["analysis_timestamp"] = None
+    if "ai_chart_time" not in st.session_state:
+        st.session_state.ai_chart_time = None
 
-    # ========================================================
-    # IMAGE INPUT SECTION
-    # ========================================================
+    # --------------------------------------------------------
+    # INPUT
+    # --------------------------------------------------------
 
     col1, col2 = st.columns(2)
 
     with col1:
-        st.markdown("### 📤 Upload Image")
-        uploaded_bytes, uploaded_mime = _get_uploaded_image()
-
-        if uploaded_bytes:
-            st.session_state["ai_chart_image"] = uploaded_bytes
-            st.session_state["ai_chart_mime"] = uploaded_mime
-            st.success("✅ Chart uploaded!")
+        upload_bytes, upload_mime = _get_uploaded_image()
 
     with col2:
-        st.markdown("### 📋 Paste Image")
-        pasted_bytes, pasted_mime = _get_pasted_image()
+        paste_bytes, paste_mime = _get_pasted_image()
 
-        if pasted_bytes:
-            st.session_state["ai_chart_image"] = pasted_bytes
-            st.session_state["ai_chart_mime"] = pasted_mime
-            st.success("✅ Chart pasted!")
+    # --------------------------------------------------------
+    # SELECT IMAGE
+    # --------------------------------------------------------
 
-    # ========================================================
-    # GET CURRENT IMAGE
-    # ========================================================
+    image_bytes = None
+    mime_type = None
 
-    image_bytes = st.session_state.get("ai_chart_image")
-    mime = st.session_state.get("ai_chart_mime")
+    if upload_bytes:
+        image_bytes = upload_bytes
+        mime_type = upload_mime
 
-    # ========================================================
-    # IMAGE PREVIEW
-    # ========================================================
+    elif paste_bytes:
+        image_bytes = paste_bytes
+        mime_type = paste_mime
+
+    # --------------------------------------------------------
+    # PREVIEW
+    # --------------------------------------------------------
 
     if image_bytes:
-        st.markdown("---")
-        st.markdown("### 👁️ Chart Preview")
-        col1, col2 = st.columns([2, 1])
-        
-        with col1:
-            st.image(
-                image_bytes,
-                caption="This exact image will be submitted",
-                use_container_width=True
-            )
-        
-        with col2:
-            # Show file info
-            file_size = len(image_bytes) / 1024  # KB
-            st.metric("File Size", f"{file_size:.1f} KB")
-            st.metric("MIME Type", mime)
 
-    # ========================================================
-    # ANALYSIS CONTROLS
-    # ========================================================
+        st.session_state.ai_chart_image = image_bytes
+        st.session_state.ai_chart_mime = mime_type
+
+        st.markdown("### 📊 Chart Preview")
+
+        st.image(
+            image_bytes,
+            use_container_width=True
+        )
+
+        size_kb = len(image_bytes) / 1024
+
+        st.caption(
+            f"Image Size: {size_kb:.1f} KB | "
+            f"MIME: {mime_type}"
+        )
+
+    elif st.session_state.ai_chart_image:
+
+        image_bytes = st.session_state.ai_chart_image
+        mime_type = st.session_state.ai_chart_mime
+
+        st.markdown("### 📊 Current Chart")
+
+        st.image(
+            image_bytes,
+            use_container_width=True
+        )
+
+    # --------------------------------------------------------
+    # BUTTONS
+    # --------------------------------------------------------
 
     st.markdown("---")
 
     col1, col2, col3 = st.columns(3)
 
     with col1:
-        submit = st.button(
+        analyze = st.button(
             "🧠 ANALYZE CHART",
-            type="primary",
             use_container_width=True,
-            disabled=not bool(image_bytes),
-            key="ai_chart_submit"
+            type="primary"
         )
 
     with col2:
         reanalyze = st.button(
             "🔄 RE-ANALYZE",
-            use_container_width=True,
-            disabled=not bool(image_bytes),
-            key="ai_chart_reanalyze"
+            use_container_width=True
         )
 
     with col3:
         clear = st.button(
-            "🗑️ CLEAR ALL",
-            use_container_width=True,
-            disabled=not bool(image_bytes or st.session_state.get("ai_chart_report")),
-            key="ai_chart_clear"
+            "🗑️ CLEAR",
+            use_container_width=True
         )
 
-    # ========================================================
-    # EXECUTE ANALYSIS
-    # ========================================================
-
-    if (submit or reanalyze) and image_bytes:
-        with st.spinner("🧠 AI analyzing chart... Please wait (30-60 seconds)"):
-            try:
-                report = _analyze(image_bytes, mime)
-                st.session_state["ai_chart_report"] = report
-                st.session_state["analysis_timestamp"] = datetime.now()
-                st.success("✅ Analysis completed!")
-
-            except Exception as e:
-                st.session_state["ai_chart_report"] = ""
-                st.error(f"❌ Analysis failed:\n{str(e)}")
-
-    # ========================================================
-    # HANDLE CLEAR ACTION
-    # ========================================================
+    # --------------------------------------------------------
+    # CLEAR
+    # --------------------------------------------------------
 
     if clear:
-        st.session_state["ai_chart_image"] = None
-        st.session_state["ai_chart_mime"] = None
-        st.session_state["ai_chart_report"] = ""
-        st.session_state["analysis_timestamp"] = None
+
+        st.session_state.ai_chart_report = ""
+        st.session_state.ai_chart_image = None
+        st.session_state.ai_chart_mime = None
+        st.session_state.ai_chart_time = None
+
         st.rerun()
 
-    # ========================================================
-    # DISPLAY REPORT
-    # ========================================================
+    # --------------------------------------------------------
+    # ANALYZE
+    # --------------------------------------------------------
 
-    report = st.session_state.get("ai_chart_report", "")
-    timestamp = st.session_state.get("analysis_timestamp")
+    if analyze or reanalyze:
 
-    if report:
+        if not image_bytes:
+            st.warning(
+                "⚠️ ముందుగా Chart Screenshot upload/paste చేయండి."
+            )
+
+        else:
+
+            with st.spinner(
+                "🤖 AI Chart ని analyze చేస్తోంది..."
+            ):
+
+                report = _analyze_chart(
+                    image_bytes,
+                    mime_type
+                )
+
+            st.session_state.ai_chart_report = report
+
+            st.session_state.ai_chart_time = (
+                datetime.now().strftime(
+                    "%d-%m-%Y %H:%M:%S"
+                )
+            )
+
+    # --------------------------------------------------------
+    # REPORT
+    # --------------------------------------------------------
+
+    if st.session_state.ai_chart_report:
+
         st.markdown("---")
-        
-        col1, col2 = st.columns([3, 1])
-        with col1:
-            st.markdown("## 📋 Analysis Report")
-        with col2:
-            if timestamp:
-                st.caption(f"📅 {timestamp.strftime('%H:%M:%S')}")
 
-        # Display report in an expander for better readability
-        with st.expander("📖 Full Report (Click to expand)", expanded=True):
-            st.markdown(report)
+        st.markdown("## 🧠 AI ANALYSIS REPORT")
 
-        st.markdown("---")
+        if st.session_state.ai_chart_time:
+            st.caption(
+                "Analysis Time: "
+                + st.session_state.ai_chart_time
+            )
 
-        # Risk Warning
-        st.warning(
-            "⚠️ **DISCLAIMER**: This is technical analysis only. "
-            "Always verify price, entry, stop-loss, and risk management "
-            "before taking ANY trade. Not financial advice. "
-            "Trade at your own risk!"
+        st.markdown(
+            st.session_state.ai_chart_report
         )
 
-        # Download options
-        col1, col2, col3 = st.columns(3)
+        # ----------------------------------------------------
+        # DOWNLOAD REPORT
+        # ----------------------------------------------------
 
-        with col1:
-            st.download_button(
-                label="📥 Download as Text",
-                data=report,
-                file_name=f"chart_analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
-                mime="text/plain"
-            )
+        st.download_button(
+            label="⬇️ DOWNLOAD AI REPORT",
+            data=st.session_state.ai_chart_report,
+            file_name="AI_Chart_Analysis.txt",
+            mime="text/plain",
+            use_container_width=True
+        )
 
-        with col2:
-            # Copy to clipboard
-            st.button(
-                "📋 Copy Report",
-                key="copy_report",
-                help="Click to copy full report"
-            )
+    else:
 
-        with col3:
-            st.button(
-                "🔗 Share Analysis",
-                key="share_report",
-                help="Share this analysis"
-            )
+        st.markdown(
+            """
+            <div style="
+                padding:30px;
+                text-align:center;
+                border:1px dashed #555;
+                border-radius:15px;
+                margin-top:20px;
+            ">
+                <h3>📷 Chart Screenshot Upload చేయండి</h3>
+                <p>
+                    తరువాత <b>🧠 ANALYZE CHART</b> click చేయండి.
+                </p>
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
 
 
 # ============================================================
-# SIDEBAR INFO
+# SIDEBAR
 # ============================================================
 
 def show_sidebar():
-    """Sidebar information and settings."""
+
     with st.sidebar:
-        st.markdown("---")
-        st.markdown("## 📌 ABOUT")
-        st.info(
-            "🤖 AI-powered technical chart analysis\n\n"
-            "📊 Supports:\n"
-            "- NSE (Stocks, Indices)\n"
-            "- BSE (Stocks)\n"
-            "- F&O (Futures, Options)\n"
-            "- Crypto (Bitcoin, Altcoins)\n"
-            "- Forex, Commodities\n\n"
-            "🔌 Powered by: OpenAI Vision API"
+
+        st.markdown("## 🤖 AI Chart Analysis")
+
+        st.success(
+            "FYERS: Scanner కోసం active\n\n"
+            "AI Chart: Image మాత్రమే"
         )
 
         st.markdown("---")
-        st.markdown("## ⚙️ SETTINGS")
-        
-        auto_refresh = st.checkbox("🔄 Auto-refresh", value=False)
-        if auto_refresh:
-            refresh_interval = st.slider(
-                "Refresh interval (seconds)",
-                min_value=5,
-                max_value=300,
-                value=60,
-                step=5
-            )
-            rerun_script(interval=refresh_interval * 1000)
+
+        st.markdown(
+            """
+            ### AI analyzes
+
+            • Candles  
+            • Trend  
+            • Support  
+            • Resistance  
+            • Breakout  
+            • Breakdown  
+            • Liquidity  
+            • Volume  
+            • Momentum  
+            • Call / Put Bias  
+            • Entry  
+            • Stop Loss  
+            • Targets  
+            • Risk / Reward  
+            • Next Move
+            """
+        )
 
         st.markdown("---")
-        st.markdown("## 📚 HELP")
-        
-        with st.expander("❓ How to Use"):
-            st.markdown("""
-            1. **Upload Chart**: Take screenshot of your chart
-            2. **Submit**: Click 'ANALYZE CHART'
-            3. **Wait**: AI analyzes (30-60 seconds)
-            4. **Review**: Check analysis and recommendations
-            5. **Trade**: Verify levels before entering
-            """)
 
-        with st.expander("⚠️ Risk Disclaimer"):
-            st.markdown("""
-            - This is technical analysis only
-            - Not financial advice
-            - Always use stop losses
-            - Risk only what you can afford
-            - Verify analysis before trading
-            - Markets are unpredictable
-            """)
-
-        st.markdown("---")
-        st.caption("🔐 API Key is secure & never stored")
-        st.caption("v1.0.0 | © 2024 AI Chart Analysis")
+        st.warning(
+            "⚠️ AI analysis is not a guarantee "
+            "of future market movement."
+        )
 
 
 # ============================================================
-# APP ENTRY POINT
+# STANDALONE MODE
 # ============================================================
 
 if __name__ == "__main__":
+
     show_sidebar()
+
     show_ai_chart_analysis()
