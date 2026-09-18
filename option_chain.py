@@ -22,6 +22,7 @@ import math
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from typing import Any, Optional
 from collections import deque
 
@@ -50,6 +51,13 @@ if not logger.handlers:
     )
     logger.addHandler(_handler)
 logger.setLevel(logging.INFO)
+
+# India market/dashboard time. The Streamlit server can run in UTC, so
+# datetime.now() must NOT be used for user-facing Movement Scanner signal time.
+INDIA_TZ = ZoneInfo("Asia/Kolkata")
+
+def _india_now() -> datetime:
+    return datetime.now(INDIA_TZ)
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -4530,7 +4538,16 @@ def _movement_trade_levels(
     ltp = _pin_num(row.get("ce_ltp"), 0.0)
     ask = _pin_num(row.get("ce_ask"), 0.0)
     entry = ask if ask > 0 else ltp
-    now_text = (signal_time or datetime.now()).strftime("%H:%M:%S")
+    # Signal Time is always India Standard Time (IST), not the Streamlit
+    # server timezone (often UTC). This fixes the 5:30 hour offset seen in UI.
+    if signal_time is not None:
+        if signal_time.tzinfo is None:
+            signal_dt = signal_time.replace(tzinfo=INDIA_TZ)
+        else:
+            signal_dt = signal_time.astimezone(INDIA_TZ)
+    else:
+        signal_dt = _india_now()
+    now_text = signal_dt.strftime("%H:%M:%S")
 
     if entry <= 0:
         return {
