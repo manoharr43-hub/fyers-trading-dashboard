@@ -4470,6 +4470,17 @@ def render_pin_confluence(df: pd.DataFrame, state: dict[str, Any], symbol: str =
 MOVEMENT_SEARCH_MIN_SCORE = 70.0
 MOVEMENT_SEARCH_MAX_ROWS = 12
 
+# Liquid F&O universe used by the optional TOTAL F&O scan.
+# The normal F&O Search remains a single-stock search.
+MOVEMENT_FNO_UNIVERSE = [
+    "RELIANCE", "HDFCBANK", "ICICIBANK", "SBIN", "AXISBANK",
+    "KOTAKBANK", "INFY", "TCS", "ITC", "BHARTIARTL",
+    "LT", "HINDUNILVR", "MARUTI", "M&M", "TATASTEEL",
+    "SUNPHARMA", "TATAMOTORS", "ADANIENT", "ADANIPORTS", "NTPC",
+    "POWERGRID", "ONGC", "COALINDIA", "BEL", "HAL",
+    "TRENT", "BAJFINANCE", "BAJAJFINSV", "INDUSINDBK", "WIPRO",
+]
+
 
 def _movement_search_status(score: float) -> str:
     """Convert the existing movement score into a compact status."""
@@ -4514,7 +4525,12 @@ def _movement_search_one(
         )
 
         if not result.get("ok"):
+            st.session_state["oc_movement_search_last_error"] = (
+                f"{symbol}: {result.get('error', 'Option-chain fetch failed.')}"
+            )
             return pd.DataFrame()
+
+        st.session_state.pop("oc_movement_search_last_error", None)
 
         df_all = result.get("df")
         meta = result.get("meta") or {}
@@ -4550,16 +4566,15 @@ def _movement_search_one(
             atm_strike = 0.0
 
         try:
+            # Match the original dashboard pipeline exactly.
             df = compute_ai_scores(
                 df,
                 spot,
                 atm_strike,
                 calc_max_pain(df),
-                calc_max_oi(df),
+                calc_pcr(df),
             )
         except Exception:
-            # Some versions of the original function have a slightly
-            # different signature. Movement scoring below can still work.
             pass
 
         try:
@@ -4567,22 +4582,25 @@ def _movement_search_one(
         except Exception:
             pass
 
-        # Existing movement-score function in the uploaded code.
+        # Reuse the ACTUAL movement engine from the uploaded source.
         try:
-            df = compute_movement_scores(df)
+            df, _market_pressure = add_pressure_analysis(
+                df, spot, DEFAULT_LOT_SIZES.get(symbol, 1)
+            )
         except Exception:
-            # Fallback if a future version renames the function.
-            if "ce_movement_score" not in df.columns:
-                df["ce_movement_score"] = 0.0
-            if "pe_movement_score" not in df.columns:
-                df["pe_movement_score"] = 0.0
-            df["movement_score"] = pd.concat(
-                [
-                    pd.to_numeric(df["ce_movement_score"], errors="coerce"),
-                    pd.to_numeric(df["pe_movement_score"], errors="coerce"),
-                ],
-                axis=1,
-            ).max(axis=1).fillna(0.0)
+            pass
+
+        try:
+            df, _order_flow = calculate_order_flow(df, spot)
+        except Exception:
+            pass
+
+        # This is the real function name in option_chain.py.
+        try:
+            df = add_strike_movement_score(df)
+        except Exception as exc:
+            logger.exception("add_strike_movement_score failed for %s: %s", symbol, exc)
+            return pd.DataFrame()
 
         if "movement_score" not in df.columns:
             return pd.DataFrame()
@@ -4663,10 +4681,14 @@ def _render_movement_search_results(
         )
 
     if result_df.empty:
-        st.info(
-            f"ℹ️ {symbol}: no strike currently meets the "
-            f"{MOVEMENT_SEARCH_MIN_SCORE:.0f}+ movement threshold."
-        )
+        last_error = st.session_state.get("oc_movement_search_last_error")
+        if last_error:
+            st.error(f"❌ Movement search failed: {last_error}")
+        else:
+            st.info(
+                f"ℹ️ {symbol}: no strike currently meets the "
+                f"{MOVEMENT_SEARCH_MIN_SCORE:.0f}+ movement threshold."
+            )
         return
 
     # Make the requested format immediately visible.
@@ -4784,6 +4806,82 @@ def _render_total_index_movement_search(
     st.dataframe(show, use_container_width=True, hide_index=True)
 
 
+
+def _render_total_fno_movement_search(
+    fyers: Any,
+    strike_count: int = 40,
+) -> None:
+    """Scan the configured F&O universe and show only movement strikes."""
+    st.markdown(
+        '<div class="block-title">📡 F&O TOTAL — BIG MOVEMENT SCANNER</div>',
+        unsafe_allow_html=True,
+    )
+    st.caption(
+        f"Scanning {len(MOVEMENT_FNO_UNIVERSE)} configured F&O stocks and "
+        f"showing only strikes with movement score ≥ {MOVEMENT_SEARCH_MIN_SCORE:.0f}."
+    )
+
+    rows = []
+    errors = []
+    progress = st.progress(0.0)
+
+    for i, stock in enumerate(MOVEMENT_FNO_UNIVERSE, start=1):
+        try:
+            one = _movement_search_one(
+                fyers,
+                stock,
+                False,
+                strike_count,
+            )
+            if not one.empty:
+                rows.extend(one.to_dict("records"))
+        except Exception as exc:
+            errors.append(f"{stock}: {type(exc).__name__}")
+            logger.warning("Total F&O scan failed for %s: %s", stock, exc)
+        progress.progress(i / max(len(MOVEMENT_FNO_UNIVERSE), 1))
+
+    progress.empty()
+
+    if not rows:
+        st.warning(
+            "No F&O movement report was produced. "
+            "Check FYERS connection/market-data access and try again."
+        )
+        if errors:
+            st.caption("Stocks with scan errors: " + ", ".join(errors[:12]))
+        return
+
+    out = (
+        pd.DataFrame(rows)
+        .sort_values(["Score", "Instrument", "Strike"], ascending=[False, True, True])
+        .head(30)
+        .reset_index(drop=True)
+    )
+
+    st.success(
+        f"📊 F&O TOTAL REPORT: {len(out)} movement strike(s) found."
+    )
+    st.dataframe(
+        out[
+            [
+                "Instrument", "Strike", "Option", "Status", "Score",
+                "CE Score", "PE Score", "Movement Bias", "Spot", "Source",
+            ]
+        ],
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    compact = "  •  ".join(
+        f"{r['Instrument']} {r['Strike']:,.0f} {r['Option']} "
+        f"{r['Status']} ({r['Score']:.0f})"
+        for _, r in out.head(15).iterrows()
+    )
+    st.markdown("**🎯 F&O Movement Strikes:**")
+    st.info(compact)
+
+
+
 def _render_movement_search_sidebar() -> dict:
     """
     New sidebar controls only. Existing _sidebar_config() is untouched.
@@ -4823,10 +4921,18 @@ def _render_movement_search_sidebar() -> dict:
         )
 
         total_index_clicked = False
+        total_fno_clicked = False
+
         if search_mode == "Index Search":
             total_index_clicked = st.button(
                 "📡 TOTAL INDEX SCAN",
                 key="oc_total_index_scan_button",
+                use_container_width=True,
+            )
+        else:
+            total_fno_clicked = st.button(
+                "📡 F&O TOTAL SCAN",
+                key="oc_total_fno_scan_button",
                 use_container_width=True,
             )
 
@@ -4836,6 +4942,7 @@ def _render_movement_search_sidebar() -> dict:
         "is_index": is_index,
         "search_clicked": search_clicked,
         "total_index_clicked": total_index_clicked,
+        "total_fno_clicked": total_fno_clicked,
     }
 
 
@@ -4868,6 +4975,10 @@ def run_dashboard(fyers: Any = None) -> None:
 
     if movement_search_cfg.get("total_index_clicked"):
         _render_total_index_movement_search(fyers, strike_count=40)
+
+    if movement_search_cfg.get("total_fno_clicked"):
+        _render_total_fno_movement_search(fyers, strike_count=40)
+
     cfg["fetch_clicked"] = bool(cfg.get("fetch_clicked") or run_clicked or refresh_clicked)
     if run_clicked or refresh_clicked:
         cfg["free_run"] = True
