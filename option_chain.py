@@ -4453,6 +4453,393 @@ def render_pin_confluence(df: pd.DataFrame, state: dict[str, Any], symbol: str =
 # END PIN ANALYSIS LAYER
 # ══════════════════════════════════════════════════════════════════════════
 
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# ADDITIVE MOVEMENT SEARCH — INDEX + F&O
+# ══════════════════════════════════════════════════════════════════════════
+# Search one selected Index / F&O stock and show ONLY strikes where the
+# existing CE/PE movement score is significant.
+#
+# IMPORTANT:
+# - Existing option-chain/analytics functions are not replaced.
+# - Existing movement_score / ce_movement_score / pe_movement_score are reused.
+# - This is an activity/ranking early-warning layer, not a guaranteed
+#   prediction of future price movement.
+
+MOVEMENT_SEARCH_MIN_SCORE = 70.0
+MOVEMENT_SEARCH_MAX_ROWS = 12
+
+
+def _movement_search_status(score: float) -> str:
+    """Convert the existing movement score into a compact status."""
+    score = float(score or 0)
+    if score >= 82:
+        return "🚨 BIG MOVE"
+    if score >= MOVEMENT_SEARCH_MIN_SCORE:
+        return "🟢 EARLY MOVE"
+    return "WATCH"
+
+
+def _movement_search_side(row: pd.Series) -> tuple[str, float]:
+    """Return the stronger existing CE/PE movement side for a strike."""
+    ce = _pin_num(row.get("ce_movement_score", 0))
+    pe = _pin_num(row.get("pe_movement_score", 0))
+    if ce >= pe:
+        return "CE", ce
+    return "PE", pe
+
+
+def _movement_search_one(
+    fyers: Any,
+    symbol: str,
+    is_index: bool,
+    strike_count: int = 40,
+) -> pd.DataFrame:
+    """
+    Fetch one instrument using the existing unified option-chain fetcher,
+    run the same existing movement analytics, then return only meaningful
+    movement strikes.
+    """
+    try:
+        stock_name = "" if is_index else normalize_stock_symbol(symbol)
+
+        result = fetch_chain_unified(
+            fyers,
+            symbol,
+            is_index,
+            stock_name,
+            "",
+            max(40, int(strike_count)),
+        )
+
+        if not result.get("ok"):
+            return pd.DataFrame()
+
+        df_all = result.get("df")
+        meta = result.get("meta") or {}
+
+        if df_all is None or df_all.empty:
+            return pd.DataFrame()
+
+        # Reuse the existing analytics pipeline. These functions already
+        # exist in this file and are deliberately not modified.
+        spot = _pin_num(meta.get("spot_price"), 0.0)
+        expiry = meta.get("selected_expiry", "")
+
+        df = df_all.copy()
+
+        try:
+            df = classify_buildup(df)
+        except Exception:
+            pass
+
+        try:
+            df = classify_moneyness(df, spot)
+        except Exception:
+            pass
+
+        try:
+            atm_strike = (
+                float(df.iloc[(df["strike_price"] - spot).abs().to_numpy().argmin()]
+                      ["strike_price"])
+                if spot and "strike_price" in df.columns
+                else float(df["strike_price"].median())
+            )
+        except Exception:
+            atm_strike = 0.0
+
+        try:
+            df = compute_ai_scores(
+                df,
+                spot,
+                atm_strike,
+                calc_max_pain(df),
+                calc_max_oi(df),
+            )
+        except Exception:
+            # Some versions of the original function have a slightly
+            # different signature. Movement scoring below can still work.
+            pass
+
+        try:
+            df = detect_institutional_smart_money(df)
+        except Exception:
+            pass
+
+        # Existing movement-score function in the uploaded code.
+        try:
+            df = compute_movement_scores(df)
+        except Exception:
+            # Fallback if a future version renames the function.
+            if "ce_movement_score" not in df.columns:
+                df["ce_movement_score"] = 0.0
+            if "pe_movement_score" not in df.columns:
+                df["pe_movement_score"] = 0.0
+            df["movement_score"] = pd.concat(
+                [
+                    pd.to_numeric(df["ce_movement_score"], errors="coerce"),
+                    pd.to_numeric(df["pe_movement_score"], errors="coerce"),
+                ],
+                axis=1,
+            ).max(axis=1).fillna(0.0)
+
+        if "movement_score" not in df.columns:
+            return pd.DataFrame()
+
+        rows = []
+        for _, row in df.iterrows():
+            side, side_score = _movement_search_side(row)
+            total_score = _pin_num(row.get("movement_score"), side_score)
+
+            # Show only actual movement candidates.
+            if side_score < MOVEMENT_SEARCH_MIN_SCORE:
+                continue
+
+            strike = _pin_num(row.get("strike_price"), 0)
+            if strike <= 0:
+                continue
+
+            rows.append({
+                "Instrument": symbol,
+                "Strike": strike,
+                "Option": side,
+                "Status": _movement_search_status(side_score),
+                "Score": round(side_score, 1),
+                "CE Score": round(_pin_num(row.get("ce_movement_score")), 1),
+                "PE Score": round(_pin_num(row.get("pe_movement_score")), 1),
+                "Movement Bias": str(row.get("movement_bias", "NEUTRAL")),
+                "Spot": round(spot, 2) if spot else 0.0,
+                "Source": result.get("source", "UNKNOWN"),
+            })
+
+        if not rows:
+            return pd.DataFrame()
+
+        return (
+            pd.DataFrame(rows)
+            .sort_values(["Score", "Strike"], ascending=[False, True])
+            .head(MOVEMENT_SEARCH_MAX_ROWS)
+            .reset_index(drop=True)
+        )
+
+    except Exception as exc:
+        logger.exception("Movement search failed for %s: %s", symbol, exc)
+        return pd.DataFrame()
+
+
+def _render_movement_search_results(
+    fyers: Any,
+    symbol: str,
+    is_index: bool,
+    strike_count: int = 40,
+) -> None:
+    """Render the selected Index/F&O movement search without changing old UI."""
+    title = "🔎 INDEX MOVEMENT SEARCH" if is_index else "🔎 F&O MOVEMENT SEARCH"
+
+    st.markdown(
+        f'<div class="block-title">{title}</div>',
+        unsafe_allow_html=True,
+    )
+    st.caption(
+        f"Searching **{symbol}** and showing only strikes with existing "
+        f"movement score ≥ {MOVEMENT_SEARCH_MIN_SCORE:.0f}. "
+        "This is an early-warning/ranking layer, not a guaranteed prediction."
+    )
+
+    if fyers is None and is_index and symbol in NSE_UNSUPPORTED_INDICES:
+        st.warning(
+            f"{symbol}: BSE-listed index. A connected FYERS client is required "
+            "for this movement search."
+        )
+        return
+
+    with st.spinner(f"Scanning {symbol} for movement strikes…"):
+        result_df = _movement_search_one(
+            fyers,
+            symbol,
+            is_index,
+            strike_count,
+        )
+
+    if result_df.empty:
+        st.info(
+            f"ℹ️ {symbol}: no strike currently meets the "
+            f"{MOVEMENT_SEARCH_MIN_SCORE:.0f}+ movement threshold."
+        )
+        return
+
+    # Make the requested format immediately visible.
+    st.success(
+        f"📌 {symbol}: {len(result_df)} movement strike(s) found."
+    )
+
+    display_df = result_df[
+        [
+            "Instrument",
+            "Strike",
+            "Option",
+            "Status",
+            "Score",
+            "CE Score",
+            "PE Score",
+            "Movement Bias",
+            "Spot",
+            "Source",
+        ]
+    ].copy()
+
+    display_df["Strike"] = display_df["Strike"].map(
+        lambda x: f"{float(x):,.0f}"
+    )
+    display_df["Score"] = display_df["Score"].map(
+        lambda x: f"{float(x):.1f}"
+    )
+    display_df["CE Score"] = display_df["CE Score"].map(
+        lambda x: f"{float(x):.1f}"
+    )
+    display_df["PE Score"] = display_df["PE Score"].map(
+        lambda x: f"{float(x):.1f}"
+    )
+    display_df["Spot"] = display_df["Spot"].map(
+        lambda x: f"₹{float(x):,.2f}" if float(x) else "—"
+    )
+
+    st.dataframe(
+        display_df,
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    # Simple human-readable strike list, e.g.
+    # NIFTY 23500 CE | BANKNIFTY 56700 PE.
+    compact = "  •  ".join(
+        f"{r['Instrument']} {r['Strike']:,.0f} {r['Option']} "
+        f"{r['Status']} ({r['Score']:.0f})"
+        for _, r in result_df.iterrows()
+    )
+    st.markdown("**🎯 Movement Strikes:**")
+    st.info(compact)
+
+
+def _render_total_index_movement_search(
+    fyers: Any,
+    strike_count: int = 40,
+) -> None:
+    """
+    Optional TOTAL INDEX scan. It scans all configured indices and displays
+    only indices/strikes that cross the movement threshold.
+    """
+    st.markdown(
+        '<div class="block-title">📡 TOTAL INDEX — BIG MOVEMENT SCANNER</div>',
+        unsafe_allow_html=True,
+    )
+    st.caption(
+        "Scans configured indices and shows only strikes with significant "
+        "existing movement scores."
+    )
+
+    rows = []
+    progress = st.progress(0.0)
+    indices = list(INDEX_SYMBOLS.keys())
+
+    for i, index_name in enumerate(indices, start=1):
+        try:
+            one = _movement_search_one(
+                fyers,
+                index_name,
+                True,
+                strike_count,
+            )
+            if not one.empty:
+                rows.extend(one.to_dict("records"))
+        except Exception as exc:
+            logger.warning("Total index scan failed for %s: %s", index_name, exc)
+        progress.progress(i / max(len(indices), 1))
+
+    progress.empty()
+
+    if not rows:
+        st.info(
+            f"No configured index currently has a strike at "
+            f"{MOVEMENT_SEARCH_MIN_SCORE:.0f}+."
+        )
+        return
+
+    out = (
+        pd.DataFrame(rows)
+        .sort_values(["Score", "Instrument", "Strike"], ascending=[False, True, True])
+        .reset_index(drop=True)
+    )
+
+    st.success(f"📊 Total Index: {len(out)} movement strike(s) found.")
+
+    show = out[
+        [
+            "Instrument", "Strike", "Option", "Status", "Score",
+            "CE Score", "PE Score", "Movement Bias", "Spot", "Source",
+        ]
+    ].copy()
+
+    st.dataframe(show, use_container_width=True, hide_index=True)
+
+
+def _render_movement_search_sidebar() -> dict:
+    """
+    New sidebar controls only. Existing _sidebar_config() is untouched.
+    """
+    with st.sidebar:
+        st.divider()
+        st.markdown("### 🔎 Movement Search")
+
+        search_mode = st.radio(
+            "Search Type",
+            ["Index Search", "F&O Search"],
+            key="oc_movement_search_type",
+        )
+
+        if search_mode == "Index Search":
+            search_symbol = st.selectbox(
+                "Select Index",
+                list(INDEX_SYMBOLS.keys()),
+                key="oc_movement_index",
+            )
+            is_index = True
+        else:
+            search_raw = st.text_input(
+                "F&O Stock",
+                value="RELIANCE",
+                key="oc_movement_fno",
+                help="Example: RELIANCE, TCS, INFY",
+            )
+            search_symbol = normalize_stock_symbol(search_raw)
+            is_index = False
+
+        search_clicked = st.button(
+            "🔎 SEARCH MOVEMENT",
+            key="oc_movement_search_button",
+            use_container_width=True,
+            type="primary",
+        )
+
+        total_index_clicked = False
+        if search_mode == "Index Search":
+            total_index_clicked = st.button(
+                "📡 TOTAL INDEX SCAN",
+                key="oc_total_index_scan_button",
+                use_container_width=True,
+            )
+
+    return {
+        "search_mode": search_mode,
+        "search_symbol": search_symbol,
+        "is_index": is_index,
+        "search_clicked": search_clicked,
+        "total_index_clicked": total_index_clicked,
+    }
+
+
+
 def run_dashboard(fyers: Any = None) -> None:
     _configure_page()
     _inject_css()
@@ -4468,6 +4855,19 @@ def run_dashboard(fyers: Any = None) -> None:
                                     help="Fetch the latest available data now.")
 
     cfg = _sidebar_config()
+
+    # ADDITIVE ONLY: selected Index/F&O movement search controls.
+    movement_search_cfg = _render_movement_search_sidebar()
+    if movement_search_cfg.get("search_clicked"):
+        _render_movement_search_results(
+            fyers,
+            movement_search_cfg["search_symbol"],
+            movement_search_cfg["is_index"],
+            strike_count=40,
+        )
+
+    if movement_search_cfg.get("total_index_clicked"):
+        _render_total_index_movement_search(fyers, strike_count=40)
     cfg["fetch_clicked"] = bool(cfg.get("fetch_clicked") or run_clicked or refresh_clicked)
     if run_clicked or refresh_clicked:
         cfg["free_run"] = True
