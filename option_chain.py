@@ -2337,6 +2337,7 @@ def compute_movement_early_warning(
             "sell": float(row.get("sell_pressure", 50) or 50),
             "volume": float(row.get("total_volume", 0) or 0),
             "oi": float(abs(row.get("ce_chng_oi", 0) or 0) + abs(row.get("pe_chng_oi", 0) or 0)),
+            "ce_price": float(row.get("ce_ltp", 0) or 0),
         })
         history[key] = series[-MOVEMENT_HISTORY_MAX:]
 
@@ -4455,6 +4456,34 @@ def render_pin_confluence(df: pd.DataFrame, state: dict[str, Any], symbol: str =
 
 
 
+def _movement_price_reversal_from_history(
+    history: dict[str, Any],
+    symbol: str,
+    expiry_label: str,
+    strike: float,
+    current_price: float,
+    lookback: int = 5,
+) -> tuple[float, str]:
+    """Get a real CE price-reversal reference from repeated live scans."""
+    key = _movement_history_key(symbol, expiry_label, strike)
+    series = history.get(key, []) if isinstance(history, dict) else []
+    prices = [
+        float(x.get("ce_price", 0) or 0)
+        for x in series
+        if float(x.get("ce_price", 0) or 0) > 0
+    ]
+    if len(prices) >= 2:
+        prior = prices[:-1][-max(2, int(lookback)):]
+        reversal = min(prior)
+        return (
+            float(reversal),
+            "UP ABOVE REVERSAL" if current_price > reversal else "PRICE REVERSAL",
+        )
+    if current_price > 0:
+        return float(current_price * 0.95), "WAIT HISTORY"
+    return 0.0, "NO PRICE"
+
+
 # ══════════════════════════════════════════════════════════════════════════
 # ADDITIVE MOVEMENT SEARCH — INDEX + F&O
 # ══════════════════════════════════════════════════════════════════════════
@@ -4491,39 +4520,42 @@ def _movement_search_status(score: float) -> str:
     return "WATCH"
 
 
-def _movement_trade_levels(row: pd.Series, signal_time: Optional[datetime] = None) -> dict[str, Any]:
-    """Build practical CE movement-scan levels from the live option premium.
-
-    Entry uses the live CE ask when available, otherwise CE LTP.
-    Price Reversal is the prior CE reference price (LTP - day change) when
-    available, otherwise a 5% pullback reference. Stop Loss is placed below
-    that reversal reference with a minimum 10% premium risk buffer.
-    These are scanner reference levels, not guaranteed execution prices.
-    """
+def _movement_trade_levels(
+    row: pd.Series,
+    signal_time: Optional[datetime] = None,
+    reversal_level: Optional[float] = None,
+    reversal_status: str = "WAIT HISTORY",
+) -> dict[str, Any]:
+    """Build CE movement-scan levels with a live price-reversal check."""
     ltp = _pin_num(row.get("ce_ltp"), 0.0)
     ask = _pin_num(row.get("ce_ask"), 0.0)
-    change = _pin_num(row.get("ce_change"), 0.0)
     entry = ask if ask > 0 else ltp
+    now_text = (signal_time or datetime.now()).strftime("%H:%M:%S")
 
     if entry <= 0:
         return {
-            "Signal Time": (signal_time or datetime.now()).strftime("%H:%M:%S"),
-            "Entry": 0.0,
-            "Stop Loss": 0.0,
-            "Price Reversal": 0.0,
+            "Signal Time": now_text, "Entry": 0.0, "Stop Loss": 0.0,
+            "Price Reversal": 0.0, "Reversal Status": "NO PRICE",
         }
 
-    previous_ref = ltp - change if ltp > 0 and abs(change) > 1e-9 else entry * 0.95
-    # For an UP/CE signal the reversal trigger must remain below the entry.
-    reversal = previous_ref if 0 < previous_ref < entry else entry * 0.95
-    risk_unit = max(entry * 0.10, entry - reversal)
-    stop_loss = max(0.0, reversal - risk_unit)
+    # First scan fallback; later scans use the actual recent CE price history.
+    fallback_reversal = entry * 0.95
+    reversal = _pin_num(reversal_level, fallback_reversal)
+    if reversal <= 0 or reversal >= entry:
+        reversal = fallback_reversal
+
+    # Keep SL close to the actual reversal trigger instead of producing a
+    # misleading zero/very-distant stop. Scanner reference only.
+    stop_loss = max(0.0, reversal * 0.98)
+    if stop_loss >= entry:
+        stop_loss = max(0.0, entry * 0.93)
 
     return {
-        "Signal Time": (signal_time or datetime.now()).strftime("%H:%M:%S"),
+        "Signal Time": now_text,
         "Entry": round(entry, 2),
         "Stop Loss": round(stop_loss, 2),
         "Price Reversal": round(reversal, 2),
+        "Reversal Status": str(reversal_status),
     }
 
 
@@ -4535,7 +4567,7 @@ def _movement_search_excel(df: pd.DataFrame, report_name: str = "Movement Search
 
     export_cols = [
         "Instrument", "Strike", "Option", "Direction", "Status",
-        "Signal Time", "Entry", "Stop Loss", "Price Reversal",
+        "Signal Time", "Entry", "Stop Loss", "Price Reversal", "Reversal Status",
         "Score", "Early Score", "CE Score", "PE Score",
         "Movement Bias", "Early Status", "Rising Scans",
         "Score Delta", "Confidence", "Spot", "Source",
@@ -4700,7 +4732,14 @@ def _movement_search_one(
             if strike <= 0:
                 continue
 
-            levels = _movement_trade_levels(row)
+            current_ce = _pin_num(row.get("ce_ltp"), 0.0)
+            movement_history = st.session_state.get(MOVEMENT_HISTORY_KEY, {})
+            reversal_level, reversal_status = _movement_price_reversal_from_history(
+                movement_history, symbol, expiry, strike, current_ce, lookback=5
+            )
+            levels = _movement_trade_levels(
+                row, reversal_level=reversal_level, reversal_status=reversal_status
+            )
             rows.append({
                 "Instrument": symbol,
                 "Strike": strike,
@@ -4711,6 +4750,7 @@ def _movement_search_one(
                 "Entry": levels["Entry"],
                 "Stop Loss": levels["Stop Loss"],
                 "Price Reversal": levels["Price Reversal"],
+                "Reversal Status": levels["Reversal Status"],
                 "Score": round(ce_score, 1),
                 "Early Score": round(_pin_num(row.get("early_movement_score")), 1),
                 "CE Score": round(ce_score, 1),
@@ -4790,7 +4830,7 @@ def _render_movement_search_results(
 
     display_cols = [
         "Instrument", "Strike", "Option", "Direction", "Status",
-        "Signal Time", "Entry", "Stop Loss", "Price Reversal",
+        "Signal Time", "Entry", "Stop Loss", "Price Reversal", "Reversal Status",
         "Score", "Early Score", "Early Status", "Rising Scans",
         "Score Delta", "Confidence", "Spot", "Source",
     ]
@@ -4879,7 +4919,7 @@ def _render_total_index_movement_search(
 
     show_cols = [
         "Instrument", "Strike", "Option", "Direction", "Status",
-        "Signal Time", "Entry", "Stop Loss", "Price Reversal",
+        "Signal Time", "Entry", "Stop Loss", "Price Reversal", "Reversal Status",
         "Score", "Early Score", "Early Status", "Rising Scans",
         "Score Delta", "Confidence", "Spot", "Source",
     ]
@@ -4957,7 +4997,7 @@ def _render_total_fno_movement_search(
 
     show_cols = [
         "Instrument", "Strike", "Option", "Direction", "Status",
-        "Signal Time", "Entry", "Stop Loss", "Price Reversal",
+        "Signal Time", "Entry", "Stop Loss", "Price Reversal", "Reversal Status",
         "Score", "Early Score", "Early Status", "Rising Scans",
         "Score Delta", "Confidence", "Spot", "Source",
     ]
