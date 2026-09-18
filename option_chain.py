@@ -4491,6 +4491,42 @@ def _movement_search_status(score: float) -> str:
     return "WATCH"
 
 
+def _movement_trade_levels(row: pd.Series, signal_time: Optional[datetime] = None) -> dict[str, Any]:
+    """Build practical CE movement-scan levels from the live option premium.
+
+    Entry uses the live CE ask when available, otherwise CE LTP.
+    Price Reversal is the prior CE reference price (LTP - day change) when
+    available, otherwise a 5% pullback reference. Stop Loss is placed below
+    that reversal reference with a minimum 10% premium risk buffer.
+    These are scanner reference levels, not guaranteed execution prices.
+    """
+    ltp = _pin_num(row.get("ce_ltp"), 0.0)
+    ask = _pin_num(row.get("ce_ask"), 0.0)
+    change = _pin_num(row.get("ce_change"), 0.0)
+    entry = ask if ask > 0 else ltp
+
+    if entry <= 0:
+        return {
+            "Signal Time": (signal_time or datetime.now()).strftime("%H:%M:%S"),
+            "Entry": 0.0,
+            "Stop Loss": 0.0,
+            "Price Reversal": 0.0,
+        }
+
+    previous_ref = ltp - change if ltp > 0 and abs(change) > 1e-9 else entry * 0.95
+    # For an UP/CE signal the reversal trigger must remain below the entry.
+    reversal = previous_ref if 0 < previous_ref < entry else entry * 0.95
+    risk_unit = max(entry * 0.10, entry - reversal)
+    stop_loss = max(0.0, reversal - risk_unit)
+
+    return {
+        "Signal Time": (signal_time or datetime.now()).strftime("%H:%M:%S"),
+        "Entry": round(entry, 2),
+        "Stop Loss": round(stop_loss, 2),
+        "Price Reversal": round(reversal, 2),
+    }
+
+
 def _movement_search_excel(df: pd.DataFrame, report_name: str = "Movement Search") -> io.BytesIO:
     """Create an Excel workbook for movement-search results."""
     wb = Workbook()
@@ -4499,6 +4535,7 @@ def _movement_search_excel(df: pd.DataFrame, report_name: str = "Movement Search
 
     export_cols = [
         "Instrument", "Strike", "Option", "Direction", "Status",
+        "Signal Time", "Entry", "Stop Loss", "Price Reversal",
         "Score", "Early Score", "CE Score", "PE Score",
         "Movement Bias", "Early Status", "Rising Scans",
         "Score Delta", "Confidence", "Spot", "Source",
@@ -4663,12 +4700,17 @@ def _movement_search_one(
             if strike <= 0:
                 continue
 
+            levels = _movement_trade_levels(row)
             rows.append({
                 "Instrument": symbol,
                 "Strike": strike,
                 "Option": "CE",
                 "Direction": "UP",
                 "Status": _movement_search_status(ce_score),
+                "Signal Time": levels["Signal Time"],
+                "Entry": levels["Entry"],
+                "Stop Loss": levels["Stop Loss"],
+                "Price Reversal": levels["Price Reversal"],
                 "Score": round(ce_score, 1),
                 "Early Score": round(_pin_num(row.get("early_movement_score")), 1),
                 "CE Score": round(ce_score, 1),
@@ -4748,12 +4790,16 @@ def _render_movement_search_results(
 
     display_cols = [
         "Instrument", "Strike", "Option", "Direction", "Status",
+        "Signal Time", "Entry", "Stop Loss", "Price Reversal",
         "Score", "Early Score", "Early Status", "Rising Scans",
         "Score Delta", "Confidence", "Spot", "Source",
     ]
     display_df = result_df[[c for c in display_cols if c in result_df.columns]].copy()
 
     display_df["Strike"] = display_df["Strike"].map(lambda x: f"{float(x):,.0f}")
+    for col in ("Entry", "Stop Loss", "Price Reversal"):
+        if col in display_df.columns:
+            display_df[col] = display_df[col].map(lambda x: f"₹{float(x):,.2f}" if float(x) else "—")
     for col in ("Score", "Early Score", "Score Delta", "Confidence"):
         if col in display_df.columns:
             display_df[col] = display_df[col].map(lambda x: f"{float(x):.1f}")
@@ -4833,11 +4879,16 @@ def _render_total_index_movement_search(
 
     show_cols = [
         "Instrument", "Strike", "Option", "Direction", "Status",
+        "Signal Time", "Entry", "Stop Loss", "Price Reversal",
         "Score", "Early Score", "Early Status", "Rising Scans",
         "Score Delta", "Confidence", "Spot", "Source",
     ]
+    out_view = out[[c for c in show_cols if c in out.columns]].copy()
+    for col in ("Entry", "Stop Loss", "Price Reversal", "Spot"):
+        if col in out_view.columns:
+            out_view[col] = out_view[col].map(lambda x: f"₹{float(x):,.2f}" if float(x) else "—")
     st.dataframe(
-        out[[c for c in show_cols if c in out.columns]],
+        out_view,
         use_container_width=True,
         hide_index=True,
     )
@@ -4906,11 +4957,16 @@ def _render_total_fno_movement_search(
 
     show_cols = [
         "Instrument", "Strike", "Option", "Direction", "Status",
+        "Signal Time", "Entry", "Stop Loss", "Price Reversal",
         "Score", "Early Score", "Early Status", "Rising Scans",
         "Score Delta", "Confidence", "Spot", "Source",
     ]
+    out_view = out[[c for c in show_cols if c in out.columns]].copy()
+    for col in ("Entry", "Stop Loss", "Price Reversal", "Spot"):
+        if col in out_view.columns:
+            out_view[col] = out_view[col].map(lambda x: f"₹{float(x):,.2f}" if float(x) else "—")
     st.dataframe(
-        out[[c for c in show_cols if c in out.columns]],
+        out_view,
         use_container_width=True,
         hide_index=True,
     )
