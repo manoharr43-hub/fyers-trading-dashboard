@@ -2346,6 +2346,7 @@ def compute_movement_early_warning(
             "volume": float(row.get("total_volume", 0) or 0),
             "oi": float(abs(row.get("ce_chng_oi", 0) or 0) + abs(row.get("pe_chng_oi", 0) or 0)),
             "ce_price": float(row.get("ce_ltp", 0) or 0),
+            "pe_price": float(row.get("pe_ltp", 0) or 0),
         })
         history[key] = series[-MOVEMENT_HISTORY_MAX:]
 
@@ -4067,8 +4068,18 @@ def calculate_option_chain_reversal(
         trigger = "Waiting for stronger confirmation"
 
     strike_median = _pin_num(pd.to_numeric(d["strike_price"], errors="coerce").median())
-    zone_rows = d[(d["distance"] <= (abs(atm - strike_median) * 2 + 1))]
-    reversal_zone = float(zone_rows["strike_price"].mean()) if not zone_rows.empty else atm
+    if "ce_movement_score" in d.columns and "pe_movement_score" in d.columns:
+        ce_rank=pd.to_numeric(d["ce_movement_score"],errors="coerce").fillna(0.0)
+        pe_rank=pd.to_numeric(d["pe_movement_score"],errors="coerce").fillna(0.0)
+        combined_rank=pd.concat([ce_rank,pe_rank],axis=1).max(axis=1)
+        if not combined_rank.empty and float(combined_rank.max())>=MOVEMENT_SEARCH_MIN_SCORE:
+            reversal_zone=float(d.loc[combined_rank.idxmax(),"strike_price"])
+        else:
+            zone_rows=d[(d["distance"]<=(abs(atm-strike_median)*2+1))]
+            reversal_zone=float(zone_rows["strike_price"].mean()) if not zone_rows.empty else atm
+    else:
+        zone_rows=d[(d["distance"]<=(abs(atm-strike_median)*2+1))]
+        reversal_zone=float(zone_rows["strike_price"].mean()) if not zone_rows.empty else atm
 
     return {
         "status": status,
@@ -4465,28 +4476,19 @@ def render_pin_confluence(df: pd.DataFrame, state: dict[str, Any], symbol: str =
 
 
 def _movement_price_reversal_from_history(
-    history: dict[str, Any],
-    symbol: str,
-    expiry_label: str,
-    strike: float,
-    current_price: float,
-    lookback: int = 5,
+    history: dict[str, Any], symbol: str, expiry_label: str, strike: float,
+    current_price: float, lookback: int = 5, option_side: str = "CE",
 ) -> tuple[float, str]:
-    """Get a real CE price-reversal reference from repeated live scans."""
+    """Get a side-correct price-reversal reference from repeated live scans."""
     key = _movement_history_key(symbol, expiry_label, strike)
     series = history.get(key, []) if isinstance(history, dict) else []
-    prices = [
-        float(x.get("ce_price", 0) or 0)
-        for x in series
-        if float(x.get("ce_price", 0) or 0) > 0
-    ]
+    side = str(option_side or "CE").upper()
+    price_key = "pe_price" if side == "PE" else "ce_price"
+    prices = [float(x.get(price_key, 0) or 0) for x in series if float(x.get(price_key, 0) or 0) > 0]
     if len(prices) >= 2:
         prior = prices[:-1][-max(2, int(lookback)):]
         reversal = min(prior)
-        return (
-            float(reversal),
-            "UP ABOVE REVERSAL" if current_price > reversal else "PRICE REVERSAL",
-        )
+        return (float(reversal), "UP ABOVE REVERSAL" if current_price > reversal else "PRICE REVERSAL")
     if current_price > 0:
         return float(current_price * 0.95), "WAIT HISTORY"
     return 0.0, "NO PRICE"
@@ -4529,52 +4531,32 @@ def _movement_search_status(score: float) -> str:
 
 
 def _movement_trade_levels(
-    row: pd.Series,
-    signal_time: Optional[datetime] = None,
-    reversal_level: Optional[float] = None,
-    reversal_status: str = "WAIT HISTORY",
+    row: pd.Series, signal_time: Optional[datetime] = None,
+    reversal_level: Optional[float] = None, reversal_status: str = "WAIT HISTORY",
+    option_side: str = "CE",
 ) -> dict[str, Any]:
-    """Build CE movement-scan levels with a live price-reversal check."""
-    ltp = _pin_num(row.get("ce_ltp"), 0.0)
-    ask = _pin_num(row.get("ce_ask"), 0.0)
+    """Build movement-scan levels using the actually selected CE/PE side."""
+    side = str(option_side or "CE").upper()
+    if side == "PE":
+        ltp = _pin_num(row.get("pe_ltp"), 0.0); ask = _pin_num(row.get("pe_ask"), 0.0)
+    else:
+        ltp = _pin_num(row.get("ce_ltp"), 0.0); ask = _pin_num(row.get("ce_ask"), 0.0)
     entry = ask if ask > 0 else ltp
-    # Signal Time is always India Standard Time (IST), not the Streamlit
-    # server timezone (often UTC). This fixes the 5:30 hour offset seen in UI.
     if signal_time is not None:
-        if signal_time.tzinfo is None:
-            signal_dt = signal_time.replace(tzinfo=INDIA_TZ)
-        else:
-            signal_dt = signal_time.astimezone(INDIA_TZ)
+        signal_dt = signal_time.replace(tzinfo=INDIA_TZ) if signal_time.tzinfo is None else signal_time.astimezone(INDIA_TZ)
     else:
         signal_dt = _india_now()
     now_text = signal_dt.strftime("%H:%M:%S")
-
     if entry <= 0:
-        return {
-            "Signal Time": now_text, "Entry": 0.0, "Stop Loss": 0.0,
-            "Price Reversal": 0.0, "Reversal Status": "NO PRICE",
-        }
-
-    # First scan fallback; later scans use the actual recent CE price history.
+        return {"Signal Time": now_text, "Entry": 0.0, "Stop Loss": 0.0, "Price Reversal": 0.0, "Reversal Status": "NO PRICE"}
     fallback_reversal = entry * 0.95
     reversal = _pin_num(reversal_level, fallback_reversal)
     if reversal <= 0 or reversal >= entry:
         reversal = fallback_reversal
-
-    # Keep SL close to the actual reversal trigger instead of producing a
-    # misleading zero/very-distant stop. Scanner reference only.
     stop_loss = max(0.0, reversal * 0.98)
     if stop_loss >= entry:
         stop_loss = max(0.0, entry * 0.93)
-
-    return {
-        "Signal Time": now_text,
-        "Entry": round(entry, 2),
-        "Stop Loss": round(stop_loss, 2),
-        "Price Reversal": round(reversal, 2),
-        "Reversal Status": str(reversal_status),
-    }
-
+    return {"Signal Time": now_text, "Entry": round(entry, 2), "Stop Loss": round(stop_loss, 2), "Price Reversal": round(reversal, 2), "Reversal Status": str(reversal_status)}
 
 def _movement_search_excel(df: pd.DataFrame, report_name: str = "Movement Search") -> io.BytesIO:
     """Create an Excel workbook for movement-search results."""
@@ -4624,180 +4606,55 @@ def _movement_search_excel(df: pd.DataFrame, report_name: str = "Movement Search
 
 
 def _movement_search_one(
-    fyers: Any,
-    symbol: str,
-    is_index: bool,
-    strike_count: int = 40,
+    fyers: Any, symbol: str, is_index: bool, strike_count: int = 40,
 ) -> pd.DataFrame:
-    """
-    Fetch one Index/F&O instrument using the existing unified option-chain
-    fetcher, run the same existing movement analytics, and return ONLY
-    upside CE movement strikes.
-    """
+    """Run the same movement engine for Index/F&O and select the stronger CE/PE side per strike."""
     try:
         stock_name = "" if is_index else normalize_stock_symbol(symbol)
-
-        result = fetch_chain_unified(
-            fyers,
-            symbol,
-            is_index,
-            stock_name,
-            "",
-            max(40, int(strike_count)),
-        )
-
+        result = fetch_chain_unified(fyers, symbol, is_index, stock_name, "", max(40, int(strike_count)))
         if not result.get("ok"):
-            st.session_state["oc_movement_search_last_error"] = (
-                f"{symbol}: {result.get('error', 'Option-chain fetch failed.')}"
-            )
+            st.session_state["oc_movement_search_last_error"] = f"{symbol}: {result.get('error', 'Option-chain fetch failed.')}"
             return pd.DataFrame()
-
         st.session_state.pop("oc_movement_search_last_error", None)
-
-        df_all = result.get("df")
-        meta = result.get("meta") or {}
-
+        df_all, meta = result.get("df"), result.get("meta") or {}
         if df_all is None or df_all.empty:
             return pd.DataFrame()
-
-        # Reuse the existing analytics pipeline. These functions are not changed.
-        spot = _pin_num(meta.get("spot_price"), 0.0)
-        expiry = meta.get("selected_expiry", "")
-        df = df_all.copy()
-
+        spot, expiry, df = _pin_num(meta.get("spot_price"), 0.0), meta.get("selected_expiry", ""), df_all.copy()
+        for fn,args in ((classify_buildup,(df,)),(classify_moneyness,(df,spot))):
+            try: df=fn(*args)
+            except Exception: pass
         try:
-            df = classify_buildup(df)
-        except Exception:
-            pass
-
-        try:
-            df = classify_moneyness(df, spot)
-        except Exception:
-            pass
-
-        try:
-            atm_strike = (
-                float(df.iloc[(df["strike_price"] - spot).abs().to_numpy().argmin()]
-                      ["strike_price"])
-                if spot and "strike_price" in df.columns
-                else float(df["strike_price"].median())
-            )
-        except Exception:
-            atm_strike = 0.0
-
-        try:
-            df = compute_ai_scores(
-                df,
-                spot,
-                atm_strike,
-                calc_max_pain(df),
-                calc_pcr(df),
-            )
-        except Exception:
-            pass
-
-        try:
-            df = detect_institutional_smart_money(df)
-        except Exception:
-            pass
-
-        try:
-            df, _market_pressure = add_pressure_analysis(
-                df, spot, DEFAULT_LOT_SIZES.get(symbol, 1)
-            )
-        except Exception:
-            pass
-
-        try:
-            df, _order_flow = calculate_order_flow(df, spot)
-        except Exception:
-            pass
-
-        # Existing movement engine.
-        try:
-            df = add_strike_movement_score(df)
+            atm_strike=float(df.iloc[(df["strike_price"]-spot).abs().to_numpy().argmin()]["strike_price"]) if spot else float(df["strike_price"].median())
+        except Exception: atm_strike=0.0
+        for fn,args in ((compute_ai_scores,(df,spot,atm_strike,calc_max_pain(df),calc_pcr(df))),(detect_institutional_smart_money,(df,))):
+            try: df=fn(*args)
+            except Exception: pass
+        try: df,_=add_pressure_analysis(df,spot,DEFAULT_LOT_SIZES.get(symbol,1))
+        except Exception: pass
+        try: df,_=calculate_order_flow(df,spot)
+        except Exception: pass
+        try: df=add_strike_movement_score(df)
         except Exception as exc:
-            logger.exception("add_strike_movement_score failed for %s: %s", symbol, exc)
-            return pd.DataFrame()
-
-        if "movement_score" not in df.columns:
-            return pd.DataFrame()
-
-        # Add the existing build-up/early-warning layer so the search can show
-        # movement developing before it becomes a large move.
-        try:
-            df, _early_summary = compute_movement_early_warning(
-                df, symbol, expiry, spot
-            )
-        except Exception as exc:
-            logger.warning("compute_movement_early_warning failed for %s: %s", symbol, exc)
-
-        rows = []
-        for _, row in df.iterrows():
-            ce_score = _pin_num(row.get("ce_movement_score"), 0.0)
-            pe_score = _pin_num(row.get("pe_movement_score"), 0.0)
-
-            # USER REQUEST: ONLY UPSIDE STRIKES.
-            # CE must be the stronger side and have a clear directional gap.
-            # PE / DOWN / BOTH-CHOP rows are intentionally excluded.
-            if ce_score < MOVEMENT_SEARCH_MIN_SCORE:
-                continue
-            if ce_score <= pe_score + 7.0:
-                continue
-
-            strike = _pin_num(row.get("strike_price"), 0.0)
-            if strike <= 0:
-                continue
-
-            current_ce = _pin_num(row.get("ce_ltp"), 0.0)
-            movement_history = st.session_state.get(MOVEMENT_HISTORY_KEY, {})
-            reversal_level, reversal_status = _movement_price_reversal_from_history(
-                movement_history, symbol, expiry, strike, current_ce, lookback=5
-            )
-            levels = _movement_trade_levels(
-                row, reversal_level=reversal_level, reversal_status=reversal_status
-            )
-            rows.append({
-                "Instrument": symbol,
-                "Strike": strike,
-                "Option": "CE",
-                "Direction": "UP",
-                "Status": _movement_search_status(ce_score),
-                "Signal Time": levels["Signal Time"],
-                "Entry": levels["Entry"],
-                "Stop Loss": levels["Stop Loss"],
-                "Price Reversal": levels["Price Reversal"],
-                "Reversal Status": levels["Reversal Status"],
-                "Score": round(ce_score, 1),
-                "Early Score": round(_pin_num(row.get("early_movement_score")), 1),
-                "CE Score": round(ce_score, 1),
-                "PE Score": round(pe_score, 1),
-                "Movement Bias": "CE UP",
-                "Early Status": str(row.get("early_movement_status", "WAIT")),
-                "Rising Scans": int(_pin_num(row.get("movement_rising_scans"), 0)),
-                "Score Delta": round(_pin_num(row.get("movement_score_delta")), 1),
-                "Confidence": round(_pin_num(row.get("early_movement_confidence")), 1),
-                "Spot": round(spot, 2) if spot else 0.0,
-                "Source": result.get("source", "UNKNOWN"),
-            })
-
-        if not rows:
-            return pd.DataFrame()
-
-        return (
-            pd.DataFrame(rows)
-            .sort_values(
-                ["Score", "Early Score", "Strike"],
-                ascending=[False, False, True],
-            )
-            .head(MOVEMENT_SEARCH_MAX_ROWS)
-            .reset_index(drop=True)
-        )
-
+            logger.exception("add_strike_movement_score failed for %s: %s",symbol,exc); return pd.DataFrame()
+        try: df,_=compute_movement_early_warning(df,symbol,expiry,spot)
+        except Exception as exc: logger.warning("compute_movement_early_warning failed for %s: %s",symbol,exc)
+        rows=[]; history=st.session_state.get(MOVEMENT_HISTORY_KEY,{})
+        for _,row in df.iterrows():
+            ce_score,pe_score=_pin_num(row.get("ce_movement_score")),_pin_num(row.get("pe_movement_score"))
+            if max(ce_score,pe_score)<MOVEMENT_SEARCH_MIN_SCORE or abs(ce_score-pe_score)<7.0: continue
+            if ce_score>pe_score: side,score,direction="CE",ce_score,"UP"
+            elif pe_score>ce_score: side,score,direction="PE",pe_score,"DOWN"
+            else: continue
+            strike=_pin_num(row.get("strike_price"));
+            if strike<=0: continue
+            current=_pin_num(row.get("pe_ltp" if side=="PE" else "ce_ltp"))
+            reversal_level,reversal_status=_movement_price_reversal_from_history(history,symbol,expiry,strike,current,lookback=5,option_side=side)
+            levels=_movement_trade_levels(row,reversal_level=reversal_level,reversal_status=reversal_status,option_side=side)
+            rows.append({"Instrument":symbol,"Strike":strike,"Option":side,"Direction":direction,"Status":_movement_search_status(score),"Signal Time":levels["Signal Time"],"Entry":levels["Entry"],"Stop Loss":levels["Stop Loss"],"Price Reversal":levels["Price Reversal"],"Reversal Status":levels["Reversal Status"],"Score":round(score,1),"Early Score":round(_pin_num(row.get("early_movement_score")),1),"CE Score":round(ce_score,1),"PE Score":round(pe_score,1),"Movement Bias":f"{side} {direction}","Early Status":str(row.get("early_movement_status","WAIT")),"Rising Scans":int(_pin_num(row.get("movement_rising_scans"),0)),"Score Delta":round(_pin_num(row.get("movement_score_delta")),1),"Confidence":round(_pin_num(row.get("early_movement_confidence")),1),"Spot":round(spot,2) if spot else 0.0,"Source":result.get("source","UNKNOWN")})
+        if not rows: return pd.DataFrame()
+        return pd.DataFrame(rows).sort_values(["Score","Early Score","Strike"],ascending=[False,False,True]).head(MOVEMENT_SEARCH_MAX_ROWS).reset_index(drop=True)
     except Exception as exc:
-        logger.exception("Movement search failed for %s: %s", symbol, exc)
-        return pd.DataFrame()
-
+        logger.exception("Movement search failed for %s: %s",symbol,exc); return pd.DataFrame()
 
 def _render_movement_search_results(
     fyers: Any,
@@ -4805,7 +4662,7 @@ def _render_movement_search_results(
     is_index: bool,
     strike_count: int = 40,
 ) -> None:
-    """Render selected Index/F&O movement search; upside CE strikes only."""
+    """Render selected Index/F&O movement search with the stronger CE/PE side per strike."""
     title = "🔎 INDEX UP-MOVEMENT SEARCH" if is_index else "🔎 F&O STOCK UP-MOVEMENT SEARCH"
 
     st.markdown(
@@ -4813,8 +4670,8 @@ def _render_movement_search_results(
         unsafe_allow_html=True,
     )
     st.caption(
-        f"Searching **{symbol}** and showing ONLY CE / UP strikes with "
-        f"movement score ≥ {MOVEMENT_SEARCH_MIN_SCORE:.0f}. "
+        f"Searching **{symbol}** and showing the stronger CE/PE side per strike "
+        f"when movement score ≥ {MOVEMENT_SEARCH_MIN_SCORE:.0f}. "
         "The Early Score tracks build-up across scans."
     )
 
@@ -4842,7 +4699,7 @@ def _render_movement_search_results(
         return
 
     st.success(
-        f"📌 {symbol}: {len(result_df)} UP strike(s) found — CE only."
+        f"📌 {symbol}: {len(result_df)} movement strike(s) found — strongest side CE/PE."
     )
 
     display_cols = [
@@ -4891,14 +4748,14 @@ def _render_total_index_movement_search(
     fyers: Any,
     strike_count: int = 40,
 ) -> None:
-    """Scan all configured indices and show ONLY CE / UP movement strikes."""
+    """Scan all configured indices using the same CE/PE movement logic."""
     st.markdown(
-        '<div class="block-title">📡 TOTAL INDEX — UP MOVEMENT SCANNER</div>',
+        '<div class="block-title">📡 TOTAL INDEX — MOVEMENT SCANNER</div>',
         unsafe_allow_html=True,
     )
     st.caption(
-        f"Scans configured indices and shows ONLY CE / UP strikes with "
-        f"movement score ≥ {MOVEMENT_SEARCH_MIN_SCORE:.0f}."
+        f"Scans configured indices and shows the stronger CE/PE side for each strike "
+        f"with movement score ≥ {MOVEMENT_SEARCH_MIN_SCORE:.0f}."
     )
 
     rows = []
@@ -4918,7 +4775,7 @@ def _render_total_index_movement_search(
 
     if not rows:
         st.info(
-            f"No configured index currently has a CE / UP strike at "
+            f"No configured index currently has a qualifying CE/PE movement strike at "
             f"{MOVEMENT_SEARCH_MIN_SCORE:.0f}+."
         )
         return
@@ -4932,7 +4789,7 @@ def _render_total_index_movement_search(
         .reset_index(drop=True)
     )
 
-    st.success(f"📊 Total Index: {len(out)} UP strike(s) found.")
+    st.success(f"📊 Total Index: {len(out)} movement strike(s) found — CE/PE selected per strike.")
 
     show_cols = [
         "Instrument", "Strike", "Option", "Direction", "Status",
@@ -4950,11 +4807,11 @@ def _render_total_index_movement_search(
         hide_index=True,
     )
 
-    excel_buf = _movement_search_excel(out, "Total Index UP Movement Search")
+    excel_buf = _movement_search_excel(out, "Total Index Movement Search")
     st.download_button(
-        "📥 Download Total Index UP Excel",
+        "📥 Download Total Index Movement Excel",
         data=excel_buf,
-        file_name=f"movement_up_total_index_{datetime.now().strftime('%H%M%S')}.xlsx",
+        file_name=f"movement_total_index_{datetime.now().strftime('%H%M%S')}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         use_container_width=True,
         key="movement_excel_total_index",
@@ -4965,14 +4822,14 @@ def _render_total_fno_movement_search(
     fyers: Any,
     strike_count: int = 40,
 ) -> None:
-    """Scan configured F&O stocks and show ONLY CE / UP movement strikes."""
+    """Scan configured F&O stocks using the same CE/PE movement logic."""
     st.markdown(
-        '<div class="block-title">📡 F&O TOTAL — UP MOVEMENT SCANNER</div>',
+        '<div class="block-title">📡 F&O TOTAL — MOVEMENT SCANNER</div>',
         unsafe_allow_html=True,
     )
     st.caption(
         f"Scanning {len(MOVEMENT_FNO_UNIVERSE)} configured F&O stocks and "
-        f"showing ONLY CE / UP strikes with movement score ≥ {MOVEMENT_SEARCH_MIN_SCORE:.0f}."
+        f"showing the stronger CE/PE side per strike with movement score ≥ {MOVEMENT_SEARCH_MIN_SCORE:.0f}."
     )
 
     rows = []
@@ -4993,7 +4850,7 @@ def _render_total_fno_movement_search(
 
     if not rows:
         st.warning(
-            "No F&O UP movement report was produced. "
+            "No F&O movement report was produced. "
             "Check FYERS connection/market-data access and try again."
         )
         if errors:
@@ -5010,7 +4867,7 @@ def _render_total_fno_movement_search(
         .reset_index(drop=True)
     )
 
-    st.success(f"📊 F&O TOTAL REPORT: {len(out)} UP strike(s) found.")
+    st.success(f"📊 F&O TOTAL REPORT: {len(out)} movement strike(s) found — CE/PE selected per strike.")
 
     show_cols = [
         "Instrument", "Strike", "Option", "Direction", "Status",
@@ -5028,11 +4885,11 @@ def _render_total_fno_movement_search(
         hide_index=True,
     )
 
-    excel_buf = _movement_search_excel(out, "F&O Total UP Movement Search")
+    excel_buf = _movement_search_excel(out, "F&O Total Movement Search")
     st.download_button(
-        "📥 Download F&O UP Excel",
+        "📥 Download F&O Movement Excel",
         data=excel_buf,
-        file_name=f"movement_up_total_fno_{datetime.now().strftime('%H%M%S')}.xlsx",
+        file_name=f"movement_total_fno_{datetime.now().strftime('%H%M%S')}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         use_container_width=True,
         key="movement_excel_total_fno",
