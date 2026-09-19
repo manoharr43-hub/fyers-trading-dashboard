@@ -4606,9 +4606,17 @@ def _movement_search_excel(df: pd.DataFrame, report_name: str = "Movement Search
 
 
 def _movement_search_one(
-    fyers: Any, symbol: str, is_index: bool, strike_count: int = 40,
+    fyers: Any,
+    symbol: str,
+    is_index: bool,
+    strike_count: int = 40,
+    min_score: Optional[float] = None,
 ) -> pd.DataFrame:
-    """Run the same movement engine for Index/F&O and select the stronger CE/PE side per strike."""
+    """Run the same movement engine for Index/F&O and select the stronger CE/PE side per strike.
+
+    min_score=None preserves the original single-search threshold.
+    Total scans can pass 0 so pre-big-movement candidates are not hidden.
+    """
     try:
         stock_name = "" if is_index else normalize_stock_symbol(symbol)
         result = fetch_chain_unified(fyers, symbol, is_index, stock_name, "", max(40, int(strike_count)))
@@ -4639,9 +4647,13 @@ def _movement_search_one(
         try: df,_=compute_movement_early_warning(df,symbol,expiry,spot)
         except Exception as exc: logger.warning("compute_movement_early_warning failed for %s: %s",symbol,exc)
         rows=[]; history=st.session_state.get(MOVEMENT_HISTORY_KEY,{})
+        threshold = MOVEMENT_SEARCH_MIN_SCORE if min_score is None else float(min_score)
         for _,row in df.iterrows():
             ce_score,pe_score=_pin_num(row.get("ce_movement_score")),_pin_num(row.get("pe_movement_score"))
-            if max(ce_score,pe_score)<MOVEMENT_SEARCH_MIN_SCORE or abs(ce_score-pe_score)<7.0: continue
+            # Keep the CE-vs-PE comparison. Total scans remove only the hard
+            # score gate so early movement/build-up can also be displayed.
+            if max(ce_score,pe_score) < threshold or abs(ce_score-pe_score) < 7.0:
+                continue
             if ce_score>pe_score: side,score,direction="CE",ce_score,"UP"
             elif pe_score>ce_score: side,score,direction="PE",pe_score,"DOWN"
             else: continue
@@ -4663,7 +4675,7 @@ def _render_movement_search_results(
     strike_count: int = 40,
 ) -> None:
     """Render selected Index/F&O movement search with the stronger CE/PE side per strike."""
-    title = "🔎 INDEX UP-MOVEMENT SEARCH" if is_index else "🔎 F&O STOCK UP-MOVEMENT SEARCH"
+    title = "🔎 INDEX MOVEMENT SEARCH" if is_index else "🔎 F&O STOCK MOVEMENT SEARCH"
 
     st.markdown(
         f'<div class="block-title">{title}</div>',
@@ -4736,11 +4748,11 @@ def _render_movement_search_results(
     )
 
     compact = "  •  ".join(
-        f"{r['Instrument']} {r['Strike']:,.0f} CE UP "
+        f"{r['Instrument']} {r['Strike']:,.0f} {r['Option']} {r['Direction']} "
         f"{r['Status']} ({r['Score']:.0f})"
         for _, r in result_df.iterrows()
     )
-    st.markdown("**🎯 UP Movement Strikes:**")
+    st.markdown("**🎯 Movement Candidates:**")
     st.info(compact)
 
 
@@ -4754,8 +4766,8 @@ def _render_total_index_movement_search(
         unsafe_allow_html=True,
     )
     st.caption(
-        f"Scans configured indices and shows the stronger CE/PE side for each strike "
-        f"with movement score ≥ {MOVEMENT_SEARCH_MIN_SCORE:.0f}."
+        "Scans configured indices with the same Total Movement logic and "
+        "shows the stronger CE/PE side for each strike, including early build-up."
     )
 
     rows = []
@@ -4764,7 +4776,7 @@ def _render_total_index_movement_search(
 
     for i, index_name in enumerate(indices, start=1):
         try:
-            one = _movement_search_one(fyers, index_name, True, strike_count)
+            one = _movement_search_one(fyers, index_name, True, strike_count, min_score=0.0)
             if not one.empty:
                 rows.extend(one.to_dict("records"))
         except Exception as exc:
@@ -4828,8 +4840,9 @@ def _render_total_fno_movement_search(
         unsafe_allow_html=True,
     )
     st.caption(
-        f"Scanning {len(MOVEMENT_FNO_UNIVERSE)} configured F&O stocks and "
-        f"showing the stronger CE/PE side per strike with movement score ≥ {MOVEMENT_SEARCH_MIN_SCORE:.0f}."
+        f"Scanning {len(MOVEMENT_FNO_UNIVERSE)} configured F&O stocks with the "
+        "same Total Movement logic and showing the stronger CE/PE side per strike, "
+        "including early build-up."
     )
 
     rows = []
@@ -4838,7 +4851,7 @@ def _render_total_fno_movement_search(
 
     for i, stock in enumerate(MOVEMENT_FNO_UNIVERSE, start=1):
         try:
-            one = _movement_search_one(fyers, stock, False, strike_count)
+            one = _movement_search_one(fyers, stock, False, strike_count, min_score=0.0)
             if not one.empty:
                 rows.extend(one.to_dict("records"))
         except Exception as exc:
@@ -4849,12 +4862,19 @@ def _render_total_fno_movement_search(
     progress.empty()
 
     if not rows:
-        st.warning(
-            "No F&O movement report was produced. "
-            "Check FYERS connection/market-data access and try again."
-        )
-        if errors:
-            st.caption("Stocks with scan errors: " + ", ".join(errors[:12]))
+        last_error = st.session_state.get("oc_movement_search_last_error")
+        if last_error:
+            st.error(f"❌ F&O total scan failed: {last_error}")
+        elif errors:
+            st.warning(
+                "No F&O movement candidates were returned. "
+                "Some stocks had scan errors: " + ", ".join(errors[:12])
+            )
+        else:
+            st.info(
+                "ℹ️ F&O scan completed, but no usable CE/PE movement candidate "
+                "was returned by the current FYERS option-chain data."
+            )
         return
 
     out = (
@@ -4896,11 +4916,11 @@ def _render_total_fno_movement_search(
     )
 
     compact = "  •  ".join(
-        f"{r['Instrument']} {r['Strike']:,.0f} CE UP "
+        f"{r['Instrument']} {r['Strike']:,.0f} {r['Option']} {r['Direction']} "
         f"{r['Status']} ({r['Score']:.0f})"
         for _, r in out.head(15).iterrows()
     )
-    st.markdown("**🎯 F&O UP Movement Strikes:**")
+    st.markdown("**🎯 F&O Movement Candidates:**")
     st.info(compact)
 
 
@@ -4947,13 +4967,13 @@ def _render_movement_search_sidebar() -> dict:
 
         if search_mode == "Index Search":
             total_index_clicked = st.button(
-                "📡 TOTAL INDEX UP SCAN",
+                "📡 TOTAL INDEX MOVEMENT SCAN",
                 key="oc_total_index_scan_button",
                 use_container_width=True,
             )
         else:
             total_fno_clicked = st.button(
-                "📡 F&O TOTAL UP SCAN",
+                "📡 F&O TOTAL MOVEMENT SCAN",
                 key="oc_total_fno_scan_button",
                 use_container_width=True,
             )
