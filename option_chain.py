@@ -2327,7 +2327,9 @@ def compute_movement_early_warning(
         return d, default_summary
 
     history = st.session_state.setdefault(MOVEMENT_HISTORY_KEY, {})
-    now = datetime.now()
+    # Movement history timestamps are user-facing signal timestamps.
+    # Always store them in IST; never use the Streamlit/server timezone.
+    now = _india_now()
 
     # Save the current snapshot strike-by-strike.
     for _, row in d.iterrows():
@@ -4465,6 +4467,49 @@ def render_pin_confluence(df: pd.DataFrame, state: dict[str, Any], symbol: str =
 
 
 
+def _movement_signal_time_from_history(
+    history: dict[str, Any],
+    symbol: str,
+    expiry_label: str,
+    strike: float,
+    side: str = "CE",
+    min_score: float = 70.0,
+    score_gap: float = 7.0,
+) -> Optional[datetime]:
+    """Return the first timestamp of the CURRENT qualifying movement signal episode.
+
+    This deliberately does not use the latest scan time. A signal that remains
+    active across multiple scans keeps its original Signal Time.
+    """
+    key = _movement_history_key(symbol, expiry_label, strike)
+    series = history.get(key, []) if isinstance(history, dict) else []
+    if not series:
+        return None
+
+    side_u = str(side).upper()
+    qualifying = []
+    for item in reversed(series):
+        ce = _pin_num(item.get("ce_score"), 0.0)
+        pe = _pin_num(item.get("pe_score"), 0.0)
+        score = ce if side_u == "CE" else pe
+        other = pe if side_u == "CE" else ce
+        if score >= float(min_score) and score > other + float(score_gap):
+            qualifying.append(item)
+        else:
+            break
+
+    if not qualifying:
+        return None
+
+    first = qualifying[-1]
+    ts = first.get("ts")
+    if isinstance(ts, datetime):
+        if ts.tzinfo is None:
+            return ts.replace(tzinfo=INDIA_TZ)
+        return ts.astimezone(INDIA_TZ)
+    return None
+
+
 def _movement_price_reversal_from_history(
     history: dict[str, Any],
     symbol: str,
@@ -4474,7 +4519,7 @@ def _movement_price_reversal_from_history(
     lookback: int = 5,
     side: str = "CE",
 ) -> tuple[float, str]:
-    """Get a side-specific price-reversal reference from repeated live scans."""
+    """Get a side-specific trailing reversal reference from repeated live scans."""
     key = _movement_history_key(symbol, expiry_label, strike)
     series = history.get(key, []) if isinstance(history, dict) else []
     price_key = "pe_price" if str(side).upper() == "PE" else "ce_price"
@@ -4484,11 +4529,24 @@ def _movement_price_reversal_from_history(
         if float(x.get(price_key, 0) or 0) > 0
     ]
     if len(prices) >= 2:
-        prior = prices[:-1][-max(2, int(lookback)):]
-        reversal = min(prior)
+        # Use the CURRENT movement window, not an old session low.
+        # For CE/UP movement, keep the highest observed price INCLUDING the
+        # current price. Example: 52 -> 80 must not fall back to an old 49.
+        # For PE/DOWN movement, keep the lowest observed price INCLUDING the
+        # current price. This makes the displayed reversal reference follow
+        # the active movement instead of an unrelated historical extreme.
+        recent = prices[-max(2, int(lookback)):]
+        current = float(current_price or 0.0)
+        side_u = str(side).upper()
+        if side_u == "PE":
+            reversal = min(recent + ([current] if current > 0 else []))
+        else:
+            reversal = max(recent + ([current] if current > 0 else []))
         return (
             float(reversal),
-            "UP ABOVE REVERSAL" if current_price > reversal else "PRICE REVERSAL",
+            "UP ABOVE REVERSAL" if side_u != "PE" and current > reversal else (
+                "DOWN BELOW REVERSAL" if side_u == "PE" and current < reversal else "PRICE REVERSAL"
+            ),
         )
     if current_price > 0:
         return float(current_price * 0.95), "WAIT HISTORY"
@@ -4497,6 +4555,8 @@ def _movement_price_reversal_from_history(
 
 # ══════════════════════════════════════════════════════════════════════════
 # ADDITIVE MOVEMENT SEARCH — INDEX + F&O
+# FIX: Signal Time is preserved from the first qualifying scan; it does not
+# reset on every refresh. Existing scanner/option-chain logic is unchanged.
 # ══════════════════════════════════════════════════════════════════════════
 # Search one selected Index / F&O stock and show ONLY upside CE strikes.
 #
@@ -4817,8 +4877,13 @@ def _movement_search_one(
                     lookback=5,
                     side=side,
                 )
+                signal_time = _movement_signal_time_from_history(
+                    movement_history, symbol, expiry, strike, side=side,
+                    min_score=threshold, score_gap=0.0,
+                ) or _india_now()
                 levels = _movement_trade_levels(
                     row,
+                    signal_time=signal_time,
                     reversal_level=reversal_level,
                     reversal_status=reversal_status,
                 )
@@ -4862,10 +4927,17 @@ def _movement_search_one(
             current_ce = _pin_num(row.get("ce_ltp"), 0.0)
             movement_history = st.session_state.get(MOVEMENT_HISTORY_KEY, {})
             reversal_level, reversal_status = _movement_price_reversal_from_history(
-                movement_history, symbol, expiry, strike, current_ce, lookback=5
+                movement_history, symbol, expiry, strike, current_ce, lookback=5, side="CE"
             )
+            signal_time = _movement_signal_time_from_history(
+                movement_history, symbol, expiry, strike, side="CE",
+                min_score=threshold, score_gap=7.0,
+            ) or _india_now()
             levels = _movement_trade_levels(
-                row, reversal_level=reversal_level, reversal_status=reversal_status
+                row,
+                signal_time=signal_time,
+                reversal_level=reversal_level,
+                reversal_status=reversal_status,
             )
             rows.append({
                 "Instrument": symbol,
