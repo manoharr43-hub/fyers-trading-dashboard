@@ -2329,7 +2329,7 @@ def compute_movement_early_warning(
     history = st.session_state.setdefault(MOVEMENT_HISTORY_KEY, {})
     now = _india_now()
 
-    # Save the current snapshot strike-by-strike (IST).
+    # Save the current snapshot strike-by-strike.
     for _, row in d.iterrows():
         strike = float(row.get("strike_price", 0) or 0)
         if strike <= 0:
@@ -2345,6 +2345,8 @@ def compute_movement_early_warning(
             "sell": float(row.get("sell_pressure", 50) or 50),
             "volume": float(row.get("total_volume", 0) or 0),
             "oi": float(abs(row.get("ce_chng_oi", 0) or 0) + abs(row.get("pe_chng_oi", 0) or 0)),
+            "volume_spike": bool(row.get("volume_spike", False)),
+            "oi_surge": bool(row.get("oi_surge", False)),
             "ce_price": float(row.get("ce_ltp", 0) or 0),
             "pe_price": float(row.get("pe_ltp", 0) or 0),
         })
@@ -4466,64 +4468,87 @@ def render_pin_confluence(df: pd.DataFrame, state: dict[str, Any], symbol: str =
 
 
 def _movement_price_reversal_from_history(
-    history: dict[str, Any],
-    symbol: str,
-    expiry_label: str,
-    strike: float,
-    current_price: float,
-    lookback: int = 5,
-    side: str = "CE",
+    history: dict[str, Any], symbol: str, expiry_label: str, strike: float,
+    current_price: float, lookback: int = 8, side: str = "CE",
     direction: str = "UP",
 ) -> tuple[float, str]:
-    """Return a direction-correct option-premium reversal level.
-
-    IMPORTANT:
-    - This uses OPTION PREMIUM history, never the strike as the reversal price.
-    - For an UP move, reversal is the closest prior support below current premium.
-    - For a DOWN move, reversal is the closest prior resistance above current premium.
-    - If history is unavailable, use a small direction-aware fallback instead of
-      the old unconditional current_price * 0.95 value.
-    """
+    """Return reversal from the same option premium history, never the strike."""
     key = _movement_history_key(symbol, expiry_label, strike)
     series = history.get(key, []) if isinstance(history, dict) else []
     price_key = "pe_price" if str(side).upper() == "PE" else "ce_price"
-
+    current = float(current_price or 0)
+    if current <= 0:
+        return 0.0, "NO PRICE"
     prices = []
-    for x in series:
+    for x in series[:-1]:
         try:
             p = float(x.get(price_key, 0) or 0)
-        except (TypeError, ValueError):
+        except Exception:
             p = 0.0
         if p > 0:
             prices.append(p)
+    prices = prices[-max(2, int(lookback)):]
+    if len(prices) < 2:
+        return 0.0, "WAIT HISTORY"
+    if str(direction).upper() == "DOWN":
+        above = [p for p in prices if p > current]
+        return (round(min(above), 2), "DOWN BELOW REVERSAL") if above else (round(max(prices), 2), "DOWN REVERSAL WATCH")
+    below = [p for p in prices if p < current]
+    return (round(max(below), 2), "UP ABOVE REVERSAL") if below else (round(min(prices), 2), "UP REVERSAL WATCH")
 
-    current = float(current_price or 0)
-    direction = str(direction or "UP").upper()
 
-    if len(prices) >= 2 and current > 0:
-        prior = prices[:-1][-max(2, int(lookback)):]
-        if direction == "DOWN":
-            above = [p for p in prior if p > current]
-            if above:
-                reversal = min(above)  # nearest resistance above current
-                return float(reversal), "DOWN BELOW REVERSAL"
-            # If current is already above all prior prices, use the recent high.
-            return float(max(prior)), "DOWN REVERSAL WATCH"
-        else:
-            below = [p for p in prior if p < current]
-            if below:
-                reversal = max(below)  # nearest support below current
-                return float(reversal), "UP ABOVE REVERSAL"
-            return float(min(prior)), "UP REVERSAL WATCH"
+def _movement_pre_direction_reason(row: pd.Series, series=None, side: str = "CE"):
+    """Separate pre-move build-up from current option-premium direction."""
+    ce = _pin_num(row.get("ce_movement_score"), 0.0)
+    pe = _pin_num(row.get("pe_movement_score"), 0.0)
+    gap = abs(ce - pe)
+    buy = _pin_num(row.get("buy_pressure"), 50.0)
+    sell = _pin_num(row.get("sell_pressure"), 50.0)
+    if ce > pe + 7.0:
+        pre, lead = "UP", f"CE lead +{ce-pe:.1f}"
+    elif pe > ce + 7.0:
+        pre, lead = "DOWN", f"PE lead +{pe-ce:.1f}"
+    else:
+        pre, lead = "NEUTRAL", "CE/PE lead not confirmed"
+    reasons=[]
+    rising=int(_pin_num(row.get("movement_rising_scans"),0))
+    delta=_pin_num(row.get("movement_score_delta"),0)
+    accel=_pin_num(row.get("movement_score_acceleration"),0)
+    if rising >= 2: reasons.append(f"{rising} rising scans")
+    if delta > .5: reasons.append(f"score +{delta:.1f}")
+    if accel > .5: reasons.append(f"acceleration +{accel:.1f}")
+    if abs(buy-sell) >= 8: reasons.append("pressure imbalance")
+    if bool(row.get("volume_spike",False)): reasons.append("volume spike")
+    if bool(row.get("oi_surge",False)): reasons.append("OI surge")
+    if gap > 7: reasons.append(lead)
+    if not reasons: reasons.append("activity building")
+    reason=f"PRE-MOVE {pre}: " + ", ".join(reasons)
+    price_key="pe_price" if str(side).upper()=="PE" else "ce_price"
+    current=_pin_num(row.get(price_key),0)
+    previous=0
+    if series:
+        vals=[_pin_num(x.get(price_key),0) for x in series[:-1]]
+        vals=[v for v in vals if v>0]
+        if vals: previous=vals[-1]
+    if current>0 and previous>0: price_delta=current-previous
+    else: price_delta=_pin_num(row.get("ce_change" if str(side).upper()=="CE" else "pe_change"),0)
+    price_direction="UP" if price_delta>.005 else ("DOWN" if price_delta<-.005 else "FLAT")
+    return pre, reason, price_delta, price_direction, _pin_num(row.get("early_movement_score"),0)
 
-    if current > 0:
-        # Direction-aware first-scan reference; do not manufacture an opposite
-        # direction price by using a fixed 5% rule.
-        if direction == "DOWN":
-            return float(current * 1.03), "WAIT HISTORY"
-        return float(current * 0.97), "WAIT HISTORY"
 
-    return 0.0, "NO PRICE"
+def _movement_signal_time_from_history(series, side: str, pre_direction: str, fallback=None):
+    """Return first scan time where the requested CE/PE pre-move lead was confirmed."""
+    if series:
+        price_key="pe_price" if str(side).upper()=="PE" else "ce_price"
+        for x in series:
+            try:
+                ce=float(x.get("ce_score",0) or 0); pe=float(x.get("pe_score",0) or 0)
+                confirmed=(ce>pe+7) if pre_direction=="UP" else ((pe>ce+7) if pre_direction=="DOWN" else False)
+                if confirmed and float(x.get(price_key,0) or 0)>0:
+                    ts=x.get("ts")
+                    if isinstance(ts,datetime): return ts.astimezone(INDIA_TZ) if ts.tzinfo else ts.replace(tzinfo=INDIA_TZ)
+            except Exception: pass
+    return fallback or _india_now()
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -4562,94 +4587,6 @@ def _movement_search_status(score: float) -> str:
     return "WATCH"
 
 
-def _movement_pre_direction_reason(
-    row: pd.Series,
-    history_series: list[dict[str, Any]],
-) -> tuple[str, str, float, float, str]:
-    """Determine pre-move bias, current premium direction and a human reason.
-
-    Pre-move direction is based on the stronger option-side score plus build-up
-    evidence. Current direction is based on scan-to-scan premium movement.
-    These are kept separate so the scanner does not confuse strike direction
-    with option-price direction.
-    """
-    ce = _pin_num(row.get("ce_movement_score"), 0.0)
-    pe = _pin_num(row.get("pe_movement_score"), 0.0)
-    early = _pin_num(row.get("early_movement_score"), 0.0)
-    delta = _pin_num(row.get("movement_score_delta"), 0.0)
-    accel = _pin_num(row.get("movement_score_acceleration"), 0.0)
-    rising = int(_pin_num(row.get("movement_rising_scans"), 0))
-    buy = _pin_num(row.get("buy_pressure"), 50.0)
-    sell = _pin_num(row.get("sell_pressure"), 50.0)
-    volume_spike = bool(row.get("volume_spike", False))
-    oi_surge = bool(row.get("oi_surge", False))
-
-    # Expected direction BEFORE a large move.
-    if ce > pe + 7:
-        pre_dir = "UP"
-        side = "CE"
-    elif pe > ce + 7:
-        pre_dir = "DOWN"
-        side = "PE"
-    else:
-        pre_dir = "NEUTRAL"
-        side = "CE" if ce >= pe else "PE"
-
-    reasons = []
-    if rising >= 2:
-        reasons.append(f"{rising} rising scans")
-    if delta > 0.5:
-        reasons.append(f"score +{delta:.1f}")
-    if accel > 0.5:
-        reasons.append("acceleration")
-    if abs(buy - sell) >= 15:
-        reasons.append("pressure imbalance")
-    if volume_spike:
-        reasons.append("volume spike")
-    if oi_surge:
-        reasons.append("OI surge")
-    if ce > pe + 7:
-        reasons.append(f"CE lead +{ce - pe:.1f}")
-    elif pe > ce + 7:
-        reasons.append(f"PE lead +{pe - ce:.1f}")
-    if not reasons:
-        reasons.append("activity building")
-
-    # Current option-premium direction from scan history.
-    current_key = "ce_price" if side == "CE" else "pe_price"
-    prices = []
-    for x in history_series:
-        try:
-            p = float(x.get(current_key, 0) or 0)
-        except (TypeError, ValueError):
-            p = 0.0
-        if p > 0:
-            prices.append(p)
-
-    current_price = _pin_num(row.get("ce_ltp" if side == "CE" else "pe_ltp"), 0.0)
-    if len(prices) >= 2:
-        prev = prices[-2]
-        price_delta = current_price - prev
-        price_direction = (
-            "UP" if price_delta > 0.005
-            else ("DOWN" if price_delta < -0.005 else "FLAT")
-        )
-        price_source = "SCAN LTP"
-    else:
-        daily_delta = _pin_num(
-            row.get("ce_change" if side == "CE" else "pe_change"), 0.0
-        )
-        price_delta = daily_delta
-        price_direction = (
-            "UP" if daily_delta > 0.005
-            else ("DOWN" if daily_delta < -0.005 else "FLAT")
-        )
-        price_source = "FYERS CHANGE"
-
-    reason = f"PRE-MOVE {pre_dir}: " + ", ".join(reasons)
-    return pre_dir, reason, price_delta, early, price_direction
-
-
 def _movement_trade_levels(
     row: pd.Series,
     signal_time: Optional[datetime] = None,
@@ -4677,17 +4614,15 @@ def _movement_trade_levels(
             "Price Reversal": 0.0, "Reversal Status": "NO PRICE",
         }
 
-    # First scan fallback; later scans use the actual recent CE price history.
-    fallback_reversal = entry * 0.95
-    reversal = _pin_num(reversal_level, fallback_reversal)
-    if reversal <= 0 or reversal >= entry:
-        reversal = fallback_reversal
-
-    # Keep SL close to the actual reversal trigger instead of producing a
-    # misleading zero/very-distant stop. Scanner reference only.
-    stop_loss = max(0.0, reversal * 0.98)
-    if stop_loss >= entry:
-        stop_loss = max(0.0, entry * 0.93)
+    # Never manufacture a reversal from a percentage.
+    # Until enough live premium history exists, explicitly show WAIT HISTORY.
+    reversal = _pin_num(reversal_level, 0.0)
+    if reversal <= 0:
+        stop_loss = 0.0
+    else:
+        stop_loss = reversal * 0.98
+        if stop_loss >= entry:
+            stop_loss = reversal * 1.02
 
     return {
         "Signal Time": now_text,
@@ -4927,22 +4862,21 @@ def _movement_search_one(
                     direction_source = "FYERS CHANGE"
 
                 movement_bias = f"{side} {direction}"
+                pre_dir, reason, pre_price_delta, pre_price_direction, early_score = _movement_pre_direction_reason(row, series, side=side)
+                signal_dt = _movement_signal_time_from_history(series, side, pre_dir, fallback=_india_now())
 
-                pre_direction, movement_reason, _, _, current_price_direction = _movement_pre_direction_reason(
-                    row, series
-                )
                 reversal_level, reversal_status = _movement_price_reversal_from_history(
                     movement_history,
                     symbol,
                     expiry,
                     strike,
                     current_option,
-                    lookback=5,
+                    lookback=8,
                     side=side,
-                    direction=pre_direction if pre_direction in ("UP", "DOWN") else "UP",
+                    direction=direction,
                 )
                 levels = _movement_trade_levels(
-                    row,
+                    row, signal_time=signal_dt,
                     reversal_level=reversal_level,
                     reversal_status=reversal_status,
                 )
@@ -4952,11 +4886,10 @@ def _movement_search_one(
                     "Strike": strike,
                     "Option": side,
                     "Direction": direction,
-                    "Pre-Move Direction": pre_direction,
                     "Status": _movement_search_status(score),
                     "Signal Time": levels["Signal Time"],
-                    "Reason": movement_reason,
-                    "Current Price Direction": current_price_direction,
+                    "Reason": reason, "Pre-Move Direction": pre_dir,
+                    "Current Price Direction": direction,
                     "Entry": levels["Entry"],
                     "Stop Loss": levels["Stop Loss"],
                     "Price Reversal": levels["Price Reversal"],
@@ -4988,33 +4921,28 @@ def _movement_search_one(
 
             current_ce = _pin_num(row.get("ce_ltp"), 0.0)
             movement_history = st.session_state.get(MOVEMENT_HISTORY_KEY, {})
-            series = movement_history.get(
-                _movement_history_key(symbol, expiry, strike), []
-            ) if isinstance(movement_history, dict) else []
-            pre_direction, movement_reason, price_delta, early_score_now, current_price_direction = _movement_pre_direction_reason(
-                row, series
-            )
-            # Selected UP search only reports CE candidates whose pre-move bias is UP.
-            if pre_direction != "UP":
+            hkey = _movement_history_key(symbol, expiry, strike)
+            series = movement_history.get(hkey, []) if isinstance(movement_history, dict) else []
+            pre_dir, reason, price_delta, price_direction, early_score = _movement_pre_direction_reason(row, series, side="CE")
+            if pre_dir != "UP":
                 continue
+            signal_dt = _movement_signal_time_from_history(series, "CE", "UP", fallback=_india_now())
             reversal_level, reversal_status = _movement_price_reversal_from_history(
-                movement_history,
-                symbol, expiry, strike, current_ce, lookback=5,
-                side="CE", direction="UP"
+                movement_history, symbol, expiry, strike, current_ce, lookback=8, side="CE", direction="UP"
             )
             levels = _movement_trade_levels(
-                row, reversal_level=reversal_level, reversal_status=reversal_status
+                row, signal_time=signal_dt, reversal_level=reversal_level, reversal_status=reversal_status
             )
             rows.append({
                 "Instrument": symbol,
                 "Strike": strike,
                 "Option": "CE",
                 "Direction": "UP",
-                "Pre-Move Direction": pre_direction,
                 "Status": _movement_search_status(ce_score),
                 "Signal Time": levels["Signal Time"],
-                "Reason": movement_reason,
-                "Current Price Direction": current_price_direction,
+                "Reason": reason,
+                "Pre-Move Direction": pre_dir,
+                "Current Price Direction": price_direction,
                 "Entry": levels["Entry"],
                 "Stop Loss": levels["Stop Loss"],
                 "Price Reversal": levels["Price Reversal"],
@@ -5056,7 +4984,7 @@ def _render_movement_search_results(
     is_index: bool,
     strike_count: int = 40,
 ) -> None:
-    """Render selected Index/F&O movement search with pre-move direction and reason."""
+    """Render selected Index/F&O movement search; upside CE strikes only."""
     title = "🔎 INDEX PRE-MOVE SEARCH" if is_index else "🔎 F&O STOCK PRE-MOVE SEARCH"
 
     st.markdown(
@@ -5064,10 +4992,9 @@ def _render_movement_search_results(
         unsafe_allow_html=True,
     )
     st.caption(
-        f"Searching **{symbol}** for CE pre-move UP candidates with "
+        f"Searching **{symbol}** and showing ONLY CE / UP strikes with "
         f"movement score ≥ {MOVEMENT_SEARCH_MIN_SCORE:.0f}. "
-        "Direction is detected from option-premium activity before the move; "
-        "strike number is never used as price direction."
+        "Only CE-led PRE-MOVE UP candidates are shown. Reversal uses option-premium history, never the strike."
     )
 
     if fyers is None and is_index and symbol in NSE_UNSUPPORTED_INDICES:
@@ -5077,7 +5004,7 @@ def _render_movement_search_results(
         )
         return
 
-    with st.spinner(f"Scanning {symbol} for pre-move UP strikes…"):
+    with st.spinner(f"Scanning {symbol} for PRE-MOVE UP strikes…"):
         result_df = _movement_search_one(
             fyers, symbol, is_index, strike_count
         )
@@ -5088,18 +5015,18 @@ def _render_movement_search_results(
             st.error(f"❌ Movement search failed: {last_error}")
         else:
             st.info(
-                f"ℹ️ {symbol}: no CE pre-move UP candidate currently meets the "
+                f"ℹ️ {symbol}: no CE PRE-MOVE UP strike currently meets the "
                 f"{MOVEMENT_SEARCH_MIN_SCORE:.0f}+ movement threshold."
             )
         return
 
     st.success(
-        f"📌 {symbol}: {len(result_df)} UP strike(s) found — CE only."
+        f"📌 {symbol}: {len(result_df)} CE PRE-MOVE UP strike(s) found."
     )
 
     display_cols = [
-        "Instrument", "Strike", "Option", "Direction", "Pre-Move Direction",
-        "Status", "Signal Time", "Reason", "Current Price Direction",
+        "Instrument", "Strike", "Option", "Direction", "Status",
+        "Signal Time", "Reason", "Pre-Move Direction", "Current Price Direction",
         "Entry", "Stop Loss", "Price Reversal", "Reversal Status",
         "Score", "Early Score", "Early Status", "Rising Scans",
         "Score Delta", "Confidence", "Spot", "Source",
@@ -5123,16 +5050,16 @@ def _render_movement_search_results(
     # Additive Excel download for this movement search.
     excel_buf = _movement_search_excel(result_df, f"{symbol} UP Movement Search")
     st.download_button(
-        "📥 Download UP Movement Excel",
+        "📥 Download PRE-MOVE Excel",
         data=excel_buf,
-        file_name=f"movement_up_{normalize_stock_symbol(symbol)}_{datetime.now().strftime('%H%M%S')}.xlsx",
+        file_name=f"movement_premove_{normalize_stock_symbol(symbol)}_{_india_now().strftime('%H%M%S')}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         use_container_width=True,
         key=f"movement_excel_{normalize_stock_symbol(symbol)}_{'idx' if is_index else 'fno'}",
     )
 
     compact = "  •  ".join(
-        f"{r['Instrument']} {r['Strike']:,.0f} CE UP "
+        f"{r['Instrument']} {r['Strike']:,.0f} CE PRE-UP "
         f"{r['Status']} ({r['Score']:.0f})"
         for _, r in result_df.iterrows()
     )
@@ -5206,7 +5133,8 @@ def _render_total_index_movement_search(
         "Instrument", "Strike", "Option", "Direction", "Status",
         "CE Score", "PE Score", "Movement Bias", "CE Price", "PE Price",
         "Price Delta", "Price Change %", "Price Direction Source",
-        "Signal Time", "Entry", "Stop Loss", "Price Reversal", "Reversal Status",
+        "Signal Time", "Reason", "Pre-Move Direction", "Current Price Direction",
+        "Entry", "Stop Loss", "Price Reversal", "Reversal Status",
         "Score", "Early Score", "Early Status", "Rising Scans",
         "Score Delta", "Confidence", "Spot", "Source",
     ]
@@ -5307,7 +5235,8 @@ def _render_total_fno_movement_search(
         "Instrument", "Strike", "Option", "Direction", "Status",
         "CE Score", "PE Score", "Movement Bias", "CE Price", "PE Price",
         "Price Delta", "Price Change %", "Price Direction Source",
-        "Signal Time", "Entry", "Stop Loss", "Price Reversal", "Reversal Status",
+        "Signal Time", "Reason", "Pre-Move Direction", "Current Price Direction",
+        "Entry", "Stop Loss", "Price Reversal", "Reversal Status",
         "Score", "Early Score", "Early Status", "Rising Scans",
         "Score Delta", "Confidence", "Spot", "Source",
     ]
@@ -5371,7 +5300,7 @@ def _render_movement_search_sidebar() -> dict:
             is_index = False
 
         search_clicked = st.button(
-            "🔎 SEARCH PRE-MOVE UP",
+            "🔎 SEARCH UP MOVEMENT",
             key="oc_movement_search_button",
             use_container_width=True,
             type="primary",
