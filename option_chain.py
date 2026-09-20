@@ -4554,12 +4554,12 @@ def _movement_signal_time_from_history(series, side: str, pre_direction: str, fa
 # ══════════════════════════════════════════════════════════════════════════
 # ADDITIVE MOVEMENT SEARCH — INDEX + F&O
 # ══════════════════════════════════════════════════════════════════════════
-# Search one selected Index / F&O stock and show ONLY upside CE strikes.
+# Search one selected Index / F&O stock. Total mode shows CE/PE pre-move candidates.
 #
 # IMPORTANT:
 # - Existing option-chain/analytics functions are not replaced.
 # - Existing movement_score / ce_movement_score / pe_movement_score are reused.
-# - The movement search is intentionally filtered to CE / UP only.
+# - Selected mode remains CE/UP; Total mode adds independent CE/PE PRE-MOVE detection.
 # - Existing dashboard UI and scanner logic remain unchanged.
 # - Excel download is additive for movement-search results.
 
@@ -4809,108 +4809,140 @@ def _movement_search_one(
                 continue
 
             if both_mode:
-                # TOTAL SCANNER: first select the stronger CE/PE activity score
-                # at the SAME strike. Direction is NOT tied to the option type.
-                # CE can be UP or DOWN; PE can also be UP or DOWN.
-                if ce_score > pe_score:
-                    side, score = "CE", ce_score
-                    current_option = _pin_num(row.get("ce_ltp"), 0.0)
-                    daily_delta = _pin_num(row.get("ce_change"), 0.0)
-                elif pe_score > ce_score:
-                    side, score = "PE", pe_score
-                    current_option = _pin_num(row.get("pe_ltp"), 0.0)
-                    daily_delta = _pin_num(row.get("pe_change"), 0.0)
-                else:
-                    # Tie-breaker only chooses the side; it does NOT decide UP/DOWN.
-                    ce_pressure = _pin_num(row.get("buy_pressure"), 50.0)
-                    pe_pressure = _pin_num(row.get("sell_pressure"), 50.0)
-                    ce_volume = _pin_num(row.get("ce_volume"), 0.0)
-                    pe_volume = _pin_num(row.get("pe_volume"), 0.0)
-                    if ce_pressure > pe_pressure or (
-                        ce_pressure == pe_pressure and ce_volume >= pe_volume
-                    ):
-                        side, score = "CE", ce_score
-                        current_option = _pin_num(row.get("ce_ltp"), 0.0)
-                        daily_delta = _pin_num(row.get("ce_change"), 0.0)
-                    else:
-                        side, score = "PE", pe_score
-                        current_option = _pin_num(row.get("pe_ltp"), 0.0)
-                        daily_delta = _pin_num(row.get("pe_change"), 0.0)
-
-                # TRUE direction = option premium movement, never strike movement.
-                # Prefer scan-to-scan LTP history; first scan falls back to FYERS
-                # day's option-price change so the report can still show direction.
+                # PRE-MOVE CE/PE MODE:
+                # Do NOT wait for the premium to make the move.  Use the existing
+                # CE-vs-PE movement scores to identify the side building FIRST.
+                # CE lead => bullish/UP pre-move candidate.
+                # PE lead => bearish/DOWN pre-move candidate.
+                # Current premium direction is shown separately only as confirmation;
+                # it must never decide whether a pre-move candidate exists.
                 movement_history = st.session_state.get(MOVEMENT_HISTORY_KEY, {})
                 hkey = _movement_history_key(symbol, expiry, strike)
                 series = movement_history.get(hkey, []) if isinstance(movement_history, dict) else []
-                price_key = "pe_price" if side == "PE" else "ce_price"
-                prior_prices = [
-                    _pin_num(x.get(price_key), 0.0)
-                    for x in series[:-1]
-                    if _pin_num(x.get(price_key), 0.0) > 0
-                ]
-                previous_price = prior_prices[-1] if prior_prices else 0.0
-                if current_option > 0 and previous_price > 0:
-                    price_delta = current_option - previous_price
-                    price_pct = (price_delta / previous_price) * 100.0
-                    direction = "UP" if price_delta > 0.005 else ("DOWN" if price_delta < -0.005 else "FLAT")
-                    direction_source = "SCAN LTP"
-                else:
-                    price_delta = daily_delta
-                    price_pct = (price_delta / current_option) * 100.0 if current_option > 0 else 0.0
-                    direction = "UP" if price_delta > 0.005 else ("DOWN" if price_delta < -0.005 else "FLAT")
-                    direction_source = "FYERS CHANGE"
 
-                movement_bias = f"{side} {direction}"
-                pre_dir, reason, pre_price_delta, pre_price_direction, early_score = _movement_pre_direction_reason(row, series, side=side)
-                signal_dt = _movement_signal_time_from_history(series, side, pre_dir, fallback=_india_now())
+                side_candidates = []
+                if ce_score > pe_score + 7.0 and ce_score >= threshold:
+                    side_candidates.append(("CE", ce_score, "UP"))
+                if pe_score > ce_score + 7.0 and pe_score >= threshold:
+                    side_candidates.append(("PE", pe_score, "DOWN"))
 
-                reversal_level, reversal_status = _movement_price_reversal_from_history(
-                    movement_history,
-                    symbol,
-                    expiry,
-                    strike,
-                    current_option,
-                    lookback=8,
-                    side=side,
-                    direction=direction,
-                )
-                levels = _movement_trade_levels(
-                    row, signal_time=signal_dt,
-                    reversal_level=reversal_level,
-                    reversal_status=reversal_status,
-                )
+                # If both sides are nearly equal there is no confirmed direction yet.
+                # This is intentionally skipped instead of guessing CE or PE.
+                if not side_candidates:
+                    continue
 
-                rows.append({
-                    "Instrument": symbol,
-                    "Strike": strike,
-                    "Option": side,
-                    "Direction": direction,
-                    "Status": _movement_search_status(score),
-                    "Signal Time": levels["Signal Time"],
-                    "Reason": reason, "Pre-Move Direction": pre_dir,
-                    "Current Price Direction": direction,
-                    "Entry": levels["Entry"],
-                    "Stop Loss": levels["Stop Loss"],
-                    "Price Reversal": levels["Price Reversal"],
-                    "Reversal Status": levels["Reversal Status"],
-                    "Score": round(score, 1),
-                    "Early Score": round(_pin_num(row.get("early_movement_score")), 1),
-                    "CE Score": round(ce_score, 1),
-                    "PE Score": round(pe_score, 1),
-                    "Movement Bias": movement_bias,
-                    "Price Delta": round(price_delta, 4),
-                    "Price Change %": round(price_pct, 2),
-                    "Price Direction Source": direction_source,
-                    "CE Price": round(_pin_num(row.get("ce_ltp"), 0.0), 4),
-                    "PE Price": round(_pin_num(row.get("pe_ltp"), 0.0), 4),
-                    "Early Status": str(row.get("early_movement_status", "WAIT")),
-                    "Rising Scans": int(_pin_num(row.get("movement_rising_scans"), 0)),
-                    "Score Delta": round(_pin_num(row.get("movement_score_delta")), 1),
-                    "Confidence": round(_pin_num(row.get("early_movement_confidence")), 1),
-                    "Spot": round(spot, 2) if spot else 0.0,
-                    "Source": result.get("source", "UNKNOWN"),
-                })
+                for side, score, pre_move_direction in side_candidates:
+                    price_key = "pe_price" if side == "PE" else "ce_price"
+                    current_option = _pin_num(
+                        row.get("pe_ltp" if side == "PE" else "ce_ltp"), 0.0
+                    )
+                    daily_delta = _pin_num(
+                        row.get("pe_change" if side == "PE" else "ce_change"), 0.0
+                    )
+
+                    prior_prices = [
+                        _pin_num(x.get(price_key), 0.0)
+                        for x in series[:-1]
+                        if _pin_num(x.get(price_key), 0.0) > 0
+                    ]
+                    previous_price = prior_prices[-1] if prior_prices else 0.0
+                    if current_option > 0 and previous_price > 0:
+                        price_delta = current_option - previous_price
+                        price_pct = (price_delta / previous_price) * 100.0
+                        current_direction = (
+                            "UP" if price_delta > 0.005
+                            else ("DOWN" if price_delta < -0.005 else "FLAT")
+                        )
+                        direction_source = "SCAN LTP"
+                    else:
+                        price_delta = daily_delta
+                        # FYERS change is a daily/reference change, not a scan-to-scan
+                        # movement. Keep it separate and never use it to create PRE-MOVE.
+                        price_pct = (
+                            (price_delta / max(current_option - price_delta, 0.0001)) * 100.0
+                            if current_option > 0 else 0.0
+                        )
+                        current_direction = (
+                            "UP" if price_delta > 0.005
+                            else ("DOWN" if price_delta < -0.005 else "FLAT")
+                        )
+                        direction_source = "FYERS CHANGE"
+
+                    pre_dir, reason, _, _, early_score = _movement_pre_direction_reason(
+                        row, series, side=side
+                    )
+                    # The side-specific pre-move confirmation is authoritative here.
+                    # This prevents a stale/current price tick from changing CE->PE.
+                    pre_dir = pre_move_direction
+                    lead_gap = abs(ce_score - pe_score)
+                    reason = (
+                        f"PRE-MOVE {pre_move_direction}: "
+                        f"{side} lead +{lead_gap:.1f}; "
+                        + reason.split(": ", 1)[-1]
+                    )
+                    signal_dt = _movement_signal_time_from_history(
+                        series, side, pre_move_direction, fallback=_india_now()
+                    )
+
+                    # No artificial stop/reversal is created before enough premium
+                    # history exists. This is a PRE-MOVE scanner, not an entry trigger.
+                    reversal_level, reversal_status = _movement_price_reversal_from_history(
+                        movement_history,
+                        symbol,
+                        expiry,
+                        strike,
+                        current_option,
+                        lookback=8,
+                        side=side,
+                        direction=current_direction,
+                    )
+                    levels = _movement_trade_levels(
+                        row,
+                        signal_time=signal_dt,
+                        reversal_level=reversal_level,
+                        reversal_status=reversal_status,
+                    )
+
+                    status = (
+                        "🟡 PRE-MOVE UP" if pre_move_direction == "UP"
+                        else "🟡 PRE-MOVE DOWN"
+                    )
+                    # If the current premium has already moved opposite to the
+                    # detected build-up, make that visible instead of hiding it.
+                    if current_direction not in ("FLAT", pre_move_direction):
+                        status = "⚠️ PRE-MOVE FAILED"
+
+                    rows.append({
+                        "Instrument": symbol,
+                        "Strike": strike,
+                        "Option": side,
+                        "Direction": f"PRE-{pre_move_direction}",
+                        "Status": status,
+                        "Signal Time": levels["Signal Time"],
+                        "Reason": reason,
+                        "Pre-Move Direction": pre_dir,
+                        "Current Price Direction": current_direction,
+                        "Entry": levels["Entry"],
+                        "Stop Loss": levels["Stop Loss"],
+                        "Price Reversal": levels["Price Reversal"],
+                        "Reversal Status": levels["Reversal Status"],
+                        "Score": round(score, 1),
+                        "Early Score": round(early_score, 1),
+                        "CE Score": round(ce_score, 1),
+                        "PE Score": round(pe_score, 1),
+                        "Movement Bias": f"{side} PRE-{pre_move_direction}",
+                        "Price Delta": round(price_delta, 4),
+                        "Price Change %": round(price_pct, 2),
+                        "Price Direction Source": direction_source,
+                        "CE Price": round(_pin_num(row.get("ce_ltp"), 0.0), 4),
+                        "PE Price": round(_pin_num(row.get("pe_ltp"), 0.0), 4),
+                        "Early Status": str(row.get("early_movement_status", "WAIT")),
+                        "Rising Scans": int(_pin_num(row.get("movement_rising_scans"), 0)),
+                        "Score Delta": round(_pin_num(row.get("movement_score_delta")), 1),
+                        "Confidence": round(_pin_num(row.get("early_movement_confidence")), 1),
+                        "Spot": round(spot, 2) if spot else 0.0,
+                        "Source": result.get("source", "UNKNOWN"),
+                    })
                 continue
 
             # ORIGINAL selected-search behavior: CE/UP only.
