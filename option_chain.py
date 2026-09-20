@@ -2299,11 +2299,12 @@ def _movement_history_key(symbol: str, expiry_label: str, strike: float) -> str:
 def compute_movement_early_warning(
     df: pd.DataFrame, symbol: str, expiry_label: str, spot: float
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
-    """Premium-first early warning engine.
+    """Track movement-score acceleration across live scans.
 
-    The old movement score remains intact. This layer additionally tracks the
-    actual CE/PE option premium across separate scan cycles. Strike is used
-    only as an option identifier; it is never used as a price or reversal.
+    This adds a *build-up* layer to the existing movement ranking. It does not
+    predict an exact future price. It looks for repeated score improvement,
+    directional pressure and option activity before the current movement score
+    becomes extreme.
     """
     d = df.copy()
     default_summary = {
@@ -2311,7 +2312,7 @@ def compute_movement_early_warning(
         "early_score": 0.0, "current_score": 0.0, "score_delta": 0.0,
         "score_acceleration": 0.0, "rising_scans": 0, "confidence": 0.0,
         "volume": 0.0, "oi_change": 0.0, "pressure": 50.0,
-        "reason": "Waiting for repeated premium scans"
+        "reason": "Waiting for repeated scans"
     }
     if d.empty or "movement_score" not in d.columns:
         for c, default in {
@@ -2319,36 +2320,22 @@ def compute_movement_early_warning(
             "movement_score_delta": 0.0,
             "movement_score_acceleration": 0.0,
             "movement_rising_scans": 0,
-            "ce_price_delta": 0.0,
-            "pe_price_delta": 0.0,
-            "ce_price_change_pct": 0.0,
-            "pe_price_change_pct": 0.0,
-            "ce_rising_scans": 0,
-            "pe_rising_scans": 0,
-            "ce_price_acceleration": 0.0,
-            "pe_price_acceleration": 0.0,
-            "early_movement_status": "WAIT HISTORY",
+            "early_movement_status": "WAIT",
             "early_movement_confidence": 0.0,
-            "premium_signal": "WAIT HISTORY",
-            "premium_reason": "Waiting for previous premium scan",
         }.items():
             d[c] = default
         return d, default_summary
 
     history = st.session_state.setdefault(MOVEMENT_HISTORY_KEY, {})
-    now = _india_now() if "_india_now" in globals() else datetime.now()
+    now = datetime.now()
 
-    # Append exactly one snapshot per option strike per scan cycle.
+    # Save the current snapshot strike-by-strike.
     for _, row in d.iterrows():
         strike = float(row.get("strike_price", 0) or 0)
         if strike <= 0:
             continue
         key = _movement_history_key(symbol, expiry_label, strike)
-        series = list(history.get(key, []))
-        # If the same option was scanned again within the same timestamp window,
-        # replace the last snapshot rather than falsely counting it as a new scan.
-        if series and abs((now - series[-1].get("ts", now)).total_seconds()) < 0.5:
-            series = series[:-1]
+        series = history.get(key, [])
         series.append({
             "ts": now,
             "score": float(row.get("movement_score", 0) or 0),
@@ -2358,144 +2345,2154 @@ def compute_movement_early_warning(
             "sell": float(row.get("sell_pressure", 50) or 50),
             "volume": float(row.get("total_volume", 0) or 0),
             "oi": float(abs(row.get("ce_chng_oi", 0) or 0) + abs(row.get("pe_chng_oi", 0) or 0)),
-            "volume_spike": bool(row.get("volume_spike", False)),
-            "oi_surge": bool(row.get("oi_surge", False)),
             "ce_price": float(row.get("ce_ltp", 0) or 0),
             "pe_price": float(row.get("pe_ltp", 0) or 0),
         })
         history[key] = series[-MOVEMENT_HISTORY_MAX:]
+
     st.session_state[MOVEMENT_HISTORY_KEY] = history
 
-    early_scores=[]; deltas=[]; accels=[]; rising_counts=[]; statuses=[]; confidences=[]
-    ce_deltas=[]; pe_deltas=[]; ce_pcts=[]; pe_pcts=[]; ce_rises=[]; pe_rises=[]
-    ce_accels=[]; pe_accels=[]; premium_signals=[]; premium_reasons=[]
+    early_scores = []
+    deltas = []
+    accels = []
+    rising_counts = []
+    statuses = []
+    confidences = []
 
     for _, row in d.iterrows():
-        strike=float(row.get("strike_price",0) or 0)
-        series=history.get(_movement_history_key(symbol,expiry_label,strike),[])
-        scores=[float(x.get("score",0) or 0) for x in series]
-        ce_prices=[float(x.get("ce_price",0) or 0) for x in series]
-        pe_prices=[float(x.get("pe_price",0) or 0) for x in series]
-        current=float(scores[-1]) if scores else float(row.get("movement_score",0) or 0)
-        delta=scores[-1]-scores[-2] if len(scores)>=2 else 0.0
-        prev_delta=scores[-2]-scores[-3] if len(scores)>=3 else 0.0
-        accel=delta-prev_delta if len(scores)>=3 else 0.0
+        strike = float(row.get("strike_price", 0) or 0)
+        key = _movement_history_key(symbol, expiry_label, strike)
+        series = history.get(key, [])
+        scores = [float(x.get("score", 0)) for x in series]
+        current = scores[-1] if scores else float(row.get("movement_score", 0) or 0)
 
-        def price_metrics(prices):
-            if len(prices)<2 or prices[-1]<=0 or prices[-2]<=0:
-                return 0.0,0.0,0,0.0
-            dlt=prices[-1]-prices[-2]
-            pct=(dlt/prices[-2])*100.0
-            rises=0
-            for j in range(len(prices)-1,0,-1):
-                if prices[j] > 0 and prices[j-1] > 0 and prices[j] > prices[j-1] + 1e-9:
-                    rises += 1
-                else:
-                    break
-            prev=prices[-2]-prices[-3] if len(prices)>=3 else 0.0
-            return dlt,pct,rises,dlt-prev
+        delta = scores[-1] - scores[-2] if len(scores) >= 2 else 0.0
+        prev_delta = scores[-2] - scores[-3] if len(scores) >= 3 else 0.0
+        accel = delta - prev_delta if len(scores) >= 3 else 0.0
 
-        ce_d,ce_p,ce_r,ce_a=price_metrics(ce_prices)
-        pe_d,pe_p,pe_r,pe_a=price_metrics(pe_prices)
-        rising=0
-        for j in range(len(scores)-1,0,-1):
-            if scores[j] > scores[j-1] + 0.5: rising+=1
-            else: break
+        rising = 0
+        for i in range(len(scores) - 1, 0, -1):
+            if scores[i] > scores[i - 1] + 0.5:
+                rising += 1
+            else:
+                break
 
-        ce=float(row.get("ce_movement_score",0) or 0); pe=float(row.get("pe_movement_score",0) or 0)
-        gap=abs(ce-pe)
-        pressure_gap=abs(float(row.get("buy_pressure",50) or 50)-float(row.get("sell_pressure",50) or 50))
-        volume_spike=bool(row.get("volume_spike",False)); oi_surge=bool(row.get("oi_surge",False))
+        ce = float(row.get("ce_movement_score", 0) or 0)
+        pe = float(row.get("pe_movement_score", 0) or 0)
+        directional_gap = abs(ce - pe)
+        pressure_gap = abs(float(row.get("buy_pressure", 50) or 50) - float(row.get("sell_pressure", 50) or 50))
 
-        # Side-specific premium signal: rising CE premium = UP; rising PE premium = DOWN.
-        if len(ce_prices)>=2 and len(pe_prices)>=2:
-            if ce_d>0 and ce_d>=abs(pe_d): premium_signal="CE UP"
-            elif pe_d>0 and pe_d>abs(ce_d): premium_signal="PE DOWN"
-            elif ce_d<0 and pe_d<0: premium_signal="PREMIUM FALL"
-            else: premium_signal="PREMIUM FLAT"
+        # Build-up score: current activity + improving score + acceleration + direction.
+        delta_component = float(np.clip(50.0 + delta * 2.5, 0, 100))
+        accel_component = float(np.clip(50.0 + accel * 4.0, 0, 100))
+        direction_component = float(np.clip(50.0 + directional_gap * 1.2 + pressure_gap * 0.25, 0, 100))
+        early = float(np.clip(
+            current * 0.50 + delta_component * 0.20 + accel_component * 0.10 + direction_component * 0.20,
+            0, 100
+        ))
+
+        volume_spike = bool(row.get("volume_spike", False))
+        oi_surge = bool(row.get("oi_surge", False))
+        confirmation = (
+            volume_spike
+            or oi_surge
+            or pressure_gap >= 15
+            or directional_gap >= 12
+        )
+
+        # If the current movement is already very strong and has confirmation,
+        # do not show WAIT just because this is the first scan in the session.
+        if early >= MOVEMENT_STRONG_THRESHOLD and confirmation:
+            status = "STRONG MOVE"
+        elif rising >= MOVEMENT_MIN_RISING_SCANS and early >= MOVEMENT_STRONG_THRESHOLD:
+            status = "STRONG MOVE"
+        elif early >= MOVEMENT_EARLY_THRESHOLD and (rising >= MOVEMENT_MIN_RISING_SCANS or confirmation):
+            status = "EARLY MOVE"
+        elif (rising >= 1 and delta > 0) or (early >= 55 and confirmation):
+            status = "BUILDING"
         else:
-            premium_signal="WAIT HISTORY"
+            status = "WAIT"
 
-        reasons=[]
-        if ce_d>0: reasons.append(f"CE premium +{ce_d:.2f} ({ce_p:+.1f}%)")
-        if pe_d>0: reasons.append(f"PE premium +{pe_d:.2f} ({pe_p:+.1f}%)")
-        if ce_a>0 or pe_a>0: reasons.append("premium acceleration")
-        if ce_r>=2: reasons.append(f"CE {ce_r} rising scans")
-        if pe_r>=2: reasons.append(f"PE {pe_r} rising scans")
-        if volume_spike: reasons.append("volume spike")
-        if oi_surge: reasons.append("OI surge")
-        if pressure_gap>=15: reasons.append("pressure imbalance")
+        confidence = float(np.clip(
+            35 + early * 0.45 + min(rising, 4) * 5 + min(directional_gap, 30) * 0.2,
+            0, 95
+        ))
 
-        # PRE-ALERT needs real premium history. Confirm only after sustained/large move.
-        best_pct=max(ce_p,pe_p)
-        best_rise=max(ce_r,pe_r)
-        best_acc=max(ce_a,pe_a)
-        if len(series)<2:
-            premium_status="WAIT HISTORY"
-        elif (ce_r>=3 and ce_p>=4) or (pe_r>=3 and pe_p>=4) or best_pct>=10:
-            premium_status="BIG MOVE CONFIRMED"
-        elif (ce_r>=2 and ce_d>0 and (ce_a>0 or ce_p>=2)) or (pe_r>=2 and pe_d>0 and (pe_a>0 or pe_p>=2)):
-            premium_status="BIG-MOVE PRE-ALERT"
-        elif (ce_d<0 and pe_d<0):
-            premium_status="PRE-MOVE FAILED"
-        else:
-            premium_status="BUILDING"
+        early_scores.append(round(early, 1))
+        deltas.append(round(delta, 1))
+        accels.append(round(accel, 1))
+        rising_counts.append(rising)
+        statuses.append(status)
+        confidences.append(round(confidence, 1))
 
-        delta_component=float(np.clip(50+delta*2.5,0,100))
-        accel_component=float(np.clip(50+accel*4,0,100))
-        premium_component=float(np.clip(50+best_pct*2+best_rise*6+best_acc*2,0,100))
-        direction_component=float(np.clip(50+gap*1.2+pressure_gap*.25,0,100))
-        early=float(np.clip(current*.40+delta_component*.15+accel_component*.10+premium_component*.25+direction_component*.10,0,100))
-        if premium_status=="BIG MOVE CONFIRMED": early=max(early,80.0)
-        elif premium_status=="BIG-MOVE PRE-ALERT": early=max(early,65.0)
+    d["early_movement_score"] = early_scores
+    d["movement_score_delta"] = deltas
+    d["movement_score_acceleration"] = accels
+    d["movement_rising_scans"] = rising_counts
+    d["early_movement_status"] = statuses
+    d["early_movement_confidence"] = confidences
 
-        status = premium_status if premium_status in ("BIG-MOVE PRE-ALERT","BIG MOVE CONFIRMED","PRE-MOVE FAILED","WAIT HISTORY") else ("BUILDING" if early>=55 else "WAIT")
-        confidence=float(np.clip(30+early*.5+min(best_rise,4)*7+(10 if volume_spike else 0)+(10 if oi_surge else 0),0,95))
-        if len(series)<2: confidence=0.0
+    # Pick the best candidate only after it has some evidence of building.
+    candidates = d[d["early_movement_status"].isin(["BUILDING", "EARLY MOVE", "STRONG MOVE"])].copy()
+    if candidates.empty:
+        candidates = d.sort_values("early_movement_score", ascending=False).head(1)
+    if candidates.empty:
+        return d, default_summary
 
-        early_scores.append(round(early,1)); deltas.append(round(delta,1)); accels.append(round(accel,1)); rising_counts.append(rising); statuses.append(status); confidences.append(round(confidence,1))
-        ce_deltas.append(round(ce_d,4)); pe_deltas.append(round(pe_d,4)); ce_pcts.append(round(ce_p,2)); pe_pcts.append(round(pe_p,2)); ce_rises.append(ce_r); pe_rises.append(pe_r); ce_accels.append(round(ce_a,4)); pe_accels.append(round(pe_a,4)); premium_signals.append(premium_signal); premium_reasons.append("; ".join(reasons) if reasons else "Waiting for premium build-up")
+    best = candidates.sort_values(
+        ["early_movement_score", "movement_score_delta"], ascending=False
+    ).iloc[0]
+    ce = float(best.get("ce_movement_score", 0) or 0)
+    pe = float(best.get("pe_movement_score", 0) or 0)
+    direction = "CE / UP" if ce > pe + 7 else ("PE / DOWN" if pe > ce + 7 else "BOTH / CHOP")
+    reasons = []
+    if float(best.get("movement_score_delta", 0) or 0) > 0:
+        reasons.append(f"score +{float(best['movement_score_delta']):.1f}")
+    if float(best.get("movement_score_acceleration", 0) or 0) > 0:
+        reasons.append("acceleration positive")
+    if int(best.get("movement_rising_scans", 0) or 0) >= 2:
+        reasons.append(f"{int(best['movement_rising_scans'])} rising scans")
+    if bool(best.get("volume_spike", False)):
+        reasons.append("volume spike")
+    if bool(best.get("oi_surge", False)):
+        reasons.append("OI surge")
+    if abs(float(best.get("buy_pressure", 50) or 50) - float(best.get("sell_pressure", 50) or 50)) >= 15:
+        reasons.append("pressure imbalance")
 
-    d["early_movement_score"]=early_scores; d["movement_score_delta"]=deltas; d["movement_score_acceleration"]=accels; d["movement_rising_scans"]=rising_counts; d["early_movement_status"]=statuses; d["early_movement_confidence"]=confidences
-    d["ce_price_delta"]=ce_deltas; d["pe_price_delta"]=pe_deltas; d["ce_price_change_pct"]=ce_pcts; d["pe_price_change_pct"]=pe_pcts; d["ce_rising_scans"]=ce_rises; d["pe_rising_scans"]=pe_rises; d["ce_price_acceleration"]=ce_accels; d["pe_price_acceleration"]=pe_accels; d["premium_signal"]=premium_signals; d["premium_reason"]=premium_reasons
-
-    best=d.sort_values(["early_movement_score","early_movement_confidence"],ascending=False).iloc[0] if not d.empty else None
-    if best is None: return d,default_summary
-    return d,{
-        "status":str(best.get("early_movement_status","WAIT")),
-        "direction":str(best.get("premium_signal","WAIT HISTORY")),
-        "strike":float(best.get("strike_price",0) or 0),
-        "early_score":float(best.get("early_movement_score",0) or 0),
-        "current_score":float(best.get("movement_score",0) or 0),
-        "score_delta":float(best.get("movement_score_delta",0) or 0),
-        "score_acceleration":float(best.get("movement_score_acceleration",0) or 0),
-        "rising_scans":int(best.get("movement_rising_scans",0) or 0),
-        "confidence":float(best.get("early_movement_confidence",0) or 0),
-        "volume":float(best.get("total_volume",0) or 0),
-        "oi_change":float(abs(best.get("ce_chng_oi",0) or 0)+abs(best.get("pe_chng_oi",0) or 0)),
-        "pressure":max(float(best.get("buy_pressure",50) or 50),float(best.get("sell_pressure",50) or 50)),
-        "reason":str(best.get("premium_reason","Waiting for premium build-up")),
+    return d, {
+        "status": str(best.get("early_movement_status", "WAIT")),
+        "direction": direction,
+        "strike": float(best.get("strike_price", 0) or 0),
+        "early_score": float(best.get("early_movement_score", 0) or 0),
+        "current_score": float(best.get("movement_score", 0) or 0),
+        "score_delta": float(best.get("movement_score_delta", 0) or 0),
+        "score_acceleration": float(best.get("movement_score_acceleration", 0) or 0),
+        "rising_scans": int(best.get("movement_rising_scans", 0) or 0),
+        "confidence": float(best.get("early_movement_confidence", 0) or 0),
+        "volume": float(best.get("total_volume", 0) or 0),
+        "oi_change": float(abs(best.get("ce_chng_oi", 0) or 0) + abs(best.get("pe_chng_oi", 0) or 0)),
+        "pressure": max(float(best.get("buy_pressure", 50) or 50), float(best.get("sell_pressure", 50) or 50)),
+        "reason": ", ".join(reasons) if reasons else "Activity building",
     }
 
 
+def _render_movement_early_warning(early: dict[str, Any]) -> None:
+    st.markdown('<div class="block-title">🚨 MOVEMENT BEFORE IT HAPPENS — EARLY WARNING</div>', unsafe_allow_html=True)
+    if not early:
+        st.info("Waiting for live movement history.")
+        return
+
+    status = str(early.get("status", "WAIT"))
+    direction = str(early.get("direction", "NEUTRAL"))
+    score = float(early.get("early_score", 0) or 0)
+    confidence = float(early.get("confidence", 0) or 0)
+
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("STATUS", status)
+    c2.metric("DIRECTION", direction)
+    c3.metric("EARLY SCORE", f"{score:.0f}/100")
+    c4.metric("CONFIDENCE", f"{confidence:.0f}%")
+    c5.metric("RISING SCANS", str(int(early.get("rising_scans", 0) or 0)))
+
+    c6, c7, c8, c9 = st.columns(4)
+    c6.metric("STRIKE", f"{float(early.get('strike', 0) or 0):,.0f}" if early.get("strike") else "—")
+    c7.metric("CURRENT MOVE", f"{float(early.get('current_score', 0) or 0):.0f}")
+    c8.metric("SCORE Δ", f"{float(early.get('score_delta', 0) or 0):+.1f}")
+    c9.metric("ACCELERATION", f"{float(early.get('score_acceleration', 0) or 0):+.1f}")
+
+    if status == "STRONG MOVE":
+        st.error(
+            f"🔴 STRONG MOVE CONFIRMED — {direction} near "
+            f"{float(early.get('strike', 0) or 0):,.0f}"
+        )
+    elif status == "EARLY MOVE":
+        st.warning(f"🟠 EARLY MOVE — {direction} near {float(early.get('strike', 0) or 0):,.0f}")
+    elif status == "BUILDING":
+        st.info(f"🟡 BUILDING — {direction} near {float(early.get('strike', 0) or 0):,.0f}")
+    else:
+        st.success("🟢 No confirmed build-up yet. Continue monitoring repeated scans.")
+
+    st.caption(
+        f"Reasons: {early.get('reason', '—')} | "
+        f"OI activity: {float(early.get('oi_change', 0) or 0):,.0f} | "
+        f"Pressure: {float(early.get('pressure', 50) or 50):.0f}"
+    )
+    st.caption("⚠️ Early Warning is probabilistic: it detects rising activity/pressure across scans; it cannot guarantee the next move.")
+
+
+def add_pressure_analysis(df: pd.DataFrame, spot: float, lot_size: int = 1) -> tuple[pd.DataFrame, MarketPressure]:
+    """Full pressure analysis pipeline."""
+    d = df.copy()
+    
+    d = calculate_volume_pressure(d)
+    d = calculate_oi_change_pressure(d)
+    d = calculate_delta_pressure(d, spot)
+    d = calculate_composite_pressure(d, spot, lot_size)
+    d = detect_pressure_anomalies(d)
+    
+    pcr = d["pe_oi"].sum() / d["ce_oi"].sum() if d["ce_oi"].sum() > 0 else 1.0
+    market_pressure = calculate_market_pressure_summary(d, spot, pcr)
+    
+    return d, market_pressure
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# ORDER FLOW ANALYSIS — ADDITIVE ONLY
+# ══════════════════════════════════════════════════════════════════════════
+
+def _estimate_aggressor(ltp: float, bid: float, ask: float) -> float:
+    """Estimate aggressor direction from option-chain LTP vs bid/ask."""
+    try:
+        ltp, bid, ask = float(ltp or 0), float(bid or 0), float(ask or 0)
+        if ltp <= 0:
+            return 0.0
+        if ask > 0 and ltp >= ask:
+            return 1.0
+        if bid > 0 and ltp <= bid:
+            return -1.0
+        if ask > bid > 0:
+            mid = (bid + ask) / 2.0
+            half_spread = (ask - bid) / 2.0
+            if half_spread > 0:
+                return float(np.clip((ltp - mid) / half_spread, -1.0, 1.0))
+        return 0.0
+    except Exception:
+        return 0.0
+
+
+def calculate_order_flow(df: pd.DataFrame, spot: float) -> tuple[pd.DataFrame, dict]:
+    """Add estimated directional order-flow columns without changing old logic."""
+    d = df.copy()
+    defaults = {
+        "ce_ltp": 0.0, "ce_bid": 0.0, "ce_ask": 0.0,
+        "ce_bid_qty": 0.0, "ce_ask_qty": 0.0, "ce_volume": 0.0,
+        "pe_ltp": 0.0, "pe_bid": 0.0, "pe_ask": 0.0,
+        "pe_bid_qty": 0.0, "pe_ask_qty": 0.0, "pe_volume": 0.0,
+    }
+    for col, default in defaults.items():
+        if col not in d.columns:
+            d[col] = default
+        d[col] = pd.to_numeric(d[col], errors="coerce").fillna(0.0)
+
+    d["ce_aggressor"] = [_estimate_aggressor(a, b, c) for a, b, c in zip(d.ce_ltp, d.ce_bid, d.ce_ask)]
+    d["pe_aggressor"] = [_estimate_aggressor(a, b, c) for a, b, c in zip(d.pe_ltp, d.pe_bid, d.pe_ask)]
+    d["ce_volume_delta"] = d.ce_volume * d.ce_aggressor
+    d["pe_volume_delta"] = d.pe_volume * d.pe_aggressor
+
+    ce_qty = d.ce_bid_qty + d.ce_ask_qty
+    pe_qty = d.pe_bid_qty + d.pe_ask_qty
+    d["ce_book_imbalance"] = np.where(ce_qty > 0, (d.ce_bid_qty - d.ce_ask_qty) / ce_qty, 0.0)
+    d["pe_book_imbalance"] = np.where(pe_qty > 0, (d.pe_bid_qty - d.pe_ask_qty) / pe_qty, 0.0)
+
+    # CE buy + PE sell = bullish; CE sell + PE buy = bearish.
+    d["bullish_flow"] = d.ce_volume_delta.clip(lower=0) + (-d.pe_volume_delta).clip(lower=0)
+    d["bearish_flow"] = (-d.ce_volume_delta).clip(lower=0) + d.pe_volume_delta.clip(lower=0)
+    d["net_order_flow"] = d.bullish_flow - d.bearish_flow
+    d["total_order_volume"] = d.ce_volume + d.pe_volume
+    d["order_flow_strength"] = np.where(
+        d.total_order_volume > 0,
+        d.net_order_flow.abs() / d.total_order_volume * 100.0,
+        0.0,
+    ).clip(0, 100)
+    d["order_flow_bias"] = np.select(
+        [d.net_order_flow > 0, d.net_order_flow < 0],
+        ["BULLISH", "BEARISH"],
+        default="NEUTRAL",
+    )
+
+    bullish = float(d.bullish_flow.sum())
+    bearish = float(d.bearish_flow.sum())
+    total = bullish + bearish
+    score = float(np.clip((bullish - bearish) / total * 100.0, -100, 100)) if total > 0 else 0.0
+    market_bias = "🟢 BULLISH" if score >= 20 else ("🔴 BEARISH" if score <= -20 else "🟡 NEUTRAL")
+
+    bullish_strike = bearish_strike = None
+    if not d.empty and "strike_price" in d.columns:
+        b = d.loc[d.net_order_flow.idxmax()]
+        s = d.loc[d.net_order_flow.idxmin()]
+        bullish_strike = {"strike": float(b.strike_price), "flow": float(b.net_order_flow)}
+        bearish_strike = {"strike": float(s.strike_price), "flow": float(s.net_order_flow)}
+
+    return d, {
+        "bullish_flow": bullish,
+        "bearish_flow": bearish,
+        "net_order_flow": bullish - bearish,
+        "flow_bias_score": score,
+        "market_bias": market_bias,
+        "average_strength": float(d.order_flow_strength.mean()) if not d.empty else 0.0,
+        "bullish_strike": bullish_strike,
+        "bearish_strike": bearish_strike,
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 16. CHARTS (ORIGINAL - UNMODIFIED + NEW PRESSURE CHARTS)
+# ══════════════════════════════════════════════════════════════════════════
+
+def _plotly_dark_layout(fig: go.Figure, height: int = 420, title: str = "") -> go.Figure:
+    fig.update_layout(
+        paper_bgcolor=DARK_BG, plot_bgcolor=DARK_BG,
+        font=dict(color=TEXT_MUTED, family="Courier New"),
+        height=height, margin=dict(l=10, r=10, t=40 if title else 10, b=10),
+        title=dict(text=title, font=dict(color=TEXT_MAIN, size=14)) if title else None,
+        legend=dict(bgcolor=PANEL_BG, bordercolor=BORDER_COLOR, borderwidth=1),
+    )
+    return fig
+
+
+def chart_oi_bars(df: pd.DataFrame, max_pain: float) -> go.Figure:
+    fig = make_subplots(rows=1, cols=2, subplot_titles=("Call OI (CE)", "Put OI (PE)"),
+                         shared_yaxes=True, horizontal_spacing=0.04)
+    if df.empty:
+        return _plotly_dark_layout(fig)
+    max_oi = max(df["ce_oi"].max(), df["pe_oi"].max(), 1)
+    strikes_sorted = df["strike_price"].sort_values().unique()
+    gap = (strikes_sorted[1] - strikes_sorted[0]) if len(strikes_sorted) > 1 else 1
+
+    fig.add_trace(go.Bar(
+        x=-df["ce_oi"], y=df["strike_price"], orientation="h",
+        marker_color=[GREEN if abs(s - max_pain) < gap / 2 else "#238636" for s in df["strike_price"]],
+        name="CE OI", showlegend=False,
+        hovertemplate="Strike %{y}<br>CE OI: %{customdata:,}<extra></extra>", customdata=df["ce_oi"],
+    ), row=1, col=1)
+    fig.add_trace(go.Bar(
+        x=df["pe_oi"], y=df["strike_price"], orientation="h",
+        marker_color=[RED if abs(s - max_pain) < gap / 2 else "#da3633" for s in df["strike_price"]],
+        name="PE OI", showlegend=False,
+        hovertemplate="Strike %{y}<br>PE OI: %{x:,}<extra></extra>",
+    ), row=1, col=2)
+    for col in (1, 2):
+        fig.add_hline(y=max_pain, line_dash="dot", line_color=AMBER,
+                      annotation_text=f"Max Pain {max_pain:,.0f}", annotation_font_color=AMBER, row=1, col=col)
+    fig.update_layout(
+        xaxis=dict(showticklabels=False, showgrid=False, range=[-max_oi * 1.1, 0]),
+        xaxis2=dict(showticklabels=False, showgrid=False, range=[0, max_oi * 1.1]),
+        yaxis=dict(showgrid=True, gridcolor=BORDER_COLOR, tickfont=dict(color=TEXT_MAIN, size=11)),
+    )
+    fig.update_annotations(font_color=TEXT_MUTED)
+    return _plotly_dark_layout(fig, height=480)
+
+
+def chart_iv_skew(df: pd.DataFrame) -> go.Figure:
+    fig = go.Figure()
+    if not df.empty:
+        fig.add_trace(go.Scatter(x=df["strike_price"], y=df["ce_iv"], mode="lines+markers",
+                                  name="CE IV", line=dict(color=GREEN, width=2)))
+        fig.add_trace(go.Scatter(x=df["strike_price"], y=df["pe_iv"], mode="lines+markers",
+                                  name="PE IV", line=dict(color=RED, width=2)))
+    fig.update_layout(xaxis=dict(title="Strike", showgrid=True, gridcolor=BORDER_COLOR),
+                       yaxis=dict(title="IV %", showgrid=True, gridcolor=BORDER_COLOR))
+    return _plotly_dark_layout(fig, height=320, title="Implied Volatility Skew")
+
+
+def chart_greeks(df: pd.DataFrame, greek: str) -> go.Figure:
+    fig = go.Figure()
+    col_ce, col_pe = f"ce_{greek}", f"pe_{greek}"
+    if not df.empty and col_ce in df.columns:
+        fig.add_trace(go.Scatter(x=df["strike_price"], y=df[col_ce], mode="lines+markers",
+                                  name=f"CE {greek.title()}", line=dict(color=GREEN, width=2)))
+        fig.add_trace(go.Scatter(x=df["strike_price"], y=df[col_pe], mode="lines+markers",
+                                  name=f"PE {greek.title()}", line=dict(color=RED, width=2)))
+    fig.update_layout(xaxis=dict(title="Strike", showgrid=True, gridcolor=BORDER_COLOR),
+                       yaxis=dict(title=greek.title(), showgrid=True, gridcolor=BORDER_COLOR))
+    return _plotly_dark_layout(fig, height=300, title=f"{greek.title()} by Strike")
+
+
+def chart_movement_score(df: pd.DataFrame) -> go.Figure:
+    fig = go.Figure()
+    if df.empty or "movement_score" not in df.columns:
+        return _plotly_dark_layout(fig, height=360, title="Strike Movement Score")
+    d = df.sort_values("movement_score", ascending=False).head(20).sort_values("strike_price")
+    fig.add_trace(go.Bar(
+        x=d["strike_price"], y=d["movement_score"],
+        text=d["movement_bias"], textposition="outside",
+        marker_color=[GREEN if x >= 75 else (AMBER if x >= 60 else RED) for x in d["movement_score"]],
+        name="Movement Score",
+        hovertemplate="Strike %{x:,.0f}<br>Score: %{y:.1f}<br>Bias: %{text}<extra></extra>",
+    ))
+    fig.update_layout(
+        xaxis=dict(title="Strike", showgrid=True, gridcolor=BORDER_COLOR),
+        yaxis=dict(title="Movement Score (0-100)", range=[0, 105], showgrid=True, gridcolor=BORDER_COLOR),
+    )
+    return _plotly_dark_layout(fig, height=380, title="Top Strike Movement Potential")
+
+
+def chart_gex_by_strike(gex_data: dict) -> go.Figure:
+    fig = go.Figure()
+    by_strike = gex_data.get("by_strike", pd.DataFrame())
+    if not by_strike.empty:
+        colors = [GREEN if v >= 0 else RED for v in by_strike["gex"]]
+        fig.add_trace(go.Bar(x=by_strike["strike_price"], y=by_strike["gex"], marker_color=colors, name="GEX"))
+    fig.update_layout(xaxis=dict(title="Strike", showgrid=True, gridcolor=BORDER_COLOR),
+                       yaxis=dict(title="Gamma Exposure", showgrid=True, gridcolor=BORDER_COLOR))
+    return _plotly_dark_layout(fig, height=320, title="Gamma Exposure (GEX) by Strike")
+
+
+def chart_price_action(df: pd.DataFrame, title: str = "Price Action with Indicators") -> go.Figure:
+    """Chart price action with VWAP, EMA, and volume."""
+    if df.empty or "close" not in df.columns:
+        return _plotly_dark_layout(go.Figure(), title=title)
+    
+    fig = make_subplots(
+        rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.1,
+        row_heights=[0.7, 0.3],
+        subplot_titles=("Price", "Volume")
+    )
+    
+    fig.add_trace(go.Candlestick(
+        x=df.index, open=df["open"], high=df["high"], low=df["low"], close=df["close"],
+        name="OHLC", showlegend=True
+    ), row=1, col=1)
+    
+    if "vwap" in df.columns:
+        fig.add_trace(go.Scatter(
+            x=df.index, y=df["vwap"], mode="lines", name="VWAP",
+            line=dict(color=BLUE, width=2)
+        ), row=1, col=1)
+    
+    if "ema_9" in df.columns:
+        fig.add_trace(go.Scatter(
+            x=df.index, y=df["ema_9"], mode="lines", name="EMA 9",
+            line=dict(color=GREEN, width=1.5)
+        ), row=1, col=1)
+    if "ema_21" in df.columns:
+        fig.add_trace(go.Scatter(
+            x=df.index, y=df["ema_21"], mode="lines", name="EMA 21",
+            line=dict(color=RED, width=1.5)
+        ), row=1, col=1)
+    
+    if "volume" in df.columns:
+        colors = [GREEN if df["close"].iloc[i] >= df["open"].iloc[i] else RED for i in range(len(df))]
+        fig.add_trace(go.Bar(
+            x=df.index, y=df["volume"], name="Volume", marker_color=colors, showlegend=True
+        ), row=2, col=1)
+    
+    fig.update_layout(
+        xaxis=dict(showgrid=True, gridcolor=BORDER_COLOR),
+        yaxis=dict(showgrid=True, gridcolor=BORDER_COLOR),
+        xaxis2=dict(showgrid=True, gridcolor=BORDER_COLOR),
+        yaxis2=dict(showgrid=True, gridcolor=BORDER_COLOR),
+    )
+    
+    return _plotly_dark_layout(fig, height=500, title=title)
+
+
+def chart_technical_indicators(df: pd.DataFrame) -> go.Figure:
+    """Chart RSI, MACD, and Momentum."""
+    if df.empty:
+        return _plotly_dark_layout(go.Figure())
+    
+    fig = make_subplots(
+        rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.08,
+        subplot_titles=("RSI (14)", "MACD", "Momentum")
+    )
+    
+    if "rsi" in df.columns:
+        fig.add_trace(go.Scatter(
+            x=df.index, y=df["rsi"], mode="lines", name="RSI",
+            line=dict(color=BLUE, width=2)
+        ), row=1, col=1)
+        fig.add_hline(y=70, line_dash="dash", line_color=RED, annotation_text="Overbought", row=1, col=1)
+        fig.add_hline(y=30, line_dash="dash", line_color=GREEN, annotation_text="Oversold", row=1, col=1)
+    
+    if "macd" in df.columns and "macd_signal" in df.columns:
+        fig.add_trace(go.Scatter(
+            x=df.index, y=df["macd"], mode="lines", name="MACD",
+            line=dict(color=BLUE, width=2)
+        ), row=2, col=1)
+        fig.add_trace(go.Scatter(
+            x=df.index, y=df["macd_signal"], mode="lines", name="MACD Signal",
+            line=dict(color=RED, width=1.5)
+        ), row=2, col=1)
+        if "macd_hist" in df.columns:
+            colors = [GREEN if v >= 0 else RED for v in df["macd_hist"]]
+            fig.add_trace(go.Bar(
+                x=df.index, y=df["macd_hist"], name="MACD Histogram",
+                marker_color=colors
+            ), row=2, col=1)
+    
+    if len(df) > 1:
+        momentum = df["close"].pct_change() * 100
+        fig.add_trace(go.Scatter(
+            x=df.index, y=momentum, mode="lines", name="Momentum %",
+            line=dict(color=AMBER, width=2)
+        ), row=3, col=1)
+        fig.add_hline(y=0, line_dash="dash", line_color=TEXT_MUTED, row=3, col=1)
+    
+    fig.update_yaxes(title_text="RSI", row=1, col=1)
+    fig.update_yaxes(title_text="MACD", row=2, col=1)
+    fig.update_yaxes(title_text="Momentum %", row=3, col=1)
+    
+    fig.update_layout(
+        xaxis=dict(showgrid=True, gridcolor=BORDER_COLOR),
+        yaxis=dict(showgrid=True, gridcolor=BORDER_COLOR),
+    )
+    
+    return _plotly_dark_layout(fig, height=600)
+
+
+def gauge_pcr(pcr: float) -> go.Figure:
+    fig = go.Figure(go.Indicator(
+        mode="gauge+number", value=pcr,
+        number={"font": {"color": TEXT_MAIN, "size": 32, "family": "Courier New"}},
+        gauge={
+            "axis": {"range": [0, 3], "tickcolor": TEXT_MUTED, "tickfont": {"color": TEXT_MUTED}},
+            "bar": {"color": BLUE, "thickness": 0.25}, "bgcolor": PANEL_BG, "borderwidth": 0,
+            "steps": [{"range": [0, 0.7], "color": "#3b0d1a"}, {"range": [0.7, 1.3], "color": "#1c2128"},
+                      {"range": [1.3, 3.0], "color": "#0d3b2e"}],
+            "threshold": {"line": {"color": AMBER, "width": 3}, "value": pcr},
+        },
+        title={"text": "PUT / CALL RATIO", "font": {"color": TEXT_MUTED, "size": 12}},
+    ))
+    return _plotly_dark_layout(fig, height=220)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# NEW PRESSURE CHARTS
+# ══════════════════════════════════════════════════════════════════════════
+
+def chart_pressure_by_strike(df: pd.DataFrame, spot: float) -> go.Figure:
+    """Chart buy/sell pressure by strike."""
+    fig = go.Figure()
+    
+    if df.empty or "buy_pressure" not in df.columns:
+        return _plotly_dark_layout(fig, title="Buy/Sell Pressure by Strike")
+    
+    df_sorted = df.sort_values("strike_price")
+    
+    fig.add_trace(go.Bar(
+        x=df_sorted["buy_pressure"],
+        y=df_sorted["strike_price"],
+        orientation="h",
+        name="Buy Pressure",
+        marker_color=GREEN,
+        hovertemplate="Strike %{y}<br>Buy: %{x:.0f}<extra></extra>",
+    ))
+    
+    fig.add_trace(go.Bar(
+        x=-df_sorted["sell_pressure"],
+        y=df_sorted["strike_price"],
+        orientation="h",
+        name="Sell Pressure",
+        marker_color=RED,
+        hovertemplate="Strike %{y}<br>Sell: %{customdata:.0f}<extra></extra>",
+        customdata=df_sorted["sell_pressure"],
+    ))
+    
+    if spot:
+        fig.add_hline(y=spot, line_dash="dash", line_color=BLUE, 
+                     annotation_text=f"Spot {spot:,.0f}",
+                     annotation_font_color=BLUE)
+    
+    fig.update_layout(
+        barmode="overlay",
+        xaxis=dict(title="Pressure Score", showgrid=True, gridcolor=BORDER_COLOR),
+        yaxis=dict(title="Strike", showgrid=True, gridcolor=BORDER_COLOR),
+    )
+    
+    return _plotly_dark_layout(fig, height=500, title="Buy/Sell Pressure by Strike")
+
+
+def chart_net_pressure(df: pd.DataFrame, spot: float) -> go.Figure:
+    """Chart net pressure (directional)."""
+    fig = go.Figure()
+    
+    if df.empty or "net_pressure" not in df.columns:
+        return _plotly_dark_layout(fig, title="Net Pressure Bias")
+    
+    df_sorted = df.sort_values("strike_price")
+    colors = [GREEN if x > 0 else RED for x in df_sorted["net_pressure"]]
+    
+    fig.add_trace(go.Bar(
+        x=df_sorted["strike_price"],
+        y=df_sorted["net_pressure"],
+        marker_color=colors,
+        name="Net Pressure",
+        hovertemplate="Strike %{x:,.0f}<br>Net: %{y:.0f}<extra></extra>",
+    ))
+    
+    fig.add_hline(y=0, line_dash="dash", line_color=TEXT_MUTED)
+    
+    if spot:
+        fig.add_vline(x=spot, line_dash="dash", line_color=BLUE,
+                     annotation_text=f"Spot {spot:,.0f}",
+                     annotation_font_color=BLUE)
+    
+    fig.update_layout(
+        xaxis=dict(title="Strike", showgrid=True, gridcolor=BORDER_COLOR),
+        yaxis=dict(title="Net Pressure (-100 to +100)", showgrid=True, gridcolor=BORDER_COLOR),
+    )
+    
+    return _plotly_dark_layout(fig, height=400, title="Net Pressure Bias by Strike")
+
+
+def chart_aggression_level(df: pd.DataFrame) -> go.Figure:
+    """Chart aggression level."""
+    fig = go.Figure()
+    
+    if df.empty or "aggression_level" not in df.columns:
+        return _plotly_dark_layout(fig, title="Aggression Level")
+    
+    df_sorted = df.sort_values("strike_price")
+    
+    fig.add_trace(go.Scatter(
+        x=df_sorted["strike_price"],
+        y=df_sorted["aggression_level"],
+        mode="lines+markers",
+        name="Aggression",
+        line=dict(color=AMBER, width=2),
+        fill="tozeroy",
+        fillcolor=f"rgba(210, 153, 34, 0.2)",
+        hovertemplate="Strike %{x:,.0f}<br>Aggression: %{y:.0f}<extra></extra>",
+    ))
+    
+    fig.update_layout(
+        xaxis=dict(title="Strike", showgrid=True, gridcolor=BORDER_COLOR),
+        yaxis=dict(title="Aggression Level (0-100)", showgrid=True, gridcolor=BORDER_COLOR, range=[0, 100]),
+    )
+    
+    return _plotly_dark_layout(fig, height=350, title="Aggression Level by Strike")
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 17. HTML TABLE RENDERING (ORIGINAL - UNMODIFIED)
+# ══════════════════════════════════════════════════════════════════════════
+
+_TABLE_CSS = f"""
+<style>
+.oc-table-wrap {{ max-height: 620px; overflow-y: auto; border: 1px solid {BORDER_COLOR}; border-radius: 8px; }}
+.oc-table {{ width: 100%; border-collapse: collapse; font-family: 'Courier New', monospace; font-size: 12.5px; }}
+.oc-table th {{ background: #1F4E78; color: #ffffff; padding: 8px 10px; text-align: center;
+                position: sticky; top: 0; font-size: 11px; text-transform: uppercase; letter-spacing: .04em; }}
+.oc-table td {{ padding: 6px 9px; text-align: center; border-bottom: 1px solid #21262d; color: {TEXT_MAIN}; white-space: nowrap; }}
+.oc-atm-row td {{ background-color: #1c2128 !important; font-weight: 700; }}
+</style>
+"""
+
+
+def _safe_cell(val: Any) -> str:
+    if val is None:
+        return ""
+    try:
+        if isinstance(val, float) and math.isnan(val):
+            return ""
+    except (TypeError, ValueError):
+        pass
+    s = str(val)
+    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+
+
+def _oi_cell_style(val: float, heavy_thresh: float, max_val: float) -> str:
+    if max_val <= 0:
+        return f"color:{TEXT_MUTED};"
+    pct = max(0.0, min(100.0, (val / max_val) * 100))
+    intensity = 0.10 + pct / 250
+    is_heavy = heavy_thresh > 0 and val >= heavy_thresh
+    bg = f"background:linear-gradient(90deg, rgba(63,185,80,{intensity:.2f}) {pct:.0f}%, transparent {pct:.0f}%);"
+    weight = "font-weight:700;" if is_heavy else ""
+    return bg + weight
+
+
+def _oi_change_cell_style(val: float, heavy_thresh: float) -> str:
+    if val == 0:
+        return f"color:{TEXT_MUTED};"
+    is_large = heavy_thresh > 0 and abs(val) >= heavy_thresh
+    if val > 0:
+        return f"color:#0d3b2e;font-weight:700;background-color:{GREEN};" if is_large else f"color:{GREEN};"
+    return f"color:#3b0d1a;font-weight:700;background-color:{RED};" if is_large else f"color:{RED};"
+
+
+def _signal_cell_style(val: str) -> str:
+    v = str(val).upper()
+    if "BUY CE" in v or "STRONG BUY" in v or "BUY" in v:
+        return f"color:{GREEN};font-weight:700;"
+    if "BUY PE" in v or "SELL" in v:
+        return f"color:{RED};font-weight:700;"
+    if "HOLD" in v or "WAIT" in v:
+        return f"color:{AMBER};font-weight:700;"
+    return f"color:{TEXT_MUTED};"
+
+
+def render_chain_table_html(df: pd.DataFrame, show_greeks: bool, top_n: int = 400) -> str:
+    if df.empty:
+        return _TABLE_CSS + "<div style='color:#8b949e;padding:12px;'>No rows to display.</div>"
+
+    base_cols = [
+        ("ce_oi", "CE OI"), ("ce_chng_oi", "CE ΔOI"), ("ce_oi_change_pct", "CE ΔOI%"),
+        ("ce_volume", "CE Vol"), ("ce_iv", "CE IV"), ("ce_ltp", "CE LTP"),
+        ("ce_bid", "CE Bid"), ("ce_ask", "CE Ask"),
+    ]
+    greek_ce_cols = [("ce_delta", "CE Δ"), ("ce_gamma", "CE Γ"), ("ce_theta", "CE Θ"), ("ce_vega", "CE V")]
+    mid_cols = [("strike_price", "STRIKE"), ("CE Buildup", "CE Build"), ("PE Buildup", "PE Build"),
+                ("AI Signal", "AI Signal"), ("movement_score", "MOVE %"),
+                ("movement_bias", "MOVE BIAS"), ("movement_strength", "MOVE STR")]
+    greek_pe_cols = [("pe_delta", "PE Δ"), ("pe_gamma", "PE Γ"), ("pe_theta", "PE Θ"), ("pe_vega", "PE V")]
+    pe_cols = [
+        ("pe_bid", "PE Bid"), ("pe_ask", "PE Ask"), ("pe_ltp", "PE LTP"), ("pe_iv", "PE IV"),
+        ("pe_volume", "PE Vol"), ("pe_oi_change_pct", "PE ΔOI%"), ("pe_chng_oi", "PE ΔOI"), ("pe_oi", "PE OI"),
+    ]
+
+    cols = base_cols + (greek_ce_cols if show_greeks else []) + mid_cols + \
+        (greek_pe_cols if show_greeks else []) + pe_cols
+    cols = [(k, label) for k, label in cols if k in df.columns]
+
+    fmt = {
+        "ce_oi": "{:,.0f}", "ce_chng_oi": "{:+,.0f}", "ce_oi_change_pct": "{:+.1f}%",
+        "ce_volume": "{:,.0f}", "ce_iv": "{:.1f}", "ce_ltp": "{:.2f}", "ce_bid": "{:.2f}", "ce_ask": "{:.2f}",
+        "ce_delta": "{:.3f}", "ce_gamma": "{:.5f}", "ce_theta": "{:.3f}", "ce_vega": "{:.3f}",
+        "strike_price": "{:,.0f}", "movement_score": "{:.1f}",
+        "pe_delta": "{:.3f}", "pe_gamma": "{:.5f}", "pe_theta": "{:.3f}", "pe_vega": "{:.3f}",
+        "pe_bid": "{:.2f}", "pe_ask": "{:.2f}", "pe_ltp": "{:.2f}", "pe_iv": "{:.1f}",
+        "pe_volume": "{:,.0f}", "pe_oi_change_pct": "{:+.1f}%", "pe_chng_oi": "{:+,.0f}", "pe_oi": "{:,.0f}",
+    }
+
+    heavy_ce_oi = df["ce_oi"].quantile(0.80) if df["ce_oi"].max() > 0 else 0
+    heavy_pe_oi = df["pe_oi"].quantile(0.80) if df["pe_oi"].max() > 0 else 0
+    heavy_ce_chng = df["ce_chng_oi"].abs().quantile(0.80) if (df["ce_chng_oi"] != 0).any() else 0
+    heavy_pe_chng = df["pe_chng_oi"].abs().quantile(0.80) if (df["pe_chng_oi"] != 0).any() else 0
+    max_ce_oi, max_pe_oi = df["ce_oi"].max(), df["pe_oi"].max()
+
+    view = df.head(top_n)
+    header_html = "".join(f"<th>{label}</th>" for _, label in cols)
+    rows_html = []
+    for _, row in view.iterrows():
+        is_atm = bool(row.get("ATM", False))
+        cells = []
+        for key, _ in cols:
+            val = row.get(key, "")
+            spec = fmt.get(key)
+            display_val = spec.format(val) if spec and pd.notna(val) else ("" if pd.isna(val) else val)
+            style = ""
+            if key == "ce_oi":
+                style = _oi_cell_style(val, heavy_ce_oi, max_ce_oi)
+            elif key == "pe_oi":
+                style = _oi_cell_style(val, heavy_pe_oi, max_pe_oi)
+            elif key == "ce_chng_oi":
+                style = _oi_change_cell_style(val, heavy_ce_chng)
+            elif key == "pe_chng_oi":
+                style = _oi_change_cell_style(val, heavy_pe_chng)
+            elif key == "AI Signal":
+                style = _signal_cell_style(val)
+            elif key == "movement_bias":
+                style = _signal_cell_style(val)
+            elif key == "movement_score":
+                try:
+                    score = float(val)
+                    style = f"font-weight:700;color:{GREEN if score >= 75 else (AMBER if score >= 60 else TEXT_MUTED)};"
+                except Exception:
+                    style = ""
+            cells.append(f'<td style="{style}">{_safe_cell(display_val)}</td>')
+        row_class = "oc-atm-row" if is_atm else ""
+        rows_html.append(f'<tr class="{row_class}">{"".join(cells)}</tr>')
+
+    return (
+        _TABLE_CSS
+        + f'<div class="oc-table-wrap"><table class="oc-table"><thead><tr>{header_html}</tr></thead>'
+        + f'<tbody>{"".join(rows_html)}</tbody></table></div>'
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 18. EXCEL EXPORT (ORIGINAL - UNMODIFIED)
+# ══════════════════════════════════════════════════════════════════════════
+
+FILL_HEADER = PatternFill(start_color="1F4E78", end_color="1F4E78", fill_type="solid")
+FILL_GREEN = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
+FILL_RED = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
+FILL_AMBER = PatternFill(start_color="FFEB9C", end_color="FFEB9C", fill_type="solid")
+FONT_HEADER = Font(color="FFFFFF", bold=True, size=11)
+THIN_BORDER = Border(*(Side(style="thin", color="30363D"),) * 4)
+
+
+def _style_header_row(ws, row_idx: int = 1) -> None:
+    for cell in ws[row_idx]:
+        cell.fill = FILL_HEADER
+        cell.font = FONT_HEADER
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+        cell.border = THIN_BORDER
+
+
+def _autosize_columns(ws) -> None:
+    for col_cells in ws.columns:
+        length = max((len(str(c.value)) if c.value is not None else 0) for c in col_cells)
+        col_letter = get_column_letter(col_cells[0].column)
+        ws.column_dimensions[col_letter].width = min(max(length + 3, 10), 40)
+
+
+def _apply_borders(ws) -> None:
+    for row in ws.iter_rows():
+        for cell in row:
+            cell.border = THIN_BORDER
+
+
+def _write_dataframe(ws, df: pd.DataFrame, start_row: int = 1) -> None:
+    for j, col_name in enumerate(df.columns, start=1):
+        ws.cell(row=start_row, column=j, value=str(col_name))
+    for i, (_, row) in enumerate(df.iterrows(), start=start_row + 1):
+        for j, val in enumerate(row, start=1):
+            if isinstance(val, (np.integer,)):
+                val = int(val)
+            elif isinstance(val, (np.floating,)):
+                val = float(val) if not math.isnan(val) else None
+            elif isinstance(val, (np.bool_,)):
+                val = bool(val)
+            ws.cell(row=i, column=j, value=val)
+    _style_header_row(ws, start_row)
+    ws.freeze_panes = ws.cell(row=start_row + 1, column=1).coordinate
+    ws.auto_filter.ref = ws.dimensions
+    _conditional_color_signal_columns(ws, list(df.columns), start_row=start_row + 1)
+    _apply_borders(ws)
+    _autosize_columns(ws)
+
+
+def _conditional_color_signal_columns(ws, header_values: list, start_row: int) -> None:
+    target_cols = [
+        idx + 1 for idx, h in enumerate(header_values)
+        if h and any(k in str(h) for k in ("Signal", "Buildup", "Institutional", "Smart Money"))
+    ]
+    for row in ws.iter_rows(min_row=start_row):
+        for col_idx in target_cols:
+            cell = row[col_idx - 1]
+            val = str(cell.value or "").upper()
+            fill = None
+            if "BUY CE" in val or "LONG BUILDUP" in val or "INSTITUTIONAL" in val or "TRUE" in val:
+                fill = FILL_GREEN
+            elif "BUY PE" in val or "SHORT BUILDUP" in val:
+                fill = FILL_RED
+            elif "HOLD" in val or "WAIT" in val or "FLAT" in val:
+                fill = FILL_AMBER
+            if fill:
+                cell.fill = fill
+
+
+def export_excel_report(df: pd.DataFrame, meta: dict, pcr: float, max_pain: float,
+                         support: Optional[float], resistance: Optional[float],
+                         symbol: str, expiry_label: str, iv_rank: float,
+                         iv_percentile: float, gex_dex: dict, market_pressure: Optional[MarketPressure] = None,
+                         trade_signal: Optional[TradeSignal] = None,
+                         po3_intelligence: Optional[dict] = None,
+                         order_flow: Optional[dict] = None,
+                         final_signal: Optional[dict] = None) -> io.BytesIO:
+    wb = Workbook()
+
+    ws_summary = wb.active
+    ws_summary.title = "Summary"
+    summary_rows = [
+        ("Symbol", symbol), ("Expiry", expiry_label),
+        ("Generated At", datetime.now().strftime("%d-%b-%Y %H:%M:%S")),
+        ("Spot Price", round(meta.get("spot_price", 0.0), 2)),
+        ("PCR", pcr), ("Max Pain", max_pain),
+        ("Support (Max PE OI)", support), ("Resistance (Max CE OI)", resistance),
+        ("IV Rank", iv_rank), ("IV Percentile", iv_percentile),
+        ("Total GEX", round(gex_dex.get("total_gex", 0.0), 2)),
+        ("Total DEX", round(gex_dex.get("total_dex", 0.0), 2)),
+        ("Gamma Flip Strike", gex_dex.get("gamma_flip")),
+        ("Total CE OI", int(df["ce_oi"].sum()) if not df.empty else 0),
+        ("Total PE OI", int(df["pe_oi"].sum()) if not df.empty else 0),
+    ]
+    
+    if market_pressure:
+        summary_rows.extend([
+            ("", ""),
+            ("MARKET PRESSURE", ""),
+            ("Market Sentiment", market_pressure.market_sentiment),
+            ("Net Market Bias", market_pressure.net_market_bias),
+            ("Buy Pressure", market_pressure.total_call_pressure),
+            ("Sell Pressure", market_pressure.total_put_pressure),
+            ("Volume Surge Detected", market_pressure.volume_surge_detected),
+            ("OI Accumulation", market_pressure.oi_accumulation_detected),
+        ])
+    
+    # ORDER FLOW + MARKET DIRECTION (ADDITIVE EXPORT ONLY)
+    if order_flow and isinstance(order_flow, dict):
+        summary_rows.extend([
+            ("", ""),
+            ("ORDER FLOW", ""),
+            ("Order Flow Bias", order_flow.get("order_flow_bias", order_flow.get("bias", "NEUTRAL"))),
+            ("Bullish Flow", order_flow.get("bullish_flow", 0.0)),
+            ("Bearish Flow", order_flow.get("bearish_flow", 0.0)),
+            ("Net Order Flow", order_flow.get("net_order_flow", 0.0)),
+            ("Order Flow Strength", order_flow.get("order_flow_strength", order_flow.get("strength", 0.0))),
+            ("Strongest Bullish Strike", order_flow.get("strongest_bullish_strike")),
+            ("Strongest Bearish Strike", order_flow.get("strongest_bearish_strike")),
+        ])
+
+    if final_signal and isinstance(final_signal, dict):
+        summary_rows.extend([
+            ("", ""),
+            ("FINAL MARKET DIRECTION", ""),
+            ("Final Signal", final_signal.get("signal", "WAIT")),
+            ("Next Candle", final_signal.get("next_candle", "WAIT")),
+            ("Market Status", final_signal.get("market_status", "NEUTRAL")),
+            ("Confidence", final_signal.get("confidence", 0.0)),
+            ("Reason", final_signal.get("reason", "")),
+        ])
+
+    if trade_signal:
+        summary_rows.extend([
+            ("", ""),
+            ("TRADE SIGNAL (Price Action)", ""),
+            ("Signal", trade_signal.signal),
+            ("Entry", round(trade_signal.entry, 2)),
+            ("Stop Loss", round(trade_signal.stop_loss, 2)),
+            ("Target 1", round(trade_signal.target_1, 2)),
+            ("Target 2", round(trade_signal.target_2, 2)),
+            ("Target 3", round(trade_signal.target_3, 2)),
+            ("Risk:Reward", round(trade_signal.risk_reward_ratio, 2)),
+            ("Probability", f"{trade_signal.probability:.1f}%"),
+            ("Confidence", f"{trade_signal.confidence:.1f}%"),
+        ])
+
+    if po3_intelligence:
+        summary_rows.extend([
+            ("", ""), ("PO3 + OPTIONS INTELLIGENCE", ""),
+            ("PO3 Phase", po3_intelligence.get("po3_phase")),
+            ("PO3 Direction", po3_intelligence.get("po3_direction")),
+            ("ATM Strike", po3_intelligence.get("atm_strike")),
+            ("CE OI", po3_intelligence.get("ce_oi")),
+            ("PE OI", po3_intelligence.get("pe_oi")),
+            ("CE OI Change", po3_intelligence.get("ce_oi_change")),
+            ("PE OI Change", po3_intelligence.get("pe_oi_change")),
+            ("PCR", po3_intelligence.get("pcr")),
+            ("Call Writing", po3_intelligence.get("call_writing")),
+            ("Put Writing", po3_intelligence.get("put_writing")),
+            ("Call Unwinding", po3_intelligence.get("call_unwinding")),
+            ("Put Unwinding", po3_intelligence.get("put_unwinding")),
+            ("PO3 + Options Confirmation", po3_intelligence.get("po3_options_confirmation")),
+            ("Final CE Bias", po3_intelligence.get("final_ce_bias")),
+            ("Final PE Bias", po3_intelligence.get("final_pe_bias")),
+            ("Confidence", po3_intelligence.get("confidence")),
+        ])
+    
+    ws_summary.cell(row=1, column=1, value="Metric")
+    ws_summary.cell(row=1, column=2, value="Value")
+    _style_header_row(ws_summary, 1)
+    for i, (label, value) in enumerate(summary_rows, start=2):
+        ws_summary.cell(row=i, column=1, value=label)
+        ws_summary.cell(row=i, column=2, value=value)
+    ws_summary.freeze_panes = "A2"
+    _apply_borders(ws_summary)
+    _autosize_columns(ws_summary)
+
+    ws_chain = wb.create_sheet("Option Chain")
+    chain_export_cols = [c for c in [
+        "strike_price", "ce_oi", "ce_chng_oi", "ce_oi_change_pct", "ce_volume", "ce_iv", "ce_ltp",
+        "ce_bid", "ce_ask", "CE Buildup", "CE Moneyness", "AI Signal", "AI Confidence %",
+        "Institutional Signal", "Smart Money", "PE Moneyness", "PE Buildup",
+        "pe_bid", "pe_ask", "pe_ltp", "pe_iv", "pe_volume", "pe_oi_change_pct", "pe_chng_oi", "pe_oi",
+    ] if c in df.columns]
+    _write_dataframe(ws_chain, df[chain_export_cols])
+
+    ws_greeks = wb.create_sheet("Greeks")
+    greek_cols = [c for c in [
+        "strike_price", "ce_delta", "ce_gamma", "ce_theta", "ce_vega",
+        "pe_delta", "pe_gamma", "pe_theta", "pe_vega",
+    ] if c in df.columns]
+    if greek_cols:
+        _write_dataframe(ws_greeks, df[greek_cols])
+
+    ws_signals = wb.create_sheet("AI Signals")
+    signal_cols = [c for c in [
+        "strike_price", "AI Signal", "AI Confidence %", "CE Score", "PE Score",
+        "Institutional Signal", "Smart Money",
+    ] if c in df.columns]
+    if signal_cols:
+        sig_df = df[signal_cols].sort_values("AI Confidence %", ascending=False) if "AI Confidence %" in df.columns else df[signal_cols]
+        _write_dataframe(ws_signals, sig_df)
+    
+    # Order Flow sheet (safe optional export)
+    order_flow_cols = [c for c in [
+        "strike_price", "ce_volume", "ce_aggressor", "ce_volume_delta",
+        "ce_book_imbalance", "pe_volume", "pe_aggressor", "pe_volume_delta",
+        "pe_book_imbalance", "bullish_flow", "bearish_flow", "net_order_flow",
+        "total_order_volume", "order_flow_strength", "order_flow_bias"
+    ] if c in df.columns]
+    if order_flow_cols:
+        ws_order = wb.create_sheet("Order Flow")
+        of_df = df[order_flow_cols].sort_values("net_order_flow", ascending=False) if "net_order_flow" in df.columns else df[order_flow_cols]
+        _write_dataframe(ws_order, of_df)
+
+    if "buy_pressure" in df.columns:
+        ws_pressure = wb.create_sheet("Buy-Sell Pressure")
+        pressure_cols = [c for c in [
+            "strike_price", "buy_pressure", "sell_pressure", "net_pressure",
+            "pressure_direction", "aggression_level", "volume_spike", "oi_surge",
+        ] if c in df.columns]
+        if pressure_cols:
+            _write_dataframe(ws_pressure, df[pressure_cols])
+
+    if "movement_score" in df.columns:
+        ws_move = wb.create_sheet("Strike Movement")
+        movement_cols = [c for c in [
+            "movement_rank", "strike_price", "movement_score", "movement_bias", "movement_strength",
+            "ce_movement_score", "pe_movement_score", "buy_pressure", "sell_pressure",
+            "aggression_level", "total_volume", "ce_chng_oi", "pe_chng_oi",
+            "volume_spike", "oi_surge", "AI Signal", "AI Confidence %",
+        ] if c in df.columns]
+        if movement_cols:
+            move_df = df[movement_cols].sort_values("movement_score", ascending=False)
+            _write_dataframe(ws_move, move_df)
+
+    # PO3 Intelligence sheet (safe optional export)
+    if po3_intelligence and isinstance(po3_intelligence, dict):
+        ws_po3 = wb.create_sheet("PO3 Intelligence")
+        ws_po3.cell(row=1, column=1, value="Metric")
+        ws_po3.cell(row=1, column=2, value="Value")
+        _style_header_row(ws_po3, 1)
+
+        for row_idx, (key, value) in enumerate(po3_intelligence.items(), start=2):
+            ws_po3.cell(row=row_idx, column=1, value=str(key))
+            if isinstance(value, (dict, list, tuple, set)):
+                value = str(value)
+            elif isinstance(value, np.generic):
+                value = value.item()
+            elif isinstance(value, float) and (math.isnan(value) or math.isinf(value)):
+                value = None
+            ws_po3.cell(row=row_idx, column=2, value=value)
+
+        ws_po3.freeze_panes = "A2"
+        _apply_borders(ws_po3)
+        _autosize_columns(ws_po3)
+
+    buffer = io.BytesIO()
+    wb.save(buffer)
+    buffer.seek(0)
+    return buffer
+
+
+def export_csv_bytes(df: pd.DataFrame) -> bytes:
+    if df is None or df.empty:
+        return b""
+    out = df.copy()
+    out = out.replace([np.inf, -np.inf], np.nan)
+    return out.to_csv(index=False).encode("utf-8")
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 19. STREAMLIT UI (ORIGINAL WITH PRESSURE ENHANCEMENTS)
+# ══════════════════════════════════════════════════════════════════════════
+
+def _configure_page() -> None:
+    try:
+        st.set_page_config(
+            page_title="NSE Options Chain Dashboard + Price Action + Buy/Sell Pressure",
+            page_icon="📊", layout="wide", initial_sidebar_state="expanded",
+        )
+    except Exception as e:
+        logger.warning("st.set_page_config() skipped: %s", e)
+
+
+def _inject_css() -> None:
+    st.markdown(f"""
+    <style>
+    .stApp {{ background-color: {DARK_BG}; }}
+    section[data-testid="stSidebar"] {{ background-color: {PANEL_BG}; border-right: 1px solid {BORDER_COLOR}; }}
+    div[data-testid="metric-container"] {{
+        background: {PANEL_BG}; border: 1px solid {BORDER_COLOR}; border-radius: 8px; padding: 14px 18px;
+    }}
+    div[data-testid="metric-container"] label {{ color: {TEXT_MUTED} !important; font-size: 12px;
+        text-transform: uppercase; letter-spacing: 0.08em; }}
+    div[data-testid="metric-container"] div[data-testid="stMetricValue"] {{
+        color: {TEXT_MAIN} !important; font-size: 21px; font-weight: 700; font-family: 'Courier New', monospace; }}
+    h1, h2, h3 {{ color: {TEXT_MAIN} !important; }}
+    .block-title {{ color: {BLUE}; font-size: 13px; font-weight: 600; text-transform: uppercase;
+        letter-spacing: 0.1em; margin-bottom: 8px; }}
+    button[data-baseweb="tab"] {{ color: {TEXT_MUTED} !important; }}
+    button[data-baseweb="tab"][aria-selected="true"] {{ color: {BLUE} !important; border-bottom: 2px solid {BLUE}; }}
+    hr {{ border-color: {BORDER_COLOR}; }}
+    .intel-card {{ background: {PANEL_BG}; border: 1px solid {BORDER_COLOR}; border-radius: 8px;
+        padding: 14px 16px; margin-bottom: 8px; }}
+    .intel-label {{ color: {TEXT_MUTED}; font-size: 11px; text-transform: uppercase; letter-spacing: .08em; }}
+    .intel-value {{ color: {TEXT_MAIN}; font-size: 20px; font-weight: 700; font-family: 'Courier New', monospace; }}
+    .trade-signal-card {{ background: linear-gradient(135deg, {PANEL_BG} 0%, #1c2128 100%); 
+        border: 2px solid {BLUE}; border-radius: 12px; padding: 16px 18px; margin: 12px 0; }}
+    .trade-signal-buy {{ border-left: 4px solid {GREEN}; }}
+    .trade-signal-sell {{ border-left: 4px solid {RED}; }}
+    </style>
+    """, unsafe_allow_html=True)
+
+
+def _pcr_sentiment_badge(pcr: float) -> str:
+    if pcr > 1.3:
+        return f'<span style="color:{GREEN};font-weight:700;">🟢 Bullish (High PCR)</span>'
+    if pcr < 0.7:
+        return f'<span style="color:{RED};font-weight:700;">🔴 Bearish (Low PCR)</span>'
+    return f'<span style="color:{AMBER};font-weight:700;">🟡 Neutral</span>'
+
+
+def _sidebar_config() -> dict:
+    with st.sidebar:
+        st.markdown("### ⚙️ Configuration")
+        instrument_type = st.radio("Instrument Type", ["Index", "F&O Stock"], key="oc_instr_type")
+        is_index = instrument_type == "Index"
+
+        if is_index:
+            symbol = st.selectbox("Index", list(INDEX_SYMBOLS.keys()), key="oc_index_select")
+            if symbol in NSE_UNSUPPORTED_INDICES:
+                st.caption(f"ℹ️ {symbol} is BSE-listed — requires a connected FYERS client.")
+        else:
+            raw_symbol = st.text_input(
+                "Stock Symbol (e.g. RELIANCE, TCS, INFY)", "RELIANCE", key="oc_stock_input"
+            )
+            symbol = normalize_stock_symbol(raw_symbol)
+
+        strike_count = st.slider("Strikes Around ATM", 5, 40, 15, step=5, key="oc_strike_count")
+        show_greeks = st.checkbox("Show Greeks in chain table", value=True, key="oc_show_greeks")
+        min_ai_conf = st.slider("Min AI Confidence %", 0, 100, 55, step=5, key="oc_min_ai_conf")
+        strike_search_raw = st.text_input("Search Strike Price", value="", key="oc_strike_search")
+        strike_search = 0.0
+        if strike_search_raw.strip():
+            try:
+                strike_search = float(strike_search_raw.strip())
+            except ValueError:
+                st.caption("⚠️ Enter a valid numeric strike price.")
+
+        default_lot = DEFAULT_LOT_SIZES.get(symbol, DEFAULT_LOT_SIZES["_STOCK_DEFAULT"])
+        lot_size = st.number_input(
+            "Lot Size", min_value=1, value=default_lot, step=1, key="oc_lot_size",
+        )
+
+        st.divider()
+        st.markdown("### 📊 Price Action Analysis")
+        analyze_price_action = st.checkbox("Fetch & Analyze Price Action (requires FYERS)", value=False, key="oc_price_action")
+
+        # ADDITIVE: optional scalping layer; old price-action logic remains untouched.
+        scalping_mode = st.checkbox(
+            "⚡ Enable Scalping Mode (FYERS)",
+            value=False,
+            key="oc_scalping_mode",
+            help="Adds 1M/3M/5M early-warning analysis without changing the existing MTF signal.",
+        )
+
+        st.divider()
+        st.markdown("### 🔄 Auto Refresh")
+        auto_refresh = st.checkbox("Enable auto-refresh", value=False, key="oc_auto_refresh")
+        refresh_secs = st.slider("Refresh interval (seconds)", 10, 120, 20, step=5, key="oc_refresh_secs",
+                                  disabled=not auto_refresh)
+
+        st.divider()
+        debug_mode = st.checkbox("Debug info", value=False, key="oc_debug_mode")
+        col_free, col_live = st.columns(2)
+        with col_free:
+            free_run = st.button("🆓 FREE RUN", use_container_width=True, type="secondary",
+                                 help="Runs the NSE option-chain scanner without requiring a FYERS client.")
+        with col_live:
+            fetch_clicked = st.button("📡 FETCH LIVE", use_container_width=True)
+
+    return {
+        "is_index": is_index, "symbol": symbol, "strike_count": strike_count,
+        "show_greeks": show_greeks, "min_ai_conf": min_ai_conf, "strike_search": strike_search,
+        "lot_size": lot_size, "auto_refresh": auto_refresh, "refresh_secs": refresh_secs,
+        "debug_mode": debug_mode, "fetch_clicked": (fetch_clicked or free_run),
+        "free_run": free_run,
+        "analyze_price_action": analyze_price_action,
+        "scalping_mode": scalping_mode,
+    }
+
+
+def _do_fetch_and_process(cfg: dict, fyers: Any = None) -> Optional[dict]:
+    """Full fetch -> parse -> validate -> analytics pipeline."""
+    preferred_expiry = st.session_state.get("oc_selected_expiry", "")
+    stock_name = cfg["symbol"] if not cfg["is_index"] else ""
+    fetch_result = fetch_chain_unified(
+        fyers, cfg["symbol"], cfg["is_index"], stock_name, preferred_expiry, cfg["strike_count"],
+    )
+    if cfg["debug_mode"]:
+        st.write("**Fetch result:**", fetch_result.get("ok"), fetch_result.get("source"), fetch_result.get("error"))
+
+    if not fetch_result.get("ok"):
+        st.error(
+            f"⚠️ Could not fetch option chain for **{cfg['symbol']}**: "
+            f"{fetch_result.get('error', 'Unknown error.')} "
+        )
+        return None
+
+    df_all: pd.DataFrame = fetch_result["df"]
+    meta: dict = fetch_result["meta"]
+    data_source: str = fetch_result.get("source", "UNKNOWN")
+
+    if not validate_chain_df(df_all):
+        st.error(
+            f"⚠️ Received a response for **{cfg['symbol']}**, but it did not contain a usable "
+            "option chain."
+        )
+        return None
+
+    spot = meta["spot_price"]
+    df = filter_strikes_around_atm(df_all, spot, cfg["strike_count"])
+    if df.empty:
+        df = df_all
+
+    expiry_label = meta["selected_expiry"]
+    if spot:
+        atm_pos = int((df["strike_price"] - float(spot)).abs().to_numpy().argmin())
+        atm_strike = float(df.iloc[atm_pos]["strike_price"])
+    else:
+        atm_strike = float(df["strike_price"].median())
+
+    df = add_greeks_columns(df, spot, expiry_label)
+    df = classify_buildup(df)
+    df = classify_moneyness(df, spot)
+    df = compute_ai_scores(df, spot, atm_strike, calc_max_pain(df), calc_pcr(df))
+    df = detect_institutional_smart_money(df)
+    
+    # ✅ ADD PRESSURE ANALYSIS — ORIGINAL CODE PRESERVED
+    df, market_pressure = add_pressure_analysis(df, spot, cfg["lot_size"])
+
+    # 📊 ADD ORDER FLOW — ADDITIVE ONLY
+    df, order_flow = calculate_order_flow(df, spot)
+
+    # EXISTING MOVEMENT ENGINE — UNCHANGED
+    df = add_strike_movement_score(df)
+    df, movement_early_warning = compute_movement_early_warning(
+        df, cfg["symbol"], meta["selected_expiry"], spot
+    )
+
+    pcr = calc_pcr(df)
+    max_pain = calc_max_pain(df)
+    support, resistance = calc_support_resistance(df)
+    max_oi = calc_max_oi(df)
+
+    atm_iv = _atm_iv(df, spot)
+    update_iv_history(cfg["symbol"], expiry_label, atm_iv)
+    iv_rank, iv_percentile = compute_iv_rank_percentile(cfg["symbol"], expiry_label, atm_iv)
+
+    gex_dex = compute_gex_dex(df, spot, cfg["lot_size"])
+
+    oi_shift_notes = detect_oi_shift(cfg["symbol"], expiry_label, support, resistance)
+
+    price_action_data = None
+    trade_signal = None
+    if cfg["analyze_price_action"] and fyers is not None:
+        fyers_symbol_candidates = (
+            _fyers_index_candidates(cfg["symbol"]) if cfg["is_index"] else fyers_stock_symbol_candidates(stock_name)
+        )
+        fyers_symbol = fyers_symbol_candidates[0] if fyers_symbol_candidates else None
+        
+        if fyers_symbol:
+            df_dict = {}
+            for tf_name, tf_mins in TIMEFRAMES.items():
+                df_tf = fetch_fyers_candles(fyers, fyers_symbol, tf_mins, count=100)
+                df_dict[tf_name] = df_tf
+            
+            if any(df_dict.values()):
+                for tf_name in df_dict:
+                    if df_dict[tf_name] is not None and not df_dict[tf_name].empty:
+                        df_dict[tf_name] = add_technical_indicators(df_dict[tf_name])
+                
+                mss = detect_mss(df_dict)
+                trade_signal = generate_trade_signal(df_dict, spot, mss, fyers is not None)
+                
+                price_action_data = {
+                    "df_dict": df_dict,
+                    "mss": mss,
+                    "trade_signal": trade_signal,
+                }
+
+    scalping_data = None
+    if cfg.get("scalping_mode") and fyers is not None:
+        fyers_symbol_candidates = (
+            _fyers_index_candidates(cfg["symbol"]) if cfg["is_index"] else fyers_stock_symbol_candidates(stock_name)
+        )
+
+        # Try every resolved FYERS symbol variant instead of only the first one.
+        scalp_dict = {}
+        scalping_symbol = None
+        for candidate in fyers_symbol_candidates:
+            test_dict = {}
+            for tf_name, tf_mins in SCALPING_TIMEFRAMES.items():
+                test_dict[tf_name] = fetch_fyers_candles(
+                    fyers, candidate, tf_mins, count=120
+                )
+
+            usable = sum(
+                1 for df_tf in test_dict.values()
+                if isinstance(df_tf, pd.DataFrame) and not df_tf.empty
+            )
+            if usable:
+                scalping_symbol = candidate
+                scalp_dict = test_dict
+                break
+
+        if scalp_dict:
+            scalping_data = compute_scalping_early_warning(scalp_dict, spot)
+            scalping_data["df_dict"] = scalp_dict
+            scalping_data["fyers_symbol"] = scalping_symbol
+        else:
+            scalping_data = {
+                "enabled": False,
+                "trigger": "FYERS candle fetch failed",
+                "score": 0.0,
+                "confidence": 0.0,
+                "direction": "WATCH",
+                "entry": None,
+                "sl": None,
+                "targets": [],
+                "reasons": [
+                    "FYERS returned no usable 1M/3M/5M/15M candles.",
+                    "Check the FYERS symbol/permissions and market-data availability.",
+                ],
+                "df_dict": {},
+                "fyers_symbol": None,
+            }
+
+    po3_price_df = None
+    if price_action_data and price_action_data.get("df_dict"):
+        po3_price_df = price_action_data["df_dict"].get("5M")
+    po3_intelligence = compute_po3_options_intelligence(df, spot, cfg["symbol"], po3_price_df)
+    po3_intelligence["final_signal"] = compute_final_signal(po3_intelligence, trade_signal)
+
+    return {
+        "df": df, "meta": meta, "spot": spot, "atm_strike": atm_strike, "expiry_label": expiry_label,
+        "pcr": pcr, "max_pain": max_pain, "support": support, "resistance": resistance, "max_oi": max_oi,
+        "atm_iv": atm_iv, "iv_rank": iv_rank, "iv_percentile": iv_percentile, "gex_dex": gex_dex,
+        "oi_shift_notes": oi_shift_notes, "data_source": data_source,
+        "price_action_data": price_action_data, "trade_signal": trade_signal,
+        "market_pressure": market_pressure,
+        "order_flow": order_flow,
+        "po3_intelligence": po3_intelligence,
+        "final_signal": po3_intelligence.get("final_signal", {}),
+        "scalping_data": scalping_data,
+        "movement_early_warning": movement_early_warning,
+    }
+
+
+def _render_summary_cards(state: dict) -> None:
+    """Enhanced with pressure metrics."""
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Spot Price", f"₹{state['spot']:,.2f}" if state["spot"] else "—")
+    c2.metric("ATM Strike", f"₹{state['atm_strike']:,.0f}")
+    c3.metric("PCR", f"{state['pcr']:.3f}")
+    c4.metric("Max Pain", f"₹{state['max_pain']:,.0f}")
+    c5.metric("IV Rank / %ile", f"{state['iv_rank']:.0f} / {state['iv_percentile']:.0f}")
+
+    c6, c7, c8, c9, c10 = st.columns(5)
+    c6.metric("Support", f"₹{state['support']:,.0f}" if state["support"] else "—")
+    c7.metric("Resistance", f"₹{state['resistance']:,.0f}" if state["resistance"] else "—")
+    c8.metric("Total GEX", f"{state['gex_dex'].get('total_gex', 0):,.0f}")
+    c9.metric("Total DEX", f"{state['gex_dex'].get('total_dex', 0):,.0f}")
+    
+    fs = state.get("final_signal", {})
+    if fs:
+        c10.metric("FINAL SIGNAL", fs.get("signal", "WAIT"),
+                   delta=f"{float(fs.get('confidence', 0) or 0):.0f}%")
+    elif state.get("trade_signal"):
+        c10.metric("FINAL SIGNAL", state["trade_signal"].signal,
+                   delta=f"{state['trade_signal'].confidence:.0f}%")
+    else:
+        c10.metric("FINAL SIGNAL", "WAIT")
+
+    # NEW: Pressure metrics
+    mp = state.get("market_pressure")
+    if mp:
+        p1, p2, p3, p4, p5 = st.columns(5)
+        p1.metric("Buy Pressure", f"{mp.total_call_pressure:.0f}")
+        p2.metric("Sell Pressure", f"{mp.total_put_pressure:.0f}")
+        p3.metric("Market Bias", f"{mp.net_market_bias:+.0f}", delta=mp.market_sentiment.split()[0])
+        p4.metric("Volume Spike", "🔴 YES" if mp.volume_surge_detected else "🟢 No")
+        p5.metric("OI Surge", "🔴 YES" if mp.oi_accumulation_detected else "🟢 No")
+
+
+def _render_ai_signal_cards(state: dict, min_conf: float) -> None:
+    df = state["df"]
+    qualifying = df[df["AI Confidence %"] >= min_conf].sort_values("AI Confidence %", ascending=False)
+    if qualifying.empty:
+        st.info(f"No strikes meet the {min_conf:.0f}% AI confidence threshold.")
+        return
+    for _, row in qualifying.head(15).iterrows():
+        signal = row["AI Signal"]
+        color = GREEN if "CE" in signal else (RED if "PE" in signal else AMBER)
+        st.markdown(f"""
+        <div class="intel-card">
+          <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;">
+            <div><b style="color:{TEXT_MAIN};">{row['strike_price']:,.0f}</b>
+              &nbsp; <span style="color:{color};font-weight:700;">{_safe_cell(signal)}</span></div>
+            <div class="intel-label">Confidence
+              <span style="color:{TEXT_MAIN};font-weight:700;font-size:15px;">{row['AI Confidence %']:.0f}%</span></div>
+          </div>
+          <div style="margin-top:8px;color:{TEXT_MUTED};font-size:12px;">
+            CE Score {row['CE Score']:.1f} &nbsp;|&nbsp; PE Score {row['PE Score']:.1f}
+          </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# NEW PIN ANALYSIS LAYER — ADDITIVE ONLY
+# ══════════════════════════════════════════════════════════════════════════
+# PIN = Option-chain based Price/Institutional Intelligence layer.
+# This section is intentionally standalone. Existing option-chain functions,
+# widgets and calculations are not replaced or renamed.
+
+PIN_MIN_STRONG_SCORE = 72.0
+PIN_MIN_WATCH_SCORE = 58.0
+PIN_MIN_CONFIDENCE = 55.0
+
+
+def _pin_num(value: Any, default: float = 0.0) -> float:
+    try:
+        if value is None:
+            return default
+        x = float(value)
+        return default if not math.isfinite(x) else x
+    except (TypeError, ValueError):
+        return default
+
+
+def _pin_strike_series(df: pd.DataFrame) -> pd.Series:
+    """Return one clean numeric strike Series even if duplicate column names exist."""
+    try:
+        raw = df.loc[:, "strike_price"]
+        if isinstance(raw, pd.DataFrame):
+            raw = raw.iloc[:, 0]
+        return pd.to_numeric(raw, errors="coerce")
+    except Exception:
+        return pd.Series(dtype=float)
+
+
+def _pin_col_sum(df: pd.DataFrame, column: str) -> float:
+    if column not in df.columns:
+        return 0.0
+    return float(pd.to_numeric(df[column], errors="coerce").fillna(0.0).sum())
+
+
+def calculate_pin_signal(
+    df: pd.DataFrame,
+    spot: float,
+    pcr: float = 0.0,
+    market_pressure: Optional[MarketPressure] = None,
+    order_flow: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    """Calculate an additive PIN signal from the already-loaded option chain.
+
+    No additional API request is made. Missing columns simply contribute zero
+    evidence instead of breaking the existing Option Chain dashboard.
+    """
+    result: dict[str, Any] = {
+        "direction": "WAIT",
+        "score": 0.0,
+        "confidence": 0.0,
+        "status": "PIN DATA UNAVAILABLE",
+        "reason": "No usable option-chain data",
+        "bull_score": 0.0,
+        "bear_score": 0.0,
+        "support": 0.0,
+        "resistance": 0.0,
+        "atm": 0.0,
+        "pcr": _pin_num(pcr),
+    }
+    if not isinstance(df, pd.DataFrame) or df.empty or "strike_price" not in df.columns:
+        return result
+
+    d = df.copy()
+    # Protect the PIN layer from duplicate strike_price columns / DataFrame-valued selection.
+    strike_series = _pin_strike_series(d)
+    if strike_series.empty:
+        return result
+    d["strike_price"] = strike_series.to_numpy()
+    d = d.dropna(subset=["strike_price"]).copy()
+    if d.empty:
+        return result
+
+    spot = _pin_num(spot)
+    if spot <= 0:
+        spot = _pin_num(pd.to_numeric(d["strike_price"], errors="coerce").median())
+    if spot <= 0:
+        return result
+
+    # Use OI concentration to derive option-chain support/resistance.
+    ce_oi = pd.to_numeric(d.get("ce_oi", 0), errors="coerce").fillna(0.0) if "ce_oi" in d else pd.Series(0.0, index=d.index)
+    pe_oi = pd.to_numeric(d.get("pe_oi", 0), errors="coerce").fillna(0.0) if "pe_oi" in d else pd.Series(0.0, index=d.index)
+    def _pin_series(primary: str, fallback: str) -> pd.Series:
+        if primary in d.columns:
+            return pd.to_numeric(d[primary], errors="coerce").fillna(0.0)
+        if fallback in d.columns:
+            return pd.to_numeric(d[fallback], errors="coerce").fillna(0.0)
+        return pd.Series(0.0, index=d.index)
+
+    ce_doi = _pin_series("ce_chng_oi", "ce_oi_change")
+    pe_doi = _pin_series("pe_chng_oi", "pe_oi_change")
+    ce_vol = _pin_series("ce_volume", "ce_vol")
+    pe_vol = _pin_series("pe_volume", "pe_vol")
+
+    atm_idx = (d["strike_price"] - spot).abs().idxmin()
+    atm = _pin_num(d.loc[atm_idx, "strike_price"])
+    result["atm"] = atm
+
+    call_oi_idx = ce_oi.idxmax() if len(ce_oi) else None
+    put_oi_idx = pe_oi.idxmax() if len(pe_oi) else None
+    resistance = _pin_num(d.loc[call_oi_idx, "strike_price"]) if call_oi_idx is not None else 0.0
+    support = _pin_num(d.loc[put_oi_idx, "strike_price"]) if put_oi_idx is not None else 0.0
+    result["support"] = support
+    result["resistance"] = resistance
+
+    bull = 0.0
+    bear = 0.0
+    bull_reasons: list[str] = []
+    bear_reasons: list[str] = []
+
+    # PCR confirmation — deliberately capped so PCR alone cannot create a signal.
+    pcr_value = _pin_num(pcr)
+    result["pcr"] = pcr_value
+    if pcr_value >= 1.10:
+        bull += 12; bull_reasons.append(f"PCR {pcr_value:.2f} bullish")
+    elif pcr_value <= 0.90 and pcr_value > 0:
+        bear += 12; bear_reasons.append(f"PCR {pcr_value:.2f} bearish")
+
+    total_pe_doi = float(pe_doi.clip(lower=0).sum())
+    total_ce_doi = float(ce_doi.clip(lower=0).sum())
+    total_pe_unwind = float((-pe_doi).clip(lower=0).sum())
+    total_ce_unwind = float((-ce_doi).clip(lower=0).sum())
+
+    if total_pe_doi > total_ce_doi * 1.10 and total_pe_doi > 0:
+        bull += 20; bull_reasons.append("PE OI accumulation stronger")
+    elif total_ce_doi > total_pe_doi * 1.10 and total_ce_doi > 0:
+        bear += 20; bear_reasons.append("CE OI accumulation stronger")
+
+    if total_ce_unwind > total_pe_unwind * 1.10 and total_ce_unwind > 0:
+        bull += 10; bull_reasons.append("CE OI unwinding")
+    elif total_pe_unwind > total_ce_unwind * 1.10 and total_pe_unwind > 0:
+        bear += 10; bear_reasons.append("PE OI unwinding")
+
+    ce_volume = float(ce_vol.sum())
+    pe_volume = float(pe_vol.sum())
+    if pe_volume > ce_volume * 1.15 and pe_volume > 0:
+        bull += 15; bull_reasons.append("PE volume dominance")
+    elif ce_volume > pe_volume * 1.15 and ce_volume > 0:
+        bear += 15; bear_reasons.append("CE volume dominance")
+
+    # Reuse existing pressure engine if available.
+    if isinstance(market_pressure, MarketPressure):
+        bias = _pin_num(market_pressure.net_market_bias)
+        if bias >= 15:
+            bull += 15; bull_reasons.append("existing buy pressure aligned")
+        elif bias <= -15:
+            bear += 15; bear_reasons.append("existing sell pressure aligned")
+
+    # Reuse existing order-flow engine if available.
+    if isinstance(order_flow, dict):
+        flow_score = _pin_num(order_flow.get("flow_bias_score", 0))
+        if flow_score >= 20:
+            bull += 13; bull_reasons.append("order flow bullish")
+        elif flow_score <= -20:
+            bear += 13; bear_reasons.append("order flow bearish")
+
+    # Support/resistance positioning.
+    if support > 0 and spot >= support and spot > atm * 0.998:
+        bull += 5; bull_reasons.append("price holding option support")
+    if resistance > 0 and spot <= resistance and spot < atm * 1.002:
+        bear += 5; bear_reasons.append("price below option resistance")
+
+    # Existing per-strike pressure/score columns, if present.
+    if "ce_pressure" in d.columns and "pe_pressure" in d.columns:
+        ce_pressure = _pin_col_sum(d, "ce_pressure")
+        pe_pressure = _pin_col_sum(d, "pe_pressure")
+        if pe_pressure > ce_pressure * 1.08:
+            bull += 10; bull_reasons.append("put-side pressure dominant")
+        elif ce_pressure > pe_pressure * 1.08:
+            bear += 10; bear_reasons.append("call-side pressure dominant")
+
+    bull = min(100.0, bull)
+    bear = min(100.0, bear)
+    top = max(bull, bear)
+    gap = abs(bull - bear)
+
+    # Confidence rewards both strength and directional separation.
+    confidence = min(100.0, max(0.0, top * 0.72 + gap * 0.28))
+
+    if bull >= PIN_MIN_STRONG_SCORE and bull > bear + 10 and confidence >= PIN_MIN_CONFIDENCE:
+        direction = "BUY"
+        status = "🟢 PIN BUY"
+        reason = " + ".join(dict.fromkeys(bull_reasons)) or "Bullish option-chain confluence"
+    elif bear >= PIN_MIN_STRONG_SCORE and bear > bull + 10 and confidence >= PIN_MIN_CONFIDENCE:
+        direction = "SELL"
+        status = "🔴 PIN SELL"
+        reason = " + ".join(dict.fromkeys(bear_reasons)) or "Bearish option-chain confluence"
+    elif bull >= PIN_MIN_WATCH_SCORE and bull > bear + 6:
+        direction = "BUY"
+        status = "🟡 PIN BUY WATCH"
+        reason = " + ".join(dict.fromkeys(bull_reasons)) or "Developing bullish evidence"
+    elif bear >= PIN_MIN_WATCH_SCORE and bear > bull + 6:
+        direction = "SELL"
+        status = "🟠 PIN SELL WATCH"
+        reason = " + ".join(dict.fromkeys(bear_reasons)) or "Developing bearish evidence"
+    else:
+        direction = "WAIT"
+        status = "⚪ PIN WAIT"
+        reason = "Conflicting option-chain evidence / insufficient confirmation"
+
+    result.update(
+        direction=direction,
+        score=round(top, 1),
+        confidence=round(confidence, 1),
+        status=status,
+        reason=reason,
+        bull_score=round(bull, 1),
+        bear_score=round(bear, 1),
+    )
+    return result
+
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# OPTION-CHAIN REVERSAL ENGINE (ADDITIVE)
+# ══════════════════════════════════════════════════════════════════════════
+def calculate_option_chain_reversal(
+    df: pd.DataFrame,
+    spot: float,
+    pcr: float = 0.0,
+    order_flow: Optional[dict] = None,
+) -> dict[str, Any]:
+    """Estimate possible option-chain reversal from OI/volume/price pressure.
+
+    This is an early-warning/confluence model, not a guaranteed prediction.
+    It uses already-loaded option-chain data and makes no extra API call.
+    """
+    result = {
+        "status": "NO REVERSAL WARNING",
+        "direction": "NONE",
+        "score": 0.0,
+        "probability": 0.0,
+        "type": "NONE",
+        "trigger": "Waiting for reversal evidence",
+        "reason": "Insufficient option-chain reversal evidence",
+        "atm_strike": float(spot or 0.0),
+        "reversal_zone": 0.0,
+    }
+    if df is None or df.empty:
+        return result
+
+    d = df.copy()
+    # Duplicate-column safe normalization: never pass a pandas Series to float().
+    strike_series = _pin_strike_series(d)
+    if strike_series.empty:
+        return result
+    d["strike_price"] = strike_series.to_numpy()
+    needed = [
+        "strike_price", "ce_oi", "pe_oi", "ce_chng_oi", "pe_chng_oi",
+        "ce_volume", "pe_volume", "ce_change", "pe_change"
+    ]
+    for col in needed:
+        if col not in d.columns:
+            d[col] = 0.0
+        d[col] = pd.to_numeric(d[col], errors="coerce").fillna(0.0)
+
+    ref = _pin_num(spot) or _pin_num(pd.to_numeric(d["strike_price"], errors="coerce").median())
+    if ref <= 0:
+        ref = _pin_num(pd.to_numeric(d["strike_price"], errors="coerce").median())
+    if ref <= 0:
+        return result
+
+    atm_idx = (d["strike_price"] - ref).abs().idxmin()
+    atm = float(d.loc[atm_idx, "strike_price"])
+    d["distance"] = (d["strike_price"] - atm).abs()
+    near = d.nsmallest(max(3, min(7, len(d))), "distance")
+
+    # Option-chain directional clues:
+    # Rising PE OI / PE volume supports downside protection or bullish positioning;
+    # rising CE OI supports resistance/bearish positioning. Price change helps detect
+    # unwinding: falling option price with falling OI can indicate position reduction.
+    ce_oi_chg = float(near["ce_chng_oi"].sum())
+    pe_oi_chg = float(near["pe_chng_oi"].sum())
+    ce_vol = float(near["ce_volume"].sum())
+    pe_vol = float(near["pe_volume"].sum())
+    ce_px = float(near["ce_change"].mean())
+    pe_px = float(near["pe_change"].mean())
+
+    bull = 0.0
+    bear = 0.0
+    bull_reasons: list[str] = []
+    bear_reasons: list[str] = []
+
+    if pe_oi_chg > 0 and ce_oi_chg < 0:
+        bull += 25; bull_reasons.append("PE OI rising + CE OI falling")
+    elif ce_oi_chg > 0 and pe_oi_chg < 0:
+        bear += 25; bear_reasons.append("CE OI rising + PE OI falling")
+    elif pe_oi_chg > ce_oi_chg * 1.15 and pe_oi_chg > 0:
+        bull += 15; bull_reasons.append("PE OI stronger")
+    elif ce_oi_chg > pe_oi_chg * 1.15 and ce_oi_chg > 0:
+        bear += 15; bear_reasons.append("CE OI stronger")
+
+    if pe_vol > ce_vol * 1.20 and pe_vol > 0:
+        bull += 15; bull_reasons.append("PE volume surge")
+    elif ce_vol > pe_vol * 1.20 and ce_vol > 0:
+        bear += 15; bear_reasons.append("CE volume surge")
+
+    # A sharp option-price move against the prevailing OI side is treated as
+    # possible unwinding/reversal evidence.
+    if pe_px > 0 and pe_oi_chg < 0:
+        bull += 20; bull_reasons.append("PE premium rising on OI reduction")
+    if ce_px > 0 and ce_oi_chg < 0:
+        bull += 10; bull_reasons.append("CE premium rising on OI reduction")
+    if ce_px > 0 and ce_oi_chg > 0:
+        bear += 10; bear_reasons.append("CE premium rising with OI build-up")
+    if pe_px > 0 and pe_oi_chg > 0:
+        bear += 10; bear_reasons.append("PE premium rising with OI build-up")
+
+    # PCR is only a supporting clue; it never decides reversal alone.
+    if pcr > 1.15:
+        bear += 8; bear_reasons.append(f"PCR high {pcr:.2f}")
+    elif 0 < pcr < 0.85:
+        bull += 8; bull_reasons.append(f"PCR low {pcr:.2f}")
+
+    # Reversal is stronger when current option-chain flow disagrees with
+    # the existing directional flow.
+    flow_score = _pin_num((order_flow or {}).get("flow_bias_score", 0))
+    if flow_score <= -25 and bull > bear:
+        bull += 12; bull_reasons.append("bearish flow weakening vs bullish reversal clues")
+    elif flow_score >= 25 and bear > bull:
+        bear += 12; bear_reasons.append("bullish flow weakening vs bearish reversal clues")
+
+    bull = float(np.clip(bull, 0, 100))
+    bear = float(np.clip(bear, 0, 100))
+    score = max(bull, bear)
+    direction = "BUY" if bull > bear else ("SELL" if bear > bull else "NONE")
+    reasons = bull_reasons if direction == "BUY" else bear_reasons
+
+    # "NOW" requires multiple aligned clues; "EARLY WARNING" is intentionally
+    # easier to trigger so the dashboard can flag developing reversal pressure.
+    if direction in ("BUY", "SELL") and score >= 75:
+        status = "🔴 REVERSAL NOW"
+        rtype = "BULLISH REVERSAL" if direction == "BUY" else "BEARISH REVERSAL"
+        trigger = " + ".join(dict.fromkeys(reasons[:4])) or "Multiple reversal clues aligned"
+    elif direction in ("BUY", "SELL") and score >= 50:
+        status = "🟡 REVERSAL EARLY WARNING"
+        rtype = "EARLY BULLISH REVERSAL" if direction == "BUY" else "EARLY BEARISH REVERSAL"
+        trigger = " + ".join(dict.fromkeys(reasons[:3])) or "Developing reversal clues"
+    else:
+        status = "NO REVERSAL WARNING"
+        rtype = "NONE"
+        direction = "NONE"
+        trigger = "Waiting for stronger confirmation"
+
+    strike_median = _pin_num(pd.to_numeric(d["strike_price"], errors="coerce").median())
+    zone_rows = d[(d["distance"] <= (abs(atm - strike_median) * 2 + 1))]
+    reversal_zone = float(zone_rows["strike_price"].mean()) if not zone_rows.empty else atm
+
+    return {
+        "status": status,
+        "direction": direction,
+        "score": round(score, 1),
+        "probability": round(float(min(95.0, max(0.0, score))), 1),
+        "type": rtype,
+        "trigger": trigger,
+        "reason": " | ".join(dict.fromkeys(reasons)) or "No strong reversal evidence",
+        "atm_strike": atm,
+        "reversal_zone": round(reversal_zone, 2),
+        "bull_score": round(bull, 1),
+        "bear_score": round(bear, 1),
+        "ce_oi_change": round(ce_oi_chg, 2),
+        "pe_oi_change": round(pe_oi_chg, 2),
+        "ce_volume": round(ce_vol, 2),
+        "pe_volume": round(pe_vol, 2),
+    }
+
+
+def calculate_sell_edge(df: pd.DataFrame, state: dict[str, Any], reversal: Optional[dict] = None) -> dict[str, Any]:
+    """Additive SELL-EDGE layer. Ranks bearish evidence without changing existing signals."""
+    try:
+        if df is None or df.empty:
+            return {"score": 0.0, "status": "NO EDGE", "direction": "NONE",
+                    "bear_score": 0.0, "buy_score": 0.0, "reason": "No option-chain data"}
+
+        mp = state.get("market_pressure")
+        of = state.get("order_flow") or {}
+        sell_components = []
+        buy_components = []
+
+        # Market pressure: sell pressure is direct bearish evidence.
+        sell_p = float(getattr(mp, "total_put_pressure", 0.0)) if mp else 0.0
+        buy_p = float(getattr(mp, "total_call_pressure", 0.0)) if mp else 0.0
+        sell_components.append(min(max(sell_p, 0.0), 100.0) * 0.30)
+        buy_components.append(min(max(buy_p, 0.0), 100.0) * 0.30)
+
+        # Order-flow bias: negative = bearish, positive = bullish.
+        flow = _pin_num(of.get("flow_bias_score", 0))
+        sell_components.append(max(0.0, min(100.0, 50.0 - flow)) * 0.25)
+        buy_components.append(max(0.0, min(100.0, 50.0 + flow)) * 0.25)
+
+        # Option-chain PIN scores.
+        pin = calculate_pin_signal(
+            df=df,
+            spot=_pin_num(state.get("spot")),
+            pcr=_pin_num(state.get("pcr")),
+            market_pressure=mp,
+            order_flow=of,
+        )
+        bear_pin = _pin_num(pin.get("bear_score", 0))
+        bull_pin = _pin_num(pin.get("bull_score", 0))
+        sell_components.append(min(max(bear_pin, 0.0), 100.0) * 0.30)
+        buy_components.append(min(max(bull_pin, 0.0), 100.0) * 0.30)
+
+        # Reversal engine adds only as confirmation.
+        rev_bear = 0.0
+        rev_bull = 0.0
+        if reversal:
+            rev_bear = _pin_num(reversal.get("bear_score", 0))
+            rev_bull = _pin_num(reversal.get("bull_score", 0))
+        sell_components.append(min(max(rev_bear, 0.0), 100.0) * 0.15)
+        buy_components.append(min(max(rev_bull, 0.0), 100.0) * 0.15)
+
+        sell_score = round(float(sum(sell_components)), 1)
+        buy_score = round(float(sum(buy_components)), 1)
+        edge = round(float(np.clip(sell_score - buy_score + 50.0, 0.0, 100.0)), 1)
+
+        reasons = []
+        if sell_p >= 60: reasons.append(f"Sell Pressure {sell_p:.0f}")
+        if flow <= -20: reasons.append(f"Bearish Order Flow {flow:+.0f}")
+        if bear_pin >= 60: reasons.append(f"PIN Bear Score {bear_pin:.0f}")
+        if rev_bear >= 50: reasons.append(f"Bearish Reversal {rev_bear:.0f}")
+
+        if edge >= 75 and sell_score > buy_score:
+            status = "🔴 STRONG SELL EDGE"
+            direction = "SELL"
+        elif edge >= 60 and sell_score > buy_score:
+            status = "🟠 SELL EDGE"
+            direction = "SELL"
+        elif edge <= 40 and buy_score > sell_score:
+            status = "🟢 BUY EDGE"
+            direction = "BUY"
+        else:
+            status = "⚪ NO CLEAR EDGE"
+            direction = "NONE"
+
+        return {
+            "score": edge,
+            "status": status,
+            "direction": direction,
+            "bear_score": sell_score,
+            "buy_score": buy_score,
+            "reason": " + ".join(reasons) if reasons else "Mixed / insufficient bearish evidence",
+        }
+    except Exception as exc:
+        logger.exception("SELL EDGE calculation failed: %s", exc)
+        return {"score": 0.0, "status": "EDGE ERROR", "direction": "NONE",
+                "bear_score": 0.0, "buy_score": 0.0, "reason": str(exc)}
+
+
+
+
+
+def calculate_sell_confirmation(df: pd.DataFrame, state: dict[str, Any],
+                                reversal: Optional[dict] = None,
+                                sell_edge: Optional[dict] = None) -> dict[str, Any]:
+    """Additive SELL CONFIRMATION layer for the option-chain dashboard.
+
+    Combines existing bearish evidence only; it does not alter the original
+    option-chain, PIN, reversal, pressure, or order-flow calculations.
+    """
+    try:
+        if df is None or df.empty:
+            return {"score": 0.0, "status": "WAIT CONFIRM", "confirmed": False,
+                    "reason": "No option-chain data", "bear_factors": 0}
+
+        if sell_edge is None:
+            sell_edge = calculate_sell_edge(df, state, reversal)
+
+        mp = state.get("market_pressure")
+        of = state.get("order_flow") or {}
+        pin = calculate_pin_signal(
+            df=df,
+            spot=_pin_num(state.get("spot")),
+            pcr=_pin_num(state.get("pcr")),
+            market_pressure=mp,
+            order_flow=of,
+        )
+
+        checks = []
+        reasons = []
+
+        # 1) Existing SELL EDGE
+        edge_score = _pin_num(sell_edge.get("score", 0))
+        edge_ok = sell_edge.get("direction") == "SELL" and edge_score >= 60
+        checks.append(edge_ok)
+        if edge_ok:
+            reasons.append(f"SELL EDGE {edge_score:.0f}")
+
+        # 2) PIN bearish confirmation
+        bear = _pin_num(pin.get("bear_score", 0))
+        bull = _pin_num(pin.get("bull_score", 0))
+        pin_ok = bear >= 60 and bear > bull + 8
+        checks.append(pin_ok)
+        if pin_ok:
+            reasons.append(f"PIN BEAR {bear:.0f}")
+
+        # 3) Order-flow confirmation
+        flow = _pin_num(of.get("flow_bias_score", 0))
+        flow_ok = flow <= -20
+        checks.append(flow_ok)
+        if flow_ok:
+            reasons.append(f"BEARISH FLOW {flow:+.0f}")
+
+        # 4) Option-chain pressure confirmation
+        sell_pressure = float(getattr(mp, "total_put_pressure", 0.0)) if mp else 0.0
+        buy_pressure = float(getattr(mp, "total_call_pressure", 0.0)) if mp else 0.0
+        pressure_ok = sell_pressure >= 55 and sell_pressure > buy_pressure + 5
+        checks.append(pressure_ok)
+        if pressure_ok:
+            reasons.append(f"PUT PRESSURE {sell_pressure:.0f}")
+
+        # 5) Reversal confirmation, when available
+        rev_bear = _pin_num((reversal or {}).get("bear_score", 0))
+        rev_dir = str((reversal or {}).get("direction", "NONE")).upper()
+        reversal_ok = rev_dir == "SELL" and rev_bear >= 50
+        checks.append(reversal_ok)
+        if reversal_ok:
+            reasons.append(f"SELL REVERSAL {rev_bear:.0f}")
+
+        passed = sum(bool(x) for x in checks)
+        score = round(float(np.clip(
+            edge_score * 0.30 + bear * 0.25 + max(0.0, min(100.0, 50.0 - flow)) * 0.15
+            + max(0.0, min(100.0, sell_pressure)) * 0.20
+            + rev_bear * 0.10,
+            0.0, 100.0
+        )), 1)
+
+        # Confirmation requires multiple independent bearish checks.
+        confirmed = passed >= 3 and score >= 65 and bear > bull
+        if confirmed:
+            status = "🔴 SELL CONFIRMED"
+        elif passed >= 2 and score >= 55:
+            status = "🟠 SELL EARLY CONFIRM"
+        else:
+            status = "⚪ WAIT SELL CONFIRM"
+
+        return {
+            "score": score,
+            "status": status,
+            "confirmed": confirmed,
+            "reason": " + ".join(reasons) if reasons else "Bearish confirmation is incomplete",
+            "bear_factors": passed,
+            "edge_score": edge_score,
+            "pin_bear": bear,
+            "pin_bull": bull,
+            "flow_score": flow,
+            "sell_pressure": sell_pressure,
+            "buy_pressure": buy_pressure,
+            "reversal_bear": rev_bear,
+        }
+    except Exception as exc:
+        logger.exception("SELL CONFIRMATION calculation failed: %s", exc)
+        return {"score": 0.0, "status": "CONFIRM ERROR", "confirmed": False,
+                "reason": str(exc), "bear_factors": 0}
+
+def build_pin_confluence(
+    df: pd.DataFrame,
+    state: dict[str, Any],
+) -> dict[str, Any]:
+    """Combine new PIN output with existing dashboard signals without replacing them."""
+    pin = calculate_pin_signal(
+        df=df,
+        spot=_pin_num(state.get("spot")),
+        pcr=_pin_num(state.get("pcr")),
+        market_pressure=state.get("market_pressure"),
+        order_flow=state.get("order_flow"),
+    )
+
+    try:
+        reversal = calculate_option_chain_reversal(
+            df=df,
+            spot=_pin_num(state.get("spot")),
+            pcr=_pin_num(state.get("pcr")),
+            order_flow=state.get("order_flow"),
+        )
+    except Exception as rev_exc:
+        logger.exception("Option-chain reversal calculation failed: %s", rev_exc)
+        reversal = {
+            "status": "REVERSAL DATA ERROR", "direction": "NONE", "score": 0.0,
+            "probability": 0.0, "type": "NONE",
+            "trigger": "Reversal calculation unavailable",
+            "reason": f"{type(rev_exc).__name__}: {rev_exc}",
+            "atm_strike": _pin_num(state.get("spot")), "reversal_zone": 0.0,
+        }
+
+    existing = state.get("final_signal", {}) or {}
+    existing_signal = str(existing.get("signal", "WAIT")).upper()
+    existing_conf = _pin_num(existing.get("confidence", 0))
+
+    # Existing price-action signal contributes only as confirmation; it is never overwritten.
+    final_direction = pin["direction"]
+    final_score = pin["score"]
+    final_confidence = pin["confidence"]
+    final_status = pin["status"]
+    final_reason = pin["reason"]
+
+    if existing_signal in ("BUY", "SELL") and pin["direction"] == existing_signal:
+        final_score = min(100.0, pin["score"] * 0.65 + existing_conf * 0.35)
+        final_confidence = min(100.0, pin["confidence"] * 0.65 + existing_conf * 0.35 + 5.0)
+        if final_score >= PIN_MIN_STRONG_SCORE and final_confidence >= 70:
+            final_status = "🔥 BIG BUY" if final_direction == "BUY" else "🔥 BIG SELL"
+        else:
+            final_status = "🟢 BUY WATCH" if final_direction == "BUY" else "🔴 SELL WATCH"
+        final_reason += f" | Existing Price Action {existing_signal} aligned"
+    elif existing_signal in ("BUY", "SELL") and pin["direction"] in ("BUY", "SELL") and existing_signal != pin["direction"]:
+        final_direction = "WAIT"
+        final_score = round(max(pin["score"], existing_conf), 1)
+        final_confidence = round(min(pin["confidence"], existing_conf), 1)
+        final_status = "⚪ CONFLICT / WAIT"
+        final_reason = f"PIN {pin['direction']} conflicts with existing {existing_signal} signal"
+    elif pin["direction"] in ("BUY", "SELL") and pin["score"] >= 78 and pin["confidence"] >= 65:
+        final_status = "🟡 PRE-BIG"
+        final_reason += " | Strong PIN setup awaiting full price-action confirmation"
+    elif pin["direction"] == "WAIT":
+        final_status = "⚪ CONFLICT / WAIT"
+
+    return {
+        "pin": pin,
+        "final_direction": final_direction,
+        "final_score": round(float(final_score), 1),
+        "final_confidence": round(float(final_confidence), 1),
+        "final_status": final_status,
+        "final_reason": final_reason,
+        "reversal": reversal,
+    }
+
+
+def render_pin_confluence(df: pd.DataFrame, state: dict[str, Any], symbol: str = "") -> dict[str, Any]:
+    """Render the new PIN section after the existing dashboard UI."""
+    try:
+        confluence = build_pin_confluence(df, state)
+        pin = confluence["pin"]
+
+        st.markdown('<div class="block-title">🧠 PIN + OPTION CHAIN CONFLUENCE</div>', unsafe_allow_html=True)
+        st.caption("Additive PIN layer — existing Option Chain, Price Action, Pressure and Order Flow logic is preserved.")
+
+        c1, c2, c3, c4, c5 = st.columns(5)
+        c1.metric("PIN DIRECTION", pin["direction"])
+        c2.metric("PIN SCORE", f"{pin['score']:.0f}/100")
+        c3.metric("PIN CONFIDENCE", f"{pin['confidence']:.0f}%")
+        c4.metric("ATM", f"{pin['atm']:,.0f}" if pin["atm"] else "—")
+        c5.metric("PCR", f"{pin['pcr']:.2f}" if pin["pcr"] else "—")
+
+        f1, f2, f3 = st.columns(3)
+        f1.metric("SUPPORT", f"{pin['support']:,.0f}" if pin["support"] else "—")
+        f2.metric("RESISTANCE", f"{pin['resistance']:,.0f}" if pin["resistance"] else "—")
+        f3.metric("FINAL STATUS", confluence["final_status"])
+
+        if confluence["final_status"] == "🔥 BIG BUY":
+            st.success("🔥 BIG BUY — PIN and existing Price Action confirmation are aligned.")
+        elif confluence["final_status"] == "🔥 BIG SELL":
+            st.error("🔥 BIG SELL — PIN and existing Price Action confirmation are aligned.")
+        elif confluence["final_status"] == "🟡 PRE-BIG":
+            st.warning("🟡 PRE-BIG — strong PIN setup detected; wait for full confirmation.")
+        elif confluence["final_status"] == "⚪ CONFLICT / WAIT":
+            st.warning("⚪ WAIT — confirmation is conflicting or insufficient.")
+        elif confluence["final_direction"] == "BUY":
+            st.info("🟢 BUY WATCH — bullish evidence is developing.")
+        elif confluence["final_direction"] == "SELL":
+            st.info("🔴 SELL WATCH — bearish evidence is developing.")
+        else:
+            st.info("⚪ PIN WAIT — no clean directional edge yet.")
+
+        reversal = confluence.get("reversal", {})
+        st.markdown("### 🔄 OPTION CHAIN REVERSAL")
+        r1, r2, r3, r4, r5 = st.columns(5)
+        r1.metric("REVERSAL STATUS", reversal.get("status", "NO REVERSAL WARNING"))
+        r2.metric("REVERSAL DIRECTION", reversal.get("direction", "NONE"))
+        r3.metric("REVERSAL SCORE", f"{float(reversal.get('score', 0) or 0):.0f}/100")
+        r4.metric("REVERSAL TYPE", reversal.get("type", "NONE"))
+        r5.metric("REVERSAL ZONE", f"{float(reversal.get('reversal_zone', 0) or 0):,.0f}" if reversal.get("reversal_zone") else "—")
+        if reversal.get("status") == "🔴 REVERSAL NOW":
+            st.error("🔴 REVERSAL NOW — multiple option-chain reversal clues are aligned. This is a warning, not certainty.")
+        elif reversal.get("status") == "🟡 REVERSAL EARLY WARNING":
+            st.warning("🟡 REVERSAL EARLY WARNING — reversal pressure is developing; wait for confirmation.")
+        else:
+            st.info("⚪ NO REVERSAL WARNING — no strong option-chain reversal setup detected.")
+        st.caption(
+            "Trigger: " + str(reversal.get("trigger", "Waiting for confirmation")) +
+            " | Reason: " + str(reversal.get("reason", "—"))
+        )
+
+        # ADDITIVE SELL EDGE — existing PIN / Reversal / Option Chain logic is preserved.
+        sell_edge = calculate_sell_edge(df, state, reversal)
+        st.markdown("### 🎯 SELL EDGE")
+        se1, se2, se3, se4 = st.columns(4)
+        se1.metric("SELL EDGE", f"{sell_edge['score']:.0f}/100")
+        se2.metric("EDGE STATUS", sell_edge["status"])
+        se3.metric("BEAR SCORE", f"{sell_edge['bear_score']:.0f}")
+        se4.metric("BUY SCORE", f"{sell_edge['buy_score']:.0f}")
+        if sell_edge["direction"] == "SELL":
+            st.warning("🔴 SELL EDGE detected — bearish evidence is stronger, but this is a confirmation layer, not a guaranteed outcome.")
+        elif sell_edge["direction"] == "BUY":
+            st.info("🟢 BUY EDGE detected — bearish evidence is not dominant.")
+        else:
+            st.info("⚪ NO CLEAR EDGE — buy/sell evidence is mixed.")
+        st.caption("SELL EDGE = pressure + order-flow + PIN + reversal confirmation. It does not replace the existing signal.")
+
+        st.markdown("### 🔎 PIN Evidence")
+        evidence = pd.DataFrame([
+            {"Metric": "PIN Direction", "Value": pin["direction"]},
+            {"Metric": "PIN Score", "Value": f"{pin['score']:.1f}/100"},
+            {"Metric": "PIN Confidence", "Value": f"{pin['confidence']:.1f}%"},
+            {"Metric": "Bull Score", "Value": f"{pin['bull_score']:.1f}"},
+            {"Metric": "Bear Score", "Value": f"{pin['bear_score']:.1f}"},
+            {"Metric": "Support", "Value": f"{pin['support']:,.0f}" if pin["support"] else "—"},
+            {"Metric": "Resistance", "Value": f"{pin['resistance']:,.0f}" if pin["resistance"] else "—"},
+            {"Metric": "Final Direction", "Value": confluence["final_direction"]},
+            {"Metric": "Final Score", "Value": f"{confluence['final_score']:.1f}/100"},
+            {"Metric": "Final Confidence", "Value": f"{confluence['final_confidence']:.1f}%"},
+            {"Metric": "Reason", "Value": confluence["final_reason"]},
+            {"Metric": "Reversal Status", "Value": reversal.get("status", "NO REVERSAL WARNING")},
+            {"Metric": "Reversal Direction", "Value": reversal.get("direction", "NONE")},
+            {"Metric": "Reversal Score", "Value": f"{float(reversal.get('score', 0) or 0):.1f}/100"},
+            {"Metric": "Reversal Type", "Value": reversal.get("type", "NONE")},
+            {"Metric": "SELL EDGE", "Value": f"{sell_edge['score']:.1f}/100"},
+            {"Metric": "SELL EDGE STATUS", "Value": sell_edge["status"]},
+            {"Metric": "SELL EDGE Reason", "Value": sell_edge["reason"]},
+        ])
+        st.dataframe(evidence, use_container_width=True, hide_index=True)
+
+        st.caption(f"Symbol: {symbol or state.get('symbol', 'OPTION_CHAIN')} | PIN uses already-loaded data; no extra API call.")
+        return confluence
+    except Exception as exc:
+        logger.exception("PIN confluence render failed: %s", exc)
+        st.warning(f"PIN layer unavailable — existing Option Chain remains active. ({exc})")
+        return {
+            "pin": {"direction": "WAIT", "score": 0.0, "confidence": 0.0,
+                     "status": "PIN DATA UNAVAILABLE", "reason": str(exc)},
+            "final_direction": "WAIT", "final_score": 0.0,
+            "final_confidence": 0.0, "final_status": "⚪ CONFLICT / WAIT",
+            "final_reason": str(exc),
+            "reversal": {"status": "NO REVERSAL WARNING", "direction": "NONE", "score": 0.0,
+                         "probability": 0.0, "type": "NONE", "reason": str(exc), "trigger": "Unavailable"},
+        }
+
+# ══════════════════════════════════════════════════════════════════════════
+# END PIN ANALYSIS LAYER
+# ══════════════════════════════════════════════════════════════════════════
+
+
+
 def _movement_price_reversal_from_history(
-    history: dict[str, Any], symbol: str, expiry_label: str, strike: float,
-    current_price: float, lookback: int = 5, side: str = "CE",
+    history: dict[str, Any],
+    symbol: str,
+    expiry_label: str,
+    strike: float,
+    current_price: float,
+    lookback: int = 5,
+    side: str = "CE",
 ) -> tuple[float, str]:
-    """Return a real premium-history reference. Never manufacture from strike."""
-    key=_movement_history_key(symbol,expiry_label,strike)
-    series=history.get(key,[]) if isinstance(history,dict) else []
-    price_key="pe_price" if str(side).upper()=="PE" else "ce_price"
-    prices=[float(x.get(price_key,0) or 0) for x in series if float(x.get(price_key,0) or 0)>0]
-    if len(prices)<2 or current_price<=0:
-        return 0.0,"WAIT HISTORY"
-    prior=prices[:-1][-max(2,int(lookback)):]
-    if not prior: return 0.0,"WAIT HISTORY"
-    if current_price>prior[-1]:
-        reversal=min(prior)
-        return float(reversal),"UP ABOVE HISTORY REVERSAL"
-    reversal=max(prior)
-    return float(reversal),"DOWN BELOW HISTORY REVERSAL"
+    """Get a side-specific price-reversal reference from repeated live scans."""
+    key = _movement_history_key(symbol, expiry_label, strike)
+    series = history.get(key, []) if isinstance(history, dict) else []
+    price_key = "pe_price" if str(side).upper() == "PE" else "ce_price"
+    prices = [
+        float(x.get(price_key, 0) or 0)
+        for x in series
+        if float(x.get(price_key, 0) or 0) > 0
+    ]
+    if len(prices) >= 2:
+        prior = prices[:-1][-max(2, int(lookback)):]
+        reversal = min(prior)
+        return (
+            float(reversal),
+            "UP ABOVE REVERSAL" if current_price > reversal else "PRICE REVERSAL",
+        )
+    if current_price > 0:
+        return float(current_price * 0.95), "WAIT HISTORY"
+    return 0.0, "NO PRICE"
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -2535,25 +4532,51 @@ def _movement_search_status(score: float) -> str:
 
 
 def _movement_trade_levels(
-    row: pd.Series, signal_time: Optional[datetime] = None,
-    reversal_level: Optional[float] = None, reversal_status: str = "WAIT HISTORY",
-    side: str = "CE",
+    row: pd.Series,
+    signal_time: Optional[datetime] = None,
+    reversal_level: Optional[float] = None,
+    reversal_status: str = "WAIT HISTORY",
 ) -> dict[str, Any]:
-    """Display-only levels based on the actual selected option premium."""
-    side=str(side).upper()
-    ltp=_pin_num(row.get("pe_ltp" if side=="PE" else "ce_ltp"),0.0)
-    ask=_pin_num(row.get("pe_ask" if side=="PE" else "ce_ask"),0.0)
-    entry=ask if ask>0 else ltp
-    signal_dt=signal_time if signal_time is not None else _india_now()
-    if signal_dt.tzinfo is None: signal_dt=signal_dt.replace(tzinfo=INDIA_TZ)
-    else: signal_dt=signal_dt.astimezone(INDIA_TZ)
-    if entry<=0:
-        return {"Signal Time":signal_dt.strftime("%H:%M:%S"),"Entry":0.0,"Stop Loss":0.0,"Price Reversal":0.0,"Reversal Status":"NO PRICE"}
-    reversal=_pin_num(reversal_level,0.0)
-    if reversal<=0:
-        return {"Signal Time":signal_dt.strftime("%H:%M:%S"),"Entry":round(entry,2),"Stop Loss":0.0,"Price Reversal":0.0,"Reversal Status":"WAIT HISTORY"}
-    stop_loss=max(0.0,reversal*0.98)
-    return {"Signal Time":signal_dt.strftime("%H:%M:%S"),"Entry":round(entry,2),"Stop Loss":round(stop_loss,2),"Price Reversal":round(reversal,2),"Reversal Status":str(reversal_status)}
+    """Build CE movement-scan levels with a live price-reversal check."""
+    ltp = _pin_num(row.get("ce_ltp"), 0.0)
+    ask = _pin_num(row.get("ce_ask"), 0.0)
+    entry = ask if ask > 0 else ltp
+    # Signal Time is always India Standard Time (IST), not the Streamlit
+    # server timezone (often UTC). This fixes the 5:30 hour offset seen in UI.
+    if signal_time is not None:
+        if signal_time.tzinfo is None:
+            signal_dt = signal_time.replace(tzinfo=INDIA_TZ)
+        else:
+            signal_dt = signal_time.astimezone(INDIA_TZ)
+    else:
+        signal_dt = _india_now()
+    now_text = signal_dt.strftime("%H:%M:%S")
+
+    if entry <= 0:
+        return {
+            "Signal Time": now_text, "Entry": 0.0, "Stop Loss": 0.0,
+            "Price Reversal": 0.0, "Reversal Status": "NO PRICE",
+        }
+
+    # First scan fallback; later scans use the actual recent CE price history.
+    fallback_reversal = entry * 0.95
+    reversal = _pin_num(reversal_level, fallback_reversal)
+    if reversal <= 0 or reversal >= entry:
+        reversal = fallback_reversal
+
+    # Keep SL close to the actual reversal trigger instead of producing a
+    # misleading zero/very-distant stop. Scanner reference only.
+    stop_loss = max(0.0, reversal * 0.98)
+    if stop_loss >= entry:
+        stop_loss = max(0.0, entry * 0.93)
+
+    return {
+        "Signal Time": now_text,
+        "Entry": round(entry, 2),
+        "Stop Loss": round(stop_loss, 2),
+        "Price Reversal": round(reversal, 2),
+        "Reversal Status": str(reversal_status),
+    }
 
 
 def _movement_search_excel(df: pd.DataFrame, report_name: str = "Movement Search") -> io.BytesIO:
@@ -2564,7 +4587,7 @@ def _movement_search_excel(df: pd.DataFrame, report_name: str = "Movement Search
 
     export_cols = [
         "Instrument", "Strike", "Option", "Direction", "Status",
-        "Signal Time", "Reason", "Pre-Move Direction", "Current Price Direction", "Entry", "Stop Loss", "Price Reversal", "Reversal Status",
+        "Signal Time", "Entry", "Stop Loss", "Price Reversal", "Reversal Status",
         "Score", "Early Score", "CE Score", "PE Score",
         "Movement Bias", "Price Delta", "Price Change %", "Price Direction Source",
         "CE Price", "PE Price", "Early Status", "Rising Scans",
@@ -2605,97 +4628,284 @@ def _movement_search_excel(df: pd.DataFrame, report_name: str = "Movement Search
 
 
 def _movement_search_one(
-    fyers: Any, symbol: str, is_index: bool, strike_count: int = 40,
-    side_mode: str = "UP", min_score: Optional[float] = None,
+    fyers: Any,
+    symbol: str,
+    is_index: bool,
+    strike_count: int = 40,
+    side_mode: str = "UP",
+    min_score: Optional[float] = None,
 ) -> pd.DataFrame:
-    """Movement search using actual CE/PE premium scan history."""
+    """
+    Unified movement search.
+
+    IMPORTANT:
+    - Default side_mode="UP" preserves the existing selected-search report.
+    - side_mode="BOTH" is used ONLY by the new Total Scanner.
+    - Existing add_strike_movement_score() logic is not changed.
+    - In BOTH mode CE and PE are compared at the SAME strike and the stronger
+      side is reported. PE is never removed from the calculation.
+    """
     try:
-        stock_name="" if is_index else normalize_stock_symbol(symbol)
-        result=fetch_chain_unified(fyers,symbol,is_index,stock_name,"",max(40,int(strike_count)))
+        stock_name = "" if is_index else normalize_stock_symbol(symbol)
+
+        result = fetch_chain_unified(
+            fyers,
+            symbol,
+            is_index,
+            stock_name,
+            "",
+            max(40, int(strike_count)),
+        )
+
         if not result.get("ok"):
-            st.session_state["oc_movement_search_last_error"]=f"{symbol}: {result.get('error','Option-chain fetch failed.')}"
+            st.session_state["oc_movement_search_last_error"] = (
+                f"{symbol}: {result.get('error', 'Option-chain fetch failed.')}"
+            )
             return pd.DataFrame()
-        st.session_state.pop("oc_movement_search_last_error",None)
-        df_all=result.get("df"); meta=result.get("meta") or {}
-        if df_all is None or df_all.empty: return pd.DataFrame()
-        spot=_pin_num(meta.get("spot_price"),0.0); expiry=meta.get("selected_expiry",""); df=df_all.copy()
-        for fn,args in ((classify_buildup,()),(classify_moneyness,(spot,))):
-            try: df=fn(df,*args)
-            except Exception: pass
-        try: atm=float(df.iloc[(df["strike_price"]-spot).abs().to_numpy().argmin()]["strike_price"]) if spot and "strike_price" in df.columns else float(df["strike_price"].median())
-        except Exception: atm=0.0
-        for fn,args in ((compute_ai_scores,(spot,atm,calc_max_pain(df),calc_pcr(df))),(detect_institutional_smart_money,()),):
-            try: df=fn(df,*args)
-            except Exception: pass
-        try: df,_=add_pressure_analysis(df,spot,DEFAULT_LOT_SIZES.get(symbol,1))
-        except Exception: pass
-        try: df,_=calculate_order_flow(df,spot)
-        except Exception: pass
-        try: df=add_strike_movement_score(df)
+
+        st.session_state.pop("oc_movement_search_last_error", None)
+
+        df_all = result.get("df")
+        meta = result.get("meta") or {}
+
+        if df_all is None or df_all.empty:
+            return pd.DataFrame()
+
+        spot = _pin_num(meta.get("spot_price"), 0.0)
+        expiry = meta.get("selected_expiry", "")
+        df = df_all.copy()
+
+        try:
+            df = classify_buildup(df)
+        except Exception:
+            pass
+        try:
+            df = classify_moneyness(df, spot)
+        except Exception:
+            pass
+
+        try:
+            atm_strike = (
+                float(df.iloc[(df["strike_price"] - spot).abs().to_numpy().argmin()]
+                      ["strike_price"])
+                if spot and "strike_price" in df.columns
+                else float(df["strike_price"].median())
+            )
+        except Exception:
+            atm_strike = 0.0
+
+        try:
+            df = compute_ai_scores(
+                df, spot, atm_strike, calc_max_pain(df), calc_pcr(df)
+            )
+        except Exception:
+            pass
+        try:
+            df = detect_institutional_smart_money(df)
+        except Exception:
+            pass
+        try:
+            df, _market_pressure = add_pressure_analysis(
+                df, spot, DEFAULT_LOT_SIZES.get(symbol, 1)
+            )
+        except Exception:
+            pass
+        try:
+            df, _order_flow = calculate_order_flow(df, spot)
+        except Exception:
+            pass
+
+        # ORIGINAL movement engine — deliberately untouched.
+        try:
+            df = add_strike_movement_score(df)
         except Exception as exc:
-            logger.exception("add_strike_movement_score failed for %s: %s",symbol,exc); return pd.DataFrame()
-        if "movement_score" not in df.columns: return pd.DataFrame()
-        try: df,_=compute_movement_early_warning(df,symbol,expiry,spot)
-        except Exception as exc: logger.warning("premium early warning failed for %s: %s",symbol,exc)
+            logger.exception("add_strike_movement_score failed for %s: %s", symbol, exc)
+            return pd.DataFrame()
 
-        both_mode=str(side_mode or "UP").upper() in ("BOTH","TOTAL","CE_PE")
-        threshold=MOVEMENT_SEARCH_MIN_SCORE if min_score is None else float(min_score)
-        rows=[]; history=st.session_state.get(MOVEMENT_HISTORY_KEY,{})
+        if "movement_score" not in df.columns:
+            return pd.DataFrame()
 
-        def build_row(row,side,score,direction):
-            strike=_pin_num(row.get("strike_price"),0.0)
-            key=_movement_history_key(symbol,expiry,strike); series=history.get(key,[]) if isinstance(history,dict) else []
-            pkey="pe_price" if side=="PE" else "ce_price"; prices=[_pin_num(x.get(pkey),0.0) for x in series if _pin_num(x.get(pkey),0.0)>0]
-            current=_pin_num(row.get("pe_ltp" if side=="PE" else "ce_ltp"),0.0)
-            prev=prices[-2] if len(prices)>=2 else 0.0
-            delta=current-prev if current>0 and prev>0 else 0.0
-            pct=(delta/prev*100.0) if prev>0 else 0.0
-            if side=="CE":
-                direction="UP" if delta>0.005 else ("DOWN" if delta<-0.005 else "FLAT")
-                pre_signal="CE UP" if delta>0 else ("CE DOWN" if delta<0 else "WAIT HISTORY")
-                premium_rise=int(_pin_num(row.get("ce_rising_scans"),0)); premium_acc=_pin_num(row.get("ce_price_acceleration"),0)
-            else:
-                direction="DOWN" if delta>0.005 else ("UP" if delta<-0.005 else "FLAT")
-                pre_signal="PE DOWN" if delta>0 else ("PE UP" if delta<0 else "WAIT HISTORY")
-                premium_rise=int(_pin_num(row.get("pe_rising_scans"),0)); premium_acc=_pin_num(row.get("pe_price_acceleration"),0)
-            early_status=str(row.get("early_movement_status","WAIT HISTORY"))
-            if len(prices)<2: early_status="WAIT HISTORY"
-            elif (premium_rise>=3 and abs(pct)>=4) or abs(pct)>=10: early_status="BIG MOVE CONFIRMED"
-            elif premium_rise>=2 and delta>0 and (premium_acc>0 or abs(pct)>=2): early_status="BIG-MOVE PRE-ALERT"
-            elif delta<0: early_status="PRE-MOVE FAILED"
-            reason=str(row.get("premium_reason","Waiting for premium build-up"))
-            reversal,reversal_status=_movement_price_reversal_from_history(history,symbol,expiry,strike,current,5,side)
-            levels=_movement_trade_levels(row,reversal_level=reversal,reversal_status=reversal_status,side=side)
-            return {
-                "Instrument":symbol,"Strike":strike,"Option":side,"Direction":direction,
-                "Status":early_status,"Signal Time":levels["Signal Time"],"Reason":reason,
-                "Pre-Move Direction":pre_signal,"Current Price Direction":direction,
-                "Entry":levels["Entry"],"Stop Loss":levels["Stop Loss"],"Price Reversal":levels["Price Reversal"],"Reversal Status":levels["Reversal Status"],
-                "Score":round(score,1),"Early Score":round(_pin_num(row.get("early_movement_score")),1),
-                "CE Score":round(_pin_num(row.get("ce_movement_score")),1),"PE Score":round(_pin_num(row.get("pe_movement_score")),1),
-                "Movement Bias":f"{side} {direction}","Price Delta":round(delta,4),"Price Change %":round(pct,2),
-                "Price Direction Source":"SCAN PREMIUM HISTORY" if prev>0 else "WAIT HISTORY",
-                "CE Price":round(_pin_num(row.get("ce_ltp")),4),"PE Price":round(_pin_num(row.get("pe_ltp")),4),
-                "Early Status":early_status,"Rising Scans":premium_rise,"Score Delta":round(_pin_num(row.get("movement_score_delta")),1),
-                "Confidence":round(_pin_num(row.get("early_movement_confidence")),1),"Spot":round(spot,2) if spot else 0.0,"Source":result.get("source","UNKNOWN"),
-            }
+        try:
+            df, _early_summary = compute_movement_early_warning(
+                df, symbol, expiry, spot
+            )
+        except Exception as exc:
+            logger.warning(
+                "compute_movement_early_warning failed for %s: %s", symbol, exc
+            )
 
-        for _,row in df.iterrows():
-            ce_score=_pin_num(row.get("ce_movement_score"),0); pe_score=_pin_num(row.get("pe_movement_score"),0)
-            if max(ce_score,pe_score)<threshold: continue
-            strike=_pin_num(row.get("strike_price"),0)
-            if strike<=0: continue
+        mode = str(side_mode or "UP").upper()
+        both_mode = mode in ("BOTH", "TOTAL", "CE_PE")
+
+        # Selected old report keeps its original 70+ threshold.
+        # Total scanner can pass min_score=0 to avoid hiding developing candidates.
+        threshold = MOVEMENT_SEARCH_MIN_SCORE if min_score is None else float(min_score)
+
+        rows = []
+        for _, row in df.iterrows():
+            ce_score = _pin_num(row.get("ce_movement_score"), 0.0)
+            pe_score = _pin_num(row.get("pe_movement_score"), 0.0)
+
+            if max(ce_score, pe_score) < threshold:
+                continue
+
+            strike = _pin_num(row.get("strike_price"), 0.0)
+            if strike <= 0:
+                continue
+
             if both_mode:
-                if ce_score>=pe_score: side,score="CE",ce_score
-                else: side,score="PE",pe_score
-                rows.append(build_row(row,side,score,"UP" if side=="CE" else "DOWN"))
-            else:
-                if ce_score<threshold or ce_score<=pe_score+7: continue
-                rows.append(build_row(row,"CE",ce_score,"UP"))
-        if not rows: return pd.DataFrame()
-        return pd.DataFrame(rows).sort_values(["Score","Early Score","Strike"],ascending=[False,False,True]).head(MOVEMENT_SEARCH_MAX_ROWS if not both_mode else 100).reset_index(drop=True)
+                # TOTAL SCANNER: first select the stronger CE/PE activity score
+                # at the SAME strike. Direction is NOT tied to the option type.
+                # CE can be UP or DOWN; PE can also be UP or DOWN.
+                if ce_score > pe_score:
+                    side, score = "CE", ce_score
+                    current_option = _pin_num(row.get("ce_ltp"), 0.0)
+                    daily_delta = _pin_num(row.get("ce_change"), 0.0)
+                elif pe_score > ce_score:
+                    side, score = "PE", pe_score
+                    current_option = _pin_num(row.get("pe_ltp"), 0.0)
+                    daily_delta = _pin_num(row.get("pe_change"), 0.0)
+                else:
+                    # Tie-breaker only chooses the side; it does NOT decide UP/DOWN.
+                    ce_pressure = _pin_num(row.get("buy_pressure"), 50.0)
+                    pe_pressure = _pin_num(row.get("sell_pressure"), 50.0)
+                    ce_volume = _pin_num(row.get("ce_volume"), 0.0)
+                    pe_volume = _pin_num(row.get("pe_volume"), 0.0)
+                    if ce_pressure > pe_pressure or (
+                        ce_pressure == pe_pressure and ce_volume >= pe_volume
+                    ):
+                        side, score = "CE", ce_score
+                        current_option = _pin_num(row.get("ce_ltp"), 0.0)
+                        daily_delta = _pin_num(row.get("ce_change"), 0.0)
+                    else:
+                        side, score = "PE", pe_score
+                        current_option = _pin_num(row.get("pe_ltp"), 0.0)
+                        daily_delta = _pin_num(row.get("pe_change"), 0.0)
+
+                # TRUE direction = option premium movement, never strike movement.
+                # Prefer scan-to-scan LTP history; first scan falls back to FYERS
+                # day's option-price change so the report can still show direction.
+                movement_history = st.session_state.get(MOVEMENT_HISTORY_KEY, {})
+                hkey = _movement_history_key(symbol, expiry, strike)
+                series = movement_history.get(hkey, []) if isinstance(movement_history, dict) else []
+                price_key = "pe_price" if side == "PE" else "ce_price"
+                prior_prices = [
+                    _pin_num(x.get(price_key), 0.0)
+                    for x in series[:-1]
+                    if _pin_num(x.get(price_key), 0.0) > 0
+                ]
+                previous_price = prior_prices[-1] if prior_prices else 0.0
+                if current_option > 0 and previous_price > 0:
+                    price_delta = current_option - previous_price
+                    price_pct = (price_delta / previous_price) * 100.0
+                    direction = "UP" if price_delta > 0.005 else ("DOWN" if price_delta < -0.005 else "FLAT")
+                    direction_source = "SCAN LTP"
+                else:
+                    price_delta = daily_delta
+                    price_pct = (price_delta / current_option) * 100.0 if current_option > 0 else 0.0
+                    direction = "UP" if price_delta > 0.005 else ("DOWN" if price_delta < -0.005 else "FLAT")
+                    direction_source = "FYERS CHANGE"
+
+                movement_bias = f"{side} {direction}"
+
+                reversal_level, reversal_status = _movement_price_reversal_from_history(
+                    movement_history,
+                    symbol,
+                    expiry,
+                    strike,
+                    current_option,
+                    lookback=5,
+                    side=side,
+                )
+                levels = _movement_trade_levels(
+                    row,
+                    reversal_level=reversal_level,
+                    reversal_status=reversal_status,
+                )
+
+                rows.append({
+                    "Instrument": symbol,
+                    "Strike": strike,
+                    "Option": side,
+                    "Direction": direction,
+                    "Status": _movement_search_status(score),
+                    "Signal Time": levels["Signal Time"],
+                    "Entry": levels["Entry"],
+                    "Stop Loss": levels["Stop Loss"],
+                    "Price Reversal": levels["Price Reversal"],
+                    "Reversal Status": levels["Reversal Status"],
+                    "Score": round(score, 1),
+                    "Early Score": round(_pin_num(row.get("early_movement_score")), 1),
+                    "CE Score": round(ce_score, 1),
+                    "PE Score": round(pe_score, 1),
+                    "Movement Bias": movement_bias,
+                    "Price Delta": round(price_delta, 4),
+                    "Price Change %": round(price_pct, 2),
+                    "Price Direction Source": direction_source,
+                    "CE Price": round(_pin_num(row.get("ce_ltp"), 0.0), 4),
+                    "PE Price": round(_pin_num(row.get("pe_ltp"), 0.0), 4),
+                    "Early Status": str(row.get("early_movement_status", "WAIT")),
+                    "Rising Scans": int(_pin_num(row.get("movement_rising_scans"), 0)),
+                    "Score Delta": round(_pin_num(row.get("movement_score_delta")), 1),
+                    "Confidence": round(_pin_num(row.get("early_movement_confidence")), 1),
+                    "Spot": round(spot, 2) if spot else 0.0,
+                    "Source": result.get("source", "UNKNOWN"),
+                })
+                continue
+
+            # ORIGINAL selected-search behavior: CE/UP only.
+            if ce_score < threshold:
+                continue
+            if ce_score <= pe_score + 7.0:
+                continue
+
+            current_ce = _pin_num(row.get("ce_ltp"), 0.0)
+            movement_history = st.session_state.get(MOVEMENT_HISTORY_KEY, {})
+            reversal_level, reversal_status = _movement_price_reversal_from_history(
+                movement_history, symbol, expiry, strike, current_ce, lookback=5
+            )
+            levels = _movement_trade_levels(
+                row, reversal_level=reversal_level, reversal_status=reversal_status
+            )
+            rows.append({
+                "Instrument": symbol,
+                "Strike": strike,
+                "Option": "CE",
+                "Direction": "UP",
+                "Status": _movement_search_status(ce_score),
+                "Signal Time": levels["Signal Time"],
+                "Entry": levels["Entry"],
+                "Stop Loss": levels["Stop Loss"],
+                "Price Reversal": levels["Price Reversal"],
+                "Reversal Status": levels["Reversal Status"],
+                "Score": round(ce_score, 1),
+                "Early Score": round(_pin_num(row.get("early_movement_score")), 1),
+                "CE Score": round(ce_score, 1),
+                "PE Score": round(pe_score, 1),
+                "Movement Bias": "CE UP",
+                "Early Status": str(row.get("early_movement_status", "WAIT")),
+                "Rising Scans": int(_pin_num(row.get("movement_rising_scans"), 0)),
+                "Score Delta": round(_pin_num(row.get("movement_score_delta")), 1),
+                "Confidence": round(_pin_num(row.get("early_movement_confidence")), 1),
+                "Spot": round(spot, 2) if spot else 0.0,
+                "Source": result.get("source", "UNKNOWN"),
+            })
+
+        if not rows:
+            return pd.DataFrame()
+
+        return (
+            pd.DataFrame(rows)
+            .sort_values(
+                ["Score", "Early Score", "Strike"],
+                ascending=[False, False, True],
+            )
+            .head(MOVEMENT_SEARCH_MAX_ROWS)
+            .reset_index(drop=True)
+        )
+
     except Exception as exc:
-        logger.exception("Movement search failed for %s: %s",symbol,exc)
+        logger.exception("Movement search failed for %s: %s", symbol, exc)
         return pd.DataFrame()
 
 
@@ -2747,7 +4957,7 @@ def _render_movement_search_results(
 
     display_cols = [
         "Instrument", "Strike", "Option", "Direction", "Status",
-        "Signal Time", "Reason", "Pre-Move Direction", "Current Price Direction", "Entry", "Stop Loss", "Price Reversal", "Reversal Status",
+        "Signal Time", "Entry", "Stop Loss", "Price Reversal", "Reversal Status",
         "Score", "Early Score", "Early Status", "Rising Scans",
         "Score Delta", "Confidence", "Spot", "Source",
     ]
@@ -2853,7 +5063,7 @@ def _render_total_index_movement_search(
         "Instrument", "Strike", "Option", "Direction", "Status",
         "CE Score", "PE Score", "Movement Bias", "CE Price", "PE Price",
         "Price Delta", "Price Change %", "Price Direction Source",
-        "Signal Time", "Reason", "Pre-Move Direction", "Current Price Direction", "Entry", "Stop Loss", "Price Reversal", "Reversal Status",
+        "Signal Time", "Entry", "Stop Loss", "Price Reversal", "Reversal Status",
         "Score", "Early Score", "Early Status", "Rising Scans",
         "Score Delta", "Confidence", "Spot", "Source",
     ]
@@ -2954,7 +5164,7 @@ def _render_total_fno_movement_search(
         "Instrument", "Strike", "Option", "Direction", "Status",
         "CE Score", "PE Score", "Movement Bias", "CE Price", "PE Price",
         "Price Delta", "Price Change %", "Price Direction Source",
-        "Signal Time", "Reason", "Pre-Move Direction", "Current Price Direction", "Entry", "Stop Loss", "Price Reversal", "Reversal Status",
+        "Signal Time", "Entry", "Stop Loss", "Price Reversal", "Reversal Status",
         "Score", "Early Score", "Early Status", "Rising Scans",
         "Score Delta", "Confidence", "Spot", "Source",
     ]
