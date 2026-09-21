@@ -4517,6 +4517,107 @@ BIG_MOVEMENT_SCAN_MIN_SCORE = 78.0
 BIG_MOVEMENT_SCAN_MAX_ROWS_INDEX = 60
 BIG_MOVEMENT_SCAN_MAX_ROWS_FNO = 100
 
+# ADDITIVE FALSE-SIGNAL FILTERS — existing movement score engine is untouched.
+# These filters are applied only after the existing CE/PE movement scores are calculated.
+MOVEMENT_SIGNAL_MIN_SIDE_GAP = 10.0
+MOVEMENT_SIGNAL_MIN_PRICE_MOVE_PCT = 0.25
+MOVEMENT_SIGNAL_FIRST_SCAN_MIN_DAILY_PCT = 0.75
+MOVEMENT_SIGNAL_MIN_CONFIRM_SCORE = 65.0
+MOVEMENT_SIGNAL_MIN_SCORE_DELTA = 2.0
+MOVEMENT_SIGNAL_MIN_PRESSURE_GAP = 15.0
+BIG_MOVEMENT_CONFIRM_MIN_PRICE_PCT = 0.25
+BIG_MOVEMENT_CONFIRM_MIN_SCORE_DELTA = 1.5
+
+
+def _movement_signal_validation(
+    score: float,
+    other_score: float,
+    current_price: float,
+    previous_price: float = 0.0,
+    daily_change: float = 0.0,
+    rising_scans: int = 0,
+    score_delta: float = 0.0,
+    early_score: float = 0.0,
+    pressure_gap: float = 0.0,
+) -> dict[str, Any]:
+    """Validate a movement candidate without changing the original score model."""
+    score = float(score or 0.0)
+    other_score = float(other_score or 0.0)
+    current_price = float(current_price or 0.0)
+    previous_price = float(previous_price or 0.0)
+    daily_change = float(daily_change or 0.0)
+    rising_scans = int(rising_scans or 0)
+    score_delta = float(score_delta or 0.0)
+    early_score = float(early_score or 0.0)
+    pressure_gap = float(pressure_gap or 0.0)
+
+    gap = score - other_score
+    if current_price <= 0:
+        return {
+            "valid": False, "direction": "FLAT", "price_pct": 0.0,
+            "price_source": "NO PRICE", "reason": "NO OPTION PRICE",
+            "gap": gap, "confirmed": False,
+        }
+
+    if previous_price > 0:
+        price_delta = current_price - previous_price
+        price_pct = price_delta / previous_price * 100.0
+        price_source = "SCAN LTP"
+        min_pct = MOVEMENT_SIGNAL_MIN_PRICE_MOVE_PCT
+    else:
+        # First scan must be stricter because there is no scan-to-scan proof yet.
+        price_delta = daily_change
+        price_pct = daily_change / current_price * 100.0 if current_price > 0 else 0.0
+        price_source = "FYERS CHANGE"
+        min_pct = MOVEMENT_SIGNAL_FIRST_SCAN_MIN_DAILY_PCT
+
+    if abs(price_pct) < min_pct:
+        return {
+            "valid": False,
+            "direction": "FLAT" if abs(price_pct) < 0.05 else ("UP" if price_pct > 0 else "DOWN"),
+            "price_pct": price_pct,
+            "price_source": price_source,
+            "reason": f"PRICE MOVE < {min_pct:.2f}%",
+            "gap": gap,
+            "confirmed": False,
+        }
+
+    direction = "UP" if price_pct > 0 else "DOWN"
+
+    if gap < MOVEMENT_SIGNAL_MIN_SIDE_GAP:
+        return {
+            "valid": False, "direction": direction, "price_pct": price_pct,
+            "price_source": price_source,
+            "reason": f"SIDE GAP < {MOVEMENT_SIGNAL_MIN_SIDE_GAP:.0f}",
+            "gap": gap, "confirmed": False,
+        }
+
+    confirmed = (
+        rising_scans >= 1
+        or score_delta >= MOVEMENT_SIGNAL_MIN_SCORE_DELTA
+        or abs(pressure_gap) >= MOVEMENT_SIGNAL_MIN_PRESSURE_GAP
+        or early_score >= MOVEMENT_SIGNAL_MIN_CONFIRM_SCORE
+    )
+
+    if not confirmed:
+        return {
+            "valid": False, "direction": direction, "price_pct": price_pct,
+            "price_source": price_source,
+            "reason": "NO PRICE/VOLUME/SCORE CONFIRMATION",
+            "gap": gap, "confirmed": False,
+        }
+
+    return {
+        "valid": True,
+        "direction": direction,
+        "price_pct": price_pct,
+        "price_source": price_source,
+        "reason": "PRICE + SCORE CONFIRMED",
+        "gap": gap,
+        "confirmed": True,
+    }
+
+
 # ADDITIVE PRE-MOVE -> BIG-MOVEMENT LIVE TRACKER
 BIG_MOVEMENT_EVENT_KEY = "oc_big_movement_events"
 BIG_PREMOVE_EVENT_KEY = "oc_big_premove_events"
@@ -4554,10 +4655,16 @@ def _movement_trade_levels(
     signal_time: Optional[datetime] = None,
     reversal_level: Optional[float] = None,
     reversal_status: str = "WAIT HISTORY",
+    side: str = "CE",
 ) -> dict[str, Any]:
-    """Build CE movement-scan levels with a live price-reversal check."""
-    ltp = _pin_num(row.get("ce_ltp"), 0.0)
-    ask = _pin_num(row.get("ce_ask"), 0.0)
+    """Build side-aware movement-scan levels with a live price-reversal check."""
+    side = str(side or "CE").upper()
+    if side == "PE":
+        ltp = _pin_num(row.get("pe_ltp"), 0.0)
+        ask = _pin_num(row.get("pe_ask"), 0.0)
+    else:
+        ltp = _pin_num(row.get("ce_ltp"), 0.0)
+        ask = _pin_num(row.get("ce_ask"), 0.0)
     entry = ask if ask > 0 else ltp
     # Signal Time is always India Standard Time (IST), not the Streamlit
     # server timezone (often UTC). This fixes the 5:30 hour offset seen in UI.
@@ -4606,7 +4713,7 @@ def _movement_search_excel(df: pd.DataFrame, report_name: str = "Movement Search
     export_cols = [
         "Instrument", "Strike", "Option", "Direction", "Status",
         "Signal Time", "Entry", "Stop Loss", "Price Reversal", "Reversal Status",
-        "Score", "Early Score", "CE Score", "PE Score",
+        "Score", "Early Score", "CE Score", "PE Score", "Signal Validation",
         "Movement Bias", "Price Delta", "Price Change %", "Price Direction Source",
         "CE Price", "PE Price", "Early Status", "Rising Scans",
         "Score Delta", "Confidence", "Spot", "Source",
@@ -4628,6 +4735,7 @@ def _movement_search_excel(df: pd.DataFrame, report_name: str = "Movement Search
         ("Generated At", datetime.now().strftime("%d-%b-%Y %H:%M:%S")),
         ("Filter", "Selected-search remains CE/UP only; Total Scanner selects stronger CE/PE side per strike and derives UP/DOWN from option-premium price movement."),
         ("Minimum Selected-Search CE Movement Score", MOVEMENT_SEARCH_MIN_SCORE),
+        ("False-signal filter", f"Requires side gap ≥ {MOVEMENT_SIGNAL_MIN_SIDE_GAP:.0f}, actual option-premium movement ≥ {MOVEMENT_SIGNAL_MIN_PRICE_MOVE_PCT:.2f}% after baseline, and confirmation; first scan requires ≥ {MOVEMENT_SIGNAL_FIRST_SCAN_MIN_DAILY_PCT:.2f}% daily premium movement."),
         ("Note", "Movement score is an activity/ranking early-warning model, not a guaranteed price prediction."),
     ]
     ws_info.cell(row=1, column=1, value="Metric")
@@ -4772,19 +4880,19 @@ def _movement_search_one(
                 continue
 
             if both_mode:
-                # TOTAL SCANNER: first select the stronger CE/PE activity score
-                # at the SAME strike. Direction is NOT tied to the option type.
-                # CE can be UP or DOWN; PE can also be UP or DOWN.
+                # TOTAL SCANNER: compare CE/PE at the SAME strike, then require
+                # actual option-premium movement before emitting a signal.
                 if ce_score > pe_score:
                     side, score = "CE", ce_score
+                    other_score = pe_score
                     current_option = _pin_num(row.get("ce_ltp"), 0.0)
                     daily_delta = _pin_num(row.get("ce_change"), 0.0)
                 elif pe_score > ce_score:
                     side, score = "PE", pe_score
+                    other_score = ce_score
                     current_option = _pin_num(row.get("pe_ltp"), 0.0)
                     daily_delta = _pin_num(row.get("pe_change"), 0.0)
                 else:
-                    # Tie-breaker only chooses the side; it does NOT decide UP/DOWN.
                     ce_pressure = _pin_num(row.get("buy_pressure"), 50.0)
                     pe_pressure = _pin_num(row.get("sell_pressure"), 50.0)
                     ce_volume = _pin_num(row.get("ce_volume"), 0.0)
@@ -4793,16 +4901,15 @@ def _movement_search_one(
                         ce_pressure == pe_pressure and ce_volume >= pe_volume
                     ):
                         side, score = "CE", ce_score
+                        other_score = pe_score
                         current_option = _pin_num(row.get("ce_ltp"), 0.0)
                         daily_delta = _pin_num(row.get("ce_change"), 0.0)
                     else:
                         side, score = "PE", pe_score
+                        other_score = ce_score
                         current_option = _pin_num(row.get("pe_ltp"), 0.0)
                         daily_delta = _pin_num(row.get("pe_change"), 0.0)
 
-                # TRUE direction = option premium movement, never strike movement.
-                # Prefer scan-to-scan LTP history; first scan falls back to FYERS
-                # day's option-price change so the report can still show direction.
                 movement_history = st.session_state.get(MOVEMENT_HISTORY_KEY, {})
                 hkey = _movement_history_key(symbol, expiry, strike)
                 series = movement_history.get(hkey, []) if isinstance(movement_history, dict) else []
@@ -4813,16 +4920,38 @@ def _movement_search_one(
                     if _pin_num(x.get(price_key), 0.0) > 0
                 ]
                 previous_price = prior_prices[-1] if prior_prices else 0.0
-                if current_option > 0 and previous_price > 0:
+
+                early_score = _pin_num(row.get("early_movement_score"), 0.0)
+                rising_scans = int(_pin_num(row.get("movement_rising_scans"), 0))
+                score_delta = _pin_num(row.get("movement_score_delta"), 0.0)
+                pressure_gap = (
+                    _pin_num(row.get("buy_pressure"), 50.0)
+                    - _pin_num(row.get("sell_pressure"), 50.0)
+                )
+                if side == "PE":
+                    pressure_gap = -pressure_gap
+
+                validation = _movement_signal_validation(
+                    score=score,
+                    other_score=other_score,
+                    current_price=current_option,
+                    previous_price=previous_price,
+                    daily_change=daily_delta,
+                    rising_scans=rising_scans,
+                    score_delta=score_delta,
+                    early_score=early_score,
+                    pressure_gap=pressure_gap,
+                )
+                if not validation["valid"]:
+                    continue
+
+                direction = str(validation["direction"])
+                price_pct = float(validation["price_pct"])
+                price_source = str(validation["price_source"])
+                if previous_price > 0:
                     price_delta = current_option - previous_price
-                    price_pct = (price_delta / previous_price) * 100.0
-                    direction = "UP" if price_delta > 0.005 else ("DOWN" if price_delta < -0.005 else "FLAT")
-                    direction_source = "SCAN LTP"
                 else:
                     price_delta = daily_delta
-                    price_pct = (price_delta / current_option) * 100.0 if current_option > 0 else 0.0
-                    direction = "UP" if price_delta > 0.005 else ("DOWN" if price_delta < -0.005 else "FLAT")
-                    direction_source = "FYERS CHANGE"
 
                 movement_bias = f"{side} {direction}"
 
@@ -4839,6 +4968,7 @@ def _movement_search_one(
                     row,
                     reversal_level=reversal_level,
                     reversal_status=reversal_status,
+                    side=side,
                 )
 
                 rows.append({
@@ -4853,37 +4983,70 @@ def _movement_search_one(
                     "Price Reversal": levels["Price Reversal"],
                     "Reversal Status": levels["Reversal Status"],
                     "Score": round(score, 1),
-                    "Early Score": round(_pin_num(row.get("early_movement_score")), 1),
+                    "Early Score": round(early_score, 1),
                     "CE Score": round(ce_score, 1),
                     "PE Score": round(pe_score, 1),
                     "Movement Bias": movement_bias,
                     "Price Delta": round(price_delta, 4),
                     "Price Change %": round(price_pct, 2),
-                    "Price Direction Source": direction_source,
+                    "Price Direction Source": price_source,
+                    "Signal Validation": validation["reason"],
                     "CE Price": round(_pin_num(row.get("ce_ltp"), 0.0), 4),
                     "PE Price": round(_pin_num(row.get("pe_ltp"), 0.0), 4),
                     "Early Status": str(row.get("early_movement_status", "WAIT")),
-                    "Rising Scans": int(_pin_num(row.get("movement_rising_scans"), 0)),
-                    "Score Delta": round(_pin_num(row.get("movement_score_delta")), 1),
+                    "Rising Scans": rising_scans,
+                    "Score Delta": round(score_delta, 1),
                     "Confidence": round(_pin_num(row.get("early_movement_confidence")), 1),
                     "Spot": round(spot, 2) if spot else 0.0,
                     "Source": result.get("source", "UNKNOWN"),
                 })
                 continue
 
-            # ORIGINAL selected-search behavior: CE/UP only.
+            # SELECTED SEARCH: keep the existing CE/UP score engine,
+            # but require actual CE premium movement + side separation.
             if ce_score < threshold:
                 continue
-            if ce_score <= pe_score + 7.0:
+            if ce_score <= pe_score + MOVEMENT_SIGNAL_MIN_SIDE_GAP:
                 continue
 
             current_ce = _pin_num(row.get("ce_ltp"), 0.0)
+            previous_ce = 0.0
             movement_history = st.session_state.get(MOVEMENT_HISTORY_KEY, {})
+            hkey = _movement_history_key(symbol, expiry, strike)
+            series = movement_history.get(hkey, []) if isinstance(movement_history, dict) else []
+            if series:
+                prior_prices = [
+                    _pin_num(x.get("ce_price"), 0.0)
+                    for x in series[:-1]
+                    if _pin_num(x.get("ce_price"), 0.0) > 0
+                ]
+                previous_ce = prior_prices[-1] if prior_prices else 0.0
+
+            validation = _movement_signal_validation(
+                score=ce_score,
+                other_score=pe_score,
+                current_price=current_ce,
+                previous_price=previous_ce,
+                daily_change=_pin_num(row.get("ce_change"), 0.0),
+                rising_scans=int(_pin_num(row.get("movement_rising_scans"), 0)),
+                score_delta=_pin_num(row.get("movement_score_delta"), 0.0),
+                early_score=_pin_num(row.get("early_movement_score"), 0.0),
+                pressure_gap=(
+                    _pin_num(row.get("buy_pressure"), 50.0)
+                    - _pin_num(row.get("sell_pressure"), 50.0)
+                ),
+            )
+            if not validation["valid"] or validation["direction"] != "UP":
+                continue
+
             reversal_level, reversal_status = _movement_price_reversal_from_history(
-                movement_history, symbol, expiry, strike, current_ce, lookback=5
+                movement_history, symbol, expiry, strike, current_ce, lookback=5, side="CE"
             )
             levels = _movement_trade_levels(
-                row, reversal_level=reversal_level, reversal_status=reversal_status
+                row,
+                reversal_level=reversal_level,
+                reversal_status=reversal_status,
+                side="CE",
             )
             rows.append({
                 "Instrument": symbol,
@@ -4901,6 +5064,15 @@ def _movement_search_one(
                 "CE Score": round(ce_score, 1),
                 "PE Score": round(pe_score, 1),
                 "Movement Bias": "CE UP",
+                "Price Delta": round(
+                    current_ce - previous_ce if previous_ce > 0
+                    else _pin_num(row.get("ce_change"), 0.0), 4
+                ),
+                "Price Change %": round(float(validation["price_pct"]), 2),
+                "Price Direction Source": str(validation["price_source"]),
+                "Signal Validation": str(validation["reason"]),
+                "CE Price": round(current_ce, 4),
+                "PE Price": round(_pin_num(row.get("pe_ltp"), 0.0), 4),
                 "Early Status": str(row.get("early_movement_status", "WAIT")),
                 "Rising Scans": int(_pin_num(row.get("movement_rising_scans"), 0)),
                 "Score Delta": round(_pin_num(row.get("movement_score_delta")), 1),
@@ -5361,9 +5533,23 @@ def _decorate_live_big_movement_rows(
         event_key = f"{symbol}|{strike:.4f}|{selected_side}"
         event = events.get(event_key)
 
+        selected_pct = ce_pct if selected_side == "CE" else pe_pct
+        selected_score_delta = ce_score_delta if selected_side == "CE" else pe_score_delta
+        selected_rising = ce_rising if selected_side == "CE" else pe_rising
+
+        big_confirmed = (
+            len(series) >= 2
+            and current_score >= BIG_MOVEMENT_SCAN_MIN_SCORE
+            and selected_pct >= BIG_MOVEMENT_CONFIRM_MIN_PRICE_PCT
+            and (
+                selected_score_delta >= BIG_MOVEMENT_CONFIRM_MIN_SCORE_DELTA
+                or selected_rising >= 1
+            )
+        )
+
         if len(series) < 2:
             live_phase = "BASELINE"
-        elif current_score >= BIG_MOVEMENT_SCAN_MIN_SCORE:
+        elif big_confirmed:
             prior_score = (
                 _pin_num(
                     series[-2].get("ce_score" if selected_side == "CE" else "pe_score"),
@@ -5602,7 +5788,7 @@ def _render_big_movement_scan(
         "Score", "CE Score", "PE Score", "CE Score Δ", "PE Score Δ",
         "Movement Bias", "CE Price", "PE Price", "CE Price Δ%", "PE Price Δ%",
         "CE Rising", "PE Rising", "Price Delta", "Price Change %",
-        "Price Direction Source", "Early Score", "Early Status",
+        "Price Direction Source", "Signal Validation", "Early Score", "Early Status",
         "Rising Scans", "Score Delta", "Confidence", "Spot", "Source",
     ]
     view = out[[c for c in show_cols if c in out.columns]].copy()
