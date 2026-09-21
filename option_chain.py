@@ -4510,13 +4510,6 @@ def _movement_price_reversal_from_history(
 MOVEMENT_SEARCH_MIN_SCORE = 70.0
 MOVEMENT_SEARCH_MAX_ROWS = 12
 
-# ADDITIVE BIG-MOVEMENT SCANNER
-# Existing movement engine is not changed. This scanner only filters the
-# existing CE/PE movement scores and displays the strongest strikes.
-BIG_MOVEMENT_SCAN_MIN_SCORE = 78.0
-BIG_MOVEMENT_SCAN_MAX_ROWS_INDEX = 60
-BIG_MOVEMENT_SCAN_MAX_ROWS_FNO = 100
-
 # Liquid F&O universe used by the optional TOTAL F&O scan.
 MOVEMENT_FNO_UNIVERSE = [
     "RELIANCE", "HDFCBANK", "ICICIBANK", "SBIN", "AXISBANK",
@@ -5203,164 +5196,6 @@ def _render_total_fno_movement_search(
     st.info(compact)
 
 
-
-def _render_big_movement_scan(
-    fyers: Any,
-    scan_type: str,
-    strike_count: int = 40,
-) -> None:
-    """
-    ADDITIVE BIG-MOVEMENT REPORT.
-
-    Does not modify the existing movement engine or selected-search report.
-    Reuses _movement_search_one(..., side_mode="BOTH") so CE and PE are
-    compared at the same strike. Only strikes whose stronger CE/PE score
-    reaches BIG_MOVEMENT_SCAN_MIN_SCORE are displayed.
-    """
-    is_index_scan = str(scan_type).upper() == "INDEX"
-    title = (
-        "🚨 BIG MOVEMENT — INDEX CE / PE"
-        if is_index_scan
-        else "🚨 BIG MOVEMENT — F&O CE / PE"
-    )
-    universe = list(INDEX_SYMBOLS.keys()) if is_index_scan else list(MOVEMENT_FNO_UNIVERSE)
-    max_rows = (
-        BIG_MOVEMENT_SCAN_MAX_ROWS_INDEX
-        if is_index_scan
-        else BIG_MOVEMENT_SCAN_MAX_ROWS_FNO
-    )
-
-    st.markdown(
-        f'<div class="block-title">{title}</div>',
-        unsafe_allow_html=True,
-    )
-    st.caption(
-        f"Showing only existing movement-engine strikes with CE or PE score "
-        f"≥ {BIG_MOVEMENT_SCAN_MIN_SCORE:.0f}. CE/PE is selected at the SAME strike; "
-        "Direction is based on the selected option-premium movement."
-    )
-
-    if not universe:
-        st.info("No symbols configured for this scan.")
-        return
-
-    rows: list[dict[str, Any]] = []
-    errors: list[str] = []
-    progress = st.progress(0.0)
-
-    for i, symbol in enumerate(universe, start=1):
-        try:
-            # SENSEX/BANKEX-type BSE index chains need FYERS.
-            if is_index_scan and fyers is None and symbol in NSE_UNSUPPORTED_INDICES:
-                errors.append(f"{symbol}: FYERS required")
-                progress.progress(i / max(len(universe), 1))
-                continue
-
-            one = _movement_search_one(
-                fyers,
-                symbol,
-                is_index_scan,
-                strike_count=max(40, int(strike_count)),
-                side_mode="BOTH",
-                min_score=BIG_MOVEMENT_SCAN_MIN_SCORE,
-            )
-            if not one.empty:
-                rows.extend(one.to_dict("records"))
-        except Exception as exc:
-            errors.append(f"{symbol}: {type(exc).__name__}: {exc}")
-            logger.warning("Big movement scan failed for %s: %s", symbol, exc)
-
-        progress.progress(i / max(len(universe), 1))
-
-    progress.empty()
-
-    if not rows:
-        st.warning(
-            f"No BIG MOVEMENT CE/PE strike reached "
-            f"{BIG_MOVEMENT_SCAN_MIN_SCORE:.0f}+ in the current scan."
-        )
-        if errors:
-            st.caption("Scan notes: " + " | ".join(errors[:12]))
-        return
-
-    out = pd.DataFrame(rows)
-
-    # Keep the strongest strike-side candidates first and remove duplicates.
-    sort_cols = [c for c in ["Score", "Early Score", "Instrument", "Strike"] if c in out.columns]
-    if sort_cols:
-        ascending = [False, False, True, True][:len(sort_cols)]
-        out = out.sort_values(sort_cols, ascending=ascending)
-
-    out = out.drop_duplicates(
-        subset=[c for c in ["Instrument", "Strike"] if c in out.columns],
-        keep="first",
-    ).head(max_rows).reset_index(drop=True)
-
-    st.success(
-        f"🚨 BIG MOVEMENT FOUND: {len(out)} strike(s) — "
-        f"Index={is_index_scan} | Threshold={BIG_MOVEMENT_SCAN_MIN_SCORE:.0f}+"
-    )
-
-    # Compact top-alert cards: strike + selected CE/PE + direction.
-    top_cards = out.head(min(5, len(out)))
-    card_cols = st.columns(max(1, len(top_cards)))
-    for col, (_, r) in zip(card_cols, top_cards.iterrows()):
-        side = str(r.get("Option", "—"))
-        direction = str(r.get("Direction", "—"))
-        score = _pin_num(r.get("Score"), 0.0)
-        strike = _pin_num(r.get("Strike"), 0.0)
-        ce_price = _pin_num(r.get("CE Price"), 0.0)
-        pe_price = _pin_num(r.get("PE Price"), 0.0)
-        text = (
-            f"{side} {direction} | {score:.0f}/100<br>"
-            f"Strike {strike:,.0f}<br>"
-            f"CE ₹{ce_price:.2f} | PE ₹{pe_price:.2f}"
-        )
-        col.markdown(
-            f'<div style="padding:10px;border:1px solid {BORDER_COLOR};'
-            f'border-radius:8px;margin-bottom:8px;">{text}</div>',
-            unsafe_allow_html=True,
-        )
-
-    show_cols = [
-        "Instrument", "Strike", "Option", "Direction", "Status",
-        "Score", "CE Score", "PE Score", "Movement Bias",
-        "CE Price", "PE Price", "Price Delta", "Price Change %",
-        "Price Direction Source", "Early Score", "Early Status",
-        "Rising Scans", "Score Delta", "Confidence", "Spot", "Source",
-    ]
-    view = out[[c for c in show_cols if c in out.columns]].copy()
-
-    if "Strike" in view.columns:
-        view["Strike"] = pd.to_numeric(view["Strike"], errors="coerce").map(
-            lambda x: f"{x:,.0f}" if pd.notna(x) else "—"
-        )
-    for col in ("CE Price", "PE Price", "Spot"):
-        if col in view.columns:
-            view[col] = pd.to_numeric(view[col], errors="coerce").map(
-                lambda x: f"₹{x:,.2f}" if pd.notna(x) and x else "—"
-            )
-
-    st.dataframe(view, use_container_width=True, hide_index=True)
-
-    excel_buf = _movement_search_excel(
-        out,
-        "BIG Movement Index CE PE" if is_index_scan else "BIG Movement F&O CE PE",
-    )
-    st.download_button(
-        "📥 Download BIG Movement CE/PE Excel",
-        data=excel_buf,
-        file_name=(
-            "big_movement_index_ce_pe_"
-            if is_index_scan
-            else "big_movement_fno_ce_pe_"
-        ) + f"{datetime.now().strftime('%H%M%S')}.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        use_container_width=True,
-        key="big_movement_excel_index" if is_index_scan else "big_movement_excel_fno",
-    )
-
-
 def _render_movement_search_sidebar() -> dict:
     """
     New sidebar controls only. Existing _sidebar_config() is untouched.
@@ -5401,18 +5236,6 @@ def _render_movement_search_sidebar() -> dict:
 
         total_index_clicked = False
         total_fno_clicked = False
-        big_index_clicked = st.button(
-            "🚨 BIG MOVEMENT INDEX CE/PE",
-            key="oc_big_index_scan_button",
-            use_container_width=True,
-            help="Show only strong CE/PE movement strikes across indexes.",
-        )
-        big_fno_clicked = st.button(
-            "🚨 BIG MOVEMENT F&O CE/PE",
-            key="oc_big_fno_scan_button",
-            use_container_width=True,
-            help="Show only strong CE/PE movement strikes across configured F&O stocks.",
-        )
 
         if search_mode == "Index Search":
             total_index_clicked = st.button(
@@ -5434,8 +5257,6 @@ def _render_movement_search_sidebar() -> dict:
         "search_clicked": search_clicked,
         "total_index_clicked": total_index_clicked,
         "total_fno_clicked": total_fno_clicked,
-        "big_index_clicked": big_index_clicked,
-        "big_fno_clicked": big_fno_clicked,
     }
 
 
@@ -5474,13 +5295,6 @@ def run_dashboard(fyers: Any = None) -> None:
 
     if movement_search_cfg.get("total_fno_clicked"):
         _render_total_fno_movement_search(fyers, strike_count=40)
-
-    # ADDITIVE BIG-MOVEMENT REPORTS — old scanner/report logic remains untouched.
-    if movement_search_cfg.get("big_index_clicked"):
-        _render_big_movement_scan(fyers, "INDEX", strike_count=40)
-
-    if movement_search_cfg.get("big_fno_clicked"):
-        _render_big_movement_scan(fyers, "FNO", strike_count=40)
 
     cfg["fetch_clicked"] = bool(cfg.get("fetch_clicked") or run_clicked or refresh_clicked)
     if run_clicked or refresh_clicked:
