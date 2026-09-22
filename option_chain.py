@@ -4813,6 +4813,46 @@ def _apply_validated_reversal_additive(
 # ============================================================
 
 
+
+# ============================================================
+# ADDITIVE MOVEMENT PROJECTION LAYER
+# OLD MOVEMENT / PIN / ORDER-BLOCK LOGIC IS NOT REPLACED.
+# ============================================================
+def _calculate_movement_projection_additive(current_price, price_history=None, direction="WAIT", score=0, score_delta=0, rising_scans=0, confidence=0):
+    """Estimate movement range from observed premium history; not a guarantee."""
+    try:
+        cur=float(current_price or 0)
+        if cur<=0: return {"expected_target_1":0.0,"expected_target_2":0.0,"expected_extension":0.0,"invalidation_price":0.0,"move_strength":"WAIT","continuation":"WAIT","exhaustion":"LOW"}
+        hist=[]
+        for x in (price_history or []):
+            try:
+                v=float(x)
+                if v>0: hist.append(v)
+            except Exception: pass
+        changes=[abs(b-a)/a for a,b in zip(hist[-6:-1],hist[-5:]) if a>0]
+        avg_change=max(0.003,min(sum(changes)/len(changes) if changes else 0.01,0.08))
+        s=float(score or 0); sd=float(score_delta or 0); rs=int(float(rising_scans or 0)); cf=float(confidence or 0)
+        pts=min(s,100)*.45+min(max(sd,0),15)*1.5+min(rs,4)*6+min(max(cf,0),95)*.20
+        if pts>=75: strength,mult="STRONG",1.50
+        elif pts>=58: strength,mult="PRE-MOVE",1.20
+        elif pts>=42: strength,mult="BUILDING",.90
+        else: strength,mult="WEAK",.60
+        d=str(direction or "WAIT").upper(); d=d if d in {"UP","DOWN"} else "WAIT"
+        move1=max(cur*avg_change*mult,cur*.005); move2=move1*1.65; ext=move2*1.35
+        if d=="UP": t1,t2,ex=cur+move1,cur+move2,cur+ext; inv=cur-max(move1*.65,cur*.004)
+        elif d=="DOWN": t1,t2,ex=max(cur-move1,0),max(cur-move2,0),max(cur-ext,0); inv=cur+max(move1*.65,cur*.004)
+        else: t1=t2=ex=inv=cur
+        exhaustion="HIGH" if len(changes)>=3 and changes[-1]>changes[-2]*1.8 else ("MEDIUM" if len(changes)>=2 and changes[-1]>changes[-2]*1.35 else "LOW")
+        continuation="WAIT"
+        if d in {"UP","DOWN"}: continuation="LIKELY CONTINUATION" if rs>=2 and sd>0 and strength in {"PRE-MOVE","STRONG"} else ("BUILDING" if rs>=1 and sd>=0 else "UNCONFIRMED")
+        return {"expected_target_1":round(t1,2),"expected_target_2":round(t2,2),"expected_extension":round(ex,2),"invalidation_price":round(inv,2),"move_strength":strength,"continuation":continuation,"exhaustion":exhaustion}
+    except Exception:
+        return {"expected_target_1":0.0,"expected_target_2":0.0,"expected_extension":0.0,"invalidation_price":0.0,"move_strength":"WAIT","continuation":"WAIT","exhaustion":"LOW"}
+
+# ============================================================
+# END ADDITIVE MOVEMENT PROJECTION LAYER
+# ============================================================
+
 def _movement_search_one(
     fyers: Any,
     symbol: str,
