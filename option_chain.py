@@ -4645,6 +4645,174 @@ def _movement_search_excel(df: pd.DataFrame, report_name: str = "Movement Search
     return buf
 
 
+
+# ============================================================
+# ADDITIVE MOVEMENT VALIDATION LAYER
+# OLD MOVEMENT ENGINE IS NOT REMOVED OR REWRITTEN.
+# Purpose:
+#   1) reduce score-only false signals
+#   2) validate direction using actual option premium movement
+#   3) identify BUILDING / PRE-MOVE before strong movement
+#   4) keep CE and PE direction separate
+# ============================================================
+def _validate_movement_signal_additive(
+    row,
+    price_delta=None,
+    price_pct=None,
+    price_direction=None,
+):
+    """Validate the existing movement score without replacing it."""
+    try:
+        score = float(row.get("movement_score", 0) or 0)
+        ce_score = float(row.get("ce_movement_score", 0) or 0)
+        pe_score = float(row.get("pe_movement_score", 0) or 0)
+        early = float(row.get("early_score", 0) or 0)
+        rising = int(float(row.get("rising_scans", 0) or 0))
+        score_delta = float(row.get("score_delta", 0) or 0)
+
+        if price_delta is None:
+            price_delta = row.get("price_delta")
+        if price_pct is None:
+            price_pct = row.get("price_change_pct")
+        if price_direction is None:
+            price_direction = row.get("price_direction")
+
+        try:
+            pd = float(price_delta or 0)
+        except Exception:
+            pd = 0.0
+        try:
+            pp = float(price_pct or 0)
+        except Exception:
+            pp = 0.0
+
+        pdir = str(price_direction or "").upper().strip()
+        if pdir not in {"UP", "DOWN", "FLAT"}:
+            pdir = "FLAT" if abs(pd) < 1e-9 else ("UP" if pd > 0 else "DOWN")
+
+        score_gap = abs(ce_score - pe_score)
+        score_side = "UP" if ce_score > pe_score + 7 else (
+            "DOWN" if pe_score > ce_score + 7 else "BOTH"
+        )
+
+        # A score alone is never enough to call a confirmed movement.
+        price_confirmed = (
+            (pdir == "UP" and pd > 0) or
+            (pdir == "DOWN" and pd < 0)
+        )
+
+        # Early/pre-move requires some developing evidence.
+        building_evidence = (
+            score_delta > 0.5 or
+            rising >= 1 or
+            early >= 55
+        )
+
+        # Strong movement needs score + price confirmation.
+        strong_confirmed = (
+            score >= 78 and
+            price_confirmed and
+            score_gap >= 7 and
+            (rising >= 1 or score_delta >= 1.5 or early >= 70)
+        )
+
+        # Pre-move can appear before a large price change, but must not be
+        # generated when price is already moving against the selected side.
+        premove_confirmed = (
+            score >= 55 and
+            early >= 55 and
+            building_evidence and
+            score_delta >= 0 and
+            (pdir == "FLAT" or price_confirmed)
+        )
+
+        if strong_confirmed:
+            status = "STRONG MOVEMENT"
+        elif premove_confirmed:
+            status = "PRE-MOVE"
+        elif building_evidence and score >= 50:
+            status = "BUILDING"
+        else:
+            status = "WAIT"
+
+        # Direction is based on actual premium movement when available.
+        # Never convert CE/PE score directly into price direction.
+        if price_confirmed:
+            final_direction = pdir
+            direction_source = "OPTION PREMIUM PRICE"
+        else:
+            final_direction = "WAIT"
+            direction_source = "NO PRICE CONFIRMATION"
+
+        # If score says one side but price is moving opposite, block it.
+        if score_side != "BOTH" and final_direction != "WAIT":
+            if score_side != final_direction and abs(score_delta) < 3:
+                final_direction = "WAIT"
+                direction_source = "SCORE/PRICE CONFLICT"
+
+        confidence = 35.0
+        confidence += min(score, 100.0) * 0.25
+        confidence += min(max(early, 0.0), 100.0) * 0.20
+        confidence += min(rising, 4) * 5.0
+        confidence += min(abs(pp), 5.0) * 2.0
+        if price_confirmed:
+            confidence += 10.0
+        if score_side == final_direction and final_direction != "WAIT":
+            confidence += 5.0
+        if final_direction == "WAIT":
+            confidence -= 15.0
+        confidence = max(0.0, min(95.0, confidence))
+
+        out = dict(row)
+        out["validated_status"] = status
+        out["validated_direction"] = final_direction
+        out["direction_source"] = direction_source
+        out["price_confirmed"] = bool(price_confirmed)
+        out["movement_signal_valid"] = bool(
+            status in {"PRE-MOVE", "STRONG MOVEMENT"} and
+            final_direction != "WAIT"
+        )
+        out["validated_confidence"] = round(confidence, 1)
+        out["score_price_conflict"] = bool(
+            score_side != "BOTH" and
+            price_confirmed and
+            score_side != final_direction
+        )
+        return out
+    except Exception:
+        return dict(row)
+
+
+def _apply_validated_reversal_additive(
+    current_price,
+    previous_price=None,
+    previous_previous_price=None,
+):
+    """Reversal based on the same option premium, not strike price."""
+    try:
+        cur = float(current_price or 0)
+        prev = float(previous_price or 0)
+        prev2 = float(previous_previous_price or 0)
+        if cur <= 0 or prev <= 0:
+            return "WAIT"
+
+        if prev2 > 0:
+            d1 = prev - prev2
+            d2 = cur - prev
+            if d1 > 0 and d2 < 0:
+                return "REVERSAL NOW"
+            if d1 < 0 and d2 > 0:
+                return "REVERSAL NOW"
+
+        return "NORMAL"
+    except Exception:
+        return "WAIT"
+
+# ============================================================
+# END ADDITIVE MOVEMENT VALIDATION LAYER
+# ============================================================
+
+
 def _movement_search_one(
     fyers: Any,
     symbol: str,
