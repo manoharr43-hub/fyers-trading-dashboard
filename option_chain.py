@@ -146,8 +146,6 @@ SCALP_EARLY_SCORE_THRESHOLD = 70.0
 
 # MOVEMENT-BEFORE-IT-HAPPENS HISTORY
 MOVEMENT_HISTORY_KEY = "oc_movement_history"
-DIRECTIONAL_SCAN_HISTORY_KEY = "oc_directional_scan_history"
-DIRECTIONAL_SCAN_HISTORY_MAX = 30
 MOVEMENT_HISTORY_MAX = 60
 MOVEMENT_EARLY_THRESHOLD = 65.0
 MOVEMENT_STRONG_THRESHOLD = 78.0
@@ -2344,7 +2342,7 @@ def compute_movement_early_warning(
             continue
         key = _movement_history_key(symbol, expiry_label, strike)
         series = history.get(key, [])
-        snapshot = {
+        series.append({
             "ts": now,
             "score": float(row.get("movement_score", 0) or 0),
             "ce_score": float(row.get("ce_movement_score", 0) or 0),
@@ -2358,25 +2356,7 @@ def compute_movement_early_warning(
             "spot": float(spot or 0),
             "ce_price": float(row.get("ce_ltp", 0) or 0),
             "pe_price": float(row.get("pe_ltp", 0) or 0),
-        }
-
-        # Prevent duplicate Streamlit reruns from creating a fake second scan.
-        if series:
-            last = series[-1]
-            same_scan = (
-                _pin_num(last.get("spot"), 0.0) == snapshot["spot"]
-                and _pin_num(last.get("ce_price"), 0.0) == snapshot["ce_price"]
-                and _pin_num(last.get("pe_price"), 0.0) == snapshot["pe_price"]
-                and _pin_num(last.get("score"), 0.0) == snapshot["score"]
-                and _pin_num(last.get("ce_score"), 0.0) == snapshot["ce_score"]
-                and _pin_num(last.get("pe_score"), 0.0) == snapshot["pe_score"]
-            )
-            if same_scan:
-                series[-1] = snapshot
-            else:
-                series.append(snapshot)
-        else:
-            series.append(snapshot)
+        })
         history[key] = series[-MOVEMENT_HISTORY_MAX:]
 
     st.session_state[MOVEMENT_HISTORY_KEY] = history
@@ -4732,20 +4712,21 @@ def _directional_confirmation_additive(
     ce_daily_change: float = 0.0,
     pe_daily_change: float = 0.0,
 ) -> dict[str, Any]:
-    """Additive scan-to-scan directional confirmation.
+    """Additive directional confirmation using the existing movement history.
 
-    This uses a dedicated lightweight history so CE/PE scan deltas are based
-    on the previous completed scanner snapshot, not on the movement engine's
-    internal write order.  Existing movement history and reports are kept.
+    The movement engine already stores a snapshot for every strike.  Reuse that
+    same history instead of maintaining a second independent history.  This
+    prevents the previous implementation from staying at WAIT HISTORY when the
+    scanner is repeatedly refreshed.
     """
     spot = _pin_num(spot, 0.0)
     ce_price = _pin_num(ce_price, 0.0)
     pe_price = _pin_num(pe_price, 0.0)
 
-    history = st.session_state.setdefault(DIRECTIONAL_SCAN_HISTORY_KEY, {})
+    history = st.session_state.get(MOVEMENT_HISTORY_KEY, {})
     key = _movement_history_key(symbol, expiry, strike)
     series = history.get(key, []) if isinstance(history, dict) else []
-    prev = series[-1] if series else None
+    prev = series[-2] if len(series) >= 2 else None
 
     def _dir(cur: float, old: float, fallback: float = 0.0) -> tuple[str, str, float]:
         if cur > 0 and old > 0:
@@ -4756,9 +4737,6 @@ def _directional_confirmation_additive(
                 return "DOWN", "SCAN LTP", pct
             return "FLAT", "SCAN LTP", pct
         if fallback > 0.005:
-            # FYERS daily change can be very large relative to a tiny option
-            # premium. It is valid for direction fallback, but it is NOT a
-            # scan-to-scan delta because no previous scan LTP exists yet.
             return "UP", "FYERS CHANGE", 0.0
         if fallback < -0.005:
             return "DOWN", "FYERS CHANGE", 0.0
@@ -4795,19 +4773,9 @@ def _directional_confirmation_additive(
     previous_aligned = previous_bias in {"UP", "DOWN"}
     aligned_now = directional_bias in {"UP", "DOWN"}
 
-    option_bias = ""
-    if ce_dir == "UP" and pe_dir in {"DOWN", "FLAT"}:
-        option_bias = "UP"
-    elif pe_dir == "UP" and ce_dir in {"DOWN", "FLAT"}:
-        option_bias = "DOWN"
-
-    rising_basis = directional_bias if aligned_now else option_bias
-    previous_rising_basis = str(prev.get("directional_rising_basis", "")) if prev else ""
-    previous_rising = int(prev.get("directional_rising_scans", 0) or 0) if prev else 0
-
-    if rising_basis in {"UP", "DOWN"} and previous_rising_basis == rising_basis:
-        rising = previous_rising + 1
-    elif rising_basis in {"UP", "DOWN"}:
+    if aligned_now and previous_aligned and previous_bias == directional_bias:
+        rising = int(prev.get("directional_rising_scans", 0) or 0) + 1
+    elif aligned_now:
         rising = 1
     else:
         rising = 0
@@ -4827,36 +4795,6 @@ def _directional_confirmation_additive(
     if validation == "CONFIRMED":
         reason += f"; {rising} consecutive matching scans"
 
-    # Save the completed directional snapshot.  If the same prices are seen
-    # again during a Streamlit rerun, replace the last snapshot instead of
-    # falsely counting that rerun as a new scan.
-    snapshot = {
-        "ts": _india_now(),
-        "spot": spot,
-        "ce_price": ce_price,
-        "pe_price": pe_price,
-        "directional_bias": directional_bias,
-        "directional_rising_basis": rising_basis,
-        "directional_rising_scans": rising,
-        "ce_direction": ce_dir,
-        "pe_direction": pe_dir,
-    }
-    if series:
-        last = series[-1]
-        same_scan = (
-            _pin_num(last.get("spot"), 0.0) == spot
-            and _pin_num(last.get("ce_price"), 0.0) == ce_price
-            and _pin_num(last.get("pe_price"), 0.0) == pe_price
-        )
-        if same_scan:
-            series[-1] = snapshot
-        else:
-            series.append(snapshot)
-    else:
-        series.append(snapshot)
-    history[key] = series[-DIRECTIONAL_SCAN_HISTORY_MAX:]
-    st.session_state[DIRECTIONAL_SCAN_HISTORY_KEY] = history
-
     return {
         "underlying_direction": underlying,
         "underlying_direction_source": underlying_source,
@@ -4868,7 +4806,6 @@ def _directional_confirmation_additive(
         "signal_valid": signal_valid,
         "false_signal_reason": reason,
         "directional_bias": directional_bias,
-        "directional_rising_basis": rising_basis,
         "directional_rising_scans": rising,
         "ce_scan_delta": round(ce_delta_pct, 4),
         "pe_scan_delta": round(pe_delta_pct, 4),
@@ -5045,7 +4982,6 @@ def _movement_search_one(
                 validation = _directional_confirmation_additive(
                     symbol, expiry, strike, spot, ce_price, pe_price, ce_daily, pe_daily
                 )
-
                 directional_bias = validation["directional_bias"]
                 # Displayed Direction is the confirmed/underlying relationship,
                 # not simply the selected option premium direction.
@@ -5093,7 +5029,7 @@ def _movement_search_one(
                     "PE Direction": validation["pe_direction"],
                     "PE Direction Source": validation["pe_direction_source"],
                     "Signal Validation": validation["signal_validation"],
-                    "Signal Valid": "YES" if validation["signal_valid"] == "YES" else "NO",
+                    "Signal Valid": "YES" if validation["signal_valid"] else "NO",
                     "False Signal Reason": validation["false_signal_reason"],
                     "Directional Bias": directional_bias,
                     "Directional Rising Scans": validation["directional_rising_scans"],
@@ -5644,11 +5580,39 @@ def _decorate_live_big_movement_rows(
                 return value.astimezone(INDIA_TZ).strftime("%H:%M:%S")
             return "—"
 
+        # ADDITIVE: make BIG-MOVE identification explicit in the report.
+        # Existing Live Phase / movement logic is preserved unchanged.
+        if live_phase == "BIG MOVEMENT CONFIRMED":
+            big_move_status = "BIG MOVE CONFIRMED"
+        elif live_phase == "BIG MOVEMENT":
+            big_move_status = "BIG MOVE"
+        elif live_phase == "PRE-MOVE":
+            big_move_status = "PRE-MOVE BUILDING"
+        elif live_phase == "BUILDING":
+            big_move_status = "BUILDING"
+        elif live_phase == "BASELINE":
+            big_move_status = "BASELINE"
+        else:
+            big_move_status = "WAIT"
+
+        # Selected option tells which side actually crossed the movement score.
+        if selected_side in ("CE", "PE"):
+            big_move_side = selected_side if current_score >= BIG_MOVEMENT_SCAN_MIN_SCORE else pre_side
+        else:
+            big_move_side = pre_side if pre_side != "WAIT" else "WAIT"
+
+        # A compact strength value for sorting/quick observation.  It does not
+        # replace the existing movement score.
+        big_move_strength = max(ce_strength, pe_strength)
+
         r = row.to_dict()
         r.update({
             "Baseline Time": _fmt_ts(baseline_ts),
             "Pre-Move Time": _fmt_ts(premove_event.get("ts")),
             "Live Phase": live_phase,
+            "BIG MOVE STATUS": big_move_status,
+            "BIG MOVE SIDE": big_move_side,
+            "BIG MOVE STRENGTH": round(big_move_strength, 1),
             "Pre-Move Side": pre_side,
             "CE Price Δ%": round(ce_pct, 2),
             "PE Price Δ%": round(pe_pct, 2),
