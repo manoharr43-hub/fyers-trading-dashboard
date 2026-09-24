@@ -2296,13 +2296,11 @@ def _movement_history_key(symbol: str, expiry_label: str, strike: float) -> str:
     return f"{symbol}|{expiry_label}|{float(strike):.4f}"
 
 
-def _movement_underlying_direction_from_series(series: list[dict[str, Any]]) -> tuple[str, float, float]:
+def _movement_underlying_direction_from_series(
+    series: list[dict[str, Any]],
+) -> tuple[str, float, float]:
     """
     ADDITIVE ONLY: derive underlying/index direction from repeated spot scans.
-    Returns (direction, delta, pct).
-
-    This prevents CE/PE premium movement from being treated as an underlying
-    directional signal when the index/F&O underlying is moving the other way.
     """
     try:
         spots = [
@@ -2317,14 +2315,120 @@ def _movement_underlying_direction_from_series(series: list[dict[str, Any]]) -> 
         cur = float(spots[-1])
         delta = cur - prev
         pct = (delta / prev) * 100.0 if prev else 0.0
-
-        # Small spot noise is treated as FLAT.
         noise = max(abs(prev) * 0.00005, 0.01)
+
         if abs(delta) <= noise:
             return "FLAT", delta, pct
         return ("UP" if delta > 0 else "DOWN"), delta, pct
     except Exception:
         return "UNKNOWN", 0.0, 0.0
+
+
+def _movement_underlying_direction_from_quote(
+    fyers: Any,
+    symbol: str,
+    is_index: bool,
+    current_spot: float = 0.0,
+) -> tuple[str, float, float, str]:
+    """
+    ADDITIVE FIRST-SCAN FALLBACK.
+
+    If session history has only one scan, use the live FYERS quote change
+    for the underlying. This prevents UNKNOWN on every first scan.
+    """
+    try:
+        candidates = (
+            _fyers_index_candidates(symbol)
+            if is_index
+            else fyers_stock_symbol_candidates(symbol)
+        )
+
+        for quote_symbol in candidates:
+            try:
+                q = fyers.quotes(data={"symbols": quote_symbol})
+            except Exception:
+                continue
+
+            if not isinstance(q, dict):
+                continue
+
+            data = q.get("d") or []
+            if not data or not isinstance(data[0], dict):
+                continue
+
+            v = data[0].get("v", {})
+            if not isinstance(v, dict):
+                continue
+
+            lp = _safe_num(
+                _fyers_field(v, "lp", "ltp", "last_price"),
+                current_spot,
+            )
+            change = _safe_num(
+                _fyers_field(v, "ch", "change", "net_change"),
+                0.0,
+            )
+            change_pct = _safe_num(
+                _fyers_field(v, "chp", "change_percent", "change_pct"),
+                0.0,
+            )
+
+            if abs(change) <= 0 and lp > 0 and abs(change_pct) > 0:
+                change = lp * change_pct / 100.0
+
+            if abs(change_pct) <= 0 and lp > 0 and abs(change) > 0:
+                prev = lp - change
+                if prev > 0:
+                    change_pct = change / prev * 100.0
+
+            noise = max(abs(lp or current_spot) * 0.00005, 0.01)
+            if abs(change) <= noise:
+                direction = "FLAT"
+            elif change > 0:
+                direction = "UP"
+            else:
+                direction = "DOWN"
+
+            return direction, change, change_pct, "FYERS QUOTE"
+
+        return "UNKNOWN", 0.0, 0.0, "NO QUOTE"
+
+    except Exception as exc:
+        logger.warning("Underlying quote direction failed for %s: %s", symbol, exc)
+        return "UNKNOWN", 0.0, 0.0, "NO QUOTE"
+
+
+def _movement_option_direction_with_fallback(
+    current_price: float,
+    previous_price: float,
+    daily_change: float,
+) -> tuple[str, float, float, str]:
+    """
+    ADDITIVE option direction:
+      scan-to-scan LTP first,
+      FYERS daily option change on first scan.
+    """
+    cur = _pin_num(current_price, 0.0)
+    prev = _pin_num(previous_price, 0.0)
+    daily = _pin_num(daily_change, 0.0)
+
+    if cur > 0 and prev > 0:
+        delta = cur - prev
+        pct = (delta / prev) * 100.0
+        noise = max(abs(prev) * 0.0015, 0.005)
+        if abs(delta) <= noise and abs(pct) < 0.15:
+            return "FLAT", delta, pct, "SCAN LTP"
+        return ("UP" if delta > 0 else "DOWN"), delta, pct, "SCAN LTP"
+
+    if cur > 0 and abs(daily) > 0:
+        prev_est = cur - daily
+        pct = (daily / prev_est) * 100.0 if prev_est > 0 else 0.0
+        noise = max(abs(cur) * 0.0015, 0.005)
+        if abs(daily) <= noise and abs(pct) < 0.15:
+            return "FLAT", daily, pct, "FYERS CHANGE"
+        return ("UP" if daily > 0 else "DOWN"), daily, pct, "FYERS CHANGE"
+
+    return "UNKNOWN", 0.0, 0.0, "NO OPTION HISTORY"
 
 
 def _movement_ce_pe_direction_filter(
@@ -2333,14 +2437,7 @@ def _movement_ce_pe_direction_filter(
     underlying_direction: str,
 ) -> dict[str, Any]:
     """
-    ADDITIVE CE/PE false-signal filter.
-
-    Rules:
-      CE up + PE down/flat + underlying up   => directional UP
-      PE up + CE down/flat + underlying down => directional DOWN
-      CE up + PE up                         => premium expansion / neutral
-      CE down + PE down                     => premium contraction / neutral
-      underlying conflict                   => blocked directional signal
+    ADDITIVE false-signal filter.
     """
     ce = str(ce_direction or "UNKNOWN").upper()
     pe = str(pe_direction or "UNKNOWN").upper()
@@ -2348,14 +2445,16 @@ def _movement_ce_pe_direction_filter(
 
     if ce == "UP" and pe == "UP":
         return {
-            "valid": False, "direction": "NEUTRAL",
+            "valid": False,
+            "direction": "NEUTRAL",
             "stage": "PREMIUM EXPANSION",
             "reason": "CE ↑ + PE ↑ : both-side premium expansion",
         }
 
     if ce == "DOWN" and pe == "DOWN":
         return {
-            "valid": False, "direction": "NEUTRAL",
+            "valid": False,
+            "direction": "NEUTRAL",
             "stage": "PREMIUM CONTRACTION",
             "reason": "CE ↓ + PE ↓ : both-side premium contraction",
         }
@@ -2363,18 +2462,21 @@ def _movement_ce_pe_direction_filter(
     if ce == "UP" and pe in {"DOWN", "FLAT"}:
         if und == "UP":
             return {
-                "valid": True, "direction": "UP",
+                "valid": True,
+                "direction": "UP",
                 "stage": "CONFIRMED",
                 "reason": "Underlying ↑ + CE ↑ + PE ↓/FLAT",
             }
         if und == "DOWN":
             return {
-                "valid": False, "direction": "NEUTRAL",
+                "valid": False,
+                "direction": "NEUTRAL",
                 "stage": "CONFLICT",
                 "reason": "CE ↑ / PE ↓ but underlying is DOWN",
             }
         return {
-            "valid": False, "direction": "UP",
+            "valid": False,
+            "direction": "UP",
             "stage": "EARLY WATCH",
             "reason": "CE ↑ + PE ↓/FLAT; underlying confirmation not available yet",
         }
@@ -2382,24 +2484,28 @@ def _movement_ce_pe_direction_filter(
     if pe == "UP" and ce in {"DOWN", "FLAT"}:
         if und == "DOWN":
             return {
-                "valid": True, "direction": "DOWN",
+                "valid": True,
+                "direction": "DOWN",
                 "stage": "CONFIRMED",
                 "reason": "Underlying ↓ + PE ↑ + CE ↓/FLAT",
             }
         if und == "UP":
             return {
-                "valid": False, "direction": "NEUTRAL",
+                "valid": False,
+                "direction": "NEUTRAL",
                 "stage": "CONFLICT",
                 "reason": "PE ↑ / CE ↓ but underlying is UP",
             }
         return {
-            "valid": False, "direction": "DOWN",
+            "valid": False,
+            "direction": "DOWN",
             "stage": "EARLY WATCH",
             "reason": "PE ↑ + CE ↓/FLAT; underlying confirmation not available yet",
         }
 
     return {
-        "valid": False, "direction": "NEUTRAL",
+        "valid": False,
+        "direction": "NEUTRAL",
         "stage": "WATCH",
         "reason": "CE/PE relationship is not directionally confirmed",
     }
@@ -2456,9 +2562,6 @@ def compute_movement_early_warning(
             "oi": float(abs(row.get("ce_chng_oi", 0) or 0) + abs(row.get("pe_chng_oi", 0) or 0)),
             "ce_price": float(row.get("ce_ltp", 0) or 0),
             "pe_price": float(row.get("pe_ltp", 0) or 0),
-            # ADDITIVE: underlying/index spot snapshot used only for
-            # movement-direction validation. Existing score history remains intact.
-            "spot_price": float(spot or 0),
         })
         history[key] = series[-MOVEMENT_HISTORY_MAX:]
 
@@ -4722,9 +4825,10 @@ def _movement_search_excel(df: pd.DataFrame, report_name: str = "Movement Search
         "Movement Bias", "Price Delta", "Price Change %", "Price Direction Source",
         "CE Price", "PE Price", "Early Status", "Rising Scans",
         "Score Delta", "Confidence", "Spot", "Source",
-        "Underlying Direction", "Underlying Delta", "Underlying Change %",
-        "CE Direction", "PE Direction", "Signal Validation",
-        "Signal Valid", "False Signal Reason",
+        "Underlying Direction", "Underlying Direction Source",
+        "CE Direction", "CE Direction Source",
+        "PE Direction", "PE Direction Source",
+        "Signal Validation", "Signal Valid", "False Signal Reason",
     ]
     cols = [c for c in export_cols if c in df.columns]
     export_df = df[cols].copy() if cols else df.copy()
@@ -5148,53 +5252,82 @@ def _movement_search_one(
                     direction_source = "FYERS CHANGE"
 
                 # ========================================================
-                # ADDITIVE FALSE-SIGNAL VALIDATION
-                # OLD movement score / CE score / PE score are untouched.
-                # Direction is validated against the underlying spot history.
+                # ADDITIVE CE/PE + UNDERLYING VALIDATION
                 # ========================================================
-                ce_current = _pin_num(row.get("ce_ltp"), 0.0)
-                pe_current = _pin_num(row.get("pe_ltp"), 0.0)
-                previous_ce = _pin_num(
-                    series[-2].get("ce_price"), 0.0
-                ) if len(series) >= 2 else 0.0
-                previous_pe = _pin_num(
-                    series[-2].get("pe_price"), 0.0
-                ) if len(series) >= 2 else 0.0
+                movement_history = st.session_state.get(MOVEMENT_HISTORY_KEY, {})
+                hkey = _movement_history_key(symbol, expiry, strike)
+                series = movement_history.get(hkey, []) if isinstance(movement_history, dict) else []
 
-                def _side_dir(cur, prev):
-                    if cur <= 0 or prev <= 0:
-                        return "UNKNOWN"
-                    delta = cur - prev
-                    pct = (delta / prev) * 100.0
-                    noise = max(abs(prev) * 0.0015, 0.005)
-                    if abs(delta) <= noise and abs(pct) < 0.15:
-                        return "FLAT"
-                    return "UP" if delta > 0 else "DOWN"
+                previous_ce = (
+                    _pin_num(series[-2].get("ce_price"), 0.0)
+                    if len(series) >= 2 else 0.0
+                )
+                previous_pe = (
+                    _pin_num(series[-2].get("pe_price"), 0.0)
+                    if len(series) >= 2 else 0.0
+                )
 
-                ce_direction = _side_dir(ce_current, previous_ce)
-                pe_direction = _side_dir(pe_current, previous_pe)
+                ce_direction, ce_delta, ce_pct, ce_direction_source = (
+                    _movement_option_direction_with_fallback(
+                        _pin_num(row.get("ce_ltp"), 0.0),
+                        previous_ce,
+                        _pin_num(row.get("ce_change"), 0.0),
+                    )
+                )
+                pe_direction, pe_delta, pe_pct, pe_direction_source = (
+                    _movement_option_direction_with_fallback(
+                        _pin_num(row.get("pe_ltp"), 0.0),
+                        previous_pe,
+                        _pin_num(row.get("pe_change"), 0.0),
+                    )
+                )
 
                 underlying_direction, underlying_delta, underlying_pct = (
                     _movement_underlying_direction_from_series(series)
                 )
+                underlying_source = "SCAN SPOT"
 
-                direction_filter = _movement_ce_pe_direction_filter(
-                    ce_direction, pe_direction, underlying_direction
+                if underlying_direction == "UNKNOWN":
+                    (
+                        underlying_direction,
+                        underlying_delta,
+                        underlying_pct,
+                        underlying_source,
+                    ) = _movement_underlying_direction_from_quote(
+                        fyers, symbol, is_index, spot
+                    )
+
+                validation = _movement_ce_pe_direction_filter(
+                    ce_direction,
+                    pe_direction,
+                    underlying_direction,
                 )
 
-                validation_stage = direction_filter.get("stage", "WATCH")
-                validation_reason = direction_filter.get("reason", "")
-                signal_valid = bool(direction_filter.get("valid", False))
+                validation_stage = validation.get("stage", "WATCH")
+                validation_reason = validation.get("reason", "")
+                signal_valid = bool(validation.get("valid", False))
 
-                # Do not call CE/PE simultaneous premium expansion UP or DOWN.
-                # Do not allow an option-side direction that conflicts with the
-                # underlying/index direction.
-                filtered_direction = direction_filter.get("direction", "NEUTRAL")
+                # First-scan quote/daily-change evidence is EARLY WATCH,
+                # not CONFIRMED, until scan-to-scan history is available.
+                used_fallback = (
+                    ce_direction_source != "SCAN LTP"
+                    or pe_direction_source != "SCAN LTP"
+                    or underlying_source != "SCAN SPOT"
+                )
+                if signal_valid and used_fallback:
+                    validation_stage = "EARLY WATCH"
+                    signal_valid = False
+                    validation_reason = (
+                        f"{validation_reason}; waiting for scan-to-scan confirmation"
+                    )
+
+                filtered_direction = validation.get("direction", "NEUTRAL")
                 if validation_stage in {
                     "PREMIUM EXPANSION",
                     "PREMIUM CONTRACTION",
                     "CONFLICT",
                     "WATCH",
+                    "EARLY WATCH",
                 }:
                     filtered_direction = "NEUTRAL"
 
@@ -5248,10 +5381,17 @@ def _movement_search_one(
                     "Spot": round(spot, 2) if spot else 0.0,
                     "Source": result.get("source", "UNKNOWN"),
                     "Underlying Direction": underlying_direction,
+                    "Underlying Direction Source": underlying_source,
                     "Underlying Delta": round(underlying_delta, 4),
                     "Underlying Change %": round(underlying_pct, 3),
                     "CE Direction": ce_direction,
+                    "CE Direction Source": ce_direction_source,
+                    "CE Delta": round(ce_delta, 4),
+                    "CE Change %": round(ce_pct, 2),
                     "PE Direction": pe_direction,
+                    "PE Direction Source": pe_direction_source,
+                    "PE Delta": round(pe_delta, 4),
+                    "PE Change %": round(pe_pct, 2),
                     "Signal Validation": validation_stage,
                     "Signal Valid": "YES" if signal_valid else "NO",
                     "False Signal Reason": validation_reason,
@@ -5365,6 +5505,10 @@ def _render_movement_search_results(
         "Signal Time", "Entry", "Stop Loss", "Price Reversal", "Reversal Status",
         "Score", "Early Score", "Early Status", "Rising Scans",
         "Score Delta", "Confidence", "Spot", "Source",
+        "Underlying Direction", "Underlying Direction Source",
+        "CE Direction", "CE Direction Source",
+        "PE Direction", "PE Direction Source",
+        "Signal Validation", "Signal Valid", "False Signal Reason",
     ]
     display_df = result_df[[c for c in display_cols if c in result_df.columns]].copy()
 
@@ -5417,8 +5561,8 @@ def _render_total_index_movement_search(
         unsafe_allow_html=True,
     )
     st.caption(
-        "Each strike compares CE vs PE activity. The stronger side is selected, while UP/DOWN "
-        "is calculated independently from the selected CE/PE premium price movement."
+        "CE/PE activity selects the candidate. Direction is validated using underlying spot "
+        "plus CE/PE price direction. CE ↑ + PE ↑ is PREMIUM EXPANSION, not directional UP."
     )
 
     rows = []
@@ -5516,8 +5660,8 @@ def _render_total_fno_movement_search(
     )
     st.caption(
         f"Scanning {len(MOVEMENT_FNO_UNIVERSE)} configured F&O stocks. "
-        "For every strike: CE score is compared with PE score; the stronger "
-        "side is shown as CE/UP or PE/DOWN."
+        "CE/PE score selects candidates; underlying + CE/PE direction validates them. "
+        "First-scan signals remain EARLY WATCH until scan-to-scan confirmation."
     )
 
     rows = []
