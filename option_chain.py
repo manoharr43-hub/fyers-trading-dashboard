@@ -2342,7 +2342,7 @@ def compute_movement_early_warning(
             continue
         key = _movement_history_key(symbol, expiry_label, strike)
         series = history.get(key, [])
-        series.append({
+        snapshot = {
             "ts": now,
             "score": float(row.get("movement_score", 0) or 0),
             "ce_score": float(row.get("ce_movement_score", 0) or 0),
@@ -2356,7 +2356,30 @@ def compute_movement_early_warning(
             "spot": float(spot or 0),
             "ce_price": float(row.get("ce_ltp", 0) or 0),
             "pe_price": float(row.get("pe_ltp", 0) or 0),
-        })
+        }
+
+        # FIX: Streamlit can refresh the same scan more than once.  Do not
+        # store an identical snapshot twice, otherwise the next comparison
+        # becomes current-vs-current and CE/PE Scan Delta stays at 0.
+        if series:
+            last = series[-1]
+            same_scan = (
+                _pin_num(last.get("spot"), 0.0) == snapshot["spot"]
+                and _pin_num(last.get("ce_price"), 0.0) == snapshot["ce_price"]
+                and _pin_num(last.get("pe_price"), 0.0) == snapshot["pe_price"]
+                and _pin_num(last.get("score"), 0.0) == snapshot["score"]
+                and _pin_num(last.get("ce_score"), 0.0) == snapshot["ce_score"]
+                and _pin_num(last.get("pe_score"), 0.0) == snapshot["pe_score"]
+            )
+            if same_scan:
+                # Keep the latest timestamp but preserve the previous distinct
+                # scan as the baseline for delta/directional confirmation.
+                series[-1] = snapshot
+            else:
+                series.append(snapshot)
+        else:
+            series.append(snapshot)
+
         history[key] = series[-MOVEMENT_HISTORY_MAX:]
 
     st.session_state[MOVEMENT_HISTORY_KEY] = history
