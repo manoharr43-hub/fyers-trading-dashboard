@@ -4756,11 +4756,12 @@ def _directional_confirmation_additive(
                 return "DOWN", "SCAN LTP", pct
             return "FLAT", "SCAN LTP", pct
         if fallback > 0.005:
-            pct = (fallback / cur) * 100.0 if cur > 0 else 0.0
-            return "UP", "FYERS CHANGE", pct
+            # FYERS daily change can be very large relative to a tiny option
+            # premium. It is valid for direction fallback, but it is NOT a
+            # scan-to-scan delta because no previous scan LTP exists yet.
+            return "UP", "FYERS CHANGE", 0.0
         if fallback < -0.005:
-            pct = (fallback / cur) * 100.0 if cur > 0 else 0.0
-            return "DOWN", "FYERS CHANGE", pct
+            return "DOWN", "FYERS CHANGE", 0.0
         return "UNKNOWN", "WAIT HISTORY", 0.0
 
     old_spot = _pin_num(prev.get("spot"), 0.0) if prev else 0.0
@@ -5092,7 +5093,7 @@ def _movement_search_one(
                     "PE Direction": validation["pe_direction"],
                     "PE Direction Source": validation["pe_direction_source"],
                     "Signal Validation": validation["signal_validation"],
-                    "Signal Valid": "YES" if validation["signal_valid"] else "NO",
+                    "Signal Valid": "YES" if validation["signal_valid"] == "YES" else "NO",
                     "False Signal Reason": validation["false_signal_reason"],
                     "Directional Bias": directional_bias,
                     "Directional Rising Scans": validation["directional_rising_scans"],
