@@ -150,14 +150,12 @@ MOVEMENT_HISTORY_MAX = 60
 MOVEMENT_EARLY_THRESHOLD = 65.0
 MOVEMENT_STRONG_THRESHOLD = 78.0
 MOVEMENT_MIN_RISING_SCANS = 2
+# Additive directional confirmation layer. 2 matching live scans are required
+# before a directional signal is promoted from WATCH to CONFIRMING.
+DIRECTION_CONFIRM_MIN_SCANS = 2
+DIRECTION_HISTORY_MAX = 20
+DIRECTION_PRICE_FLAT_PCT = 0.08
 
-# PERFORMANCE / LIVE-SCAN CACHE (ADDITIVE)
-# Prevent repeated FYERS/NSE calls when Streamlit reruns happen quickly.
-MOVEMENT_FETCH_CACHE_TTL = 7.0
-MOVEMENT_MAX_HISTORY_GAP_SECONDS = 2.0
-UNDERLYING_HISTORY_KEY = "oc_underlying_direction_history"
-DIRECTION_CONFIRM_HISTORY_KEY = "oc_direction_confirmation_history"
-DIRECTION_CONFIRM_SCANS = 2
 
 DEFAULT_RSI_PERIOD = 14
 DEFAULT_EMA_PERIODS = {"fast": 9, "slow": 21}
@@ -1473,234 +1471,6 @@ def fetch_chain_unified(fyers: Any, symbol_key: str, is_index: bool, stock_name:
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# ADDITIVE MOVEMENT PERFORMANCE CACHE + DIRECTION HISTORY
-# ══════════════════════════════════════════════════════════════════════════
-def _movement_fast_fetch_chain(
-    fyers: Any,
-    symbol_key: str,
-    is_index: bool,
-    stock_name: str,
-    preferred_expiry: str,
-    strike_count: int,
-) -> tuple[dict, bool]:
-    """Short session cache for movement scans.
-
-    Streamlit can rerun the script several times while the user changes a
-    control. Without a small cache, the same option-chain request can be sent
-    repeatedly. The cache is session-local and expires quickly, so it does not
-    turn the scanner into a stale-data dashboard.
-    """
-    try:
-        cache = st.session_state.setdefault("oc_movement_fetch_cache", {})
-        key = (
-            str(symbol_key), bool(is_index), str(stock_name or ""),
-            str(preferred_expiry or ""), int(strike_count),
-        )
-        now_mono = time.monotonic()
-        cached = cache.get(key)
-        if isinstance(cached, dict):
-            age = now_mono - float(cached.get("mono", 0.0) or 0.0)
-            if age < MOVEMENT_FETCH_CACHE_TTL and isinstance(cached.get("result"), dict):
-                return cached["result"], True
-
-        result = fetch_chain_unified(
-            fyers, symbol_key, is_index, stock_name,
-            preferred_expiry, strike_count,
-        )
-        cache[key] = {"mono": now_mono, "result": result}
-        # Keep the cache bounded.
-        if len(cache) > 80:
-            oldest = sorted(
-                cache.items(),
-                key=lambda kv: float(kv[1].get("mono", 0.0) or 0.0)
-                if isinstance(kv[1], dict) else 0.0,
-            )[:20]
-            for old_key, _ in oldest:
-                cache.pop(old_key, None)
-        st.session_state["oc_movement_fetch_cache"] = cache
-        return result, False
-    except Exception:
-        # Never let the performance layer break the original fetch path.
-        return fetch_chain_unified(
-            fyers, symbol_key, is_index, stock_name,
-            preferred_expiry, strike_count,
-        ), False
-
-
-def _update_underlying_direction(symbol: str, spot: float, record: bool = True, daily_direction: str = "UNKNOWN") -> tuple[str, str, float]:
-    """Return scan-to-scan underlying direction without counting duplicate reruns."""
-    spot = _pin_num(spot, 0.0)
-    if spot <= 0:
-        return "UNKNOWN", "NO SPOT", 0.0
-    hist = st.session_state.setdefault(UNDERLYING_HISTORY_KEY, {})
-    key = str(symbol).upper()
-    series = hist.get(key, []) if isinstance(hist.get(key, []), list) else []
-    previous = _pin_num(series[-1].get("spot"), 0.0) if series else 0.0
-    if previous <= 0:
-        # First scan may display FYERS's daily direction, but it is NOT confirmation.
-        direction = str(daily_direction or "UNKNOWN").upper() if daily_direction in {"UP", "DOWN", "FLAT"} else "UNKNOWN"
-        source = "FYERS DAILY CHANGE" if direction != "UNKNOWN" else "WAIT HISTORY"
-    else:
-        delta = spot - previous
-        threshold = max(abs(previous) * 0.00005, 0.01)
-        direction = "UP" if delta > threshold else ("DOWN" if delta < -threshold else "FLAT")
-        source = "SCAN SPOT"
-    if record:
-        duplicate = bool(series and abs(_pin_num(series[-1].get("spot"), 0.0) - spot) < 1e-9)
-        if not duplicate:
-            series.append({"ts": _india_now(), "spot": spot, "direction": direction})
-            hist[key] = series[-MOVEMENT_HISTORY_MAX:]
-            st.session_state[UNDERLYING_HISTORY_KEY] = hist
-    return direction, source, previous
-
-def _directional_option_state(
-    underlying_direction: str,
-    ce_direction: str,
-    pe_direction: str,
-) -> tuple[str, str]:
-    """Convert underlying + CE/PE premium directions into a non-score signal."""
-    u = str(underlying_direction or "UNKNOWN").upper()
-    ce = str(ce_direction or "UNKNOWN").upper()
-    pe = str(pe_direction or "UNKNOWN").upper()
-
-    if ce == "UP" and pe == "UP":
-        return "NEUTRAL", "PREMIUM EXPANSION"
-    if ce == "DOWN" and pe == "DOWN":
-        return "NEUTRAL", "PREMIUM CONTRACTION"
-
-    if u == "UP" and ce == "UP" and pe in {"DOWN", "FLAT", "UNKNOWN"}:
-        return "UP", "UNDERLYING UP + CE UP + PE DOWN/FLAT"
-    if u == "DOWN" and pe == "UP" and ce in {"DOWN", "FLAT", "UNKNOWN"}:
-        return "DOWN", "UNDERLYING DOWN + PE UP + CE DOWN/FLAT"
-
-    return "WAIT", "CE/PE RELATIONSHIP NOT CONFIRMED"
-
-
-def _update_direction_confirmation(
-    symbol: str,
-    strike: float,
-    option_side: str,
-    signal_direction: str,
-    validation_state: str,
-) -> int:
-    """Persist consecutive directional confirmations per symbol/strike/side."""
-    history = st.session_state.setdefault(DIRECTION_CONFIRM_HISTORY_KEY, {})
-    key = f"{str(symbol).upper()}|{float(strike):.4f}|{str(option_side).upper()}"
-    direction = str(signal_direction or "WAIT").upper()
-    now = _india_now()
-    item = history.get(key, {}) if isinstance(history.get(key, {}), dict) else {}
-
-    token = f"{direction}|{str(validation_state).upper()}"
-    if item.get("last_token") == token and direction in {"UP", "DOWN"}:
-        # Streamlit rerun of the same market snapshot: do not count it twice.
-        pass
-    elif direction not in {"UP", "DOWN"}:
-        item = {"direction": direction, "count": 0, "ts": now, "last_token": token}
-    elif item.get("direction") == direction:
-        item["count"] = int(item.get("count", 0) or 0) + 1
-        item["ts"] = now
-        item["last_token"] = token
-    else:
-        item = {"direction": direction, "count": 1, "ts": now, "last_token": token}
-
-    item["validation_state"] = str(validation_state or "WAIT")
-    history[key] = item
-    if len(history) > 5000:
-        # Keep the dictionary bounded without affecting current keys.
-        keys = list(history.keys())[-4000:]
-        history = {k: history[k] for k in keys}
-    st.session_state[DIRECTION_CONFIRM_HISTORY_KEY] = history
-    return int(item.get("count", 0) or 0)
-
-
-def _movement_validation_row(
-    symbol: str,
-    strike: float,
-    side: str,
-    spot: float,
-    ce_price: float,
-    pe_price: float,
-    series: list[dict[str, Any]],
-    underlying_direction: str = "UNKNOWN",
-    underlying_source: str = "WAIT HISTORY",
-) -> dict[str, Any]:
-    """Build fast additive validation fields from actual scan history."""
-    # Underlying direction is updated once per symbol scan, not once per strike.
-    u_dir = str(underlying_direction or "UNKNOWN").upper()
-    u_src = str(underlying_source or "WAIT HISTORY")
-
-    ce_prev = _pin_num(series[-2].get("ce_price"), 0.0) if len(series) >= 2 else 0.0
-    pe_prev = _pin_num(series[-2].get("pe_price"), 0.0) if len(series) >= 2 else 0.0
-
-    def side_dir(cur: float, prev: float) -> tuple[str, str, float]:
-        if cur <= 0 or prev <= 0:
-            return "UNKNOWN", "NO OPTION HISTORY", 0.0
-        delta = cur - prev
-        threshold = max(abs(prev) * 0.0005, 0.005)
-        d = "UP" if delta > threshold else ("DOWN" if delta < -threshold else "FLAT")
-        return d, "SCAN LTP", delta
-
-    ce_dir, ce_src, ce_delta = side_dir(ce_price, ce_prev)
-    pe_dir, pe_src, pe_delta = side_dir(pe_price, pe_prev)
-    # On the first scan, use FYERS daily change only as an informational direction.
-    # Confirmation still requires real scan-to-scan history.
-    if ce_dir == "UNKNOWN":
-        ce_dir = "UP" if ce_price > 0 and _pin_num(series[-1].get("ce_change"), 0.0) > 0.005 else ("DOWN" if ce_price > 0 and _pin_num(series[-1].get("ce_change"), 0.0) < -0.005 else "UNKNOWN")
-        ce_src = "FYERS CHANGE" if ce_dir != "UNKNOWN" else ce_src
-    if pe_dir == "UNKNOWN":
-        pe_dir = "UP" if pe_price > 0 and _pin_num(series[-1].get("pe_change"), 0.0) > 0.005 else ("DOWN" if pe_price > 0 and _pin_num(series[-1].get("pe_change"), 0.0) < -0.005 else "UNKNOWN")
-        pe_src = "FYERS CHANGE" if pe_dir != "UNKNOWN" else pe_src
-    final_dir, relation = _directional_option_state(u_dir, ce_dir, pe_dir)
-
-    if final_dir in {"UP", "DOWN"}:
-        confirm_side = "CE" if final_dir == "UP" else "PE"
-        # Don't count a direction until the option itself has scan history.
-        if (ce_dir == "UNKNOWN" or pe_dir == "UNKNOWN"):
-            rising = 0
-            validation = "WAIT HISTORY"
-        else:
-            rising = _update_direction_confirmation(
-                symbol, strike, confirm_side, final_dir, "CONFIRMING"
-            )
-            validation = "CONFIRMED" if rising >= DIRECTION_CONFIRM_SCANS else "CONFIRMING"
-    else:
-        rising = 0
-        validation = "PREMIUM EXPANSION" if relation == "PREMIUM EXPANSION" else "WATCH"
-        # Neutral/conflict should reset the relevant streaks.
-        _update_direction_confirmation(symbol, strike, side, "WAIT", validation)
-
-    valid = validation == "CONFIRMED"
-    if relation == "PREMIUM EXPANSION":
-        reason = "CE ↑ + PE ↑ = premium expansion; directional signal blocked"
-    elif relation == "PREMIUM CONTRACTION":
-        reason = "CE ↓ + PE ↓ = premium contraction; directional signal blocked"
-    elif validation == "CONFIRMED":
-        reason = f"{relation}; {DIRECTION_CONFIRM_SCANS} consecutive confirmations reached"
-    elif validation == "CONFIRMING":
-        reason = f"{relation}; waiting for {DIRECTION_CONFIRM_SCANS} consecutive scans"
-    elif u_dir == "UNKNOWN":
-        reason = "Waiting for underlying scan-to-scan history"
-    else:
-        reason = relation
-
-    return {
-        "Underlying Direction": u_dir,
-        "Underlying Direction Source": u_src,
-        "CE Direction": ce_dir,
-        "CE Direction Source": ce_src,
-        "PE Direction": pe_dir,
-        "PE Direction Source": pe_src,
-        "Signal Validation": validation,
-        "Signal Valid": "YES" if valid else "NO",
-        "False Signal Reason": "" if valid else reason,
-        "Directional Bias": final_dir,
-        "Directional Rising Scans": rising,
-        "CE Scan Delta": round(ce_delta, 4),
-        "PE Scan Delta": round(pe_delta, 4),
-    }
-
-
-# ══════════════════════════════════════════════════════════════════════════
 # 13. ANALYTICS (ORIGINAL - UNMODIFIED)
 # ══════════════════════════════════════════════════════════════════════════
 
@@ -2572,7 +2342,7 @@ def compute_movement_early_warning(
             continue
         key = _movement_history_key(symbol, expiry_label, strike)
         series = history.get(key, [])
-        snapshot = {
+        series.append({
             "ts": now,
             "score": float(row.get("movement_score", 0) or 0),
             "ce_score": float(row.get("ce_movement_score", 0) or 0),
@@ -2583,32 +2353,8 @@ def compute_movement_early_warning(
             "oi": float(abs(row.get("ce_chng_oi", 0) or 0) + abs(row.get("pe_chng_oi", 0) or 0)),
             "ce_price": float(row.get("ce_ltp", 0) or 0),
             "pe_price": float(row.get("pe_ltp", 0) or 0),
-            "ce_change": float(row.get("ce_change", 0) or 0),
-            "pe_change": float(row.get("pe_change", 0) or 0),
-        }
-        # Streamlit reruns can happen faster than the market changes. Do not
-        # count the same snapshot as another confirmation scan.
-        duplicate = False
-        if series:
-            last = series[-1]
-            try:
-                same_prices = (
-                    abs(float(last.get("ce_price", 0) or 0) - snapshot["ce_price"]) < 1e-9
-                    and abs(float(last.get("pe_price", 0) or 0) - snapshot["pe_price"]) < 1e-9
-                )
-                same_scores = (
-                    abs(float(last.get("score", 0) or 0) - snapshot["score"]) < 1e-9
-                    and abs(float(last.get("ce_score", 0) or 0) - snapshot["ce_score"]) < 1e-9
-                    and abs(float(last.get("pe_score", 0) or 0) - snapshot["pe_score"]) < 1e-9
-                )
-                last_ts = last.get("ts")
-                age = (now - last_ts).total_seconds() if isinstance(last_ts, datetime) else 9999.0
-                duplicate = same_prices and same_scores and age <= MOVEMENT_MAX_HISTORY_GAP_SECONDS
-            except Exception:
-                duplicate = False
-        if not duplicate:
-            series.append(snapshot)
-            history[key] = series[-MOVEMENT_HISTORY_MAX:]
+        })
+        history[key] = series[-MOVEMENT_HISTORY_MAX:]
 
     st.session_state[MOVEMENT_HISTORY_KEY] = history
 
@@ -4870,10 +4616,10 @@ def _movement_search_excel(df: pd.DataFrame, report_name: str = "Movement Search
         "Movement Bias", "Price Delta", "Price Change %", "Price Direction Source",
         "CE Price", "PE Price", "Early Status", "Rising Scans",
         "Score Delta", "Confidence", "Spot", "Source",
-        "Underlying Direction", "Underlying Direction Source",
-        "CE Direction", "CE Direction Source", "PE Direction", "PE Direction Source",
-        "Signal Validation", "Signal Valid", "False Signal Reason",
-        "Directional Bias", "Directional Rising Scans", "CE Scan Delta", "PE Scan Delta",
+        "Underlying Direction", "Underlying Direction Source", "CE Direction", "CE Direction Source",
+        "PE Direction", "PE Direction Source", "Signal Validation", "Signal Valid",
+        "False Signal Reason", "Directional Bias", "Directional Rising Scans",
+        "CE Scan Delta", "PE Scan Delta",
     ]
     cols = [c for c in export_cols if c in df.columns]
     export_df = df[cols].copy() if cols else df.copy()
@@ -4919,6 +4665,134 @@ def _movement_search_excel(df: pd.DataFrame, report_name: str = "Movement Search
 #   3) identify BUILDING / PRE-MOVE before strong movement
 #   4) keep CE and PE direction separate
 # ============================================================
+def _directional_confirmation_additive(
+    symbol: str,
+    expiry: str,
+    strike: float,
+    spot: float,
+    ce_price: float,
+    pe_price: float,
+    ce_daily_change: float = 0.0,
+    pe_daily_change: float = 0.0,
+) -> dict[str, Any]:
+    """Persistent scan-to-scan direction confirmation.
+
+    This is additive: the original movement score/history remains untouched.
+    Direction is based on the underlying spot plus CE/PE premium movement.
+    FYERS daily CHANGE is used only as a first-scan fallback; confirmation
+    requires persisted scan-to-scan values.
+    """
+    try:
+        spot = float(spot or 0.0)
+        ce_price = float(ce_price or 0.0)
+        pe_price = float(pe_price or 0.0)
+    except Exception:
+        spot = ce_price = pe_price = 0.0
+
+    hist = st.session_state.setdefault("oc_direction_confirmation_history", {})
+    key = f"{symbol}|{expiry}|{float(strike):.4f}"
+    series = hist.get(key, [])
+
+    def _dir(cur: float, prev: float, fallback: float = 0.0) -> str:
+        if cur > 0 and prev > 0:
+            pct = ((cur - prev) / prev) * 100.0
+            if pct > DIRECTION_PRICE_FLAT_PCT:
+                return "UP"
+            if pct < -DIRECTION_PRICE_FLAT_PCT:
+                return "DOWN"
+            return "FLAT"
+        if fallback > 0.005:
+            return "UP"
+        if fallback < -0.005:
+            return "DOWN"
+        return "UNKNOWN"
+
+    prev = series[-1] if series else None
+    underlying = _dir(spot, _pin_num(prev.get("spot"), 0.0) if prev else 0.0)
+    ce_dir = _dir(ce_price, _pin_num(prev.get("ce_price"), 0.0) if prev else 0.0, ce_daily_change)
+    pe_dir = _dir(pe_price, _pin_num(prev.get("pe_price"), 0.0) if prev else 0.0, pe_daily_change)
+
+    # True directional relationships. Both premiums rising is expansion, not UP.
+    if underlying == "UP" and ce_dir == "UP" and pe_dir in {"DOWN", "FLAT"}:
+        directional_bias = "UP"
+        validation = "CONFIRMING" if len(series) >= 1 else "WATCH"
+        reason = "Underlying ↑ + CE ↑ + PE ↓/FLAT"
+    elif underlying == "DOWN" and pe_dir == "UP" and ce_dir in {"DOWN", "FLAT"}:
+        directional_bias = "DOWN"
+        validation = "CONFIRMING" if len(series) >= 1 else "WATCH"
+        reason = "Underlying ↓ + PE ↑ + CE ↓/FLAT"
+    elif ce_dir == "UP" and pe_dir == "UP":
+        directional_bias = "NEUTRAL"
+        validation = "PREMIUM EXPANSION"
+        reason = "CE ↑ + PE ↑ = premium expansion; directional signal blocked"
+    elif ce_dir == "DOWN" and pe_dir == "DOWN":
+        directional_bias = "NEUTRAL"
+        validation = "PREMIUM CONTRACTION"
+        reason = "CE ↓ + PE ↓ = premium contraction; directional signal blocked"
+    elif "UNKNOWN" in {underlying, ce_dir, pe_dir}:
+        directional_bias = "WAIT"
+        validation = "WATCH"
+        reason = "Waiting for underlying and CE/PE scan-to-scan history"
+    else:
+        directional_bias = "WAIT"
+        validation = "WATCH"
+        reason = "CE/PE relationship is not directionally confirmed"
+
+    prior_bias = str(series[-1].get("directional_bias", "")) if series else ""
+    prior_valid = bool(series and series[-1].get("directional_valid"))
+    aligned_now = directional_bias in {"UP", "DOWN"}
+
+    if aligned_now and prior_valid and prior_bias == directional_bias:
+        rising = int(series[-1].get("directional_rising_scans", 0) or 0) + 1
+    elif aligned_now:
+        # First valid directional scan starts at 1; it is never confirmed alone.
+        rising = 1
+    else:
+        rising = 0
+
+    if aligned_now:
+        if rising >= DIRECTION_CONFIRM_MIN_SCANS:
+            validation = "CONFIRMED"
+        elif rising >= 1:
+            validation = "CONFIRMING"
+
+    valid = validation == "CONFIRMED"
+    if valid:
+        reason = reason + f"; {rising} consecutive matching scans"
+
+    # Persist the CURRENT scan only after comparing with the previous scan.
+    series.append({
+        "ts": _india_now(),
+        "spot": spot,
+        "ce_price": ce_price,
+        "pe_price": pe_price,
+        "underlying_direction": underlying,
+        "ce_direction": ce_dir,
+        "pe_direction": pe_dir,
+        "directional_bias": directional_bias,
+        "directional_valid": aligned_now,
+        "directional_rising_scans": rising,
+    })
+    hist[key] = series[-DIRECTION_HISTORY_MAX:]
+    st.session_state["oc_direction_confirmation_history"] = hist
+
+    return {
+        "underlying_direction": underlying,
+        "underlying_direction_source": "SCAN SPOT" if prev and spot > 0 else "WAIT HISTORY",
+        "ce_direction": ce_dir,
+        "ce_direction_source": "SCAN LTP" if prev and ce_price > 0 else ("FYERS CHANGE" if ce_daily_change else "NO OPTION HISTORY"),
+        "pe_direction": pe_dir,
+        "pe_direction_source": "SCAN LTP" if prev and pe_price > 0 else ("FYERS CHANGE" if pe_daily_change else "NO OPTION HISTORY"),
+        "signal_validation": validation,
+        "signal_valid": valid,
+        "false_signal_reason": reason,
+        "directional_bias": directional_bias,
+        "directional_rising_scans": rising,
+        "ce_scan_delta": round(ce_price - _pin_num(prev.get("ce_price"), 0.0), 4) if prev and ce_price > 0 else 0.0,
+        "pe_scan_delta": round(pe_price - _pin_num(prev.get("pe_price"), 0.0), 4) if prev and pe_price > 0 else 0.0,
+    }
+
+
 def _validate_movement_signal_additive(
     row,
     price_delta=None,
@@ -5138,7 +5012,7 @@ def _movement_search_one(
     try:
         stock_name = "" if is_index else normalize_stock_symbol(symbol)
 
-        result, _cache_hit = _movement_fast_fetch_chain(
+        result = fetch_chain_unified(
             fyers,
             symbol,
             is_index,
@@ -5231,12 +5105,6 @@ def _movement_search_one(
         # Total scanner can pass min_score=0 to avoid hiding developing candidates.
         threshold = MOVEMENT_SEARCH_MIN_SCORE if min_score is None else float(min_score)
 
-        # Record the underlying spot only once for this symbol/scan.
-        # Recording it once per strike would create false FLAT/confirmation states.
-        underlying_direction, underlying_source, _ = _update_underlying_direction(
-            symbol, spot, record=True
-        )
-
         rows = []
         for _, row in df.iterrows():
             ce_score = _pin_num(row.get("ce_movement_score"), 0.0)
@@ -5250,92 +5118,66 @@ def _movement_search_one(
                 continue
 
             if both_mode:
-                # TOTAL SCANNER: first select the stronger CE/PE activity score
-                # at the SAME strike. Direction is NOT tied to the option type.
-                # CE can be UP or DOWN; PE can also be UP or DOWN.
+                # TOTAL SCANNER: keep the stronger CE/PE activity side, but
+                # direction is independently validated against the underlying.
                 if ce_score > pe_score:
                     side, score = "CE", ce_score
-                    current_option = _pin_num(row.get("ce_ltp"), 0.0)
-                    daily_delta = _pin_num(row.get("ce_change"), 0.0)
                 elif pe_score > ce_score:
                     side, score = "PE", pe_score
-                    current_option = _pin_num(row.get("pe_ltp"), 0.0)
-                    daily_delta = _pin_num(row.get("pe_change"), 0.0)
                 else:
-                    # Tie-breaker only chooses the side; it does NOT decide UP/DOWN.
                     ce_pressure = _pin_num(row.get("buy_pressure"), 50.0)
                     pe_pressure = _pin_num(row.get("sell_pressure"), 50.0)
                     ce_volume = _pin_num(row.get("ce_volume"), 0.0)
                     pe_volume = _pin_num(row.get("pe_volume"), 0.0)
-                    if ce_pressure > pe_pressure or (
-                        ce_pressure == pe_pressure and ce_volume >= pe_volume
-                    ):
+                    if ce_pressure > pe_pressure or (ce_pressure == pe_pressure and ce_volume >= pe_volume):
                         side, score = "CE", ce_score
-                        current_option = _pin_num(row.get("ce_ltp"), 0.0)
-                        daily_delta = _pin_num(row.get("ce_change"), 0.0)
                     else:
                         side, score = "PE", pe_score
-                        current_option = _pin_num(row.get("pe_ltp"), 0.0)
-                        daily_delta = _pin_num(row.get("pe_change"), 0.0)
 
-                # TRUE direction = option premium movement, never strike movement.
-                # Prefer scan-to-scan LTP history; first scan falls back to FYERS
-                # day's option-price change so the report can still show direction.
+                ce_price = _pin_num(row.get("ce_ltp"), 0.0)
+                pe_price = _pin_num(row.get("pe_ltp"), 0.0)
+                ce_daily = _pin_num(row.get("ce_change"), 0.0)
+                pe_daily = _pin_num(row.get("pe_change"), 0.0)
+
                 movement_history = st.session_state.get(MOVEMENT_HISTORY_KEY, {})
                 hkey = _movement_history_key(symbol, expiry, strike)
                 series = movement_history.get(hkey, []) if isinstance(movement_history, dict) else []
                 price_key = "pe_price" if side == "PE" else "ce_price"
-                prior_prices = [
-                    _pin_num(x.get(price_key), 0.0)
-                    for x in series[:-1]
-                    if _pin_num(x.get(price_key), 0.0) > 0
-                ]
-                previous_price = prior_prices[-1] if prior_prices else 0.0
+                previous_price = _pin_num(series[-2].get(price_key), 0.0) if len(series) >= 2 else 0.0
+                current_option = pe_price if side == "PE" else ce_price
                 if current_option > 0 and previous_price > 0:
                     price_delta = current_option - previous_price
                     price_pct = (price_delta / previous_price) * 100.0
                     direction = "UP" if price_delta > 0.005 else ("DOWN" if price_delta < -0.005 else "FLAT")
                     direction_source = "SCAN LTP"
                 else:
+                    daily_delta = pe_daily if side == "PE" else ce_daily
                     price_delta = daily_delta
-                    price_pct = (price_delta / current_option) * 100.0 if current_option > 0 else 0.0
-                    direction = "UP" if price_delta > 0.005 else ("DOWN" if price_delta < -0.005 else "FLAT")
+                    price_pct = (daily_delta / current_option) * 100.0 if current_option > 0 else 0.0
+                    direction = "UP" if daily_delta > 0.005 else ("DOWN" if daily_delta < -0.005 else "FLAT")
                     direction_source = "FYERS CHANGE"
 
-                movement_bias = f"{side} {direction}"
-
-                validation = _movement_validation_row(
-                    symbol=symbol,
-                    strike=strike,
-                    side=side,
-                    spot=spot,
-                    ce_price=_pin_num(row.get("ce_ltp"), 0.0),
-                    pe_price=_pin_num(row.get("pe_ltp"), 0.0),
-                    series=series,
-                    underlying_direction=underlying_direction,
-                    underlying_source=underlying_source,
+                validation = _directional_confirmation_additive(
+                    symbol, expiry, strike, spot, ce_price, pe_price, ce_daily, pe_daily
                 )
+                directional_bias = validation["directional_bias"]
+                # Displayed Direction is the confirmed/underlying relationship,
+                # not simply the selected option premium direction.
+                display_direction = directional_bias if directional_bias in {"UP", "DOWN"} else direction
+                if validation["signal_validation"] in {"PREMIUM EXPANSION", "PREMIUM CONTRACTION"}:
+                    display_direction = "NEUTRAL"
 
                 reversal_level, reversal_status = _movement_price_reversal_from_history(
-                    movement_history,
-                    symbol,
-                    expiry,
-                    strike,
-                    current_option,
-                    lookback=5,
-                    side=side,
+                    movement_history, symbol, expiry, strike, current_option,
+                    lookback=5, side=side,
                 )
-                levels = _movement_trade_levels(
-                    row,
-                    reversal_level=reversal_level,
-                    reversal_status=reversal_status,
-                )
+                levels = _movement_trade_levels(row, reversal_level=reversal_level, reversal_status=reversal_status)
 
                 rows.append({
                     "Instrument": symbol,
                     "Strike": strike,
                     "Option": side,
-                    "Direction": direction,
+                    "Direction": display_direction,
                     "Status": _movement_search_status(score),
                     "Signal Time": levels["Signal Time"],
                     "Entry": levels["Entry"],
@@ -5346,19 +5188,31 @@ def _movement_search_one(
                     "Early Score": round(_pin_num(row.get("early_movement_score")), 1),
                     "CE Score": round(ce_score, 1),
                     "PE Score": round(pe_score, 1),
-                    "Movement Bias": movement_bias,
+                    "Movement Bias": f"{side} {direction}",
                     "Price Delta": round(price_delta, 4),
                     "Price Change %": round(price_pct, 2),
                     "Price Direction Source": direction_source,
-                    "CE Price": round(_pin_num(row.get("ce_ltp"), 0.0), 4),
-                    "PE Price": round(_pin_num(row.get("pe_ltp"), 0.0), 4),
+                    "CE Price": round(ce_price, 4),
+                    "PE Price": round(pe_price, 4),
                     "Early Status": str(row.get("early_movement_status", "WAIT")),
                     "Rising Scans": int(_pin_num(row.get("movement_rising_scans"), 0)),
                     "Score Delta": round(_pin_num(row.get("movement_score_delta")), 1),
                     "Confidence": round(_pin_num(row.get("early_movement_confidence")), 1),
                     "Spot": round(spot, 2) if spot else 0.0,
                     "Source": result.get("source", "UNKNOWN"),
-                    **validation,
+                    "Underlying Direction": validation["underlying_direction"],
+                    "Underlying Direction Source": validation["underlying_direction_source"],
+                    "CE Direction": validation["ce_direction"],
+                    "CE Direction Source": validation["ce_direction_source"],
+                    "PE Direction": validation["pe_direction"],
+                    "PE Direction Source": validation["pe_direction_source"],
+                    "Signal Validation": validation["signal_validation"],
+                    "Signal Valid": "YES" if validation["signal_valid"] else "NO",
+                    "False Signal Reason": validation["false_signal_reason"],
+                    "Directional Bias": directional_bias,
+                    "Directional Rising Scans": validation["directional_rising_scans"],
+                    "CE Scan Delta": validation["ce_scan_delta"],
+                    "PE Scan Delta": validation["pe_scan_delta"],
                 })
                 continue
 
@@ -5431,7 +5285,6 @@ def _render_movement_search_results(
         f'<div class="block-title">{title}</div>',
         unsafe_allow_html=True,
     )
-    st.caption("Fast scan cache enabled: repeated reruns within a few seconds reuse the latest chain snapshot.")
     st.caption(
         f"Searching **{symbol}** and showing ONLY CE / UP strikes with "
         f"movement score ≥ {MOVEMENT_SEARCH_MIN_SCORE:.0f}. "
@@ -5470,8 +5323,6 @@ def _render_movement_search_results(
         "Signal Time", "Entry", "Stop Loss", "Price Reversal", "Reversal Status",
         "Score", "Early Score", "Early Status", "Rising Scans",
         "Score Delta", "Confidence", "Spot", "Source",
-        "Underlying Direction", "CE Direction", "PE Direction",
-        "Signal Validation", "Signal Valid", "False Signal Reason",
     ]
     display_df = result_df[[c for c in display_cols if c in result_df.columns]].copy()
 
@@ -5578,6 +5429,9 @@ def _render_total_index_movement_search(
         "Signal Time", "Entry", "Stop Loss", "Price Reversal", "Reversal Status",
         "Score", "Early Score", "Early Status", "Rising Scans",
         "Score Delta", "Confidence", "Spot", "Source",
+        "Underlying Direction", "Underlying Direction Source", "CE Direction", "CE Direction Source",
+        "PE Direction", "PE Direction Source", "Signal Validation", "Signal Valid",
+        "False Signal Reason", "Directional Bias", "Directional Rising Scans", "CE Scan Delta", "PE Scan Delta",
     ]
     out_view = out[[c for c in show_cols if c in out.columns]].copy()
     for col in ("Entry", "Stop Loss", "Price Reversal", "Spot"):
@@ -5679,6 +5533,9 @@ def _render_total_fno_movement_search(
         "Signal Time", "Entry", "Stop Loss", "Price Reversal", "Reversal Status",
         "Score", "Early Score", "Early Status", "Rising Scans",
         "Score Delta", "Confidence", "Spot", "Source",
+        "Underlying Direction", "Underlying Direction Source", "CE Direction", "CE Direction Source",
+        "PE Direction", "PE Direction Source", "Signal Validation", "Signal Valid",
+        "False Signal Reason", "Directional Bias", "Directional Rising Scans", "CE Scan Delta", "PE Scan Delta",
     ]
     out_view = out[[c for c in show_cols if c in out.columns]].copy()
     for col in ("Entry", "Stop Loss", "Price Reversal", "Spot"):
