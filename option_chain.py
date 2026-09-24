@@ -1527,36 +1527,31 @@ def _movement_fast_fetch_chain(
         ), False
 
 
-def _update_underlying_direction(symbol: str, spot: float, record: bool = True) -> tuple[str, str, float]:
-    """Return scan-to-scan underlying direction using the spot price."""
-    try:
-        spot = float(spot or 0.0)
-    except Exception:
-        spot = 0.0
+def _update_underlying_direction(symbol: str, spot: float, record: bool = True, daily_direction: str = "UNKNOWN") -> tuple[str, str, float]:
+    """Return scan-to-scan underlying direction without counting duplicate reruns."""
+    spot = _pin_num(spot, 0.0)
     if spot <= 0:
         return "UNKNOWN", "NO SPOT", 0.0
-
     hist = st.session_state.setdefault(UNDERLYING_HISTORY_KEY, {})
     key = str(symbol).upper()
     series = hist.get(key, []) if isinstance(hist.get(key, []), list) else []
-    previous = float(series[-1].get("spot", 0.0) or 0.0) if series else 0.0
-
+    previous = _pin_num(series[-1].get("spot"), 0.0) if series else 0.0
     if previous <= 0:
-        direction, source = "UNKNOWN", "WAIT HISTORY"
+        # First scan may display FYERS's daily direction, but it is NOT confirmation.
+        direction = str(daily_direction or "UNKNOWN").upper() if daily_direction in {"UP", "DOWN", "FLAT"} else "UNKNOWN"
+        source = "FYERS DAILY CHANGE" if direction != "UNKNOWN" else "WAIT HISTORY"
     else:
         delta = spot - previous
-        # Tiny changes are treated as flat to avoid noise around unchanged spot.
         threshold = max(abs(previous) * 0.00005, 0.01)
         direction = "UP" if delta > threshold else ("DOWN" if delta < -threshold else "FLAT")
         source = "SCAN SPOT"
-
     if record:
-        now = _india_now()
-        series.append({"ts": now, "spot": spot, "direction": direction})
-        hist[key] = series[-MOVEMENT_HISTORY_MAX:]
-        st.session_state[UNDERLYING_HISTORY_KEY] = hist
+        duplicate = bool(series and abs(_pin_num(series[-1].get("spot"), 0.0) - spot) < 1e-9)
+        if not duplicate:
+            series.append({"ts": _india_now(), "spot": spot, "direction": direction})
+            hist[key] = series[-MOVEMENT_HISTORY_MAX:]
+            st.session_state[UNDERLYING_HISTORY_KEY] = hist
     return direction, source, previous
-
 
 def _directional_option_state(
     underlying_direction: str,
@@ -1595,15 +1590,18 @@ def _update_direction_confirmation(
     now = _india_now()
     item = history.get(key, {}) if isinstance(history.get(key, {}), dict) else {}
 
-    if direction not in {"UP", "DOWN"}:
-        # Neutral/conflict breaks the directional streak.
-        item = {"direction": direction, "count": 0, "ts": now}
+    token = f"{direction}|{str(validation_state).upper()}"
+    if item.get("last_token") == token and direction in {"UP", "DOWN"}:
+        # Streamlit rerun of the same market snapshot: do not count it twice.
+        pass
+    elif direction not in {"UP", "DOWN"}:
+        item = {"direction": direction, "count": 0, "ts": now, "last_token": token}
     elif item.get("direction") == direction:
         item["count"] = int(item.get("count", 0) or 0) + 1
         item["ts"] = now
+        item["last_token"] = token
     else:
-        # First observation of a new direction starts at 1.
-        item = {"direction": direction, "count": 1, "ts": now}
+        item = {"direction": direction, "count": 1, "ts": now, "last_token": token}
 
     item["validation_state"] = str(validation_state or "WAIT")
     history[key] = item
@@ -1644,6 +1642,14 @@ def _movement_validation_row(
 
     ce_dir, ce_src, ce_delta = side_dir(ce_price, ce_prev)
     pe_dir, pe_src, pe_delta = side_dir(pe_price, pe_prev)
+    # On the first scan, use FYERS daily change only as an informational direction.
+    # Confirmation still requires real scan-to-scan history.
+    if ce_dir == "UNKNOWN":
+        ce_dir = "UP" if ce_price > 0 and _pin_num(series[-1].get("ce_change"), 0.0) > 0.005 else ("DOWN" if ce_price > 0 and _pin_num(series[-1].get("ce_change"), 0.0) < -0.005 else "UNKNOWN")
+        ce_src = "FYERS CHANGE" if ce_dir != "UNKNOWN" else ce_src
+    if pe_dir == "UNKNOWN":
+        pe_dir = "UP" if pe_price > 0 and _pin_num(series[-1].get("pe_change"), 0.0) > 0.005 else ("DOWN" if pe_price > 0 and _pin_num(series[-1].get("pe_change"), 0.0) < -0.005 else "UNKNOWN")
+        pe_src = "FYERS CHANGE" if pe_dir != "UNKNOWN" else pe_src
     final_dir, relation = _directional_option_state(u_dir, ce_dir, pe_dir)
 
     if final_dir in {"UP", "DOWN"}:
@@ -2577,6 +2583,8 @@ def compute_movement_early_warning(
             "oi": float(abs(row.get("ce_chng_oi", 0) or 0) + abs(row.get("pe_chng_oi", 0) or 0)),
             "ce_price": float(row.get("ce_ltp", 0) or 0),
             "pe_price": float(row.get("pe_ltp", 0) or 0),
+            "ce_change": float(row.get("ce_change", 0) or 0),
+            "pe_change": float(row.get("pe_change", 0) or 0),
         }
         # Streamlit reruns can happen faster than the market changes. Do not
         # count the same snapshot as another confirmation scan.
