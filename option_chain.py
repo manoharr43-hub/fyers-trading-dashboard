@@ -2409,8 +2409,10 @@ def compute_movement_early_warning(
             or directional_gap >= 12
         )
 
-        # If the current movement is already very strong and has confirmation,
-        # do not show WAIT just because this is the first scan in the session.
+        # Do not promote a score-only first scan to an EARLY/STRONG signal.
+        # A first scan may be strong because of existing activity, but the
+        # scanner needs either confirmation evidence or scan-to-scan improvement.
+        first_scan = len(scores) < 2
         if early >= MOVEMENT_STRONG_THRESHOLD and confirmation:
             status = "STRONG MOVE"
         elif rising >= MOVEMENT_MIN_RISING_SCANS and early >= MOVEMENT_STRONG_THRESHOLD:
@@ -2419,6 +2421,8 @@ def compute_movement_early_warning(
             status = "EARLY MOVE"
         elif (rising >= 1 and delta > 0) or (early >= 55 and confirmation):
             status = "BUILDING"
+        elif first_scan and early >= 55:
+            status = "WATCH"
         else:
             status = "WAIT"
 
@@ -4483,22 +4487,52 @@ def _movement_price_reversal_from_history(
     lookback: int = 5,
     side: str = "CE",
 ) -> tuple[float, str]:
-    """Get a side-specific price-reversal reference from repeated live scans."""
+    """Return a scan-to-scan reversal trigger without using an old low/high.
+
+    FIX: the old implementation used ``min(prior_prices)`` for both CE and PE.
+    That could turn a recent CE move such as 52 -> 80 into a reversal near 49,
+    even though the meaningful reference was the latest completed scan near 80.
+    The movement scanner now uses the *last completed side price* as the primary
+    reversal reference. Older history is used only to validate that the reference
+    is inside a sensible recent range.
+    """
     key = _movement_history_key(symbol, expiry_label, strike)
     series = history.get(key, []) if isinstance(history, dict) else []
     price_key = "pe_price" if str(side).upper() == "PE" else "ce_price"
+
     prices = [
         float(x.get(price_key, 0) or 0)
         for x in series
         if float(x.get(price_key, 0) or 0) > 0
     ]
+
     if len(prices) >= 2:
-        prior = prices[:-1][-max(2, int(lookback)):]
-        reversal = min(prior)
-        return (
-            float(reversal),
-            "UP ABOVE REVERSAL" if current_price > reversal else "PRICE REVERSAL",
-        )
+        # Last history item is the current snapshot. The item immediately before
+        # it is the last completed scan and therefore the correct live trigger.
+        previous = float(prices[-2])
+        recent = prices[-max(2, int(lookback)) - 1:-1]
+        recent = [x for x in recent if x > 0]
+
+        if previous > 0 and recent:
+            recent_low = min(recent)
+            recent_high = max(recent)
+            # Do not let a stale/outlier reference survive. In normal operation
+            # previous will already be inside this range.
+            reversal = float(min(max(previous, recent_low), recent_high))
+        else:
+            reversal = previous
+
+        if current_price > reversal:
+            status = "UP ABOVE REVERSAL"
+        elif current_price < reversal:
+            status = "BELOW REVERSAL"
+        else:
+            status = "AT REVERSAL"
+        return reversal, status
+
+    if len(prices) == 1:
+        return float(prices[-1]), "WAIT CONFIRMATION"
+
     if current_price > 0:
         return float(current_price * 0.95), "WAIT HISTORY"
     return 0.0, "NO PRICE"
