@@ -2358,9 +2358,7 @@ def compute_movement_early_warning(
             "pe_price": float(row.get("pe_ltp", 0) or 0),
         }
 
-        # FIX: Streamlit can refresh the same scan more than once.  Do not
-        # store an identical snapshot twice, otherwise the next comparison
-        # becomes current-vs-current and CE/PE Scan Delta stays at 0.
+        # Prevent duplicate Streamlit reruns from creating a fake second scan.
         if series:
             last = series[-1]
             same_scan = (
@@ -2372,14 +2370,11 @@ def compute_movement_early_warning(
                 and _pin_num(last.get("pe_score"), 0.0) == snapshot["pe_score"]
             )
             if same_scan:
-                # Keep the latest timestamp but preserve the previous distinct
-                # scan as the baseline for delta/directional confirmation.
                 series[-1] = snapshot
             else:
                 series.append(snapshot)
         else:
             series.append(snapshot)
-
         history[key] = series[-MOVEMENT_HISTORY_MAX:]
 
     st.session_state[MOVEMENT_HISTORY_KEY] = history
@@ -4796,9 +4791,26 @@ def _directional_confirmation_additive(
     previous_aligned = previous_bias in {"UP", "DOWN"}
     aligned_now = directional_bias in {"UP", "DOWN"}
 
-    if aligned_now and previous_aligned and previous_bias == directional_bias:
+    # ADDITIVE FIX: keep the original confirmed directional logic, but let
+    # Directional Rising Scans build during the pre-confirmation stage too.
+    # This prevents the report from staying at 0 when CE/PE are already moving
+    # in a directional relationship but the underlying has not confirmed yet.
+    #
+    # Option-side directional relationship:
+    #   CE UP + PE DOWN/FLAT  -> UP pressure building
+    #   PE UP + CE DOWN/FLAT  -> DOWN pressure building
+    option_bias = ""
+    if ce_dir == "UP" and pe_dir in {"DOWN", "FLAT"}:
+        option_bias = "UP"
+    elif pe_dir == "UP" and ce_dir in {"DOWN", "FLAT"}:
+        option_bias = "DOWN"
+
+    rising_basis = directional_bias if aligned_now else option_bias
+    previous_rising_basis = str(prev.get("directional_rising_basis", "")) if prev else ""
+
+    if rising_basis in {"UP", "DOWN"} and previous_rising_basis == rising_basis:
         rising = int(prev.get("directional_rising_scans", 0) or 0) + 1
-    elif aligned_now:
+    elif rising_basis in {"UP", "DOWN"}:
         rising = 1
     else:
         rising = 0
@@ -4829,6 +4841,7 @@ def _directional_confirmation_additive(
         "signal_valid": signal_valid,
         "false_signal_reason": reason,
         "directional_bias": directional_bias,
+        "directional_rising_basis": rising_basis,
         "directional_rising_scans": rising,
         "ce_scan_delta": round(ce_delta_pct, 4),
         "pe_scan_delta": round(pe_delta_pct, 4),
