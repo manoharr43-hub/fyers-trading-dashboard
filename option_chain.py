@@ -146,6 +146,8 @@ SCALP_EARLY_SCORE_THRESHOLD = 70.0
 
 # MOVEMENT-BEFORE-IT-HAPPENS HISTORY
 MOVEMENT_HISTORY_KEY = "oc_movement_history"
+DIRECTIONAL_SCAN_HISTORY_KEY = "oc_directional_scan_history"
+DIRECTIONAL_SCAN_HISTORY_MAX = 30
 MOVEMENT_HISTORY_MAX = 60
 MOVEMENT_EARLY_THRESHOLD = 65.0
 MOVEMENT_STRONG_THRESHOLD = 78.0
@@ -4730,21 +4732,20 @@ def _directional_confirmation_additive(
     ce_daily_change: float = 0.0,
     pe_daily_change: float = 0.0,
 ) -> dict[str, Any]:
-    """Additive directional confirmation using the existing movement history.
+    """Additive scan-to-scan directional confirmation.
 
-    The movement engine already stores a snapshot for every strike.  Reuse that
-    same history instead of maintaining a second independent history.  This
-    prevents the previous implementation from staying at WAIT HISTORY when the
-    scanner is repeatedly refreshed.
+    This uses a dedicated lightweight history so CE/PE scan deltas are based
+    on the previous completed scanner snapshot, not on the movement engine's
+    internal write order.  Existing movement history and reports are kept.
     """
     spot = _pin_num(spot, 0.0)
     ce_price = _pin_num(ce_price, 0.0)
     pe_price = _pin_num(pe_price, 0.0)
 
-    history = st.session_state.get(MOVEMENT_HISTORY_KEY, {})
+    history = st.session_state.setdefault(DIRECTIONAL_SCAN_HISTORY_KEY, {})
     key = _movement_history_key(symbol, expiry, strike)
     series = history.get(key, []) if isinstance(history, dict) else []
-    prev = series[-2] if len(series) >= 2 else None
+    prev = series[-1] if series else None
 
     def _dir(cur: float, old: float, fallback: float = 0.0) -> tuple[str, str, float]:
         if cur > 0 and old > 0:
@@ -4754,14 +4755,12 @@ def _directional_confirmation_additive(
             if pct < -DIRECTION_PRICE_FLAT_PCT:
                 return "DOWN", "SCAN LTP", pct
             return "FLAT", "SCAN LTP", pct
-        # First complete scan has no prior LTP.  Keep Scan Delta strictly
-        # scan-to-scan: FYERS CHANGE may provide direction, but it must not
-        # be reported as a scan delta.  The separate Price Delta / Price
-        # Change % fields already expose the daily FYERS movement.
         if fallback > 0.005:
-            return "UP", "FYERS CHANGE", 0.0
+            pct = (fallback / cur) * 100.0 if cur > 0 else 0.0
+            return "UP", "FYERS CHANGE", pct
         if fallback < -0.005:
-            return "DOWN", "FYERS CHANGE", 0.0
+            pct = (fallback / cur) * 100.0 if cur > 0 else 0.0
+            return "DOWN", "FYERS CHANGE", pct
         return "UNKNOWN", "WAIT HISTORY", 0.0
 
     old_spot = _pin_num(prev.get("spot"), 0.0) if prev else 0.0
@@ -4795,14 +4794,6 @@ def _directional_confirmation_additive(
     previous_aligned = previous_bias in {"UP", "DOWN"}
     aligned_now = directional_bias in {"UP", "DOWN"}
 
-    # ADDITIVE FIX: keep the original confirmed directional logic, but let
-    # Directional Rising Scans build during the pre-confirmation stage too.
-    # This prevents the report from staying at 0 when CE/PE are already moving
-    # in a directional relationship but the underlying has not confirmed yet.
-    #
-    # Option-side directional relationship:
-    #   CE UP + PE DOWN/FLAT  -> UP pressure building
-    #   PE UP + CE DOWN/FLAT  -> DOWN pressure building
     option_bias = ""
     if ce_dir == "UP" and pe_dir in {"DOWN", "FLAT"}:
         option_bias = "UP"
@@ -4811,9 +4802,10 @@ def _directional_confirmation_additive(
 
     rising_basis = directional_bias if aligned_now else option_bias
     previous_rising_basis = str(prev.get("directional_rising_basis", "")) if prev else ""
+    previous_rising = int(prev.get("directional_rising_scans", 0) or 0) if prev else 0
 
     if rising_basis in {"UP", "DOWN"} and previous_rising_basis == rising_basis:
-        rising = int(prev.get("directional_rising_scans", 0) or 0) + 1
+        rising = previous_rising + 1
     elif rising_basis in {"UP", "DOWN"}:
         rising = 1
     else:
@@ -4833,6 +4825,36 @@ def _directional_confirmation_additive(
     signal_valid = "YES" if validation == "CONFIRMED" else "NO"
     if validation == "CONFIRMED":
         reason += f"; {rising} consecutive matching scans"
+
+    # Save the completed directional snapshot.  If the same prices are seen
+    # again during a Streamlit rerun, replace the last snapshot instead of
+    # falsely counting that rerun as a new scan.
+    snapshot = {
+        "ts": _india_now(),
+        "spot": spot,
+        "ce_price": ce_price,
+        "pe_price": pe_price,
+        "directional_bias": directional_bias,
+        "directional_rising_basis": rising_basis,
+        "directional_rising_scans": rising,
+        "ce_direction": ce_dir,
+        "pe_direction": pe_dir,
+    }
+    if series:
+        last = series[-1]
+        same_scan = (
+            _pin_num(last.get("spot"), 0.0) == spot
+            and _pin_num(last.get("ce_price"), 0.0) == ce_price
+            and _pin_num(last.get("pe_price"), 0.0) == pe_price
+        )
+        if same_scan:
+            series[-1] = snapshot
+        else:
+            series.append(snapshot)
+    else:
+        series.append(snapshot)
+    history[key] = series[-DIRECTIONAL_SCAN_HISTORY_MAX:]
+    st.session_state[DIRECTIONAL_SCAN_HISTORY_KEY] = history
 
     return {
         "underlying_direction": underlying,
@@ -5023,26 +5045,6 @@ def _movement_search_one(
                     symbol, expiry, strike, spot, ce_price, pe_price, ce_daily, pe_daily
                 )
 
-                # ADDITIVE HISTORY FIX: persist the directional basis on the
-                # snapshot just created by compute_movement_early_warning().
-                # The next scan can then compare against the previous scan
-                # instead of resetting Rising Scans to 1 every refresh.
-                _directional_history = st.session_state.get(MOVEMENT_HISTORY_KEY, {})
-                _directional_hkey = _movement_history_key(symbol, expiry, strike)
-                _directional_series = (
-                    _directional_history.get(_directional_hkey, [])
-                    if isinstance(_directional_history, dict) else []
-                )
-                if _directional_series:
-                    _directional_series[-1]["directional_bias"] = validation["directional_bias"]
-                    _directional_series[-1]["directional_rising_basis"] = validation.get(
-                        "directional_rising_basis", ""
-                    )
-                    _directional_series[-1]["ce_direction"] = validation["ce_direction"]
-                    _directional_series[-1]["pe_direction"] = validation["pe_direction"]
-                    _directional_history[_directional_hkey] = _directional_series
-                    st.session_state[MOVEMENT_HISTORY_KEY] = _directional_history
-
                 directional_bias = validation["directional_bias"]
                 # Displayed Direction is the confirmed/underlying relationship,
                 # not simply the selected option premium direction.
@@ -5090,10 +5092,7 @@ def _movement_search_one(
                     "PE Direction": validation["pe_direction"],
                     "PE Direction Source": validation["pe_direction_source"],
                     "Signal Validation": validation["signal_validation"],
-                    # signal_valid is stored as the text "YES"/"NO".
-                    # Do not use truthiness here because both non-empty strings
-                    # are truthy and would incorrectly display YES for WATCH.
-                    "Signal Valid": "YES" if str(validation["signal_valid"]).upper() == "YES" else "NO",
+                    "Signal Valid": "YES" if validation["signal_valid"] else "NO",
                     "False Signal Reason": validation["false_signal_reason"],
                     "Directional Bias": directional_bias,
                     "Directional Rising Scans": validation["directional_rising_scans"],
