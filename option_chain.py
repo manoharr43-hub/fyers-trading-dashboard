@@ -4754,10 +4754,15 @@ def _directional_confirmation_additive(
             if pct < -DIRECTION_PRICE_FLAT_PCT:
                 return "DOWN", "SCAN LTP", pct
             return "FLAT", "SCAN LTP", pct
+        # First complete scan has no prior LTP.  FYERS CHANGE is the
+        # available live price movement source, so expose its percentage
+        # instead of returning a misleading zero delta.
         if fallback > 0.005:
-            return "UP", "FYERS CHANGE", 0.0
+            pct = (fallback / cur) * 100.0 if cur > 0 else 0.0
+            return "UP", "FYERS CHANGE", pct
         if fallback < -0.005:
-            return "DOWN", "FYERS CHANGE", 0.0
+            pct = (fallback / cur) * 100.0 if cur > 0 else 0.0
+            return "DOWN", "FYERS CHANGE", pct
         return "UNKNOWN", "WAIT HISTORY", 0.0
 
     old_spot = _pin_num(prev.get("spot"), 0.0) if prev else 0.0
@@ -5018,6 +5023,27 @@ def _movement_search_one(
                 validation = _directional_confirmation_additive(
                     symbol, expiry, strike, spot, ce_price, pe_price, ce_daily, pe_daily
                 )
+
+                # ADDITIVE HISTORY FIX: persist the directional basis on the
+                # snapshot just created by compute_movement_early_warning().
+                # The next scan can then compare against the previous scan
+                # instead of resetting Rising Scans to 1 every refresh.
+                _directional_history = st.session_state.get(MOVEMENT_HISTORY_KEY, {})
+                _directional_hkey = _movement_history_key(symbol, expiry, strike)
+                _directional_series = (
+                    _directional_history.get(_directional_hkey, [])
+                    if isinstance(_directional_history, dict) else []
+                )
+                if _directional_series:
+                    _directional_series[-1]["directional_bias"] = validation["directional_bias"]
+                    _directional_series[-1]["directional_rising_basis"] = validation.get(
+                        "directional_rising_basis", ""
+                    )
+                    _directional_series[-1]["ce_direction"] = validation["ce_direction"]
+                    _directional_series[-1]["pe_direction"] = validation["pe_direction"]
+                    _directional_history[_directional_hkey] = _directional_series
+                    st.session_state[MOVEMENT_HISTORY_KEY] = _directional_history
+
                 directional_bias = validation["directional_bias"]
                 # Displayed Direction is the confirmed/underlying relationship,
                 # not simply the selected option premium direction.
