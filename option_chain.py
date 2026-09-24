@@ -2296,6 +2296,115 @@ def _movement_history_key(symbol: str, expiry_label: str, strike: float) -> str:
     return f"{symbol}|{expiry_label}|{float(strike):.4f}"
 
 
+def _movement_underlying_direction_from_series(series: list[dict[str, Any]]) -> tuple[str, float, float]:
+    """
+    ADDITIVE ONLY: derive underlying/index direction from repeated spot scans.
+    Returns (direction, delta, pct).
+
+    This prevents CE/PE premium movement from being treated as an underlying
+    directional signal when the index/F&O underlying is moving the other way.
+    """
+    try:
+        spots = [
+            _pin_num(x.get("spot_price"), 0.0)
+            for x in (series or [])
+            if _pin_num(x.get("spot_price"), 0.0) > 0
+        ]
+        if len(spots) < 2:
+            return "UNKNOWN", 0.0, 0.0
+
+        prev = float(spots[-2])
+        cur = float(spots[-1])
+        delta = cur - prev
+        pct = (delta / prev) * 100.0 if prev else 0.0
+
+        # Small spot noise is treated as FLAT.
+        noise = max(abs(prev) * 0.00005, 0.01)
+        if abs(delta) <= noise:
+            return "FLAT", delta, pct
+        return ("UP" if delta > 0 else "DOWN"), delta, pct
+    except Exception:
+        return "UNKNOWN", 0.0, 0.0
+
+
+def _movement_ce_pe_direction_filter(
+    ce_direction: str,
+    pe_direction: str,
+    underlying_direction: str,
+) -> dict[str, Any]:
+    """
+    ADDITIVE CE/PE false-signal filter.
+
+    Rules:
+      CE up + PE down/flat + underlying up   => directional UP
+      PE up + CE down/flat + underlying down => directional DOWN
+      CE up + PE up                         => premium expansion / neutral
+      CE down + PE down                     => premium contraction / neutral
+      underlying conflict                   => blocked directional signal
+    """
+    ce = str(ce_direction or "UNKNOWN").upper()
+    pe = str(pe_direction or "UNKNOWN").upper()
+    und = str(underlying_direction or "UNKNOWN").upper()
+
+    if ce == "UP" and pe == "UP":
+        return {
+            "valid": False, "direction": "NEUTRAL",
+            "stage": "PREMIUM EXPANSION",
+            "reason": "CE ↑ + PE ↑ : both-side premium expansion",
+        }
+
+    if ce == "DOWN" and pe == "DOWN":
+        return {
+            "valid": False, "direction": "NEUTRAL",
+            "stage": "PREMIUM CONTRACTION",
+            "reason": "CE ↓ + PE ↓ : both-side premium contraction",
+        }
+
+    if ce == "UP" and pe in {"DOWN", "FLAT"}:
+        if und == "UP":
+            return {
+                "valid": True, "direction": "UP",
+                "stage": "CONFIRMED",
+                "reason": "Underlying ↑ + CE ↑ + PE ↓/FLAT",
+            }
+        if und == "DOWN":
+            return {
+                "valid": False, "direction": "NEUTRAL",
+                "stage": "CONFLICT",
+                "reason": "CE ↑ / PE ↓ but underlying is DOWN",
+            }
+        return {
+            "valid": False, "direction": "UP",
+            "stage": "EARLY WATCH",
+            "reason": "CE ↑ + PE ↓/FLAT; underlying confirmation not available yet",
+        }
+
+    if pe == "UP" and ce in {"DOWN", "FLAT"}:
+        if und == "DOWN":
+            return {
+                "valid": True, "direction": "DOWN",
+                "stage": "CONFIRMED",
+                "reason": "Underlying ↓ + PE ↑ + CE ↓/FLAT",
+            }
+        if und == "UP":
+            return {
+                "valid": False, "direction": "NEUTRAL",
+                "stage": "CONFLICT",
+                "reason": "PE ↑ / CE ↓ but underlying is UP",
+            }
+        return {
+            "valid": False, "direction": "DOWN",
+            "stage": "EARLY WATCH",
+            "reason": "PE ↑ + CE ↓/FLAT; underlying confirmation not available yet",
+        }
+
+    return {
+        "valid": False, "direction": "NEUTRAL",
+        "stage": "WATCH",
+        "reason": "CE/PE relationship is not directionally confirmed",
+    }
+
+
 def compute_movement_early_warning(
     df: pd.DataFrame, symbol: str, expiry_label: str, spot: float
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
@@ -2347,6 +2456,9 @@ def compute_movement_early_warning(
             "oi": float(abs(row.get("ce_chng_oi", 0) or 0) + abs(row.get("pe_chng_oi", 0) or 0)),
             "ce_price": float(row.get("ce_ltp", 0) or 0),
             "pe_price": float(row.get("pe_ltp", 0) or 0),
+            # ADDITIVE: underlying/index spot snapshot used only for
+            # movement-direction validation. Existing score history remains intact.
+            "spot_price": float(spot or 0),
         })
         history[key] = series[-MOVEMENT_HISTORY_MAX:]
 
@@ -4610,6 +4722,9 @@ def _movement_search_excel(df: pd.DataFrame, report_name: str = "Movement Search
         "Movement Bias", "Price Delta", "Price Change %", "Price Direction Source",
         "CE Price", "PE Price", "Early Status", "Rising Scans",
         "Score Delta", "Confidence", "Spot", "Source",
+        "Underlying Direction", "Underlying Delta", "Underlying Change %",
+        "CE Direction", "PE Direction", "Signal Validation",
+        "Signal Valid", "False Signal Reason",
     ]
     cols = [c for c in export_cols if c in df.columns]
     export_df = df[cols].copy() if cols else df.copy()
@@ -5032,7 +5147,63 @@ def _movement_search_one(
                     direction = "UP" if price_delta > 0.005 else ("DOWN" if price_delta < -0.005 else "FLAT")
                     direction_source = "FYERS CHANGE"
 
-                movement_bias = f"{side} {direction}"
+                # ========================================================
+                # ADDITIVE FALSE-SIGNAL VALIDATION
+                # OLD movement score / CE score / PE score are untouched.
+                # Direction is validated against the underlying spot history.
+                # ========================================================
+                ce_current = _pin_num(row.get("ce_ltp"), 0.0)
+                pe_current = _pin_num(row.get("pe_ltp"), 0.0)
+                previous_ce = _pin_num(
+                    series[-2].get("ce_price"), 0.0
+                ) if len(series) >= 2 else 0.0
+                previous_pe = _pin_num(
+                    series[-2].get("pe_price"), 0.0
+                ) if len(series) >= 2 else 0.0
+
+                def _side_dir(cur, prev):
+                    if cur <= 0 or prev <= 0:
+                        return "UNKNOWN"
+                    delta = cur - prev
+                    pct = (delta / prev) * 100.0
+                    noise = max(abs(prev) * 0.0015, 0.005)
+                    if abs(delta) <= noise and abs(pct) < 0.15:
+                        return "FLAT"
+                    return "UP" if delta > 0 else "DOWN"
+
+                ce_direction = _side_dir(ce_current, previous_ce)
+                pe_direction = _side_dir(pe_current, previous_pe)
+
+                underlying_direction, underlying_delta, underlying_pct = (
+                    _movement_underlying_direction_from_series(series)
+                )
+
+                direction_filter = _movement_ce_pe_direction_filter(
+                    ce_direction, pe_direction, underlying_direction
+                )
+
+                validation_stage = direction_filter.get("stage", "WATCH")
+                validation_reason = direction_filter.get("reason", "")
+                signal_valid = bool(direction_filter.get("valid", False))
+
+                # Do not call CE/PE simultaneous premium expansion UP or DOWN.
+                # Do not allow an option-side direction that conflicts with the
+                # underlying/index direction.
+                filtered_direction = direction_filter.get("direction", "NEUTRAL")
+                if validation_stage in {
+                    "PREMIUM EXPANSION",
+                    "PREMIUM CONTRACTION",
+                    "CONFLICT",
+                    "WATCH",
+                }:
+                    filtered_direction = "NEUTRAL"
+
+                direction = filtered_direction
+                movement_bias = (
+                    f"{side} {direction}"
+                    if direction != "NEUTRAL"
+                    else validation_stage
+                )
 
                 reversal_level, reversal_status = _movement_price_reversal_from_history(
                     movement_history,
@@ -5076,6 +5247,14 @@ def _movement_search_one(
                     "Confidence": round(_pin_num(row.get("early_movement_confidence")), 1),
                     "Spot": round(spot, 2) if spot else 0.0,
                     "Source": result.get("source", "UNKNOWN"),
+                    "Underlying Direction": underlying_direction,
+                    "Underlying Delta": round(underlying_delta, 4),
+                    "Underlying Change %": round(underlying_pct, 3),
+                    "CE Direction": ce_direction,
+                    "PE Direction": pe_direction,
+                    "Signal Validation": validation_stage,
+                    "Signal Valid": "YES" if signal_valid else "NO",
+                    "False Signal Reason": validation_reason,
                 })
                 continue
 
