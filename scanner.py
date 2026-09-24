@@ -3254,6 +3254,240 @@ def _fetch_momentum_signal(fyers, symbol: str, is_fo: bool = False):
     except Exception as e:
         logger.exception("LIVE MOMENTUM worker failed for %s",symbol); return None,f"{symbol}: error ({type(e).__name__}: {str(e)[:120]})"
 
+
+# ════════════════════════════════════════════════════════════════════════════════
+# MASTER SCANNER — FALSE SIGNAL PROTECTION (ADDITIVE / OLD SCANNER UNTOUCHED)
+# ════════════════════════════════════════════════════════════════════════════════
+# This layer validates the existing scanner output. It does NOT replace or
+# rewrite the original AI SIGNAL calculation.
+MASTER_MIN_CONFIRMATIONS = 5
+MASTER_MIN_SCORE = 62
+MASTER_STRONG_SCORE = 80
+MASTER_DEDUP_MINUTES = 15
+
+
+def _master_norm_signal(value: Any) -> str:
+    s = str(value or "").upper().strip()
+    if "BUY" in s or "BULL" in s or "UP" == s:
+        return "BUY"
+    if "SELL" in s or "BEAR" in s or "DOWN" == s:
+        return "SELL"
+    return "WAIT"
+
+
+def _master_num(value: Any, default: float = np.nan) -> float:
+    try:
+        if value is None or (isinstance(value, str) and value.strip() in ("", "N/A", "NA", "NONE", "-", "−")):
+            return default
+        return float(value)
+    except Exception:
+        return default
+
+
+def _master_text_direction(value: Any) -> str:
+    s = str(value or "").upper()
+    if any(x in s for x in ("BULLISH", "BUY", "UP", "HH/HL", "HH")) and not any(x in s for x in ("BEAR", "SELL", "DOWN")):
+        return "BUY"
+    if any(x in s for x in ("BEARISH", "SELL", "DOWN", "LH/LL", "LL")) and not any(x in s for x in ("BULL", "BUY", "UP")):
+        return "SELL"
+    return "WAIT"
+
+
+def _master_signal_from_row(row: Dict[str, Any]) -> Dict[str, Any]:
+    """Validate existing scanner output using independent confirmations.
+
+    The original AI SIGNAL remains unchanged. FINAL SIGNAL is a separate
+    safety layer: conflicting evidence becomes WAIT rather than forcing BUY/SELL.
+    """
+    original = _master_norm_signal(row.get("AI SIGNAL"))
+    if original == "WAIT":
+        return {
+            "INTRADAY": "WAIT", "SWING": "WAIT", "BIG MOVE": "WAIT",
+            "PIN": "WAIT", "REVERSAL": "WAIT", "FINAL SIGNAL": "WAIT",
+            "AI CONFIDENCE %": _master_num(row.get("AI CONFIDENCE %"), 0),
+            "SIGNAL CONFIRMATION": "Original scanner has no directional signal",
+            "CONFIRMATION SCORE": 0.0,
+            "MASTER STATUS": "WAIT", "MASTER REASON": "No base BUY/SELL signal"
+        }
+
+    side = original
+    score = 0.0
+    confirmations = 0
+    conflicts = 0
+    reasons = []
+
+    def add(name: str, direction: str, weight: float, detail: str = ""):
+        nonlocal score, confirmations, conflicts
+        if direction == side:
+            score += weight
+            confirmations += 1
+            reasons.append(f"{name}=OK" + (f"({detail})" if detail else ""))
+        elif direction in ("BUY", "SELL") and direction != side:
+            score -= weight
+            conflicts += 1
+            reasons.append(f"{name}=CONFLICT" + (f"({detail})" if detail else ""))
+
+    # INTRADAY: 5M direction + pressure + VWAP + momentum fields.
+    intraday_votes = []
+    d5 = _master_text_direction(row.get("5M Trend"))
+    if d5 in ("BUY", "SELL"): intraday_votes.append(d5)
+    p = _master_text_direction(row.get("PRESSURE SIGNAL"))
+    if p in ("BUY", "SELL"): intraday_votes.append(p)
+    vwap = _master_num(row.get("VWAP")); ltp = _master_num(row.get("LTP"))
+    if np.isfinite(vwap) and np.isfinite(ltp) and vwap > 0:
+        intraday_votes.append("BUY" if ltp > vwap else "SELL")
+    intraday = side if intraday_votes.count(side) >= max(2, len(intraday_votes)//2 + 1) else "WAIT"
+    add("5M/INTRADAY", intraday, 15)
+
+    # SWING: 1H + 15M structure/trend alignment.
+    d15 = _master_text_direction(row.get("15M Trend"))
+    d1h = _master_text_direction(row.get("1H Trend"))
+    swing_votes = [x for x in (d15, d1h) if x in ("BUY", "SELL")]
+    swing = side if swing_votes.count(side) >= 2 else "WAIT"
+    add("15M+1H/SWING", swing, 15)
+
+    # BIG MOVE: use movement fields if present; otherwise conservative WAIT.
+    movement = _master_norm_signal(row.get("MOVEMENT STATUS"))
+    if movement == "WAIT":
+        movement = _master_norm_signal(row.get("DIRECTION"))
+    big_move = movement if movement == side else "WAIT"
+    add("BIG MOVE", big_move, 15)
+
+    # PIN: use explicit PIN fields when available, otherwise derive a conservative
+    # proxy from pressure + structure. No extra API request is made here.
+    pin_raw = _master_norm_signal(row.get("PIN SIGNAL"))
+    if pin_raw == "WAIT":
+        pin_raw = _master_norm_signal(row.get("PIN"))
+    pin = pin_raw if pin_raw == side else "WAIT"
+    add("PIN", pin, 10)
+
+    # REVERSAL: an opposite reversal is a hard conflict. A same-side reversal is
+    # confirmation. Existing reversal columns are preserved.
+    rev = _master_norm_signal(row.get("REVERSAL SIGNAL"))
+    if rev == "WAIT":
+        rev = _master_norm_signal(row.get("SIGNAL TYPE"))
+    reversal = rev if rev == side else "WAIT"
+    if rev in ("BUY", "SELL") and rev != side:
+        conflicts += 1
+        score -= 20
+        reasons.append("REVERSAL=OPPOSITE")
+    elif rev == side:
+        score += 10
+        confirmations += 1
+        reasons.append("REVERSAL=OK")
+
+    # Core indicator confirmations.
+    rsi = _master_num(row.get("RSI"), 50)
+    macd = str(row.get("MACD", "")).upper()
+    rvol = _master_num(row.get("RVOL"), 1.0)
+    if side == "BUY":
+        rsi_ok = 45 <= rsi <= 72
+        macd_ok = "🟢" in macd or "GREEN" in macd or "BULL" in macd
+    else:
+        rsi_ok = 28 <= rsi <= 55
+        macd_ok = "🔴" in macd or "RED" in macd or "BEAR" in macd
+    if rsi_ok:
+        score += 5; confirmations += 1; reasons.append("RSI=OK")
+    else:
+        score -= 4; conflicts += 1; reasons.append("RSI=WEAK")
+    if macd_ok:
+        score += 5; confirmations += 1; reasons.append("MACD=OK")
+    else:
+        score -= 4; conflicts += 1; reasons.append("MACD=WEAK")
+    if np.isfinite(rvol):
+        if rvol >= DEFAULT_RVOL_THRESHOLD:
+            score += 5; confirmations += 1; reasons.append(f"RVOL={rvol:.2f}x")
+        elif rvol < 0.8:
+            score -= 5; conflicts += 1; reasons.append(f"RVOL_LOW={rvol:.2f}x")
+
+    # Options confirmation is only used when present; never treated as mandatory.
+    opt = _master_text_direction(row.get("OPTIONS BIAS"))
+    if opt in ("BUY", "SELL"):
+        if opt == side:
+            score += 5; confirmations += 1; reasons.append("OPTIONS=OK")
+        else:
+            score -= 8; conflicts += 1; reasons.append("OPTIONS=CONFLICT")
+
+    score = max(0.0, min(100.0, score + 30.0))
+
+    # Hard conflict rule: opposite 15M + 1H or explicit reversal conflict means WAIT.
+    hard_conflict = (d15 in ("BUY", "SELL") and d1h in ("BUY", "SELL") and d15 != side and d1h != side)
+    hard_conflict = hard_conflict or (rev in ("BUY", "SELL") and rev != side)
+
+    if hard_conflict or conflicts >= 4 or confirmations < MASTER_MIN_CONFIRMATIONS or score < MASTER_MIN_SCORE:
+        final = "WAIT"
+        status = "FILTERED"
+    elif score >= MASTER_STRONG_SCORE and confirmations >= 7 and conflicts <= 1:
+        final = side
+        status = "STRONG CONFIRMED"
+    else:
+        final = side
+        status = "CONFIRMED"
+
+    conf0 = _master_num(row.get("AI CONFIDENCE %"), 0.0)
+    confidence = round(max(0.0, min(100.0, conf0 * 0.45 + score * 0.55)), 1)
+    confirmation_text = f"{confirmations} confirmations / {conflicts} conflicts"
+    return {
+        "INTRADAY": intraday,
+        "SWING": swing,
+        "BIG MOVE": big_move,
+        "PIN": pin,
+        "REVERSAL": reversal,
+        "FINAL SIGNAL": final,
+        "AI CONFIDENCE %": confidence,
+        "SIGNAL CONFIRMATION": confirmation_text,
+        "CONFIRMATION SCORE": round(score, 1),
+        "MASTER STATUS": status,
+        "MASTER REASON": " | ".join(reasons[:14])
+    }
+
+
+def _master_enrich_row(res: Dict[str, Any]) -> Dict[str, Any]:
+    """Add Master Scanner columns without changing any original fields."""
+    if not isinstance(res, dict):
+        return res
+    try:
+        master = _master_signal_from_row(res)
+        # Preserve the original AI CONFIDENCE and expose validated confidence
+        # separately so old filters/results remain untouched.
+        master["MASTER CONFIDENCE %"] = master.pop("AI CONFIDENCE %")
+        res.update(master)
+        # Keep the original signal visible and create a clearly separate final signal.
+        res["ORIGINAL AI SIGNAL"] = res.get("AI SIGNAL", "WAIT")
+        return res
+    except Exception as e:
+        res["INTRADAY"] = "WAIT"
+        res["SWING"] = "WAIT"
+        res["BIG MOVE"] = "WAIT"
+        res["PIN"] = "WAIT"
+        res["REVERSAL"] = "WAIT"
+        res["FINAL SIGNAL"] = "WAIT"
+        res["MASTER CONFIDENCE %"] = 0.0
+        res["SIGNAL CONFIRMATION"] = "Master validation error"
+        res["CONFIRMATION SCORE"] = 0.0
+        res["MASTER STATUS"] = "ERROR"
+        res["MASTER REASON"] = f"{type(e).__name__}"
+        return res
+
+
+def _master_dedupe_results(results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Single-time protection: one current direction per symbol per scan session."""
+    if not results:
+        return results
+    seen = {}
+    out = []
+    for r in results:
+        sym = str(r.get("Symbol", r.get("STOCK NAME", ""))).upper().strip()
+        sig = str(r.get("FINAL SIGNAL", "WAIT")).upper()
+        if sig in ("BUY", "SELL") and sym:
+            key = (sym, sig)
+            if key in seen:
+                continue
+            seen[key] = True
+        out.append(r)
+    return out
+
+
 # ════════════════════════════════════════════════════════════════════════════════
 # THREADED SCAN FUNCTIONS
 # ════════════════════════════════════════════════════════════════════════════════
@@ -3276,6 +3510,7 @@ def run_nse_scan(fyers, symbols):
                     res, err = None, f"{futures[future]}: worker error"
                 
                 if res:
+                    res = _master_enrich_row(res)
                     results.append(res)
                 if err:
                     errors.append(err)
@@ -3310,6 +3545,7 @@ def run_fo_scan(fyers, symbols):
                     res, err = None, f"{futures[future]}: worker error"
                 
                 if res:
+                    res = _master_enrich_row(res)
                     results.append(res)
                 if err:
                     errors.append(err)
@@ -5107,6 +5343,10 @@ def show_scanner(fyers) -> None:
                 
                 nse_filtered = _add_reversal_columns(nse_filtered)
                 st.dataframe(nse_filtered, use_container_width=True, height=500, hide_index=True)
+
+                if st.checkbox("🧠 Show Master Scanner validation", key="nse_master_view"):
+                    master_cols = [c for c in ["Symbol", "LTP", "ORIGINAL AI SIGNAL", "AI CONFIDENCE %", "INTRADAY", "SWING", "BIG MOVE", "PIN", "REVERSAL", "FINAL SIGNAL", "MASTER CONFIDENCE %", "SIGNAL CONFIRMATION", "CONFIRMATION SCORE", "MASTER STATUS", "MASTER REASON", "ENTRY", "STOP LOSS", "TARGET 1", "TARGET 2", "RISK:REWARD"] if c in nse_filtered.columns]
+                    st.dataframe(nse_filtered[master_cols], use_container_width=True, height=420, hide_index=True)
                 
                 st.markdown("### 📥 Download")
                 col_d1, col_d2, col_d3 = st.columns(3)
@@ -5231,6 +5471,10 @@ def show_scanner(fyers) -> None:
                 
                 fo_filtered = _add_reversal_columns(fo_filtered)
                 st.dataframe(fo_filtered, use_container_width=True, height=500, hide_index=True)
+
+                if st.checkbox("🧠 Show Master Scanner validation", key="fo_master_view"):
+                    master_cols = [c for c in ["Symbol", "LTP", "ORIGINAL AI SIGNAL", "AI CONFIDENCE %", "INTRADAY", "SWING", "BIG MOVE", "PIN", "REVERSAL", "FINAL SIGNAL", "MASTER CONFIDENCE %", "SIGNAL CONFIRMATION", "CONFIRMATION SCORE", "MASTER STATUS", "MASTER REASON", "ENTRY", "STOP LOSS", "TARGET 1", "TARGET 2", "RISK:REWARD"] if c in fo_filtered.columns]
+                    st.dataframe(fo_filtered[master_cols], use_container_width=True, height=420, hide_index=True)
                 
                 st.markdown("### 📥 Download")
                 col_d1, col_d2, col_d3 = st.columns(3)
