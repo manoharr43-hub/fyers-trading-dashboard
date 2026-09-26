@@ -5254,21 +5254,16 @@ def show_scanner(fyers) -> None:
     tabs = st.tabs([
         "🇮🇳 NSE STOCKS",
         "📊 F&O STOCKS",
-        "⚡ MOMENTUM MOVERS",
         "🚦 BEFORE MOVE",
-        "📖 LIVE ORDER BOOK",
-        "⚡ LIVE INTRADAY",
-        "🔥 STRONG SIGNALS",
-        "📈 SWING (GOLDEN/DEATH CROSS)",
-        "🧠 ADDITIONAL ANALYSIS",
-        "📊 MARKET DASHBOARD",
-        "⚙️ SETTINGS",
-        "📌 PIN RULES",
         "🎯 F&O OPTION CHECK",
         "🔄 REVERSAL",
-        "🤖 AI CHART ANALYSIS"
+        "📈 SWING",
+        "📌 PIN RULES",
+        "⚙️ SETTINGS"
     ])
     
+    # ════════════════════════════════════════════════════════════════════════════════
+    # TAB 0: NSE STOCKS
     # ════════════════════════════════════════════════════════════════════════════════
     # TAB 0: NSE STOCKS
     # ════════════════════════════════════════════════════════════════════════════════
@@ -5379,7 +5374,6 @@ def show_scanner(fyers) -> None:
                 st.error(f"❌ NSE Tab Error: {str(e)[:100]}")
         else:
             st.info("👈 Click 'SCAN NSE' to start")
-    
     # ════════════════════════════════════════════════════════════════════════════════
     # TAB 1: F&O STOCKS
     # ════════════════════════════════════════════════════════════════════════════════
@@ -5507,51 +5501,10 @@ def show_scanner(fyers) -> None:
                 st.error(f"❌ F&O Tab Error: {str(e)[:100]}")
         else:
             st.info("👈 Click 'SCAN F&O' to start")
-    
     # ════════════════════════════════════════════════════════════════════════════════
-    # TAB 2: MOMENTUM MOVERS — INTRADAY PRE-MOVE + BIG MOVE
+    # TAB 2: BEFORE MOVE — EARLY WARNING SIGNAL
     # ════════════════════════════════════════════════════════════════════════════════
     with tabs[2]:
-        st.markdown("### ⚡ INTRADAY MOVEMENT — PRE-MOVE + BIG BUY / BIG SELL")
-        st.caption("Checks recent completed 5M candles. Early warning before movement + confirmed movement after breakout/acceleration.")
-        col_m1,col_m2,col_m3=st.columns([2,2,1])
-        with col_m1:
-            momentum_type=st.radio("Select Universe",["NSE Stocks","F&O Stocks"],horizontal=True,key="momentum_type")
-            momentum_universe=all_symbols if momentum_type=="NSE Stocks" else fo_symbols
-        with col_m2:
-            momentum_limit=st.number_input("Scan limit",min_value=50,max_value=len(momentum_universe),value=min(500,len(momentum_universe)),step=50,key="momentum_limit")
-        with col_m3: st.metric("Available",len(momentum_universe))
-        momentum_symbols=momentum_universe[:momentum_limit]
-        if st.button(f"⚡ SCAN INTRADAY MOVEMENT ({len(momentum_symbols)} stocks)",key="momentum_run",type="primary"):
-            with st.spinner("Scanning recent 5M candles for PRE-MOVE and BIG BUY/SELL…"):
-                is_fo=momentum_type=="F&O Stocks"; rr,ee,ss=run_momentum_scan(fyers,momentum_symbols,is_fo=is_fo)
-                st.session_state["momentum_df"]=pd.DataFrame(rr) if rr else pd.DataFrame(); st.session_state["momentum_errors"]=ee; st.session_state["momentum_stats"]=ss; st.session_state["momentum_scanned_at"]=_generated_timestamp()
-        if "momentum_stats" in st.session_state:
-            _display_scan_summary(st.session_state["momentum_stats"]); st.caption(f"Last scan: {st.session_state.get('momentum_scanned_at','N/A')}")
-        mdf=st.session_state.get("momentum_df")
-        if mdf is not None and not mdf.empty:
-            for col in ["SCORE","PRE-MOVE SCORE","BEFORE MOVE SCORE","EARLY MOVE SCORE","ENERGY BUILD","RANGE COMPRESSION","VOLUME ACCELERATION","PRICE ACCELERATION","RVOL","SIGNAL AGE (MIN)"]: mdf[col]=pd.to_numeric(mdf[col],errors="coerce") if col in mdf.columns else 0
-            status_order={"🔥 BIG BUY":0,"🔥 BIG SELL":0,"🟢 BUY BEFORE MOVE":1,"🔴 SELL BEFORE MOVE":1,"🟢 BIG BUY WATCH":2,"🔴 BIG SELL WATCH":2,"🟡 PRE-BIG BUY":3,"🟡 PRE-BIG SELL":3,"🟢 BUY":4,"🔴 SELL":4,"⚪ WAIT":9}
-            mdf["_order"]=mdf["MOVEMENT STATUS"].map(status_order).fillna(8)
-            mdf=mdf.sort_values(["_order","EARLY MOVE SCORE","SCORE","PRE-MOVE SCORE","RVOL"],ascending=[True,False,False,False,False]).drop(columns=["_order"])
-            # Keep stock name as the first visible column in the movement table.
-            _momentum_symbol_col = next((c for c in ["SYMBOL", "Symbol", "symbol"] if c in mdf.columns), None)
-            if _momentum_symbol_col is not None and _momentum_symbol_col != "STOCK NAME":
-                mdf=mdf.rename(columns={_momentum_symbol_col:"STOCK NAME"})
-            if "STOCK NAME" not in mdf.columns:
-                mdf.insert(0,"STOCK NAME","N/A")
-            _momentum_cols=["STOCK NAME"]+[c for c in mdf.columns if c!="STOCK NAME"]
-            mdf=mdf[_momentum_cols]
-            mdf=_add_reversal_columns(mdf)
-            st.markdown("### 🚦 MOVEMENT STATUS")
-            st.dataframe(mdf,use_container_width=True,height=560,hide_index=True)
-            st.download_button("📊 Excel",_format_excel_output(mdf,"INTRADAY_MOVEMENT"),f"INTRADAY_MOVEMENT_{_now_ist().strftime('%Y%m%d_%H%M')}.xlsx","application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",key="momentum_xls")
-        else: st.info("Click SCAN INTRADAY MOVEMENT to start.")
-
-    # ════════════════════════════════════════════════════════════════════════════════
-    # TAB 3: BEFORE MOVE — EARLY WARNING SIGNAL
-    # ════════════════════════════════════════════════════════════════════════════════
-    with tabs[3]:
         st.markdown("### 🚦 BEFORE MOVE — EARLY WARNING SIGNAL")
         st.caption("Advanced early-warning engine added. Old Momentum / NSE / F&O / PIN / Liquidity / Order Block / Reversal logic remains intact.")
         bdf = st.session_state.get("momentum_df")
@@ -5577,507 +5530,10 @@ def show_scanner(fyers) -> None:
             st.download_button("📊 Download BEFORE MOVE", _format_excel_output(view, "BEFORE_MOVE"), f"BEFORE_MOVE_{_now_ist().strftime('%Y%m%d_%H%M')}.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="before_move_xls")
         else:
             st.info("Run SCAN INTRADAY MOVEMENT first. The separate BEFORE MOVE tab will then show the early-warning signals.")
-
     # ════════════════════════════════════════════════════════════════════════════════
-    # TAB 4: LIVE EXCHANGE ORDER BOOK
+    # TAB 3: F&O OPTION CHECK — LIVE RUN
     # ════════════════════════════════════════════════════════════════════════════════
-    with tabs[4]:
-        _show_live_order_flow_tab(fyers, all_symbols)
-
-    # ════════════════════════════════════════════════════════════════════════════════
-    # TAB 4: LIVE INTRADAY
-    # ════════════════════════════════════════════════════════════════════════════════
-    with tabs[5]:
-        st.markdown("### ⚡ Live Intraday Scanner\nReal-time multi-timeframe analysis (5M, 15M, 1H)")
-        
-        col1, col2 = st.columns(2)
-        with col1:
-            intraday_type = st.radio("Select Universe", ["NSE Stocks", "F&O Stocks"], horizontal=True, key="intraday_type")
-            intraday_universe = all_symbols if intraday_type == "NSE Stocks" else fo_symbols
-        
-        with col2:
-            intraday_limit = st.number_input("Scan limit", min_value=10, max_value=len(intraday_universe),
-                                            value=min(100, len(intraday_universe)), step=10, key="intraday_limit")
-        
-        intraday_symbols = intraday_universe[:intraday_limit]
-        
-        if st.button(f"⚡ SCAN LIVE INTRADAY ({len(intraday_symbols)} stocks)", key="intraday_run"):
-            with st.spinner("Fetching live intraday data…"):
-                if intraday_type == "NSE Stocks":
-                    intraday_results, _, _ = run_nse_scan(fyers, intraday_symbols)
-                else:
-                    intraday_results, _, _ = run_fo_scan(fyers, intraday_symbols)
-                
-                if intraday_results:
-                    intraday_df = pd.DataFrame(intraday_results)
-                    st.session_state["intraday_df"] = intraday_df
-        
-        intraday_df = st.session_state.get("intraday_df")
-        if intraday_df is not None and not intraday_df.empty:
-            st.success(f"✅ Live data: {len(intraday_df)} stocks")
-            
-            col_if1, col_if2, col_if3 = st.columns(3)
-            with col_if1:
-                intraday_min_rvol = st.slider("Min RVOL", 0.5, 3.0, 1.2, 0.1, key="intraday_rvol")
-            with col_if2:
-                intraday_signal_filter = st.selectbox("Signal", ["ALL", "BUY", "SELL"], key="intraday_sig_filter")
-            with col_if3:
-                intraday_show_cols = st.multiselect("Show Columns", intraday_df.columns, 
-                                                   default=["Symbol", "LTP", "AI SIGNAL", "AI CONFIDENCE %", "RVOL", "🟢 BUY PRESSURE %", "🔴 SELL PRESSURE %"],
-                                                   key="intraday_cols")
-            
-            intraday_filtered = intraday_df.copy()
-            try:
-                intraday_filtered = intraday_filtered[pd.to_numeric(intraday_filtered["RVOL"], errors='coerce') >= intraday_min_rvol]
-            except:
-                pass
-            
-            if intraday_signal_filter != "ALL":
-                try:
-                    normalized = intraday_filtered["AI SIGNAL"].apply(normalize_signal)
-                    if intraday_signal_filter == "BUY":
-                        intraday_filtered = intraday_filtered[normalized == "BUY"]
-                    elif intraday_signal_filter == "SELL":
-                        intraday_filtered = intraday_filtered[normalized == "SELL"]
-                except:
-                    pass
-            
-            if intraday_show_cols:
-                st.dataframe(intraday_filtered[intraday_show_cols], use_container_width=True, height=400)
-            else:
-                st.dataframe(intraday_filtered, use_container_width=True, height=400)
-        else:
-            st.info("👈 Click 'SCAN LIVE INTRADAY' to fetch data")
-    
-    # ════════════════════════════════════════════════════════════════════════════════
-    # TAB 5: STRONG SIGNALS
-    # ════════════════════════════════════════════════════════════════════════════════
-    with tabs[6]:
-        st.markdown("### 🔥 Strong Signals Only\nHigh-confidence setups (≥70%)")
-        strong_source = st.radio("Source", ["NSE Stocks", "F&O Stocks"], horizontal=True, key="strong_source")
-
-        strong_universe_all = all_symbols if strong_source == "NSE Stocks" else fo_symbols
-        strong_default = min(500 if strong_source == "NSE Stocks" else 200, len(strong_universe_all))
-        strong_limit = st.number_input(
-            "Strong Signals scan limit (0 = all)",
-            min_value=0, max_value=len(strong_universe_all),
-            value=strong_default,
-            step=50 if strong_source == "NSE Stocks" else 25,
-            key="strong_limit"
-        )
-
-        if st.button("🔥 RUN STRONG SIGNALS", key="run_strong_signals", type="primary", use_container_width=True):
-            with st.spinner(f"Scanning {strong_source} for strong signals…"):
-                universe = strong_universe_all if strong_limit == 0 else strong_universe_all[:strong_limit]
-                if strong_source == "NSE Stocks":
-                    r, e, s = run_nse_scan(fyers, universe)
-                    st.session_state["nse_df"] = pd.DataFrame(r) if r else pd.DataFrame()
-                    st.session_state["nse_errors"] = e
-                    st.session_state["nse_stats"] = s
-                else:
-                    r, e, s = run_fo_scan(fyers, universe)
-                    st.session_state["fo_df"] = pd.DataFrame(r) if r else pd.DataFrame()
-                    st.session_state["fo_errors"] = e
-                    st.session_state["fo_stats"] = s
-
-        strong_df = st.session_state.get("nse_df" if strong_source == "NSE Stocks" else "fo_df")
-        
-        if strong_df is not None and not strong_df.empty:
-            try:
-                confidence_col = pd.to_numeric(strong_df.get("AI CONFIDENCE %", pd.Series([])), errors='coerce')
-                strong_filtered = strong_df[confidence_col >= 75].copy()
-                
-                normalized = strong_filtered["AI SIGNAL"].apply(normalize_signal)
-                strong_filtered = strong_filtered[normalized != "NEUTRAL"]
-                
-                st.subheader(f"💪 {len(strong_filtered)} Strong Signals")
-                
-                if len(strong_filtered) > 0:
-                    st.dataframe(strong_filtered.sort_values("AI CONFIDENCE %", ascending=False), 
-                               use_container_width=True, height=400)
-                    _excel_download_button(
-                        strong_filtered.sort_values("AI CONFIDENCE %", ascending=False),
-                        "STRONG_SIGNALS",
-                        "download_strong_signals_excel"
-                    )
-                else:
-                    st.warning("No strong signals (≥75% confidence) found. Lower the threshold in Settings tab.")
-            
-            except Exception as e:
-                st.error(f"❌ Error: {str(e)[:100]}")
-        else:
-            st.info(f"👈 Run '{strong_source}' scanner first")
-    
-    # ════════════════════════════════════════════════════════════════════════════════
-    # TAB 6: SWING — CROSS + LONG-MOVE RADAR
-    # ════════════════════════════════════════════════════════════════════════════════
-    with tabs[7]:
-        st.markdown("### 📈 Swing Trading — Long-Move Radar + Golden/Death Cross")
-        st.caption("Daily closed-candle trend scanner. LONG-MOVE WATCH is a setup filter, not a guaranteed forecast.")
-
-        col1, col2 = st.columns([3, 1])
-        with col1:
-            swing_limit = st.number_input("Scan limit (0 = ALL NSE)", min_value=10, max_value=len(all_symbols),
-                                         value=min(100, len(all_symbols)), step=25, key="swing_limit")
-        with col2:
-            st.metric("Available", len(all_symbols))
-        swing_symbols = all_symbols if swing_limit == 0 else all_symbols[:swing_limit]
-
-        b1, b2 = st.columns(2)
-        with b1:
-            if st.button(f"🚀 RUN SWING LONG-MOVE ({len(swing_symbols)} stocks)", key="swing_long_run", type="primary", use_container_width=True):
-                results = []
-                prog = st.progress(0)
-                with st.spinner("Scanning daily trend, EMA structure, momentum and volume…"):
-                    for idx, symbol in enumerate(swing_symbols):
-                        r = detect_swing_long_move(fyers, symbol)
-                        # Keep both successful and failed rows so the user can see why a symbol was skipped.
-                        results.append(r)
-                        prog.progress((idx + 1) / max(len(swing_symbols),1))
-                prog.empty()
-                df_long = pd.DataFrame(results)
-                if not df_long.empty:
-                    usable = df_long[df_long["ltp"].notna()].copy()
-                    if not usable.empty:
-                        usable = usable.sort_values(["score","return60"], ascending=False, na_position="last")
-                    st.session_state["swing_long_df"] = usable if not usable.empty else df_long
-                    st.success(f"✅ Swing scan complete: {len(usable)} stocks with usable daily data out of {len(df_long)} scanned.")
-                else:
-                    st.warning("No symbols were scanned. Check the NSE symbol list / API connection.")
-        with b2:
-            if st.button(f"📈 DETECT CROSSOVERS ({len(swing_symbols)} stocks)", key="swing_run", use_container_width=True):
-                swing_results = []
-                swing_progress = st.progress(0)
-                with st.spinner("Analyzing daily charts for Golden/Death Cross…"):
-                    for idx, symbol in enumerate(swing_symbols):
-                        try:
-                            cc_data = detect_golden_death_cross(fyers, symbol)
-                            if cc_data.get("reason") == "OK":
-                                ticker = symbol.replace("NSE:", "").replace("-EQ", "")
-                                swing_results.append({"Symbol": ticker, "LTP": cc_data.get("ltp", "N/A"), "EMA50": cc_data.get("ema50", "N/A"),
-                                                      "EMA200": cc_data.get("ema200", "N/A"), "EMA Trend": cc_data.get("ema_trend", "N/A"),
-                                                      "Signal": cc_data.get("signal", "NONE"), "Signal Date": cc_data.get("signal_date", "N/A")})
-                        except Exception:
-                            pass
-                        swing_progress.progress((idx + 1) / max(len(swing_symbols),1))
-                swing_progress.empty()
-                if swing_results:
-                    st.session_state["swing_df"] = pd.DataFrame(swing_results)
-
-        long_df = st.session_state.get("swing_long_df")
-        if long_df is not None and not long_df.empty:
-            st.success(f"✅ Swing Long-Move scan complete: {len(long_df)} stocks")
-            fcol1, fcol2 = st.columns(2)
-            with fcol1:
-                long_filter = st.selectbox("Long-Move Status", ["ALL", "🟢 LONG-MOVE WATCH", "🟡 EARLY WATCH", "⚪ WAIT"], key="swing_long_filter")
-            with fcol2:
-                trend_filter = st.selectbox("Daily Trend", ["ALL", "BULLISH", "NEUTRAL", "BEARISH"], key="swing_long_trend")
-            view = _add_reversal_columns(long_df.copy())
-            if long_filter != "ALL": view = view[view["status"] == long_filter]
-            if trend_filter != "ALL": view = view[view["trend"] == trend_filter]
-            st.dataframe(view.head(50), use_container_width=True, hide_index=True)
-            _excel_download_button(view, "SWING_LONG_MOVE", "download_swing_long_move_excel")
-            st.caption("Higher score means more conditions are aligned; it does not mean the stock will definitely rise.")
-        else:
-            st.info("👈 Click RUN SWING LONG-MOVE to find stocks with stronger daily trend/momentum alignment.")
-
-        if long_df is not None and not long_df.empty and "reason" in long_df.columns:
-            bad = long_df[long_df["ltp"].isna()].copy() if "ltp" in long_df.columns else pd.DataFrame()
-            if not bad.empty:
-                with st.expander(f"⚠️ Daily data unavailable / skipped: {len(bad)} stocks", expanded=False):
-                    st.dataframe(bad[[c for c in ["symbol","status","reason"] if c in bad.columns]].head(100), use_container_width=True, hide_index=True)
-
-        swing_df = st.session_state.get("swing_df")
-        if swing_df is not None and not swing_df.empty:
-            st.markdown("#### Golden / Death Cross results")
-            swing_report = _add_reversal_columns(swing_df.copy())
-            st.dataframe(swing_report, use_container_width=True, hide_index=True)
-            _excel_download_button(swing_report, "SWING_CROSS_REVERSAL", "download_swing_cross_reversal_excel")
-
-    # ════════════════════════════════════════════════════════════════════════════════
-    # TAB 7: ADDITIONAL ANALYSIS
-    # ════════════════════════════════════════════════════════════════════════════════
-    with tabs[8]:
-        st.markdown("### 🧠 Additional Analysis - Deep Dive on Single Stock")
-        
-        col1, col2 = st.columns(2)
-        with col1:
-            aa_universe = st.radio("Select Universe", ["NSE", "F&O"], horizontal=True, key="aa_universe")
-            aa_symbols = all_symbols if aa_universe == "NSE" else fo_symbols
-        
-        with col2:
-            aa_symbol_input = st.selectbox("Choose Stock", aa_symbols, key="aa_stock_select")
-        
-        if st.button("🔍 ANALYZE", key="aa_run"):
-            with st.spinner(f"Analyzing {aa_symbol_input}…"):
-                try:
-                    analysis_5m = analyze_timeframe(fyers, aa_symbol_input, "5")
-                    analysis_15m = analyze_timeframe(fyers, aa_symbol_input, "15")
-                    analysis_1h = analyze_timeframe(fyers, aa_symbol_input, "60")
-                    
-                    if aa_universe == "F&O":
-                        options_data = fetch_options_chain_data(fyers, aa_symbol_input)
-                    else:
-                        options_data = None
-                    
-                    master_signal = calculate_master_signal(aa_symbol_input, analysis_5m, analysis_15m, analysis_1h, options_data)
-                    
-                    st.session_state["aa_analysis"] = {
-                        "5m": analysis_5m,
-                        "15m": analysis_15m,
-                        "1h": analysis_1h,
-                        "master": master_signal,
-                        "options": options_data,
-                    }
-                
-                except Exception as e:
-                    st.error(f"❌ Analysis failed: {str(e)}")
-        
-        aa_analysis = st.session_state.get("aa_analysis")
-        if aa_analysis:
-            ticker = aa_symbol_input.replace("NSE:", "").replace("-EQ", "")
-            
-            st.markdown(f"## {ticker} Analysis")
-            master = aa_analysis.get("master", {})
-            signal = master.get("final_signal", "NEUTRAL")
-            conf = master.get("confidence", 0)
-            
-            if "BUY" in signal:
-                st.success(f"{signal} — {conf:.0f}% Confidence")
-            elif "SELL" in signal:
-                st.error(f"{signal} — {conf:.0f}% Confidence")
-            else:
-                st.warning(f"{signal} — {conf:.0f}% Confidence")
-            
-            st.markdown("### ⏱️ Timeframe Analysis")
-            col_5m, col_15m, col_1h = st.columns(3)
-            
-            with col_5m:
-                d5 = aa_analysis["5m"].get("data", {})
-                if d5:
-                    st.write("**5 MINUTE**")
-                    st.write(f"Trend: {d5.get('structure_trend', 'N/A')}")
-                    st.write(f"Structure: {d5.get('structure_type', 'N/A')}")
-                    st.write(f"LTP: {d5.get('last_close', 'N/A')}")
-                    st.write(f"RSI: {d5.get('rsi', 'N/A')}")
-                    st.write(f"RVOL: {d5.get('rvol', 'N/A')}x")
-            
-            with col_15m:
-                d15 = aa_analysis["15m"].get("data", {})
-                if d15:
-                    st.write("**15 MINUTE**")
-                    st.write(f"Trend: {d15.get('structure_trend', 'N/A')}")
-                    st.write(f"Structure: {d15.get('structure_type', 'N/A')}")
-                    st.write(f"VWAP: {d15.get('vwap', 'N/A')}")
-                    st.write(f"EMA Trend: {d15.get('ema_trend', 'N/A')}")
-            
-            with col_1h:
-                d1h = aa_analysis["1h"].get("data", {})
-                if d1h:
-                    st.write("**1 HOUR**")
-                    st.write(f"Trend: {d1h.get('structure_trend', 'N/A')}")
-                    st.write(f"Structure: {d1h.get('structure_type', 'N/A')}")
-                    st.write(f"EMA50: {d1h.get('ema50', 'N/A')}")
-                    st.write(f"EMA200: {d1h.get('ema200', 'N/A')}")
-            
-            st.markdown("### 📊 Pressure Analysis")
-            if d5:
-                bp = d5.get("buying_pressure", 0)
-                sp = d5.get("selling_pressure", 0)
-                col_bp1, col_bp2 = st.columns(2)
-                with col_bp1:
-                    st.metric("🟢 Buying Pressure", f"{bp}%")
-                with col_bp2:
-                    st.metric("🔴 Selling Pressure", f"{sp}%")
-            
-            st.markdown("### 🏗️ Market Structure")
-            col_struct1, col_struct2, col_struct3 = st.columns(3)
-            
-            with col_struct1:
-                if d5 and d5.get("bullish_choch"):
-                    st.success("✅ Bullish CHoCH")
-                elif d5 and d5.get("bearish_choch"):
-                    st.error("❌ Bearish CHoCH")
-            
-            with col_struct2:
-                if d5 and d5.get("bullish_mss"):
-                    st.success("✅ Bullish MSS")
-                elif d5 and d5.get("bearish_mss"):
-                    st.error("❌ Bearish MSS")
-            
-            with col_struct3:
-                if d5 and d5.get("bullish_cisd"):
-                    st.success("✅ Bullish CISD")
-                elif d5 and d5.get("bearish_cisd"):
-                    st.error("❌ Bearish CISD")
-            
-            st.markdown("### 💹 Trade Plan")
-            col_tp1, col_tp2, col_tp3, col_tp4 = st.columns(4)
-            
-            entry = master.get("entry", "N/A")
-            sl = master.get("stop_loss", "N/A")
-            t1 = master.get("target1", "N/A")
-            t2 = master.get("target2", "N/A")
-            rr = master.get("rr_ratio", "N/A")
-            
-            with col_tp1:
-                st.metric("Entry", f"{entry}")
-            with col_tp2:
-                st.metric("Stop Loss", f"{sl}")
-            with col_tp3:
-                st.metric("Target 1", f"{t1}")
-            with col_tp4:
-                st.metric("Target 2 / R:R", f"{t2} / {rr}")
-            
-            st.markdown("### 📝 Signal Explanation")
-            reason = master.get("signal_reason", "N/A")
-            st.info(reason)
-            
-            if aa_universe == "F&O" and aa_analysis.get("options"):
-                st.markdown("### 📊 Options Analysis")
-                opt = aa_analysis["options"]
-                col_opt1, col_opt2, col_opt3, col_opt4 = st.columns(4)
-                
-                with col_opt1:
-                    st.metric("ATM Strike", opt.get("atm_strike", "N/A"))
-                with col_opt2:
-                    st.metric("PCR", opt.get("pcr", "N/A"))
-                with col_opt3:
-                    st.metric("CE OI", opt.get("ce_oi", "N/A"))
-                with col_opt4:
-                    st.metric("Options Bias", opt.get("options_bias", "N/A"))
-    
-    # ════════════════════════════════════════════════════════════════════════════════
-    # TAB 8: MARKET DASHBOARD
-    # ════════════════════════════════════════════════════════════════════════════════
-    with tabs[9]:
-        st.markdown("### 📊 Market Dashboard - Statistics & Sentiment")
-        dashboard_source = st.radio("Data Source", ["NSE Stocks", "F&O Stocks"], horizontal=True, key="dash_source")
-
-        dash_universe_all = all_symbols if dashboard_source == "NSE Stocks" else fo_symbols
-        dash_default = min(500 if dashboard_source == "NSE Stocks" else 200, len(dash_universe_all))
-        dash_limit = st.number_input(
-            "Dashboard scan limit (0 = all)",
-            min_value=0, max_value=len(dash_universe_all),
-            value=dash_default,
-            step=50 if dashboard_source == "NSE Stocks" else 25,
-            key="dash_limit"
-        )
-
-        if st.button("📊 RUN MARKET DASHBOARD", key="run_market_dashboard", type="primary", use_container_width=True):
-            with st.spinner(f"Scanning {dashboard_source} for market dashboard…"):
-                universe = dash_universe_all if dash_limit == 0 else dash_universe_all[:dash_limit]
-                if dashboard_source == "NSE Stocks":
-                    r, e, s = run_nse_scan(fyers, universe)
-                    st.session_state["nse_df"] = pd.DataFrame(r) if r else pd.DataFrame()
-                    st.session_state["nse_errors"] = e
-                    st.session_state["nse_stats"] = s
-                else:
-                    r, e, s = run_fo_scan(fyers, universe)
-                    st.session_state["fo_df"] = pd.DataFrame(r) if r else pd.DataFrame()
-                    st.session_state["fo_errors"] = e
-                    st.session_state["fo_stats"] = s
-
-        dash_df = st.session_state.get("nse_df" if dashboard_source == "NSE Stocks" else "fo_df")
-        
-        if dash_df is not None and not dash_df.empty:
-            stats = calculate_market_stats(dash_df)
-            
-            st.markdown("### 📈 Market Overview")
-            col_ov1, col_ov2, col_ov3, col_ov4, col_ov5 = st.columns(5)
-            
-            with col_ov1:
-                st.metric("Total Scanned", stats["total"])
-            with col_ov2:
-                st.metric("🟢 BUY", stats["buy"])
-            with col_ov3:
-                st.metric("🔴 SELL", stats["sell"])
-            with col_ov4:
-                st.metric("🟡 NEUTRAL", stats["neutral"])
-            with col_ov5:
-                st.metric("Avg Confidence", f"{stats['avg_confidence']:.1f}%")
-            
-            st.markdown("### 💪 Strong Signals")
-            col_str1, col_str2 = st.columns(2)
-            
-            with col_str1:
-                st.metric("💪 Strong BUY", stats["strong_buy"])
-            with col_str2:
-                st.metric("💪 Strong SELL", stats["strong_sell"])
-            
-            st.markdown("### 😊 Market Sentiment")
-            col_sent1, col_sent2, col_sent3 = st.columns(3)
-            
-            with col_sent1:
-                st.metric("Bullish %", f"{stats['buy_pct']:.1f}%")
-            with col_sent2:
-                st.metric("Bearish %", f"{stats['sell_pct']:.1f}%")
-            with col_sent3:
-                st.metric("Neutral %", f"{stats['neutral_pct']:.1f}%")
-
-            _excel_download_button(
-                dash_df,
-                "MARKET_DASHBOARD",
-                "download_market_dashboard_excel"
-            )
-        else:
-            st.info(f"👈 Run '{dashboard_source}' scanner first")
-    
-    # ════════════════════════════════════════════════════════════════════════════════
-    # TAB 9: SETTINGS
-    # ════════════════════════════════════════════════════════════════════════════════
-    with tabs[10]:
-        st.markdown("### ⚙️ Scanner Settings & Configuration")
-        
-        st.markdown("#### 🎯 Signal Filtering")
-        col_set1, col_set2, col_set3 = st.columns(3)
-        
-        with col_set1:
-            default_conf = st.number_input("Default Min Confidence %", 0, 100, DEFAULT_CONFIDENCE_THRESHOLD, 5, key="set_conf")
-        with col_set2:
-            default_rvol = st.slider("Default Min RVOL", 0.5, 3.0, DEFAULT_RVOL_THRESHOLD, 0.1, key="set_rvol")
-        with col_set3:
-            default_strong_rvol = st.slider("Strong Signal RVOL", 1.0, 3.0, DEFAULT_STRONG_RVOL, 0.1, key="set_strong_rvol")
-        
-        st.markdown("#### ⚡ Live Movement Settings")
-        col_mom1, col_mom2, col_mom3 = st.columns(3)
-        
-        with col_mom1:
-            momentum_min_score = st.slider("Min Live Movement Score", 50, 100, MOMENTUM_MIN_SCORE, 5, key="set_mom_score")
-        with col_mom2:
-            momentum_strong_score = st.slider("Strong BIG MOVE Score", 75, 100, MOMENTUM_STRONG_SCORE, 5, key="set_mom_strong")
-        with col_mom3:
-            momentum_min_rvol = st.slider("Min Live Movement RVOL", 1.0, 3.0, MOMENTUM_MIN_RVOL, 0.1, key="set_mom_rvol")
-        
-        st.markdown("#### ℹ️ Information")
-        st.info("""
-        **NSE AI PRO V17 — Features:**
-        - ✅ Multi-timeframe analysis (5M, 15M, 1H, Daily)
-        - ✅ Strict signal validation engine
-        - ✅ Pressure-based confirmation
-        - ✅ VWAP, EMA, RSI, MACD indicators
-        - ✅ Market structure (CHoCH, MSS, CISD)
-        - ✅ Options chain analysis (F&O)
-        - ✅ Golden Cross / Death Cross detection
-        - ✅ **⚡ NEW: MOMENTUM MOVERS Scanner**
-        - ✅ **📖 NEW: LIVE FYERS EXCHANGE ORDER BOOK**
-        - ✅ Next Candle Bias + LIVE Depth Direction + BUY/SELL PIN + Buy/Sell Liquidity
-        
-        **Data Source:** Fyers Live API
-        **Timeframes:** 5M, 15M, 1H, Daily
-        **Universes:** NSE Equities + F&O Stocks
-        """)
-    
-    # ════════════════════════════════════════════════════════════════════════════════
-    # TAB 10: PIN RULES — ADDITIONAL ONLY
-    # ════════════════════════════════════════════════════════════════════════════════
-    with tabs[11]:
-        _show_pin_rules_tab(fyers, all_symbols, fo_symbols)
-    
-    # ════════════════════════════════════════════════════════════════════════════════
-    # TAB 11: F&O OPTION CHECK — LIVE RUN
-    # ════════════════════════════════════════════════════════════════════════════════
-    with tabs[12]:
+    with tabs[3]:
         st.markdown("### 🎯 F&O OPTION CHECK")
         st.caption("RUN LIVE CHECK fetches the current FYERS option-chain data. CE/PE is shown as WATCH, not an order instruction.")
         fo_pick = st.selectbox("Select F&O stock", fo_symbols if fo_symbols else all_symbols, key="fo_option_check_symbol")
@@ -6134,11 +5590,10 @@ def show_scanner(fyers) -> None:
                 st.error(f"Option-chain data unavailable: {live_opt.get('message','Unknown error')}")
         else:
             st.info("👆 Select an F&O stock and click RUN LIVE OPTION CHECK to refresh the current spot and option-chain data.")
-
     # ════════════════════════════════════════════════════════════════════════════════
-    # TAB 13: DIRECT REVERSAL SCANNER — RUN WITHOUT PRE-SCANNING NSE/F&O
+    # TAB 4: DIRECT REVERSAL SCANNER
     # ════════════════════════════════════════════════════════════════════════════════
-    with tabs[13]:
+    with tabs[4]:
         st.markdown("### 🔄 REVERSAL SCANNER")
         st.caption(
             "Direct reversal scan for NSE / F&O / BOTH. "
@@ -6423,14 +5878,141 @@ def show_scanner(fyers) -> None:
                     st.write(f"• {err}")
                 if len(direct_reversal_errors) > 100:
                     st.caption("Showing first 100 errors.")
-
     # ════════════════════════════════════════════════════════════════════════════════
-    # TAB 14: AI CHART ANALYSIS — MUST RENDER INSIDE show_scanner
+    # TAB 5: SWING — CROSS + LONG-MOVE RADAR
     # ════════════════════════════════════════════════════════════════════════════════
-    with tabs[14]:
-        _show_ai_chart_analysis_tab()
+    with tabs[5]:
+        st.markdown("### 📈 Swing Trading — Long-Move Radar + Golden/Death Cross")
+        st.caption("Daily closed-candle trend scanner. LONG-MOVE WATCH is a setup filter, not a guaranteed forecast.")
 
-    gc.collect()
+        col1, col2 = st.columns([3, 1])
+        with col1:
+            swing_limit = st.number_input("Scan limit (0 = ALL NSE)", min_value=10, max_value=len(all_symbols),
+                                         value=min(100, len(all_symbols)), step=25, key="swing_limit")
+        with col2:
+            st.metric("Available", len(all_symbols))
+        swing_symbols = all_symbols if swing_limit == 0 else all_symbols[:swing_limit]
+
+        b1, b2 = st.columns(2)
+        with b1:
+            if st.button(f"🚀 RUN SWING LONG-MOVE ({len(swing_symbols)} stocks)", key="swing_long_run", type="primary", use_container_width=True):
+                results = []
+                prog = st.progress(0)
+                with st.spinner("Scanning daily trend, EMA structure, momentum and volume…"):
+                    for idx, symbol in enumerate(swing_symbols):
+                        r = detect_swing_long_move(fyers, symbol)
+                        # Keep both successful and failed rows so the user can see why a symbol was skipped.
+                        results.append(r)
+                        prog.progress((idx + 1) / max(len(swing_symbols),1))
+                prog.empty()
+                df_long = pd.DataFrame(results)
+                if not df_long.empty:
+                    usable = df_long[df_long["ltp"].notna()].copy()
+                    if not usable.empty:
+                        usable = usable.sort_values(["score","return60"], ascending=False, na_position="last")
+                    st.session_state["swing_long_df"] = usable if not usable.empty else df_long
+                    st.success(f"✅ Swing scan complete: {len(usable)} stocks with usable daily data out of {len(df_long)} scanned.")
+                else:
+                    st.warning("No symbols were scanned. Check the NSE symbol list / API connection.")
+        with b2:
+            if st.button(f"📈 DETECT CROSSOVERS ({len(swing_symbols)} stocks)", key="swing_run", use_container_width=True):
+                swing_results = []
+                swing_progress = st.progress(0)
+                with st.spinner("Analyzing daily charts for Golden/Death Cross…"):
+                    for idx, symbol in enumerate(swing_symbols):
+                        try:
+                            cc_data = detect_golden_death_cross(fyers, symbol)
+                            if cc_data.get("reason") == "OK":
+                                ticker = symbol.replace("NSE:", "").replace("-EQ", "")
+                                swing_results.append({"Symbol": ticker, "LTP": cc_data.get("ltp", "N/A"), "EMA50": cc_data.get("ema50", "N/A"),
+                                                      "EMA200": cc_data.get("ema200", "N/A"), "EMA Trend": cc_data.get("ema_trend", "N/A"),
+                                                      "Signal": cc_data.get("signal", "NONE"), "Signal Date": cc_data.get("signal_date", "N/A")})
+                        except Exception:
+                            pass
+                        swing_progress.progress((idx + 1) / max(len(swing_symbols),1))
+                swing_progress.empty()
+                if swing_results:
+                    st.session_state["swing_df"] = pd.DataFrame(swing_results)
+
+        long_df = st.session_state.get("swing_long_df")
+        if long_df is not None and not long_df.empty:
+            st.success(f"✅ Swing Long-Move scan complete: {len(long_df)} stocks")
+            fcol1, fcol2 = st.columns(2)
+            with fcol1:
+                long_filter = st.selectbox("Long-Move Status", ["ALL", "🟢 LONG-MOVE WATCH", "🟡 EARLY WATCH", "⚪ WAIT"], key="swing_long_filter")
+            with fcol2:
+                trend_filter = st.selectbox("Daily Trend", ["ALL", "BULLISH", "NEUTRAL", "BEARISH"], key="swing_long_trend")
+            view = _add_reversal_columns(long_df.copy())
+            if long_filter != "ALL": view = view[view["status"] == long_filter]
+            if trend_filter != "ALL": view = view[view["trend"] == trend_filter]
+            st.dataframe(view.head(50), use_container_width=True, hide_index=True)
+            _excel_download_button(view, "SWING_LONG_MOVE", "download_swing_long_move_excel")
+            st.caption("Higher score means more conditions are aligned; it does not mean the stock will definitely rise.")
+        else:
+            st.info("👈 Click RUN SWING LONG-MOVE to find stocks with stronger daily trend/momentum alignment.")
+
+        if long_df is not None and not long_df.empty and "reason" in long_df.columns:
+            bad = long_df[long_df["ltp"].isna()].copy() if "ltp" in long_df.columns else pd.DataFrame()
+            if not bad.empty:
+                with st.expander(f"⚠️ Daily data unavailable / skipped: {len(bad)} stocks", expanded=False):
+                    st.dataframe(bad[[c for c in ["symbol","status","reason"] if c in bad.columns]].head(100), use_container_width=True, hide_index=True)
+
+        swing_df = st.session_state.get("swing_df")
+        if swing_df is not None and not swing_df.empty:
+            st.markdown("#### Golden / Death Cross results")
+            swing_report = _add_reversal_columns(swing_df.copy())
+            st.dataframe(swing_report, use_container_width=True, hide_index=True)
+            _excel_download_button(swing_report, "SWING_CROSS_REVERSAL", "download_swing_cross_reversal_excel")
+    # ════════════════════════════════════════════════════════════════════════════════
+    # TAB 6: PIN RULES — ADDITIONAL ONLY
+    # ════════════════════════════════════════════════════════════════════════════════
+    with tabs[6]:
+        _show_pin_rules_tab(fyers, all_symbols, fo_symbols)
+    # ════════════════════════════════════════════════════════════════════════════════
+    # TAB 7: SETTINGS
+    # ════════════════════════════════════════════════════════════════════════════════
+    with tabs[7]:
+        st.markdown("### ⚙️ Scanner Settings & Configuration")
+        
+        st.markdown("#### 🎯 Signal Filtering")
+        col_set1, col_set2, col_set3 = st.columns(3)
+        
+        with col_set1:
+            default_conf = st.number_input("Default Min Confidence %", 0, 100, DEFAULT_CONFIDENCE_THRESHOLD, 5, key="set_conf")
+        with col_set2:
+            default_rvol = st.slider("Default Min RVOL", 0.5, 3.0, DEFAULT_RVOL_THRESHOLD, 0.1, key="set_rvol")
+        with col_set3:
+            default_strong_rvol = st.slider("Strong Signal RVOL", 1.0, 3.0, DEFAULT_STRONG_RVOL, 0.1, key="set_strong_rvol")
+        
+        st.markdown("#### ⚡ Live Movement Settings")
+        col_mom1, col_mom2, col_mom3 = st.columns(3)
+        
+        with col_mom1:
+            momentum_min_score = st.slider("Min Live Movement Score", 50, 100, MOMENTUM_MIN_SCORE, 5, key="set_mom_score")
+        with col_mom2:
+            momentum_strong_score = st.slider("Strong BIG MOVE Score", 75, 100, MOMENTUM_STRONG_SCORE, 5, key="set_mom_strong")
+        with col_mom3:
+            momentum_min_rvol = st.slider("Min Live Movement RVOL", 1.0, 3.0, MOMENTUM_MIN_RVOL, 0.1, key="set_mom_rvol")
+        
+        st.markdown("#### ℹ️ Information")
+        st.info("""
+        **NSE AI PRO V17 — Features:**
+        - ✅ Multi-timeframe analysis (5M, 15M, 1H, Daily)
+        - ✅ Strict signal validation engine
+        - ✅ Pressure-based confirmation
+        - ✅ VWAP, EMA, RSI, MACD indicators
+        - ✅ Market structure (CHoCH, MSS, CISD)
+        - ✅ Options chain analysis (F&O)
+        - ✅ Golden Cross / Death Cross detection
+        - ✅ **⚡ NEW: MOMENTUM MOVERS Scanner**
+        - ✅ **📖 NEW: LIVE FYERS EXCHANGE ORDER BOOK**
+        - ✅ Next Candle Bias + LIVE Depth Direction + BUY/SELL PIN + Buy/Sell Liquidity
+        
+        **Data Source:** Fyers Live API
+        **Timeframes:** 5M, 15M, 1H, Daily
+        **Universes:** NSE Equities + F&O Stocks
+        """)
+        gc.collect()
 
 # ════════════════════════════════════════════════════════════════════════════════
 # ENTRY POINT
