@@ -15,15 +15,6 @@ from datetime import datetime, timedelta
 from typing import List, Optional, Tuple, Dict, Any
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# Optional clipboard-image support for the AI Chart Analysis tab.
-try:
-    from streamlit_paste_button import paste_image_button
-    PASTE_IMAGE_AVAILABLE = True
-except Exception:
-    paste_image_button = None
-    PASTE_IMAGE_AVAILABLE = False
-
-
 # ============================================================
 # INDEPENDENT STRONG SIGNALS / MARKET DASHBOARD HELPERS
 # ============================================================
@@ -3181,6 +3172,102 @@ def _advanced_early_move_engine(df: pd.DataFrame, pre: Dict[str, Any] = None,
         out["reason"]=f"ADVANCED ENGINE error: {type(e).__name__}"
         return out
 
+def _detect_amd_phase(df: pd.DataFrame, pre: dict = None) -> dict:
+    """Lightweight Accumulation/Manipulation/Distribution phase detector.
+    Uses completed 5M candles already fetched by the movement engine; no extra API call.
+    AMD is a context label, not a guaranteed forecast.
+    """
+    out = {"phase": "WAIT", "direction": "NONE", "score": 0.0, "reason": "Insufficient data"}
+    try:
+        if df is None or len(df) < 20:
+            return out
+        d = df.copy()
+        c = pd.to_numeric(d["Close"], errors="coerce")
+        o = pd.to_numeric(d["Open"], errors="coerce")
+        h = pd.to_numeric(d["High"], errors="coerce")
+        l = pd.to_numeric(d["Low"], errors="coerce")
+        v = pd.to_numeric(d["Volume"], errors="coerce")
+        valid = pd.concat([o,h,l,c,v], axis=1).dropna()
+        if len(valid) < 20:
+            return out
+        c,o,h,l,v = [valid[x] for x in ["Close","Open","High","Low","Volume"]]
+        last = float(c.iloc[-1])
+        if last <= 0:
+            return out
+
+        recent = valid.tail(20)
+        prior = valid.iloc[-20:-5] if len(valid) >= 25 else valid.iloc[:-5]
+        prange = max(float(prior["High"].max() - prior["Low"].min()), 1e-9)
+        recent_range = float(recent["High"].max() - recent["Low"].min())
+        compression = max(0.0, min(100.0, (1.0 - recent_range / prange) * 100.0))
+        avg_vol = float(prior["Volume"].mean()) if len(prior) else 0.0
+        rvol = float(v.iloc[-1] / avg_vol) if avg_vol > 0 else 0.0
+
+        tail = valid.tail(8)
+        up_vol = float(tail.loc[tail["Close"] > tail["Open"], "Volume"].sum())
+        dn_vol = float(tail.loc[tail["Close"] < tail["Open"], "Volume"].sum())
+        vol_total = max(up_vol + dn_vol, 1.0)
+        pressure = (up_vol - dn_vol) / vol_total * 100.0
+
+        last_h = float(h.iloc[-1]); last_l = float(l.iloc[-1])
+        range20_h = float(recent["High"].iloc[:-1].max())
+        range20_l = float(recent["Low"].iloc[:-1].min())
+        breakout = last > range20_h
+        breakdown = last < range20_l
+
+        pre = pre if isinstance(pre, dict) else {}
+        pdir = str(pre.get("direction", "NONE")).upper()
+        pscore = float(pre.get("score", 0) or 0)
+
+        reasons = []
+        # Accumulation: compression + positive pressure + support/absorption context.
+        acc = 0.0
+        if compression >= 25: acc += 30; reasons.append("range compression")
+        if pressure >= 15: acc += 25; reasons.append("buy pressure")
+        if rvol >= 1.15: acc += 15; reasons.append(f"RVOL {rvol:.2f}x")
+        if pdir == "BUY": acc += min(20, pscore * 0.20); reasons.append("pre-move BUY")
+        if last <= range20_l * 1.03: acc += 10
+
+        # Distribution: compression + negative pressure + resistance/rejection context.
+        dist = 0.0
+        if compression >= 25: dist += 30
+        if pressure <= -15: dist += 25; reasons.append("sell pressure")
+        if rvol >= 1.15: dist += 15
+        if pdir == "SELL": dist += min(20, pscore * 0.20); reasons.append("pre-move SELL")
+        if last >= range20_h * 0.97: dist += 10
+
+        # Manipulation: liquidity sweep / false break characteristics.
+        manipulation = 0.0
+        prev_h = float(h.iloc[-2]); prev_l = float(l.iloc[-2]); prev_c = float(c.iloc[-2])
+        if prev_h > range20_h and prev_c < range20_h:
+            manipulation += 55; reasons.append("failed high sweep")
+        if prev_l < range20_l and prev_c > range20_l:
+            manipulation += 55; reasons.append("failed low sweep")
+        if rvol >= 1.5 and (last_h > range20_h or last_l < range20_l):
+            manipulation += 20; reasons.append("high-volume sweep")
+
+        if manipulation >= max(acc, dist, 45):
+            phase = "MANIPULATION"
+            direction = "SELL" if prev_h > range20_h and prev_c < range20_h else "BUY" if prev_l < range20_l and prev_c > range20_l else "NONE"
+            score = min(100.0, manipulation)
+        elif acc >= dist and acc >= 50:
+            phase, direction, score = "ACCUMULATION", "BUY", min(100.0, acc)
+        elif dist > acc and dist >= 50:
+            phase, direction, score = "DISTRIBUTION", "SELL", min(100.0, dist)
+        elif breakout and pressure > 0:
+            phase, direction, score = "EXPANSION", "BUY", min(100.0, 55 + max(0, pressure) * 0.3)
+        elif breakdown and pressure < 0:
+            phase, direction, score = "EXPANSION", "SELL", min(100.0, 55 + abs(min(0, pressure)) * 0.3)
+        else:
+            phase, direction, score = "WAIT", "NONE", max(acc, dist, manipulation)
+
+        out.update({"phase": phase, "direction": direction, "score": round(float(score), 1),
+                    "reason": " + ".join(reasons[:6]) if reasons else "No clear AMD structure"})
+        return out
+    except Exception as e:
+        out["reason"] = f"AMD error: {type(e).__name__}"
+        return out
+
 def _fetch_momentum_signal(fyers, symbol: str, is_fo: bool = False):
     """Intraday movement worker. Checks recent completed 5M candles and adds early-warning status."""
     stock_ticker = symbol.replace("NSE:", "").replace("-EQ", "") if isinstance(symbol,str) else str(symbol)
@@ -3193,6 +3280,7 @@ def _fetch_momentum_signal(fyers, symbol: str, is_fo: bool = False):
         pre=_pre_move_signal(d, block=block)
         before=_before_move_signal(d, pre)
         early=_advanced_early_move_engine(d, pre=pre, block=block)
+        amd=_detect_amd_phase(d, pre=pre)
         # Search the latest 12 completed candles so a signal is not lost on the next candle.
         candidates=[]
         for idx in range(max(12,len(d)-12),len(d)):
@@ -3223,7 +3311,7 @@ def _fetch_momentum_signal(fyers, symbol: str, is_fo: bool = False):
             age=max(0,(_now_ist()-sig_time).total_seconds()/60)
             signal=pre["status"] if pre["direction"] in ("BUY","SELL") else "NO MOVE"
         ltp=float(d["Close"].iloc[-1])
-        result={"Symbol":stock_ticker,"LTP":round(ltp,2),"SIGNAL TIME":sig_time.strftime("%d-%b-%Y %H:%M:%S"),"SIGNAL AGE (MIN)":round(age,1),"SIGNAL":signal,"DIRECTION":mv.get("direction") if candidates else pre["direction"],"MOVE %":mv.get("move_pct",0.0),"BODY %":mv.get("body_pct",0.0),"BODY / ATR":mv.get("body_atr",0.0),"RVOL":mv.get("rvol",0.0),"STRUCTURE":mv.get("structure", "NONE"),"HH/HL":"✅" if mv.get("hh_hl") else "−","LH/LL":"✅" if mv.get("lh_ll") else "−","ACCELERATION":mv.get("price_acceleration",0.0),"VOLUME SPIKE":"🔥" if mv.get("volume_spike") else "−","SCORE":mv.get("score",0.0),"BEFORE MOVE SIGNAL":before["signal"],"BEFORE MOVE DIRECTION":before["direction"],"BEFORE MOVE SCORE":before["score"],"BEFORE MOVE REASON":before["reason"],"BEFORE MOVE TRIGGER":before["trigger"],"EARLY MOVE SCORE":early["score"],"EARLY DIRECTION":early["direction"],"EARLY STATUS":early["status"],"ENERGY BUILD":early["energy"],"RANGE COMPRESSION":early["compression"],"VOLUME ACCELERATION":early["volume_accel"],"PRICE ACCELERATION":early["price_accel"],"BREAKOUT DISTANCE %":early["breakout_distance_pct"],"BREAKDOWN DISTANCE %":early["breakdown_distance_pct"],"EARLY TRIGGER":early["trigger"],"EARLY INVALIDATION":early["invalidation"],"EARLY MTF PROXY":early["mtf_proxy"],"EARLY MOVE REASON":early["reason"],"PRE-MOVE":pre["direction"],"PRE-MOVE SCORE":pre["score"],"PRE-MOVE STATUS":pre["status"],"PRE BUY SCORE":pre.get("buy_score",0),"PRE SELL SCORE":pre.get("sell_score",0),"PRE SCORE GAP":pre.get("score_gap",0),"PRE-MOVE REASON":pre["reason"],"BREAKOUT LEVEL":pre.get("breakout_level"),"BREAKDOWN LEVEL":pre.get("breakdown_level"),"PRE-MOVE RVOL":pre.get("rvol",0),"BLOCK ORDER SCORE":block["block_score"],"BLOCK ACTIVITY":block["block_signal"],"BLOCK SIDE":block["block_side"],"BLOCK LEVEL":block["block_level"],"BLOCK RVOL":block["block_rvol"],"BLOCK REASON":block["block_reason"],"REASON":mv.get("reason",pre["reason"]),"MOVEMENT STATUS": signal if candidates else pre["status"]}
+        result={"Symbol":stock_ticker,"LTP":round(ltp,2),"SIGNAL TIME":sig_time.strftime("%d-%b-%Y %H:%M:%S"),"SIGNAL AGE (MIN)":round(age,1),"SIGNAL":signal,"DIRECTION":mv.get("direction") if candidates else pre["direction"],"MOVE %":mv.get("move_pct",0.0),"BODY %":mv.get("body_pct",0.0),"BODY / ATR":mv.get("body_atr",0.0),"RVOL":mv.get("rvol",0.0),"STRUCTURE":mv.get("structure", "NONE"),"HH/HL":"✅" if mv.get("hh_hl") else "−","LH/LL":"✅" if mv.get("lh_ll") else "−","ACCELERATION":mv.get("price_acceleration",0.0),"VOLUME SPIKE":"🔥" if mv.get("volume_spike") else "−","SCORE":mv.get("score",0.0),"BEFORE MOVE SIGNAL":before["signal"],"BEFORE MOVE DIRECTION":before["direction"],"BEFORE MOVE SCORE":before["score"],"BEFORE MOVE REASON":before["reason"],"BEFORE MOVE TRIGGER":before["trigger"],"EARLY MOVE SCORE":early["score"],"EARLY DIRECTION":early["direction"],"EARLY STATUS":early["status"],"ENERGY BUILD":early["energy"],"RANGE COMPRESSION":early["compression"],"VOLUME ACCELERATION":early["volume_accel"],"PRICE ACCELERATION":early["price_accel"],"BREAKOUT DISTANCE %":early["breakout_distance_pct"],"BREAKDOWN DISTANCE %":early["breakdown_distance_pct"],"EARLY TRIGGER":early["trigger"],"EARLY INVALIDATION":early["invalidation"],"EARLY MTF PROXY":early["mtf_proxy"],"EARLY MOVE REASON":early["reason"],"AMD PHASE":amd["phase"],"AMD DIRECTION":amd["direction"],"AMD SCORE":amd["score"],"AMD REASON":amd["reason"],"PRE-MOVE":pre["direction"],"PRE-MOVE SCORE":pre["score"],"PRE-MOVE STATUS":pre["status"],"PRE BUY SCORE":pre.get("buy_score",0),"PRE SELL SCORE":pre.get("sell_score",0),"PRE SCORE GAP":pre.get("score_gap",0),"PRE-MOVE REASON":pre["reason"],"BREAKOUT LEVEL":pre.get("breakout_level"),"BREAKDOWN LEVEL":pre.get("breakdown_level"),"PRE-MOVE RVOL":pre.get("rvol",0),"BLOCK ORDER SCORE":block["block_score"],"BLOCK ACTIVITY":block["block_signal"],"BLOCK SIDE":block["block_side"],"BLOCK LEVEL":block["block_level"],"BLOCK RVOL":block["block_rvol"],"BLOCK REASON":block["block_reason"],"REASON":mv.get("reason",pre["reason"]),"MOVEMENT STATUS": signal if candidates else pre["status"]}
         if is_fo and result["DIRECTION"] in ("BUY","SELL"):
             try:
                 od=fetch_options_chain_data(fyers,symbol); result["PCR"]=od.get("pcr","N/A"); result["OPTIONS BIAS"]=od.get("options_bias","N/A")
@@ -4659,572 +4747,6 @@ def _add_reversal_columns(df: pd.DataFrame) -> pd.DataFrame:
 
 
 
-# ════════════════════════════════════════════════════════════════════════════════
-# AI CHART ANALYSIS — ADDITIONAL TAB ONLY
-# ════════════════════════════════════════════════════════════════════════════════
-def _ai_chart_signal(analysis_5m: Dict[str, Any],
-                     analysis_15m: Dict[str, Any],
-                     analysis_1h: Dict[str, Any]) -> Dict[str, Any]:
-    """Rule-based AI-style chart synthesis using the scanner's existing indicators.
-    This does not claim to predict the future with certainty.
-    """
-    d5 = analysis_5m.get("data", {}) or {}
-    d15 = analysis_15m.get("data", {}) or {}
-    d1h = analysis_1h.get("data", {}) or {}
-    if not d5:
-        return {"direction": "WAIT", "confidence": 0.0, "buy_score": 0.0,
-                "sell_score": 0.0, "reason": "5M data unavailable"}
-
-    buy = 0.0
-    sell = 0.0
-    buy_reasons, sell_reasons = [], []
-
-    def add_trend(data, weight):
-        nonlocal buy, sell
-        trend = str(data.get("structure_trend", "NEUTRAL")).upper()
-        if trend == "BULLISH":
-            buy += weight
-            buy_reasons.append(f"Bullish {weight:.0f}x trend")
-        elif trend == "BEARISH":
-            sell += weight
-            sell_reasons.append(f"Bearish {weight:.0f}x trend")
-
-    add_trend(d5, 25)
-    add_trend(d15, 20)
-    add_trend(d1h, 15)
-
-    # VWAP + EMA
-    price = float(d5.get("last_close", 0) or 0)
-    vwap = d5.get("vwap")
-    if vwap is not None and price:
-        if price > float(vwap):
-            buy += 10; buy_reasons.append("Price above VWAP")
-        elif price < float(vwap):
-            sell += 10; sell_reasons.append("Price below VWAP")
-
-    ema = str(d5.get("ema_trend", "NEUTRAL")).upper()
-    if ema == "BULLISH":
-        buy += 8; buy_reasons.append("EMA alignment bullish")
-    elif ema == "BEARISH":
-        sell += 8; sell_reasons.append("EMA alignment bearish")
-
-    pressure = str(d5.get("pressure_trend", "NEUTRAL")).upper()
-    if pressure == "STRONG_BUYING":
-        buy += 10; buy_reasons.append("Strong buying pressure")
-    elif pressure == "BUYING":
-        buy += 6; buy_reasons.append("Buying pressure")
-    elif pressure == "STRONG_SELLING":
-        sell += 10; sell_reasons.append("Strong selling pressure")
-    elif pressure == "SELLING":
-        sell += 6; sell_reasons.append("Selling pressure")
-
-    rvol = float(d5.get("rvol", 1.0) or 1.0)
-    if rvol >= 2.0:
-        if buy >= sell:
-            buy += 7; buy_reasons.append(f"High RVOL {rvol:.2f}x")
-        else:
-            sell += 7; sell_reasons.append(f"High RVOL {rvol:.2f}x")
-    elif rvol >= 1.5:
-        if buy >= sell:
-            buy += 4; buy_reasons.append(f"RVOL {rvol:.2f}x")
-        else:
-            sell += 4; sell_reasons.append(f"RVOL {rvol:.2f}x")
-
-    rsi = float(d5.get("rsi", 50) or 50)
-    if 55 <= rsi < 70:
-        buy += 5; buy_reasons.append(f"RSI {rsi:.1f} bullish zone")
-    elif 30 < rsi <= 45:
-        sell += 5; sell_reasons.append(f"RSI {rsi:.1f} bearish zone")
-
-    if d5.get("macd_bullish"):
-        buy += 5; buy_reasons.append("MACD bullish")
-    else:
-        sell += 5; sell_reasons.append("MACD bearish")
-
-    # Confirmed structure events
-    if d5.get("bullish_choch") or d5.get("bullish_mss") or d5.get("bullish_cisd"):
-        buy += 8; buy_reasons.append("Bullish structure event")
-    if d5.get("bearish_choch") or d5.get("bearish_mss") or d5.get("bearish_cisd"):
-        sell += 8; sell_reasons.append("Bearish structure event")
-
-    total = max(buy + sell, 1.0)
-    gap = abs(buy - sell)
-    confidence = min(98.0, 50.0 + (gap / total) * 48.0)
-
-    if buy >= sell and gap >= 12:
-        direction = "🟢 BUY"
-        reasons = buy_reasons
-    elif sell > buy and gap >= 12:
-        direction = "🔴 SELL"
-        reasons = sell_reasons
-    else:
-        direction = "🟡 WAIT"
-        reasons = list(dict.fromkeys(buy_reasons + sell_reasons))[:5] or ["Mixed signals"]
-
-    return {
-        "direction": direction,
-        "confidence": round(confidence, 1),
-        "buy_score": round(buy, 1),
-        "sell_score": round(sell, 1),
-        "reason": " | ".join(reasons[:6]),
-    }
-
-
-def _plot_ai_candles(df: pd.DataFrame, ticker: str, signal: Dict[str, Any]):
-    """Simple dependency-light OHLC chart with EMA/VWAP overlays."""
-    if not MATPLOTLIB_AVAILABLE or df is None or df.empty:
-        st.warning("Chart library/data unavailable.")
-        return
-
-    d = df.tail(100).copy().reset_index(drop=True)
-    close = pd.to_numeric(d["Close"], errors="coerce")
-    ema9 = close.ewm(span=9, adjust=False).mean()
-    ema21 = close.ewm(span=21, adjust=False).mean()
-    vwap = calculate_vwap(d)
-
-    fig, ax = plt.subplots(figsize=(13, 5.5))
-    for i, row in d.iterrows():
-        o, h, l, c = map(float, [row["Open"], row["High"], row["Low"], row["Close"]])
-        ax.vlines(i, l, h, linewidth=1)
-        bottom = min(o, c)
-        height = max(abs(c-o), max((h-l)*0.01, 0.000001))
-        rect = plt.Rectangle((i-0.32, bottom), 0.64, height,
-                             fill=False if c >= o else True, linewidth=1)
-        ax.add_patch(rect)
-
-    ax.plot(range(len(d)), ema9, linewidth=1.3, label="EMA 9")
-    ax.plot(range(len(d)), ema21, linewidth=1.3, label="EMA 21")
-    ax.plot(range(len(d)), vwap, linewidth=1.1, label="VWAP")
-
-    ax.set_title(f"{ticker} — 5M AI Chart Analysis | {signal.get('direction','WAIT')} | {signal.get('confidence',0):.1f}%")
-    ax.set_xlabel("Recent 5M candles")
-    ax.set_ylabel("Price")
-    ax.grid(alpha=0.2)
-    ax.legend(loc="upper left")
-    st.pyplot(fig, use_container_width=True)
-    plt.close(fig)
-
-
-def _analyze_submitted_chart_image(image_bytes: bytes) -> str:
-    """Analyze ONLY the exact submitted chart image with an OpenAI vision model."""
-    if not image_bytes:
-        raise ValueError("No submitted chart image found.")
-
-    # Reuse the existing Streamlit configuration first, with an environment
-    # fallback so the addition works in normal Streamlit deployments too.
-    try:
-        api_key = str(st.secrets.get("OPENAI_API_KEY", "")).strip()
-    except Exception:
-        api_key = ""
-    if not api_key:
-        api_key = os.environ.get("OPENAI_API_KEY", "").strip()
-    if not api_key:
-        raise ValueError(
-            "OPENAI_API_KEY is required. Add OPENAI_API_KEY to Streamlit Secrets "
-            "or the environment before submitting a chart."
-        )
-
-    try:
-        model = str(st.secrets.get("OPENAI_MODEL", "")).strip()
-    except Exception:
-        model = ""
-    model = model or os.environ.get("OPENAI_MODEL", "").strip() or "gpt-5.6-luna"
-
-    import base64
-    image_b64 = base64.b64encode(image_bytes).decode("ascii")
-    mime = _chart_image_mime(image_bytes)
-
-    prompt = """
-You are an expert technical-chart analyst. Analyze ONLY the exact chart screenshot attached to this request.
-The image is the sole source of truth. Do not use NSE/F&O selections, Select Stock values, FYERS data,
-external market data, memory, or assumptions about the instrument.
-
-ANTI-HALLUCINATION RULES:
-1. Read instrument, timeframe, price and levels ONLY when they are visibly readable in the image.
-2. If a requested value is not readable or not visibly derivable, return exactly "N/A". Never guess.
-3. Support/resistance may be derived only from clearly visible price structure in the screenshot. If not clear, use N/A.
-4. Liquidity/sweep and breakout/breakdown must be marked N/A unless clearly visible.
-5. CALL/PUT bias must be based only on the visible chart. Do not invent an option strike, premium, expiry, or chain data.
-6. Confidence is confidence in the screenshot interpretation, not a guarantee of future price movement.
-7. If the screenshot is insufficient for a reliable setup, the final decision must be WAIT.
-
-Return ONLY valid JSON with these exact keys and string/number values. Do not add markdown fences or extra text:
-{
-  "instrument": "...",
-  "timeframe": "...",
-  "current_visible_price": "...",
-  "market_direction": "BULLISH / BEARISH / SIDEWAYS / UNCLEAR",
-  "trend": "...",
-  "support_levels": "...",
-  "resistance_levels": "...",
-  "breakout_breakdown": "...",
-  "liquidity_sweep": "...",
-  "call_put_bias": "CALL / PUT / NO TRADE / N/A",
-  "entry_zone": "...",
-  "stop_loss": "...",
-  "target_1": "...",
-  "target_2": "...",
-  "risk_reward": "...",
-  "scalping_setup": "...",
-  "next_probable_move": "...",
-  "confidence_percent": 0,
-  "final_decision": "BUY / SELL / WAIT",
-  "evidence": "...",
-  "warning": "..."
-}
-
-For confidence_percent use a number from 0 to 100. If the screenshot does not support a reliable setup,
-use a conservative confidence and final_decision WAIT.
-""".strip()
-
-    body = {
-        "model": model,
-        "input": [{
-            "role": "user",
-            "content": [
-                {"type": "input_text", "text": prompt},
-                {
-                    "type": "input_image",
-                    "image_url": f"data:{mime};base64,{image_b64}",
-                },
-            ],
-        }],
-    }
-
-    response = requests.post(
-        "https://api.openai.com/v1/responses",
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        },
-        json=body,
-        timeout=120,
-    )
-
-    if not response.ok:
-        try:
-            err = response.json()
-        except Exception:
-            err = response.text
-        raise RuntimeError(
-            f"OpenAI API error {response.status_code}: {str(err)[:700]}"
-        )
-
-    payload = response.json()
-    report = _extract_openai_response_text(payload)
-    if not report:
-        raise RuntimeError("OpenAI returned an empty chart-analysis report.")
-    return report
-
-
-def _parse_chart_vision_report(report_text: str) -> Dict[str, Any]:
-    """Parse the vision response JSON while remaining safe if the model adds fences."""
-    text = (report_text or "").strip()
-    candidates = [text]
-    if text.startswith("```"):
-        candidates.append(re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.I | re.S).strip())
-
-    for candidate in candidates:
-        try:
-            obj = json.loads(candidate)
-            if isinstance(obj, dict):
-                return obj
-        except Exception:
-            pass
-
-    # Last-resort extraction if a model surrounded JSON with prose.
-    first, last = text.find("{"), text.rfind("}")
-    if first >= 0 and last > first:
-        try:
-            obj = json.loads(text[first:last + 1])
-            if isinstance(obj, dict):
-                return obj
-        except Exception:
-            pass
-
-    return {
-        "instrument": "N/A",
-        "timeframe": "N/A",
-        "current_visible_price": "N/A",
-        "market_direction": "UNCLEAR",
-        "trend": "N/A",
-        "support_levels": "N/A",
-        "resistance_levels": "N/A",
-        "breakout_breakdown": "N/A",
-        "liquidity_sweep": "N/A",
-        "call_put_bias": "N/A",
-        "entry_zone": "N/A",
-        "stop_loss": "N/A",
-        "target_1": "N/A",
-        "target_2": "N/A",
-        "risk_reward": "N/A",
-        "scalping_setup": "N/A",
-        "next_probable_move": "N/A",
-        "confidence_percent": 0,
-        "final_decision": "WAIT",
-        "evidence": "The AI response could not be parsed safely; no chart values were inferred.",
-        "warning": "Screenshot analysis is unavailable in structured form. Please re-analyze the chart.",
-    }
-
-
-def _show_ai_chart_analysis_tab():
-    """AI Chart Analysis tab. Screenshot submission is always available and independent.
-
-    The existing NSE/F&O stock analysis is retained below as a separate optional section.
-    """
-    st.markdown("### 🤖 AI CHART ANALYSIS")
-    st.success(
-        "📷 INDEPENDENT CHART MODE — Upload or paste a chart, then click "
-        "🧠 SUBMIT CHART → ANALYZE. Only that exact image is sent to AI. "
-        "NSE/F&O Universe, Select Stock and FYERS data are NOT used."
-    )
-
-    st.markdown("#### 📷 PASTE / UPLOAD CHART")
-    st.caption(
-        "Upload a chart screenshot or paste one from the clipboard. NIFTY, BANKNIFTY, stocks, "
-        "crypto, commodities, etc. are accepted. Only the submitted image is analyzed."
-    )
-
-    uploaded_chart = st.file_uploader(
-        "📁 Upload chart screenshot",
-        type=["png", "jpg", "jpeg", "webp"],
-        key="ai_chart_vision_upload_v3",
-        help="The exact image selected here is sent to the AI vision model after submission.",
-    )
-
-    if PASTE_IMAGE_AVAILABLE:
-        paste_result = paste_image_button(
-            "📋 PASTE CHART SCREENSHOT",
-            key="ai_chart_vision_paste_v3",
-            errors="ignore",
-        )
-        if paste_result is not None and paste_result.image_data is not None:
-            try:
-                buf = io.BytesIO()
-                paste_result.image_data.save(buf, format="PNG")
-                pasted_bytes = buf.getvalue()
-                st.session_state["ai_chart_vision_pasted_bytes_v3"] = pasted_bytes
-                # A new pasted image is a new candidate, not an automatic submission.
-                st.session_state["ai_chart_vision_source_hash_v3"] = None
-            except Exception as e:
-                st.error(f"❌ Clipboard paste failed: {e}")
-    else:
-        st.warning(
-            "📋 Clipboard paste requires `streamlit-paste-button`. "
-            "Install it with: `pip install streamlit-paste-button`. Upload still works without it."
-        )
-
-    pasted_chart_bytes = st.session_state.get("ai_chart_vision_pasted_bytes_v3")
-
-    # Prefer a newly uploaded file over an older clipboard image.
-    if uploaded_chart is not None:
-        candidate_bytes = uploaded_chart.getvalue()
-        candidate_source = "Uploaded chart"
-    else:
-        candidate_bytes = pasted_chart_bytes
-        candidate_source = "Pasted chart"
-
-    if candidate_bytes:
-        import hashlib
-        candidate_hash = hashlib.sha256(candidate_bytes).hexdigest()
-        submitted_hash = st.session_state.get("ai_chart_vision_source_hash_v3")
-
-        # If the user supplied a different image, clear only the screenshot report.
-        if submitted_hash and candidate_hash != submitted_hash:
-            st.session_state["ai_chart_vision_report_v3"] = None
-            st.session_state["ai_chart_vision_submitted_bytes_v3"] = None
-            st.session_state["ai_chart_vision_completed_v3"] = False
-
-        st.image(
-            candidate_bytes,
-            caption=f"Preview — {candidate_source} (this exact image will be submitted)",
-        )
-
-    chart_ready = bool(candidate_bytes)
-    submitted_report = st.session_state.get("ai_chart_vision_report_v3")
-    completed = bool(st.session_state.get("ai_chart_vision_completed_v3") and submitted_report)
-
-    if not chart_ready:
-        st.warning("👆 Upload or paste a chart screenshot first.")
-
-    # Required prominent submit button. It is disabled until an image exists.
-    submit_label = "✅ CHART ANALYSIS COMPLETED" if completed else "🧠 SUBMIT CHART → ANALYZE"
-    if st.button(
-        submit_label,
-        key="ai_chart_vision_submit_v3",
-        type="primary",
-        use_container_width=True,
-        disabled=not chart_ready or completed,
-    ):
-        import hashlib
-        exact_bytes = bytes(candidate_bytes)
-        exact_hash = hashlib.sha256(exact_bytes).hexdigest()
-
-        # Important: only these bytes are sent to the vision model. No symbol,
-        # universe, Fyers data, or selected-stock value is passed to the request.
-        st.session_state["ai_chart_vision_submitted_bytes_v3"] = exact_bytes
-        st.session_state["ai_chart_vision_source_hash_v3"] = exact_hash
-        st.session_state["ai_chart_vision_report_v3"] = None
-        st.session_state["ai_chart_vision_completed_v3"] = False
-        st.session_state["ai_chart_vision_submit_time_v3"] = _generated_timestamp()
-
-        with st.spinner("🧠 AI vision is analyzing ONLY the submitted chart image…"):
-            try:
-                raw_report = _analyze_submitted_chart_image(exact_bytes)
-                parsed_report = _parse_chart_vision_report(raw_report)
-                st.session_state["ai_chart_vision_report_v3"] = parsed_report
-                st.session_state["ai_chart_vision_raw_report_v3"] = raw_report
-                st.session_state["ai_chart_vision_completed_v3"] = True
-                st.rerun()
-            except Exception as e:
-                st.session_state["ai_chart_vision_completed_v3"] = False
-                st.error(f"❌ Chart analysis failed: {type(e).__name__}: {str(e)[:1200]}")
-
-    # Re-analysis intentionally reuses the already submitted image, not a stock.
-    if st.session_state.get("ai_chart_vision_submitted_bytes_v3"):
-        if st.button(
-            "🔄 RE-ANALYZE CHART",
-            key="ai_chart_vision_reanalyze_v3",
-            use_container_width=True,
-        ):
-            exact_bytes = bytes(st.session_state["ai_chart_vision_submitted_bytes_v3"])
-            st.session_state["ai_chart_vision_report_v3"] = None
-            st.session_state["ai_chart_vision_completed_v3"] = False
-            with st.spinner("🧠 Re-analyzing the exact submitted image…"):
-                try:
-                    raw_report = _analyze_submitted_chart_image(exact_bytes)
-                    parsed_report = _parse_chart_vision_report(raw_report)
-                    st.session_state["ai_chart_vision_report_v3"] = parsed_report
-                    st.session_state["ai_chart_vision_raw_report_v3"] = raw_report
-                    st.session_state["ai_chart_vision_completed_v3"] = True
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"❌ Re-analysis failed: {type(e).__name__}: {str(e)[:1200]}")
-
-    report = st.session_state.get("ai_chart_vision_report_v3")
-    submitted_bytes = st.session_state.get("ai_chart_vision_submitted_bytes_v3")
-    if not report or not submitted_bytes:
-        st.info("After submission, the chart analysis report will remain visible here across Streamlit reruns.")
-        return
-
-    st.markdown("---")
-    st.markdown("## 📋 CHART ANALYSIS REPORT")
-    st.image(
-        submitted_bytes,
-        caption=f"Exact submitted chart image • {st.session_state.get('ai_chart_vision_submit_time_v3', 'N/A')}",
-    )
-
-    def _r(key: str, default: str = "N/A") -> str:
-        value = report.get(key, default)
-        if value is None or str(value).strip() == "":
-            return default
-        return str(value)
-
-    try:
-        confidence = float(report.get("confidence_percent", 0))
-    except Exception:
-        confidence = 0.0
-    confidence = max(0.0, min(100.0, confidence))
-
-    decision = _r("final_decision", "WAIT").upper()
-    direction = _r("market_direction", "UNCLEAR").upper()
-
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("INSTRUMENT", _r("instrument"))
-    c2.metric("TIMEFRAME", _r("timeframe"))
-    c3.metric("VISIBLE PRICE", _r("current_visible_price"))
-    c4.metric("CONFIDENCE", f"{confidence:.0f}%")
-
-    if decision == "BUY":
-        st.success(f"🟢 FINAL DECISION: {decision}")
-    elif decision == "SELL":
-        st.error(f"🔴 FINAL DECISION: {decision}")
-    else:
-        st.warning(f"🟡 FINAL DECISION: {decision}")
-
-    st.markdown("### 🧭 MARKET DIRECTION")
-    st.write(f"**Market Direction:** {direction}")
-    st.write(f"**Trend:** {_r('trend')}")
-
-    st.markdown("### 🧱 SUPPORT / RESISTANCE")
-    sr_df = pd.DataFrame([
-        {
-            "ITEM": "Support levels",
-            "VALUE": _r("support_levels"),
-        },
-        {
-            "ITEM": "Resistance levels",
-            "VALUE": _r("resistance_levels"),
-        },
-        {
-            "ITEM": "Breakout / Breakdown",
-            "VALUE": _r("breakout_breakdown"),
-        },
-        {
-            "ITEM": "Liquidity / Sweep",
-            "VALUE": _r("liquidity_sweep"),
-        },
-    ])
-    st.dataframe(sr_df, use_container_width=True, hide_index=True)
-
-    st.markdown("### 🎯 TRADE SETUP")
-    setup_df = pd.DataFrame([
-        {"ITEM": "CALL / PUT bias", "VALUE": _r("call_put_bias")},
-        {"ITEM": "Entry zone", "VALUE": _r("entry_zone")},
-        {"ITEM": "Stop Loss", "VALUE": _r("stop_loss")},
-        {"ITEM": "Target 1", "VALUE": _r("target_1")},
-        {"ITEM": "Target 2", "VALUE": _r("target_2")},
-        {"ITEM": "Risk / Reward", "VALUE": _r("risk_reward")},
-        {"ITEM": "Scalping setup", "VALUE": _r("scalping_setup")},
-    ])
-    st.dataframe(setup_df, use_container_width=True, hide_index=True)
-
-    st.markdown("### ⚡ NEXT PROBABLE MOVE")
-    st.info(_r("next_probable_move"))
-
-    st.markdown("### 🔍 CHART EVIDENCE")
-    st.write(_r("evidence"))
-    warning = _r("warning")
-    if warning != "N/A":
-        st.warning(warning)
-
-    # Excel export uses only the screenshot report values. It does not include
-    # or query the NSE/F&O selected stock.
-    report_row = {
-        "Chart / Instrument Identification": _r("instrument"),
-        "Timeframe visible in chart": _r("timeframe"),
-        "Current visible price": _r("current_visible_price"),
-        "Market Direction": direction,
-        "Trend": _r("trend"),
-        "Support levels": _r("support_levels"),
-        "Resistance levels": _r("resistance_levels"),
-        "Breakout / Breakdown": _r("breakout_breakdown"),
-        "Liquidity / Sweep": _r("liquidity_sweep"),
-        "CALL / PUT bias": _r("call_put_bias"),
-        "Entry zone": _r("entry_zone"),
-        "Stop Loss": _r("stop_loss"),
-        "Target 1": _r("target_1"),
-        "Target 2": _r("target_2"),
-        "Risk / Reward": _r("risk_reward"),
-        "Scalping setup": _r("scalping_setup"),
-        "Next probable move": _r("next_probable_move"),
-        "Confidence %": confidence,
-        "Final Buy / Sell / Wait decision": decision,
-        "Evidence": _r("evidence"),
-        "Warning": warning,
-        "Submitted at": st.session_state.get("ai_chart_vision_submit_time_v3", "N/A"),
-    }
-    report_df = pd.DataFrame([report_row])
-    st.markdown("### 📥 REPORT EXPORT")
-    _excel_download_button(report_df, "CHART_VISION_ANALYSIS", "ai_chart_vision_excel_v3", label="📊 DOWNLOAD EXCEL REPORT")
-
-    st.caption(
-        "This report is based only on the submitted screenshot. Values that were not readable were returned as N/A. "
-        "Educational analysis only; not a guarantee of market movement."
-    )
-
-
-
 def show_scanner(fyers) -> None:
     """Streamlit main app - NSE AI PRO V17 with MOMENTUM MOVERS"""
     
@@ -5505,20 +5027,73 @@ def show_scanner(fyers) -> None:
     # TAB 2: BEFORE MOVE — EARLY WARNING SIGNAL
     # ════════════════════════════════════════════════════════════════════════════════
     with tabs[2]:
-        st.markdown("### 🚦 BEFORE MOVE — EARLY WARNING SIGNAL")
-        st.caption("Advanced early-warning engine added. Old Momentum / NSE / F&O / PIN / Liquidity / Order Block / Reversal logic remains intact.")
+        st.markdown("### 🚦 BEFORE MOVE — EARLY WARNING + AMD")
+        st.caption("Scans completed 5M candles for pre-move energy, BEFORE MOVE conditions and Accumulation / Manipulation / Distribution (AMD).")
+
+        bm_source = st.radio(
+            "Scan Source", ["NSE Stocks", "F&O Stocks", "BOTH"],
+            horizontal=True, key="before_move_source"
+        )
+        bm_universe_all = (all_symbols if bm_source == "NSE Stocks" else
+                           fo_symbols if bm_source == "F&O Stocks" else
+                           list(dict.fromkeys(list(all_symbols) + list(fo_symbols))))
+        bm_default = min(300 if bm_source == "NSE Stocks" else 200, len(bm_universe_all))
+        bm_limit = st.number_input(
+            "Before Move scan limit (0 = ALL)", min_value=0,
+            max_value=max(len(bm_universe_all), 1), value=bm_default, step=25, key="before_move_limit"
+        )
+        bm_universe = bm_universe_all if bm_limit == 0 else bm_universe_all[:bm_limit]
+
+        c_run, c_info = st.columns([2, 3])
+        with c_run:
+            run_before = st.button(
+                f"🚦 RUN SCAN ({len(bm_universe)} stocks)",
+                key="before_move_run", type="primary", use_container_width=True
+            )
+        with c_info:
+            st.info("Run this scan first. Results stay available after Streamlit reruns and can be downloaded to Excel.")
+
+        if run_before:
+            with st.spinner(f"Scanning BEFORE MOVE + AMD for {len(bm_universe)} stocks…"):
+                all_rows, all_errors, all_stats = [], [], None
+                if bm_source in ("NSE Stocks", "BOTH"):
+                    nse_bm = all_symbols if bm_limit == 0 else [x for x in all_symbols if x in bm_universe]
+                    if bm_source == "NSE Stocks": nse_bm = bm_universe
+                    r, e, stt = run_momentum_scan(fyers, nse_bm, is_fo=False)
+                    all_rows.extend(r or []); all_errors.extend(e or []); all_stats = stt
+                if bm_source in ("F&O Stocks", "BOTH"):
+                    fo_bm = fo_symbols if bm_limit == 0 else [x for x in fo_symbols if x in bm_universe]
+                    if bm_source == "F&O Stocks": fo_bm = bm_universe
+                    r, e, stt = run_momentum_scan(fyers, fo_bm, is_fo=True)
+                    all_rows.extend(r or []); all_errors.extend(e or []); all_stats = stt if all_stats is None else all_stats
+                bm_df = pd.DataFrame(all_rows) if all_rows else pd.DataFrame()
+                if not bm_df.empty and "Symbol" in bm_df.columns:
+                    bm_df = bm_df.drop_duplicates(subset=["Symbol"], keep="first")
+                st.session_state["momentum_df"] = bm_df
+                st.session_state["momentum_errors"] = all_errors
+                st.session_state["momentum_stats"] = all_stats
+                st.success(f"✅ BEFORE MOVE scan completed — {len(bm_df)} rows")
+
         bdf = st.session_state.get("momentum_df")
         if bdf is not None and not bdf.empty:
             view = bdf.copy()
-            # Always expose the stock name first; FYERS/session data may use
-            # SYMBOL, Symbol or symbol depending on the scan path.
             _symbol_col = next((c for c in ["SYMBOL", "Symbol", "symbol"] if c in view.columns), None)
             if _symbol_col is not None:
                 view = view.rename(columns={_symbol_col: "STOCK NAME"})
             elif "STOCK NAME" not in view.columns:
                 view.insert(0, "STOCK NAME", "N/A")
             view = _add_reversal_columns(view)
-            _before_cols = ["STOCK NAME", "LTP", "BEFORE MOVE SIGNAL", "BEFORE MOVE SCORE", "PRE-MOVE SCORE", "PRE-MOVE STATUS", "PRE BUY/SELL SCORE", "PRE SCORE GAP", "BREAKOUT LEVEL", "BREAKDOWN LEVEL", "EARLY MOVE SCORE", "EARLY DIRECTION", "EARLY STATUS", "ENERGY BUILD", "RANGE COMPRESSION", "VOLUME ACCELERATION", "PRICE ACCELERATION", "BREAKOUT DISTANCE %", "BREAKDOWN DISTANCE %", "EARLY TRIGGER", "EARLY INVALIDATION", "EARLY MTF PROXY", "EARLY MOVE REASON", "PRE-MOVE RVOL", "PRE-MOVE REASON", "REVERSAL SIGNAL", "REVERSAL SCORE", "REVERSAL LEVEL", "REVERSAL ZONE", "REVERSAL REASON", "SIGNAL TYPE", "COMBINED BIAS"]
+            _before_cols = [
+                "STOCK NAME", "LTP", "BEFORE MOVE SIGNAL", "BEFORE MOVE SCORE",
+                "AMD PHASE", "AMD DIRECTION", "AMD SCORE", "AMD REASON",
+                "PRE-MOVE SCORE", "PRE-MOVE STATUS", "PRE BUY SCORE", "PRE SELL SCORE", "PRE SCORE GAP",
+                "BREAKOUT LEVEL", "BREAKDOWN LEVEL", "EARLY MOVE SCORE", "EARLY DIRECTION", "EARLY STATUS",
+                "ENERGY BUILD", "RANGE COMPRESSION", "VOLUME ACCELERATION", "PRICE ACCELERATION",
+                "BREAKOUT DISTANCE %", "BREAKDOWN DISTANCE %", "EARLY TRIGGER", "EARLY INVALIDATION",
+                "EARLY MTF PROXY", "EARLY MOVE REASON", "PRE-MOVE RVOL", "PRE-MOVE REASON",
+                "REVERSAL SIGNAL", "REVERSAL SCORE", "REVERSAL LEVEL", "REVERSAL ZONE", "REVERSAL REASON",
+                "SIGNAL TYPE", "COMBINED BIAS"
+            ]
             cols = [c for c in _before_cols if c in view.columns]
             view = view[cols].copy() if cols else view.copy()
             if "BEFORE MOVE SIGNAL" in view.columns:
@@ -5527,9 +5102,18 @@ def show_scanner(fyers) -> None:
                 score_col = "BEFORE MOVE SCORE" if "BEFORE MOVE SCORE" in view.columns else "PRE-MOVE SCORE"
                 view = view.sort_values(["_sort", score_col], ascending=[True, False]).drop(columns=["_sort"])
             st.dataframe(view, use_container_width=True, height=560, hide_index=True)
-            st.download_button("📊 Download BEFORE MOVE", _format_excel_output(view, "BEFORE_MOVE"), f"BEFORE_MOVE_{_now_ist().strftime('%Y%m%d_%H%M')}.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="before_move_xls")
+            st.download_button(
+                "📥 DOWNLOAD BEFORE MOVE + AMD EXCEL",
+                _format_excel_output(view, "BEFORE_MOVE_AMD"),
+                f"BEFORE_MOVE_AMD_{_now_ist().strftime('%Y%m%d_%H%M')}.xlsx",
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="before_move_amd_xls"
+            )
+            if st.session_state.get("momentum_errors"):
+                with st.expander(f"⚠️ Scan errors ({len(st.session_state['momentum_errors'])})"):
+                    st.dataframe(pd.DataFrame({"Error": st.session_state["momentum_errors"]}), use_container_width=True)
         else:
-            st.info("Run SCAN INTRADAY MOVEMENT first. The separate BEFORE MOVE tab will then show the early-warning signals.")
+            st.info("👆 Select NSE/F&O/BOTH and click RUN SCAN. Then BEFORE MOVE + AMD results and Excel download will appear.")
     # ════════════════════════════════════════════════════════════════════════════════
     # TAB 3: F&O OPTION CHECK — LIVE RUN
     # ════════════════════════════════════════════════════════════════════════════════
