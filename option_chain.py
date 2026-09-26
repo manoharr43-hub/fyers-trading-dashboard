@@ -416,20 +416,22 @@ def fetch_fyers_candles(fyers: Any, symbol: str, timeframe_minutes: int, count: 
 # ══════════════════════════════════════════════════════════════════════════
 
 def calculate_rsi(df: pd.DataFrame, period: int = DEFAULT_RSI_PERIOD, col: str = "close") -> pd.Series:
-    """Calculate RSI (Relative Strength Index)."""
+    """Calculate Wilder-style RSI, closer to standard TradingView RSI."""
     if df.empty or col not in df.columns:
         return pd.Series(index=df.index, dtype=float)
-    
-    delta = df[col].diff()
-    gain = delta.where(delta > 0, 0.0)
-    loss = -delta.where(delta < 0, 0.0)
-    
-    avg_gain = gain.rolling(window=period, min_periods=1).mean()
-    avg_loss = loss.rolling(window=period, min_periods=1).mean()
-    
-    rs = avg_gain / avg_loss.replace(0, 1e-10)
-    rsi = 100 - (100 / (1 + rs))
-    return rsi.fillna(50.0)
+
+    delta = pd.to_numeric(df[col], errors="coerce").diff()
+    gain = delta.clip(lower=0.0)
+    loss = -delta.clip(upper=0.0)
+
+    avg_gain = gain.ewm(alpha=1.0 / max(1, int(period)), adjust=False, min_periods=period).mean()
+    avg_loss = loss.ewm(alpha=1.0 / max(1, int(period)), adjust=False, min_periods=period).mean()
+
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    rsi = 100.0 - (100.0 / (1.0 + rs))
+    rsi = rsi.where(avg_loss > 0, 100.0)
+    rsi = rsi.where(~((avg_gain <= 0) & (avg_loss <= 0)), 50.0)
+    return rsi.fillna(50.0).clip(0, 100)
 
 
 def calculate_ema(df: pd.DataFrame, period: int, col: str = "close") -> pd.Series:
@@ -457,12 +459,23 @@ def calculate_macd(df: pd.DataFrame, fast: int = DEFAULT_MACD_PARAMS["fast"],
 
 
 def calculate_vwap(df: pd.DataFrame) -> pd.Series:
-    """Calculate Volume Weighted Average Price."""
+    """Calculate session VWAP, resetting at each trading date."""
     if df.empty or not all(c in df.columns for c in ["high", "low", "close", "volume"]):
         return pd.Series(index=df.index, dtype=float)
-    
-    typical_price = (df["high"] + df["low"] + df["close"]) / 3
-    vwap = (typical_price * df["volume"]).cumsum() / df["volume"].cumsum()
+
+    typical_price = (df["high"] + df["low"] + df["close"]) / 3.0
+    volume = pd.to_numeric(df["volume"], errors="coerce").fillna(0.0).clip(lower=0.0)
+    if "timestamp" in df.columns:
+        ts = pd.to_datetime(df["timestamp"], errors="coerce")
+        session_key = ts.dt.tz_localize(None).dt.date if getattr(ts.dt, "tz", None) is not None else ts.dt.date
+        pv = typical_price * volume
+        cum_pv = pv.groupby(session_key).cumsum()
+        cum_vol = volume.groupby(session_key).cumsum()
+    else:
+        pv = typical_price * volume
+        cum_pv = pv.cumsum()
+        cum_vol = volume.cumsum()
+    vwap = cum_pv / cum_vol.replace(0, np.nan)
     return vwap.fillna(df["close"])
 
 
@@ -513,14 +526,15 @@ def detect_hh_ll(df: pd.DataFrame) -> tuple[pd.Series, pd.Series]:
 
 
 def detect_structure_levels(df: pd.DataFrame, lookback: int = 5) -> dict[str, float]:
-    """Detect major support and resistance levels (highs and lows)."""
-    if df.empty or len(df) < lookback:
+    """Detect prior-candle support/resistance so the current candle can actually break it."""
+    if df.empty or len(df) < max(2, lookback + 1):
         return {"resistance": 0.0, "support": 0.0, "recent_high": 0.0, "recent_low": 0.0}
-    
-    recent = df.tail(lookback)
+
+    # Exclude the current candle from the reference range.
+    previous = df.iloc[:-1].tail(max(1, int(lookback)))
     return {
-        "resistance": float(recent["high"].max()),
-        "support": float(recent["low"].min()),
+        "resistance": float(previous["high"].max()),
+        "support": float(previous["low"].min()),
         "recent_high": float(df["high"].iloc[-1]),
         "recent_low": float(df["low"].iloc[-1]),
     }
@@ -543,23 +557,23 @@ def detect_bos(df: pd.DataFrame, structure_levels: dict) -> bool:
 
 
 def detect_choch(df: pd.DataFrame, lookback: int = 10) -> bool:
-    """Detect Change of Character (CHoCH)."""
-    if df.empty or len(df) < lookback:
+    """Detect CHoCH from a meaningful recent swing break, not 8/9 monotonic candles."""
+    if df.empty or len(df) < max(5, lookback):
         return False
-    
-    recent = df.tail(lookback)
-    lows = recent["low"].values
-    highs = recent["high"].values
-    
-    lower_lows = sum(1 for i in range(1, len(lows)) if lows[i] < lows[i-1])
-    lower_highs = sum(1 for i in range(1, len(highs)) if highs[i] < highs[i-1])
-    bearish_shift = (lower_lows >= lookback - 2) and (lower_highs >= lookback - 2)
-    
-    higher_lows = sum(1 for i in range(1, len(lows)) if lows[i] > lows[i-1])
-    higher_highs = sum(1 for i in range(1, len(highs)) if highs[i] > highs[i-1])
-    bullish_shift = (higher_lows >= lookback - 2) and (higher_highs >= lookback - 2)
-    
-    return bearish_shift or bullish_shift
+
+    n = max(3, int(lookback // 2))
+    recent = df.tail(int(lookback)).copy()
+    prior = recent.iloc[:-n]
+    latest = recent.tail(n)
+    if prior.empty or latest.empty:
+        return False
+
+    prior_high = float(prior["high"].max())
+    prior_low = float(prior["low"].min())
+    latest_high = float(latest["high"].max())
+    latest_low = float(latest["low"].min())
+
+    return bool(latest_high > prior_high or latest_low < prior_low)
 
 
 def detect_mss(df_list: dict[str, pd.DataFrame]) -> dict[str, dict]:
@@ -1071,7 +1085,8 @@ def parse_days_to_expiry(expiry_label: str) -> float:
     for fmt in ("%d-%b-%Y", "%d-%m-%Y", "%Y-%m-%d"):
         try:
             exp_dt = datetime.strptime(expiry_label, fmt)
-            delta_days = (exp_dt.replace(hour=15, minute=30) - datetime.now()).total_seconds() / 86400
+            expiry_close = exp_dt.replace(hour=15, minute=30, tzinfo=INDIA_TZ)
+            delta_days = (expiry_close - _india_now()).total_seconds() / 86400
             return max(delta_days, TRADING_DAYS_MIN_T)
         except ValueError:
             continue
@@ -4541,12 +4556,12 @@ def _movement_price_reversal_from_history(
 # ══════════════════════════════════════════════════════════════════════════
 # ADDITIVE MOVEMENT SEARCH — INDEX + F&O
 # ══════════════════════════════════════════════════════════════════════════
-# Search one selected Index / F&O stock and show ONLY upside CE strikes.
+# Search one selected Index / F&O stock and show validated UP/DOWN movement strikes.
 #
 # IMPORTANT:
 # - Existing option-chain/analytics functions are not replaced.
 # - Existing movement_score / ce_movement_score / pe_movement_score are reused.
-# - The movement search is intentionally filtered to CE / UP only.
+# - Movement search supports validated UP, DOWN and NEUTRAL states.
 # - Existing dashboard UI and scanner logic remain unchanged.
 # - Excel download is additive for movement-search results.
 
@@ -4619,17 +4634,23 @@ def _movement_trade_levels(
             "Price Reversal": 0.0, "Reversal Status": "NO PRICE",
         }
 
-    # First scan fallback; later scans use the actual recent CE price history.
-    fallback_reversal = entry * 0.95
-    reversal = _pin_num(reversal_level, fallback_reversal)
-    if reversal <= 0 or reversal >= entry:
-        reversal = fallback_reversal
+    # Never invent a 5% reversal level. If there is no validated history, keep
+    # the level at zero and explicitly show WAIT HISTORY/CONFIRMATION.
+    reversal = _pin_num(reversal_level, 0.0)
+    if reversal <= 0:
+        return {
+            "Signal Time": now_text,
+            "Entry": round(entry, 2),
+            "Stop Loss": 0.0,
+            "Price Reversal": 0.0,
+            "Reversal Status": str(reversal_status or "WAIT HISTORY"),
+        }
 
     # Keep SL close to the actual reversal trigger instead of producing a
     # misleading zero/very-distant stop. Scanner reference only.
     stop_loss = max(0.0, reversal * 0.98)
     if stop_loss >= entry:
-        stop_loss = max(0.0, entry * 0.93)
+        stop_loss = max(0.0, entry * 0.98)
 
     return {
         "Signal Time": now_text,
@@ -4791,7 +4812,7 @@ def _directional_confirmation_additive(
     else:
         validation = "WATCH"
 
-    signal_valid = "YES" if validation == "CONFIRMED" else "NO"
+    signal_valid = validation == "CONFIRMED"
     if validation == "CONFIRMED":
         reason += f"; {rising} consecutive matching scans"
 
@@ -4810,6 +4831,9 @@ def _directional_confirmation_additive(
         "ce_scan_delta": round(ce_delta_pct, 4),
         "pe_scan_delta": round(pe_delta_pct, 4),
         "underlying_scan_delta": round(spot_delta_pct, 4),
+        "selected_scan_delta": round(ce_delta_pct if abs(ce_delta_pct) >= abs(pe_delta_pct) else pe_delta_pct, 4),
+        "selected_price_change_pct": round(ce_delta_pct if abs(ce_delta_pct) >= abs(pe_delta_pct) else pe_delta_pct, 4),
+        "selected_direction_source": ce_source if abs(ce_delta_pct) >= abs(pe_delta_pct) else pe_source,
     }
 
 
@@ -5038,42 +5062,72 @@ def _movement_search_one(
                 })
                 continue
 
-            # ORIGINAL selected-search behavior: CE/UP only.
-            if ce_score < threshold:
-                continue
-            if ce_score <= pe_score + 7.0:
+            # Selected-search behavior: validated CE/PE direction, not CE-only.
+            side = "CE" if ce_score >= pe_score else "PE"
+            score = max(ce_score, pe_score)
+            if score < threshold:
                 continue
 
-            current_ce = _pin_num(row.get("ce_ltp"), 0.0)
+            ce_price = _pin_num(row.get("ce_ltp"), 0.0)
+            pe_price = _pin_num(row.get("pe_ltp"), 0.0)
+            ce_daily = _pin_num(row.get("ce_change"), 0.0)
+            pe_daily = _pin_num(row.get("pe_change"), 0.0)
             movement_history = st.session_state.get(MOVEMENT_HISTORY_KEY, {})
+
+            validation = _directional_confirmation_additive(
+                symbol, expiry, strike, spot, ce_price, pe_price, ce_daily, pe_daily
+            )
+            directional_bias = validation["directional_bias"]
+            selected_price = pe_price if side == "PE" else ce_price
             reversal_level, reversal_status = _movement_price_reversal_from_history(
-                movement_history, symbol, expiry, strike, current_ce, lookback=5
+                movement_history, symbol, expiry, strike, selected_price,
+                lookback=5, side=side
             )
             levels = _movement_trade_levels(
                 row, reversal_level=reversal_level, reversal_status=reversal_status
             )
+
+            if validation["signal_validation"] in {"PREMIUM EXPANSION", "PREMIUM CONTRACTION"}:
+                display_direction = "NEUTRAL"
+            elif directional_bias in {"UP", "DOWN"}:
+                display_direction = directional_bias
+            else:
+                display_direction = "WATCH"
+
             rows.append({
-                "Instrument": symbol,
-                "Strike": strike,
-                "Option": "CE",
-                "Direction": "UP",
-                "Status": _movement_search_status(ce_score),
-                "Signal Time": levels["Signal Time"],
-                "Entry": levels["Entry"],
-                "Stop Loss": levels["Stop Loss"],
-                "Price Reversal": levels["Price Reversal"],
+                "Instrument": symbol, "Strike": strike, "Option": side,
+                "Direction": display_direction,
+                "Status": _movement_search_status(score),
+                "Signal Time": levels["Signal Time"], "Entry": levels["Entry"],
+                "Stop Loss": levels["Stop Loss"], "Price Reversal": levels["Price Reversal"],
                 "Reversal Status": levels["Reversal Status"],
-                "Score": round(ce_score, 1),
+                "Score": round(score, 1),
                 "Early Score": round(_pin_num(row.get("early_movement_score")), 1),
-                "CE Score": round(ce_score, 1),
-                "PE Score": round(pe_score, 1),
-                "Movement Bias": "CE UP",
+                "CE Score": round(ce_score, 1), "PE Score": round(pe_score, 1),
+                "Movement Bias": f"{side} {display_direction}",
+                "Price Delta": round(_pin_num(validation.get("selected_scan_delta")), 4),
+                "Price Change %": round(_pin_num(validation.get("selected_price_change_pct")), 2),
+                "Price Direction Source": validation.get("selected_direction_source", "SCAN LTP"),
+                "CE Price": round(ce_price, 4), "PE Price": round(pe_price, 4),
                 "Early Status": str(row.get("early_movement_status", "WAIT")),
                 "Rising Scans": int(_pin_num(row.get("movement_rising_scans"), 0)),
                 "Score Delta": round(_pin_num(row.get("movement_score_delta")), 1),
                 "Confidence": round(_pin_num(row.get("early_movement_confidence")), 1),
                 "Spot": round(spot, 2) if spot else 0.0,
                 "Source": result.get("source", "UNKNOWN"),
+                "Underlying Direction": validation["underlying_direction"],
+                "Underlying Direction Source": validation["underlying_direction_source"],
+                "CE Direction": validation["ce_direction"],
+                "CE Direction Source": validation["ce_direction_source"],
+                "PE Direction": validation["pe_direction"],
+                "PE Direction Source": validation["pe_direction_source"],
+                "Signal Validation": validation["signal_validation"],
+                "Signal Valid": "YES" if validation["signal_valid"] else "NO",
+                "False Signal Reason": validation["false_signal_reason"],
+                "Directional Bias": directional_bias,
+                "Directional Rising Scans": validation["directional_rising_scans"],
+                "CE Scan Delta": validation["ce_scan_delta"],
+                "PE Scan Delta": validation["pe_scan_delta"],
             })
 
         if not rows:
@@ -5100,17 +5154,16 @@ def _render_movement_search_results(
     is_index: bool,
     strike_count: int = 40,
 ) -> None:
-    """Render selected Index/F&O movement search; upside CE strikes only."""
-    title = "🔎 INDEX UP-MOVEMENT SEARCH" if is_index else "🔎 F&O STOCK UP-MOVEMENT SEARCH"
+    """Render selected Index/F&O movement search with validated UP/DOWN direction."""
+    title = "🔎 INDEX MOVEMENT SEARCH" if is_index else "🔎 F&O STOCK MOVEMENT SEARCH"
 
     st.markdown(
         f'<div class="block-title">{title}</div>',
         unsafe_allow_html=True,
     )
     st.caption(
-        f"Searching **{symbol}** and showing ONLY CE / UP strikes with "
-        f"movement score ≥ {MOVEMENT_SEARCH_MIN_SCORE:.0f}. "
-        "The Early Score tracks build-up across scans."
+        f"Searching **{symbol}** for CE/PE movement with score ≥ {MOVEMENT_SEARCH_MIN_SCORE:.0f}. "
+        "UP/DOWN is shown only after premium + underlying confirmation; CE+PE moving together is NEUTRAL."
     )
 
     if fyers is None and is_index and symbol in NSE_UNSUPPORTED_INDICES:
