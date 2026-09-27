@@ -4597,14 +4597,18 @@ MOVEMENT_FNO_UNIVERSE = [
 ]
 
 
-def _movement_search_status(score: float) -> str:
-    """Convert the existing movement score into a compact upside status."""
+def _movement_search_status(score: float, side: str = "", direction: str = "") -> str:
+    """Return movement strength without assuming every signal is UP."""
     score = float(score or 0)
+    side = str(side or "").upper().strip()
+    direction = str(direction or "").upper().strip()
+    prefix = f"{side} {direction}".strip() or "MOVEMENT"
+
     if score >= 82:
-        return "🚨 BIG UP MOVE"
+        return f"🚨 BIG MOVEMENT — {prefix}"
     if score >= MOVEMENT_SEARCH_MIN_SCORE:
-        return "🟢 EARLY UP MOVE"
-    return "WATCH"
+        return f"🟢 EARLY MOVEMENT — {prefix}"
+    return f"WATCH — {prefix}"
 
 
 def _movement_trade_levels(
@@ -4612,13 +4616,24 @@ def _movement_trade_levels(
     signal_time: Optional[datetime] = None,
     reversal_level: Optional[float] = None,
     reversal_status: str = "WAIT HISTORY",
+    side: str = "CE",
+    direction: str = "FLAT",
 ) -> dict[str, Any]:
-    """Build CE movement-scan levels with a live price-reversal check."""
-    ltp = _pin_num(row.get("ce_ltp"), 0.0)
-    ask = _pin_num(row.get("ce_ask"), 0.0)
+    """Build side-aware movement levels for CE or PE.
+
+    FIXES: PE no longer uses CE entry; DOWN signals no longer get an
+    incorrectly placed below-entry stop; and missing history never creates
+    an artificial reversal level.
+    """
+    side = "PE" if str(side).upper() == "PE" else "CE"
+    direction = str(direction or "FLAT").upper()
+
+    ltp_key = "pe_ltp" if side == "PE" else "ce_ltp"
+    ask_key = "pe_ask" if side == "PE" else "ce_ask"
+    ltp = _pin_num(row.get(ltp_key), 0.0)
+    ask = _pin_num(row.get(ask_key), 0.0)
     entry = ask if ask > 0 else ltp
-    # Signal Time is always India Standard Time (IST), not the Streamlit
-    # server timezone (often UTC). This fixes the 5:30 hour offset seen in UI.
+
     if signal_time is not None:
         if signal_time.tzinfo is None:
             signal_dt = signal_time.replace(tzinfo=INDIA_TZ)
@@ -4634,8 +4649,6 @@ def _movement_trade_levels(
             "Price Reversal": 0.0, "Reversal Status": "NO PRICE",
         }
 
-    # Never invent a 5% reversal level. If there is no validated history, keep
-    # the level at zero and explicitly show WAIT HISTORY/CONFIRMATION.
     reversal = _pin_num(reversal_level, 0.0)
     if reversal <= 0:
         return {
@@ -4646,11 +4659,19 @@ def _movement_trade_levels(
             "Reversal Status": str(reversal_status or "WAIT HISTORY"),
         }
 
-    # Keep SL close to the actual reversal trigger instead of producing a
-    # misleading zero/very-distant stop. Scanner reference only.
-    stop_loss = max(0.0, reversal * 0.98)
-    if stop_loss >= entry:
-        stop_loss = max(0.0, entry * 0.98)
+    # Side/direction-aware reference stop. For an UP premium move the
+    # reversal reference is below entry; for a DOWN premium move it is above.
+    if direction == "UP":
+        stop_loss = min(reversal, entry)
+        if stop_loss >= entry:
+            stop_loss = entry * 0.98
+    elif direction == "DOWN":
+        stop_loss = max(reversal, entry)
+        if stop_loss <= entry:
+            stop_loss = entry * 1.02
+    else:
+        # No directional confirmation -> do not manufacture a trade stop.
+        stop_loss = 0.0
 
     return {
         "Signal Time": now_text,
@@ -4694,7 +4715,7 @@ def _movement_search_excel(df: pd.DataFrame, report_name: str = "Movement Search
     info = [
         ("Report", report_name),
         ("Generated At", datetime.now().strftime("%d-%b-%Y %H:%M:%S")),
-        ("Filter", "Selected-search remains CE/UP only; Total Scanner selects stronger CE/PE side per strike and derives UP/DOWN from option-premium price movement."),
+        ("Filter", "Selected-search and Total Scanner compare CE/PE at the same strike; Entry, Price Reversal and Stop Loss are side-aware and direction-aware."),
         ("Minimum Selected-Search CE Movement Score", MOVEMENT_SEARCH_MIN_SCORE),
         ("Note", "Movement score is an activity/ranking early-warning model, not a guaranteed price prediction."),
     ]
@@ -5017,14 +5038,17 @@ def _movement_search_one(
                     movement_history, symbol, expiry, strike, current_option,
                     lookback=5, side=side,
                 )
-                levels = _movement_trade_levels(row, reversal_level=reversal_level, reversal_status=reversal_status)
+                levels = _movement_trade_levels(
+                    row, reversal_level=reversal_level, reversal_status=reversal_status,
+                    side=side, direction=direction,
+                )
 
                 rows.append({
                     "Instrument": symbol,
                     "Strike": strike,
                     "Option": side,
                     "Direction": display_direction,
-                    "Status": _movement_search_status(score),
+                    "Status": _movement_search_status(score, side, direction),
                     "Signal Time": levels["Signal Time"],
                     "Entry": levels["Entry"],
                     "Stop Loss": levels["Stop Loss"],
@@ -5078,13 +5102,18 @@ def _movement_search_one(
                 symbol, expiry, strike, spot, ce_price, pe_price, ce_daily, pe_daily
             )
             directional_bias = validation["directional_bias"]
+            option_direction = (
+                validation["pe_direction"] if side == "PE"
+                else validation["ce_direction"]
+            )
             selected_price = pe_price if side == "PE" else ce_price
             reversal_level, reversal_status = _movement_price_reversal_from_history(
                 movement_history, symbol, expiry, strike, selected_price,
                 lookback=5, side=side
             )
             levels = _movement_trade_levels(
-                row, reversal_level=reversal_level, reversal_status=reversal_status
+                row, reversal_level=reversal_level, reversal_status=reversal_status,
+                side=side, direction=option_direction,
             )
 
             if validation["signal_validation"] in {"PREMIUM EXPANSION", "PREMIUM CONTRACTION"}:
@@ -5097,7 +5126,7 @@ def _movement_search_one(
             rows.append({
                 "Instrument": symbol, "Strike": strike, "Option": side,
                 "Direction": display_direction,
-                "Status": _movement_search_status(score),
+                "Status": _movement_search_status(score, side, option_direction),
                 "Signal Time": levels["Signal Time"], "Entry": levels["Entry"],
                 "Stop Loss": levels["Stop Loss"], "Price Reversal": levels["Price Reversal"],
                 "Reversal Status": levels["Reversal Status"],
