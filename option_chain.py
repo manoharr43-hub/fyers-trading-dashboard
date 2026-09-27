@@ -4692,7 +4692,7 @@ def _movement_search_excel(df: pd.DataFrame, report_name: str = "Movement Search
         "Instrument", "Strike", "Option", "Direction", "Status",
         "Signal Time", "Entry", "Stop Loss", "Price Reversal", "Reversal Status",
         "Score", "Early Score", "CE Score", "PE Score",
-        "Movement Bias", "Price Delta", "Price Change %", "Price Direction Source",
+        "Movement Bias", "Price Delta", "Price Change %", "Price Direction Source", "Daily Change", "Daily Change %",
         "CE Price", "PE Price", "Early Status", "Rising Scans",
         "Score Delta", "Confidence", "Spot", "Source",
         "Underlying Direction", "Underlying Direction Source", "CE Direction", "CE Direction Source",
@@ -4837,6 +4837,9 @@ def _directional_confirmation_additive(
     if validation == "CONFIRMED":
         reason += f"; {rising} consecutive matching scans"
 
+    # ce_scan_delta / pe_scan_delta are percentage changes between the current
+    # scan and the previous valid scan. They are intentionally NOT FYERS daily
+    # change values. Daily change is exported separately by the movement report.
     return {
         "underlying_direction": underlying,
         "underlying_direction_source": underlying_source,
@@ -4870,7 +4873,7 @@ def _movement_search_one(
     Unified movement search.
 
     IMPORTANT:
-    - Default side_mode="UP" preserves the existing selected-search report.
+    - Default side_mode="UP" preserves the existing selected-search entry point.
     - side_mode="BOTH" is used ONLY by the new Total Scanner.
     - Existing add_strike_movement_score() logic is not changed.
     - In BOTH mode CE and PE are compared at the SAME strike and the stronger
@@ -5018,11 +5021,13 @@ def _movement_search_one(
                     direction = "UP" if price_delta > 0.005 else ("DOWN" if price_delta < -0.005 else "FLAT")
                     direction_source = "SCAN LTP"
                 else:
+                    # Do not mix FYERS day-change with scan-to-scan movement.
+                    # Without two valid snapshots, movement direction must wait for history.
                     daily_delta = pe_daily if side == "PE" else ce_daily
-                    price_delta = daily_delta
-                    price_pct = (daily_delta / current_option) * 100.0 if current_option > 0 else 0.0
-                    direction = "UP" if daily_delta > 0.005 else ("DOWN" if daily_delta < -0.005 else "FLAT")
-                    direction_source = "FYERS CHANGE"
+                    price_delta = 0.0
+                    price_pct = 0.0
+                    direction = "WAIT"
+                    direction_source = "WAIT HISTORY"
 
                 validation = _directional_confirmation_additive(
                     symbol, expiry, strike, spot, ce_price, pe_price, ce_daily, pe_daily
@@ -5062,6 +5067,8 @@ def _movement_search_one(
                     "Price Delta": round(price_delta, 4),
                     "Price Change %": round(price_pct, 2),
                     "Price Direction Source": direction_source,
+                    "Daily Change": round(ce_daily if side == "CE" else pe_daily, 4),
+                    "Daily Change %": round(((ce_daily if side == "CE" else pe_daily) / (current_option - (ce_daily if side == "CE" else pe_daily)) * 100.0) if current_option > 0 and (current_option - (ce_daily if side == "CE" else pe_daily)) > 0 else 0.0, 2),
                     "CE Price": round(ce_price, 4),
                     "PE Price": round(pe_price, 4),
                     "Early Status": str(row.get("early_movement_status", "WAIT")),
@@ -5134,9 +5141,11 @@ def _movement_search_one(
                 "Early Score": round(_pin_num(row.get("early_movement_score")), 1),
                 "CE Score": round(ce_score, 1), "PE Score": round(pe_score, 1),
                 "Movement Bias": f"{side} {display_direction}",
-                "Price Delta": round(_pin_num(validation.get("selected_scan_delta")), 4),
-                "Price Change %": round(_pin_num(validation.get("selected_price_change_pct")), 2),
-                "Price Direction Source": validation.get("selected_direction_source", "SCAN LTP"),
+                "Price Delta": round(_pin_num(validation.get("pe_scan_delta" if side == "PE" else "ce_scan_delta")), 4),
+                "Price Change %": round(_pin_num(validation.get("pe_scan_delta" if side == "PE" else "ce_scan_delta")), 2),
+                "Price Direction Source": validation.get("pe_direction_source" if side == "PE" else "ce_direction_source", "WAIT HISTORY"),
+                "Daily Change": round(pe_daily if side == "PE" else ce_daily, 4),
+                "Daily Change %": round((((pe_daily if side == "PE" else ce_daily) / (selected_price - (pe_daily if side == "PE" else ce_daily))) * 100.0) if selected_price > 0 and (selected_price - (pe_daily if side == "PE" else ce_daily)) > 0 else 0.0, 2),
                 "CE Price": round(ce_price, 4), "PE Price": round(pe_price, 4),
                 "Early Status": str(row.get("early_movement_status", "WAIT")),
                 "Rising Scans": int(_pin_num(row.get("movement_rising_scans"), 0)),
@@ -5202,7 +5211,7 @@ def _render_movement_search_results(
         )
         return
 
-    with st.spinner(f"Scanning {symbol} for UP movement strikes…"):
+    with st.spinner(f"Scanning {symbol} for CE/PE movement strikes…"):
         result_df = _movement_search_one(
             fyers, symbol, is_index, strike_count
         )
@@ -5213,13 +5222,13 @@ def _render_movement_search_results(
             st.error(f"❌ Movement search failed: {last_error}")
         else:
             st.info(
-                f"ℹ️ {symbol}: no CE / UP strike currently meets the "
+                f"ℹ️ {symbol}: no CE / PE movement strike currently meets the "
                 f"{MOVEMENT_SEARCH_MIN_SCORE:.0f}+ movement threshold."
             )
         return
 
     st.success(
-        f"📌 {symbol}: {len(result_df)} UP strike(s) found — CE only."
+        f"📌 {symbol}: {len(result_df)} CE/PE movement strike(s) found."
     )
 
     display_cols = [
@@ -5256,11 +5265,11 @@ def _render_movement_search_results(
     )
 
     compact = "  •  ".join(
-        f"{r['Instrument']} {r['Strike']:,.0f} CE UP "
+        f"{r['Instrument']} {r['Strike']:,.0f} {r['Option']} {r['Direction']} "
         f"{r['Status']} ({r['Score']:.0f})"
         for _, r in result_df.iterrows()
     )
-    st.markdown("**🎯 UP Movement Strikes:**")
+    st.markdown("**🎯 CE / PE Movement Strikes:**")
     st.info(compact)
 
 
@@ -6529,3 +6538,4 @@ def show_option_chain(fyers: Any = None) -> None:
 
 if __name__ == "__main__":
     run_dashboard()
+# FINAL MOVEMENT SCANNER BUILD: 2026-09-27
