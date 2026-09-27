@@ -274,6 +274,23 @@ VOL_BIGMOVE_MIN_BODY_PCT = 0.8
 VOL_BIGMOVE_LOOKBACK = 20
 
 # ════════════════════════════════════════════════════════════════════════════════
+# BIG MOVE / AMD ENGINE CONSTANTS
+# These constants are used by detect_last_consolidation() and
+# detect_big_move_setup(). Keep them separate from the original VOL_* values
+# so the existing scanner logic is not disturbed.
+# ════════════════════════════════════════════════════════════════════════════════
+BIGMOVE_MIN_BODY_ATR = 0.8
+BIGMOVE_MIN_BODY_PCT = VOL_BIGMOVE_MIN_BODY_PCT
+BIGMOVE_MIN_RVOL = VOL_BIGMOVE_MIN_RVOL
+BIGMOVE_MIN_BREAK_PCT = 0.30
+BIGMOVE_CONSOLIDATION_MIN_BARS = 4
+BIGMOVE_CONSOLIDATION_MAX_BARS = 12
+BIGMOVE_LOOKBACK_BARS = VOL_BIGMOVE_LOOKBACK
+BIGMOVE_MAX_RANGE_PCT = 2.5
+BIGMOVE_MAX_BAR_ATR_MULT = 1.0
+BIGMOVE_STRONG_SCORE = 82
+
+# ════════════════════════════════════════════════════════════════════════════════
 # MULTI-TIMEFRAME CONSTANTS (NEW)
 # ════════════════════════════════════════════════════════════════════════════════
 SWING_LOOKBACK_PERIODS = 20
