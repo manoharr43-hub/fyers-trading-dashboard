@@ -3859,16 +3859,43 @@ def _future_move_signal(fyers, symbol: str, is_fo: bool = False):
         tf_confirm = direction in (f5["direction"], f15["direction"]) and f5["direction"] == f15["direction"]
         volume_confirm = f5["rvol"] >= 1.2 or f5["volume_accel"] >= 1.15
         structure_confirm = (direction == "BUY" and f5["structure"] == "HH/HL") or (direction == "SELL" and f5["structure"] == "LH/LL")
+        # Explicit contradiction check: a BUY should not be labelled structurally bearish
+        # and a SELL should not be labelled structurally bullish.  NONE is treated as
+        # missing confirmation, not as a contradiction.
+        structure_contradiction = (direction == "BUY" and f5["structure"] == "LH/LL") or (direction == "SELL" and f5["structure"] == "HH/HL")
         energy = f5["compression"] >= 20 and volume_confirm
+        compression_confirm = f5["compression"] >= 20
         near_trigger = (direction == "BUY" and f5["breakout_distance"] is not None and f5["breakout_distance"] <= 1.0) or (direction == "SELL" and f5["breakdown_distance"] is not None and f5["breakdown_distance"] <= 1.0)
+
+        # Final score is a signal-strength score, not a probability. Penalise missing
+        # early-build evidence and explicit structure contradictions so a high raw
+        # momentum score cannot by itself produce an overconfident future signal.
+        score_penalty = 0.0
+        if not tf_confirm:
+            score_penalty += 8.0
+        if not volume_confirm:
+            score_penalty += 7.0
+        if not structure_confirm:
+            score_penalty += 6.0
+        if structure_contradiction:
+            score_penalty += 10.0
+        if not compression_confirm:
+            score_penalty += 4.0
+        if not energy:
+            score_penalty += 3.0
+        if not near_trigger:
+            score_penalty += 3.0
+        score = min(100.0, max(0.0, score - score_penalty))
 
         if direction == "NONE":
             stage = "WATCH"
-        elif tf_confirm and score >= 78 and energy and near_trigger:
+        elif structure_contradiction:
+            stage = "WATCH"
+        elif tf_confirm and score >= 78 and energy and near_trigger and structure_confirm:
             stage = "READY"
-        elif tf_confirm and score >= 65 and energy:
+        elif tf_confirm and score >= 65 and (energy or structure_confirm) and not structure_contradiction:
             stage = "BUILDING"
-        elif score >= 55:
+        elif score >= 55 and not structure_contradiction:
             stage = "EARLY BUILD"
         else:
             stage = "WATCH"
@@ -3911,7 +3938,10 @@ def _future_move_signal(fyers, symbol: str, is_fo: bool = False):
             "5M/15M CONFIRMATION": "YES" if tf_confirm else "NO",
             "VOLUME CONFIRMATION": "YES" if volume_confirm else "NO",
             "STRUCTURE CONFIRMATION": "YES" if structure_confirm else "NO",
+            "STRUCTURE CONTRADICTION": "YES" if structure_contradiction else "NO",
             "ENERGY BUILD": "YES" if energy else "NO",
+            "COMPRESSION CONFIRMATION": "YES" if compression_confirm else "NO",
+            "SCORE PENALTY": round(score_penalty, 1),
             "RANGE COMPRESSION": f5["compression"], "RVOL": f5["rvol"],
             "VOLUME ACCELERATION": f5["volume_accel"], "PRICE ACCELERATION": f5["price_accel"],
             "STRUCTURE": f5["structure"], "BREAKOUT DISTANCE %": f5["breakout_distance"],
@@ -5607,7 +5637,7 @@ def show_scanner(fyers) -> None:
             fm_cols = [
                 "Symbol","LTP","SIGNAL TIME","FUTURE DIRECTION","FUTURE MOVE SCORE","FUTURE STATUS","MOVE STAGE",
                 "5M DIRECTION","5M SCORE","15M DIRECTION","15M SCORE","5M/15M CONFIRMATION",
-                "VOLUME CONFIRMATION","STRUCTURE CONFIRMATION","ENERGY BUILD","RANGE COMPRESSION",
+                "VOLUME CONFIRMATION","STRUCTURE CONFIRMATION","STRUCTURE CONTRADICTION","ENERGY BUILD","COMPRESSION CONFIRMATION","SCORE PENALTY","RANGE COMPRESSION",
                 "RVOL","VOLUME ACCELERATION","PRICE ACCELERATION","STRUCTURE","BREAKOUT DISTANCE %",
                 "BREAKDOWN DISTANCE %","FUTURE TRIGGER","FUTURE INVALIDATION","FUTURE REASON",
                 "ACTUAL MOVE VALIDATION","VALIDATION WINDOW","BARS TO VALIDATION","VALIDATION TIME",
