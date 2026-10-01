@@ -3791,8 +3791,19 @@ def _future_tf_features(df: pd.DataFrame) -> Dict[str, Any]:
 
         direction = "BUY" if buy > sell + 8 else "SELL" if sell > buy + 8 else "NONE"
         score = min(100.0, max(buy, sell))
-        trigger = rh if direction == "BUY" else rl if direction == "SELL" else None
-        invalidation = (c - atr*0.8) if direction == "BUY" else (c + atr*0.8) if direction == "SELL" else None
+        # Normalize trigger/invalidation direction.
+        # BUY: trigger above current price; invalidation below current price.
+        # SELL: trigger below current price; invalidation above current price.
+        buffer = max(atr * 0.80, c * 0.001)
+        if direction == "BUY":
+            trigger = rh if rh > c else c + max(atr * 0.25, c * 0.001)
+            invalidation = c - buffer
+        elif direction == "SELL":
+            trigger = rl if rl < c else c - max(atr * 0.25, c * 0.001)
+            invalidation = c + buffer
+        else:
+            trigger = None
+            invalidation = None
         if direction == "BUY":
             status_reason = " + ".join(buy_reasons[:7])
         elif direction == "SELL":
@@ -3907,7 +3918,15 @@ def _future_move_signal(fyers, symbol: str, is_fo: bool = False):
             "BREAKDOWN DISTANCE %": f5["breakdown_distance"], "FUTURE TRIGGER": trigger,
             "FUTURE INVALIDATION": invalidation, "5M REASON": f5["reason"],
             "15M REASON": f15["reason"], "FUTURE REASON": " + ".join(reason_parts),
-            "ACTUAL MOVE VALIDATION": "PENDING", "VALIDATION WINDOW": "NEXT 3 COMPLETED 5M CANDLES"
+            "ACTUAL MOVE VALIDATION": "PENDING",
+            "VALIDATION WINDOW": "NEXT 3 COMPLETED 5M CANDLES",
+            "BARS TO VALIDATION": None,
+            "VALIDATION TIME": None,
+            "MOVE %": None,
+            "MFE %": None,
+            "MAE %": None,
+            "_SIGNAL_TS_ISO": pd.Timestamp(sig_time).isoformat(),
+            "_VALIDATION_ENTRY": round(ltp, 4)
         }
         if is_fo:
             result["SOURCE"] = "F&O"
@@ -3916,6 +3935,100 @@ def _future_move_signal(fyers, symbol: str, is_fo: bool = False):
         return result, None
     except Exception as e:
         return None, f"{symbol}: future scan error: {type(e).__name__}: {str(e)[:120]}"
+
+
+def _validate_future_move_row(row: dict, df5: pd.DataFrame):
+    """Validate a future-move signal against the next 3 completed 5M candles."""
+    try:
+        direction = str(row.get("FUTURE DIRECTION", "")).upper()
+        if direction not in ("BUY", "SELL"):
+            return row
+        signal_ts = pd.to_datetime(row.get("_SIGNAL_TS_ISO") or row.get("SIGNAL TIME"), errors="coerce")
+        if pd.isna(signal_ts):
+            return row
+        trigger = float(row.get("FUTURE TRIGGER"))
+        invalidation = float(row.get("FUTURE INVALIDATION"))
+        entry = float(row.get("_VALIDATION_ENTRY", row.get("LTP")))
+        d = df5.copy().reset_index(drop=True)
+        if "Time" not in d.columns:
+            return row
+        ts = pd.to_datetime(d["Time"], errors="coerce")
+        if getattr(ts.dt, "tz", None) is not None:
+            ts_cmp = ts.dt.tz_convert("UTC").dt.tz_localize(None)
+            sig_cmp = signal_ts.tz_convert("UTC").tz_localize(None) if signal_ts.tzinfo else signal_ts
+        else:
+            ts_cmp = ts
+            sig_cmp = signal_ts.tz_convert("UTC").tz_localize(None) if signal_ts.tzinfo else signal_ts
+        future = d.loc[ts_cmp > sig_cmp].copy()
+        if future.empty:
+            return row
+        future["_ts_cmp"] = ts_cmp[future.index]
+        future = future.sort_values("_ts_cmp").head(3)
+        if len(future) < 3:
+            row["ACTUAL MOVE VALIDATION"] = "PENDING"
+            row["VALIDATION WINDOW"] = f"{len(future)}/3 COMPLETED 5M CANDLES"
+            return row
+        result = None; bars = None; validation_time = None
+        for i, (_, candle) in enumerate(future.iterrows(), start=1):
+            high = float(candle["High"]); low = float(candle["Low"])
+            if direction == "BUY":
+                hit_trigger = high >= trigger; hit_invalid = low <= invalidation
+            else:
+                hit_trigger = low <= trigger; hit_invalid = high >= invalidation
+            if hit_trigger and hit_invalid:
+                result = "AMBIGUOUS"; bars = i; validation_time = candle.get("Time"); break
+            if hit_trigger:
+                result = "WIN"; bars = i; validation_time = candle.get("Time"); break
+            if hit_invalid:
+                result = "FALSE"; bars = i; validation_time = candle.get("Time"); break
+        if result is None:
+            result = "NO MOVE"; bars = 3; validation_time = future.iloc[-1].get("Time")
+        closes = pd.to_numeric(future["Close"], errors="coerce")
+        highs = pd.to_numeric(future["High"], errors="coerce")
+        lows = pd.to_numeric(future["Low"], errors="coerce")
+        if direction == "BUY":
+            mfe = (float(highs.max()) / entry - 1.0) * 100.0
+            mae = (float(lows.min()) / entry - 1.0) * 100.0
+            move = (float(closes.iloc[-1]) / entry - 1.0) * 100.0
+        else:
+            mfe = (1.0 - float(lows.min()) / entry) * 100.0
+            mae = (1.0 - float(highs.max()) / entry) * 100.0
+            move = (1.0 - float(closes.iloc[-1]) / entry) * 100.0
+        row["ACTUAL MOVE VALIDATION"] = result
+        row["VALIDATION WINDOW"] = "NEXT 3 COMPLETED 5M CANDLES"
+        row["BARS TO VALIDATION"] = bars
+        try:
+            row["VALIDATION TIME"] = pd.Timestamp(validation_time).strftime("%d-%b-%Y %H:%M:%S")
+        except Exception:
+            row["VALIDATION TIME"] = str(validation_time) if validation_time is not None else None
+        row["MOVE %"] = round(move, 2)
+        row["MFE %"] = round(mfe, 2)
+        row["MAE %"] = round(mae, 2)
+    except Exception:
+        pass
+    return row
+
+
+def _refresh_future_move_validation(fyers, rows):
+    """Refresh pending future-move rows using newly completed 5M candles."""
+    cache = {}
+    refreshed = []
+    for row in rows or []:
+        if str(row.get("ACTUAL MOVE VALIDATION", "PENDING")) not in ("PENDING", ""):
+            refreshed.append(row); continue
+        symbol = str(row.get("Symbol", "")).strip()
+        if not symbol:
+            refreshed.append(row); continue
+        api_symbol = symbol if ":" in symbol else f"NSE:{symbol}-EQ"
+        if api_symbol not in cache:
+            try:
+                cache[api_symbol] = _fetch_timeframe_data(fyers, api_symbol, "5", lookback_days=LIVE_MOVE_LOOKBACK_DAYS)
+            except Exception:
+                cache[api_symbol] = None
+        if cache[api_symbol] is not None:
+            row = _validate_future_move_row(row, cache[api_symbol])
+        refreshed.append(row)
+    return refreshed
 
 
 def run_future_move_scan(fyers, symbols, is_fo: bool = False):
@@ -5467,6 +5580,14 @@ def show_scanner(fyers) -> None:
                     fo_fm = fo_symbols if fm_limit == 0 else [x for x in fo_symbols if x in fm_universe]
                     if fm_source == "F&O Stocks": fo_fm = fm_universe
                     r,e = run_future_move_scan(fyers, fo_fm, is_fo=True); rows.extend(r); errs.extend(e)
+                # Preserve prior signals and update older PENDING rows when 3 new 5M candles exist.
+                previous = st.session_state.get("future_move_history_rows", []) or []
+                merged = {}
+                for item in previous + rows:
+                    key = (str(item.get("Symbol", "")), str(item.get("SIGNAL TIME", "")))
+                    merged[key] = item
+                rows = _refresh_future_move_validation(fyers, list(merged.values()))
+                st.session_state["future_move_history_rows"] = rows
                 fm_df = pd.DataFrame(rows) if rows else pd.DataFrame()
                 if not fm_df.empty and "Symbol" in fm_df.columns:
                     fm_df = fm_df.drop_duplicates(subset=["Symbol"], keep="first")
@@ -5489,7 +5610,8 @@ def show_scanner(fyers) -> None:
                 "VOLUME CONFIRMATION","STRUCTURE CONFIRMATION","ENERGY BUILD","RANGE COMPRESSION",
                 "RVOL","VOLUME ACCELERATION","PRICE ACCELERATION","STRUCTURE","BREAKOUT DISTANCE %",
                 "BREAKDOWN DISTANCE %","FUTURE TRIGGER","FUTURE INVALIDATION","FUTURE REASON",
-                "ACTUAL MOVE VALIDATION","VALIDATION WINDOW","SOURCE"
+                "ACTUAL MOVE VALIDATION","VALIDATION WINDOW","BARS TO VALIDATION","VALIDATION TIME",
+                "MOVE %","MFE %","MAE %","SOURCE"
             ]
             fm_cols = [c for c in fm_cols if c in candidate_view.columns]
             candidate_view = candidate_view[fm_cols] if fm_cols else candidate_view
