@@ -3298,8 +3298,6 @@ def _fetch_momentum_signal(fyers, symbol: str, is_fo: bool = False):
         before=_before_move_signal(d, pre)
         early=_advanced_early_move_engine(d, pre=pre, block=block)
         amd=_detect_amd_phase(d, pre=pre)
-        # AMD is informational/context only. It is NEVER used to qualify or reject
-        # the sudden BIG MOVEMENT direction. BEFORE BIG MOVE is also independent.
         # Search the latest 12 completed candles so a signal is not lost on the next candle.
         candidates=[]
         for idx in range(max(12,len(d)-12),len(d)):
@@ -4795,8 +4793,7 @@ def show_scanner(fyers) -> None:
     tabs = st.tabs([
         "🇮🇳 NSE STOCKS",
         "📊 F&O STOCKS",
-        "🧩 AMD ADDITIONAL",
-        "⚡ BEFORE BIG MOVE ADDITIONAL",
+        "🚦 BEFORE MOVE",
         "🎯 F&O OPTION CHECK",
         "🔄 REVERSAL",
         "📈 SWING",
@@ -5044,164 +5041,100 @@ def show_scanner(fyers) -> None:
         else:
             st.info("👈 Click 'SCAN F&O' to start")
     # ════════════════════════════════════════════════════════════════════════════════
-    # TAB 2: AMD ADDITIONAL
-    # Renamed from the old BEFORE MOVE + AMD tab. AMD is context only.
+    # TAB 2: BEFORE MOVE — EARLY WARNING SIGNAL
     # ════════════════════════════════════════════════════════════════════════════════
     with tabs[2]:
-        st.markdown("### 🧩 AMD ADDITIONAL")
-        st.caption("Accumulation / Manipulation / Distribution context from completed 5M candles. AMD is a context label, not a guaranteed forecast.")
+        st.markdown("### 🚦 BEFORE MOVE — EARLY WARNING + AMD")
+        st.caption("Scans completed 5M candles for pre-move energy, BEFORE MOVE conditions and Accumulation / Manipulation / Distribution (AMD).")
 
-        amd_source = st.radio(
+        bm_source = st.radio(
             "Scan Source", ["NSE Stocks", "F&O Stocks", "BOTH"],
-            horizontal=True, key="amd_additional_source"
+            horizontal=True, key="before_move_source"
         )
-        amd_universe_all = (all_symbols if amd_source == "NSE Stocks" else
-                            fo_symbols if amd_source == "F&O Stocks" else
-                            list(dict.fromkeys(list(all_symbols) + list(fo_symbols))))
-        amd_default = min(300 if amd_source == "NSE Stocks" else 200, len(amd_universe_all))
-        amd_limit = st.number_input(
-            "AMD scan limit (0 = ALL)", min_value=0,
-            max_value=max(len(amd_universe_all), 1), value=amd_default, step=25, key="amd_additional_limit"
+        bm_universe_all = (all_symbols if bm_source == "NSE Stocks" else
+                           fo_symbols if bm_source == "F&O Stocks" else
+                           list(dict.fromkeys(list(all_symbols) + list(fo_symbols))))
+        bm_default = min(300 if bm_source == "NSE Stocks" else 200, len(bm_universe_all))
+        bm_limit = st.number_input(
+            "Before Move scan limit (0 = ALL)", min_value=0,
+            max_value=max(len(bm_universe_all), 1), value=bm_default, step=25, key="before_move_limit"
         )
-        amd_universe = amd_universe_all if amd_limit == 0 else amd_universe_all[:amd_limit]
+        bm_universe = bm_universe_all if bm_limit == 0 else bm_universe_all[:bm_limit]
 
-        if st.button(f"🧩 RUN AMD SCAN ({len(amd_universe)} stocks)", key="amd_additional_run", type="primary", use_container_width=True):
-            with st.spinner(f"Scanning AMD for {len(amd_universe)} stocks…"):
+        c_run, c_info = st.columns([2, 3])
+        with c_run:
+            run_before = st.button(
+                f"🚦 RUN SCAN ({len(bm_universe)} stocks)",
+                key="before_move_run", type="primary", use_container_width=True
+            )
+        with c_info:
+            st.info("Run this scan first. Results stay available after Streamlit reruns and can be downloaded to Excel.")
+
+        if run_before:
+            with st.spinner(f"Scanning BEFORE MOVE + AMD for {len(bm_universe)} stocks…"):
                 all_rows, all_errors, all_stats = [], [], None
-                if amd_source in ("NSE Stocks", "BOTH"):
-                    nse_amd = all_symbols if amd_limit == 0 else [x for x in all_symbols if x in amd_universe]
-                    if amd_source == "NSE Stocks": nse_amd = amd_universe
-                    r, e, stt = run_momentum_scan(fyers, nse_amd, is_fo=False)
+                if bm_source in ("NSE Stocks", "BOTH"):
+                    nse_bm = all_symbols if bm_limit == 0 else [x for x in all_symbols if x in bm_universe]
+                    if bm_source == "NSE Stocks": nse_bm = bm_universe
+                    r, e, stt = run_momentum_scan(fyers, nse_bm, is_fo=False)
                     all_rows.extend(r or []); all_errors.extend(e or []); all_stats = stt
-                if amd_source in ("F&O Stocks", "BOTH"):
-                    fo_amd = fo_symbols if amd_limit == 0 else [x for x in fo_symbols if x in amd_universe]
-                    if amd_source == "F&O Stocks": fo_amd = amd_universe
-                    r, e, stt = run_momentum_scan(fyers, fo_amd, is_fo=True)
+                if bm_source in ("F&O Stocks", "BOTH"):
+                    fo_bm = fo_symbols if bm_limit == 0 else [x for x in fo_symbols if x in bm_universe]
+                    if bm_source == "F&O Stocks": fo_bm = bm_universe
+                    r, e, stt = run_momentum_scan(fyers, fo_bm, is_fo=True)
                     all_rows.extend(r or []); all_errors.extend(e or []); all_stats = stt if all_stats is None else all_stats
-                amd_df = pd.DataFrame(all_rows) if all_rows else pd.DataFrame()
-                if not amd_df.empty and "Symbol" in amd_df.columns:
-                    amd_df = amd_df.drop_duplicates(subset=["Symbol"], keep="first")
-                st.session_state["momentum_df"] = amd_df
+                bm_df = pd.DataFrame(all_rows) if all_rows else pd.DataFrame()
+                if not bm_df.empty and "Symbol" in bm_df.columns:
+                    bm_df = bm_df.drop_duplicates(subset=["Symbol"], keep="first")
+                st.session_state["momentum_df"] = bm_df
                 st.session_state["momentum_errors"] = all_errors
                 st.session_state["momentum_stats"] = all_stats
-                st.success(f"✅ AMD scan completed — {len(amd_df)} rows")
+                st.success(f"✅ BEFORE MOVE scan completed — {len(bm_df)} rows")
 
-        adf = st.session_state.get("momentum_df")
-        if adf is not None and not adf.empty:
-            view = adf.copy()
-            sym = next((c for c in ["SYMBOL", "Symbol", "symbol"] if c in view.columns), None)
-            if sym and sym != "STOCK NAME":
-                view = view.rename(columns={sym: "STOCK NAME"})
-            elif "STOCK NAME" not in view.columns:
-                view.insert(0, "STOCK NAME", "N/A")
-            amd_cols = [
-                "STOCK NAME", "LTP", "SIGNAL TIME", "AMD PHASE", "AMD DIRECTION", "AMD SCORE", "AMD REASON",
-                "PRE-MOVE", "PRE-MOVE SCORE", "PRE-MOVE STATUS", "PRE-MOVE RVOL", "PRE-MOVE REASON",
-                "EARLY MOVE SCORE", "EARLY DIRECTION", "EARLY STATUS", "ENERGY BUILD",
-                "VOLUME ACCELERATION", "PRICE ACCELERATION", "RVOL", "SCORE"
-            ]
-            amd_cols = [c for c in amd_cols if c in view.columns]
-            view = view[amd_cols] if amd_cols else view
-            if "AMD SCORE" in view.columns:
-                view = view.sort_values("AMD SCORE", ascending=False)
-            st.dataframe(view, use_container_width=True, height=560, hide_index=True)
-            _excel_download_button(view, "AMD_ADDITIONAL", "amd_additional_excel", label="📥 DOWNLOAD AMD ADDITIONAL EXCEL")
-            errs = st.session_state.get("momentum_errors") or []
-            if errs:
-                with st.expander(f"⚠️ Scan errors ({len(errs)})"):
-                    st.dataframe(pd.DataFrame({"Error": errs}), use_container_width=True)
-        else:
-            st.info("👆 Select NSE/F&O/BOTH and click RUN AMD SCAN. AMD results will appear here.")
-
-    # ════════════════════════════════════════════════════════════════════════════════
-    # TAB 3: BEFORE BIG MOVE ADDITIONAL
-    # Separate early-warning view. It does NOT depend on AMD.
-    # ════════════════════════════════════════════════════════════════════════════════
-    with tabs[3]:
-        st.markdown("### ⚡ BEFORE BIG MOVE ADDITIONAL")
-        st.caption("Early-warning layer: compression + volume build/acceleration + price acceleration + breakout/breakdown proximity. This is not a guaranteed future-price forecast.")
-
-        bb_source = st.radio(
-            "Scan Source", ["NSE Stocks", "F&O Stocks", "BOTH"],
-            horizontal=True, key="before_bigmove_source"
-        )
-        bb_universe_all = (all_symbols if bb_source == "NSE Stocks" else
-                           fo_symbols if bb_source == "F&O Stocks" else
-                           list(dict.fromkeys(list(all_symbols) + list(fo_symbols))))
-        bb_default = min(300 if bb_source == "NSE Stocks" else 200, len(bb_universe_all))
-        bb_limit = st.number_input(
-            "Before Big Move scan limit (0 = ALL)", min_value=0,
-            max_value=max(len(bb_universe_all), 1), value=bb_default, step=25, key="before_bigmove_limit"
-        )
-        bb_universe = bb_universe_all if bb_limit == 0 else bb_universe_all[:bb_limit]
-
-        if st.button(f"⚡ RUN BEFORE BIG MOVE ({len(bb_universe)} stocks)", key="before_bigmove_run", type="primary", use_container_width=True):
-            with st.spinner(f"Scanning BEFORE BIG MOVE for {len(bb_universe)} stocks…"):
-                all_rows, all_errors, all_stats = [], [], None
-                if bb_source in ("NSE Stocks", "BOTH"):
-                    nse_bb = all_symbols if bb_limit == 0 else [x for x in all_symbols if x in bb_universe]
-                    if bb_source == "NSE Stocks": nse_bb = bb_universe
-                    r, e, stt = run_momentum_scan(fyers, nse_bb, is_fo=False)
-                    all_rows.extend(r or []); all_errors.extend(e or []); all_stats = stt
-                if bb_source in ("F&O Stocks", "BOTH"):
-                    fo_bb = fo_symbols if bb_limit == 0 else [x for x in fo_symbols if x in bb_universe]
-                    if bb_source == "F&O Stocks": fo_bb = bb_universe
-                    r, e, stt = run_momentum_scan(fyers, fo_bb, is_fo=True)
-                    all_rows.extend(r or []); all_errors.extend(e or []); all_stats = stt if all_stats is None else all_stats
-                bb_df = pd.DataFrame(all_rows) if all_rows else pd.DataFrame()
-                if not bb_df.empty and "Symbol" in bb_df.columns:
-                    bb_df = bb_df.drop_duplicates(subset=["Symbol"], keep="first")
-                st.session_state["before_bigmove_df"] = bb_df
-                st.session_state["before_bigmove_errors"] = all_errors
-                st.session_state["before_bigmove_stats"] = all_stats
-                st.success(f"✅ BEFORE BIG MOVE scan completed — {len(bb_df)} rows")
-
-        bdf = st.session_state.get("before_bigmove_df")
+        bdf = st.session_state.get("momentum_df")
         if bdf is not None and not bdf.empty:
             view = bdf.copy()
-            sym = next((c for c in ["SYMBOL", "Symbol", "symbol"] if c in view.columns), None)
-            if sym and sym != "STOCK NAME":
-                view = view.rename(columns={sym: "STOCK NAME"})
+            _symbol_col = next((c for c in ["SYMBOL", "Symbol", "symbol"] if c in view.columns), None)
+            if _symbol_col is not None:
+                view = view.rename(columns={_symbol_col: "STOCK NAME"})
             elif "STOCK NAME" not in view.columns:
                 view.insert(0, "STOCK NAME", "N/A")
-
-            # Keep only genuine pre-big-move/early-energy candidates first.
-            if "EARLY STATUS" in view.columns:
-                status_text = view["EARLY STATUS"].astype(str).str.upper()
-                candidate_mask = status_text.str.contains("READY|BUILDING|EARLY", regex=True, na=False)
-                candidate_view = view[candidate_mask].copy()
-                if candidate_view.empty:
-                    candidate_view = view.copy()
-            else:
-                candidate_view = view.copy()
-
-            bb_cols = [
-                "STOCK NAME", "LTP", "SIGNAL TIME", "EARLY DIRECTION", "EARLY STATUS", "EARLY MOVE SCORE",
+            view = _add_reversal_columns(view)
+            _before_cols = [
+                "STOCK NAME", "LTP", "BEFORE MOVE SIGNAL", "BEFORE MOVE SCORE",
+                "AMD PHASE", "AMD DIRECTION", "AMD SCORE", "AMD REASON",
+                "PRE-MOVE SCORE", "PRE-MOVE STATUS", "PRE BUY SCORE", "PRE SELL SCORE", "PRE SCORE GAP",
+                "BREAKOUT LEVEL", "BREAKDOWN LEVEL", "EARLY MOVE SCORE", "EARLY DIRECTION", "EARLY STATUS",
                 "ENERGY BUILD", "RANGE COMPRESSION", "VOLUME ACCELERATION", "PRICE ACCELERATION",
                 "BREAKOUT DISTANCE %", "BREAKDOWN DISTANCE %", "EARLY TRIGGER", "EARLY INVALIDATION",
-                "EARLY MTF PROXY", "EARLY MOVE REASON", "PRE-MOVE", "PRE-MOVE SCORE", "PRE-MOVE STATUS",
-                "PRE BUY SCORE", "PRE SELL SCORE", "PRE SCORE GAP", "PRE-MOVE RVOL", "PRE-MOVE REASON",
-                "BREAKOUT LEVEL", "BREAKDOWN LEVEL", "RVOL", "SCORE"
+                "EARLY MTF PROXY", "EARLY MOVE REASON", "PRE-MOVE RVOL", "PRE-MOVE REASON",
+                "REVERSAL SIGNAL", "REVERSAL SCORE", "REVERSAL LEVEL", "REVERSAL ZONE", "REVERSAL REASON",
+                "SIGNAL TYPE", "COMBINED BIAS"
             ]
-            bb_cols = [c for c in bb_cols if c in candidate_view.columns]
-            candidate_view = candidate_view[bb_cols] if bb_cols else candidate_view
-            if "EARLY MOVE SCORE" in candidate_view.columns:
-                candidate_view = candidate_view.sort_values("EARLY MOVE SCORE", ascending=False)
-            st.dataframe(candidate_view, use_container_width=True, height=560, hide_index=True)
-            _excel_download_button(candidate_view, "BEFORE_BIG_MOVE_ADDITIONAL", "before_bigmove_additional_excel", label="📥 DOWNLOAD BEFORE BIG MOVE EXCEL")
-            errs = st.session_state.get("before_bigmove_errors") or []
-            if errs:
-                with st.expander(f"⚠️ Scan errors ({len(errs)})"):
-                    st.dataframe(pd.DataFrame({"Error": errs}), use_container_width=True)
+            cols = [c for c in _before_cols if c in view.columns]
+            view = view[cols].copy() if cols else view.copy()
+            if "BEFORE MOVE SIGNAL" in view.columns:
+                order = {"🟢 BUY BEFORE MOVE": 0, "🔴 SELL BEFORE MOVE": 1, "🟡 WAIT": 2}
+                view["_sort"] = view["BEFORE MOVE SIGNAL"].map(order).fillna(9)
+                score_col = "BEFORE MOVE SCORE" if "BEFORE MOVE SCORE" in view.columns else "PRE-MOVE SCORE"
+                view = view.sort_values(["_sort", score_col], ascending=[True, False]).drop(columns=["_sort"])
+            st.dataframe(view, use_container_width=True, height=560, hide_index=True)
+            st.download_button(
+                "📥 DOWNLOAD BEFORE MOVE + AMD EXCEL",
+                _format_excel_output(view, "BEFORE_MOVE_AMD"),
+                f"BEFORE_MOVE_AMD_{_now_ist().strftime('%Y%m%d_%H%M')}.xlsx",
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="before_move_amd_xls"
+            )
+            if st.session_state.get("momentum_errors"):
+                with st.expander(f"⚠️ Scan errors ({len(st.session_state['momentum_errors'])})"):
+                    st.dataframe(pd.DataFrame({"Error": st.session_state["momentum_errors"]}), use_container_width=True)
         else:
-            st.info("👆 Select NSE/F&O/BOTH and click RUN BEFORE BIG MOVE. Early-warning results will appear here.")
-
+            st.info("👆 Select NSE/F&O/BOTH and click RUN SCAN. Then BEFORE MOVE + AMD results and Excel download will appear.")
     # ════════════════════════════════════════════════════════════════════════════════
-    # TAB 4: F&O OPTION CHECK — LIVE RUN
+    # TAB 3: F&O OPTION CHECK — LIVE RUN
     # ════════════════════════════════════════════════════════════════════════════════
-
-    # ════════════════════════════════════════════════════════════════════════════════
-    with tabs[4]:
+    with tabs[3]:
         st.markdown("### 🎯 F&O OPTION CHECK")
         st.caption("RUN LIVE CHECK fetches the current FYERS option-chain data. CE/PE is shown as WATCH, not an order instruction.")
         fo_pick = st.selectbox("Select F&O stock", fo_symbols if fo_symbols else all_symbols, key="fo_option_check_symbol")
@@ -5259,9 +5192,9 @@ def show_scanner(fyers) -> None:
         else:
             st.info("👆 Select an F&O stock and click RUN LIVE OPTION CHECK to refresh the current spot and option-chain data.")
     # ════════════════════════════════════════════════════════════════════════════════
-    # TAB 5: DIRECT REVERSAL SCANNER
+    # TAB 4: DIRECT REVERSAL SCANNER
     # ════════════════════════════════════════════════════════════════════════════════
-    with tabs[5]:
+    with tabs[4]:
         st.markdown("### 🔄 REVERSAL SCANNER")
         st.caption(
             "Direct reversal scan for NSE / F&O / BOTH. "
@@ -5547,9 +5480,9 @@ def show_scanner(fyers) -> None:
                 if len(direct_reversal_errors) > 100:
                     st.caption("Showing first 100 errors.")
     # ════════════════════════════════════════════════════════════════════════════════
-    # TAB 6: SWING — CROSS + LONG-MOVE RADAR
+    # TAB 5: SWING — CROSS + LONG-MOVE RADAR
     # ════════════════════════════════════════════════════════════════════════════════
-    with tabs[6]:
+    with tabs[5]:
         st.markdown("### 📈 Swing Trading — Long-Move Radar + Golden/Death Cross")
         st.caption("Daily closed-candle trend scanner. LONG-MOVE WATCH is a setup filter, not a guaranteed forecast.")
 
@@ -5632,14 +5565,14 @@ def show_scanner(fyers) -> None:
             st.dataframe(swing_report, use_container_width=True, hide_index=True)
             _excel_download_button(swing_report, "SWING_CROSS_REVERSAL", "download_swing_cross_reversal_excel")
     # ════════════════════════════════════════════════════════════════════════════════
-    # TAB 7: PIN RULES — ADDITIONAL ONLY
+    # TAB 6: PIN RULES — ADDITIONAL ONLY
     # ════════════════════════════════════════════════════════════════════════════════
-    with tabs[7]:
+    with tabs[6]:
         _show_pin_rules_tab(fyers, all_symbols, fo_symbols)
     # ════════════════════════════════════════════════════════════════════════════════
-    # TAB 8: SETTINGS
+    # TAB 7: SETTINGS
     # ════════════════════════════════════════════════════════════════════════════════
-    with tabs[8]:
+    with tabs[7]:
         st.markdown("### ⚙️ Scanner Settings & Configuration")
         
         st.markdown("#### 🎯 Signal Filtering")
