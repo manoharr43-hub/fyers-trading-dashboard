@@ -336,6 +336,24 @@ def _candle_signal_timestamp(df, is_daily: bool = False, resolution: str = "15")
         close_ts = ts_ist + timedelta(minutes=minutes)
     return close_ts.strftime("%d-%b-%Y"), close_ts.strftime("%H:%M:%S") + " IST"
 
+def _completed_candle_datetime(ts, resolution: str = "5") -> datetime:
+    """Return the close/end time of a completed candle in IST.
+
+    FYERS history timestamps represent candle start times. The scanner removes
+    the still-forming candle in _fetch_timeframe_data(), so signal time must be
+    candle-start + timeframe, not the raw candle timestamp.
+    """
+    try:
+        t = pd.Timestamp(ts)
+        if t.tzinfo is None:
+            t = t.tz_localize("UTC")
+        t = t.tz_convert(IST)
+        minutes = int(resolution)
+        return t.to_pydatetime() + timedelta(minutes=minutes)
+    except Exception:
+        return _now_ist()
+
+
 def _generated_timestamp() -> str:
     return _now_ist().strftime("%d-%b-%Y %H:%M:%S IST")
 
@@ -3285,81 +3303,290 @@ def _detect_amd_phase(df: pd.DataFrame, pre: dict = None) -> dict:
         out["reason"] = f"AMD error: {type(e).__name__}"
         return out
 
-def _fetch_momentum_signal(fyers, symbol: str, is_fo: bool = False):
-    """Intraday movement worker. Checks recent completed 5M candles and adds early-warning status."""
-    stock_ticker = symbol.replace("NSE:", "").replace("-EQ", "") if isinstance(symbol,str) else str(symbol)
-    if not isinstance(symbol,str) or not _VALID_EQ_SYMBOL_RE.match(symbol): return None, f"{symbol}: invalid format"
+def detect_pre_big_move_identity(df: pd.DataFrame) -> Dict[str, Any]:
+    """Unified LAST-CONSOLIDATION -> ENERGY -> DIRECTION pre-big-move engine.
+
+    This is intentionally based only on completed candles. It does not require
+    the current candle to already be a BIG MOVE. Existing BIG MOVE / AMD engines
+    remain available; this function is the common early-warning layer used by the
+    movement scanner.
+    """
+    out = {
+        "status": "⚪ WAIT", "direction": "NONE", "score": 0.0,
+        "energy": 0.0, "consolidation_found": False,
+        "range_high": None, "range_low": None,
+        "breakout_distance_pct": None, "breakdown_distance_pct": None,
+        "trigger": None, "invalidation": None, "target": None,
+        "structure": "NONE", "pressure": 0.0, "rvol": 0.0,
+        "volume_build": 0.0, "reason": "Waiting for last consolidation"
+    }
+    if df is None or len(df) < 30:
+        return out
     try:
-        df5=_fetch_timeframe_data(fyers,symbol,"5",lookback_days=LIVE_MOVE_LOOKBACK_DAYS)
-        if df5 is None or len(df5)<25: return None, f"{symbol}: insufficient 5M data"
-        d=df5.reset_index(drop=True).copy()
-        block=detect_block_order_activity(d)
-        pre=_pre_move_signal(d, block=block)
-        before=_before_move_signal(d, pre)
-        early=_advanced_early_move_engine(d, pre=pre, block=block)
-        amd=_detect_amd_phase(d, pre=pre)
-        # AMD is informational/context only. It is NEVER used to qualify or reject
-        # the sudden BIG MOVEMENT direction. BEFORE BIG MOVE is also independent.
-        # Search the latest 12 completed candles so a signal is not lost on the next candle.
-        candidates=[]
-        for idx in range(max(12,len(d)-12),len(d)):
-            sub=d.iloc[:idx+1]
-            mv=detect_live_sudden_move(sub)
-            if mv.get("direction") in ("BUY","SELL"):
-                candidates.append((idx,mv))
-        if candidates:
-            idx,mv=max(candidates,key=lambda x:x[0])
-            # Always use the actual completed candle timestamp. d has a
-            # RangeIndex after reset_index(), so d.index[idx] is NOT time.
-            sig_time=d["Time"].iloc[idx] if "Time" in d.columns else _now_ist()
-            try:
-                sig_time=pd.Timestamp(sig_time).to_pydatetime()
-                if sig_time.tzinfo is None: sig_time=sig_time.replace(tzinfo=_now_ist().tzinfo)
-            except Exception: sig_time=_now_ist()
-            age=max(0,( _now_ist()-sig_time).total_seconds()/60)
-            signal=mv["signal"]
+        d = df.reset_index(drop=True).copy()
+        cinfo = detect_last_consolidation(d)
+        if not cinfo.get("found"):
+            out["reason"] = "No recent tight consolidation"
+            return out
+
+        hi = float(cinfo["high"]); lo = float(cinfo["low"])
+        last = d.iloc[-1]
+        close = float(last["Close"]); high = float(last["High"]); low = float(last["Low"])
+        open_ = float(last["Open"])
+        rng = max(high - low, 1e-9)
+        atr_s = calculate_atr(d, 14)
+        atr = float(atr_s.iloc[-1]) if pd.notna(atr_s.iloc[-1]) else max(close * 0.005, 0.01)
+
+        # Consolidation energy: recent bars versus the prior baseline.
+        recent = d.iloc[max(0, len(d)-8):]
+        baseline = d.iloc[max(0, len(d)-28):max(0, len(d)-8)]
+        rr = (recent["High"] - recent["Low"]).astype(float)
+        br = (baseline["High"] - baseline["Low"]).astype(float)
+        compression_ratio = float(rr.mean() / br.mean()) if len(br) and br.mean() > 0 else 1.0
+        compression_score = max(0.0, min(30.0, (1.0 - compression_ratio) * 75.0))
+
+        vol_recent = pd.to_numeric(recent["Volume"], errors="coerce").mean()
+        vol_base = pd.to_numeric(baseline["Volume"], errors="coerce").mean()
+        vol_build = float(vol_recent / vol_base) if vol_base and vol_base > 0 else 1.0
+        volume_score = max(0.0, min(20.0, (vol_build - 1.0) * 30.0))
+        rvol = float(last["Volume"]) / vol_base if vol_base and vol_base > 0 else 0.0
+
+        # Directional pressure from the last completed candles.
+        tail = d.iloc[-8:]
+        upv = float(tail.loc[tail["Close"] >= tail["Open"], "Volume"].sum())
+        dnv = float(tail.loc[tail["Close"] < tail["Open"], "Volume"].sum())
+        totalv = upv + dnv
+        pressure = ((upv - dnv) / totalv * 100.0) if totalv > 0 else 0.0
+
+        # Confirmed structure, excluding the current candle as an unconfirmed pivot.
+        ph, pl = _bigmove_pivots(d.iloc[:-1] if len(d) > 1 else d)
+        hh_hl = len(ph) >= 2 and len(pl) >= 2 and ph[-1][1] > ph[-2][1] and pl[-1][1] > pl[-2][1]
+        lh_ll = len(ph) >= 2 and len(pl) >= 2 and ph[-1][1] < ph[-2][1] and pl[-1][1] < pl[-2][1]
+        structure = "HH/HL" if hh_hl else "LH/LL" if lh_ll else "NONE"
+
+        pos = (close - lo) / max(hi - lo, 1e-9)
+        close_loc = (close - low) / rng
+        near_up = max(0.0, (hi - close) / max(close, 1e-9) * 100.0)
+        near_down = max(0.0, (close - lo) / max(close, 1e-9) * 100.0)
+        buy_break = close > hi
+        sell_break = close < lo
+
+        # Current candle may be starting the expansion. If the existing BIG MOVE
+        # detector confirms it, the caller keeps BIG BUY/SELL. Here we only label
+        # the pre-trigger state when the range is not decisively broken.
+        score_buy = 0.0; score_sell = 0.0
+        reasons_buy = []; reasons_sell = []
+        energy = compression_score + volume_score
+        if compression_ratio <= 0.92:
+            score_buy += 12; score_sell += 12
+        if compression_ratio <= 0.82:
+            score_buy += 8; score_sell += 8
+        if vol_build >= 1.08:
+            score_buy += 8; score_sell += 8
+        if vol_build >= 1.20:
+            score_buy += 5; score_sell += 5
+        if pressure >= 15:
+            score_buy += 18; reasons_buy.append("Buy pressure")
+        elif pressure <= -15:
+            score_sell += 18; reasons_sell.append("Sell pressure")
+        if pressure >= 30:
+            score_buy += 7; reasons_buy.append("Strong pressure")
+        elif pressure <= -30:
+            score_sell += 7; reasons_sell.append("Strong pressure")
+        if hh_hl:
+            score_buy += 15; reasons_buy.append("HH/HL")
+        if lh_ll:
+            score_sell += 15; reasons_sell.append("LH/LL")
+        if pos >= 0.68:
+            score_buy += 12; reasons_buy.append("Upper range pressure")
+        elif pos <= 0.32:
+            score_sell += 12; reasons_sell.append("Lower range pressure")
+        if close_loc >= 0.68:
+            score_buy += 5; reasons_buy.append("Strong close")
+        elif close_loc <= 0.32:
+            score_sell += 5; reasons_sell.append("Weak close")
+
+        # Do not let neutral compression/volume alone create a directional signal.
+        gap = abs(score_buy - score_sell)
+        if score_buy >= 55 and score_buy > score_sell + 10 and not buy_break:
+            direction = "BUY"
+        elif score_sell >= 55 and score_sell > score_buy + 10 and not sell_break:
+            direction = "SELL"
         else:
-            mv=detect_live_sudden_move(d)
-            idx=len(d)-1
-            # Latest completed candle timestamp, not scanner refresh time.
-            sig_time=d["Time"].iloc[-1] if "Time" in d.columns else _now_ist()
+            direction = "NONE"
+
+        score = max(score_buy, score_sell)
+        # Trigger is always outside the last consolidation; invalidation is on the
+        # opposite side of the range. Target is the next structural projection,
+        # not a fake LTP +/- ATR reversal number.
+        if direction == "BUY":
+            trigger = hi
+            invalidation = lo
+            target = hi + max(hi - lo, atr)
+            status = "🚨 PRE-BIG BUY READY" if score >= 78 and energy >= 22 and gap >= 15 else "🟢 PRE-BIG BUY WATCH" if score >= 62 and energy >= 14 else "🟡 ENERGY BUILD"
+            reason = " + ".join((reasons_buy + [f"Compression {compression_ratio:.2f}", f"RVOL {rvol:.2f}x"])[:7])
+        elif direction == "SELL":
+            trigger = lo
+            invalidation = hi
+            target = lo - max(hi - lo, atr)
+            status = "🚨 PRE-BIG SELL READY" if score >= 78 and energy >= 22 and gap >= 15 else "🔴 PRE-BIG SELL WATCH" if score >= 62 and energy >= 14 else "🟡 ENERGY BUILD"
+            reason = " + ".join((reasons_sell + [f"Compression {compression_ratio:.2f}", f"RVOL {rvol:.2f}x"])[:7])
+        else:
+            trigger = hi if score_buy >= score_sell else lo
+            invalidation = lo if score_buy >= score_sell else hi
+            target = None
+            status = "🟡 ENERGY BUILD" if energy >= 14 else "⚪ WAIT"
+            reason = "Conflicting directional evidence"
+
+        # If the candle already closed outside the range, this function reports
+        # context only; the caller's BIG MOVE engine takes precedence.
+        if buy_break or sell_break:
+            status = "⚡ TRIGGERED — BIG MOVE CHECK"
+            direction = "BUY" if buy_break else "SELL"
+
+        out.update({
+            "status": status, "direction": direction,
+            "score": round(min(100.0, score), 1),
+            "energy": round(min(100.0, energy), 1),
+            "consolidation_found": True,
+            "range_high": round(hi, 2), "range_low": round(lo, 2),
+            "breakout_distance_pct": round(max(0.0, (hi-close)/max(close,1e-9)*100), 2),
+            "breakdown_distance_pct": round(max(0.0, (close-lo)/max(close,1e-9)*100), 2),
+            "trigger": round(trigger, 2) if trigger is not None else None,
+            "invalidation": round(invalidation, 2) if invalidation is not None else None,
+            "target": round(target, 2) if target is not None else None,
+            "structure": structure, "pressure": round(pressure, 1),
+            "rvol": round(rvol, 2), "volume_build": round(vol_build, 2),
+            "reason": reason or "Waiting for directional energy"
+        })
+        return out
+    except Exception as e:
+        out["reason"] = f"PRE-BIG error: {type(e).__name__}"
+        return out
+
+
+def _fetch_momentum_signal(fyers, symbol: str, is_fo: bool = False):
+    """Intraday movement worker with one unified last-consolidation/pre-big pipeline."""
+    stock_ticker = symbol.replace("NSE:", "").replace("-EQ", "") if isinstance(symbol, str) else str(symbol)
+    if not isinstance(symbol, str) or not _VALID_EQ_SYMBOL_RE.match(symbol):
+        return None, f"{symbol}: invalid format"
+    try:
+        df5 = _fetch_timeframe_data(fyers, symbol, "5", lookback_days=LIVE_MOVE_LOOKBACK_DAYS)
+        if df5 is None or len(df5) < 30:
+            return None, f"{symbol}: insufficient 5M data"
+        d = df5.reset_index(drop=True).copy()
+
+        block = detect_block_order_activity(d)
+        pre = _pre_move_signal(d, block=block)
+        before = _before_move_signal(d, pre)
+        early = _advanced_early_move_engine(d, pre=pre, block=block)
+        amd = _detect_amd_phase(d, pre=pre)
+        unified = detect_pre_big_move_identity(d)
+
+        # Confirm an actual BIG MOVE first. Only when it is not confirmed do we
+        # expose the unified PRE-BIG identity as the primary movement status.
+        candidates = []
+        for idx in range(max(12, len(d) - 12), len(d)):
+            sub = d.iloc[:idx+1]
+            mv = detect_live_sudden_move(sub)
+            if mv.get("direction") in ("BUY", "SELL"):
+                candidates.append((idx, mv))
+
+        if candidates:
+            idx, mv = max(candidates, key=lambda x: x[0])
+            signal_direction = mv.get("direction", "NONE")
+            signal = mv.get("signal", "BIG MOVE")
+            sig_time = _completed_candle_datetime(d["Time"].iloc[idx], "5") if "Time" in d.columns else _now_ist()
+            age = max(0.0, (_now_ist() - sig_time).total_seconds() / 60.0)
+            primary_score = mv.get("score", 0.0)
+            movement_status = signal
+        else:
+            mv = detect_live_sudden_move(d)
+            signal_direction = unified.get("direction", "NONE")
+            signal = unified.get("status", "⚪ WAIT")
+            sig_time = _completed_candle_datetime(d["Time"].iloc[-1], "5") if "Time" in d.columns else _now_ist()
+            age = max(0.0, (_now_ist() - sig_time).total_seconds() / 60.0)
+            primary_score = unified.get("score", pre.get("score", 0.0))
+            movement_status = signal
+
+        ltp = float(d["Close"].iloc[-1])
+        result = {
+            "Symbol": stock_ticker, "LTP": round(ltp, 2),
+            "SIGNAL TIME": sig_time.strftime("%d-%b-%Y %H:%M:%S"),
+            "SIGNAL AGE (MIN)": round(age, 1), "SIGNAL": signal,
+            "DIRECTION": signal_direction,
+            "MOVE %": mv.get("move_pct", 0.0), "BODY %": mv.get("body_pct", 0.0),
+            "BODY / ATR": mv.get("body_atr", 0.0), "RVOL": mv.get("rvol", 0.0),
+            "STRUCTURE": mv.get("structure", unified.get("structure", "NONE")),
+            "HH/HL": "✅" if mv.get("hh_hl") else "−",
+            "LH/LL": "✅" if mv.get("lh_ll") else "−",
+            "ACCELERATION": mv.get("price_acceleration", 0.0),
+            "VOLUME SPIKE": "🔥" if mv.get("volume_spike") else "−",
+            "SCORE": primary_score,
+            "BEFORE MOVE SIGNAL": before["signal"], "BEFORE MOVE DIRECTION": before["direction"],
+            "BEFORE MOVE SCORE": before["score"], "BEFORE MOVE REASON": before["reason"],
+            "BEFORE MOVE TRIGGER": before["trigger"],
+            "EARLY MOVE SCORE": early["score"], "EARLY DIRECTION": early["direction"],
+            "EARLY STATUS": early["status"], "ENERGY BUILD": early["energy"],
+            "RANGE COMPRESSION": early["compression"], "VOLUME ACCELERATION": early["volume_accel"],
+            "PRICE ACCELERATION": early["price_accel"], "BREAKOUT DISTANCE %": early["breakout_distance_pct"],
+            "BREAKDOWN DISTANCE %": early["breakdown_distance_pct"], "EARLY TRIGGER": early["trigger"],
+            "EARLY INVALIDATION": early["invalidation"], "EARLY MTF PROXY": early["mtf_proxy"],
+            "EARLY MOVE REASON": early["reason"],
+            "AMD PHASE": amd["phase"], "AMD DIRECTION": amd["direction"], "AMD SCORE": amd["score"],
+            "AMD REASON": amd["reason"],
+            "PRE-MOVE": pre["direction"], "PRE-MOVE SCORE": pre["score"], "PRE-MOVE STATUS": pre["status"],
+            "PRE BUY SCORE": pre.get("buy_score", 0), "PRE SELL SCORE": pre.get("sell_score", 0),
+            "PRE SCORE GAP": pre.get("score_gap", 0), "PRE-MOVE REASON": pre["reason"],
+            "BREAKOUT LEVEL": pre.get("breakout_level"), "BREAKDOWN LEVEL": pre.get("breakdown_level"),
+            "PRE-MOVE RVOL": pre.get("rvol", 0),
+            "BLOCK ORDER SCORE": block["block_score"], "BLOCK ACTIVITY": block["block_signal"],
+            "BLOCK SIDE": block["block_side"], "BLOCK LEVEL": block["block_level"],
+            "BLOCK RVOL": block["block_rvol"], "BLOCK REASON": block["block_reason"],
+            "REASON": mv.get("reason", unified["reason"]), "MOVEMENT STATUS": movement_status,
+            # Unified LAST CHART -> PRE-BIG fields.
+            "PRE-BIG STATUS": unified["status"], "PRE-BIG DIRECTION": unified["direction"],
+            "PRE-BIG SCORE": unified["score"], "PRE-BIG ENERGY": unified["energy"],
+            "LAST CONSOLIDATION": "YES" if unified["consolidation_found"] else "NO",
+            "LAST RANGE HIGH": unified["range_high"], "LAST RANGE LOW": unified["range_low"],
+            "PRE-BIG BREAKOUT DISTANCE %": unified["breakout_distance_pct"],
+            "PRE-BIG BREAKDOWN DISTANCE %": unified["breakdown_distance_pct"],
+            "PRE-BIG TRIGGER": unified["trigger"], "PRE-BIG INVALIDATION": unified["invalidation"],
+            "PRE-BIG TARGET": unified["target"], "PRE-BIG PRESSURE %": unified["pressure"],
+            "PRE-BIG RVOL": unified["rvol"], "PRE-BIG VOLUME BUILD": unified["volume_build"],
+            "PRE-BIG REASON": unified["reason"],
+        }
+        if is_fo and result["DIRECTION"] in ("BUY", "SELL"):
             try:
-                sig_time=pd.Timestamp(sig_time).to_pydatetime()
-                if sig_time.tzinfo is None: sig_time=sig_time.replace(tzinfo=_now_ist().tzinfo)
-            except Exception: sig_time=_now_ist()
-            age=max(0,(_now_ist()-sig_time).total_seconds()/60)
-            signal=pre["status"] if pre["direction"] in ("BUY","SELL") else "NO MOVE"
-        ltp=float(d["Close"].iloc[-1])
-        result={"Symbol":stock_ticker,"LTP":round(ltp,2),"SIGNAL TIME":sig_time.strftime("%d-%b-%Y %H:%M:%S"),"SIGNAL AGE (MIN)":round(age,1),"SIGNAL":signal,"DIRECTION":mv.get("direction") if candidates else pre["direction"],"MOVE %":mv.get("move_pct",0.0),"BODY %":mv.get("body_pct",0.0),"BODY / ATR":mv.get("body_atr",0.0),"RVOL":mv.get("rvol",0.0),"STRUCTURE":mv.get("structure", "NONE"),"HH/HL":"✅" if mv.get("hh_hl") else "−","LH/LL":"✅" if mv.get("lh_ll") else "−","ACCELERATION":mv.get("price_acceleration",0.0),"VOLUME SPIKE":"🔥" if mv.get("volume_spike") else "−","SCORE":mv.get("score",0.0),"BEFORE MOVE SIGNAL":before["signal"],"BEFORE MOVE DIRECTION":before["direction"],"BEFORE MOVE SCORE":before["score"],"BEFORE MOVE REASON":before["reason"],"BEFORE MOVE TRIGGER":before["trigger"],"EARLY MOVE SCORE":early["score"],"EARLY DIRECTION":early["direction"],"EARLY STATUS":early["status"],"ENERGY BUILD":early["energy"],"RANGE COMPRESSION":early["compression"],"VOLUME ACCELERATION":early["volume_accel"],"PRICE ACCELERATION":early["price_accel"],"BREAKOUT DISTANCE %":early["breakout_distance_pct"],"BREAKDOWN DISTANCE %":early["breakdown_distance_pct"],"EARLY TRIGGER":early["trigger"],"EARLY INVALIDATION":early["invalidation"],"EARLY MTF PROXY":early["mtf_proxy"],"EARLY MOVE REASON":early["reason"],"AMD PHASE":amd["phase"],"AMD DIRECTION":amd["direction"],"AMD SCORE":amd["score"],"AMD REASON":amd["reason"],"PRE-MOVE":pre["direction"],"PRE-MOVE SCORE":pre["score"],"PRE-MOVE STATUS":pre["status"],"PRE BUY SCORE":pre.get("buy_score",0),"PRE SELL SCORE":pre.get("sell_score",0),"PRE SCORE GAP":pre.get("score_gap",0),"PRE-MOVE REASON":pre["reason"],"BREAKOUT LEVEL":pre.get("breakout_level"),"BREAKDOWN LEVEL":pre.get("breakdown_level"),"PRE-MOVE RVOL":pre.get("rvol",0),"BLOCK ORDER SCORE":block["block_score"],"BLOCK ACTIVITY":block["block_signal"],"BLOCK SIDE":block["block_side"],"BLOCK LEVEL":block["block_level"],"BLOCK RVOL":block["block_rvol"],"BLOCK REASON":block["block_reason"],"REASON":mv.get("reason",pre["reason"]),"MOVEMENT STATUS": signal if candidates else pre["status"]}
-        if is_fo and result["DIRECTION"] in ("BUY","SELL"):
-            try:
-                od=fetch_options_chain_data(fyers,symbol); result["PCR"]=od.get("pcr","N/A"); result["OPTIONS BIAS"]=od.get("options_bias","N/A")
-            except: result["PCR"]="N/A"; result["OPTIONS BIAS"]="N/A"
-        # Explicitly label price/options conflicts instead of silently mixing
-        # two independent signals.
-        price_dir=str(result.get("DIRECTION", "NONE")).upper()
-        opt_bias=str(result.get("OPTIONS BIAS", "N/A")).upper()
-        if price_dir in ("BUY","SELL") and opt_bias not in ("N/A","NONE",""):
+                od = fetch_options_chain_data(fyers, symbol)
+                result["PCR"] = od.get("pcr", "N/A"); result["OPTIONS BIAS"] = od.get("options_bias", "N/A")
+            except Exception:
+                result["PCR"] = "N/A"; result["OPTIONS BIAS"] = "N/A"
+
+        price_dir = str(result.get("DIRECTION", "NONE")).upper()
+        opt_bias = str(result.get("OPTIONS BIAS", "N/A")).upper()
+        if price_dir in ("BUY", "SELL") and opt_bias not in ("N/A", "NONE", ""):
             opt_dir = "BUY" if "BULL" in opt_bias or "CALL" in opt_bias else "SELL" if "BEAR" in opt_bias or "PUT" in opt_bias else "NONE"
             if opt_dir == price_dir:
                 result["COMBINED BIAS"] = f"{price_dir} + OPTIONS CONFIRM"
-            elif opt_dir in ("BUY","SELL"):
+            elif opt_dir in ("BUY", "SELL"):
                 result["COMBINED BIAS"] = f"PRICE {price_dir} / OPTIONS {opt_dir} CONFLICT"
             else:
                 result["COMBINED BIAS"] = f"PRICE {price_dir} / OPTIONS {opt_bias}"
         else:
-            result["COMBINED BIAS"] = price_dir if price_dir in ("BUY","SELL") else "WAIT"
-        # Classify opposite-structure trades as reversals for clarity.
-        structure=str(result.get("STRUCTURE", "NONE")).upper()
+            result["COMBINED BIAS"] = price_dir if price_dir in ("BUY", "SELL") else "WAIT"
+
+        structure = str(result.get("STRUCTURE", "NONE")).upper()
         if price_dir == "BUY" and structure == "LH/LL":
             result["SIGNAL TYPE"] = "BUY REVERSAL"
         elif price_dir == "SELL" and structure == "HH/HL":
             result["SIGNAL TYPE"] = "SELL REVERSAL"
         else:
-            result["SIGNAL TYPE"] = price_dir if price_dir in ("BUY","SELL") else "WAIT"
-        return result,None
+            result["SIGNAL TYPE"] = price_dir if price_dir in ("BUY", "SELL") else "WAIT"
+        return result, None
     except Exception as e:
-        logger.exception("LIVE MOMENTUM worker failed for %s",symbol); return None,f"{symbol}: error ({type(e).__name__}: {str(e)[:120]})"
+        logger.exception("LIVE MOMENTUM worker failed for %s", symbol)
+        return None, f"{symbol}: error ({type(e).__name__}: {str(e)[:120]})"
 
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -3913,7 +4140,7 @@ def _future_move_signal(fyers, symbol: str, is_fo: bool = False):
             trigger = None; invalidation = None
 
         # Historical observation marker: the signal timestamp is the latest completed 5M candle.
-        sig_time = d5["Time"].iloc[-1] if "Time" in d5.columns else _now_ist()
+        sig_time = _completed_candle_datetime(d5["Time"].iloc[-1], "5") if "Time" in d5.columns else _now_ist()
         try:
             sig_time = pd.Timestamp(sig_time).to_pydatetime()
             if sig_time.tzinfo is None: sig_time = sig_time.replace(tzinfo=_now_ist().tzinfo)
@@ -3928,8 +4155,17 @@ def _future_move_signal(fyers, symbol: str, is_fo: bool = False):
         if structure_confirm: reason_parts.append("Structure confirmed")
         if not reason_parts: reason_parts.append("Waiting for confirmation")
 
+        unified = detect_pre_big_move_identity(d5)
+
         result = {
             "Symbol": stock_ticker, "LTP": round(ltp,2),
+            "PRE-BIG STATUS": unified["status"], "PRE-BIG DIRECTION": unified["direction"],
+            "PRE-BIG SCORE": unified["score"], "PRE-BIG ENERGY": unified["energy"],
+            "LAST CONSOLIDATION": "YES" if unified["consolidation_found"] else "NO",
+            "LAST RANGE HIGH": unified["range_high"], "LAST RANGE LOW": unified["range_low"],
+            "PRE-BIG TRIGGER": unified["trigger"], "PRE-BIG INVALIDATION": unified["invalidation"],
+            "PRE-BIG TARGET": unified["target"], "PRE-BIG REASON": unified["reason"],
+
             "SIGNAL TIME": sig_time.strftime("%d-%b-%Y %H:%M:%S"),
             "FUTURE DIRECTION": direction, "FUTURE MOVE SCORE": round(score,1),
             "FUTURE STATUS": status, "MOVE STAGE": stage,
@@ -5094,10 +5330,11 @@ def _add_reversal_columns(df: pd.DataFrame) -> pd.DataFrame:
         ltp + (atr * 0.50)
     )
 
-    # REVERSAL LEVEL should always be a usable reference price.
-    # Even when REVERSAL SIGNAL = WAIT, do not show N/A.
-    # Use the prevailing direction/context to choose the correct side.
+    # REVERSAL LEVEL should be a structural reference, not a fabricated LTP value.
+    # Prefer the scanner's last consolidation / breakout / breakdown levels.
     dir_text = x["DIRECTION"].astype(str).str.upper() if "DIRECTION" in x.columns else pd.Series("", index=x.index)
+    structural_hi = num(["LAST RANGE HIGH", "PRE-BIG TRIGGER", "BREAKOUT LEVEL"], np.nan)
+    structural_lo = num(["LAST RANGE LOW", "PRE-BIG INVALIDATION", "BREAKDOWN LEVEL"], np.nan)
 
     reversal_level = np.where(
         np.array(direction) == "BUY REVERSAL",
@@ -5143,6 +5380,18 @@ def _add_reversal_columns(df: pd.DataFrame) -> pd.DataFrame:
 
     reversal_level = reversal_level.fillna(fallback_level)
     x["REVERSAL LEVEL"] = reversal_level.round(2)
+
+    # Structural target: opposite side / one range projection beyond the last
+    # consolidation. This is separate from the reversal trigger.
+    range_width = (structural_hi - structural_lo).abs()
+    buy_target = structural_hi + range_width.where(range_width > 0, atr)
+    sell_target = structural_lo - range_width.where(range_width > 0, atr)
+    x["REVERSAL TARGET"] = np.where(
+        np.array(direction) == "BUY REVERSAL", buy_target,
+        np.where(np.array(direction) == "SELL REVERSAL", sell_target,
+                 np.where(dir_text.str.contains("SELL", na=False), sell_target, buy_target))
+    )
+    x["REVERSAL TARGET"] = pd.to_numeric(x["REVERSAL TARGET"], errors="coerce").round(2)
 
     x["REVERSAL ZONE"] = np.where(
         dir_text.str.contains("SELL", na=False),
