@@ -3701,6 +3701,253 @@ def run_momentum_scan(fyers, symbols, is_fo: bool = False):
     return results, errors, stats
 
 
+
+# ════════════════════════════════════════════════════════════════════════════════
+# FUTURE MOVE DETECTION — INDEPENDENT EARLY-WARNING ENGINE
+# Existing BIG MOVEMENT / AMD logic is intentionally NOT modified by this engine.
+# This engine uses completed 5M + 15M candles only and reports setup probability,
+# not a guaranteed future-price prediction.
+# ════════════════════════════════════════════════════════════════════════════════
+
+def _future_tf_features(df: pd.DataFrame) -> Dict[str, Any]:
+    out = {
+        "direction": "NONE", "score": 0.0, "rvol": 0.0, "volume_accel": 1.0,
+        "price_accel": 0.0, "compression": 0.0, "breakout_distance": None,
+        "breakdown_distance": None, "structure": "NONE", "vwap": None,
+        "trend": "NEUTRAL", "trigger": None, "invalidation": None,
+        "reason": "DATA_UNAVAILABLE"
+    }
+    if df is None or len(df) < 30:
+        return out
+    try:
+        d = df.reset_index(drop=True).copy()
+        for c in ["Open", "High", "Low", "Close", "Volume"]:
+            d[c] = pd.to_numeric(d[c], errors="coerce")
+        d = d.dropna(subset=["Open", "High", "Low", "Close", "Volume"]).reset_index(drop=True)
+        if len(d) < 30:
+            return out
+        c = float(d["Close"].iloc[-1]); o = float(d["Open"].iloc[-1])
+        h = float(d["High"].iloc[-1]); l = float(d["Low"].iloc[-1])
+        atr_s = calculate_atr(d, 14)
+        atr = float(atr_s.iloc[-1]) if len(atr_s) and pd.notna(atr_s.iloc[-1]) else max(c*0.005, 0.01)
+        base_vol = float(d["Volume"].iloc[-25:-5].mean())
+        recent_vol = float(d["Volume"].iloc[-5:].mean())
+        last_vol = float(d["Volume"].iloc[-1])
+        rvol = last_vol / base_vol if base_vol > 0 else 0.0
+        prev3 = float(d["Volume"].iloc[-5:-2].mean())
+        last2 = float(d["Volume"].iloc[-2:].mean())
+        vacc = last2 / prev3 if prev3 > 0 else 1.0
+
+        ranges = (d["High"] - d["Low"]).clip(lower=0)
+        recent_range = float(ranges.iloc[-8:].mean())
+        prior_range = float(ranges.iloc[-28:-8].mean())
+        compression = max(0.0, min(100.0, (1.0 - recent_range / prior_range) * 100.0)) if prior_range > 0 else 0.0
+
+        prev_close = float(d["Close"].iloc[-2])
+        prev3_close = float(d["Close"].iloc[-4])
+        ret1 = (c / prev_close - 1.0) * 100 if prev_close else 0.0
+        ret3 = (c / prev3_close - 1.0) * 100 if prev3_close else 0.0
+        prev_body = abs(float(d["Close"].iloc[-2]) - float(d["Open"].iloc[-2]))
+        body = abs(c-o)
+        price_accel = body / prev_body if prev_body > 0 else 1.0
+
+        rh = float(d["High"].iloc[-21:-1].max())
+        rl = float(d["Low"].iloc[-21:-1].min())
+        up_gap = max(0.0, (rh-c)/c*100) if c else 0.0
+        down_gap = max(0.0, (c-rl)/c*100) if c else 0.0
+        near_up = c >= rh*0.995
+        near_down = c <= rl*1.005
+
+        vwap_s = calculate_vwap(d)
+        vwap = float(vwap_s.iloc[-1]) if len(vwap_s) and pd.notna(vwap_s.iloc[-1]) else c
+        above_vwap = c > vwap
+        below_vwap = c < vwap
+
+        ph, pl = _confirmed_pivots(d.tail(40), left=1, right=1)
+        hh_hl = len(ph) >= 2 and len(pl) >= 2 and ph[-1][1] > ph[-2][1] and pl[-1][1] > pl[-2][1]
+        lh_ll = len(ph) >= 2 and len(pl) >= 2 and ph[-1][1] < ph[-2][1] and pl[-1][1] < pl[-2][1]
+        structure = "HH/HL" if hh_hl else "LH/LL" if lh_ll else "NONE"
+
+        buy = 0.0; sell = 0.0; buy_reasons=[]; sell_reasons=[]
+        if compression >= 20:
+            buy += 10; sell += 10
+            buy_reasons.append("Compression"); sell_reasons.append("Compression")
+        if vacc >= 1.15:
+            if c >= prev_close: buy += 10; buy_reasons.append("Volume Acceleration")
+            if c <= prev_close: sell += 10; sell_reasons.append("Volume Acceleration")
+        if rvol >= 1.20:
+            if c >= o: buy += 10; buy_reasons.append(f"RVOL {rvol:.2f}x")
+            if c <= o: sell += 10; sell_reasons.append(f"RVOL {rvol:.2f}x")
+        if ret3 > 0: buy += min(12, abs(ret3)*4); buy_reasons.append("Price Momentum")
+        if ret3 < 0: sell += min(12, abs(ret3)*4); sell_reasons.append("Price Momentum")
+        if price_accel >= 1.20 and c >= o: buy += 8; buy_reasons.append("Price Acceleration")
+        if price_accel >= 1.20 and c <= o: sell += 8; sell_reasons.append("Price Acceleration")
+        if above_vwap: buy += 8; buy_reasons.append("Above VWAP")
+        if below_vwap: sell += 8; sell_reasons.append("Below VWAP")
+        if hh_hl: buy += 15; buy_reasons.append("HH/HL")
+        if lh_ll: sell += 15; sell_reasons.append("LH/LL")
+        if near_up: buy += 15; buy_reasons.append("Near Breakout")
+        if near_down: sell += 15; sell_reasons.append("Near Breakdown")
+
+        direction = "BUY" if buy > sell + 8 else "SELL" if sell > buy + 8 else "NONE"
+        score = min(100.0, max(buy, sell))
+        trigger = rh if direction == "BUY" else rl if direction == "SELL" else None
+        invalidation = (c - atr*0.8) if direction == "BUY" else (c + atr*0.8) if direction == "SELL" else None
+        if direction == "BUY":
+            status_reason = " + ".join(buy_reasons[:7])
+        elif direction == "SELL":
+            status_reason = " + ".join(sell_reasons[:7])
+        else:
+            status_reason = "Conflicting directional evidence"
+        out.update({
+            "direction": direction, "score": round(score,1), "rvol": round(rvol,2),
+            "volume_accel": round(vacc,2), "price_accel": round(price_accel,2),
+            "compression": round(compression,1), "breakout_distance": round(up_gap,2),
+            "breakdown_distance": round(down_gap,2), "structure": structure,
+            "vwap": round(vwap,2), "trend": "BULLISH" if above_vwap and ret3 > 0 else "BEARISH" if below_vwap and ret3 < 0 else "NEUTRAL",
+            "trigger": round(trigger,2) if trigger is not None else None,
+            "invalidation": round(invalidation,2) if invalidation is not None else None,
+            "reason": status_reason or "Waiting for alignment"
+        })
+        return out
+    except Exception as e:
+        out["reason"] = f"Future feature error: {type(e).__name__}"
+        return out
+
+
+def _future_move_signal(fyers, symbol: str, is_fo: bool = False):
+    stock_ticker = symbol.replace("NSE:", "").replace("-EQ", "") if isinstance(symbol, str) else str(symbol)
+    if not isinstance(symbol, str) or not _VALID_EQ_SYMBOL_RE.match(symbol):
+        return None, f"{symbol}: invalid format"
+    try:
+        df5 = _fetch_timeframe_data(fyers, symbol, "5", lookback_days=LIVE_MOVE_LOOKBACK_DAYS)
+        df15 = _fetch_timeframe_data(fyers, symbol, "15", lookback_days=LIVE_MOVE_LOOKBACK_DAYS)
+        if df5 is None or len(df5) < 30 or df15 is None or len(df15) < 20:
+            return None, f"{symbol}: insufficient 5M/15M data"
+        f5 = _future_tf_features(df5)
+        f15 = _future_tf_features(df15)
+        d5 = df5.reset_index(drop=True)
+        ltp = float(d5["Close"].iloc[-1])
+
+        buy = float(f5["score"] if f5["direction"] == "BUY" else 0) + float(f15["score"] if f15["direction"] == "BUY" else 0)
+        sell = float(f5["score"] if f5["direction"] == "SELL" else 0) + float(f15["score"] if f15["direction"] == "SELL" else 0)
+        # 5M has more weight for near-term movement, 15M acts as confirmation.
+        buy = buy * 0.62 + (15 if f5["direction"] == "BUY" and f15["direction"] == "BUY" else 0)
+        sell = sell * 0.62 + (15 if f5["direction"] == "SELL" and f15["direction"] == "SELL" else 0)
+        if buy > sell + 10:
+            direction = "BUY"
+            raw_score = buy
+        elif sell > buy + 10:
+            direction = "SELL"
+            raw_score = sell
+        else:
+            direction = "NONE"
+            raw_score = max(buy, sell)
+        score = min(100.0, max(0.0, raw_score))
+
+        tf_confirm = direction in (f5["direction"], f15["direction"]) and f5["direction"] == f15["direction"]
+        volume_confirm = f5["rvol"] >= 1.2 or f5["volume_accel"] >= 1.15
+        structure_confirm = (direction == "BUY" and f5["structure"] == "HH/HL") or (direction == "SELL" and f5["structure"] == "LH/LL")
+        energy = f5["compression"] >= 20 and volume_confirm
+        near_trigger = (direction == "BUY" and f5["breakout_distance"] is not None and f5["breakout_distance"] <= 1.0) or (direction == "SELL" and f5["breakdown_distance"] is not None and f5["breakdown_distance"] <= 1.0)
+
+        if direction == "NONE":
+            stage = "WATCH"
+        elif tf_confirm and score >= 78 and energy and near_trigger:
+            stage = "READY"
+        elif tf_confirm and score >= 65 and energy:
+            stage = "BUILDING"
+        elif score >= 55:
+            stage = "EARLY BUILD"
+        else:
+            stage = "WATCH"
+
+        if direction == "BUY":
+            status = "🟢 FUTURE BUY"
+            trigger = f5["trigger"]
+            invalidation = f5["invalidation"]
+        elif direction == "SELL":
+            status = "🔴 FUTURE SELL"
+            trigger = f5["trigger"]
+            invalidation = f5["invalidation"]
+        else:
+            status = "🟡 WAIT"
+            trigger = None; invalidation = None
+
+        # Historical observation marker: the signal timestamp is the latest completed 5M candle.
+        sig_time = d5["Time"].iloc[-1] if "Time" in d5.columns else _now_ist()
+        try:
+            sig_time = pd.Timestamp(sig_time).to_pydatetime()
+            if sig_time.tzinfo is None: sig_time = sig_time.replace(tzinfo=_now_ist().tzinfo)
+        except Exception:
+            sig_time = _now_ist()
+
+        reason_parts = []
+        if f5["reason"]: reason_parts.append("5M: " + f5["reason"])
+        if f15["reason"]: reason_parts.append("15M: " + f15["reason"])
+        if tf_confirm: reason_parts.append("MTF aligned")
+        if volume_confirm: reason_parts.append("Volume confirmed")
+        if structure_confirm: reason_parts.append("Structure confirmed")
+        if not reason_parts: reason_parts.append("Waiting for confirmation")
+
+        result = {
+            "Symbol": stock_ticker, "LTP": round(ltp,2),
+            "SIGNAL TIME": sig_time.strftime("%d-%b-%Y %H:%M:%S"),
+            "FUTURE DIRECTION": direction, "FUTURE MOVE SCORE": round(score,1),
+            "FUTURE STATUS": status, "MOVE STAGE": stage,
+            "5M DIRECTION": f5["direction"], "5M SCORE": f5["score"],
+            "15M DIRECTION": f15["direction"], "15M SCORE": f15["score"],
+            "5M/15M CONFIRMATION": "YES" if tf_confirm else "NO",
+            "VOLUME CONFIRMATION": "YES" if volume_confirm else "NO",
+            "STRUCTURE CONFIRMATION": "YES" if structure_confirm else "NO",
+            "ENERGY BUILD": "YES" if energy else "NO",
+            "RANGE COMPRESSION": f5["compression"], "RVOL": f5["rvol"],
+            "VOLUME ACCELERATION": f5["volume_accel"], "PRICE ACCELERATION": f5["price_accel"],
+            "STRUCTURE": f5["structure"], "BREAKOUT DISTANCE %": f5["breakout_distance"],
+            "BREAKDOWN DISTANCE %": f5["breakdown_distance"], "FUTURE TRIGGER": trigger,
+            "FUTURE INVALIDATION": invalidation, "5M REASON": f5["reason"],
+            "15M REASON": f15["reason"], "FUTURE REASON": " + ".join(reason_parts),
+            "ACTUAL MOVE VALIDATION": "PENDING", "VALIDATION WINDOW": "NEXT 3 COMPLETED 5M CANDLES"
+        }
+        if is_fo:
+            result["SOURCE"] = "F&O"
+        else:
+            result["SOURCE"] = "NSE"
+        return result, None
+    except Exception as e:
+        return None, f"{symbol}: future scan error: {type(e).__name__}: {str(e)[:120]}"
+
+
+def run_future_move_scan(fyers, symbols, is_fo: bool = False):
+    """Independent future-move early-warning scan. Does not call BIG MOVEMENT or AMD."""
+    symbols = _validate_symbols(symbols)
+    results, errors = [], []
+    progress = st.progress(0.0, text=f"Future Move 0 / {len(symbols)}")
+    done = 0
+    for i in range(0, len(symbols), BATCH_SIZE):
+        batch = symbols[i:i+BATCH_SIZE]
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            futures = {executor.submit(_future_move_signal, fyers, s, is_fo): s for s in batch}
+            for future in as_completed(futures):
+                symbol = futures[future]
+                try:
+                    res, err = future.result()
+                except Exception as e:
+                    res, err = None, f"{symbol}: worker error: {str(e)[:120]}"
+                if res:
+                    results.append(res)
+                if err:
+                    errors.append(err)
+                done += 1
+                progress.progress(done/max(len(symbols),1), text=f"Future Move {done} / {len(symbols)}")
+        if i + BATCH_SIZE < len(symbols):
+            time.sleep(BATCH_PAUSE_SECONDS)
+    progress.empty()
+    gc.collect()
+    results.sort(key=lambda x: (float(x.get("FUTURE MOVE SCORE",0)), x.get("MOVE STAGE","") == "READY", x.get("5M/15M CONFIRMATION","") == "YES"), reverse=True)
+    return results, errors
+
+
 # ════════════════════════════════════════════════════════════════════════════════
 # PIN RULES — ADDITIONAL LIQUIDITY / REVERSAL / BIG-MOVE ANALYSIS
 # Existing scanner logic is intentionally untouched. This tab runs only when used.
@@ -4797,6 +5044,7 @@ def show_scanner(fyers) -> None:
         "📊 F&O STOCKS",
         "🧩 AMD ADDITIONAL",
         "⚡ BEFORE BIG MOVE ADDITIONAL",
+        "🔮 FUTURE MOVE DETECTION",
         "🎯 F&O OPTION CHECK",
         "🔄 REVERSAL",
         "📈 SWING",
@@ -5197,11 +5445,71 @@ def show_scanner(fyers) -> None:
             st.info("👆 Select NSE/F&O/BOTH and click RUN BEFORE BIG MOVE. Early-warning results will appear here.")
 
     # ════════════════════════════════════════════════════════════════════════════════
+    # TAB 4: FUTURE MOVE DETECTION
+    # Independent 5M + 15M early-warning engine.
+    # ════════════════════════════════════════════════════════════════════════════════
+    with tabs[4]:
+        st.markdown("### 🔮 FUTURE MOVE DETECTION")
+        st.caption("Completed 5M + 15M candles: early direction, energy, volume, structure and trigger proximity. This is an early-warning analysis, not a guaranteed future-price prediction.")
+        fm_source = st.radio("Scan Source", ["NSE Stocks", "F&O Stocks", "BOTH"], horizontal=True, key="future_move_source")
+        fm_all = (all_symbols if fm_source == "NSE Stocks" else fo_symbols if fm_source == "F&O Stocks" else list(dict.fromkeys(list(all_symbols)+list(fo_symbols))))
+        fm_default = min(300 if fm_source == "NSE Stocks" else 200, len(fm_all))
+        fm_limit = st.number_input("Future Move scan limit (0 = ALL)", min_value=0, max_value=max(len(fm_all),1), value=fm_default, step=25, key="future_move_limit")
+        fm_universe = fm_all if fm_limit == 0 else fm_all[:fm_limit]
+        if st.button(f"🔮 RUN FUTURE MOVE ({len(fm_universe)} stocks)", key="future_move_run", type="primary", use_container_width=True):
+            with st.spinner(f"Analyzing 5M + 15M future-move setup for {len(fm_universe)} stocks…"):
+                rows, errs = [], []
+                if fm_source in ("NSE Stocks", "BOTH"):
+                    nse_fm = all_symbols if fm_limit == 0 else [x for x in all_symbols if x in fm_universe]
+                    if fm_source == "NSE Stocks": nse_fm = fm_universe
+                    r,e = run_future_move_scan(fyers, nse_fm, is_fo=False); rows.extend(r); errs.extend(e)
+                if fm_source in ("F&O Stocks", "BOTH"):
+                    fo_fm = fo_symbols if fm_limit == 0 else [x for x in fo_symbols if x in fm_universe]
+                    if fm_source == "F&O Stocks": fo_fm = fm_universe
+                    r,e = run_future_move_scan(fyers, fo_fm, is_fo=True); rows.extend(r); errs.extend(e)
+                fm_df = pd.DataFrame(rows) if rows else pd.DataFrame()
+                if not fm_df.empty and "Symbol" in fm_df.columns:
+                    fm_df = fm_df.drop_duplicates(subset=["Symbol"], keep="first")
+                st.session_state["future_move_df"] = fm_df
+                st.session_state["future_move_errors"] = errs
+                st.success(f"✅ FUTURE MOVE scan completed — {len(fm_df)} rows")
+
+        fdf = st.session_state.get("future_move_df")
+        if fdf is not None and not fdf.empty:
+            view = fdf.copy()
+            if "FUTURE STATUS" in view.columns:
+                stage_mask = view["MOVE STAGE"].astype(str).str.upper().isin(["READY","BUILDING","EARLY BUILD"])
+                candidate_view = view[stage_mask].copy()
+                if candidate_view.empty: candidate_view = view.copy()
+            else:
+                candidate_view = view.copy()
+            fm_cols = [
+                "Symbol","LTP","SIGNAL TIME","FUTURE DIRECTION","FUTURE MOVE SCORE","FUTURE STATUS","MOVE STAGE",
+                "5M DIRECTION","5M SCORE","15M DIRECTION","15M SCORE","5M/15M CONFIRMATION",
+                "VOLUME CONFIRMATION","STRUCTURE CONFIRMATION","ENERGY BUILD","RANGE COMPRESSION",
+                "RVOL","VOLUME ACCELERATION","PRICE ACCELERATION","STRUCTURE","BREAKOUT DISTANCE %",
+                "BREAKDOWN DISTANCE %","FUTURE TRIGGER","FUTURE INVALIDATION","FUTURE REASON",
+                "ACTUAL MOVE VALIDATION","VALIDATION WINDOW","SOURCE"
+            ]
+            fm_cols = [c for c in fm_cols if c in candidate_view.columns]
+            candidate_view = candidate_view[fm_cols] if fm_cols else candidate_view
+            if "FUTURE MOVE SCORE" in candidate_view.columns:
+                candidate_view = candidate_view.sort_values("FUTURE MOVE SCORE", ascending=False)
+            st.dataframe(candidate_view, use_container_width=True, height=560, hide_index=True)
+            _excel_download_button(candidate_view, "FUTURE_MOVE_DETECTION", "future_move_excel", label="📥 DOWNLOAD FUTURE MOVE EXCEL")
+            errs = st.session_state.get("future_move_errors") or []
+            if errs:
+                with st.expander(f"⚠️ Future Move scan errors ({len(errs)})"):
+                    st.dataframe(pd.DataFrame({"Error": errs}), use_container_width=True)
+        else:
+            st.info("👆 Select NSE/F&O/BOTH and click RUN FUTURE MOVE. Early-warning results will appear here.")
+
+    # ════════════════════════════════════════════════════════════════════════════════
     # TAB 4: F&O OPTION CHECK — LIVE RUN
     # ════════════════════════════════════════════════════════════════════════════════
 
     # ════════════════════════════════════════════════════════════════════════════════
-    with tabs[4]:
+    with tabs[5]:
         st.markdown("### 🎯 F&O OPTION CHECK")
         st.caption("RUN LIVE CHECK fetches the current FYERS option-chain data. CE/PE is shown as WATCH, not an order instruction.")
         fo_pick = st.selectbox("Select F&O stock", fo_symbols if fo_symbols else all_symbols, key="fo_option_check_symbol")
@@ -5261,7 +5569,7 @@ def show_scanner(fyers) -> None:
     # ════════════════════════════════════════════════════════════════════════════════
     # TAB 5: DIRECT REVERSAL SCANNER
     # ════════════════════════════════════════════════════════════════════════════════
-    with tabs[5]:
+    with tabs[6]:
         st.markdown("### 🔄 REVERSAL SCANNER")
         st.caption(
             "Direct reversal scan for NSE / F&O / BOTH. "
@@ -5549,7 +5857,7 @@ def show_scanner(fyers) -> None:
     # ════════════════════════════════════════════════════════════════════════════════
     # TAB 6: SWING — CROSS + LONG-MOVE RADAR
     # ════════════════════════════════════════════════════════════════════════════════
-    with tabs[6]:
+    with tabs[7]:
         st.markdown("### 📈 Swing Trading — Long-Move Radar + Golden/Death Cross")
         st.caption("Daily closed-candle trend scanner. LONG-MOVE WATCH is a setup filter, not a guaranteed forecast.")
 
@@ -5634,12 +5942,12 @@ def show_scanner(fyers) -> None:
     # ════════════════════════════════════════════════════════════════════════════════
     # TAB 7: PIN RULES — ADDITIONAL ONLY
     # ════════════════════════════════════════════════════════════════════════════════
-    with tabs[7]:
+    with tabs[8]:
         _show_pin_rules_tab(fyers, all_symbols, fo_symbols)
     # ════════════════════════════════════════════════════════════════════════════════
     # TAB 8: SETTINGS
     # ════════════════════════════════════════════════════════════════════════════════
-    with tabs[8]:
+    with tabs[9]:
         st.markdown("### ⚙️ Scanner Settings & Configuration")
         
         st.markdown("#### 🎯 Signal Filtering")
