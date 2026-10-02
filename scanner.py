@@ -357,6 +357,32 @@ def _completed_candle_datetime(ts, resolution: str = "5") -> datetime:
 def _generated_timestamp() -> str:
     return _now_ist().strftime("%d-%b-%Y %H:%M:%S IST")
 
+
+def _ensure_signal_time_column(df: pd.DataFrame, fallback=None) -> pd.DataFrame:
+    """Ensure every user-facing scanner report has a SIGNAL TIME column.
+
+    Existing signal timestamps are preserved. Missing/blank timestamps are
+    filled with the scan timestamp. All fallback timestamps use IST.
+    """
+    if df is None:
+        return df
+    out = df.copy()
+    fallback_value = fallback if fallback is not None else _generated_timestamp()
+
+    if "SIGNAL TIME" not in out.columns:
+        out.insert(0, "SIGNAL TIME", fallback_value)
+    else:
+        vals = out["SIGNAL TIME"].copy()
+        def _fill(v):
+            if v is None or (isinstance(v, float) and pd.isna(v)):
+                return fallback_value
+            s = str(v).strip()
+            if not s or s.lower() in {"nan", "nat", "none", "n/a", "na"}:
+                return fallback_value
+            return v
+        out["SIGNAL TIME"] = vals.map(_fill)
+    return out
+
 # ════════════════════════════════════════════════════════════════════════════════
 # CORE INDICATORS (RETAINED FROM ORIGINAL)
 # ════════════════════════════════════════════════════════════════════════════════
@@ -5321,9 +5347,10 @@ def _show_live_order_flow_tab(fyers, all_symbols):
         st.caption(f"Last depth scan: {st.session_state.get('depth_scanned_at', 'N/A')}")
 
         st.markdown("### 🎯 NEXT DIRECTION — LIVE DEPTH")
+        depth_display = _ensure_signal_time_column(depth_df, st.session_state.get("depth_scanned_at"))
         st.dataframe(
-            depth_df[[
-                "Symbol", "LTP", "BEST BID", "BEST ASK", "TOTAL BUY QTY", "TOTAL SELL QTY",
+            depth_display[[
+                "SIGNAL TIME", "Symbol", "LTP", "BEST BID", "BEST ASK", "TOTAL BUY QTY", "TOTAL SELL QTY",
                 "DEPTH IMBALANCE %", "BUY SCORE", "SELL SCORE", "NEXT DIRECTION",
                 "DIRECTION STRENGTH %", "FUTURE DIRECTION", "FUTURE CONFIDENCE %",
                 "FUTURE BUY SCORE", "FUTURE SELL SCORE", "PIN SIGNAL", "SPREAD %", "REASON", "FUTURE REASON"
@@ -5334,7 +5361,7 @@ def _show_live_order_flow_tab(fyers, all_symbols):
         if not pins.empty:
             st.markdown("### 📌 LIVE DEPTH PIN SIGNALS")
             st.dataframe(
-                pins[["Symbol", "LTP", "TOTAL BUY QTY", "TOTAL SELL QTY", "DEPTH IMBALANCE %", "NEXT DIRECTION", "DIRECTION STRENGTH %", "PIN SIGNAL", "REASON"]],
+                _ensure_signal_time_column(pins, st.session_state.get("depth_scanned_at"))[["SIGNAL TIME", "Symbol", "LTP", "TOTAL BUY QTY", "TOTAL SELL QTY", "DEPTH IMBALANCE %", "NEXT DIRECTION", "DIRECTION STRENGTH %", "PIN SIGNAL", "REASON"]],
                 use_container_width=True, height=300
             )
 
@@ -5422,6 +5449,8 @@ def _show_pin_rules_tab(fyers, all_symbols=None, fo_symbols=None) -> None:
                 pin_min=pin_min,
                 pin_mode=pin_mode
             )
+        st.session_state["pin_scan_time"] = _generated_timestamp()
+        result = _ensure_signal_time_column(result, st.session_state["pin_scan_time"])
         st.session_state["pin_df"] = result
         st.session_state["pin_errors"] = errors
         st.session_state["pin_last_scan_count"] = total_available
@@ -5445,6 +5474,9 @@ def _show_pin_rules_tab(fyers, all_symbols=None, fo_symbols=None) -> None:
             "STRUCTURE", "5M TREND", "15M TREND", "1H TREND", "RVOL", "RSI",
             "PRESSURE", "AI CONFIDENCE %", "AI SIGNAL", "REASON"
         ]
+        display_cols = [c for c in display_cols if c in pin_df.columns]
+        display_cols = ["SIGNAL TIME"] + [c for c in display_cols if c != "SIGNAL TIME"]
+        pin_df = _ensure_signal_time_column(pin_df, st.session_state.get("pin_scan_time"))
         display_cols = [c for c in display_cols if c in pin_df.columns]
         st.dataframe(pin_df[display_cols], use_container_width=True, height=500)
 
@@ -5677,7 +5709,8 @@ def show_scanner(fyers) -> None:
         if st.button(f"🔍 SCAN NSE ({len(nse_universe)} stocks)", key="nse_run", type="primary"):
             with st.spinner("Analyzing NSE stocks…"):
                 nse_results, nse_errors, nse_stats = run_nse_scan(fyers, nse_universe)
-                st.session_state["nse_df"] = pd.DataFrame(nse_results) if nse_results else pd.DataFrame()
+                st.session_state["nse_scan_time"] = _generated_timestamp()
+                st.session_state["nse_df"] = _ensure_signal_time_column(pd.DataFrame(nse_results) if nse_results else pd.DataFrame(), st.session_state["nse_scan_time"])
                 st.session_state["nse_errors"] = nse_errors
                 st.session_state["nse_stats"] = nse_stats
         
@@ -5728,11 +5761,11 @@ def show_scanner(fyers) -> None:
                     pass
                 
                 nse_filtered = _add_reversal_columns(nse_filtered)
-                st.dataframe(nse_filtered, use_container_width=True, height=500, hide_index=True)
+                st.dataframe(_ensure_signal_time_column(nse_filtered, st.session_state.get("nse_scan_time")), use_container_width=True, height=500, hide_index=True)
 
                 if st.checkbox("🧠 Show Master Scanner validation", key="nse_master_view"):
                     master_cols = [c for c in ["Symbol", "LTP", "ORIGINAL AI SIGNAL", "AI CONFIDENCE %", "INTRADAY", "SWING", "BIG MOVE", "PIN", "REVERSAL", "FINAL SIGNAL", "MASTER CONFIDENCE %", "SIGNAL CONFIRMATION", "CONFIRMATION SCORE", "MASTER STATUS", "MASTER REASON", "ENTRY", "STOP LOSS", "TARGET 1", "TARGET 2", "RISK:REWARD"] if c in nse_filtered.columns]
-                    st.dataframe(nse_filtered[master_cols], use_container_width=True, height=420, hide_index=True)
+                    st.dataframe(_ensure_signal_time_column(nse_filtered, st.session_state.get("nse_scan_time"))[master_cols], use_container_width=True, height=420, hide_index=True)
                 
                 st.markdown("### 📥 Download")
                 col_d1, col_d2, col_d3 = st.columns(3)
@@ -5791,8 +5824,10 @@ def show_scanner(fyers) -> None:
             with st.spinner(f"Analyzing F&O stocks ({len(fo_universe)} symbols)…"):
                 try:
                     fo_results, fo_errors, fo_stats = run_fo_scan(fyers, fo_universe)
-                    st.session_state["fo_df"] = (
-                        pd.DataFrame(fo_results) if fo_results else pd.DataFrame()
+                    st.session_state["fo_scan_time"] = _generated_timestamp()
+                    st.session_state["fo_df"] = _ensure_signal_time_column(
+                        pd.DataFrame(fo_results) if fo_results else pd.DataFrame(),
+                        st.session_state["fo_scan_time"]
                     )
                     st.session_state["fo_errors"] = fo_errors or []
                     st.session_state["fo_stats"] = fo_stats
@@ -5855,11 +5890,11 @@ def show_scanner(fyers) -> None:
                     pass
                 
                 fo_filtered = _add_reversal_columns(fo_filtered)
-                st.dataframe(fo_filtered, use_container_width=True, height=500, hide_index=True)
+                st.dataframe(_ensure_signal_time_column(fo_filtered, st.session_state.get("fo_scan_time")), use_container_width=True, height=500, hide_index=True)
 
                 if st.checkbox("🧠 Show Master Scanner validation", key="fo_master_view"):
                     master_cols = [c for c in ["Symbol", "LTP", "ORIGINAL AI SIGNAL", "AI CONFIDENCE %", "INTRADAY", "SWING", "BIG MOVE", "PIN", "REVERSAL", "FINAL SIGNAL", "MASTER CONFIDENCE %", "SIGNAL CONFIRMATION", "CONFIRMATION SCORE", "MASTER STATUS", "MASTER REASON", "ENTRY", "STOP LOSS", "TARGET 1", "TARGET 2", "RISK:REWARD"] if c in fo_filtered.columns]
-                    st.dataframe(fo_filtered[master_cols], use_container_width=True, height=420, hide_index=True)
+                    st.dataframe(_ensure_signal_time_column(fo_filtered, st.session_state.get("fo_scan_time"))[master_cols], use_container_width=True, height=420, hide_index=True)
                 
                 st.markdown("### 📥 Download")
                 col_d1, col_d2, col_d3 = st.columns(3)
@@ -5930,6 +5965,8 @@ def show_scanner(fyers) -> None:
                 amd_df = pd.DataFrame(all_rows) if all_rows else pd.DataFrame()
                 if not amd_df.empty and "Symbol" in amd_df.columns:
                     amd_df = amd_df.drop_duplicates(subset=["Symbol"], keep="first")
+                st.session_state["amd_scan_time"] = _generated_timestamp()
+                amd_df = _ensure_signal_time_column(amd_df, st.session_state["amd_scan_time"])
                 st.session_state["momentum_df"] = amd_df
                 st.session_state["momentum_errors"] = all_errors
                 st.session_state["momentum_stats"] = all_stats
@@ -6003,6 +6040,8 @@ def show_scanner(fyers) -> None:
                 bb_rows = _merge_intraday_history(previous_bb, all_rows)
                 st.session_state["before_bigmove_history_rows"] = bb_rows
                 bb_df = pd.DataFrame(bb_rows) if bb_rows else pd.DataFrame()
+                st.session_state["before_bigmove_scan_time"] = _generated_timestamp()
+                bb_df = _ensure_signal_time_column(bb_df, st.session_state["before_bigmove_scan_time"])
                 st.session_state["before_bigmove_df"] = bb_df
                 st.session_state["before_bigmove_errors"] = all_errors
                 st.session_state["before_bigmove_stats"] = all_stats
@@ -6042,6 +6081,7 @@ def show_scanner(fyers) -> None:
             candidate_view = candidate_view[bb_cols] if bb_cols else candidate_view
             if "EARLY MOVE SCORE" in candidate_view.columns:
                 candidate_view = candidate_view.sort_values("EARLY MOVE SCORE", ascending=False)
+            candidate_view = _ensure_signal_time_column(candidate_view, st.session_state.get("before_bigmove_scan_time"))
             st.dataframe(candidate_view, use_container_width=True, height=560, hide_index=True)
             _excel_download_button(candidate_view, "BEFORE_BIG_MOVE_ADDITIONAL", "before_bigmove_additional_excel", label="📥 DOWNLOAD BEFORE BIG MOVE EXCEL")
             errs = st.session_state.get("before_bigmove_errors") or []
@@ -6081,7 +6121,9 @@ def show_scanner(fyers) -> None:
                 rows = _refresh_future_move_validation(fyers, merged_rows)
                 rows = _merge_intraday_history([], rows)
                 st.session_state["future_move_history_rows"] = rows
+                st.session_state["future_move_scan_time"] = _generated_timestamp()
                 fm_df = pd.DataFrame(rows) if rows else pd.DataFrame()
+                fm_df = _ensure_signal_time_column(fm_df, st.session_state["future_move_scan_time"])
                 # Preserve separate FUTURE MOVE signal timestamps for the same symbol.
                 if not fm_df.empty:
                     dedupe_cols = [c for c in ["Symbol", "SIGNAL TIME", "FUTURE DIRECTION"] if c in fm_df.columns]
@@ -6116,6 +6158,7 @@ def show_scanner(fyers) -> None:
             candidate_view = candidate_view[fm_cols] if fm_cols else candidate_view
             if "FUTURE MOVE SCORE" in candidate_view.columns:
                 candidate_view = candidate_view.sort_values("FUTURE MOVE SCORE", ascending=False)
+            candidate_view = _ensure_signal_time_column(candidate_view, st.session_state.get("future_move_scan_time"))
             st.dataframe(candidate_view, use_container_width=True, height=560, hide_index=True)
             _excel_download_button(candidate_view, "FUTURE_MOVE_DETECTION", "future_move_excel", label="📥 DOWNLOAD FUTURE MOVE EXCEL")
             errs = st.session_state.get("future_move_errors") or []
@@ -6146,6 +6189,7 @@ def show_scanner(fyers) -> None:
         if run_live:
             with st.spinner(f"Fetching live option chain for {fo_pick}…"):
                 live_opt = fetch_options_chain_data(fyers, fo_pick)
+            st.session_state["fo_option_scan_time"] = _generated_timestamp()
             st.session_state["fo_option_live"] = live_opt
             st.session_state["fo_option_live_symbol"] = fo_pick
 
@@ -6177,7 +6221,7 @@ def show_scanner(fyers) -> None:
                         try:
                             k=float(x.get("strike_price")); typ=x.get("option_type")
                             if abs(k-strike_input) <= max(1.0, abs(strike_input)*0.08):
-                                rows.append({"Strike":k,"Type":typ,"LTP":x.get("ltp"),"OI":x.get("oi"),"OI Change":x.get("oich"),"Volume":x.get("volume"),"IV":x.get("iv")})
+                                rows.append({"SIGNAL TIME": st.session_state.get("fo_option_scan_time", _generated_timestamp()), "Strike":k,"Type":typ,"LTP":x.get("ltp"),"OI":x.get("oi"),"OI Change":x.get("oich"),"Volume":x.get("volume"),"IV":x.get("iv")})
                         except Exception: pass
                     if rows:
                         st.markdown("#### Nearby option strikes")
@@ -6297,6 +6341,8 @@ def show_scanner(fyers) -> None:
             else:
                 reversal_df = pd.DataFrame()
 
+            st.session_state["direct_reversal_scan_time"] = _generated_timestamp()
+            reversal_df = _ensure_signal_time_column(reversal_df, st.session_state["direct_reversal_scan_time"])
             st.session_state["direct_reversal_df"] = reversal_df
             st.session_state["direct_reversal_errors"] = reversal_errors
             st.session_state["direct_reversal_scanned_at"] = _generated_timestamp()
@@ -6369,6 +6415,7 @@ def show_scanner(fyers) -> None:
             # FULL REPORT — ALWAYS SHOW ALL SCANNED ROWS.
             # The score slider controls only the Watch List below.
             st.markdown(f"### 📋 FULL REVERSAL REPORT ({len(display_df)})")
+            display_df = _ensure_signal_time_column(display_df, st.session_state.get("direct_reversal_scan_time"))
             st.dataframe(
                 display_df,
                 use_container_width=True,
@@ -6417,6 +6464,7 @@ def show_scanner(fyers) -> None:
                     "The FULL REVERSAL REPORT above still contains every scanned stock."
                 )
             else:
+                view = _ensure_signal_time_column(view, st.session_state.get("direct_reversal_scan_time"))
                 st.dataframe(
                     view,
                     use_container_width=True,
@@ -6507,7 +6555,9 @@ def show_scanner(fyers) -> None:
                     usable = df_long[df_long["ltp"].notna()].copy()
                     if not usable.empty:
                         usable = usable.sort_values(["score","return60"], ascending=False, na_position="last")
-                    st.session_state["swing_long_df"] = usable if not usable.empty else df_long
+                    st.session_state["swing_long_scan_time"] = _generated_timestamp()
+                    usable = _ensure_signal_time_column(usable if not usable.empty else df_long, st.session_state["swing_long_scan_time"])
+                    st.session_state["swing_long_df"] = usable
                     st.success(f"✅ Swing scan complete: {len(usable)} stocks with usable daily data out of {len(df_long)} scanned.")
                 else:
                     st.warning("No symbols were scanned. Check the NSE symbol list / API connection.")
@@ -6529,7 +6579,8 @@ def show_scanner(fyers) -> None:
                         swing_progress.progress((idx + 1) / max(len(swing_symbols),1))
                 swing_progress.empty()
                 if swing_results:
-                    st.session_state["swing_df"] = pd.DataFrame(swing_results)
+                    st.session_state["swing_scan_time"] = _generated_timestamp()
+                    st.session_state["swing_df"] = _ensure_signal_time_column(pd.DataFrame(swing_results), st.session_state["swing_scan_time"])
 
         long_df = st.session_state.get("swing_long_df")
         if long_df is not None and not long_df.empty:
@@ -6542,6 +6593,7 @@ def show_scanner(fyers) -> None:
             view = _add_reversal_columns(long_df.copy())
             if long_filter != "ALL": view = view[view["status"] == long_filter]
             if trend_filter != "ALL": view = view[view["trend"] == trend_filter]
+            view = _ensure_signal_time_column(view, st.session_state.get("swing_long_scan_time"))
             st.dataframe(view.head(50), use_container_width=True, hide_index=True)
             _excel_download_button(view, "SWING_LONG_MOVE", "download_swing_long_move_excel")
             st.caption("Higher score means more conditions are aligned; it does not mean the stock will definitely rise.")
@@ -6558,6 +6610,7 @@ def show_scanner(fyers) -> None:
         if swing_df is not None and not swing_df.empty:
             st.markdown("#### Golden / Death Cross results")
             swing_report = _add_reversal_columns(swing_df.copy())
+            swing_report = _ensure_signal_time_column(swing_report, st.session_state.get("swing_scan_time"))
             st.dataframe(swing_report, use_container_width=True, hide_index=True)
             _excel_download_button(swing_report, "SWING_CROSS_REVERSAL", "download_swing_cross_reversal_excel")
     # ════════════════════════════════════════════════════════════════════════════════
