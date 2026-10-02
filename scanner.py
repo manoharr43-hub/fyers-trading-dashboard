@@ -5302,8 +5302,17 @@ def _add_reversal_columns(df: pd.DataFrame) -> pd.DataFrame:
     for col in ["BEFORE MOVE DIRECTION", "PRE-MOVE", "DIRECTION", "MOVEMENT STATUS", "AI SIGNAL", "Signal", "trend", "REVERSAL", "SWEEP", "REASON", "reason"]:
         if col in x.columns:
             text = text + " " + x[col].astype(str).str.upper()
-    down_context = text.str.contains("DOWN|BEAR|SELL BEFORE MOVE|PRE-MOVE SELL|LOW SWEPT|BULL REVERSAL|BULLISH SWEEP|SELL REVERSAL", regex=True, na=False)
-    up_context = text.str.contains("UP|BULL|BUY BEFORE MOVE|PRE-MOVE BUY|HIGH SWEPT|BEAR REVERSAL|BEARISH SWEEP|BUY REVERSAL", regex=True, na=False)
+    # Use directional word boundaries to reduce substring false positives.
+    down_context = text.str.contains(
+        r"\bDOWN\b|\bBEAR(?:ISH)?\b|SELL BEFORE MOVE|PRE-MOVE SELL|LOW SWEPT|"
+        r"BULL REVERSAL|BULLISH SWEEP|SELL REVERSAL",
+        regex=True, na=False
+    )
+    up_context = text.str.contains(
+        r"\bUP\b|\bBULL(?:ISH)?\b|BUY BEFORE MOVE|PRE-MOVE BUY|HIGH SWEPT|"
+        r"BEAR REVERSAL|BEARISH SWEEP|BUY REVERSAL",
+        regex=True, na=False
+    )
     bull_rejection = text.str.contains("LOW SWEPT|BULL REVERSAL|BULLISH SWEEP|BULLISH REJECTION|HAMMER", regex=True, na=False)
     bear_rejection = text.str.contains("HIGH SWEPT|BEAR REVERSAL|BEARISH SWEEP|BEARISH REJECTION|SHOOTING STAR", regex=True, na=False)
     buy = ((rsi <= 35).astype(int) + down_context.astype(int) + bull_rejection.astype(int) + ((valid_vwap) & (ltp >= vwap)).astype(int) + ((rvol >= 1.30) & down_context).astype(int))
@@ -5380,6 +5389,9 @@ def _add_reversal_columns(df: pd.DataFrame) -> pd.DataFrame:
 
     reversal_level = reversal_level.fillna(fallback_level)
     x["REVERSAL LEVEL"] = reversal_level.round(2)
+    # REVERSAL LEVEL is a watch/structural reference, not confirmed execution price.
+    x["REVERSAL CONFIRMED PRICE"] = np.nan
+    x["REVERSAL CONFIRMED"] = "NO"
 
     # Structural target: opposite side / one range projection beyond the last
     # consolidation. This is separate from the reversal trigger.
@@ -5868,8 +5880,11 @@ def show_scanner(fyers) -> None:
                 rows = _refresh_future_move_validation(fyers, list(merged.values()))
                 st.session_state["future_move_history_rows"] = rows
                 fm_df = pd.DataFrame(rows) if rows else pd.DataFrame()
-                if not fm_df.empty and "Symbol" in fm_df.columns:
-                    fm_df = fm_df.drop_duplicates(subset=["Symbol"], keep="first")
+                # Preserve separate FUTURE MOVE signal timestamps for the same symbol.
+                if not fm_df.empty:
+                    dedupe_cols = [c for c in ["Symbol", "SIGNAL TIME", "FUTURE DIRECTION"] if c in fm_df.columns]
+                    if dedupe_cols:
+                        fm_df = fm_df.drop_duplicates(subset=dedupe_cols, keep="last")
                 st.session_state["future_move_df"] = fm_df
                 st.session_state["future_move_errors"] = errs
                 st.success(f"✅ FUTURE MOVE scan completed — {len(fm_df)} rows")
