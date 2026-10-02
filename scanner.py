@@ -3894,177 +3894,6 @@ def run_fo_scan(fyers, symbols):
     gc.collect()
     return results, errors, stats
 
-
-# ============================================================
-# INTRADAY PRE-MOVE TIMING / HISTORY LAYER (ADDITIVE)
-# ============================================================
-# This layer does not replace the existing PRE-MOVE/FUTURE MOVE engines.
-# It records when a setup was first seen, separates early vs late signals,
-# and preserves repeated scans for the same symbol during the session.
-INTRADAY_OPEN_HOUR = 9
-INTRADAY_OPEN_MINUTE = 15
-INTRADAY_CLOSE_HOUR = 15
-INTRADAY_CLOSE_MINUTE = 30
-INTRADAY_EARLY_CUTOFF_MIN = 315   # 14:30
-INTRADAY_GOOD_CUTOFF_MIN = 345    # 15:00
-INTRADAY_LATE_CUTOFF_MIN = 360    # 15:15
-
-
-def _intraday_minutes_from_open(ts) -> Optional[float]:
-    try:
-        t = pd.to_datetime(ts, errors="coerce")
-        if pd.isna(t):
-            return None
-        if getattr(t, "tzinfo", None) is not None:
-            try:
-                t = t.tz_convert("Asia/Kolkata")
-            except Exception:
-                pass
-        return (t.hour * 60 + t.minute + t.second / 60.0) - (INTRADAY_OPEN_HOUR * 60 + INTRADAY_OPEN_MINUTE)
-    except Exception:
-        return None
-
-
-def _intraday_timing_quality(ts) -> str:
-    """Classify signal timing for an Indian cash-session intraday scanner."""
-    try:
-        t = pd.to_datetime(ts, errors="coerce")
-        if pd.isna(t):
-            return "UNKNOWN"
-        if getattr(t, "tzinfo", None) is not None:
-            try:
-                t = t.tz_convert("Asia/Kolkata")
-            except Exception:
-                pass
-        minute_of_day = t.hour * 60 + t.minute + t.second / 60.0
-        if minute_of_day < 9 * 60 + 15:
-            return "PRE-MARKET"
-        if minute_of_day <= 14 * 60 + 30:
-            return "EARLY"
-        if minute_of_day <= 15 * 60:
-            return "GOOD INTRADAY"
-        if minute_of_day <= 15 * 60 + 15:
-            return "LATE"
-        if minute_of_day <= 15 * 60 + 30:
-            return "VERY LATE"
-        return "AFTER CLOSE"
-    except Exception:
-        return "UNKNOWN"
-
-
-def _intraday_stage(score: float, direction: str, timing_quality: str, old_status: str = "") -> str:
-    """Convert the existing score into an intraday stage without changing old status."""
-    d = str(direction or "NONE").upper()
-    if d not in ("BUY", "SELL"):
-        return "WAIT"
-    try:
-        sc = float(score or 0)
-    except Exception:
-        sc = 0.0
-    if sc >= 90:
-        stage = "HIGH-CONFLUENCE PRE-MOVE"
-    elif sc >= 80:
-        stage = "STRONG PRE-MOVE"
-    elif sc >= 70:
-        stage = "PRE-MOVE"
-    elif sc >= 60:
-        stage = "BUILDING"
-    elif sc >= 50:
-        stage = "WATCH"
-    else:
-        stage = "WAIT"
-    if timing_quality in ("VERY LATE", "AFTER CLOSE") and stage not in ("WAIT",):
-        stage = "LATE " + stage
-    return stage
-
-
-def _annotate_intraday_row(row: Dict[str, Any], first_seen: Optional[str] = None) -> Dict[str, Any]:
-    """Add intraday timing fields while retaining all existing fields."""
-    out = dict(row or {})
-    sig = out.get("SIGNAL TIME") or out.get("_SIGNAL_TS_ISO")
-    ts = pd.to_datetime(sig, errors="coerce")
-    if pd.isna(ts):
-        ts = _now_ist()
-    first_ts = pd.to_datetime(first_seen, errors="coerce") if first_seen else ts
-    if pd.isna(first_ts):
-        first_ts = ts
-    timing = _intraday_timing_quality(first_ts)
-    score = out.get("PRE-MOVE SCORE", out.get("EARLY MOVE SCORE", out.get("FUTURE MOVE SCORE", out.get("SCORE", 0))))
-    direction = out.get("PRE-MOVE", out.get("EARLY DIRECTION", out.get("FUTURE DIRECTION", out.get("DIRECTION", "NONE"))))
-    stage = _intraday_stage(score, direction, timing, out.get("PRE-MOVE STATUS", out.get("EARLY STATUS", "")))
-    close_ts = ts.replace(hour=INTRADAY_CLOSE_HOUR, minute=INTRADAY_CLOSE_MINUTE, second=0, microsecond=0)
-    mins_to_close = (close_ts - ts).total_seconds() / 60.0
-    age = max(0.0, (_now_ist() - ts).total_seconds() / 60.0)
-    out["FIRST DETECTED TIME"] = pd.Timestamp(first_ts).strftime("%d-%b-%Y %H:%M:%S")
-    out["LATEST SIGNAL TIME"] = pd.Timestamp(ts).strftime("%d-%b-%Y %H:%M:%S")
-    out["SIGNAL AGE MIN"] = round(age, 1)
-    out["PRE-MOVE STAGE"] = stage
-    out["PRE-MOVE QUALITY"] = stage
-    out["LEAD TIME MIN"] = round(max(0.0, mins_to_close), 1)
-    out["MINUTES BEFORE CLOSE"] = round(max(0.0, mins_to_close), 1)
-    out["SIGNAL TIMING QUALITY"] = timing
-    out["TRIGGER STATUS"] = "WAITING"
-    trigger = out.get("EARLY TRIGGER", out.get("FUTURE TRIGGER", out.get("PRE-BIG TRIGGER")))
-    try:
-        ltp = float(out.get("LTP"))
-        trig = float(trigger)
-        dd = str(direction).upper()
-        if dd == "BUY":
-            out["TRIGGER STATUS"] = "TRIGGERED" if ltp >= trig else "WAITING"
-        elif dd == "SELL":
-            out["TRIGGER STATUS"] = "TRIGGERED" if ltp <= trig else "WAITING"
-    except Exception:
-        pass
-    out["SIGNAL TIMING NOTE"] = (
-        "Early intraday detection" if timing == "EARLY" else
-        "Usable intraday timing" if timing == "GOOD INTRADAY" else
-        "Late detection — not an early alert" if timing in ("LATE", "VERY LATE") else
-        "Close/after-close signal — validation requires next session" if timing == "AFTER CLOSE" else
-        "Timing unavailable"
-    )
-    return out
-
-
-def _merge_intraday_history(history_rows: List[Dict[str, Any]], new_rows: List[Dict[str, Any]], limit: int = 5000) -> List[Dict[str, Any]]:
-    """Preserve multiple observations for the same symbol; update exact observation keys."""
-    merged: Dict[Tuple[str, str, str, str], Dict[str, Any]] = {}
-    for item in (history_rows or []) + (new_rows or []):
-        symbol = str(item.get("Symbol", item.get("STOCK NAME", "")))
-        sig = str(item.get("SIGNAL TIME", item.get("LATEST SIGNAL TIME", "")))
-        direction = str(item.get("PRE-MOVE", item.get("EARLY DIRECTION", item.get("FUTURE DIRECTION", item.get("DIRECTION", "NONE")))))
-        stage = str(item.get("PRE-MOVE STAGE", item.get("EARLY STATUS", item.get("FUTURE STATUS", ""))))
-        key = (symbol, sig, direction, stage)
-        merged[key] = dict(item)
-
-    rows = list(merged.values())
-    # First detection is the earliest observed timestamp for each symbol.
-    first_by_symbol: Dict[str, str] = {}
-    for r in rows:
-        sym = str(r.get("Symbol", r.get("STOCK NAME", "")))
-        sig = str(r.get("SIGNAL TIME", r.get("LATEST SIGNAL TIME", "")))
-        if not sym or not sig:
-            continue
-        ts = pd.to_datetime(sig, errors="coerce")
-        if pd.isna(ts):
-            continue
-        prev = pd.to_datetime(first_by_symbol.get(sym), errors="coerce")
-        if pd.isna(prev) or ts < prev:
-            first_by_symbol[sym] = sig
-
-    out = []
-    for r in rows:
-        sym = str(r.get("Symbol", r.get("STOCK NAME", "")))
-        out.append(_annotate_intraday_row(r, first_by_symbol.get(sym)))
-    out.sort(key=lambda x: pd.to_datetime(x.get("FIRST DETECTED TIME"), errors="coerce"), reverse=False)
-    return out[-limit:]
-
-
-def _is_market_hours_intraday() -> bool:
-    now = _now_ist()
-    mins = now.hour * 60 + now.minute + now.second / 60.0
-    return (9 * 60 + 15) <= mins <= (15 * 60 + 30)
-
-
 def run_momentum_scan(fyers, symbols, is_fo: bool = False):
     """Threaded LIVE sudden movement scan. Returns BUY/SELL only."""
     symbols = _validate_symbols(symbols)
@@ -5942,7 +5771,6 @@ def show_scanner(fyers) -> None:
     # ════════════════════════════════════════════════════════════════════════════════
     with tabs[3]:
         st.markdown("### ⚡ BEFORE BIG MOVE ADDITIONAL")
-        st.caption("Intraday mode: first detection is preserved across repeated scans; late 15:15–15:30 signals are explicitly marked as late.")
         st.caption("Early-warning layer: compression + volume build/acceleration + price acceleration + breakout/breakdown proximity. This is not a guaranteed future-price forecast.")
 
         bb_source = st.radio(
@@ -5972,11 +5800,9 @@ def show_scanner(fyers) -> None:
                     if bb_source == "F&O Stocks": fo_bb = bb_universe
                     r, e, stt = run_momentum_scan(fyers, fo_bb, is_fo=True)
                     all_rows.extend(r or []); all_errors.extend(e or []); all_stats = stt if all_stats is None else all_stats
-                # INTRADAY HISTORY: preserve every scan timestamp instead of keeping only one row per symbol.
-                previous_bb = st.session_state.get("before_bigmove_history_rows", []) or []
-                bb_rows = _merge_intraday_history(previous_bb, all_rows)
-                st.session_state["before_bigmove_history_rows"] = bb_rows
-                bb_df = pd.DataFrame(bb_rows) if bb_rows else pd.DataFrame()
+                bb_df = pd.DataFrame(all_rows) if all_rows else pd.DataFrame()
+                if not bb_df.empty and "Symbol" in bb_df.columns:
+                    bb_df = bb_df.drop_duplicates(subset=["Symbol"], keep="first")
                 st.session_state["before_bigmove_df"] = bb_df
                 st.session_state["before_bigmove_errors"] = all_errors
                 st.session_state["before_bigmove_stats"] = all_stats
@@ -6007,10 +5833,7 @@ def show_scanner(fyers) -> None:
                 "BREAKOUT DISTANCE %", "BREAKDOWN DISTANCE %", "EARLY TRIGGER", "EARLY INVALIDATION",
                 "EARLY MTF PROXY", "EARLY MOVE REASON", "PRE-MOVE", "PRE-MOVE SCORE", "PRE-MOVE STATUS",
                 "PRE BUY SCORE", "PRE SELL SCORE", "PRE SCORE GAP", "PRE-MOVE RVOL", "PRE-MOVE REASON",
-                "BREAKOUT LEVEL", "BREAKDOWN LEVEL", "RVOL", "SCORE",
-                "FIRST DETECTED TIME", "LATEST SIGNAL TIME", "SIGNAL AGE MIN", "PRE-MOVE QUALITY",
-                "PRE-MOVE STAGE", "LEAD TIME MIN", "MINUTES BEFORE CLOSE", "SIGNAL TIMING QUALITY",
-                "TRIGGER STATUS", "SIGNAL TIMING NOTE"
+                "BREAKOUT LEVEL", "BREAKDOWN LEVEL", "RVOL", "SCORE"
             ]
             bb_cols = [c for c in bb_cols if c in candidate_view.columns]
             candidate_view = candidate_view[bb_cols] if bb_cols else candidate_view
@@ -6031,7 +5854,6 @@ def show_scanner(fyers) -> None:
     # ════════════════════════════════════════════════════════════════════════════════
     with tabs[4]:
         st.markdown("### 🔮 FUTURE MOVE DETECTION")
-        st.caption("Intraday mode: 5M/15M setup + trigger timing + signal history. Scores are confluence scores, not probability guarantees.")
         st.caption("Completed 5M + 15M candles: early direction, energy, volume, structure and trigger proximity. This is an early-warning analysis, not a guaranteed future-price prediction.")
         fm_source = st.radio("Scan Source", ["NSE Stocks", "F&O Stocks", "BOTH"], horizontal=True, key="future_move_source")
         fm_all = (all_symbols if fm_source == "NSE Stocks" else fo_symbols if fm_source == "F&O Stocks" else list(dict.fromkeys(list(all_symbols)+list(fo_symbols))))
@@ -6049,11 +5871,13 @@ def show_scanner(fyers) -> None:
                     fo_fm = fo_symbols if fm_limit == 0 else [x for x in fo_symbols if x in fm_universe]
                     if fm_source == "F&O Stocks": fo_fm = fm_universe
                     r,e = run_future_move_scan(fyers, fo_fm, is_fo=True); rows.extend(r); errs.extend(e)
-                # Preserve every intraday observation. Do not collapse a symbol to one row.
+                # Preserve prior signals and update older PENDING rows when 3 new 5M candles exist.
                 previous = st.session_state.get("future_move_history_rows", []) or []
-                merged_rows = _merge_intraday_history(previous, rows)
-                rows = _refresh_future_move_validation(fyers, merged_rows)
-                rows = _merge_intraday_history([], rows)
+                merged = {}
+                for item in previous + rows:
+                    key = (str(item.get("Symbol", "")), str(item.get("SIGNAL TIME", "")))
+                    merged[key] = item
+                rows = _refresh_future_move_validation(fyers, list(merged.values()))
                 st.session_state["future_move_history_rows"] = rows
                 fm_df = pd.DataFrame(rows) if rows else pd.DataFrame()
                 # Preserve separate FUTURE MOVE signal timestamps for the same symbol.
@@ -6081,10 +5905,7 @@ def show_scanner(fyers) -> None:
                 "RVOL","VOLUME ACCELERATION","PRICE ACCELERATION","STRUCTURE","BREAKOUT DISTANCE %",
                 "BREAKDOWN DISTANCE %","FUTURE TRIGGER","FUTURE INVALIDATION","FUTURE REASON",
                 "ACTUAL MOVE VALIDATION","VALIDATION WINDOW","BARS TO VALIDATION","VALIDATION TIME",
-                "MOVE %","MFE %","MAE %","SOURCE",
-                "FIRST DETECTED TIME", "LATEST SIGNAL TIME", "SIGNAL AGE MIN", "PRE-MOVE QUALITY",
-                "PRE-MOVE STAGE", "LEAD TIME MIN", "MINUTES BEFORE CLOSE", "SIGNAL TIMING QUALITY",
-                "TRIGGER STATUS", "SIGNAL TIMING NOTE"
+                "MOVE %","MFE %","MAE %","SOURCE"
             ]
             fm_cols = [c for c in fm_cols if c in candidate_view.columns]
             candidate_view = candidate_view[fm_cols] if fm_cols else candidate_view
