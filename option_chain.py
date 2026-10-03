@@ -73,7 +73,6 @@ INDEX_SYMBOLS: dict[str, str] = {
     "BANKNIFTY": "BANKNIFTY",
     "FINNIFTY": "FINNIFTY",
     "MIDCPNIFTY": "MIDCPNIFTY",
-    "NIFTYNXT50": "NIFTYNXT50",
     "SENSEX": "SENSEX",
 }
 
@@ -172,7 +171,6 @@ FYERS_INDEX_SYMBOL_CANDIDATES: dict[str, list[str]] = {
     "BANKNIFTY": ["NSE:NIFTYBANK-INDEX", "NSE:BANKNIFTY-INDEX"],
     "FINNIFTY": ["NSE:FINNIFTY-INDEX"],
     "MIDCPNIFTY": ["NSE:MIDCPNIFTY-INDEX", "NSE:MIDCAPNIFTY-INDEX"],
-    "NIFTYNXT50": ["NSE:NIFTYNXT50-INDEX"],
     "SENSEX": ["BSE:SENSEX-INDEX", "BSE:SENSEX-INDEX50"],
     "BANKEX": ["BSE:BANKEX-INDEX"],
 }
@@ -4589,10 +4587,7 @@ BIG_TRACKER_STARTED_KEY = "oc_big_tracker_started"
 BIG_TRACKER_INTERVAL_KEY = "oc_big_tracker_interval"
 
 # Liquid F&O universe used by the optional TOTAL F&O scan.
-# Fallback only. Runtime discovery below expands this to the current NSE
-# individual-security derivatives universe when the NSE underlyings page is
-# reachable. This removes the old fixed-30-symbol limitation.
-MOVEMENT_FNO_UNIVERSE_FALLBACK = [
+MOVEMENT_FNO_UNIVERSE = [
     "RELIANCE", "HDFCBANK", "ICICIBANK", "SBIN", "AXISBANK",
     "KOTAKBANK", "INFY", "TCS", "ITC", "BHARTIARTL",
     "LT", "HINDUNILVR", "MARUTI", "M&M", "TATASTEEL",
@@ -4600,44 +4595,6 @@ MOVEMENT_FNO_UNIVERSE_FALLBACK = [
     "POWERGRID", "ONGC", "COALINDIA", "BEL", "HAL",
     "TRENT", "BAJFINANCE", "BAJAJFINSV", "INDUSINDBK", "WIPRO",
 ]
-
-NSE_FNO_UNDERLYINGS_URL = (
-    "https://www.nseindia.com/static/products-services/"
-    "equity-derivatives-list-underlyings-information"
-)
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def get_movement_fno_universe() -> list[str]:
-    """Return the current NSE individual-security F&O underlying universe."""
-    try:
-        session = get_nse_session()
-        resp = session.get(NSE_FNO_UNDERLYINGS_URL, timeout=REQUEST_TIMEOUT)
-        if resp.status_code == 200 and resp.text:
-            tables = pd.read_html(io.StringIO(resp.text))
-            symbols: list[str] = []
-            for table in tables:
-                if not isinstance(table, pd.DataFrame):
-                    continue
-                cols = {str(c).strip().upper(): c for c in table.columns}
-                sym_col = cols.get("SYMBOL")
-                if sym_col is None:
-                    continue
-                for value in table[sym_col].dropna().astype(str):
-                    s = normalize_stock_symbol(value)
-                    if s and s not in symbols:
-                        symbols.append(s)
-            if symbols:
-                return symbols
-    except Exception as exc:
-        logger.warning("Dynamic NSE F&O universe fetch failed: %s", exc)
-    return list(MOVEMENT_FNO_UNIVERSE_FALLBACK)
-
-def movement_fno_universe() -> list[str]:
-    """Compatibility wrapper used by scanner/report functions."""
-    return get_movement_fno_universe()
-
-# Backward-compatible name for any existing code that reads the constant.
-MOVEMENT_FNO_UNIVERSE = MOVEMENT_FNO_UNIVERSE_FALLBACK
 
 
 def _movement_search_status(score: float) -> str:
@@ -4880,326 +4837,6 @@ def _directional_confirmation_additive(
     }
 
 
-
-# ============================================================
-# ADDITIVE MOVEMENT SIGNAL ENGINE — INDEX + F&O
-# Existing option-chain movement score is preserved.
-# BIG/PRE-BIG labels are generated only in BOTH/TOTAL scanner mode.
-# ============================================================
-
-MOVEMENT_PRE_BIG_SCORE = 65.0
-MOVEMENT_BIG_SCORE = 78.0
-MOVEMENT_PRE_RVOL = 1.20
-MOVEMENT_BIG_RVOL = 1.50
-MOVEMENT_STRUCTURE_LOOKBACK = 5
-MOVEMENT_ATR_PERIOD = 14
-MOVEMENT_MTF_REQUIRED = True
-
-
-def _movement_chart_engine(
-    fyers: Any,
-    symbol: str,
-    is_index: bool,
-) -> dict[str, Any]:
-    """
-    Additive chart-confirmation engine.
-
-    BIG BUY requires:
-        last-chart continuation + HH/HL + accumulation +
-        liquidity reaction + RVOL + BOS/MSS UP + 5M + 15M UP.
-
-    BIG SELL is the exact bearish mirror.
-
-    AMD WATCH is never promoted directly to BIG BUY/BIG SELL.
-    """
-    out = {
-        "signal": "WAIT",
-        "direction": "NEUTRAL",
-        "score": 0.0,
-        "structure": "UNKNOWN",
-        "continuation": "UNKNOWN",
-        "amd": "WATCH",
-        "liquidity": "NONE",
-        "bos_mss": "NONE",
-        "rvol": 0.0,
-        "volume_ok": False,
-        "trend_5m": "WAIT",
-        "trend_15m": "WAIT",
-        "reasons": [],
-        "fyers_symbol": "",
-    }
-
-    if fyers is None:
-        out["reasons"].append("FYERS unavailable — chart confirmation skipped")
-        return out
-
-    candidates = (
-        _fyers_index_candidates(symbol)
-        if is_index
-        else fyers_stock_symbol_candidates(symbol)
-    )
-
-    best = None
-    best_symbol = ""
-    for candidate in candidates:
-        try:
-            df5 = fetch_fyers_candles(fyers, candidate, 5, count=100)
-            df15 = fetch_fyers_candles(fyers, candidate, 15, count=100)
-            if (
-                isinstance(df5, pd.DataFrame) and not df5.empty
-                and isinstance(df15, pd.DataFrame) and not df15.empty
-                and len(df5) >= 25 and len(df15) >= 25
-            ):
-                best = (df5.copy(), df15.copy())
-                best_symbol = candidate
-                break
-        except Exception as exc:
-            logger.debug("Movement chart context failed for %s: %s", candidate, exc)
-
-    if best is None:
-        out["reasons"].append("5M/15M FYERS chart data unavailable")
-        return out
-
-    df5, df15 = best
-    out["fyers_symbol"] = best_symbol
-
-    def _prep(d: pd.DataFrame) -> pd.DataFrame:
-        x = d.copy()
-        x["ema9"] = calculate_ema(x, 9)
-        x["ema21"] = calculate_ema(x, 21)
-        x["atr"] = calculate_atr(x, MOVEMENT_ATR_PERIOD)
-        x["rvol"] = calculate_rvol(x, 20)
-        x["vwap"] = calculate_vwap(x)
-        _, _, x["macd_hist"] = calculate_macd(x)
-        return x
-
-    df5 = _prep(df5)
-    df15 = _prep(df15)
-
-    def _structure(d: pd.DataFrame) -> tuple[str, str]:
-        if len(d) < MOVEMENT_STRUCTURE_LOOKBACK + 2:
-            return "UNKNOWN", "UNKNOWN"
-        cur = d.iloc[-1]
-        ref = d.iloc[-(MOVEMENT_STRUCTURE_LOOKBACK + 1):-1]
-        hh = float(cur["high"]) > float(ref["high"].max())
-        hl = float(cur["low"]) > float(ref["low"].min())
-        lh = float(cur["high"]) < float(ref["high"].max())
-        ll = float(cur["low"]) < float(ref["low"].min())
-        if hh and hl:
-            return "HH/HL", "BULLISH"
-        if lh and ll:
-            return "LH/LL", "BEARISH"
-        return "MIXED", "MIXED"
-
-    structure, structure_bias = _structure(df5)
-
-    # "Last-chart continuation" is stricter than a single green/red candle:
-    # require current close plus the immediately previous candle to agree.
-    last5 = df5.iloc[-1]
-    prev5 = df5.iloc[-2]
-    bullish_continue = (
-        float(last5["close"]) > float(last5["open"])
-        and float(prev5["close"]) >= float(prev5["open"])
-        and structure_bias == "BULLISH"
-        and float(last5["close"]) >= float(last5["ema21"])
-    )
-    bearish_continue = (
-        float(last5["close"]) < float(last5["open"])
-        and float(prev5["close"]) <= float(prev5["open"])
-        and structure_bias == "BEARISH"
-        and float(last5["close"]) <= float(last5["ema21"])
-    )
-    continuation = (
-        "UP" if bullish_continue else
-        "DOWN" if bearish_continue else
-        "WAIT"
-    )
-
-    # Adaptive AMD classification: use ATR-normalized range and EMA/VWAP
-    # location, so indices and stocks are not judged by fixed price %.
-    window = df15.tail(8)
-    mean_range = float((window["high"] - window["low"]).mean())
-    atr15 = max(float(df15["atr"].iloc[-1]), 1e-9)
-    compression = mean_range / atr15
-    close15 = float(df15["close"].iloc[-1])
-    ema21_15 = float(df15["ema21"].iloc[-1])
-    vwap15 = float(df15["vwap"].iloc[-1])
-
-    if compression <= 0.90 and close15 >= ema21_15 and close15 >= vwap15:
-        amd = "ACCUMULATION"
-    elif compression <= 0.90 and close15 <= ema21_15 and close15 <= vwap15:
-        amd = "DISTRIBUTION"
-    elif close15 > ema21_15 and close15 > vwap15:
-        amd = "MARKUP"
-    elif close15 < ema21_15 and close15 < vwap15:
-        amd = "MARKDOWN"
-    else:
-        amd = "WATCH"
-
-    # Liquidity reaction = sweep + reclaim, not merely touching a level.
-    recent = df5.iloc[-(MOVEMENT_STRUCTURE_LOOKBACK + 1):-1]
-    recent_high = float(recent["high"].max())
-    recent_low = float(recent["low"].min())
-    cur_high = float(last5["high"])
-    cur_low = float(last5["low"])
-    cur_close = float(last5["close"])
-    cur_open = float(last5["open"])
-
-    buy_liq = cur_low < recent_low and cur_close > recent_low and cur_close > cur_open
-    sell_liq = cur_high > recent_high and cur_close < recent_high and cur_close < cur_open
-    liquidity = "BUY REACTION" if buy_liq else "SELL REACTION" if sell_liq else "NONE"
-
-    # BOS/MSS uses the same prior-structure idea and ATR-normalized close
-    # confirmation; a wick-only break is not enough.
-    bos_up = cur_close > recent_high and (cur_close - recent_high) >= max(float(last5["atr"]) * 0.05, 1e-9)
-    bos_down = cur_close < recent_low and (recent_low - cur_close) >= max(float(last5["atr"]) * 0.05, 1e-9)
-    bos_mss = "BOS/MSS UP" if bos_up else "BOS/MSS DOWN" if bos_down else "NONE"
-
-    rvol5 = float(last5["rvol"])
-    volume_ok = rvol5 >= MOVEMENT_PRE_RVOL
-    out["rvol"] = round(rvol5, 2)
-    out["volume_ok"] = volume_ok
-
-    # MTF confirmation requires 2 of 3: EMA alignment, VWAP location, MACD.
-    def _tf_confirm(d: pd.DataFrame) -> str:
-        z = d.iloc[-1]
-        bull_votes = sum([
-            float(z["ema9"]) > float(z["ema21"]),
-            float(z["close"]) > float(z["vwap"]),
-            float(z["macd_hist"]) > 0,
-        ])
-        bear_votes = sum([
-            float(z["ema9"]) < float(z["ema21"]),
-            float(z["close"]) < float(z["vwap"]),
-            float(z["macd_hist"]) < 0,
-        ])
-        if bull_votes >= 2:
-            return "UP"
-        if bear_votes >= 2:
-            return "DOWN"
-        return "WAIT"
-
-    trend5 = _tf_confirm(df5)
-    trend15 = _tf_confirm(df15)
-
-    # Weighted chart score. BIG is still gated by ALL mandatory components.
-    buy_score = (
-        10 if continuation == "UP" else 0
-    ) + (
-        15 if structure == "HH/HL" else 0
-    ) + (
-        15 if amd == "ACCUMULATION" else 0
-    ) + (
-        15 if liquidity == "BUY REACTION" else 0
-    ) + (
-        15 if rvol5 >= MOVEMENT_BIG_RVOL else 0
-    ) + (
-        15 if bos_mss == "BOS/MSS UP" else 0
-    ) + (
-        5 if trend5 == "UP" else 0
-    ) + (
-        5 if trend15 == "UP" else 0
-    )
-
-    sell_score = (
-        10 if continuation == "DOWN" else 0
-    ) + (
-        15 if structure == "LH/LL" else 0
-    ) + (
-        15 if amd == "DISTRIBUTION" else 0
-    ) + (
-        15 if liquidity == "SELL REACTION" else 0
-    ) + (
-        15 if rvol5 >= MOVEMENT_BIG_RVOL else 0
-    ) + (
-        15 if bos_mss == "BOS/MSS DOWN" else 0
-    ) + (
-        5 if trend5 == "DOWN" else 0
-    ) + (
-        5 if trend15 == "DOWN" else 0
-    )
-
-    # BIG requires every requested component. AMD WATCH can never pass this gate.
-    big_buy = (
-        continuation == "UP"
-        and structure == "HH/HL"
-        and amd == "ACCUMULATION"
-        and liquidity == "BUY REACTION"
-        and rvol5 >= MOVEMENT_BIG_RVOL
-        and bos_mss == "BOS/MSS UP"
-        and trend5 == "UP"
-        and trend15 == "UP"
-    )
-    big_sell = (
-        continuation == "DOWN"
-        and structure == "LH/LL"
-        and amd == "DISTRIBUTION"
-        and liquidity == "SELL REACTION"
-        and rvol5 >= MOVEMENT_BIG_RVOL
-        and bos_mss == "BOS/MSS DOWN"
-        and trend5 == "DOWN"
-        and trend15 == "DOWN"
-    )
-
-    # PRE-BIG is deliberately incomplete: it detects the build-up before
-    # expansion, but never converts AMD WATCH alone into a directional signal.
-    pre_buy = (
-        buy_score >= MOVEMENT_PRE_BIG_SCORE
-        and structure == "HH/HL"
-        and amd == "ACCUMULATION"
-        and rvol5 >= MOVEMENT_PRE_RVOL
-        and trend5 == "UP"
-        and (liquidity == "BUY REACTION" or bos_mss == "BOS/MSS UP")
-        and not big_buy
-    )
-    pre_sell = (
-        sell_score >= MOVEMENT_PRE_BIG_SCORE
-        and structure == "LH/LL"
-        and amd == "DISTRIBUTION"
-        and rvol5 >= MOVEMENT_PRE_RVOL
-        and trend5 == "DOWN"
-        and (liquidity == "SELL REACTION" or bos_mss == "BOS/MSS DOWN")
-        and not big_sell
-    )
-
-    if big_buy:
-        signal, direction, score = "BIG BUY", "BUY", float(buy_score)
-    elif big_sell:
-        signal, direction, score = "BIG SELL", "SELL", float(sell_score)
-    elif pre_buy:
-        signal, direction, score = "PRE-BIG BUY", "BUY", float(buy_score)
-    elif pre_sell:
-        signal, direction, score = "PRE-BIG SELL", "SELL", float(sell_score)
-    else:
-        signal, direction, score = "WATCH", "NEUTRAL", max(float(buy_score), float(sell_score))
-
-    reasons = [
-        f"CONTINUE {continuation}",
-        structure,
-        f"AMD {amd}",
-        f"LIQUIDITY {liquidity}",
-        f"RVOL {rvol5:.2f}x",
-        bos_mss,
-        f"5M {trend5}",
-        f"15M {trend15}",
-    ]
-
-    out.update({
-        "signal": signal,
-        "direction": direction,
-        "score": round(score, 1),
-        "structure": structure,
-        "continuation": continuation,
-        "amd": amd,
-        "liquidity": liquidity,
-        "bos_mss": bos_mss,
-        "trend_5m": trend5,
-        "trend_15m": trend15,
-        "reasons": reasons,
-    })
-    return out
-
-
 def _movement_search_one(
     fyers: Any,
     symbol: str,
@@ -5370,23 +5007,6 @@ def _movement_search_one(
                     symbol, expiry, strike, spot, ce_price, pe_price, ce_daily, pe_daily
                 )
                 directional_bias = validation["directional_bias"]
-
-                # NEW: strict chart-confirmation engine is additive and runs
-                # only for TOTAL/BOTH movement scans. Existing selected-search
-                # behavior is intentionally untouched.
-                chart_engine = _movement_chart_engine(
-                    fyers, symbol, is_index
-                )
-
-                # BIG/PRE-BIG is allowed to override the old option-premium
-                # direction only when the complete chart gate is satisfied.
-                engine_direction = chart_engine["direction"]
-                engine_signal = chart_engine["signal"]
-                if engine_signal in {"BIG BUY", "PRE-BIG BUY"}:
-                    directional_bias = "UP"
-                elif engine_signal in {"BIG SELL", "PRE-BIG SELL"}:
-                    directional_bias = "DOWN"
-
                 # Displayed Direction is the confirmed/underlying relationship,
                 # not simply the selected option premium direction.
                 display_direction = directional_bias if directional_bias in {"UP", "DOWN"} else direction
@@ -5439,20 +5059,6 @@ def _movement_search_one(
                     "Directional Rising Scans": validation["directional_rising_scans"],
                     "CE Scan Delta": validation["ce_scan_delta"],
                     "PE Scan Delta": validation["pe_scan_delta"],
-                    # NEW movement-engine diagnostics. These are additive and
-                    # do not remove any existing report columns.
-                    "BIG SIGNAL": chart_engine["signal"],
-                    "BIG DIRECTION": chart_engine["direction"],
-                    "BIG SCORE": chart_engine["score"],
-                    "LAST CHART": chart_engine["continuation"],
-                    "STRUCTURE": chart_engine["structure"],
-                    "AMD": chart_engine["amd"],
-                    "LIQUIDITY REACTION": chart_engine["liquidity"],
-                    "BOS/MSS": chart_engine["bos_mss"],
-                    "RVOL": chart_engine["rvol"],
-                    "5M CONFIRM": chart_engine["trend_5m"],
-                    "15M CONFIRM": chart_engine["trend_15m"],
-                    "BIG REASON": " → ".join(chart_engine["reasons"]),
                 })
                 continue
 
@@ -5745,7 +5351,7 @@ def _render_total_fno_movement_search(
         unsafe_allow_html=True,
     )
     st.caption(
-        f"Scanning {len(movement_fno_universe())} current NSE F&O stocks. "
+        f"Scanning {len(MOVEMENT_FNO_UNIVERSE)} configured F&O stocks. "
         "For every strike: CE score is compared with PE score; the stronger "
         "side is shown as CE/UP or PE/DOWN."
     )
@@ -5754,8 +5360,7 @@ def _render_total_fno_movement_search(
     errors = []
     progress = st.progress(0.0)
 
-    fno_universe = movement_fno_universe()
-    for i, stock in enumerate(fno_universe, start=1):
+    for i, stock in enumerate(MOVEMENT_FNO_UNIVERSE, start=1):
         try:
             one = _movement_search_one(
                 fyers, stock, False, strike_count,
@@ -5766,7 +5371,7 @@ def _render_total_fno_movement_search(
         except Exception as exc:
             errors.append(f"{stock}: {type(exc).__name__}: {exc}")
             logger.warning("Total F&O scan failed for %s: %s", stock, exc)
-        progress.progress(i / max(len(fno_universe), 1))
+        progress.progress(i / max(len(MOVEMENT_FNO_UNIVERSE), 1))
 
     progress.empty()
 
@@ -6095,7 +5700,7 @@ def _render_big_movement_scan(
         if is_index_scan
         else "🚨 BIG MOVEMENT — F&O CE / PE"
     )
-    universe = list(INDEX_SYMBOLS.keys()) if is_index_scan else movement_fno_universe()
+    universe = list(INDEX_SYMBOLS.keys()) if is_index_scan else list(MOVEMENT_FNO_UNIVERSE)
     max_rows = (
         BIG_MOVEMENT_SCAN_MAX_ROWS_INDEX
         if is_index_scan
@@ -6157,18 +5762,17 @@ def _render_big_movement_scan(
 
     out = _decorate_live_big_movement_rows(pd.DataFrame(rows))
 
-    # NEW strict engine gate. The old CE/PE live tracker remains visible,
-    # but it can no longer promote an AMD WATCH / activity-only row into BIG.
-    out["_engine_rank"] = out.get("BIG SIGNAL", "WATCH").map({
-        "BIG BUY": 0,
-        "BIG SELL": 0,
-        "PRE-BIG BUY": 1,
-        "PRE-BIG SELL": 1,
-        "WATCH": 9,
+    out["_phase_rank"] = out.get("Live Phase", "WAIT").map({
+        "BIG MOVEMENT CONFIRMED": 0,
+        "BIG MOVEMENT": 1,
+        "PRE-MOVE": 2,
+        "BUILDING": 3,
+        "BASELINE": 4,
+        "WAIT": 5,
     }).fillna(9)
 
-    out = out[out["BIG SIGNAL"].isin(
-        ["BIG BUY", "BIG SELL", "PRE-BIG BUY", "PRE-BIG SELL"]
+    out = out[out["Live Phase"].isin(
+        ["BIG MOVEMENT CONFIRMED", "BIG MOVEMENT", "PRE-MOVE", "BUILDING"]
     )].copy()
 
     if out.empty:
@@ -6187,9 +5791,9 @@ def _render_big_movement_scan(
         return
 
     # Keep the strongest strike-side candidates first and remove duplicates.
-    sort_cols = [c for c in ["_engine_rank", "BIG SCORE", "Score", "Early Score", "Instrument", "Strike"] if c in out.columns]
+    sort_cols = [c for c in ["_phase_rank", "Score", "Early Score", "Instrument", "Strike"] if c in out.columns]
     if sort_cols:
-        ascending = [True, False, False, False, True, True][:len(sort_cols)]
+        ascending = [True, False, False, True, True][:len(sort_cols)]
         out = out.sort_values(sort_cols, ascending=ascending)
 
     out = out.drop_duplicates(
@@ -6197,16 +5801,14 @@ def _render_big_movement_scan(
         keep="first",
     ).head(max_rows).reset_index(drop=True)
 
-    confirmed = int(out["BIG SIGNAL"].isin(
-        ["BIG BUY", "BIG SELL"]
-    ).sum()) if "BIG SIGNAL" in out.columns else 0
-    premove = int(out["BIG SIGNAL"].isin(
-        ["PRE-BIG BUY", "PRE-BIG SELL"]
-    ).sum()) if "BIG SIGNAL" in out.columns else 0
+    confirmed = int(out["Live Phase"].isin(
+        ["BIG MOVEMENT CONFIRMED", "BIG MOVEMENT"]
+    ).sum()) if "Live Phase" in out.columns else 0
+    premove = int((out["Live Phase"] == "PRE-MOVE").sum()) if "Live Phase" in out.columns else 0
 
     st.success(
         f"📡 LIVE MOVEMENT TRACKER: {len(out)} candidate(s) | "
-        f"PRE-BIG={premove} | BIG={confirmed}"
+        f"PRE-MOVE={premove} | BIG MOVEMENT={confirmed}"
     )
     st.caption(
         "First scan creates the baseline. Later REFRESH/RUN scans compare CE/PE "
@@ -6224,7 +5826,7 @@ def _render_big_movement_scan(
         strike = _pin_num(r.get("Strike"), 0.0)
         ce_price = _pin_num(r.get("CE Price"), 0.0)
         pe_price = _pin_num(r.get("PE Price"), 0.0)
-        phase = str(r.get("BIG SIGNAL", r.get("Live Phase", "WAIT")))
+        phase = str(r.get("Live Phase", "WAIT"))
         pre_side = str(r.get("Pre-Move Side", "WAIT"))
         movement_time = str(r.get("Movement Time", "—"))
         text = (
@@ -6249,10 +5851,8 @@ def _render_big_movement_scan(
 
     show_cols = [
         "Instrument", "Strike", "Option", "Direction", "Status",
-        "Live Phase", "BIG SIGNAL", "BIG DIRECTION", "BIG SCORE",
-        "LAST CHART", "STRUCTURE", "AMD", "LIQUIDITY REACTION", "BOS/MSS",
-        "RVOL", "5M CONFIRM", "15M CONFIRM",
-        "Pre-Move Side", "Baseline Time", "Pre-Move Time", "Movement Time",
+        "Live Phase", "Pre-Move Side", "Baseline Time", "Pre-Move Time",
+        "Movement Time",
         "Score", "CE Score", "PE Score", "CE Score Δ", "PE Score Δ",
         "Movement Bias", "CE Price", "PE Price", "CE Price Δ%", "PE Price Δ%",
         "CE Rising", "PE Rising", "Price Delta", "Price Change %",
@@ -6278,7 +5878,7 @@ def _render_big_movement_scan(
 
     st.dataframe(view, use_container_width=True, hide_index=True)
 
-    export_out = out.drop(columns=["_phase_rank", "_engine_rank"], errors="ignore")
+    export_out = out.drop(columns=["_phase_rank"], errors="ignore")
     excel_buf = _movement_search_excel(
         export_out,
         "BIG Movement Index CE PE" if is_index_scan else "BIG Movement F&O CE PE",
