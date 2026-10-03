@@ -20,6 +20,7 @@ import io
 import logging
 import math
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
@@ -4903,6 +4904,7 @@ MOVEMENT_ATR_PERIOD = 14
 MOVEMENT_MTF_REQUIRED = True
 
 
+@st.cache_data(ttl=15, show_spinner=False)
 def _movement_chart_engine(
     fyers: Any,
     symbol: str,
@@ -5756,6 +5758,50 @@ def _render_total_index_movement_search(
     st.info(compact)
 
 
+def _movement_scan_symbols_parallel(
+    fyers: Any,
+    symbols: list[str],
+    is_index: bool,
+    strike_count: int,
+    max_workers: int = 6,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Run independent symbol scans concurrently to reduce ALL-F&O wall time.
+
+    The existing per-symbol scoring/output is unchanged; only the orchestration
+    is parallelized. Results are collected in deterministic symbol order.
+    """
+    if not symbols:
+        return [], []
+
+    results: dict[int, list[dict[str, Any]]] = {}
+    errors: dict[int, str] = {}
+    workers = max(1, min(int(max_workers), len(symbols)))
+
+    def _one(idx: int, sym: str):
+        one = _movement_search_one(
+            fyers, sym, is_index, strike_count,
+            side_mode="BOTH", min_score=0.0,
+        )
+        return idx, sym, ([] if one.empty else one.to_dict("records"))
+
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="move_scan") as pool:
+        futures = [pool.submit(_one, i, sym) for i, sym in enumerate(symbols)]
+        for fut in as_completed(futures):
+            idx = -1
+            sym = "?"
+            try:
+                idx, sym, rows = fut.result()
+                results[idx] = rows
+            except Exception as exc:
+                errors[idx if idx >= 0 else len(errors)] = f"{sym}: {type(exc).__name__}: {exc}"
+                logger.warning("Parallel movement scan failed for %s: %s", sym, exc)
+
+    rows: list[dict[str, Any]] = []
+    for idx in sorted(results):
+        rows.extend(results[idx])
+    return rows, [errors[k] for k in sorted(errors)]
+
+
 def _render_total_fno_movement_search(
     fyers: Any,
     strike_count: int = 40,
@@ -5776,24 +5822,16 @@ def _render_total_fno_movement_search(
         "side is shown as CE/UP or PE/DOWN."
     )
 
-    rows = []
-    errors = []
+    universe = movement_fno_universe()
+    st.caption(
+        f"Scanning {len(universe)} current F&O underlyings. "
+        "Parallel symbol scan + short chart-cache are enabled for faster loading."
+    )
     progress = st.progress(0.0)
-
-    fno_universe = movement_fno_universe()
-    for i, stock in enumerate(fno_universe, start=1):
-        try:
-            one = _movement_search_one(
-                fyers, stock, False, strike_count,
-                side_mode="BOTH", min_score=0.0,
-            )
-            if not one.empty:
-                rows.extend(one.to_dict("records"))
-        except Exception as exc:
-            errors.append(f"{stock}: {type(exc).__name__}: {exc}")
-            logger.warning("Total F&O scan failed for %s: %s", stock, exc)
-        progress.progress(i / max(len(fno_universe), 1))
-
+    rows, errors = _movement_scan_symbols_parallel(
+        fyers, universe, False, strike_count, max_workers=6
+    )
+    progress.progress(1.0)
     progress.empty()
 
     if not rows:
@@ -6142,34 +6180,15 @@ def _render_big_movement_scan(
         st.info("No symbols configured for this scan.")
         return
 
-    rows: list[dict[str, Any]] = []
-    errors: list[str] = []
-    progress = st.progress(0.0)
-
-    for i, symbol in enumerate(universe, start=1):
-        try:
-            # SENSEX/BANKEX-type BSE index chains need FYERS.
-            if is_index_scan and fyers is None and symbol in NSE_UNSUPPORTED_INDICES:
-                errors.append(f"{symbol}: FYERS required")
-                progress.progress(i / max(len(universe), 1))
-                continue
-
-            one = _movement_search_one(
-                fyers,
-                symbol,
-                is_index_scan,
-                strike_count=max(40, int(strike_count)),
-                side_mode="BOTH",
-                min_score=0.0,
-            )
-            if not one.empty:
-                rows.extend(one.to_dict("records"))
-        except Exception as exc:
-            errors.append(f"{symbol}: {type(exc).__name__}: {exc}")
-            logger.warning("Big movement scan failed for %s: %s", symbol, exc)
-
-        progress.progress(i / max(len(universe), 1))
-
+    if is_index_scan:
+        rows, errors = _movement_scan_symbols_parallel(
+            fyers, universe, True, max(40, int(strike_count)), max_workers=4
+        )
+    else:
+        rows, errors = _movement_scan_symbols_parallel(
+            fyers, universe, False, max(40, int(strike_count)), max_workers=6
+        )
+    progress = st.progress(1.0)
     progress.empty()
 
     if not rows:
