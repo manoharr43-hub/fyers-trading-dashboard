@@ -5685,7 +5685,7 @@ def _render_movement_search_results(
         )
         return
 
-    with st.spinner(f"Scanning {symbol} for UP movement strikes…"):
+    with st.spinner(f"Scanning {symbol} for validated UP/DOWN movement strikes…"):
         result_df = _movement_search_one(
             fyers, symbol, is_index, strike_count
         )
@@ -5696,13 +5696,13 @@ def _render_movement_search_results(
             st.error(f"❌ Movement search failed: {last_error}")
         else:
             st.info(
-                f"ℹ️ {symbol}: no CE / UP strike currently meets the "
+                f"ℹ️ {symbol}: no CE/PE strike currently meets the "
                 f"{MOVEMENT_SEARCH_MIN_SCORE:.0f}+ movement threshold."
             )
         return
 
     st.success(
-        f"📌 {symbol}: {len(result_df)} UP strike(s) found — CE only."
+        f"📌 {symbol}: {len(result_df)} validated CE/PE strike(s) found."
     )
 
     display_cols = [
@@ -5728,11 +5728,11 @@ def _render_movement_search_results(
     st.dataframe(display_df, use_container_width=True, hide_index=True)
 
     # Additive Excel download for this movement search.
-    excel_buf = _movement_search_excel(result_df, f"{symbol} UP Movement Search")
+    excel_buf = _movement_search_excel(result_df, f"{symbol} Movement Search")
     st.download_button(
-        "📥 Download UP Movement Excel",
+        "📥 Download Movement Excel",
         data=excel_buf,
-        file_name=f"movement_up_{normalize_stock_symbol(symbol)}_{datetime.now().strftime('%H%M%S')}.xlsx",
+        file_name=f"movement_{normalize_stock_symbol(symbol)}_{datetime.now().strftime('%H%M%S')}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         use_container_width=True,
         key=f"movement_excel_{normalize_stock_symbol(symbol)}_{'idx' if is_index else 'fno'}",
@@ -5743,7 +5743,7 @@ def _render_movement_search_results(
         f"{r['Status']} ({r['Score']:.0f})"
         for _, r in result_df.iterrows()
     )
-    st.markdown("**🎯 UP Movement Strikes:**")
+    st.markdown("**🎯 Validated Movement Strikes:**")
     st.info(compact)
 
 
@@ -5809,6 +5809,8 @@ def _render_total_index_movement_search(
     )
 
     st.success(f"📊 TOTAL INDEX REPORT: {len(out)} CE/PE movement strike(s) found.")
+    if errors:
+        st.caption(f"⚠️ {len(errors)} index scan error(s) were isolated. First errors: {' | '.join(errors[:5])}")
 
     show_cols = [
         "Instrument", "Strike", "Option", "Direction", "Status",
@@ -5859,41 +5861,37 @@ def _movement_scan_symbols_parallel(
     strike_count: int,
     max_workers: int = 6,
 ) -> tuple[list[dict[str, Any]], list[str]]:
-    """Run independent symbol scans concurrently to reduce ALL-F&O wall time.
+    """Scan ALL-F&O symbols safely in the Streamlit session context.
 
-    The existing per-symbol scoring/output is unchanged; only the orchestration
-    is parallelized. Results are collected in deterministic symbol order.
+    IMPORTANT: the movement engine uses ``st.session_state`` for scan history,
+    reversal history and early-warning state. Streamlit session state is not
+    thread-safe and calling the engine from ThreadPoolExecutor workers can
+    make every worker fail silently, which produced the user's blank 194-stock
+    report.  Keep this orchestration sequential for correctness.  The scoring
+    and option-chain logic itself is unchanged.
+
+    ``max_workers`` is retained for API compatibility with the existing code.
     """
     if not symbols:
         return [], []
 
-    results: dict[int, list[dict[str, Any]]] = {}
-    errors: dict[int, str] = {}
-    workers = max(1, min(int(max_workers), len(symbols)))
-
-    def _one(idx: int, sym: str):
-        one = _movement_search_one(
-            fyers, sym, is_index, strike_count,
-            side_mode="BOTH", min_score=0.0,
-        )
-        return idx, sym, ([] if one.empty else one.to_dict("records"))
-
-    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="move_scan") as pool:
-        futures = [pool.submit(_one, i, sym) for i, sym in enumerate(symbols)]
-        for fut in as_completed(futures):
-            idx = -1
-            sym = "?"
-            try:
-                idx, sym, rows = fut.result()
-                results[idx] = rows
-            except Exception as exc:
-                errors[idx if idx >= 0 else len(errors)] = f"{sym}: {type(exc).__name__}: {exc}"
-                logger.warning("Parallel movement scan failed for %s: %s", sym, exc)
-
     rows: list[dict[str, Any]] = []
-    for idx in sorted(results):
-        rows.extend(results[idx])
-    return rows, [errors[k] for k in sorted(errors)]
+    errors: list[str] = []
+
+    for idx, sym in enumerate(symbols):
+        try:
+            one = _movement_search_one(
+                fyers, sym, is_index, strike_count,
+                side_mode="BOTH", min_score=0.0,
+            )
+            if one is not None and not one.empty:
+                rows.extend(one.to_dict("records"))
+        except Exception as exc:
+            msg = f"{sym}: {type(exc).__name__}: {exc}"
+            errors.append(msg)
+            logger.warning("Movement scan failed for %s: %s", sym, exc)
+
+    return rows, errors
 
 
 def _render_total_fno_movement_search(
@@ -5953,6 +5951,8 @@ def _render_total_fno_movement_search(
     )
 
     st.success(f"📊 F&O TOTAL REPORT: {len(out)} CE/PE movement strike(s) found.")
+    if errors:
+        st.caption(f"⚠️ {len(errors)} symbol(s) had isolated scan errors; successful symbols are still shown. First errors: {' | '.join(errors[:5])}")
 
     show_cols = [
         "Instrument", "Strike", "Option", "Direction", "Status",
