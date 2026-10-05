@@ -4551,9 +4551,85 @@ def _movement_price_reversal_from_history(
     if len(prices) == 1:
         return float(prices[-1]), "WAIT CONFIRMATION"
 
+    # IMPORTANT: never manufacture a reversal level from the current price.
+    # Without a validated previous scan there is no defensible reversal trigger.
     if current_price > 0:
-        return float(current_price * 0.95), "WAIT HISTORY"
+        return 0.0, "WAIT HISTORY"
     return 0.0, "NO PRICE"
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# INDEX / F&O CE-PE DIRECTION GATE
+# ══════════════════════════════════════════════════════════════════════════
+# CE/PE score = activity strength only. It must never be interpreted as
+# CE=UP or PE=DOWN. Actual direction comes from the underlying + option
+# relationship, with the strict chart engine allowed to promote only when
+# its full BIG/PRE-BIG gate is satisfied.
+
+def _index_fno_direction_gate(
+    validation: dict[str, Any],
+    chart_engine: dict[str, Any],
+) -> dict[str, Any]:
+    """Return a safe final direction for Index/F&O total scanning."""
+    engine_signal = str(chart_engine.get("signal", "WAIT") or "WAIT").upper()
+    engine_direction = str(chart_engine.get("direction", "NEUTRAL") or "NEUTRAL").upper()
+    ce_dir = str(validation.get("ce_direction", "UNKNOWN") or "UNKNOWN").upper()
+    pe_dir = str(validation.get("pe_direction", "UNKNOWN") or "UNKNOWN").upper()
+    underlying = str(validation.get("underlying_direction", "UNKNOWN") or "UNKNOWN").upper()
+    validation_state = str(validation.get("signal_validation", "WATCH") or "WATCH").upper()
+
+    # Strict chart gate is the highest-confidence directional layer.
+    if engine_signal in {"BIG BUY", "PRE-BIG BUY"} and engine_direction == "UP":
+        return {
+            "direction": "UP",
+            "confidence": "HIGH" if engine_signal == "BIG BUY" else "BUILDING",
+            "reason": f"{engine_signal}: full chart gate confirmed bullish continuation",
+        }
+    if engine_signal in {"BIG SELL", "PRE-BIG SELL"} and engine_direction == "DOWN":
+        return {
+            "direction": "DOWN",
+            "confidence": "HIGH" if engine_signal == "BIG SELL" else "BUILDING",
+            "reason": f"{engine_signal}: full chart gate confirmed bearish continuation",
+        }
+
+    # Premium expansion/contraction is deliberately neutral.
+    if validation_state == "PREMIUM EXPANSION" or (ce_dir == "UP" and pe_dir == "UP"):
+        return {"direction": "NEUTRAL", "confidence": "LOW",
+                "reason": "CE and PE premiums rising together — premium expansion, direction blocked"}
+    if validation_state == "PREMIUM CONTRACTION" or (ce_dir == "DOWN" and pe_dir == "DOWN"):
+        return {"direction": "NEUTRAL", "confidence": "LOW",
+                "reason": "CE and PE premiums falling together — premium contraction, direction blocked"}
+
+    # Underlying must agree with the option relationship.
+    if validation_state == "CONFIRMED" and validation.get("directional_bias") in {"UP", "DOWN"}:
+        direction = str(validation["directional_bias"]).upper()
+        return {
+            "direction": direction,
+            "confidence": "HIGH",
+            "reason": str(validation.get("false_signal_reason", "Underlying + CE/PE confirmed")),
+        }
+
+    if validation_state == "CONFIRMING" and validation.get("directional_bias") in {"UP", "DOWN"}:
+        direction = str(validation["directional_bias"]).upper()
+        return {
+            "direction": direction,
+            "confidence": "BUILDING",
+            "reason": str(validation.get("false_signal_reason", "Underlying + CE/PE confirming")),
+        }
+
+    # Conflict protection: never convert a strong option score into direction.
+    if underlying in {"UP", "DOWN"} and validation.get("directional_bias") == "WAIT":
+        return {
+            "direction": "WAIT",
+            "confidence": "LOW",
+            "reason": "Underlying direction exists, but CE/PE relationship is not confirmed",
+        }
+
+    return {
+        "direction": "WAIT",
+        "confidence": "LOW",
+        "reason": str(validation.get("false_signal_reason", "Waiting for directional confirmation")),
+    }
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -4648,14 +4724,23 @@ def movement_fno_universe() -> list[str]:
 MOVEMENT_FNO_UNIVERSE = MOVEMENT_FNO_UNIVERSE_FALLBACK  # legacy alias; scanners call movement_fno_universe()
 
 
-def _movement_search_status(score: float) -> str:
-    """Convert the existing movement score into a compact upside status."""
+def _movement_search_status(score: float, direction: str = "UP") -> str:
+    """Convert movement score + validated direction into a compact status."""
     score = float(score or 0)
-    if score >= 82:
-        return "🚨 BIG UP MOVE"
-    if score >= MOVEMENT_SEARCH_MIN_SCORE:
-        return "🟢 EARLY UP MOVE"
-    return "WATCH"
+    direction = str(direction or "WAIT").upper()
+    if direction == "DOWN":
+        if score >= 82:
+            return "🚨 BIG DOWN MOVE"
+        if score >= MOVEMENT_SEARCH_MIN_SCORE:
+            return "🔴 EARLY DOWN MOVE"
+    elif direction == "UP":
+        if score >= 82:
+            return "🚨 BIG UP MOVE"
+        if score >= MOVEMENT_SEARCH_MIN_SCORE:
+            return "🟢 EARLY UP MOVE"
+    elif direction == "NEUTRAL":
+        return "🟡 PREMIUM NEUTRAL"
+    return "⚪ WATCH"
 
 
 def _movement_trade_levels(
@@ -4663,10 +4748,16 @@ def _movement_trade_levels(
     signal_time: Optional[datetime] = None,
     reversal_level: Optional[float] = None,
     reversal_status: str = "WAIT HISTORY",
+    side: str = "CE",
 ) -> dict[str, Any]:
-    """Build CE movement-scan levels with a live price-reversal check."""
-    ltp = _pin_num(row.get("ce_ltp"), 0.0)
-    ask = _pin_num(row.get("ce_ask"), 0.0)
+    """Build option movement levels using the selected CE/PE side."""
+    side = str(side or "CE").upper()
+    if side == "PE":
+        ltp = _pin_num(row.get("pe_ltp"), 0.0)
+        ask = _pin_num(row.get("pe_ask"), 0.0)
+    else:
+        ltp = _pin_num(row.get("ce_ltp"), 0.0)
+        ask = _pin_num(row.get("ce_ask"), 0.0)
     entry = ask if ask > 0 else ltp
     # Signal Time is always India Standard Time (IST), not the Streamlit
     # server timezone (often UTC). This fixes the 5:30 hour offset seen in UI.
@@ -4729,6 +4820,10 @@ def _movement_search_excel(df: pd.DataFrame, report_name: str = "Movement Search
         "PE Direction", "PE Direction Source", "Signal Validation", "Signal Valid",
         "False Signal Reason", "Directional Bias", "Directional Rising Scans",
         "CE Scan Delta", "PE Scan Delta",
+        "Option Activity", "Direction Confidence", "Direction Reason",
+        "BIG SIGNAL", "BIG DIRECTION", "BIG SCORE", "LAST CHART", "STRUCTURE",
+        "AMD", "LIQUIDITY REACTION", "BOS/MSS", "RVOL", "5M CONFIRM",
+        "15M CONFIRM", "BIG REASON",
     ]
     cols = [c for c in export_cols if c in df.columns]
     export_df = df[cols].copy() if cols else df.copy()
@@ -4745,7 +4840,7 @@ def _movement_search_excel(df: pd.DataFrame, report_name: str = "Movement Search
     info = [
         ("Report", report_name),
         ("Generated At", datetime.now().strftime("%d-%b-%Y %H:%M:%S")),
-        ("Filter", "Selected-search remains CE/UP only; Total Scanner selects stronger CE/PE side per strike and derives UP/DOWN from option-premium price movement."),
+        ("Filter", "CE/PE score is activity strength only. Index/F&O direction requires underlying + CE/PE confirmation; CE+PE expansion/contraction stays neutral."),
         ("Minimum Selected-Search CE Movement Score", MOVEMENT_SEARCH_MIN_SCORE),
         ("Note", "Movement score is an activity/ranking early-warning model, not a guaranteed price prediction."),
     ]
@@ -5400,39 +5495,33 @@ def _movement_search_one(
                 validation = _directional_confirmation_additive(
                     symbol, expiry, strike, spot, ce_price, pe_price, ce_daily, pe_daily
                 )
-                directional_bias = validation["directional_bias"]
 
-                # NEW: strict chart-confirmation engine is additive and runs
-                # once per symbol in TOTAL/BOTH mode. Existing selected-search
-                # behavior is intentionally untouched.
-
-                # BIG/PRE-BIG is allowed to override the old option-premium
-                # direction only when the complete chart gate is satisfied.
-                engine_direction = chart_engine["direction"]
-                engine_signal = chart_engine["signal"]
-                if engine_signal in {"BIG BUY", "PRE-BIG BUY"}:
-                    directional_bias = "UP"
-                elif engine_signal in {"BIG SELL", "PRE-BIG SELL"}:
-                    directional_bias = "DOWN"
-
-                # Displayed Direction is the confirmed/underlying relationship,
-                # not simply the selected option premium direction.
-                display_direction = directional_bias if directional_bias in {"UP", "DOWN"} else direction
-                if validation["signal_validation"] in {"PREMIUM EXPANSION", "PREMIUM CONTRACTION"}:
-                    display_direction = "NEUTRAL"
+                # IMPORTANT FIX: CE/PE score is activity strength, not direction.
+                # Final Index/F&O direction is produced only by the direction gate.
+                direction_gate = _index_fno_direction_gate(validation, chart_engine)
+                directional_bias = direction_gate["direction"]
+                display_direction = directional_bias
+                direction_confidence = direction_gate["confidence"]
+                direction_reason = direction_gate["reason"]
 
                 reversal_level, reversal_status = _movement_price_reversal_from_history(
                     movement_history, symbol, expiry, strike, current_option,
                     lookback=5, side=side,
                 )
-                levels = _movement_trade_levels(row, reversal_level=reversal_level, reversal_status=reversal_status)
+                levels = _movement_trade_levels(
+                    row, reversal_level=reversal_level,
+                    reversal_status=reversal_status, side=side
+                )
 
                 rows.append({
                     "Instrument": symbol,
                     "Strike": strike,
                     "Option": side,
                     "Direction": display_direction,
-                    "Status": _movement_search_status(score),
+                    "Status": _movement_search_status(score, display_direction),
+                    "Option Activity": side,
+                    "Direction Confidence": direction_confidence,
+                    "Direction Reason": direction_reason,
                     "Signal Time": levels["Signal Time"],
                     "Entry": levels["Entry"],
                     "Stop Loss": levels["Stop Loss"],
@@ -5442,7 +5531,7 @@ def _movement_search_one(
                     "Early Score": round(_pin_num(row.get("early_movement_score")), 1),
                     "CE Score": round(ce_score, 1),
                     "PE Score": round(pe_score, 1),
-                    "Movement Bias": f"{side} {direction}",
+                    "Movement Bias": f"{side} ACTIVITY | {display_direction}",
                     "Price Delta": round(price_delta, 4),
                     "Price Change %": round(price_pct, 2),
                     "Price Direction Source": direction_source,
@@ -5506,7 +5595,8 @@ def _movement_search_one(
                 lookback=5, side=side
             )
             levels = _movement_trade_levels(
-                row, reversal_level=reversal_level, reversal_status=reversal_status
+                row, reversal_level=reversal_level,
+                reversal_status=reversal_status, side=side
             )
 
             if validation["signal_validation"] in {"PREMIUM EXPANSION", "PREMIUM CONTRACTION"}:
@@ -5519,14 +5609,14 @@ def _movement_search_one(
             rows.append({
                 "Instrument": symbol, "Strike": strike, "Option": side,
                 "Direction": display_direction,
-                "Status": _movement_search_status(score),
+                "Status": _movement_search_status(score, display_direction),
                 "Signal Time": levels["Signal Time"], "Entry": levels["Entry"],
                 "Stop Loss": levels["Stop Loss"], "Price Reversal": levels["Price Reversal"],
                 "Reversal Status": levels["Reversal Status"],
                 "Score": round(score, 1),
                 "Early Score": round(_pin_num(row.get("early_movement_score")), 1),
                 "CE Score": round(ce_score, 1), "PE Score": round(pe_score, 1),
-                "Movement Bias": f"{side} {display_direction}",
+                "Movement Bias": f"{side} ACTIVITY | {display_direction}",
                 "Price Delta": round(_pin_num(validation.get("selected_scan_delta")), 4),
                 "Price Change %": round(_pin_num(validation.get("selected_price_change_pct")), 2),
                 "Price Direction Source": validation.get("selected_direction_source", "SCAN LTP"),
@@ -5672,8 +5762,9 @@ def _render_total_index_movement_search(
         unsafe_allow_html=True,
     )
     st.caption(
-        "Each strike compares CE vs PE activity. The stronger side is selected, while UP/DOWN "
-        "is calculated independently from the selected CE/PE premium price movement."
+        "Each strike compares CE vs PE activity. The stronger side is shown as ACTIVITY only. "
+        "UP/DOWN is decided independently from the underlying + CE/PE relationship + chart confirmation. "
+        "CE is NOT automatically UP and PE is NOT automatically DOWN."
     )
 
     rows = []
@@ -5729,6 +5820,9 @@ def _render_total_index_movement_search(
         "Underlying Direction", "Underlying Direction Source", "CE Direction", "CE Direction Source",
         "PE Direction", "PE Direction Source", "Signal Validation", "Signal Valid",
         "False Signal Reason", "Directional Bias", "Directional Rising Scans", "CE Scan Delta", "PE Scan Delta",
+        "Option Activity", "Direction Confidence", "Direction Reason",
+        "BIG SIGNAL", "BIG DIRECTION", "BIG SCORE", "LAST CHART", "STRUCTURE",
+        "AMD", "LIQUIDITY REACTION", "BOS/MSS", "RVOL", "5M CONFIRM", "15M CONFIRM", "BIG REASON",
     ]
     out_view = out[[c for c in show_cols if c in out.columns]].copy()
     for col in ("Entry", "Stop Loss", "Price Reversal", "Spot"):
@@ -5818,8 +5912,8 @@ def _render_total_fno_movement_search(
     )
     st.caption(
         f"Scanning {len(movement_fno_universe())} current NSE F&O stocks. "
-        "For every strike: CE score is compared with PE score; the stronger "
-        "side is shown as CE/UP or PE/DOWN."
+        "For every strike: CE score is compared with PE score for activity strength only. "
+        "Final UP/DOWN requires underlying + CE/PE confirmation. CE is not automatically UP; PE is not automatically DOWN."
     )
 
     universe = movement_fno_universe()
@@ -5870,6 +5964,9 @@ def _render_total_fno_movement_search(
         "Underlying Direction", "Underlying Direction Source", "CE Direction", "CE Direction Source",
         "PE Direction", "PE Direction Source", "Signal Validation", "Signal Valid",
         "False Signal Reason", "Directional Bias", "Directional Rising Scans", "CE Scan Delta", "PE Scan Delta",
+        "Option Activity", "Direction Confidence", "Direction Reason",
+        "BIG SIGNAL", "BIG DIRECTION", "BIG SCORE", "LAST CHART", "STRUCTURE",
+        "AMD", "LIQUIDITY REACTION", "BOS/MSS", "RVOL", "5M CONFIRM", "15M CONFIRM", "BIG REASON",
     ]
     out_view = out[[c for c in show_cols if c in out.columns]].copy()
     for col in ("Entry", "Stop Loss", "Price Reversal", "Spot"):
@@ -6124,6 +6221,7 @@ def _decorate_live_big_movement_rows(
             "Live Phase": live_phase,
             "BIG MOVE STATUS": big_move_status,
             "BIG MOVE SIDE": big_move_side,
+            "BIG MOVE SIDE TYPE": "OPTION ACTIVITY SIDE",
             "BIG MOVE STRENGTH": round(big_move_strength, 1),
             "Pre-Move Side": pre_side,
             "CE Price Δ%": round(ce_pct, 2),
@@ -6171,9 +6269,9 @@ def _render_big_movement_scan(
         unsafe_allow_html=True,
     )
     st.caption(
-        f"Showing only existing movement-engine strikes with CE or PE score "
-        f"≥ {BIG_MOVEMENT_SCAN_MIN_SCORE:.0f}. CE/PE is selected at the SAME strike; "
-        "Direction is based on the selected option-premium movement."
+        f"Showing existing movement-engine strikes with CE or PE score "
+        f"≥ {BIG_MOVEMENT_SCAN_MIN_SCORE:.0f}. CE/PE is selected at the SAME strike for activity strength; "
+        "final Direction comes from underlying + CE/PE confirmation + chart gate. Premium expansion/contraction is neutral."
     )
 
     if not universe:
