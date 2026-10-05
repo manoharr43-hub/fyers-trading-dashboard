@@ -20,7 +20,6 @@ import io
 import logging
 import math
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
@@ -74,7 +73,6 @@ INDEX_SYMBOLS: dict[str, str] = {
     "BANKNIFTY": "BANKNIFTY",
     "FINNIFTY": "FINNIFTY",
     "MIDCPNIFTY": "MIDCPNIFTY",
-    "NIFTYNXT50": "NIFTYNXT50",
     "SENSEX": "SENSEX",
 }
 
@@ -152,12 +150,6 @@ MOVEMENT_HISTORY_MAX = 60
 MOVEMENT_EARLY_THRESHOLD = 65.0
 MOVEMENT_STRONG_THRESHOLD = 78.0
 MOVEMENT_MIN_RISING_SCANS = 2
-# Additive directional confirmation layer. 2 matching live scans are required
-# before a directional signal is promoted from WATCH to CONFIRMING.
-DIRECTION_CONFIRM_MIN_SCANS = 2
-DIRECTION_HISTORY_MAX = 20
-DIRECTION_PRICE_FLAT_PCT = 0.08
-
 
 DEFAULT_RSI_PERIOD = 14
 DEFAULT_EMA_PERIODS = {"fast": 9, "slow": 21}
@@ -173,7 +165,6 @@ FYERS_INDEX_SYMBOL_CANDIDATES: dict[str, list[str]] = {
     "BANKNIFTY": ["NSE:NIFTYBANK-INDEX", "NSE:BANKNIFTY-INDEX"],
     "FINNIFTY": ["NSE:FINNIFTY-INDEX"],
     "MIDCPNIFTY": ["NSE:MIDCPNIFTY-INDEX", "NSE:MIDCAPNIFTY-INDEX"],
-    "NIFTYNXT50": ["NSE:NIFTYNXT50-INDEX"],
     "SENSEX": ["BSE:SENSEX-INDEX", "BSE:SENSEX-INDEX50"],
     "BANKEX": ["BSE:BANKEX-INDEX"],
 }
@@ -419,22 +410,20 @@ def fetch_fyers_candles(fyers: Any, symbol: str, timeframe_minutes: int, count: 
 # ══════════════════════════════════════════════════════════════════════════
 
 def calculate_rsi(df: pd.DataFrame, period: int = DEFAULT_RSI_PERIOD, col: str = "close") -> pd.Series:
-    """Calculate Wilder-style RSI, closer to standard TradingView RSI."""
+    """Calculate RSI (Relative Strength Index)."""
     if df.empty or col not in df.columns:
         return pd.Series(index=df.index, dtype=float)
-
-    delta = pd.to_numeric(df[col], errors="coerce").diff()
-    gain = delta.clip(lower=0.0)
-    loss = -delta.clip(upper=0.0)
-
-    avg_gain = gain.ewm(alpha=1.0 / max(1, int(period)), adjust=False, min_periods=period).mean()
-    avg_loss = loss.ewm(alpha=1.0 / max(1, int(period)), adjust=False, min_periods=period).mean()
-
-    rs = avg_gain / avg_loss.replace(0, np.nan)
-    rsi = 100.0 - (100.0 / (1.0 + rs))
-    rsi = rsi.where(avg_loss > 0, 100.0)
-    rsi = rsi.where(~((avg_gain <= 0) & (avg_loss <= 0)), 50.0)
-    return rsi.fillna(50.0).clip(0, 100)
+    
+    delta = df[col].diff()
+    gain = delta.where(delta > 0, 0.0)
+    loss = -delta.where(delta < 0, 0.0)
+    
+    avg_gain = gain.rolling(window=period, min_periods=1).mean()
+    avg_loss = loss.rolling(window=period, min_periods=1).mean()
+    
+    rs = avg_gain / avg_loss.replace(0, 1e-10)
+    rsi = 100 - (100 / (1 + rs))
+    return rsi.fillna(50.0)
 
 
 def calculate_ema(df: pd.DataFrame, period: int, col: str = "close") -> pd.Series:
@@ -462,23 +451,12 @@ def calculate_macd(df: pd.DataFrame, fast: int = DEFAULT_MACD_PARAMS["fast"],
 
 
 def calculate_vwap(df: pd.DataFrame) -> pd.Series:
-    """Calculate session VWAP, resetting at each trading date."""
+    """Calculate Volume Weighted Average Price."""
     if df.empty or not all(c in df.columns for c in ["high", "low", "close", "volume"]):
         return pd.Series(index=df.index, dtype=float)
-
-    typical_price = (df["high"] + df["low"] + df["close"]) / 3.0
-    volume = pd.to_numeric(df["volume"], errors="coerce").fillna(0.0).clip(lower=0.0)
-    if "timestamp" in df.columns:
-        ts = pd.to_datetime(df["timestamp"], errors="coerce")
-        session_key = ts.dt.tz_localize(None).dt.date if getattr(ts.dt, "tz", None) is not None else ts.dt.date
-        pv = typical_price * volume
-        cum_pv = pv.groupby(session_key).cumsum()
-        cum_vol = volume.groupby(session_key).cumsum()
-    else:
-        pv = typical_price * volume
-        cum_pv = pv.cumsum()
-        cum_vol = volume.cumsum()
-    vwap = cum_pv / cum_vol.replace(0, np.nan)
+    
+    typical_price = (df["high"] + df["low"] + df["close"]) / 3
+    vwap = (typical_price * df["volume"]).cumsum() / df["volume"].cumsum()
     return vwap.fillna(df["close"])
 
 
@@ -529,15 +507,14 @@ def detect_hh_ll(df: pd.DataFrame) -> tuple[pd.Series, pd.Series]:
 
 
 def detect_structure_levels(df: pd.DataFrame, lookback: int = 5) -> dict[str, float]:
-    """Detect prior-candle support/resistance so the current candle can actually break it."""
-    if df.empty or len(df) < max(2, lookback + 1):
+    """Detect major support and resistance levels (highs and lows)."""
+    if df.empty or len(df) < lookback:
         return {"resistance": 0.0, "support": 0.0, "recent_high": 0.0, "recent_low": 0.0}
-
-    # Exclude the current candle from the reference range.
-    previous = df.iloc[:-1].tail(max(1, int(lookback)))
+    
+    recent = df.tail(lookback)
     return {
-        "resistance": float(previous["high"].max()),
-        "support": float(previous["low"].min()),
+        "resistance": float(recent["high"].max()),
+        "support": float(recent["low"].min()),
         "recent_high": float(df["high"].iloc[-1]),
         "recent_low": float(df["low"].iloc[-1]),
     }
@@ -560,23 +537,23 @@ def detect_bos(df: pd.DataFrame, structure_levels: dict) -> bool:
 
 
 def detect_choch(df: pd.DataFrame, lookback: int = 10) -> bool:
-    """Detect CHoCH from a meaningful recent swing break, not 8/9 monotonic candles."""
-    if df.empty or len(df) < max(5, lookback):
+    """Detect Change of Character (CHoCH)."""
+    if df.empty or len(df) < lookback:
         return False
-
-    n = max(3, int(lookback // 2))
-    recent = df.tail(int(lookback)).copy()
-    prior = recent.iloc[:-n]
-    latest = recent.tail(n)
-    if prior.empty or latest.empty:
-        return False
-
-    prior_high = float(prior["high"].max())
-    prior_low = float(prior["low"].min())
-    latest_high = float(latest["high"].max())
-    latest_low = float(latest["low"].min())
-
-    return bool(latest_high > prior_high or latest_low < prior_low)
+    
+    recent = df.tail(lookback)
+    lows = recent["low"].values
+    highs = recent["high"].values
+    
+    lower_lows = sum(1 for i in range(1, len(lows)) if lows[i] < lows[i-1])
+    lower_highs = sum(1 for i in range(1, len(highs)) if highs[i] < highs[i-1])
+    bearish_shift = (lower_lows >= lookback - 2) and (lower_highs >= lookback - 2)
+    
+    higher_lows = sum(1 for i in range(1, len(lows)) if lows[i] > lows[i-1])
+    higher_highs = sum(1 for i in range(1, len(highs)) if highs[i] > highs[i-1])
+    bullish_shift = (higher_lows >= lookback - 2) and (higher_highs >= lookback - 2)
+    
+    return bearish_shift or bullish_shift
 
 
 def detect_mss(df_list: dict[str, pd.DataFrame]) -> dict[str, dict]:
@@ -1088,8 +1065,7 @@ def parse_days_to_expiry(expiry_label: str) -> float:
     for fmt in ("%d-%b-%Y", "%d-%m-%Y", "%Y-%m-%d"):
         try:
             exp_dt = datetime.strptime(expiry_label, fmt)
-            expiry_close = exp_dt.replace(hour=15, minute=30, tzinfo=INDIA_TZ)
-            delta_days = (expiry_close - _india_now()).total_seconds() / 86400
+            delta_days = (exp_dt.replace(hour=15, minute=30) - datetime.now()).total_seconds() / 86400
             return max(delta_days, TRADING_DAYS_MIN_T)
         except ValueError:
             continue
@@ -2369,9 +2345,6 @@ def compute_movement_early_warning(
             "sell": float(row.get("sell_pressure", 50) or 50),
             "volume": float(row.get("total_volume", 0) or 0),
             "oi": float(abs(row.get("ce_chng_oi", 0) or 0) + abs(row.get("pe_chng_oi", 0) or 0)),
-            # ADDITIVE: keep underlying spot in the same movement history so
-            # scan-to-scan direction can use the exact previous spot.
-            "spot": float(spot or 0),
             "ce_price": float(row.get("ce_ltp", 0) or 0),
             "pe_price": float(row.get("pe_ltp", 0) or 0),
         })
@@ -2427,10 +2400,8 @@ def compute_movement_early_warning(
             or directional_gap >= 12
         )
 
-        # Do not promote a score-only first scan to an EARLY/STRONG signal.
-        # A first scan may be strong because of existing activity, but the
-        # scanner needs either confirmation evidence or scan-to-scan improvement.
-        first_scan = len(scores) < 2
+        # If the current movement is already very strong and has confirmation,
+        # do not show WAIT just because this is the first scan in the session.
         if early >= MOVEMENT_STRONG_THRESHOLD and confirmation:
             status = "STRONG MOVE"
         elif rising >= MOVEMENT_MIN_RISING_SCANS and early >= MOVEMENT_STRONG_THRESHOLD:
@@ -2439,8 +2410,6 @@ def compute_movement_early_warning(
             status = "EARLY MOVE"
         elif (rising >= 1 and delta > 0) or (early >= 55 and confirmation):
             status = "BUILDING"
-        elif first_scan and early >= 55:
-            status = "WATCH"
         else:
             status = "WAIT"
 
@@ -4505,142 +4474,36 @@ def _movement_price_reversal_from_history(
     lookback: int = 5,
     side: str = "CE",
 ) -> tuple[float, str]:
-    """Return a scan-to-scan reversal trigger without using an old low/high.
-
-    FIX: the old implementation used ``min(prior_prices)`` for both CE and PE.
-    That could turn a recent CE move such as 52 -> 80 into a reversal near 49,
-    even though the meaningful reference was the latest completed scan near 80.
-    The movement scanner now uses the *last completed side price* as the primary
-    reversal reference. Older history is used only to validate that the reference
-    is inside a sensible recent range.
-    """
+    """Get a side-specific price-reversal reference from repeated live scans."""
     key = _movement_history_key(symbol, expiry_label, strike)
     series = history.get(key, []) if isinstance(history, dict) else []
     price_key = "pe_price" if str(side).upper() == "PE" else "ce_price"
-
     prices = [
         float(x.get(price_key, 0) or 0)
         for x in series
         if float(x.get(price_key, 0) or 0) > 0
     ]
-
     if len(prices) >= 2:
-        # Last history item is the current snapshot. The item immediately before
-        # it is the last completed scan and therefore the correct live trigger.
-        previous = float(prices[-2])
-        recent = prices[-max(2, int(lookback)) - 1:-1]
-        recent = [x for x in recent if x > 0]
-
-        if previous > 0 and recent:
-            recent_low = min(recent)
-            recent_high = max(recent)
-            # Do not let a stale/outlier reference survive. In normal operation
-            # previous will already be inside this range.
-            reversal = float(min(max(previous, recent_low), recent_high))
-        else:
-            reversal = previous
-
-        if current_price > reversal:
-            status = "UP ABOVE REVERSAL"
-        elif current_price < reversal:
-            status = "BELOW REVERSAL"
-        else:
-            status = "AT REVERSAL"
-        return reversal, status
-
-    if len(prices) == 1:
-        return float(prices[-1]), "WAIT CONFIRMATION"
-
-    # IMPORTANT: never manufacture a reversal level from the current price.
-    # Without a validated previous scan there is no defensible reversal trigger.
+        prior = prices[:-1][-max(2, int(lookback)):]
+        reversal = min(prior)
+        return (
+            float(reversal),
+            "UP ABOVE REVERSAL" if current_price > reversal else "PRICE REVERSAL",
+        )
     if current_price > 0:
-        return 0.0, "WAIT HISTORY"
+        return float(current_price * 0.95), "WAIT HISTORY"
     return 0.0, "NO PRICE"
-
-
-# ══════════════════════════════════════════════════════════════════════════
-# INDEX / F&O CE-PE DIRECTION GATE
-# ══════════════════════════════════════════════════════════════════════════
-# CE/PE score = activity strength only. It must never be interpreted as
-# CE=UP or PE=DOWN. Actual direction comes from the underlying + option
-# relationship, with the strict chart engine allowed to promote only when
-# its full BIG/PRE-BIG gate is satisfied.
-
-def _index_fno_direction_gate(
-    validation: dict[str, Any],
-    chart_engine: dict[str, Any],
-) -> dict[str, Any]:
-    """Return a safe final direction for Index/F&O total scanning."""
-    engine_signal = str(chart_engine.get("signal", "WAIT") or "WAIT").upper()
-    engine_direction = str(chart_engine.get("direction", "NEUTRAL") or "NEUTRAL").upper()
-    ce_dir = str(validation.get("ce_direction", "UNKNOWN") or "UNKNOWN").upper()
-    pe_dir = str(validation.get("pe_direction", "UNKNOWN") or "UNKNOWN").upper()
-    underlying = str(validation.get("underlying_direction", "UNKNOWN") or "UNKNOWN").upper()
-    validation_state = str(validation.get("signal_validation", "WATCH") or "WATCH").upper()
-
-    # Strict chart gate is the highest-confidence directional layer.
-    if engine_signal in {"BIG BUY", "PRE-BIG BUY"} and engine_direction == "UP":
-        return {
-            "direction": "UP",
-            "confidence": "HIGH" if engine_signal == "BIG BUY" else "BUILDING",
-            "reason": f"{engine_signal}: full chart gate confirmed bullish continuation",
-        }
-    if engine_signal in {"BIG SELL", "PRE-BIG SELL"} and engine_direction == "DOWN":
-        return {
-            "direction": "DOWN",
-            "confidence": "HIGH" if engine_signal == "BIG SELL" else "BUILDING",
-            "reason": f"{engine_signal}: full chart gate confirmed bearish continuation",
-        }
-
-    # Premium expansion/contraction is deliberately neutral.
-    if validation_state == "PREMIUM EXPANSION" or (ce_dir == "UP" and pe_dir == "UP"):
-        return {"direction": "NEUTRAL", "confidence": "LOW",
-                "reason": "CE and PE premiums rising together — premium expansion, direction blocked"}
-    if validation_state == "PREMIUM CONTRACTION" or (ce_dir == "DOWN" and pe_dir == "DOWN"):
-        return {"direction": "NEUTRAL", "confidence": "LOW",
-                "reason": "CE and PE premiums falling together — premium contraction, direction blocked"}
-
-    # Underlying must agree with the option relationship.
-    if validation_state == "CONFIRMED" and validation.get("directional_bias") in {"UP", "DOWN"}:
-        direction = str(validation["directional_bias"]).upper()
-        return {
-            "direction": direction,
-            "confidence": "HIGH",
-            "reason": str(validation.get("false_signal_reason", "Underlying + CE/PE confirmed")),
-        }
-
-    if validation_state == "CONFIRMING" and validation.get("directional_bias") in {"UP", "DOWN"}:
-        direction = str(validation["directional_bias"]).upper()
-        return {
-            "direction": direction,
-            "confidence": "BUILDING",
-            "reason": str(validation.get("false_signal_reason", "Underlying + CE/PE confirming")),
-        }
-
-    # Conflict protection: never convert a strong option score into direction.
-    if underlying in {"UP", "DOWN"} and validation.get("directional_bias") == "WAIT":
-        return {
-            "direction": "WAIT",
-            "confidence": "LOW",
-            "reason": "Underlying direction exists, but CE/PE relationship is not confirmed",
-        }
-
-    return {
-        "direction": "WAIT",
-        "confidence": "LOW",
-        "reason": str(validation.get("false_signal_reason", "Waiting for directional confirmation")),
-    }
 
 
 # ══════════════════════════════════════════════════════════════════════════
 # ADDITIVE MOVEMENT SEARCH — INDEX + F&O
 # ══════════════════════════════════════════════════════════════════════════
-# Search one selected Index / F&O stock and show validated UP/DOWN movement strikes.
+# Search one selected Index / F&O stock and show ONLY upside CE strikes.
 #
 # IMPORTANT:
 # - Existing option-chain/analytics functions are not replaced.
 # - Existing movement_score / ce_movement_score / pe_movement_score are reused.
-# - Movement search supports validated UP, DOWN and NEUTRAL states.
+# - The movement search is intentionally filtered to CE / UP only.
 # - Existing dashboard UI and scanner logic remain unchanged.
 # - Excel download is additive for movement-search results.
 
@@ -4666,81 +4529,24 @@ BIG_TRACKER_STARTED_KEY = "oc_big_tracker_started"
 BIG_TRACKER_INTERVAL_KEY = "oc_big_tracker_interval"
 
 # Liquid F&O universe used by the optional TOTAL F&O scan.
-# Fallback only. Runtime discovery below expands this to the current NSE
-# individual-security derivatives universe when the NSE underlyings page is
-# reachable. This removes the old fixed-30-symbol limitation.
-MOVEMENT_FNO_UNIVERSE_FALLBACK = [
-    'AARTIIND', 'ABB', 'ABBOTINDIA', 'ACC', 'ADANIENT', 'ADANIPORTS', 'ABCAPITAL', 'ABFRL', 'ALKEM', 'AMBUJACEM', 'APOLLOHOSP', 'APOLLOTYRE', 'ASHOKLEY', 'ASIANPAINT', 'ASTRAL', 'ATUL', 'AUBANK', 'AUROPHARMA', 'AXISBANK', 'BAJAJ-AUTO', 'BAJFINANCE', 'BAJAJFINSV', 'BALKRISIND', 'BALRAMCHIN', 'BANDHANBNK', 'BANKBARODA', 'BATAINDIA', 'BERGEPAINT', 'BEL', 'BHARATFORG', 'BHEL', 'BPCL', 'BHARTIARTL', 'BIOCON', 'BSOFT', 'BOSCHLTD', 'BRITANNIA', 'CANFINHOME', 'CANBK', 'CHAMBLFERT', 'CHOLAFIN', 'CIPLA', 'CUB', 'COALINDIA', 'COFORGE', 'COLPAL', 'CONCOR', 'COROMANDEL', 'CROMPTON', 'CUMMINSIND', 'DABUR', 'DALBHARAT', 'DEEPAKNTR', 'DELTACORP', 'DIVISLAB', 'DIXON', 'DLF', 'LALPATHLAB', 'DRREDDY', 'EICHERMOT', 'ESCORTS', 'EXIDEIND', 'GAIL', 'GLENMARK', 'GMRINFRA', 'GODREJCP', 'GODREJPROP', 'GRANULES', 'GRASIM', 'GUJGASLTD', 'GNFC', 'HAVELLS', 'HCLTECH', 'HDFCAMC', 'HDFCBANK', 'HDFCLIFE', 'HEROMOTOCO', 'HINDALCO', 'HAL', 'HINDCOPPER', 'HINDPETRO', 'HINDUNILVR', 'HDFC', 'ICICIBANK', 'ICICIGI', 'ICICIPRULI', 'IDFCFIRSTB', 'IDFC', 'IBULHSGFIN', 'INDIAMART', 'IEX', 'IOC', 'IRCTC', 'IGL', 'INDUSTOWER', 'INDUSINDBK', 'NAUKRI', 'INFY', 'INTELLECT', 'INDIGO', 'IPCALAB', 'ITC', 'JINDALSTEL', 'JKCEMENT', 'JSWSTEEL', 'JUBLFOOD', 'KOTAKBANK', 'L&TFH', 'LTTS', 'LTIM', 'LT', 'LAURUSLABS', 'LICHSGFIN', 'LUPIN', 'MGL', 'M&MFIN', 'M&M', 'MANAPPURAM', 'MARICO', 'MARUTI', 'MFSL', 'METROPOLIS', 'MOTHERSON', 'MPHASIS', 'MRF', 'MCX', 'MUTHOOTFIN', 'NATIONALUM', 'NAVINFLUOR', 'NESTLEIND', 'NMDC', 'NTPC', 'OBEROIRLTY', 'ONGC', 'OFSS', 'PAGEIND', 'PERSISTENT', 'PETRONET', 'PIIND', 'PIDILITIND', 'PEL', 'POLYCAB', 'PFC', 'POWERGRID', 'PNB', 'PVRINOX', 'RAIN', 'RBLBANK', 'RECLTD', 'RELIANCE', 'SBICARD', 'SBILIFE', 'SHREECEM', 'SHRIRAMFIN', 'SIEMENS', 'SRF', 'SBIN', 'SAIL', 'SUNPHARMA', 'SUNTV', 'SYNGENE', 'TATACHEM', 'TATACOM', 'TCS', 'TATACONSUM', 'TATAMOTORS', 'TATAPOWER', 'TATASTEEL', 'TECHM', 'FEDERALBNK', 'INDIACEM', 'INDHOTEL', 'RAMCOCEM', 'TITAN', 'TORNTPHARM', 'TRENT', 'TVSMOTOR', 'ULTRACEMCO', 'UBL', 'MCDOWELL-N', 'UPL', 'VEDL', 'IDEA', 'VOLTAS', 'WHIRLPOOL', 'WIPRO', 'ZEEL', 'ZYDUSLIFE', 'ADANIPOWER', 'COCHINSHIP', 'HYUNDAI', 'MOTILALOFS', 'NAM-INDIA', 'VMM',
+MOVEMENT_FNO_UNIVERSE = [
+    "RELIANCE", "HDFCBANK", "ICICIBANK", "SBIN", "AXISBANK",
+    "KOTAKBANK", "INFY", "TCS", "ITC", "BHARTIARTL",
+    "LT", "HINDUNILVR", "MARUTI", "M&M", "TATASTEEL",
+    "SUNPHARMA", "TATAMOTORS", "ADANIENT", "ADANIPORTS", "NTPC",
+    "POWERGRID", "ONGC", "COALINDIA", "BEL", "HAL",
+    "TRENT", "BAJFINANCE", "BAJAJFINSV", "INDUSINDBK", "WIPRO",
 ]
 
-NSE_FNO_UNDERLYINGS_URL = (
-    "https://www.nseindia.com/static/products-services/"
-    "equity-derivatives-list-underlyings-information"
-)
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def get_movement_fno_universe() -> list[str]:
-    """Return a broad NSE F&O underlying universe, with safe fallback."""
-    try:
-        session = get_nse_session()
-        resp = session.get(NSE_FNO_UNDERLYINGS_URL, timeout=min(REQUEST_TIMEOUT, 8))
-        if resp.status_code == 200 and resp.text:
-            # NSE may return the table as HTML, or a page whose table is not
-            # exposed consistently to pandas.read_html. Try both paths.
-            symbols: list[str] = []
-            try:
-                tables = pd.read_html(io.StringIO(resp.text))
-            except Exception:
-                tables = []
-            for table in tables:
-                if not isinstance(table, pd.DataFrame):
-                    continue
-                cols = {str(c).strip().upper(): c for c in table.columns}
-                sym_col = cols.get("SYMBOL") or cols.get("UNDERLYING SYMBOL")
-                if sym_col is None:
-                    continue
-                for value in table[sym_col].dropna().astype(str):
-                    s = normalize_stock_symbol(value)
-                    if s and s not in symbols:
-                        symbols.append(s)
-            # The first five rows on NSE are index derivatives; TOTAL F&O here
-            # is for individual-security underlyings, so exclude index names.
-            symbols = [x for x in symbols if x not in INDEX_SYMBOLS]
-            if len(symbols) >= 50:
-                # Add newly introduced securities when NSE's static page lags.
-                for extra in ("ADANIPOWER", "COCHINSHIP", "HYUNDAI", "MOTILALOFS", "NAM-INDIA", "VMM"):
-                    if extra not in symbols:
-                        symbols.append(extra)
-                return symbols
-    except Exception as exc:
-        logger.warning("Dynamic NSE F&O universe fetch failed: %s", exc)
-    return list(MOVEMENT_FNO_UNIVERSE_FALLBACK)
-
-def movement_fno_universe() -> list[str]:
-    """Compatibility wrapper used by scanner/report functions."""
-    return get_movement_fno_universe()
-
-# Backward-compatible name for any existing code that reads the constant.
-MOVEMENT_FNO_UNIVERSE = MOVEMENT_FNO_UNIVERSE_FALLBACK  # legacy alias; scanners call movement_fno_universe()
-
-
-def _movement_search_status(score: float, direction: str = "UP") -> str:
-    """Convert movement score + validated direction into a compact status."""
+def _movement_search_status(score: float) -> str:
+    """Convert the existing movement score into a compact upside status."""
     score = float(score or 0)
-    direction = str(direction or "WAIT").upper()
-    if direction == "DOWN":
-        if score >= 82:
-            return "🚨 BIG DOWN MOVE"
-        if score >= MOVEMENT_SEARCH_MIN_SCORE:
-            return "🔴 EARLY DOWN MOVE"
-    elif direction == "UP":
-        if score >= 82:
-            return "🚨 BIG UP MOVE"
-        if score >= MOVEMENT_SEARCH_MIN_SCORE:
-            return "🟢 EARLY UP MOVE"
-    elif direction == "NEUTRAL":
-        return "🟡 PREMIUM NEUTRAL"
-    return "⚪ WATCH"
+    if score >= 82:
+        return "🚨 BIG UP MOVE"
+    if score >= MOVEMENT_SEARCH_MIN_SCORE:
+        return "🟢 EARLY UP MOVE"
+    return "WATCH"
 
 
 def _movement_trade_levels(
@@ -4748,16 +4554,10 @@ def _movement_trade_levels(
     signal_time: Optional[datetime] = None,
     reversal_level: Optional[float] = None,
     reversal_status: str = "WAIT HISTORY",
-    side: str = "CE",
 ) -> dict[str, Any]:
-    """Build option movement levels using the selected CE/PE side."""
-    side = str(side or "CE").upper()
-    if side == "PE":
-        ltp = _pin_num(row.get("pe_ltp"), 0.0)
-        ask = _pin_num(row.get("pe_ask"), 0.0)
-    else:
-        ltp = _pin_num(row.get("ce_ltp"), 0.0)
-        ask = _pin_num(row.get("ce_ask"), 0.0)
+    """Build CE movement-scan levels with a live price-reversal check."""
+    ltp = _pin_num(row.get("ce_ltp"), 0.0)
+    ask = _pin_num(row.get("ce_ask"), 0.0)
     entry = ask if ask > 0 else ltp
     # Signal Time is always India Standard Time (IST), not the Streamlit
     # server timezone (often UTC). This fixes the 5:30 hour offset seen in UI.
@@ -4776,23 +4576,17 @@ def _movement_trade_levels(
             "Price Reversal": 0.0, "Reversal Status": "NO PRICE",
         }
 
-    # Never invent a 5% reversal level. If there is no validated history, keep
-    # the level at zero and explicitly show WAIT HISTORY/CONFIRMATION.
-    reversal = _pin_num(reversal_level, 0.0)
-    if reversal <= 0:
-        return {
-            "Signal Time": now_text,
-            "Entry": round(entry, 2),
-            "Stop Loss": 0.0,
-            "Price Reversal": 0.0,
-            "Reversal Status": str(reversal_status or "WAIT HISTORY"),
-        }
+    # First scan fallback; later scans use the actual recent CE price history.
+    fallback_reversal = entry * 0.95
+    reversal = _pin_num(reversal_level, fallback_reversal)
+    if reversal <= 0 or reversal >= entry:
+        reversal = fallback_reversal
 
     # Keep SL close to the actual reversal trigger instead of producing a
     # misleading zero/very-distant stop. Scanner reference only.
     stop_loss = max(0.0, reversal * 0.98)
     if stop_loss >= entry:
-        stop_loss = max(0.0, entry * 0.98)
+        stop_loss = max(0.0, entry * 0.93)
 
     return {
         "Signal Time": now_text,
@@ -4816,14 +4610,6 @@ def _movement_search_excel(df: pd.DataFrame, report_name: str = "Movement Search
         "Movement Bias", "Price Delta", "Price Change %", "Price Direction Source",
         "CE Price", "PE Price", "Early Status", "Rising Scans",
         "Score Delta", "Confidence", "Spot", "Source",
-        "Underlying Direction", "Underlying Direction Source", "CE Direction", "CE Direction Source",
-        "PE Direction", "PE Direction Source", "Signal Validation", "Signal Valid",
-        "False Signal Reason", "Directional Bias", "Directional Rising Scans",
-        "CE Scan Delta", "PE Scan Delta",
-        "Option Activity", "Direction Confidence", "Direction Reason",
-        "BIG SIGNAL", "BIG DIRECTION", "BIG SCORE", "LAST CHART", "STRUCTURE",
-        "AMD", "LIQUIDITY REACTION", "BOS/MSS", "RVOL", "5M CONFIRM",
-        "15M CONFIRM", "BIG REASON",
     ]
     cols = [c for c in export_cols if c in df.columns]
     export_df = df[cols].copy() if cols else df.copy()
@@ -4840,7 +4626,7 @@ def _movement_search_excel(df: pd.DataFrame, report_name: str = "Movement Search
     info = [
         ("Report", report_name),
         ("Generated At", datetime.now().strftime("%d-%b-%Y %H:%M:%S")),
-        ("Filter", "CE/PE score is activity strength only. Index/F&O direction requires underlying + CE/PE confirmation; CE+PE expansion/contraction stays neutral."),
+        ("Filter", "Selected-search remains CE/UP only; Total Scanner selects stronger CE/PE side per strike and derives UP/DOWN from option-premium price movement."),
         ("Minimum Selected-Search CE Movement Score", MOVEMENT_SEARCH_MIN_SCORE),
         ("Note", "Movement score is an activity/ranking early-warning model, not a guaranteed price prediction."),
     ]
@@ -4869,440 +4655,203 @@ def _movement_search_excel(df: pd.DataFrame, report_name: str = "Movement Search
 #   3) identify BUILDING / PRE-MOVE before strong movement
 #   4) keep CE and PE direction separate
 # ============================================================
-def _directional_confirmation_additive(
-    symbol: str,
-    expiry: str,
-    strike: float,
-    spot: float,
-    ce_price: float,
-    pe_price: float,
-    ce_daily_change: float = 0.0,
-    pe_daily_change: float = 0.0,
-) -> dict[str, Any]:
-    """Additive directional confirmation using the existing movement history.
+def _validate_movement_signal_additive(
+    row,
+    price_delta=None,
+    price_pct=None,
+    price_direction=None,
+):
+    """Validate the existing movement score without replacing it."""
+    try:
+        score = float(row.get("movement_score", 0) or 0)
+        ce_score = float(row.get("ce_movement_score", 0) or 0)
+        pe_score = float(row.get("pe_movement_score", 0) or 0)
+        early = float(row.get("early_score", 0) or 0)
+        rising = int(float(row.get("rising_scans", 0) or 0))
+        score_delta = float(row.get("score_delta", 0) or 0)
 
-    The movement engine already stores a snapshot for every strike.  Reuse that
-    same history instead of maintaining a second independent history.  This
-    prevents the previous implementation from staying at WAIT HISTORY when the
-    scanner is repeatedly refreshed.
-    """
-    spot = _pin_num(spot, 0.0)
-    ce_price = _pin_num(ce_price, 0.0)
-    pe_price = _pin_num(pe_price, 0.0)
+        if price_delta is None:
+            price_delta = row.get("price_delta")
+        if price_pct is None:
+            price_pct = row.get("price_change_pct")
+        if price_direction is None:
+            price_direction = row.get("price_direction")
 
-    history = st.session_state.get(MOVEMENT_HISTORY_KEY, {})
-    key = _movement_history_key(symbol, expiry, strike)
-    series = history.get(key, []) if isinstance(history, dict) else []
-    prev = series[-2] if len(series) >= 2 else None
-
-    def _dir(cur: float, old: float, fallback: float = 0.0) -> tuple[str, str, float]:
-        if cur > 0 and old > 0:
-            pct = ((cur - old) / old) * 100.0
-            if pct > DIRECTION_PRICE_FLAT_PCT:
-                return "UP", "SCAN LTP", pct
-            if pct < -DIRECTION_PRICE_FLAT_PCT:
-                return "DOWN", "SCAN LTP", pct
-            return "FLAT", "SCAN LTP", pct
-        if fallback > 0.005:
-            return "UP", "FYERS CHANGE", 0.0
-        if fallback < -0.005:
-            return "DOWN", "FYERS CHANGE", 0.0
-        return "UNKNOWN", "WAIT HISTORY", 0.0
-
-    old_spot = _pin_num(prev.get("spot"), 0.0) if prev else 0.0
-    old_ce = _pin_num(prev.get("ce_price"), 0.0) if prev else 0.0
-    old_pe = _pin_num(prev.get("pe_price"), 0.0) if prev else 0.0
-
-    underlying, underlying_source, spot_delta_pct = _dir(spot, old_spot)
-    ce_dir, ce_source, ce_delta_pct = _dir(ce_price, old_ce, ce_daily_change)
-    pe_dir, pe_source, pe_delta_pct = _dir(pe_price, old_pe, pe_daily_change)
-
-    if underlying == "UP" and ce_dir == "UP" and pe_dir in {"DOWN", "FLAT"}:
-        directional_bias = "UP"
-        reason = "Underlying UP + CE UP + PE DOWN/FLAT"
-    elif underlying == "DOWN" and pe_dir == "UP" and ce_dir in {"DOWN", "FLAT"}:
-        directional_bias = "DOWN"
-        reason = "Underlying DOWN + PE UP + CE DOWN/FLAT"
-    elif ce_dir == "UP" and pe_dir == "UP":
-        directional_bias = "NEUTRAL"
-        reason = "CE UP + PE UP = PREMIUM EXPANSION; directional signal blocked"
-    elif ce_dir == "DOWN" and pe_dir == "DOWN":
-        directional_bias = "NEUTRAL"
-        reason = "CE DOWN + PE DOWN = PREMIUM CONTRACTION; directional signal blocked"
-    elif "UNKNOWN" in {underlying, ce_dir, pe_dir}:
-        directional_bias = "WAIT"
-        reason = "Waiting for first complete scan-to-scan baseline"
-    else:
-        directional_bias = "WAIT"
-        reason = "CE/PE relationship not directionally confirmed"
-
-    previous_bias = str(prev.get("directional_bias", "")) if prev else ""
-    previous_aligned = previous_bias in {"UP", "DOWN"}
-    aligned_now = directional_bias in {"UP", "DOWN"}
-
-    if aligned_now and previous_aligned and previous_bias == directional_bias:
-        rising = int(prev.get("directional_rising_scans", 0) or 0) + 1
-    elif aligned_now:
-        rising = 1
-    else:
-        rising = 0
-
-    if aligned_now and rising >= DIRECTION_CONFIRM_MIN_SCANS:
-        validation = "CONFIRMED"
-    elif aligned_now:
-        validation = "CONFIRMING"
-    elif directional_bias == "NEUTRAL" and ce_dir == "UP" and pe_dir == "UP":
-        validation = "PREMIUM EXPANSION"
-    elif directional_bias == "NEUTRAL":
-        validation = "PREMIUM CONTRACTION"
-    else:
-        validation = "WATCH"
-
-    signal_valid = validation == "CONFIRMED"
-    if validation == "CONFIRMED":
-        reason += f"; {rising} consecutive matching scans"
-
-    return {
-        "underlying_direction": underlying,
-        "underlying_direction_source": underlying_source,
-        "ce_direction": ce_dir,
-        "ce_direction_source": ce_source,
-        "pe_direction": pe_dir,
-        "pe_direction_source": pe_source,
-        "signal_validation": validation,
-        "signal_valid": signal_valid,
-        "false_signal_reason": reason,
-        "directional_bias": directional_bias,
-        "directional_rising_scans": rising,
-        "ce_scan_delta": round(ce_delta_pct, 4),
-        "pe_scan_delta": round(pe_delta_pct, 4),
-        "underlying_scan_delta": round(spot_delta_pct, 4),
-        "selected_scan_delta": round(ce_delta_pct if abs(ce_delta_pct) >= abs(pe_delta_pct) else pe_delta_pct, 4),
-        "selected_price_change_pct": round(ce_delta_pct if abs(ce_delta_pct) >= abs(pe_delta_pct) else pe_delta_pct, 4),
-        "selected_direction_source": ce_source if abs(ce_delta_pct) >= abs(pe_delta_pct) else pe_source,
-    }
-
-
-
-# ============================================================
-# ADDITIVE MOVEMENT SIGNAL ENGINE — INDEX + F&O
-# Existing option-chain movement score is preserved.
-# BIG/PRE-BIG labels are generated only in BOTH/TOTAL scanner mode.
-# ============================================================
-
-MOVEMENT_PRE_BIG_SCORE = 65.0
-MOVEMENT_BIG_SCORE = 78.0
-MOVEMENT_PRE_RVOL = 1.20
-MOVEMENT_BIG_RVOL = 1.50
-MOVEMENT_STRUCTURE_LOOKBACK = 5
-MOVEMENT_ATR_PERIOD = 14
-MOVEMENT_MTF_REQUIRED = True
-
-
-@st.cache_data(ttl=15, show_spinner=False)
-def _movement_chart_engine(
-    fyers: Any,
-    symbol: str,
-    is_index: bool,
-) -> dict[str, Any]:
-    """
-    Additive chart-confirmation engine.
-
-    BIG BUY requires:
-        last-chart continuation + HH/HL + accumulation +
-        liquidity reaction + RVOL + BOS/MSS UP + 5M + 15M UP.
-
-    BIG SELL is the exact bearish mirror.
-
-    AMD WATCH is never promoted directly to BIG BUY/BIG SELL.
-    """
-    out = {
-        "signal": "WAIT",
-        "direction": "NEUTRAL",
-        "score": 0.0,
-        "structure": "UNKNOWN",
-        "continuation": "UNKNOWN",
-        "amd": "WATCH",
-        "liquidity": "NONE",
-        "bos_mss": "NONE",
-        "rvol": 0.0,
-        "volume_ok": False,
-        "trend_5m": "WAIT",
-        "trend_15m": "WAIT",
-        "reasons": [],
-        "fyers_symbol": "",
-    }
-
-    if fyers is None:
-        out["reasons"].append("FYERS unavailable — chart confirmation skipped")
-        return out
-
-    candidates = (
-        _fyers_index_candidates(symbol)
-        if is_index
-        else fyers_stock_symbol_candidates(symbol)
-    )
-
-    best = None
-    best_symbol = ""
-    for candidate in candidates:
         try:
-            df5 = fetch_fyers_candles(fyers, candidate, 5, count=100)
-            df15 = fetch_fyers_candles(fyers, candidate, 15, count=100)
-            if (
-                isinstance(df5, pd.DataFrame) and not df5.empty
-                and isinstance(df15, pd.DataFrame) and not df15.empty
-                and len(df5) >= 25 and len(df15) >= 25
-            ):
-                best = (df5.copy(), df15.copy())
-                best_symbol = candidate
-                break
-        except Exception as exc:
-            logger.debug("Movement chart context failed for %s: %s", candidate, exc)
+            pd = float(price_delta or 0)
+        except Exception:
+            pd = 0.0
+        try:
+            pp = float(price_pct or 0)
+        except Exception:
+            pp = 0.0
 
-    if best is None:
-        out["reasons"].append("5M/15M FYERS chart data unavailable")
+        pdir = str(price_direction or "").upper().strip()
+        if pdir not in {"UP", "DOWN", "FLAT"}:
+            pdir = "FLAT" if abs(pd) < 1e-9 else ("UP" if pd > 0 else "DOWN")
+
+        score_gap = abs(ce_score - pe_score)
+        score_side = "UP" if ce_score > pe_score + 7 else (
+            "DOWN" if pe_score > ce_score + 7 else "BOTH"
+        )
+
+        # A score alone is never enough to call a confirmed movement.
+        price_confirmed = (
+            (pdir == "UP" and pd > 0) or
+            (pdir == "DOWN" and pd < 0)
+        )
+
+        # Early/pre-move requires some developing evidence.
+        building_evidence = (
+            score_delta > 0.5 or
+            rising >= 1 or
+            early >= 55
+        )
+
+        # Strong movement needs score + price confirmation.
+        strong_confirmed = (
+            score >= 78 and
+            price_confirmed and
+            score_gap >= 7 and
+            (rising >= 1 or score_delta >= 1.5 or early >= 70)
+        )
+
+        # Pre-move can appear before a large price change, but must not be
+        # generated when price is already moving against the selected side.
+        premove_confirmed = (
+            score >= 55 and
+            early >= 55 and
+            building_evidence and
+            score_delta >= 0 and
+            (pdir == "FLAT" or price_confirmed)
+        )
+
+        if strong_confirmed:
+            status = "STRONG MOVEMENT"
+        elif premove_confirmed:
+            status = "PRE-MOVE"
+        elif building_evidence and score >= 50:
+            status = "BUILDING"
+        else:
+            status = "WAIT"
+
+        # Direction is based on actual premium movement when available.
+        # Never convert CE/PE score directly into price direction.
+        if price_confirmed:
+            final_direction = pdir
+            direction_source = "OPTION PREMIUM PRICE"
+        else:
+            final_direction = "WAIT"
+            direction_source = "NO PRICE CONFIRMATION"
+
+        # If score says one side but price is moving opposite, block it.
+        if score_side != "BOTH" and final_direction != "WAIT":
+            if score_side != final_direction and abs(score_delta) < 3:
+                final_direction = "WAIT"
+                direction_source = "SCORE/PRICE CONFLICT"
+
+        confidence = 35.0
+        confidence += min(score, 100.0) * 0.25
+        confidence += min(max(early, 0.0), 100.0) * 0.20
+        confidence += min(rising, 4) * 5.0
+        confidence += min(abs(pp), 5.0) * 2.0
+        if price_confirmed:
+            confidence += 10.0
+        if score_side == final_direction and final_direction != "WAIT":
+            confidence += 5.0
+        if final_direction == "WAIT":
+            confidence -= 15.0
+        confidence = max(0.0, min(95.0, confidence))
+
+        out = dict(row)
+        out["validated_status"] = status
+        out["validated_direction"] = final_direction
+        out["direction_source"] = direction_source
+        out["price_confirmed"] = bool(price_confirmed)
+        out["movement_signal_valid"] = bool(
+            status in {"PRE-MOVE", "STRONG MOVEMENT"} and
+            final_direction != "WAIT"
+        )
+        out["validated_confidence"] = round(confidence, 1)
+        out["score_price_conflict"] = bool(
+            score_side != "BOTH" and
+            price_confirmed and
+            score_side != final_direction
+        )
         return out
+    except Exception:
+        return dict(row)
 
-    df5, df15 = best
-    out["fyers_symbol"] = best_symbol
 
-    def _prep(d: pd.DataFrame) -> pd.DataFrame:
-        x = d.copy()
-        x["ema9"] = calculate_ema(x, 9)
-        x["ema21"] = calculate_ema(x, 21)
-        x["atr"] = calculate_atr(x, MOVEMENT_ATR_PERIOD)
-        x["rvol"] = calculate_rvol(x, 20)
-        x["vwap"] = calculate_vwap(x)
-        _, _, x["macd_hist"] = calculate_macd(x)
-        return x
+def _apply_validated_reversal_additive(
+    current_price,
+    previous_price=None,
+    previous_previous_price=None,
+):
+    """Reversal based on the same option premium, not strike price."""
+    try:
+        cur = float(current_price or 0)
+        prev = float(previous_price or 0)
+        prev2 = float(previous_previous_price or 0)
+        if cur <= 0 or prev <= 0:
+            return "WAIT"
 
-    df5 = _prep(df5)
-    df15 = _prep(df15)
+        if prev2 > 0:
+            d1 = prev - prev2
+            d2 = cur - prev
+            if d1 > 0 and d2 < 0:
+                return "REVERSAL NOW"
+            if d1 < 0 and d2 > 0:
+                return "REVERSAL NOW"
 
-    def _structure(d: pd.DataFrame) -> tuple[str, str]:
-        if len(d) < MOVEMENT_STRUCTURE_LOOKBACK + 2:
-            return "UNKNOWN", "UNKNOWN"
-        cur = d.iloc[-1]
-        ref = d.iloc[-(MOVEMENT_STRUCTURE_LOOKBACK + 1):-1]
-        hh = float(cur["high"]) > float(ref["high"].max())
-        hl = float(cur["low"]) > float(ref["low"].min())
-        lh = float(cur["high"]) < float(ref["high"].max())
-        ll = float(cur["low"]) < float(ref["low"].min())
-        if hh and hl:
-            return "HH/HL", "BULLISH"
-        if lh and ll:
-            return "LH/LL", "BEARISH"
-        return "MIXED", "MIXED"
-
-    structure, structure_bias = _structure(df5)
-
-    # "Last-chart continuation" is stricter than a single green/red candle:
-    # require current close plus the immediately previous candle to agree.
-    last5 = df5.iloc[-1]
-    prev5 = df5.iloc[-2]
-    bullish_continue = (
-        float(last5["close"]) > float(last5["open"])
-        and float(prev5["close"]) >= float(prev5["open"])
-        and structure_bias == "BULLISH"
-        and float(last5["close"]) >= float(last5["ema21"])
-    )
-    bearish_continue = (
-        float(last5["close"]) < float(last5["open"])
-        and float(prev5["close"]) <= float(prev5["open"])
-        and structure_bias == "BEARISH"
-        and float(last5["close"]) <= float(last5["ema21"])
-    )
-    continuation = (
-        "UP" if bullish_continue else
-        "DOWN" if bearish_continue else
-        "WAIT"
-    )
-
-    # Adaptive AMD classification: use ATR-normalized range and EMA/VWAP
-    # location, so indices and stocks are not judged by fixed price %.
-    window = df15.tail(8)
-    mean_range = float((window["high"] - window["low"]).mean())
-    atr15 = max(float(df15["atr"].iloc[-1]), 1e-9)
-    compression = mean_range / atr15
-    close15 = float(df15["close"].iloc[-1])
-    ema21_15 = float(df15["ema21"].iloc[-1])
-    vwap15 = float(df15["vwap"].iloc[-1])
-
-    if compression <= 0.90 and close15 >= ema21_15 and close15 >= vwap15:
-        amd = "ACCUMULATION"
-    elif compression <= 0.90 and close15 <= ema21_15 and close15 <= vwap15:
-        amd = "DISTRIBUTION"
-    elif close15 > ema21_15 and close15 > vwap15:
-        amd = "MARKUP"
-    elif close15 < ema21_15 and close15 < vwap15:
-        amd = "MARKDOWN"
-    else:
-        amd = "WATCH"
-
-    # Liquidity reaction = sweep + reclaim, not merely touching a level.
-    recent = df5.iloc[-(MOVEMENT_STRUCTURE_LOOKBACK + 1):-1]
-    recent_high = float(recent["high"].max())
-    recent_low = float(recent["low"].min())
-    cur_high = float(last5["high"])
-    cur_low = float(last5["low"])
-    cur_close = float(last5["close"])
-    cur_open = float(last5["open"])
-
-    buy_liq = cur_low < recent_low and cur_close > recent_low and cur_close > cur_open
-    sell_liq = cur_high > recent_high and cur_close < recent_high and cur_close < cur_open
-    liquidity = "BUY REACTION" if buy_liq else "SELL REACTION" if sell_liq else "NONE"
-
-    # BOS/MSS uses the same prior-structure idea and ATR-normalized close
-    # confirmation; a wick-only break is not enough.
-    bos_up = cur_close > recent_high and (cur_close - recent_high) >= max(float(last5["atr"]) * 0.05, 1e-9)
-    bos_down = cur_close < recent_low and (recent_low - cur_close) >= max(float(last5["atr"]) * 0.05, 1e-9)
-    bos_mss = "BOS/MSS UP" if bos_up else "BOS/MSS DOWN" if bos_down else "NONE"
-
-    rvol5 = float(last5["rvol"])
-    volume_ok = rvol5 >= MOVEMENT_PRE_RVOL
-    out["rvol"] = round(rvol5, 2)
-    out["volume_ok"] = volume_ok
-
-    # MTF confirmation requires 2 of 3: EMA alignment, VWAP location, MACD.
-    def _tf_confirm(d: pd.DataFrame) -> str:
-        z = d.iloc[-1]
-        bull_votes = sum([
-            float(z["ema9"]) > float(z["ema21"]),
-            float(z["close"]) > float(z["vwap"]),
-            float(z["macd_hist"]) > 0,
-        ])
-        bear_votes = sum([
-            float(z["ema9"]) < float(z["ema21"]),
-            float(z["close"]) < float(z["vwap"]),
-            float(z["macd_hist"]) < 0,
-        ])
-        if bull_votes >= 2:
-            return "UP"
-        if bear_votes >= 2:
-            return "DOWN"
+        return "NORMAL"
+    except Exception:
         return "WAIT"
 
-    trend5 = _tf_confirm(df5)
-    trend15 = _tf_confirm(df15)
+# ============================================================
+# END ADDITIVE MOVEMENT VALIDATION LAYER
+# ============================================================
 
-    # Weighted chart score. BIG is still gated by ALL mandatory components.
-    buy_score = (
-        10 if continuation == "UP" else 0
-    ) + (
-        15 if structure == "HH/HL" else 0
-    ) + (
-        15 if amd == "ACCUMULATION" else 0
-    ) + (
-        15 if liquidity == "BUY REACTION" else 0
-    ) + (
-        15 if rvol5 >= MOVEMENT_BIG_RVOL else 0
-    ) + (
-        15 if bos_mss == "BOS/MSS UP" else 0
-    ) + (
-        5 if trend5 == "UP" else 0
-    ) + (
-        5 if trend15 == "UP" else 0
-    )
 
-    sell_score = (
-        10 if continuation == "DOWN" else 0
-    ) + (
-        15 if structure == "LH/LL" else 0
-    ) + (
-        15 if amd == "DISTRIBUTION" else 0
-    ) + (
-        15 if liquidity == "SELL REACTION" else 0
-    ) + (
-        15 if rvol5 >= MOVEMENT_BIG_RVOL else 0
-    ) + (
-        15 if bos_mss == "BOS/MSS DOWN" else 0
-    ) + (
-        5 if trend5 == "DOWN" else 0
-    ) + (
-        5 if trend15 == "DOWN" else 0
-    )
 
-    # BIG requires every requested component. AMD WATCH can never pass this gate.
-    big_buy = (
-        continuation == "UP"
-        and structure == "HH/HL"
-        and amd == "ACCUMULATION"
-        and liquidity == "BUY REACTION"
-        and rvol5 >= MOVEMENT_BIG_RVOL
-        and bos_mss == "BOS/MSS UP"
-        and trend5 == "UP"
-        and trend15 == "UP"
-    )
-    big_sell = (
-        continuation == "DOWN"
-        and structure == "LH/LL"
-        and amd == "DISTRIBUTION"
-        and liquidity == "SELL REACTION"
-        and rvol5 >= MOVEMENT_BIG_RVOL
-        and bos_mss == "BOS/MSS DOWN"
-        and trend5 == "DOWN"
-        and trend15 == "DOWN"
-    )
+# ============================================================
+# ADDITIVE MOVEMENT PROJECTION LAYER
+# OLD MOVEMENT / PIN / ORDER-BLOCK LOGIC IS NOT REPLACED.
+# ============================================================
+def _calculate_movement_projection_additive(current_price, price_history=None, direction="WAIT", score=0, score_delta=0, rising_scans=0, confidence=0):
+    """Estimate movement range from observed premium history; not a guarantee."""
+    try:
+        cur=float(current_price or 0)
+        if cur<=0: return {"expected_target_1":0.0,"expected_target_2":0.0,"expected_extension":0.0,"invalidation_price":0.0,"move_strength":"WAIT","continuation":"WAIT","exhaustion":"LOW"}
+        hist=[]
+        for x in (price_history or []):
+            try:
+                v=float(x)
+                if v>0: hist.append(v)
+            except Exception: pass
+        changes=[abs(b-a)/a for a,b in zip(hist[-6:-1],hist[-5:]) if a>0]
+        avg_change=max(0.003,min(sum(changes)/len(changes) if changes else 0.01,0.08))
+        s=float(score or 0); sd=float(score_delta or 0); rs=int(float(rising_scans or 0)); cf=float(confidence or 0)
+        pts=min(s,100)*.45+min(max(sd,0),15)*1.5+min(rs,4)*6+min(max(cf,0),95)*.20
+        if pts>=75: strength,mult="STRONG",1.50
+        elif pts>=58: strength,mult="PRE-MOVE",1.20
+        elif pts>=42: strength,mult="BUILDING",.90
+        else: strength,mult="WEAK",.60
+        d=str(direction or "WAIT").upper(); d=d if d in {"UP","DOWN"} else "WAIT"
+        move1=max(cur*avg_change*mult,cur*.005); move2=move1*1.65; ext=move2*1.35
+        if d=="UP": t1,t2,ex=cur+move1,cur+move2,cur+ext; inv=cur-max(move1*.65,cur*.004)
+        elif d=="DOWN": t1,t2,ex=max(cur-move1,0),max(cur-move2,0),max(cur-ext,0); inv=cur+max(move1*.65,cur*.004)
+        else: t1=t2=ex=inv=cur
+        exhaustion="HIGH" if len(changes)>=3 and changes[-1]>changes[-2]*1.8 else ("MEDIUM" if len(changes)>=2 and changes[-1]>changes[-2]*1.35 else "LOW")
+        continuation="WAIT"
+        if d in {"UP","DOWN"}: continuation="LIKELY CONTINUATION" if rs>=2 and sd>0 and strength in {"PRE-MOVE","STRONG"} else ("BUILDING" if rs>=1 and sd>=0 else "UNCONFIRMED")
+        return {"expected_target_1":round(t1,2),"expected_target_2":round(t2,2),"expected_extension":round(ex,2),"invalidation_price":round(inv,2),"move_strength":strength,"continuation":continuation,"exhaustion":exhaustion}
+    except Exception:
+        return {"expected_target_1":0.0,"expected_target_2":0.0,"expected_extension":0.0,"invalidation_price":0.0,"move_strength":"WAIT","continuation":"WAIT","exhaustion":"LOW"}
 
-    # PRE-BIG is deliberately incomplete: it detects the build-up before
-    # expansion, but never converts AMD WATCH alone into a directional signal.
-    pre_buy = (
-        buy_score >= MOVEMENT_PRE_BIG_SCORE
-        and structure == "HH/HL"
-        and amd == "ACCUMULATION"
-        and rvol5 >= MOVEMENT_PRE_RVOL
-        and trend5 == "UP"
-        and (liquidity == "BUY REACTION" or bos_mss == "BOS/MSS UP")
-        and not big_buy
-    )
-    pre_sell = (
-        sell_score >= MOVEMENT_PRE_BIG_SCORE
-        and structure == "LH/LL"
-        and amd == "DISTRIBUTION"
-        and rvol5 >= MOVEMENT_PRE_RVOL
-        and trend5 == "DOWN"
-        and (liquidity == "SELL REACTION" or bos_mss == "BOS/MSS DOWN")
-        and not big_sell
-    )
-
-    if big_buy:
-        signal, direction, score = "BIG BUY", "BUY", float(buy_score)
-    elif big_sell:
-        signal, direction, score = "BIG SELL", "SELL", float(sell_score)
-    elif pre_buy:
-        signal, direction, score = "PRE-BIG BUY", "BUY", float(buy_score)
-    elif pre_sell:
-        signal, direction, score = "PRE-BIG SELL", "SELL", float(sell_score)
-    else:
-        signal, direction, score = "WATCH", "NEUTRAL", max(float(buy_score), float(sell_score))
-
-    reasons = [
-        f"CONTINUE {continuation}",
-        structure,
-        f"AMD {amd}",
-        f"LIQUIDITY {liquidity}",
-        f"RVOL {rvol5:.2f}x",
-        bos_mss,
-        f"5M {trend5}",
-        f"15M {trend15}",
-    ]
-
-    out.update({
-        "signal": signal,
-        "direction": direction,
-        "score": round(score, 1),
-        "structure": structure,
-        "continuation": continuation,
-        "amd": amd,
-        "liquidity": liquidity,
-        "bos_mss": bos_mss,
-        "trend_5m": trend5,
-        "trend_15m": trend15,
-        "reasons": reasons,
-    })
-    return out
-
+# ============================================================
+# END ADDITIVE MOVEMENT PROJECTION LAYER
+# ============================================================
 
 def _movement_search_one(
     fyers: Any,
@@ -5418,28 +4967,6 @@ def _movement_search_one(
         # Total scanner can pass min_score=0 to avoid hiding developing candidates.
         threshold = MOVEMENT_SEARCH_MIN_SCORE if min_score is None else float(min_score)
 
-        # Chart engine is expensive (5M + 15M history). Run it at most once
-        # per symbol, and only when option activity has reached a useful
-        # candidate level. This avoids one history call pair per strike.
-        chart_engine = {
-            "signal": "WAIT", "direction": "NEUTRAL", "score": 0.0,
-            "structure": "UNKNOWN", "continuation": "UNKNOWN", "amd": "WATCH",
-            "liquidity": "NONE", "bos_mss": "NONE", "rvol": 0.0,
-            "volume_ok": False, "trend_5m": "WAIT", "trend_15m": "WAIT",
-            "reasons": ["Chart gate not run — option activity below candidate threshold"],
-            "fyers_symbol": "",
-        }
-        if both_mode:
-            try:
-                max_option_score = float(max(
-                    pd.to_numeric(df.get("ce_movement_score", 0), errors="coerce").fillna(0).max(),
-                    pd.to_numeric(df.get("pe_movement_score", 0), errors="coerce").fillna(0).max(),
-                ))
-            except Exception:
-                max_option_score = 0.0
-            if max_option_score >= 55.0:
-                chart_engine = _movement_chart_engine(fyers, symbol, is_index)
-
         rows = []
         for _, row in df.iterrows():
             ce_score = _pin_num(row.get("ce_movement_score"), 0.0)
@@ -5453,75 +4980,81 @@ def _movement_search_one(
                 continue
 
             if both_mode:
-                # TOTAL SCANNER: keep the stronger CE/PE activity side, but
-                # direction is independently validated against the underlying.
+                # TOTAL SCANNER: first select the stronger CE/PE activity score
+                # at the SAME strike. Direction is NOT tied to the option type.
+                # CE can be UP or DOWN; PE can also be UP or DOWN.
                 if ce_score > pe_score:
                     side, score = "CE", ce_score
+                    current_option = _pin_num(row.get("ce_ltp"), 0.0)
+                    daily_delta = _pin_num(row.get("ce_change"), 0.0)
                 elif pe_score > ce_score:
                     side, score = "PE", pe_score
+                    current_option = _pin_num(row.get("pe_ltp"), 0.0)
+                    daily_delta = _pin_num(row.get("pe_change"), 0.0)
                 else:
+                    # Tie-breaker only chooses the side; it does NOT decide UP/DOWN.
                     ce_pressure = _pin_num(row.get("buy_pressure"), 50.0)
                     pe_pressure = _pin_num(row.get("sell_pressure"), 50.0)
                     ce_volume = _pin_num(row.get("ce_volume"), 0.0)
                     pe_volume = _pin_num(row.get("pe_volume"), 0.0)
-                    if ce_pressure > pe_pressure or (ce_pressure == pe_pressure and ce_volume >= pe_volume):
+                    if ce_pressure > pe_pressure or (
+                        ce_pressure == pe_pressure and ce_volume >= pe_volume
+                    ):
                         side, score = "CE", ce_score
+                        current_option = _pin_num(row.get("ce_ltp"), 0.0)
+                        daily_delta = _pin_num(row.get("ce_change"), 0.0)
                     else:
                         side, score = "PE", pe_score
+                        current_option = _pin_num(row.get("pe_ltp"), 0.0)
+                        daily_delta = _pin_num(row.get("pe_change"), 0.0)
 
-                ce_price = _pin_num(row.get("ce_ltp"), 0.0)
-                pe_price = _pin_num(row.get("pe_ltp"), 0.0)
-                ce_daily = _pin_num(row.get("ce_change"), 0.0)
-                pe_daily = _pin_num(row.get("pe_change"), 0.0)
-
+                # TRUE direction = option premium movement, never strike movement.
+                # Prefer scan-to-scan LTP history; first scan falls back to FYERS
+                # day's option-price change so the report can still show direction.
                 movement_history = st.session_state.get(MOVEMENT_HISTORY_KEY, {})
                 hkey = _movement_history_key(symbol, expiry, strike)
                 series = movement_history.get(hkey, []) if isinstance(movement_history, dict) else []
                 price_key = "pe_price" if side == "PE" else "ce_price"
-                previous_price = _pin_num(series[-2].get(price_key), 0.0) if len(series) >= 2 else 0.0
-                current_option = pe_price if side == "PE" else ce_price
+                prior_prices = [
+                    _pin_num(x.get(price_key), 0.0)
+                    for x in series[:-1]
+                    if _pin_num(x.get(price_key), 0.0) > 0
+                ]
+                previous_price = prior_prices[-1] if prior_prices else 0.0
                 if current_option > 0 and previous_price > 0:
                     price_delta = current_option - previous_price
                     price_pct = (price_delta / previous_price) * 100.0
                     direction = "UP" if price_delta > 0.005 else ("DOWN" if price_delta < -0.005 else "FLAT")
                     direction_source = "SCAN LTP"
                 else:
-                    daily_delta = pe_daily if side == "PE" else ce_daily
                     price_delta = daily_delta
-                    price_pct = (daily_delta / current_option) * 100.0 if current_option > 0 else 0.0
-                    direction = "UP" if daily_delta > 0.005 else ("DOWN" if daily_delta < -0.005 else "FLAT")
+                    price_pct = (price_delta / current_option) * 100.0 if current_option > 0 else 0.0
+                    direction = "UP" if price_delta > 0.005 else ("DOWN" if price_delta < -0.005 else "FLAT")
                     direction_source = "FYERS CHANGE"
 
-                validation = _directional_confirmation_additive(
-                    symbol, expiry, strike, spot, ce_price, pe_price, ce_daily, pe_daily
-                )
-
-                # IMPORTANT FIX: CE/PE score is activity strength, not direction.
-                # Final Index/F&O direction is produced only by the direction gate.
-                direction_gate = _index_fno_direction_gate(validation, chart_engine)
-                directional_bias = direction_gate["direction"]
-                display_direction = directional_bias
-                direction_confidence = direction_gate["confidence"]
-                direction_reason = direction_gate["reason"]
+                movement_bias = f"{side} {direction}"
 
                 reversal_level, reversal_status = _movement_price_reversal_from_history(
-                    movement_history, symbol, expiry, strike, current_option,
-                    lookback=5, side=side,
+                    movement_history,
+                    symbol,
+                    expiry,
+                    strike,
+                    current_option,
+                    lookback=5,
+                    side=side,
                 )
                 levels = _movement_trade_levels(
-                    row, reversal_level=reversal_level,
-                    reversal_status=reversal_status, side=side
+                    row,
+                    reversal_level=reversal_level,
+                    reversal_status=reversal_status,
                 )
 
                 rows.append({
                     "Instrument": symbol,
                     "Strike": strike,
                     "Option": side,
-                    "Direction": display_direction,
-                    "Status": _movement_search_status(score, display_direction),
-                    "Option Activity": side,
-                    "Direction Confidence": direction_confidence,
-                    "Direction Reason": direction_reason,
+                    "Direction": direction,
+                    "Status": _movement_search_status(score),
                     "Signal Time": levels["Signal Time"],
                     "Entry": levels["Entry"],
                     "Stop Loss": levels["Stop Loss"],
@@ -5531,115 +5064,57 @@ def _movement_search_one(
                     "Early Score": round(_pin_num(row.get("early_movement_score")), 1),
                     "CE Score": round(ce_score, 1),
                     "PE Score": round(pe_score, 1),
-                    "Movement Bias": f"{side} ACTIVITY | {display_direction}",
+                    "Movement Bias": movement_bias,
                     "Price Delta": round(price_delta, 4),
                     "Price Change %": round(price_pct, 2),
                     "Price Direction Source": direction_source,
-                    "CE Price": round(ce_price, 4),
-                    "PE Price": round(pe_price, 4),
+                    "CE Price": round(_pin_num(row.get("ce_ltp"), 0.0), 4),
+                    "PE Price": round(_pin_num(row.get("pe_ltp"), 0.0), 4),
                     "Early Status": str(row.get("early_movement_status", "WAIT")),
                     "Rising Scans": int(_pin_num(row.get("movement_rising_scans"), 0)),
                     "Score Delta": round(_pin_num(row.get("movement_score_delta")), 1),
                     "Confidence": round(_pin_num(row.get("early_movement_confidence")), 1),
                     "Spot": round(spot, 2) if spot else 0.0,
                     "Source": result.get("source", "UNKNOWN"),
-                    "Underlying Direction": validation["underlying_direction"],
-                    "Underlying Direction Source": validation["underlying_direction_source"],
-                    "CE Direction": validation["ce_direction"],
-                    "CE Direction Source": validation["ce_direction_source"],
-                    "PE Direction": validation["pe_direction"],
-                    "PE Direction Source": validation["pe_direction_source"],
-                    "Signal Validation": validation["signal_validation"],
-                    "Signal Valid": "YES" if validation["signal_valid"] else "NO",
-                    "False Signal Reason": validation["false_signal_reason"],
-                    "Directional Bias": directional_bias,
-                    "Directional Rising Scans": validation["directional_rising_scans"],
-                    "CE Scan Delta": validation["ce_scan_delta"],
-                    "PE Scan Delta": validation["pe_scan_delta"],
-                    # NEW movement-engine diagnostics. These are additive and
-                    # do not remove any existing report columns.
-                    "BIG SIGNAL": chart_engine["signal"],
-                    "BIG DIRECTION": chart_engine["direction"],
-                    "BIG SCORE": chart_engine["score"],
-                    "LAST CHART": chart_engine["continuation"],
-                    "STRUCTURE": chart_engine["structure"],
-                    "AMD": chart_engine["amd"],
-                    "LIQUIDITY REACTION": chart_engine["liquidity"],
-                    "BOS/MSS": chart_engine["bos_mss"],
-                    "RVOL": chart_engine["rvol"],
-                    "5M CONFIRM": chart_engine["trend_5m"],
-                    "15M CONFIRM": chart_engine["trend_15m"],
-                    "BIG REASON": " → ".join(chart_engine["reasons"]),
                 })
                 continue
 
-            # Selected-search behavior: validated CE/PE direction, not CE-only.
-            side = "CE" if ce_score >= pe_score else "PE"
-            score = max(ce_score, pe_score)
-            if score < threshold:
+            # ORIGINAL selected-search behavior: CE/UP only.
+            if ce_score < threshold:
+                continue
+            if ce_score <= pe_score + 7.0:
                 continue
 
-            ce_price = _pin_num(row.get("ce_ltp"), 0.0)
-            pe_price = _pin_num(row.get("pe_ltp"), 0.0)
-            ce_daily = _pin_num(row.get("ce_change"), 0.0)
-            pe_daily = _pin_num(row.get("pe_change"), 0.0)
+            current_ce = _pin_num(row.get("ce_ltp"), 0.0)
             movement_history = st.session_state.get(MOVEMENT_HISTORY_KEY, {})
-
-            validation = _directional_confirmation_additive(
-                symbol, expiry, strike, spot, ce_price, pe_price, ce_daily, pe_daily
-            )
-            directional_bias = validation["directional_bias"]
-            selected_price = pe_price if side == "PE" else ce_price
             reversal_level, reversal_status = _movement_price_reversal_from_history(
-                movement_history, symbol, expiry, strike, selected_price,
-                lookback=5, side=side
+                movement_history, symbol, expiry, strike, current_ce, lookback=5
             )
             levels = _movement_trade_levels(
-                row, reversal_level=reversal_level,
-                reversal_status=reversal_status, side=side
+                row, reversal_level=reversal_level, reversal_status=reversal_status
             )
-
-            if validation["signal_validation"] in {"PREMIUM EXPANSION", "PREMIUM CONTRACTION"}:
-                display_direction = "NEUTRAL"
-            elif directional_bias in {"UP", "DOWN"}:
-                display_direction = directional_bias
-            else:
-                display_direction = "WATCH"
-
             rows.append({
-                "Instrument": symbol, "Strike": strike, "Option": side,
-                "Direction": display_direction,
-                "Status": _movement_search_status(score, display_direction),
-                "Signal Time": levels["Signal Time"], "Entry": levels["Entry"],
-                "Stop Loss": levels["Stop Loss"], "Price Reversal": levels["Price Reversal"],
+                "Instrument": symbol,
+                "Strike": strike,
+                "Option": "CE",
+                "Direction": "UP",
+                "Status": _movement_search_status(ce_score),
+                "Signal Time": levels["Signal Time"],
+                "Entry": levels["Entry"],
+                "Stop Loss": levels["Stop Loss"],
+                "Price Reversal": levels["Price Reversal"],
                 "Reversal Status": levels["Reversal Status"],
-                "Score": round(score, 1),
+                "Score": round(ce_score, 1),
                 "Early Score": round(_pin_num(row.get("early_movement_score")), 1),
-                "CE Score": round(ce_score, 1), "PE Score": round(pe_score, 1),
-                "Movement Bias": f"{side} ACTIVITY | {display_direction}",
-                "Price Delta": round(_pin_num(validation.get("selected_scan_delta")), 4),
-                "Price Change %": round(_pin_num(validation.get("selected_price_change_pct")), 2),
-                "Price Direction Source": validation.get("selected_direction_source", "SCAN LTP"),
-                "CE Price": round(ce_price, 4), "PE Price": round(pe_price, 4),
+                "CE Score": round(ce_score, 1),
+                "PE Score": round(pe_score, 1),
+                "Movement Bias": "CE UP",
                 "Early Status": str(row.get("early_movement_status", "WAIT")),
                 "Rising Scans": int(_pin_num(row.get("movement_rising_scans"), 0)),
                 "Score Delta": round(_pin_num(row.get("movement_score_delta")), 1),
                 "Confidence": round(_pin_num(row.get("early_movement_confidence")), 1),
                 "Spot": round(spot, 2) if spot else 0.0,
                 "Source": result.get("source", "UNKNOWN"),
-                "Underlying Direction": validation["underlying_direction"],
-                "Underlying Direction Source": validation["underlying_direction_source"],
-                "CE Direction": validation["ce_direction"],
-                "CE Direction Source": validation["ce_direction_source"],
-                "PE Direction": validation["pe_direction"],
-                "PE Direction Source": validation["pe_direction_source"],
-                "Signal Validation": validation["signal_validation"],
-                "Signal Valid": "YES" if validation["signal_valid"] else "NO",
-                "False Signal Reason": validation["false_signal_reason"],
-                "Directional Bias": directional_bias,
-                "Directional Rising Scans": validation["directional_rising_scans"],
-                "CE Scan Delta": validation["ce_scan_delta"],
-                "PE Scan Delta": validation["pe_scan_delta"],
             })
 
         if not rows:
@@ -5666,16 +5141,17 @@ def _render_movement_search_results(
     is_index: bool,
     strike_count: int = 40,
 ) -> None:
-    """Render selected Index/F&O movement search with validated UP/DOWN direction."""
-    title = "🔎 INDEX MOVEMENT SEARCH" if is_index else "🔎 F&O STOCK MOVEMENT SEARCH"
+    """Render selected Index/F&O movement search; upside CE strikes only."""
+    title = "🔎 INDEX UP-MOVEMENT SEARCH" if is_index else "🔎 F&O STOCK UP-MOVEMENT SEARCH"
 
     st.markdown(
         f'<div class="block-title">{title}</div>',
         unsafe_allow_html=True,
     )
     st.caption(
-        f"Searching **{symbol}** for CE/PE movement with score ≥ {MOVEMENT_SEARCH_MIN_SCORE:.0f}. "
-        "UP/DOWN is shown only after premium + underlying confirmation; CE+PE moving together is NEUTRAL."
+        f"Searching **{symbol}** and showing ONLY CE / UP strikes with "
+        f"movement score ≥ {MOVEMENT_SEARCH_MIN_SCORE:.0f}. "
+        "The Early Score tracks build-up across scans."
     )
 
     if fyers is None and is_index and symbol in NSE_UNSUPPORTED_INDICES:
@@ -5685,7 +5161,7 @@ def _render_movement_search_results(
         )
         return
 
-    with st.spinner(f"Scanning {symbol} for validated UP/DOWN movement strikes…"):
+    with st.spinner(f"Scanning {symbol} for UP movement strikes…"):
         result_df = _movement_search_one(
             fyers, symbol, is_index, strike_count
         )
@@ -5696,13 +5172,13 @@ def _render_movement_search_results(
             st.error(f"❌ Movement search failed: {last_error}")
         else:
             st.info(
-                f"ℹ️ {symbol}: no CE/PE strike currently meets the "
+                f"ℹ️ {symbol}: no CE / UP strike currently meets the "
                 f"{MOVEMENT_SEARCH_MIN_SCORE:.0f}+ movement threshold."
             )
         return
 
     st.success(
-        f"📌 {symbol}: {len(result_df)} validated CE/PE strike(s) found."
+        f"📌 {symbol}: {len(result_df)} UP strike(s) found — CE only."
     )
 
     display_cols = [
@@ -5728,11 +5204,11 @@ def _render_movement_search_results(
     st.dataframe(display_df, use_container_width=True, hide_index=True)
 
     # Additive Excel download for this movement search.
-    excel_buf = _movement_search_excel(result_df, f"{symbol} Movement Search")
+    excel_buf = _movement_search_excel(result_df, f"{symbol} UP Movement Search")
     st.download_button(
-        "📥 Download Movement Excel",
+        "📥 Download UP Movement Excel",
         data=excel_buf,
-        file_name=f"movement_{normalize_stock_symbol(symbol)}_{datetime.now().strftime('%H%M%S')}.xlsx",
+        file_name=f"movement_up_{normalize_stock_symbol(symbol)}_{datetime.now().strftime('%H%M%S')}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         use_container_width=True,
         key=f"movement_excel_{normalize_stock_symbol(symbol)}_{'idx' if is_index else 'fno'}",
@@ -5743,7 +5219,7 @@ def _render_movement_search_results(
         f"{r['Status']} ({r['Score']:.0f})"
         for _, r in result_df.iterrows()
     )
-    st.markdown("**🎯 Validated Movement Strikes:**")
+    st.markdown("**🎯 UP Movement Strikes:**")
     st.info(compact)
 
 
@@ -5762,9 +5238,8 @@ def _render_total_index_movement_search(
         unsafe_allow_html=True,
     )
     st.caption(
-        "Each strike compares CE vs PE activity. The stronger side is shown as ACTIVITY only. "
-        "UP/DOWN is decided independently from the underlying + CE/PE relationship + chart confirmation. "
-        "CE is NOT automatically UP and PE is NOT automatically DOWN."
+        "Each strike compares CE vs PE activity. The stronger side is selected, while UP/DOWN "
+        "is calculated independently from the selected CE/PE premium price movement."
     )
 
     rows = []
@@ -5809,8 +5284,6 @@ def _render_total_index_movement_search(
     )
 
     st.success(f"📊 TOTAL INDEX REPORT: {len(out)} CE/PE movement strike(s) found.")
-    if errors:
-        st.caption(f"⚠️ {len(errors)} index scan error(s) were isolated. First errors: {' | '.join(errors[:5])}")
 
     show_cols = [
         "Instrument", "Strike", "Option", "Direction", "Status",
@@ -5819,12 +5292,6 @@ def _render_total_index_movement_search(
         "Signal Time", "Entry", "Stop Loss", "Price Reversal", "Reversal Status",
         "Score", "Early Score", "Early Status", "Rising Scans",
         "Score Delta", "Confidence", "Spot", "Source",
-        "Underlying Direction", "Underlying Direction Source", "CE Direction", "CE Direction Source",
-        "PE Direction", "PE Direction Source", "Signal Validation", "Signal Valid",
-        "False Signal Reason", "Directional Bias", "Directional Rising Scans", "CE Scan Delta", "PE Scan Delta",
-        "Option Activity", "Direction Confidence", "Direction Reason",
-        "BIG SIGNAL", "BIG DIRECTION", "BIG SCORE", "LAST CHART", "STRUCTURE",
-        "AMD", "LIQUIDITY REACTION", "BOS/MSS", "RVOL", "5M CONFIRM", "15M CONFIRM", "BIG REASON",
     ]
     out_view = out[[c for c in show_cols if c in out.columns]].copy()
     for col in ("Entry", "Stop Loss", "Price Reversal", "Spot"):
@@ -5854,46 +5321,6 @@ def _render_total_index_movement_search(
     st.info(compact)
 
 
-def _movement_scan_symbols_parallel(
-    fyers: Any,
-    symbols: list[str],
-    is_index: bool,
-    strike_count: int,
-    max_workers: int = 6,
-) -> tuple[list[dict[str, Any]], list[str]]:
-    """Scan ALL-F&O symbols safely in the Streamlit session context.
-
-    IMPORTANT: the movement engine uses ``st.session_state`` for scan history,
-    reversal history and early-warning state. Streamlit session state is not
-    thread-safe and calling the engine from ThreadPoolExecutor workers can
-    make every worker fail silently, which produced the user's blank 194-stock
-    report.  Keep this orchestration sequential for correctness.  The scoring
-    and option-chain logic itself is unchanged.
-
-    ``max_workers`` is retained for API compatibility with the existing code.
-    """
-    if not symbols:
-        return [], []
-
-    rows: list[dict[str, Any]] = []
-    errors: list[str] = []
-
-    for idx, sym in enumerate(symbols):
-        try:
-            one = _movement_search_one(
-                fyers, sym, is_index, strike_count,
-                side_mode="BOTH", min_score=0.0,
-            )
-            if one is not None and not one.empty:
-                rows.extend(one.to_dict("records"))
-        except Exception as exc:
-            msg = f"{sym}: {type(exc).__name__}: {exc}"
-            errors.append(msg)
-            logger.warning("Movement scan failed for %s: %s", sym, exc)
-
-    return rows, errors
-
-
 def _render_total_fno_movement_search(
     fyers: Any,
     strike_count: int = 40,
@@ -5909,21 +5336,28 @@ def _render_total_fno_movement_search(
         unsafe_allow_html=True,
     )
     st.caption(
-        f"Scanning {len(movement_fno_universe())} current NSE F&O stocks. "
-        "For every strike: CE score is compared with PE score for activity strength only. "
-        "Final UP/DOWN requires underlying + CE/PE confirmation. CE is not automatically UP; PE is not automatically DOWN."
+        f"Scanning {len(MOVEMENT_FNO_UNIVERSE)} configured F&O stocks. "
+        "For every strike: CE score is compared with PE score; the stronger "
+        "side is shown as CE/UP or PE/DOWN."
     )
 
-    universe = movement_fno_universe()
-    st.caption(
-        f"Scanning {len(universe)} current F&O underlyings. "
-        "Parallel symbol scan + short chart-cache are enabled for faster loading."
-    )
+    rows = []
+    errors = []
     progress = st.progress(0.0)
-    rows, errors = _movement_scan_symbols_parallel(
-        fyers, universe, False, strike_count, max_workers=6
-    )
-    progress.progress(1.0)
+
+    for i, stock in enumerate(MOVEMENT_FNO_UNIVERSE, start=1):
+        try:
+            one = _movement_search_one(
+                fyers, stock, False, strike_count,
+                side_mode="BOTH", min_score=0.0,
+            )
+            if not one.empty:
+                rows.extend(one.to_dict("records"))
+        except Exception as exc:
+            errors.append(f"{stock}: {type(exc).__name__}: {exc}")
+            logger.warning("Total F&O scan failed for %s: %s", stock, exc)
+        progress.progress(i / max(len(MOVEMENT_FNO_UNIVERSE), 1))
+
     progress.empty()
 
     if not rows:
@@ -5951,8 +5385,6 @@ def _render_total_fno_movement_search(
     )
 
     st.success(f"📊 F&O TOTAL REPORT: {len(out)} CE/PE movement strike(s) found.")
-    if errors:
-        st.caption(f"⚠️ {len(errors)} symbol(s) had isolated scan errors; successful symbols are still shown. First errors: {' | '.join(errors[:5])}")
 
     show_cols = [
         "Instrument", "Strike", "Option", "Direction", "Status",
@@ -5961,12 +5393,6 @@ def _render_total_fno_movement_search(
         "Signal Time", "Entry", "Stop Loss", "Price Reversal", "Reversal Status",
         "Score", "Early Score", "Early Status", "Rising Scans",
         "Score Delta", "Confidence", "Spot", "Source",
-        "Underlying Direction", "Underlying Direction Source", "CE Direction", "CE Direction Source",
-        "PE Direction", "PE Direction Source", "Signal Validation", "Signal Valid",
-        "False Signal Reason", "Directional Bias", "Directional Rising Scans", "CE Scan Delta", "PE Scan Delta",
-        "Option Activity", "Direction Confidence", "Direction Reason",
-        "BIG SIGNAL", "BIG DIRECTION", "BIG SCORE", "LAST CHART", "STRUCTURE",
-        "AMD", "LIQUIDITY REACTION", "BOS/MSS", "RVOL", "5M CONFIRM", "15M CONFIRM", "BIG REASON",
     ]
     out_view = out[[c for c in show_cols if c in out.columns]].copy()
     for col in ("Entry", "Stop Loss", "Price Reversal", "Spot"):
@@ -6189,40 +5615,11 @@ def _decorate_live_big_movement_rows(
                 return value.astimezone(INDIA_TZ).strftime("%H:%M:%S")
             return "—"
 
-        # ADDITIVE: make BIG-MOVE identification explicit in the report.
-        # Existing Live Phase / movement logic is preserved unchanged.
-        if live_phase == "BIG MOVEMENT CONFIRMED":
-            big_move_status = "BIG MOVE CONFIRMED"
-        elif live_phase == "BIG MOVEMENT":
-            big_move_status = "BIG MOVE"
-        elif live_phase == "PRE-MOVE":
-            big_move_status = "PRE-MOVE BUILDING"
-        elif live_phase == "BUILDING":
-            big_move_status = "BUILDING"
-        elif live_phase == "BASELINE":
-            big_move_status = "BASELINE"
-        else:
-            big_move_status = "WAIT"
-
-        # Selected option tells which side actually crossed the movement score.
-        if selected_side in ("CE", "PE"):
-            big_move_side = selected_side if current_score >= BIG_MOVEMENT_SCAN_MIN_SCORE else pre_side
-        else:
-            big_move_side = pre_side if pre_side != "WAIT" else "WAIT"
-
-        # A compact strength value for sorting/quick observation.  It does not
-        # replace the existing movement score.
-        big_move_strength = max(ce_strength, pe_strength)
-
         r = row.to_dict()
         r.update({
             "Baseline Time": _fmt_ts(baseline_ts),
             "Pre-Move Time": _fmt_ts(premove_event.get("ts")),
             "Live Phase": live_phase,
-            "BIG MOVE STATUS": big_move_status,
-            "BIG MOVE SIDE": big_move_side,
-            "BIG MOVE SIDE TYPE": "OPTION ACTIVITY SIDE",
-            "BIG MOVE STRENGTH": round(big_move_strength, 1),
             "Pre-Move Side": pre_side,
             "CE Price Δ%": round(ce_pct, 2),
             "PE Price Δ%": round(pe_pct, 2),
@@ -6257,7 +5654,7 @@ def _render_big_movement_scan(
         if is_index_scan
         else "🚨 BIG MOVEMENT — F&O CE / PE"
     )
-    universe = list(INDEX_SYMBOLS.keys()) if is_index_scan else movement_fno_universe()
+    universe = list(INDEX_SYMBOLS.keys()) if is_index_scan else list(MOVEMENT_FNO_UNIVERSE)
     max_rows = (
         BIG_MOVEMENT_SCAN_MAX_ROWS_INDEX
         if is_index_scan
@@ -6269,24 +5666,43 @@ def _render_big_movement_scan(
         unsafe_allow_html=True,
     )
     st.caption(
-        f"Showing existing movement-engine strikes with CE or PE score "
-        f"≥ {BIG_MOVEMENT_SCAN_MIN_SCORE:.0f}. CE/PE is selected at the SAME strike for activity strength; "
-        "final Direction comes from underlying + CE/PE confirmation + chart gate. Premium expansion/contraction is neutral."
+        f"Showing only existing movement-engine strikes with CE or PE score "
+        f"≥ {BIG_MOVEMENT_SCAN_MIN_SCORE:.0f}. CE/PE is selected at the SAME strike; "
+        "Direction is based on the selected option-premium movement."
     )
 
     if not universe:
         st.info("No symbols configured for this scan.")
         return
 
-    if is_index_scan:
-        rows, errors = _movement_scan_symbols_parallel(
-            fyers, universe, True, max(40, int(strike_count)), max_workers=4
-        )
-    else:
-        rows, errors = _movement_scan_symbols_parallel(
-            fyers, universe, False, max(40, int(strike_count)), max_workers=6
-        )
-    progress = st.progress(1.0)
+    rows: list[dict[str, Any]] = []
+    errors: list[str] = []
+    progress = st.progress(0.0)
+
+    for i, symbol in enumerate(universe, start=1):
+        try:
+            # SENSEX/BANKEX-type BSE index chains need FYERS.
+            if is_index_scan and fyers is None and symbol in NSE_UNSUPPORTED_INDICES:
+                errors.append(f"{symbol}: FYERS required")
+                progress.progress(i / max(len(universe), 1))
+                continue
+
+            one = _movement_search_one(
+                fyers,
+                symbol,
+                is_index_scan,
+                strike_count=max(40, int(strike_count)),
+                side_mode="BOTH",
+                min_score=0.0,
+            )
+            if not one.empty:
+                rows.extend(one.to_dict("records"))
+        except Exception as exc:
+            errors.append(f"{symbol}: {type(exc).__name__}: {exc}")
+            logger.warning("Big movement scan failed for %s: %s", symbol, exc)
+
+        progress.progress(i / max(len(universe), 1))
+
     progress.empty()
 
     if not rows:
@@ -6300,18 +5716,17 @@ def _render_big_movement_scan(
 
     out = _decorate_live_big_movement_rows(pd.DataFrame(rows))
 
-    # NEW strict engine gate. The old CE/PE live tracker remains visible,
-    # but it can no longer promote an AMD WATCH / activity-only row into BIG.
-    out["_engine_rank"] = out.get("BIG SIGNAL", "WATCH").map({
-        "BIG BUY": 0,
-        "BIG SELL": 0,
-        "PRE-BIG BUY": 1,
-        "PRE-BIG SELL": 1,
-        "WATCH": 9,
+    out["_phase_rank"] = out.get("Live Phase", "WAIT").map({
+        "BIG MOVEMENT CONFIRMED": 0,
+        "BIG MOVEMENT": 1,
+        "PRE-MOVE": 2,
+        "BUILDING": 3,
+        "BASELINE": 4,
+        "WAIT": 5,
     }).fillna(9)
 
-    out = out[out["BIG SIGNAL"].isin(
-        ["BIG BUY", "BIG SELL", "PRE-BIG BUY", "PRE-BIG SELL"]
+    out = out[out["Live Phase"].isin(
+        ["BIG MOVEMENT CONFIRMED", "BIG MOVEMENT", "PRE-MOVE", "BUILDING"]
     )].copy()
 
     if out.empty:
@@ -6330,9 +5745,9 @@ def _render_big_movement_scan(
         return
 
     # Keep the strongest strike-side candidates first and remove duplicates.
-    sort_cols = [c for c in ["_engine_rank", "BIG SCORE", "Score", "Early Score", "Instrument", "Strike"] if c in out.columns]
+    sort_cols = [c for c in ["_phase_rank", "Score", "Early Score", "Instrument", "Strike"] if c in out.columns]
     if sort_cols:
-        ascending = [True, False, False, False, True, True][:len(sort_cols)]
+        ascending = [True, False, False, True, True][:len(sort_cols)]
         out = out.sort_values(sort_cols, ascending=ascending)
 
     out = out.drop_duplicates(
@@ -6340,16 +5755,14 @@ def _render_big_movement_scan(
         keep="first",
     ).head(max_rows).reset_index(drop=True)
 
-    confirmed = int(out["BIG SIGNAL"].isin(
-        ["BIG BUY", "BIG SELL"]
-    ).sum()) if "BIG SIGNAL" in out.columns else 0
-    premove = int(out["BIG SIGNAL"].isin(
-        ["PRE-BIG BUY", "PRE-BIG SELL"]
-    ).sum()) if "BIG SIGNAL" in out.columns else 0
+    confirmed = int(out["Live Phase"].isin(
+        ["BIG MOVEMENT CONFIRMED", "BIG MOVEMENT"]
+    ).sum()) if "Live Phase" in out.columns else 0
+    premove = int((out["Live Phase"] == "PRE-MOVE").sum()) if "Live Phase" in out.columns else 0
 
     st.success(
         f"📡 LIVE MOVEMENT TRACKER: {len(out)} candidate(s) | "
-        f"PRE-BIG={premove} | BIG={confirmed}"
+        f"PRE-MOVE={premove} | BIG MOVEMENT={confirmed}"
     )
     st.caption(
         "First scan creates the baseline. Later REFRESH/RUN scans compare CE/PE "
@@ -6367,7 +5780,7 @@ def _render_big_movement_scan(
         strike = _pin_num(r.get("Strike"), 0.0)
         ce_price = _pin_num(r.get("CE Price"), 0.0)
         pe_price = _pin_num(r.get("PE Price"), 0.0)
-        phase = str(r.get("BIG SIGNAL", r.get("Live Phase", "WAIT")))
+        phase = str(r.get("Live Phase", "WAIT"))
         pre_side = str(r.get("Pre-Move Side", "WAIT"))
         movement_time = str(r.get("Movement Time", "—"))
         text = (
@@ -6392,10 +5805,8 @@ def _render_big_movement_scan(
 
     show_cols = [
         "Instrument", "Strike", "Option", "Direction", "Status",
-        "Live Phase", "BIG SIGNAL", "BIG DIRECTION", "BIG SCORE",
-        "LAST CHART", "STRUCTURE", "AMD", "LIQUIDITY REACTION", "BOS/MSS",
-        "RVOL", "5M CONFIRM", "15M CONFIRM",
-        "Pre-Move Side", "Baseline Time", "Pre-Move Time", "Movement Time",
+        "Live Phase", "Pre-Move Side", "Baseline Time", "Pre-Move Time",
+        "Movement Time",
         "Score", "CE Score", "PE Score", "CE Score Δ", "PE Score Δ",
         "Movement Bias", "CE Price", "PE Price", "CE Price Δ%", "PE Price Δ%",
         "CE Rising", "PE Rising", "Price Delta", "Price Change %",
@@ -6421,7 +5832,7 @@ def _render_big_movement_scan(
 
     st.dataframe(view, use_container_width=True, hide_index=True)
 
-    export_out = out.drop(columns=["_phase_rank", "_engine_rank"], errors="ignore")
+    export_out = out.drop(columns=["_phase_rank"], errors="ignore")
     excel_buf = _movement_search_excel(
         export_out,
         "BIG Movement Index CE PE" if is_index_scan else "BIG Movement F&O CE PE",
