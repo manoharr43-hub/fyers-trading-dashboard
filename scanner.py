@@ -3,6 +3,7 @@ import pandas as pd
 import numpy as np
 import requests
 import time
+import threading
 import io
 import os
 import re
@@ -254,6 +255,15 @@ DEPTH_MIN_IMBALANCE = 15.0
 DEPTH_STRONG_IMBALANCE = 35.0
 DEPTH_BIG_QTY_MULTIPLIER = 2.0
 DEPTH_TOP_LEVELS = 5
+
+# FYERS REST depth is rate-limited. PIN may scan many candidates, so all
+# depth requests pass through one small limiter instead of firing concurrent
+# requests and producing HTTP 429 for most stocks.
+DEPTH_API_MIN_INTERVAL = 0.18       # ~5.5 requests/sec maximum
+DEPTH_API_RETRIES = 2
+DEPTH_API_BACKOFF = 0.75
+_DEPTH_API_LOCK = threading.Lock()
+_DEPTH_API_LAST_CALL = 0.0
 
 # ════════════════════════════════════════════════════════════════════════════════
 # 15-MIN REVERSAL SCANNER CONSTANTS (ORIGINAL)
@@ -4952,7 +4962,11 @@ def _run_pin_scan(fyers, universe, pin_min=PIN_MIN_CONFIDENCE, pin_mode="ALL"):
     candidate_total = len(candidates)
     if candidate_total:
         done = 0
-        with ThreadPoolExecutor(max_workers=PIN_FAST_WORKERS) as executor:
+        # Stage 2 includes 15M + 1H + live depth. Keep this deliberately
+        # small; the depth function itself is rate-limited, so extra workers
+        # only increase contention and 429 risk.
+        depth_workers = min(2, max(1, int(PIN_FAST_WORKERS)))
+        with ThreadPoolExecutor(max_workers=depth_workers) as executor:
             futures = {
                 executor.submit(_pin_stage2_confirm, fyers, candidate): candidate
                 for candidate in candidates
@@ -5044,14 +5058,41 @@ def fetch_live_market_depth(fyers, symbol: str) -> Dict[str, Any]:
             empty["reason"] = "Invalid NSE equity symbol"
             return empty
 
-        resp = fyers.depth({"symbol": symbol, "ohlcv_flag": "1"})
-        if not isinstance(resp, dict):
-            empty["reason"] = "Invalid FYERS depth response"
-            return empty
+        # Serialize the actual REST request. A worker pool may call this
+        # function from several threads, but FYERS should see a paced stream
+        # of requests rather than a burst. Retry only rate-limit responses.
+        resp = None
+        last_code = None
+        last_message = None
+        for attempt in range(DEPTH_API_RETRIES + 1):
+            global _DEPTH_API_LAST_CALL
+            with _DEPTH_API_LOCK:
+                now = time.monotonic()
+                wait_for = DEPTH_API_MIN_INTERVAL - (now - _DEPTH_API_LAST_CALL)
+                if wait_for > 0:
+                    time.sleep(wait_for)
+                _DEPTH_API_LAST_CALL = time.monotonic()
+                resp = fyers.depth({"symbol": symbol, "ohlcv_flag": "1"})
 
-        api_status = str(resp.get("s", "")).lower()
-        api_code = resp.get("code")
-        api_message = resp.get("message")
+            if not isinstance(resp, dict):
+                empty["reason"] = "Invalid FYERS depth response"
+                return empty
+
+            api_status = str(resp.get("s", "")).lower()
+            api_code = resp.get("code")
+            api_message = str(resp.get("message") or "")
+            last_code, last_message = api_code, api_message
+            is_rate_limited = str(api_code) == "429" or "rate limit" in api_message.lower() or "request limit" in api_message.lower()
+            if not (api_status == "error" or (api_code not in (None, 0, "0", ""))):
+                break
+            if not is_rate_limited or attempt >= DEPTH_API_RETRIES:
+                empty["reason"] = f"FYERS depth API {api_code}: {api_message or 'Unknown error'}"
+                return empty
+            time.sleep(DEPTH_API_BACKOFF * (attempt + 1))
+
+        api_status = str(resp.get("s", "")).lower() if isinstance(resp, dict) else "error"
+        api_code = resp.get("code") if isinstance(resp, dict) else last_code
+        api_message = resp.get("message") if isinstance(resp, dict) else last_message
         if api_status == "error" or (api_code not in (None, 0, "0", "")):
             empty["reason"] = f"FYERS depth API {api_code}: {api_message or 'Unknown error'}"
             return empty
@@ -5211,7 +5252,7 @@ def _depth_candidate_symbols(fyers, all_symbols, limit=30, extra_symbols=None):
         return ordered
     return ordered[:target]
 
-def run_live_depth_scan(fyers, symbols, max_workers=4):
+def run_live_depth_scan(fyers, symbols, max_workers=1):
     """Fetch real FYERS market-depth snapshots with a small worker pool."""
 
     symbols = _validate_symbols(symbols)
