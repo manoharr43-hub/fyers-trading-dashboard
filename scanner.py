@@ -4570,11 +4570,20 @@ PIN_PIVOT_LEN = 5
 PIN_EQUAL_ATR_TOL = 0.15
 PIN_BIGMOVE_MIN_SCORE = 70
 PIN_MAX_SCAN = None  # Full NSE/F&O universe; no artificial 100-stock limit
+PIN_SWEEP_RVOL_MIN = 1.50
+PIN_SWEEP_RVOL_STRONG = 2.00
+PIN_SWEEP_VOLUME_LOOKBACK = 20
 
 
 def calculate_pin_rules(df_5m: pd.DataFrame, data_5m: Dict[str, Any], data_15m: Dict[str, Any], data_1h: Dict[str, Any]) -> Dict[str, Any]:
-    """Rule-based implementation of the supplied Pine 'AI PRO v3' ideas.
-    This is NOT machine-learning AI and it does not access the exchange order book.
+    """PIN engine with confirmed liquidity, sweep and post-sweep volume confirmation.
+
+    TOP LIQUIDITY  = BUY-SIDE liquidity at the latest confirmed swing high.
+    BOTTOM LIQUIDITY = SELL-SIDE liquidity at the latest confirmed swing low.
+
+    A sweep is only confirmed after price takes the level and closes back inside.
+    Volume/RVOL is checked AFTER the sweep. Weak volume keeps the sweep in WAIT.
+    Existing PIN, reversal and big-move logic is preserved.
     """
     out = {
         "PIN SIGNAL": "WAIT", "PIN SCORE": 0.0, "LIQUIDITY": "NONE",
@@ -4584,7 +4593,12 @@ def calculate_pin_rules(df_5m: pd.DataFrame, data_5m: Dict[str, Any], data_15m: 
         "TOP LIQUIDITY SIDE": "BUY-SIDE", "TOP LIQUIDITY STATUS": "NONE",
         "BOTTOM LIQUIDITY": "NONE", "BOTTOM LIQUIDITY LEVEL": None,
         "BOTTOM LIQUIDITY SIDE": "SELL-SIDE", "BOTTOM LIQUIDITY STATUS": "NONE",
-        "SWEEP": "NONE", "REVERSAL": "NONE", "EQUAL HIGH": "NO", "EQUAL LOW": "NO",
+        "SWEEP": "NONE", "SWEEP TYPE": "NONE", "SWEEP PRICE": None,
+        "SWEEP LEVEL": None, "SWEEP VOLUME": 0.0, "AVERAGE VOLUME": 0.0,
+        "SWEEP RVOL": 0.0, "VOLUME CONFIRMATION": "NO SWEEP",
+        "SWEEP STATUS": "NO SWEEP", "SWEEP CONFIDENCE": 0.0,
+        "LIQUIDITY SWEEP SIGNAL": "⚪ NO LIQUIDITY SWEEP",
+        "REVERSAL": "NONE", "EQUAL HIGH": "NO", "EQUAL LOW": "NO",
         "BIG MOVEMENT": "NO", "BIG MOVE SCORE": 0.0, "STRUCTURE": "NONE",
         "5M TREND": data_5m.get("structure_trend", "N/A"),
         "15M TREND": data_15m.get("structure_trend", "N/A"),
@@ -4597,26 +4611,38 @@ def calculate_pin_rules(df_5m: pd.DataFrame, data_5m: Dict[str, Any], data_15m: 
         return out
     try:
         d = df_5m.reset_index(drop=True).copy()
+        required = ["Open", "High", "Low", "Close", "Volume"]
+        if any(x not in d.columns for x in required):
+            out["REASON"] = "Missing OHLCV columns"
+            return out
+        for col in required:
+            d[col] = pd.to_numeric(d[col], errors="coerce")
+        d = d.dropna(subset=required).reset_index(drop=True)
+        if len(d) < 30:
+            out["REASON"] = "Insufficient valid 5M candles"
+            return out
+
         last = d.iloc[-1]
-        o, h, l, c, v = [float(last[x]) for x in ["Open", "High", "Low", "Close", "Volume"]]
+        o, h, l, c, v = [float(last[x]) for x in required]
         body = abs(c-o)
         rng = max(h-l, 1e-9)
         upper_wick = h-max(o,c)
         lower_wick = min(o,c)-l
         atr_s = calculate_atr(d, 14)
-        atr = float(atr_s.iloc[-1]) if pd.notna(atr_s.iloc[-1]) else max(c*0.005, 0.01)
+        atr = float(atr_s.iloc[-1]) if len(atr_s) and pd.notna(atr_s.iloc[-1]) else max(c*0.005, 0.01)
         vwap_s = calculate_vwap(d)
-        vwap = float(vwap_s.iloc[-1]) if len(vwap_s) else c
+        vwap = float(vwap_s.iloc[-1]) if len(vwap_s) and pd.notna(vwap_s.iloc[-1]) else c
         rsi = float(data_5m.get("rsi", 50) or 50)
         rvol = float(data_5m.get("rvol", 0) or 0)
         macd_bull = bool(data_5m.get("macd_bullish", False))
         ema_trend = data_5m.get("ema_trend", "NEUTRAL")
         structure_trend = data_5m.get("structure_trend", "NEUTRAL")
-        bull = c > o; bear = c < o
+        bull = c > o
+        bear = c < o
         strong_bull = bull and body/rng*100 >= 55
         strong_bear = bear and body/rng*100 >= 55
 
-        # Confirmed liquidity pivots. Current candle is never used as a pivot.
+        # Confirmed pivots only. The current candle is never used to create a pivot.
         ph, pl = _confirmed_pivots(d, left=PIN_PIVOT_LEN, right=PIN_PIVOT_LEN)
         last_hi = ph[-1][1] if ph else None
         prev_hi = ph[-2][1] if len(ph) >= 2 else None
@@ -4624,6 +4650,8 @@ def calculate_pin_rules(df_5m: pd.DataFrame, data_5m: Dict[str, Any], data_15m: 
         prev_lo = pl[-2][1] if len(pl) >= 2 else None
         eq_hi = last_hi is not None and prev_hi is not None and abs(last_hi-prev_hi) <= atr*PIN_EQUAL_ATR_TOL
         eq_lo = last_lo is not None and prev_lo is not None and abs(last_lo-prev_lo) <= atr*PIN_EQUAL_ATR_TOL
+
+        # Existing PIN sweep definitions.
         sweep_buy = last_hi is not None and h > last_hi and c < last_hi and upper_wick > body
         sweep_sell = last_lo is not None and l < last_lo and c > last_lo and lower_wick > body
         bullish_sweep = sweep_sell
@@ -4632,20 +4660,25 @@ def calculate_pin_rules(df_5m: pd.DataFrame, data_5m: Dict[str, Any], data_15m: 
         bullish_reversal = bullish_sweep and bull and c > vwap and rsi > 45
         bearish_reversal = bearish_sweep and bear and c < vwap and rsi < 55
 
-        # Pine-style confluence score.
-        buy = 0.0; sell = 0.0
+        # Pine-style confluence score — original scoring retained.
+        buy = 0.0
+        sell = 0.0
         buy += 25 if ema_trend == "BULLISH" and structure_trend == "BULLISH" else 15 if structure_trend == "BULLISH" else 0
         sell += 25 if ema_trend == "BEARISH" and structure_trend == "BEARISH" else 15 if structure_trend == "BEARISH" else 0
         buy += 15 if rsi >= 55 else 7 if rsi >= 50 else 0
         sell += 15 if rsi <= 45 else 7 if rsi <= 50 else 0
-        buy += 15 if c > vwap else 0; sell += 15 if c < vwap else 0
+        buy += 15 if c > vwap else 0
+        sell += 15 if c < vwap else 0
         buy += 20 if macd_bull and float(data_5m.get("macd_hist", 0) or 0) > 0 else 10 if macd_bull else 0
         sell += 20 if (not macd_bull) and float(data_5m.get("macd_hist", 0) or 0) < 0 else 10 if not macd_bull else 0
         buy += 10 if rvol >= 1.5 and bull else 0
         sell += 10 if rvol >= 1.5 and bear else 0
-        buy += 5 if strong_bull else 0; sell += 5 if strong_bear else 0
-        buy += 10 if bullish_sweep else 0; sell += 10 if bearish_sweep else 0
-        buy += 10 if bullish_reversal else 0; sell += 10 if bearish_reversal else 0
+        buy += 5 if strong_bull else 0
+        sell += 5 if strong_bear else 0
+        buy += 10 if bullish_sweep else 0
+        sell += 10 if bearish_sweep else 0
+        buy += 10 if bullish_reversal else 0
+        sell += 10 if bearish_reversal else 0
         pin_score = min(100.0, max(buy, sell))
         direction = "BUY" if buy > sell else "SELL" if sell > buy else "WAIT"
         if pin_score >= PIN_STRONG_CONFIDENCE and direction != "WAIT":
@@ -4660,42 +4693,120 @@ def calculate_pin_rules(df_5m: pd.DataFrame, data_5m: Dict[str, Any], data_15m: 
         structure = bm.get("structure", "NONE")
         liquidity = "EQ HIGH" if eq_hi else "EQ LOW" if eq_lo else "HIGH" if last_hi is not None else "LOW" if last_lo is not None else "NONE"
 
-        # Buy-side liquidity normally sits above confirmed swing highs/equal highs;
-        # sell-side liquidity normally sits below confirmed swing lows/equal lows.
-        # Scores are setup-strength scores, not exchange order-book quantities.
+        # TOP = buy-side liquidity at confirmed high; BOTTOM = sell-side liquidity at confirmed low.
         buy_liq_score = 0.0
         sell_liq_score = 0.0
         if last_hi is not None:
             buy_liq_score += 45
-            if eq_hi:
-                buy_liq_score += 30
-            if h >= last_hi:
-                buy_liq_score += 15
-            if bearish_sweep:
-                buy_liq_score += 10
+            if eq_hi: buy_liq_score += 30
+            if h >= last_hi: buy_liq_score += 15
+            if bearish_sweep: buy_liq_score += 10
         if last_lo is not None:
             sell_liq_score += 45
-            if eq_lo:
-                sell_liq_score += 30
-            if l <= last_lo:
-                sell_liq_score += 15
-            if bullish_sweep:
-                sell_liq_score += 10
+            if eq_lo: sell_liq_score += 30
+            if l <= last_lo: sell_liq_score += 15
+            if bullish_sweep: sell_liq_score += 10
         buy_liq_score = min(100.0, buy_liq_score)
         sell_liq_score = min(100.0, sell_liq_score)
-        buy_liq = ("HIGH" if buy_liq_score >= 70 else "MEDIUM" if buy_liq_score >= 40 else "LOW" if buy_liq_score > 0 else "NONE")
-        sell_liq = ("HIGH" if sell_liq_score >= 70 else "MEDIUM" if sell_liq_score >= 40 else "LOW" if sell_liq_score > 0 else "NONE")
+        buy_liq = "HIGH" if buy_liq_score >= 70 else "MEDIUM" if buy_liq_score >= 40 else "LOW" if buy_liq_score > 0 else "NONE"
+        sell_liq = "HIGH" if sell_liq_score >= 70 else "MEDIUM" if sell_liq_score >= 40 else "LOW" if sell_liq_score > 0 else "NONE"
 
-        # Explicit TOP/BOTTOM liquidity identification.
-        # TOP = buy-side liquidity above the latest confirmed swing/equal high.
-        # BOTTOM = sell-side liquidity below the latest confirmed swing/equal low.
         top_liq = "TOP BUY LIQ" if last_hi is not None else "NONE"
         bottom_liq = "BOTTOM SELL LIQ" if last_lo is not None else "NONE"
         top_status = "SWEPT" if bearish_sweep else "ACTIVE" if last_hi is not None else "NONE"
         bottom_status = "SWEPT" if bullish_sweep else "ACTIVE" if last_lo is not None else "NONE"
 
+        # ────────────────────────────────────────────────────────────────────────
+        # NEW: LIQUIDITY → SWEEP → POST-SWEEP VOLUME CONFIRMATION
+        # ────────────────────────────────────────────────────────────────────────
+        lookback = min(PIN_SWEEP_VOLUME_LOOKBACK, max(len(d)-1, 1))
+        previous_volumes = pd.to_numeric(d["Volume"].iloc[-lookback-1:-1], errors="coerce").dropna()
+        average_volume = float(previous_volumes.mean()) if not previous_volumes.empty else 0.0
+        sweep_rvol = (v / average_volume) if average_volume > 0 else 0.0
+
+        top_liquidity_swept = bool(last_hi is not None and h > float(last_hi) and c < float(last_hi))
+        bottom_liquidity_swept = bool(last_lo is not None and l < float(last_lo) and c > float(last_lo))
+
+        # The old sweep requires wick rejection. Keep that as the strict sweep;
+        # the new post-sweep layer additionally verifies close-back + volume.
+        if bearish_sweep:
+            sweep_type = "HIGH / BUY-SIDE SWEEP"
+            sweep_price = h
+            sweep_level = float(last_hi)
+            sweep_kind = "HIGH"
+        elif bullish_sweep:
+            sweep_type = "LOW / SELL-SIDE SWEEP"
+            sweep_price = l
+            sweep_level = float(last_lo)
+            sweep_kind = "LOW"
+        elif top_liquidity_swept:
+            sweep_type = "HIGH / BUY-SIDE SWEEP — REJECTION CHECK"
+            sweep_price = h
+            sweep_level = float(last_hi)
+            sweep_kind = "HIGH"
+        elif bottom_liquidity_swept:
+            sweep_type = "LOW / SELL-SIDE SWEEP — REJECTION CHECK"
+            sweep_price = l
+            sweep_level = float(last_lo)
+            sweep_kind = "LOW"
+        else:
+            sweep_type = "NONE"
+            sweep_price = None
+            sweep_level = None
+            sweep_kind = "NONE"
+
+        strict_sweep = bearish_sweep or bullish_sweep
+        if strict_sweep:
+            if sweep_rvol >= PIN_SWEEP_RVOL_STRONG:
+                volume_confirmation = "STRONG"
+                sweep_status = "STRONG CONFIRMED"
+                sweep_confidence = 100.0
+            elif sweep_rvol >= PIN_SWEEP_RVOL_MIN:
+                volume_confirmation = "CONFIRMED"
+                sweep_status = "CONFIRMED"
+                sweep_confidence = 85.0
+            else:
+                volume_confirmation = "WEAK"
+                sweep_status = "WAIT — VOLUME WEAK"
+                sweep_confidence = 55.0
+        elif top_liquidity_swept or bottom_liquidity_swept:
+            volume_confirmation = "WEAK" if sweep_rvol < PIN_SWEEP_RVOL_MIN else "CONFIRMED"
+            sweep_status = "WAIT — WICK/REJECTION NOT CONFIRMED"
+            sweep_confidence = 35.0 if sweep_rvol < PIN_SWEEP_RVOL_MIN else 50.0
+        else:
+            volume_confirmation = "NO SWEEP"
+            sweep_status = "NO SWEEP"
+            sweep_confidence = 0.0
+
+        if sweep_kind == "HIGH":
+            if volume_confirmation == "STRONG":
+                liquidity_sweep_signal = "🔴 HIGH SWEEP + STRONG VOLUME"
+            elif volume_confirmation == "CONFIRMED":
+                liquidity_sweep_signal = "🔴 HIGH SWEEP + VOLUME CONFIRMED"
+            else:
+                liquidity_sweep_signal = "🟡 HIGH SWEEP — WAIT VOLUME"
+        elif sweep_kind == "LOW":
+            if volume_confirmation == "STRONG":
+                liquidity_sweep_signal = "🟢 LOW SWEEP + STRONG VOLUME"
+            elif volume_confirmation == "CONFIRMED":
+                liquidity_sweep_signal = "🟢 LOW SWEEP + VOLUME CONFIRMED"
+            else:
+                liquidity_sweep_signal = "🟡 LOW SWEEP — WAIT VOLUME"
+        else:
+            liquidity_sweep_signal = "⚪ NO LIQUIDITY SWEEP"
+
         sweep = "🟢 LOW SWEPT" if bullish_sweep else "🔴 HIGH SWEPT" if bearish_sweep else "NONE"
         reversal = "🟢 BULL REVERSAL" if bullish_reversal else "🔴 BEAR REVERSAL" if bearish_reversal else "NONE"
+
+        reasons = [
+            "EQ HIGH" if eq_hi else "",
+            "EQ LOW" if eq_lo else "",
+            "LOW SWEEP" if bullish_sweep else "HIGH SWEEP" if bearish_sweep else "",
+            "VOLUME CONFIRMED" if volume_confirmation in ("CONFIRMED", "STRONG") else "",
+            "BULL REVERSAL" if bullish_reversal else "BEAR REVERSAL" if bearish_reversal else "",
+            "BIG MOVE" if bm.get("direction") in ["UP", "DOWN"] else "",
+        ]
+
         out.update({
             "PIN SIGNAL": pin_signal, "PIN SCORE": round(pin_score, 1),
             "LIQUIDITY": liquidity,
@@ -4710,20 +4821,26 @@ def calculate_pin_rules(df_5m: pd.DataFrame, data_5m: Dict[str, Any], data_15m: 
             "BOTTOM LIQUIDITY LEVEL": round(float(last_lo), 2) if last_lo is not None else None,
             "BOTTOM LIQUIDITY SIDE": "SELL-SIDE",
             "BOTTOM LIQUIDITY STATUS": bottom_status,
-            "SWEEP": sweep, "REVERSAL": reversal,
+            "SWEEP": sweep,
+            "SWEEP TYPE": sweep_type,
+            "SWEEP PRICE": round(float(sweep_price), 2) if sweep_price is not None else None,
+            "SWEEP LEVEL": round(float(sweep_level), 2) if sweep_level is not None else None,
+            "SWEEP VOLUME": round(v, 0),
+            "AVERAGE VOLUME": round(average_volume, 0),
+            "SWEEP RVOL": round(sweep_rvol, 2),
+            "VOLUME CONFIRMATION": volume_confirmation,
+            "SWEEP STATUS": sweep_status,
+            "SWEEP CONFIDENCE": round(sweep_confidence, 1),
+            "LIQUIDITY SWEEP SIGNAL": liquidity_sweep_signal,
+            "REVERSAL": reversal,
             "EQUAL HIGH": "YES" if eq_hi else "NO", "EQUAL LOW": "YES" if eq_lo else "NO",
             "BIG MOVEMENT": bm.get("signal", "NO BIG MOVE"),
             "BIG MOVE SCORE": bm.get("score", 0.0), "STRUCTURE": structure,
-            "REASON": " | ".join([x for x in [
-                "EQ HIGH" if eq_hi else "", "EQ LOW" if eq_lo else "",
-                "LOW SWEEP" if bullish_sweep else "HIGH SWEEP" if bearish_sweep else "",
-                "BULL REVERSAL" if bullish_reversal else "BEAR REVERSAL" if bearish_reversal else "",
-                "BIG MOVE" if bm.get("direction") in ["UP", "DOWN"] else ""
-            ] if x]) or "No PIN confirmation"
+            "REASON": " | ".join([x for x in reasons if x]) or "No PIN confirmation"
         })
         return out
     except Exception as e:
-        out["REASON"] = f"PIN error: {type(e).__name__}"
+        out["REASON"] = f"PIN error: {type(e).__name__}: {str(e)[:120]}"
         return out
 
 
@@ -5622,7 +5739,9 @@ def _show_pin_rules_tab(fyers, all_symbols=None, fo_symbols=None) -> None:
             "TOP LIQUIDITY", "TOP LIQUIDITY LEVEL", "TOP LIQUIDITY SIDE", "TOP LIQUIDITY STATUS",
             "BOTTOM LIQUIDITY", "BOTTOM LIQUIDITY LEVEL", "BOTTOM LIQUIDITY SIDE", "BOTTOM LIQUIDITY STATUS",
             "BUY LIQUIDITY", "BUY LIQUIDITY SCORE", "SELL LIQUIDITY", "SELL LIQUIDITY SCORE",
-            "SWEEP", "REVERSAL", "EQUAL HIGH", "EQUAL LOW", "BIG MOVEMENT", "BIG MOVE SCORE",
+            "SWEEP", "SWEEP TYPE", "SWEEP LEVEL", "SWEEP PRICE", "SWEEP VOLUME", "AVERAGE VOLUME",
+            "SWEEP RVOL", "VOLUME CONFIRMATION", "SWEEP STATUS", "SWEEP CONFIDENCE",
+            "LIQUIDITY SWEEP SIGNAL", "REVERSAL", "EQUAL HIGH", "EQUAL LOW", "BIG MOVEMENT", "BIG MOVE SCORE",
             "ORDER FLOW", "ORDER FLOW STRENGTH %", "DEPTH IMBALANCE %",
             "TOTAL BUY QTY", "TOTAL SELL QTY", "BEST BID", "BEST ASK",
             "ORDER FLOW PIN", "PIN OF CONFIRMATION", "BASE PIN SCORE",
