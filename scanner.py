@@ -4838,6 +4838,56 @@ def calculate_pin_rules(df_5m: pd.DataFrame, data_5m: Dict[str, Any], data_15m: 
             "BIG MOVE SCORE": bm.get("score", 0.0), "STRUCTURE": structure,
             "REASON": " | ".join([x for x in reasons if x]) or "No PIN confirmation"
         })
+
+        # FINAL PIN LIQUIDITY-SWEEP GATE
+        # A detected sweep must not blindly inherit an opposite BUY/SELL signal.
+        # Sweep direction is treated as reaction context only after strict wick/
+        # rejection confirmation and post-sweep volume confirmation.
+        if sweep_kind in ("HIGH", "LOW"):
+            expected_direction = "SELL" if sweep_kind == "HIGH" else "BUY"
+            base_signal_text = str(out.get("PIN SIGNAL", "WAIT")).upper()
+
+            if not strict_sweep:
+                # Price took the level but the strict wick/rejection rule failed.
+                out["PIN SIGNAL"] = "🟡 WAIT — SWEEP REJECTION NOT CONFIRMED"
+                out["REASON"] = (
+                    f"{out.get('REASON', 'PIN')} | "
+                    f"{sweep_kind} LIQUIDITY TAKE WITHOUT STRICT REJECTION | WAIT"
+                )
+            elif volume_confirmation not in ("CONFIRMED", "STRONG"):
+                # Strict sweep exists, but volume is not strong enough yet.
+                out["PIN SIGNAL"] = f"🟡 WAIT — {sweep_kind} SWEEP VOLUME WEAK"
+                out["REASON"] = (
+                    f"{out.get('REASON', 'PIN')} | "
+                    f"{sweep_kind} SWEEP | RVOL {sweep_rvol:.2f} | WAIT FOR VOLUME"
+                )
+            else:
+                # Confirmed sweep: do not allow the opposite base direction to
+                # masquerade as a confirmed PIN signal.
+                if expected_direction == "BUY":
+                    if "BUY" in base_signal_text and "SELL" not in base_signal_text:
+                        out["PIN SIGNAL"] = (
+                            "🟢 STRONG BUY — LIQUIDITY SWEEP"
+                            if volume_confirmation == "STRONG" and pin_score >= PIN_STRONG_CONFIDENCE
+                            else "🟢 BUY — LIQUIDITY SWEEP CONFIRMED"
+                        )
+                    else:
+                        out["PIN SIGNAL"] = "🟢 BUY WATCH — LIQUIDITY SWEEP CONFIRMED"
+                else:
+                    if "SELL" in base_signal_text and "BUY" not in base_signal_text:
+                        out["PIN SIGNAL"] = (
+                            "🔴 STRONG SELL — LIQUIDITY SWEEP"
+                            if volume_confirmation == "STRONG" and pin_score >= PIN_STRONG_CONFIDENCE
+                            else "🔴 SELL — LIQUIDITY SWEEP CONFIRMED"
+                        )
+                    else:
+                        out["PIN SIGNAL"] = "🔴 SELL WATCH — LIQUIDITY SWEEP CONFIRMED"
+
+                out["REASON"] = (
+                    f"{out.get('REASON', 'PIN')} | "
+                    f"{sweep_kind} SWEEP + CLOSE-BACK + {volume_confirmation} VOLUME"
+                )
+
         return out
     except Exception as e:
         out["REASON"] = f"PIN error: {type(e).__name__}: {str(e)[:120]}"
