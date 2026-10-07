@@ -4787,8 +4787,106 @@ def _pin_stage1_candidate(fyers, symbol):
         return None, f"{display_symbol}: {type(e).__name__}: {str(e)[:100]}"
 
 
+def _pin_apply_order_flow_confirmation(fyers, pin: Dict[str, Any], symbol: str) -> Dict[str, Any]:
+    """Add real FYERS live-depth confirmation to an existing PIN result.
+
+    The original PIN score remains available as BASE PIN SCORE. Order Flow is a
+    confirmation layer only: it cannot create a BUY/SELL signal when the original
+    PIN engine is WAIT. This keeps the old liquidity/sweep/reversal logic intact.
+    """
+    out = dict(pin or {})
+    base_score = float(out.get("PIN SCORE", 0) or 0)
+    out["BASE PIN SCORE"] = round(base_score, 1)
+    defaults = {
+        "ORDER FLOW STATUS": "DATA_UNAVAILABLE",
+        "BEST BID": None, "BEST ASK": None,
+        "TOTAL BUY QTY": 0.0, "TOTAL SELL QTY": 0.0,
+        "DEPTH IMBALANCE %": 0.0,
+        "ORDER FLOW BUY SCORE": 0.0, "ORDER FLOW SELL SCORE": 0.0,
+        "ORDER FLOW": "WAIT", "ORDER FLOW STRENGTH %": 0.0,
+        "ORDER FLOW PIN": "WAIT", "ORDER FLOW REASON": "No live depth data",
+        "PIN OF CONFIRMATION": "NONE",
+    }
+    out.update(defaults)
+    try:
+        depth = fetch_live_market_depth(fyers, symbol)
+        if not isinstance(depth, dict):
+            return out
+
+        status = str(depth.get("status", "DATA_UNAVAILABLE"))
+        out["ORDER FLOW STATUS"] = status
+        out["BEST BID"] = depth.get("best_bid")
+        out["BEST ASK"] = depth.get("best_ask")
+        out["TOTAL BUY QTY"] = round(float(depth.get("total_buy_qty", 0) or 0), 0)
+        out["TOTAL SELL QTY"] = round(float(depth.get("total_sell_qty", 0) or 0), 0)
+        out["DEPTH IMBALANCE %"] = round(float(depth.get("depth_imbalance", 0) or 0), 2)
+        out["ORDER FLOW BUY SCORE"] = round(float(depth.get("buy_score", 0) or 0), 1)
+        out["ORDER FLOW SELL SCORE"] = round(float(depth.get("sell_score", 0) or 0), 1)
+        out["ORDER FLOW"] = str(depth.get("direction", "WAIT"))
+        out["ORDER FLOW STRENGTH %"] = round(float(depth.get("strength", 0) or 0), 1)
+        out["ORDER FLOW PIN"] = str(depth.get("pin", "WAIT"))
+        out["ORDER FLOW REASON"] = str(depth.get("reason", "Live depth snapshot"))
+
+        base_signal = str(out.get("PIN SIGNAL", "WAIT")).upper()
+        base_direction = "BUY" if "BUY" in base_signal else "SELL" if "SELL" in base_signal else "WAIT"
+        of_direction = str(depth.get("direction", "WAIT")).upper()
+        of_strength = float(depth.get("strength", 50) or 50)
+        imbalance = float(depth.get("depth_imbalance", 0) or 0)
+
+        # Confirmation is deliberately modest: depth should confirm PIN, not
+        # overpower the candle/structure/liquidity engine.
+        final_score = base_score
+        confirmation = "NONE"
+        if base_direction in ("BUY", "SELL") and of_direction == base_direction:
+            bonus = min(12.0, max(0.0, of_strength - 50.0) * 0.24)
+            final_score = min(100.0, base_score + bonus)
+            confirmation = "CONFIRMED" if of_strength >= 65 else "ALIGNED"
+        elif base_direction in ("BUY", "SELL") and of_direction in ("BUY", "SELL") and of_direction != base_direction:
+            penalty = min(15.0, max(0.0, of_strength - 50.0) * 0.30)
+            final_score = max(0.0, base_score - penalty)
+            confirmation = "CONTRADICTION"
+        elif base_direction in ("BUY", "SELL") and of_direction == "WAIT":
+            confirmation = "NO CONFIRMATION"
+
+        out["PIN SCORE"] = round(final_score, 1)
+        out["PIN OF CONFIRMATION"] = confirmation
+
+        # Rebuild the displayed PIN label from the original direction and the
+        # combined score. A conflicting live book can downgrade a strong label.
+        if base_direction == "BUY" and confirmation != "CONTRADICTION":
+            if final_score >= PIN_STRONG_CONFIDENCE and confirmation == "CONFIRMED":
+                out["PIN SIGNAL"] = "🟢 STRONG BUY + ORDER FLOW"
+            elif final_score >= PIN_MIN_CONFIDENCE:
+                out["PIN SIGNAL"] = "🟢 BUY + ORDER FLOW" if confirmation == "CONFIRMED" else "🟢 BUY"
+            else:
+                out["PIN SIGNAL"] = "🟡 BUY WATCH"
+        elif base_direction == "SELL" and confirmation != "CONTRADICTION":
+            if final_score >= PIN_STRONG_CONFIDENCE and confirmation == "CONFIRMED":
+                out["PIN SIGNAL"] = "🔴 STRONG SELL + ORDER FLOW"
+            elif final_score >= PIN_MIN_CONFIDENCE:
+                out["PIN SIGNAL"] = "🔴 SELL + ORDER FLOW" if confirmation == "CONFIRMED" else "🔴 SELL"
+            else:
+                out["PIN SIGNAL"] = "🟡 SELL WATCH"
+        elif base_direction in ("BUY", "SELL") and confirmation == "CONTRADICTION":
+            out["PIN SIGNAL"] = f"🟠 {base_direction} — ORDER FLOW CONTRADICTION"
+        else:
+            out["PIN SIGNAL"] = "🟡 WAIT"
+
+        if confirmation == "CONFIRMED":
+            out["REASON"] = f"{out.get('REASON', 'PIN')} | LIVE ORDER FLOW {of_direction} {of_strength:.0f}% | Imbalance {imbalance:+.1f}%"
+        elif confirmation == "CONTRADICTION":
+            out["REASON"] = f"{out.get('REASON', 'PIN')} | ORDER FLOW CONTRADICTION {of_direction} {of_strength:.0f}% | Imbalance {imbalance:+.1f}%"
+        else:
+            out["REASON"] = f"{out.get('REASON', 'PIN')} | ORDER FLOW {of_direction} {of_strength:.0f}%"
+        return out
+    except Exception as e:
+        out["ORDER FLOW STATUS"] = "ERROR"
+        out["ORDER FLOW REASON"] = f"Order Flow error: {type(e).__name__}: {str(e)[:100]}"
+        return out
+
+
 def _pin_stage2_confirm(fyers, candidate):
-    """Fetch higher timeframes only for stage-1 candidates."""
+    """Fetch higher timeframes and live FYERS Order Flow for stage-1 candidates."""
     symbol = candidate["symbol"]
     display_symbol = candidate["display"]
     try:
@@ -4804,6 +4902,9 @@ def _pin_stage2_confirm(fyers, candidate):
         )
         pin["Symbol"] = display_symbol
         pin["LTP"] = (a5.get("data", {}) or {}).get("close", "N/A")
+
+        # Add live Order Flow confirmation without replacing the existing PIN rules.
+        pin = _pin_apply_order_flow_confirmation(fyers, pin, symbol)
         return pin, None
     except Exception as e:
         return None, f"{display_symbol}: {type(e).__name__}: {str(e)[:100]}"
@@ -5408,6 +5509,10 @@ def _show_pin_rules_tab(fyers, all_symbols=None, fo_symbols=None) -> None:
         **Confluence:** Trend + RSI + VWAP + MACD + RVOL + candle + sweep + reversal.
         
         **Big Movement:** existing consolidation-breakout + candle + RVOL + structure engine.
+
+        **Live Order Flow:** real FYERS bid/ask depth is used only as PIN confirmation.
+        Same direction = confirmation/bonus; opposite direction = contradiction/penalty.
+        Order Flow cannot create a BUY/SELL PIN when the original PIN engine is WAIT.
         """)
 
     # FULL UNIVERSE MODE: PIN is completely independent from nse_df/fo_df.
@@ -5464,6 +5569,12 @@ def _show_pin_rules_tab(fyers, all_symbols=None, fo_symbols=None) -> None:
         pc2.metric("🟢 BUY", int(signal_series.str.contains("BUY", na=False).sum()))
         pc3.metric("🔴 SELL", int(signal_series.str.contains("SELL", na=False).sum()))
         pc4.metric("💧 SWEEPS", int((sweep_series != "NONE").sum()))
+        of_series = pin_df["PIN OF CONFIRMATION"].astype(str).str.upper() if "PIN OF CONFIRMATION" in pin_df.columns else pd.Series(dtype=str)
+        if not of_series.empty:
+            oc1, oc2, oc3 = st.columns(3)
+            oc1.metric("📖 ORDER FLOW CONFIRMED", int((of_series == "CONFIRMED").sum()))
+            oc2.metric("🟠 CONTRADICTION", int((of_series == "CONTRADICTION").sum()))
+            oc3.metric("⚪ NO CONFIRMATION", int((of_series.isin(["NO CONFIRMATION", "NONE"])).sum()))
 
         display_cols = [
             "Symbol", "LTP", "PIN SIGNAL", "PIN SCORE", "LIQUIDITY",
@@ -5471,8 +5582,11 @@ def _show_pin_rules_tab(fyers, all_symbols=None, fo_symbols=None) -> None:
             "BOTTOM LIQUIDITY", "BOTTOM LIQUIDITY LEVEL", "BOTTOM LIQUIDITY SIDE", "BOTTOM LIQUIDITY STATUS",
             "BUY LIQUIDITY", "BUY LIQUIDITY SCORE", "SELL LIQUIDITY", "SELL LIQUIDITY SCORE",
             "SWEEP", "REVERSAL", "EQUAL HIGH", "EQUAL LOW", "BIG MOVEMENT", "BIG MOVE SCORE",
+            "ORDER FLOW", "ORDER FLOW STRENGTH %", "DEPTH IMBALANCE %",
+            "TOTAL BUY QTY", "TOTAL SELL QTY", "BEST BID", "BEST ASK",
+            "ORDER FLOW PIN", "PIN OF CONFIRMATION", "BASE PIN SCORE",
             "STRUCTURE", "5M TREND", "15M TREND", "1H TREND", "RVOL", "RSI",
-            "PRESSURE", "AI CONFIDENCE %", "AI SIGNAL", "REASON"
+            "PRESSURE", "AI CONFIDENCE %", "AI SIGNAL", "ORDER FLOW REASON", "REASON"
         ]
         display_cols = [c for c in display_cols if c in pin_df.columns]
         display_cols = ["SIGNAL TIME"] + [c for c in display_cols if c != "SIGNAL TIME"]
