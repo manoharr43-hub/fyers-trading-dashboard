@@ -6439,12 +6439,12 @@ def run_dashboard(fyers: Any = None) -> None:
     st.divider()
 
     if state.get("price_action_data") and state["price_action_data"].get("df_dict"):
-        tab_chain, tab_charts, tab_pressure, tab_orderflow, tab_movement, tab_greeks, tab_ai, tab_gex, tab_po3, tab_price_action, tab_sell_confirm, tab_export = st.tabs([
-            "📋 Chain", "📈 OI", "💪 Pressure", "📊 Order Flow", "🎯 Strike Movement", "🧮 Greeks", "🤖 AI", "⚡ GEX", "🧠 PO3 Intelligence", "💹 Price Action", "🔴 SELL CONFIRM", "📥 Export",
+        tab_chain, tab_charts, tab_pressure, tab_orderflow, tab_movement, tab_prebreakout, tab_greeks, tab_ai, tab_gex, tab_po3, tab_price_action, tab_sell_confirm, tab_export = st.tabs([
+            "📋 Chain", "📈 OI", "💪 Pressure", "📊 Order Flow", "🎯 Strike Movement", "🚀 PRE-BREAKOUT (Index & F&O)", "🧮 Greeks", "🤖 AI", "⚡ GEX", "🧠 PO3 Intelligence", "💹 Price Action", "🔴 SELL CONFIRM", "📥 Export",
         ])
     else:
-        tab_chain, tab_charts, tab_pressure, tab_orderflow, tab_movement, tab_greeks, tab_ai, tab_gex, tab_po3, tab_sell_confirm, tab_export = st.tabs([
-            "📋 Chain", "📈 OI", "💪 Pressure", "📊 Order Flow", "🎯 Strike Movement", "🧮 Greeks", "🤖 AI", "⚡ GEX", "🧠 PO3 Intelligence", "🔴 SELL CONFIRM", "📥 Export",
+        tab_chain, tab_charts, tab_pressure, tab_orderflow, tab_movement, tab_prebreakout, tab_greeks, tab_ai, tab_gex, tab_po3, tab_sell_confirm, tab_export = st.tabs([
+            "📋 Chain", "📈 OI", "💪 Pressure", "📊 Order Flow", "🎯 Strike Movement", "🚀 PRE-BREAKOUT (Index & F&O)", "🧮 Greeks", "🤖 AI", "⚡ GEX", "🧠 PO3 Intelligence", "🔴 SELL CONFIRM", "📥 Export",
         ])
 
     with tab_chain:
@@ -6595,22 +6595,6 @@ def run_dashboard(fyers: Any = None) -> None:
                     hide_index=True
                 )
 
-            # NEW: early pre-breakout watch, kept separate from BUY/SELL signals.
-            pre_cols = [c for c in [
-                "strike_price", "prebreakout_status", "prebreakout_direction",
-                "prebreakout_score", "prebreakout_reasons", "prebreakout_trigger_price",
-                "prebreakout_distance_pct", "prebreakout_data_mode"
-            ] if c in df.columns]
-            if pre_cols:
-                pre_view = df[df["prebreakout_status"].isin(["PRE-BREAKOUT WATCH", "BUILDING"])][pre_cols].copy()
-                if not pre_view.empty:
-                    pre_view = pre_view.sort_values("prebreakout_score", ascending=False).head(top_n)
-                    st.markdown("#### 🧭 Pre-Breakout Watch — before breakout confirmation")
-                    st.caption("Watchlist only: direction is a bias, not a guaranteed prediction or automatic trade.")
-                    st.dataframe(pre_view, use_container_width=True, hide_index=True)
-                else:
-                    st.info("No pre-breakout setup meets the current filter. Keep monitoring; do not force a signal.")
-
             st.dataframe(
                 move_view.head(top_n),
                 use_container_width=True,
@@ -6619,6 +6603,55 @@ def run_dashboard(fyers: Any = None) -> None:
             st.plotly_chart(chart_movement_score(df), use_container_width=True, config={"displayModeBar": False})
         else:
             st.info("No strike movement data available.")
+
+    with tab_prebreakout:
+        symbol_label = str(cfg.get("symbol", "UNKNOWN"))
+        is_index = bool(cfg.get("is_index", False))
+        instrument_type = "INDEX" if is_index else "F&O STOCK"
+        st.markdown('<div class="block-title">🚀 PRE-BREAKOUT WATCH — INDEX & F&O</div>', unsafe_allow_html=True)
+        st.caption(f"Instrument: **{symbol_label} ({instrument_type})** | FYERS candles are preferred when available; otherwise this is a chain-only watch. This is not a confirmed BUY/SELL signal.")
+
+        summary = state.get("prebreakout_summary") or {}
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Status", str(summary.get("status", "WAIT")))
+        m2.metric("Direction Bias", str(summary.get("direction", "NEUTRAL")))
+        try:
+            summary_score = float(summary.get("score", 0) or 0)
+        except (TypeError, ValueError):
+            summary_score = 0.0
+        m3.metric("Pre-Breakout Score", f"{summary_score:.1f}/100")
+        m4.metric("Trigger Price", f"{float(summary['trigger_price']):,.2f}" if summary.get("trigger_price") is not None else "—")
+
+        if summary.get("reason"):
+            st.info("**Why it is being watched:** " + str(summary["reason"]))
+        if summary.get("status") == "PRE-BREAKOUT WATCH":
+            st.warning("Potential setup developing near a boundary. Wait for price breakout and candle-close confirmation; no order is placed automatically.")
+        elif summary.get("status") == "BUILDING":
+            st.info("Movement evidence is building, but the pre-breakout threshold is not fully met yet.")
+        else:
+            st.info("No qualifying pre-breakout setup right now. WAIT is a valid result; do not force a trade.")
+
+        pre_cols = [c for c in [
+            "strike_price", "prebreakout_status", "prebreakout_direction", "prebreakout_score",
+            "prebreakout_trigger_price", "prebreakout_distance_pct", "prebreakout_data_mode",
+            "prebreakout_reasons", "movement_score", "movement_score_delta", "buy_pressure", "sell_pressure"
+        ] if c in df.columns]
+        if pre_cols and "prebreakout_status" in df.columns:
+            candidates = df[df["prebreakout_status"].isin(["PRE-BREAKOUT WATCH", "BUILDING"])][pre_cols].copy()
+            if not candidates.empty:
+                candidates["prebreakout_score"] = pd.to_numeric(candidates["prebreakout_score"], errors="coerce").fillna(0.0)
+                candidates = candidates.sort_values("prebreakout_score", ascending=False)
+                st.markdown("### 📊 Index / F&O Pre-Breakout Candidates")
+                st.dataframe(candidates, use_container_width=True, hide_index=True)
+                csv_data = candidates.to_csv(index=False).encode("utf-8")
+                st.download_button("📥 Download Pre-Breakout CSV", data=csv_data,
+                                   file_name=f"prebreakout_{symbol_label}_{datetime.now().strftime('%H%M%S')}.csv",
+                                   mime="text/csv", key="prebreakout_download_csv")
+            else:
+                st.info("No candidates pass the current filter. Keep monitoring the selected instrument.")
+        else:
+            st.warning("Pre-breakout columns are unavailable in this response. Refresh the chain and check data availability.")
+        st.caption("Score is a heuristic watch score, not a probability. Option-chain-only mode cannot independently confirm underlying price breakout.")
 
     with tab_greeks:
         g1, g2 = st.columns(2)
