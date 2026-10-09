@@ -451,33 +451,12 @@ def calculate_macd(df: pd.DataFrame, fast: int = DEFAULT_MACD_PARAMS["fast"],
 
 
 def calculate_vwap(df: pd.DataFrame) -> pd.Series:
-    """Calculate intraday VWAP, resetting by date when timestamps are available."""
+    """Calculate Volume Weighted Average Price."""
     if df.empty or not all(c in df.columns for c in ["high", "low", "close", "volume"]):
         return pd.Series(index=df.index, dtype=float)
-
+    
     typical_price = (df["high"] + df["low"] + df["close"]) / 3
-    volume = pd.to_numeric(df["volume"], errors="coerce").fillna(0).clip(lower=0)
-    pv = typical_price * volume
-
-    timestamps = None
-    for name in ("datetime", "timestamp", "date", "time"):
-        if name in df.columns:
-            parsed = pd.to_datetime(df[name], errors="coerce")
-            if parsed.notna().any():
-                timestamps = parsed.dt.date
-                break
-    if timestamps is None and isinstance(df.index, pd.DatetimeIndex):
-        timestamps = pd.Series(df.index.date, index=df.index)
-
-    if timestamps is not None:
-        groups = pd.Series(timestamps, index=df.index)
-        cum_pv = pv.groupby(groups).cumsum()
-        cum_vol = volume.groupby(groups).cumsum()
-    else:
-        # Keep support for datasets that have no timestamp column/index.
-        cum_pv = pv.cumsum()
-        cum_vol = volume.cumsum()
-    vwap = cum_pv / cum_vol.replace(0, np.nan)
+    vwap = (typical_price * df["volume"]).cumsum() / df["volume"].cumsum()
     return vwap.fillna(df["close"])
 
 
@@ -2357,7 +2336,7 @@ def compute_movement_early_warning(
             continue
         key = _movement_history_key(symbol, expiry_label, strike)
         series = history.get(key, [])
-        snapshot = {
+        series.append({
             "ts": now,
             "score": float(row.get("movement_score", 0) or 0),
             "ce_score": float(row.get("ce_movement_score", 0) or 0),
@@ -2368,18 +2347,7 @@ def compute_movement_early_warning(
             "oi": float(abs(row.get("ce_chng_oi", 0) or 0) + abs(row.get("pe_chng_oi", 0) or 0)),
             "ce_price": float(row.get("ce_ltp", 0) or 0),
             "pe_price": float(row.get("pe_ltp", 0) or 0),
-        }
-        # Streamlit reruns can happen several times during one scan. Replace the
-        # most recent snapshot inside 8 seconds instead of counting it as a new scan.
-        previous_ts = series[-1].get("ts") if series else None
-        try:
-            elapsed = (now - previous_ts).total_seconds() if previous_ts else float("inf")
-        except (TypeError, ValueError):
-            elapsed = float("inf")
-        if series and elapsed < 8:
-            series[-1] = snapshot
-        else:
-            series.append(snapshot)
+        })
         history[key] = series[-MOVEMENT_HISTORY_MAX:]
 
     st.session_state[MOVEMENT_HISTORY_KEY] = history
@@ -2506,283 +2474,6 @@ def compute_movement_early_warning(
         "pressure": max(float(best.get("buy_pressure", 50) or 50), float(best.get("sell_pressure", 50) or 50)),
         "reason": ", ".join(reasons) if reasons else "Activity building",
     }
-
-
-PREBREAKOUT_HISTORY_KEY = "oc_prebreakout_spot_history"
-PREBREAKOUT_HISTORY_MAX = 40
-PREBREAKOUT_MIN_SCORE = 58.0
-PREBREAKOUT_TRIGGER_ATR = 0.35
-
-
-def _pb_num(value: Any, default: float = 0.0) -> float:
-    try:
-        value = float(value)
-        return value if np.isfinite(value) else default
-    except (TypeError, ValueError):
-        return default
-
-
-def _pb_candle_compression(df_candles: pd.DataFrame | None) -> dict[str, Any]:
-    """
-    Return a conservative compression/proximity snapshot from OHLCV candles.
-    Only completed-looking OHLCV data is accepted; caller should pass a FYERS
-    timeframe DataFrame. Does not infer candle compression from option-chain rows.
-    """
-    out = {
-        "available": False, "compression": False, "direction": "NEUTRAL",
-        "atr": 0.0, "recent_high": 0.0, "recent_low": 0.0,
-        "close": 0.0, "rvol": 1.0, "distance_atr": None, "reason": "No candle data",
-    }
-    if not isinstance(df_candles, pd.DataFrame) or df_candles.empty:
-        return out
-    required = {"open", "high", "low", "close", "volume"}
-    if not required.issubset(df_candles.columns) or len(df_candles) < 25:
-        out["reason"] = "Insufficient OHLCV history"
-        return out
-
-    d = df_candles.copy()
-    for col in required:
-        d[col] = pd.to_numeric(d[col], errors="coerce")
-    d = d.replace([np.inf, -np.inf], np.nan).dropna(subset=["open", "high", "low", "close"])
-    d = d[(d["high"] >= d["low"]) & (d["close"] > 0)]
-    if len(d) < 25:
-        out["reason"] = "Insufficient valid candles"
-        return out
-
-    prev_close = d["close"].shift(1)
-    tr = pd.concat([
-        d["high"] - d["low"],
-        (d["high"] - prev_close).abs(),
-        (d["low"] - prev_close).abs(),
-    ], axis=1).max(axis=1)
-    atr_series = tr.rolling(14, min_periods=14).mean()
-    atr = _pb_num(atr_series.iloc[-1])
-    close = _pb_num(d["close"].iloc[-1])
-    if atr <= 0 or close <= 0:
-        out["reason"] = "ATR/close unavailable"
-        return out
-
-    # Exclude the latest candle from the prior range to avoid self-confirming a breakout.
-    prior = d.iloc[-21:-1]
-    if len(prior) < 15:
-        out["reason"] = "Insufficient prior range"
-        return out
-    prior_high = _pb_num(prior["high"].max())
-    prior_low = _pb_num(prior["low"].min())
-    range_atr = (prior_high - prior_low) / atr if atr > 0 else 999.0
-
-    vol = d["volume"].fillna(0.0)
-    vol_avg = vol.rolling(20, min_periods=10).mean().iloc[-1]
-    rvol = _pb_num(vol.iloc[-1] / vol_avg, 1.0) if _pb_num(vol_avg) > 0 else 1.0
-
-    # Compression means a relatively narrow prior range; proximity is measured
-    # to a prior boundary in ATR units. Direction is only a watch bias, not confirmation.
-    compression = range_atr <= 4.0
-    dist_high = abs(prior_high - close) / atr
-    dist_low = abs(close - prior_low) / atr
-    if dist_high <= dist_low:
-        direction, distance = "UP", dist_high
-    else:
-        direction, distance = "DOWN", dist_low
-
-    out.update({
-        "available": True,
-        "compression": bool(compression),
-        "direction": direction,
-        "atr": round(atr, 4),
-        "recent_high": round(prior_high, 4),
-        "recent_low": round(prior_low, 4),
-        "close": round(close, 4),
-        "rvol": round(rvol, 2),
-        "distance_atr": round(float(distance), 3),
-        "reason": f"prior range {range_atr:.2f} ATR; boundary distance {distance:.2f} ATR",
-    })
-    return out
-
-
-def add_prebreakout_watch(
-    chain_df: pd.DataFrame,
-    symbol: str,
-    expiry_label: str,
-    spot: float,
-    price_action_data: dict[str, Any] | None = None,
-) -> tuple[pd.DataFrame, dict[str, Any]]:
-    """
-    Add pre-breakout watch columns to an option-chain DataFrame without changing
-    existing score/signal columns.
-
-    Score components are bounded and explainable:
-      - current movement score (max 30 points)
-      - improving score across scans (max 20)
-      - repeated rising scans (max 15)
-      - pressure imbalance (max 15)
-      - volume/OI activity (max 10)
-      - underlying candle compression + proximity (max 10, FYERS candles only)
-
-    Important: option-chain score direction is a CE/PE pressure bias, not a direct
-    prediction of the underlying index. A PRE-BREAKOUT WATCH never equals BUY/SELL.
-    """
-    d = chain_df.copy() if isinstance(chain_df, pd.DataFrame) else pd.DataFrame()
-    summary = {
-        "status": "WAIT", "direction": "NEUTRAL", "score": 0.0,
-        "strike": None, "trigger_price": None, "data_mode": "CHAIN-ONLY",
-        "reason": "Waiting for valid option-chain snapshots",
-    }
-    if d.empty:
-        return d, summary
-
-    defaults = {
-        "prebreakout_status": "WAIT",
-        "prebreakout_direction": "NEUTRAL",
-        "prebreakout_score": 0.0,
-        "prebreakout_reasons": "",
-        "prebreakout_trigger_price": np.nan,
-        "prebreakout_distance_pct": np.nan,
-        "prebreakout_data_mode": "CHAIN-ONLY",
-    }
-    for col, default in defaults.items():
-        if col not in d.columns:
-            d[col] = default
-
-    spot = _pb_num(spot)
-    candle_df = None
-    df_dict = (price_action_data or {}).get("df_dict", {}) if isinstance(price_action_data, dict) else {}
-    # Prefer 5M for intraday pre-breakout context; use 15M if 5M is unavailable.
-    for tf in ("5M", "15M"):
-        candidate = df_dict.get(tf) if isinstance(df_dict, dict) else None
-        if isinstance(candidate, pd.DataFrame) and not candidate.empty:
-            candle_df = candidate
-            break
-    candle = _pb_candle_compression(candle_df)
-    data_mode = "FYERS CANDLES + CHAIN" if candle["available"] else "CHAIN-ONLY"
-
-    history = st.session_state.setdefault(PREBREAKOUT_HISTORY_KEY, {})
-    now = datetime.now(ZoneInfo("Asia/Kolkata")) if "ZoneInfo" in globals() else pd.Timestamp.now(tz="Asia/Kolkata")
-    spot_key = f"{str(symbol).upper()}|{str(expiry_label)}"
-    spot_series = history.get(spot_key, [])
-    if spot > 0:
-        spot_series.append({"ts": str(now), "spot": spot})
-        spot_series = spot_series[-PREBREAKOUT_HISTORY_MAX:]
-        history[spot_key] = spot_series
-    st.session_state[PREBREAKOUT_HISTORY_KEY] = history
-
-    score_col = "movement_score" if "movement_score" in d.columns else None
-    ce_col = "ce_movement_score" if "ce_movement_score" in d.columns else "CE Score"
-    pe_col = "pe_movement_score" if "pe_movement_score" in d.columns else "PE Score"
-
-    computed = []
-    for _, row in d.iterrows():
-        strike = _pb_num(row.get("strike_price"))
-        current = _pb_num(row.get(score_col)) if score_col else max(
-            _pb_num(row.get(ce_col)), _pb_num(row.get(pe_col))
-        )
-        ce = _pb_num(row.get(ce_col))
-        pe = _pb_num(row.get(pe_col))
-        buy = _pb_num(row.get("buy_pressure"), 50.0)
-        sell = _pb_num(row.get("sell_pressure"), 50.0)
-        pressure_gap = abs(buy - sell)
-        rising = int(_pb_num(row.get("movement_rising_scans"), 0))
-        delta = _pb_num(row.get("movement_score_delta"), 0.0)
-        accel = _pb_num(row.get("movement_score_acceleration"), 0.0)
-        vol_spike = bool(row.get("volume_spike", False))
-        oi_surge = bool(row.get("oi_surge", False))
-
-        # Avoid treating a missing/zero score as a valid setup.
-        score = min(30.0, max(0.0, current * 0.30))
-        score += min(20.0, max(0.0, 10.0 + delta * 2.0)) if delta > 0 else 0.0
-        score += min(15.0, max(0.0, rising * 5.0))
-        score += min(15.0, pressure_gap * 0.35)
-        score += 5.0 if vol_spike else 0.0
-        score += 5.0 if oi_surge else 0.0
-
-        reasons = []
-        if delta > 0:
-            reasons.append(f"score rising +{delta:.1f}")
-        if accel > 0:
-            reasons.append("positive score acceleration")
-        if rising >= 2:
-            reasons.append(f"{rising} consecutive rising scans")
-        if pressure_gap >= 15:
-            reasons.append(f"pressure imbalance {pressure_gap:.1f}")
-        if vol_spike:
-            reasons.append("volume spike")
-        if oi_surge:
-            reasons.append("OI surge")
-
-        direction = "NEUTRAL"
-        if ce > pe + 7:
-            direction = "UP"
-        elif pe > ce + 7:
-            direction = "DOWN"
-
-        trigger_price = np.nan
-        distance_pct = np.nan
-        if candle["available"] and spot > 0:
-            score += 5.0 if candle["compression"] else 0.0
-            if candle["distance_atr"] is not None and candle["distance_atr"] <= PREBREAKOUT_TRIGGER_ATR:
-                score += 5.0
-                reasons.append("spot near prior range boundary")
-            if candle["rvol"] >= 1.2:
-                reasons.append(f"underlying RVOL {candle['rvol']:.2f}x")
-            if direction == "UP":
-                trigger_price = candle["recent_high"]
-            elif direction == "DOWN":
-                trigger_price = candle["recent_low"]
-            if trigger_price and np.isfinite(trigger_price) and spot > 0:
-                distance_pct = abs(trigger_price - spot) / spot * 100.0
-            if not candle["compression"]:
-                reasons.append("no clear range compression")
-        else:
-            reasons.append("chain-only: no underlying candle compression test")
-
-        # The watch is only for setups still near a boundary, not already extended.
-        near_boundary = (
-            candle["available"]
-            and candle["distance_atr"] is not None
-            and candle["distance_atr"] <= 1.0
-        )
-        directional = direction in ("UP", "DOWN")
-        if score >= PREBREAKOUT_MIN_SCORE and directional and (near_boundary or not candle["available"]):
-            status = "PRE-BREAKOUT WATCH"
-        elif score >= 45 and directional:
-            status = "BUILDING"
-        else:
-            status = "WAIT"
-
-        computed.append({
-            "prebreakout_status": status,
-            "prebreakout_direction": direction,
-            "prebreakout_score": round(min(score, 100.0), 1),
-            "prebreakout_reasons": "; ".join(dict.fromkeys(reasons)),
-            "prebreakout_trigger_price": trigger_price,
-            "prebreakout_distance_pct": round(distance_pct, 3) if np.isfinite(distance_pct) else np.nan,
-            "prebreakout_data_mode": data_mode,
-        })
-
-    out = pd.DataFrame(computed, index=d.index)
-    for col in out.columns:
-        d[col] = out[col]
-
-    candidates = d[d["prebreakout_status"].isin(["PRE-BREAKOUT WATCH", "BUILDING"])].copy()
-    if not candidates.empty:
-        best = candidates.sort_values(
-            ["prebreakout_score", "movement_score_delta"] if "movement_score_delta" in candidates.columns else ["prebreakout_score"],
-            ascending=False,
-        ).iloc[0]
-        summary = {
-            "status": str(best["prebreakout_status"]),
-            "direction": str(best["prebreakout_direction"]),
-            "score": float(best["prebreakout_score"]),
-            "strike": _pb_num(best.get("strike_price")) or None,
-            "trigger_price": (
-                _pb_num(best.get("prebreakout_trigger_price"))
-                if pd.notna(best.get("prebreakout_trigger_price")) else None
-            ),
-            "data_mode": data_mode,
-            "reason": str(best.get("prebreakout_reasons", "")),
-        }
-    return d, summary
-
 
 
 def _render_movement_early_warning(early: dict[str, Any]) -> None:
@@ -3945,16 +3636,6 @@ def _do_fetch_and_process(cfg: dict, fyers: Any = None) -> Optional[dict]:
                 "fyers_symbol": None,
             }
 
-    # ADDITIVE PRE-BREAKOUT WATCH: uses existing option-chain rows and FYERS
-    # candles when available. Does not replace or alter the original movement engine.
-    df, prebreakout_summary = add_prebreakout_watch(
-        df,
-        cfg["symbol"],
-        meta["selected_expiry"],
-        spot,
-        price_action_data=price_action_data,
-    )
-
     po3_price_df = None
     if price_action_data and price_action_data.get("df_dict"):
         po3_price_df = price_action_data["df_dict"].get("5M")
@@ -3973,7 +3654,6 @@ def _do_fetch_and_process(cfg: dict, fyers: Any = None) -> Optional[dict]:
         "final_signal": po3_intelligence.get("final_signal", {}),
         "scalping_data": scalping_data,
         "movement_early_warning": movement_early_warning,
-        "prebreakout_summary": prebreakout_summary,
     }
 
 
@@ -6439,12 +6119,12 @@ def run_dashboard(fyers: Any = None) -> None:
     st.divider()
 
     if state.get("price_action_data") and state["price_action_data"].get("df_dict"):
-        tab_chain, tab_charts, tab_pressure, tab_orderflow, tab_movement, tab_prebreakout, tab_greeks, tab_ai, tab_gex, tab_po3, tab_price_action, tab_sell_confirm, tab_export = st.tabs([
-            "📋 Chain", "📈 OI", "💪 Pressure", "📊 Order Flow", "🎯 Strike Movement", "🚀 PRE-BREAKOUT (Index & F&O)", "🧮 Greeks", "🤖 AI", "⚡ GEX", "🧠 PO3 Intelligence", "💹 Price Action", "🔴 SELL CONFIRM", "📥 Export",
+        tab_chain, tab_charts, tab_pressure, tab_orderflow, tab_movement, tab_greeks, tab_ai, tab_gex, tab_po3, tab_price_action, tab_sell_confirm, tab_export = st.tabs([
+            "📋 Chain", "📈 OI", "💪 Pressure", "📊 Order Flow", "🎯 Strike Movement", "🧮 Greeks", "🤖 AI", "⚡ GEX", "🧠 PO3 Intelligence", "💹 Price Action", "🔴 SELL CONFIRM", "📥 Export",
         ])
     else:
-        tab_chain, tab_charts, tab_pressure, tab_orderflow, tab_movement, tab_prebreakout, tab_greeks, tab_ai, tab_gex, tab_po3, tab_sell_confirm, tab_export = st.tabs([
-            "📋 Chain", "📈 OI", "💪 Pressure", "📊 Order Flow", "🎯 Strike Movement", "🚀 PRE-BREAKOUT (Index & F&O)", "🧮 Greeks", "🤖 AI", "⚡ GEX", "🧠 PO3 Intelligence", "🔴 SELL CONFIRM", "📥 Export",
+        tab_chain, tab_charts, tab_pressure, tab_orderflow, tab_movement, tab_greeks, tab_ai, tab_gex, tab_po3, tab_sell_confirm, tab_export = st.tabs([
+            "📋 Chain", "📈 OI", "💪 Pressure", "📊 Order Flow", "🎯 Strike Movement", "🧮 Greeks", "🤖 AI", "⚡ GEX", "🧠 PO3 Intelligence", "🔴 SELL CONFIRM", "📥 Export",
         ])
 
     with tab_chain:
@@ -6603,55 +6283,6 @@ def run_dashboard(fyers: Any = None) -> None:
             st.plotly_chart(chart_movement_score(df), use_container_width=True, config={"displayModeBar": False})
         else:
             st.info("No strike movement data available.")
-
-    with tab_prebreakout:
-        symbol_label = str(cfg.get("symbol", "UNKNOWN"))
-        is_index = bool(cfg.get("is_index", False))
-        instrument_type = "INDEX" if is_index else "F&O STOCK"
-        st.markdown('<div class="block-title">🚀 PRE-BREAKOUT WATCH — INDEX & F&O</div>', unsafe_allow_html=True)
-        st.caption(f"Instrument: **{symbol_label} ({instrument_type})** | FYERS candles are preferred when available; otherwise this is a chain-only watch. This is not a confirmed BUY/SELL signal.")
-
-        summary = state.get("prebreakout_summary") or {}
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Status", str(summary.get("status", "WAIT")))
-        m2.metric("Direction Bias", str(summary.get("direction", "NEUTRAL")))
-        try:
-            summary_score = float(summary.get("score", 0) or 0)
-        except (TypeError, ValueError):
-            summary_score = 0.0
-        m3.metric("Pre-Breakout Score", f"{summary_score:.1f}/100")
-        m4.metric("Trigger Price", f"{float(summary['trigger_price']):,.2f}" if summary.get("trigger_price") is not None else "—")
-
-        if summary.get("reason"):
-            st.info("**Why it is being watched:** " + str(summary["reason"]))
-        if summary.get("status") == "PRE-BREAKOUT WATCH":
-            st.warning("Potential setup developing near a boundary. Wait for price breakout and candle-close confirmation; no order is placed automatically.")
-        elif summary.get("status") == "BUILDING":
-            st.info("Movement evidence is building, but the pre-breakout threshold is not fully met yet.")
-        else:
-            st.info("No qualifying pre-breakout setup right now. WAIT is a valid result; do not force a trade.")
-
-        pre_cols = [c for c in [
-            "strike_price", "prebreakout_status", "prebreakout_direction", "prebreakout_score",
-            "prebreakout_trigger_price", "prebreakout_distance_pct", "prebreakout_data_mode",
-            "prebreakout_reasons", "movement_score", "movement_score_delta", "buy_pressure", "sell_pressure"
-        ] if c in df.columns]
-        if pre_cols and "prebreakout_status" in df.columns:
-            candidates = df[df["prebreakout_status"].isin(["PRE-BREAKOUT WATCH", "BUILDING"])][pre_cols].copy()
-            if not candidates.empty:
-                candidates["prebreakout_score"] = pd.to_numeric(candidates["prebreakout_score"], errors="coerce").fillna(0.0)
-                candidates = candidates.sort_values("prebreakout_score", ascending=False)
-                st.markdown("### 📊 Index / F&O Pre-Breakout Candidates")
-                st.dataframe(candidates, use_container_width=True, hide_index=True)
-                csv_data = candidates.to_csv(index=False).encode("utf-8")
-                st.download_button("📥 Download Pre-Breakout CSV", data=csv_data,
-                                   file_name=f"prebreakout_{symbol_label}_{datetime.now().strftime('%H%M%S')}.csv",
-                                   mime="text/csv", key="prebreakout_download_csv")
-            else:
-                st.info("No candidates pass the current filter. Keep monitoring the selected instrument.")
-        else:
-            st.warning("Pre-breakout columns are unavailable in this response. Refresh the chain and check data availability.")
-        st.caption("Score is a heuristic watch score, not a probability. Option-chain-only mode cannot independently confirm underlying price breakout.")
 
     with tab_greeks:
         g1, g2 = st.columns(2)
