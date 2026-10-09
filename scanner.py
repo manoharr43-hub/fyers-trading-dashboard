@@ -1026,6 +1026,118 @@ def _confirmed_pivots(df, left: int = 2, right: int = 2):
             pl.append((i, float(lows[i])))
     return ph, pl
 
+def detect_order_block(df, lookback: int = 20) -> Dict[str, Any]:
+    """Detect recent bullish/bearish order-block zones from OHLCV candles.
+
+    This is a rule-based chart heuristic, not a view of actual institutional orders.
+    A zone is created only when a displacement candle closes beyond a recent range.
+    """
+    result = {
+        "ORDER BLOCK TYPE": "NONE", "ORDER BLOCK HIGH": None,
+        "ORDER BLOCK LOW": None, "ORDER BLOCK STATUS": "NONE",
+        "ORDER BLOCK CONFIRMATION": "WAIT", "ORDER BLOCK SIGNAL": "WAIT",
+        "ORDER BLOCK SCORE": 0.0, "ORDER BLOCK REASON": "Not enough confirmed structure"
+    }
+    required = ["Open", "High", "Low", "Close"]
+    if df is None or not isinstance(df, pd.DataFrame) or len(df) < 25:
+        return result
+    if any(col not in df.columns for col in required):
+        result["ORDER BLOCK REASON"] = "Missing OHLC columns"
+        return result
+    d = df.copy().reset_index(drop=True)
+    for col in required:
+        d[col] = pd.to_numeric(d[col], errors="coerce")
+    d = d.dropna(subset=required).reset_index(drop=True)
+    if len(d) < 25:
+        return result
+    try:
+        atr_series = calculate_atr(d, 14)
+        atr = float(atr_series.iloc[-1]) if len(atr_series) and pd.notna(atr_series.iloc[-1]) else 0.0
+    except Exception:
+        atr = 0.0
+    if not atr or atr <= 0:
+        atr = max(float(d["Close"].iloc[-1]) * 0.002, 0.01)
+
+    # Check recent closed candles for a decisive break of the preceding range.
+    end = len(d) - 1
+    start = max(12, end - 5)
+    setup = None
+    for i in range(end, start - 1, -1):
+        prev = d.iloc[max(0, i-10):i]
+        if len(prev) < 8:
+            continue
+        candle = d.iloc[i]
+        o, h, l, c = [float(candle[k]) for k in required]
+        body = abs(c - o)
+        prior_high = float(prev["High"].max())
+        prior_low = float(prev["Low"].min())
+        if c > o and c > prior_high and body >= 0.60 * atr:
+            setup = ("BULLISH", i)
+            break
+        if c < o and c < prior_low and body >= 0.60 * atr:
+            setup = ("BEARISH", i)
+            break
+    if setup is None:
+        result["ORDER BLOCK REASON"] = "No recent displacement + range break; WAIT for confirmation"
+        return result
+
+    direction, impulse_i = setup
+    # The order block is the nearest opposite-colour candle before the impulse.
+    ob_i = None
+    search_start = max(0, impulse_i - 6)
+    for j in range(impulse_i - 1, search_start - 1, -1):
+        candle = d.iloc[j]
+        o, c = float(candle["Open"]), float(candle["Close"])
+        if (direction == "BULLISH" and c < o) or (direction == "BEARISH" and c > o):
+            ob_i = j
+            break
+    if ob_i is None:
+        result["ORDER BLOCK REASON"] = "Displacement found but no opposing origin candle nearby"
+        return result
+
+    origin = d.iloc[ob_i]
+    if direction == "BULLISH":
+        zone_low, zone_high = float(origin["Low"]), float(origin["Open"])
+    else:
+        zone_low, zone_high = float(origin["Open"]), float(origin["High"])
+    zone_low, zone_high = min(zone_low, zone_high), max(zone_low, zone_high)
+    current_close = float(d["Close"].iloc[-1])
+
+    # Only candles after the impulse count as a retest; the impulse candle itself
+    # cannot mark its own origin zone as mitigated.
+    later = d.iloc[impulse_i + 1:]
+    invalidated = current_close < zone_low if direction == "BULLISH" else current_close > zone_high
+    if invalidated:
+        status = "INVALIDATED"
+        signal = "WAIT"
+        score = 20.0
+        reason = "Price closed through the order-block zone; setup invalidated"
+    else:
+        if not later.empty:
+            touched = ((later["Low"].astype(float) <= zone_high) & (later["High"].astype(float) >= zone_low)).any()
+        else:
+            touched = False
+        if touched:
+            status, score = "MITIGATED", 65.0
+            signal = "BUY" if direction == "BULLISH" and current_close > zone_high else "SELL" if direction == "BEARISH" and current_close < zone_low else "WAIT"
+            reason = "Order-block zone retested; wait for directional candle confirmation"
+        else:
+            status, score = "FRESH", 80.0
+            signal = "BUY" if direction == "BULLISH" and current_close > zone_high else "SELL" if direction == "BEARISH" and current_close < zone_low else "WAIT"
+            reason = "Fresh order block after displacement and range break"
+    result.update({
+        "ORDER BLOCK TYPE": direction,
+        "ORDER BLOCK HIGH": round(zone_high, 2),
+        "ORDER BLOCK LOW": round(zone_low, 2),
+        "ORDER BLOCK STATUS": status,
+        "ORDER BLOCK CONFIRMATION": "CONFIRMED" if status in ("FRESH", "MITIGATED") else "INVALIDATED",
+        "ORDER BLOCK SIGNAL": signal,
+        "ORDER BLOCK SCORE": round(score, 1),
+        "ORDER BLOCK REASON": reason,
+    })
+    return result
+
+
 def detect_structure(df) -> Dict[str, Any]:
     """Detect HH/HL/LH/LL from confirmed pivots only."""
     ph, pl = _confirmed_pivots(df)
@@ -4604,7 +4716,11 @@ def calculate_pin_rules(df_5m: pd.DataFrame, data_5m: Dict[str, Any], data_15m: 
         "15M TREND": data_15m.get("structure_trend", "N/A"),
         "1H TREND": data_1h.get("structure_trend", "N/A"),
         "RVOL": data_5m.get("rvol", 0), "RSI": data_5m.get("rsi", 50),
-        "PRESSURE": data_5m.get("pressure_trend", "N/A"), "REASON": ""
+        "PRESSURE": data_5m.get("pressure_trend", "N/A"), "REASON": "",
+        "ORDER BLOCK TYPE": "NONE", "ORDER BLOCK HIGH": None,
+        "ORDER BLOCK LOW": None, "ORDER BLOCK STATUS": "NONE",
+        "ORDER BLOCK CONFIRMATION": "WAIT", "ORDER BLOCK SIGNAL": "WAIT",
+        "ORDER BLOCK SCORE": 0.0, "ORDER BLOCK REASON": "Not analyzed"
     }
     if df_5m is None or len(df_5m) < 30:
         out["REASON"] = "Insufficient 5M candles"
@@ -4807,7 +4923,16 @@ def calculate_pin_rules(df_5m: pd.DataFrame, data_5m: Dict[str, Any], data_15m: 
             "BIG MOVE" if bm.get("direction") in ["UP", "DOWN"] else "",
         ]
 
+        order_block = detect_order_block(d)
         out.update({
+            "ORDER BLOCK TYPE": order_block["ORDER BLOCK TYPE"],
+            "ORDER BLOCK HIGH": order_block["ORDER BLOCK HIGH"],
+            "ORDER BLOCK LOW": order_block["ORDER BLOCK LOW"],
+            "ORDER BLOCK STATUS": order_block["ORDER BLOCK STATUS"],
+            "ORDER BLOCK CONFIRMATION": order_block["ORDER BLOCK CONFIRMATION"],
+            "ORDER BLOCK SIGNAL": order_block["ORDER BLOCK SIGNAL"],
+            "ORDER BLOCK SCORE": order_block["ORDER BLOCK SCORE"],
+            "ORDER BLOCK REASON": order_block["ORDER BLOCK REASON"],
             "PIN SIGNAL": pin_signal, "PIN SCORE": round(pin_score, 1),
             "LIQUIDITY": liquidity,
             "BUY LIQUIDITY": buy_liq, "SELL LIQUIDITY": sell_liq,
@@ -5688,7 +5813,7 @@ def _show_live_order_flow_tab(fyers, all_symbols):
 
 def _show_pin_rules_tab(fyers, all_symbols=None, fo_symbols=None) -> None:
     """PIN Rules scanner. Runs independently from the main scanners."""
-    st.markdown("### 📌 PIN RULES — Liquidity + Reversal + Big Movement")
+    st.markdown("### 📌 PIN RULES — Liquidity + Reversal + Big Movement + Order Blocks")
     st.caption("Independent PIN scanner. It does not modify NSE, F&O, Momentum, or other scanner results.")
 
     source = st.selectbox(
@@ -5717,6 +5842,12 @@ def _show_pin_rules_tab(fyers, all_symbols=None, fo_symbols=None) -> None:
         **Confluence:** Trend + RSI + VWAP + MACD + RVOL + candle + sweep + reversal.
         
         **Big Movement:** existing consolidation-breakout + candle + RVOL + structure engine.
+
+        **Bullish Order Block:** the nearest bearish candle before a strong bullish displacement that closes above the recent range. Zone = candle Low to Open.
+
+        **Bearish Order Block:** the nearest bullish candle before a strong bearish displacement that closes below the recent range. Zone = candle Open to High.
+
+        **Order Block Status:** FRESH = no later retest; MITIGATED = later candle retested the zone; INVALIDATED = price closed through the zone. BUY/SELL is shown only when price remains on the directional side of the zone; otherwise WAIT.
 
         **Live Order Flow:** real FYERS bid/ask depth is used only as PIN confirmation.
         Same direction = confirmation/bonus; opposite direction = contradiction/penalty.
@@ -5795,6 +5926,9 @@ def _show_pin_rules_tab(fyers, all_symbols=None, fo_symbols=None) -> None:
             "ORDER FLOW", "ORDER FLOW STRENGTH %", "DEPTH IMBALANCE %",
             "TOTAL BUY QTY", "TOTAL SELL QTY", "BEST BID", "BEST ASK",
             "ORDER FLOW PIN", "PIN OF CONFIRMATION", "BASE PIN SCORE",
+            "ORDER BLOCK TYPE", "ORDER BLOCK HIGH", "ORDER BLOCK LOW",
+            "ORDER BLOCK STATUS", "ORDER BLOCK CONFIRMATION", "ORDER BLOCK SIGNAL",
+            "ORDER BLOCK SCORE", "ORDER BLOCK REASON",
             "STRUCTURE", "5M TREND", "15M TREND", "1H TREND", "RVOL", "RSI",
             "PRESSURE", "AI CONFIDENCE %", "AI SIGNAL", "ORDER FLOW REASON", "REASON"
         ]
