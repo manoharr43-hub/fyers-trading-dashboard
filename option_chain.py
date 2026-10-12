@@ -3420,19 +3420,61 @@ def _pcr_sentiment_badge(pcr: float) -> str:
     return f'<span style="color:{AMBER};font-weight:700;">🟡 Neutral</span>'
 
 
+def _oc_sync_main_mode() -> None:
+    """Synchronize Movement Search mode when the main instrument changes."""
+    mode = st.session_state.get("oc_instr_type", "Index")
+    st.session_state["oc_movement_search_type"] = (
+        "Index Search" if mode == "Index" else "F&O Search"
+    )
+
+
+def _oc_sync_movement_mode() -> None:
+    """Synchronize the main dashboard with Movement Search mode."""
+    mode = st.session_state.get("oc_movement_search_type", "Index Search")
+    st.session_state["oc_instr_type"] = (
+        "Index" if mode == "Index Search" else "F&O Stock"
+    )
+
+
+def _oc_sync_main_index() -> None:
+    selected = st.session_state.get("oc_index_select")
+    if selected in INDEX_SYMBOLS:
+        st.session_state["oc_movement_index"] = selected
+
+
+def _oc_sync_movement_index() -> None:
+    selected = st.session_state.get("oc_movement_index")
+    if selected in INDEX_SYMBOLS:
+        st.session_state["oc_index_select"] = selected
+        st.session_state["oc_instr_type"] = "Index"
+
+
+def _oc_sync_main_stock() -> None:
+    stock = normalize_stock_symbol(st.session_state.get("oc_stock_input", ""))
+    if stock:
+        st.session_state["oc_movement_fno"] = stock
+
+
+def _oc_sync_movement_stock() -> None:
+    stock = normalize_stock_symbol(st.session_state.get("oc_movement_fno", ""))
+    if stock:
+        st.session_state["oc_stock_input"] = stock
+        st.session_state["oc_instr_type"] = "F&O Stock"
+
+
 def _sidebar_config() -> dict:
     with st.sidebar:
         st.markdown("### ⚙️ Configuration")
-        instrument_type = st.radio("Instrument Type", ["Index", "F&O Stock"], key="oc_instr_type")
+        instrument_type = st.radio("Instrument Type", ["Index", "F&O Stock"], key="oc_instr_type", on_change=_oc_sync_main_mode)
         is_index = instrument_type == "Index"
 
         if is_index:
-            symbol = st.selectbox("Index", list(INDEX_SYMBOLS.keys()), key="oc_index_select")
+            symbol = st.selectbox("Index", list(INDEX_SYMBOLS.keys()), key="oc_index_select", on_change=_oc_sync_main_index)
             if symbol in NSE_UNSUPPORTED_INDICES:
                 st.caption(f"ℹ️ {symbol} is BSE-listed — requires a connected FYERS client.")
         else:
             raw_symbol = st.text_input(
-                "Stock Symbol (e.g. RELIANCE, TCS, INFY)", "RELIANCE", key="oc_stock_input"
+                "Stock Symbol (e.g. RELIANCE, TCS, INFY)", "RELIANCE", key="oc_stock_input", on_change=_oc_sync_main_stock
             )
             symbol = normalize_stock_symbol(raw_symbol)
 
@@ -5223,6 +5265,50 @@ def _render_movement_search_results(
     st.info(compact)
 
 
+def _lh_breakout_signal(candles: Optional[pd.DataFrame]) -> dict[str, Any]:
+    """Confirmed pivot lower-high breakout on 5-minute underlying candles."""
+    wait = {"LH Signal": "WAIT", "LH Level": None, "LH Close": None,
+            "LH RVOL": None, "LH Entry": None, "LH SL": None,
+            "LH T1": None, "LH T2": None, "LH T3": None}
+    if candles is None or len(candles) < 35:
+        return wait
+    d = candles.copy().reset_index(drop=True)
+    for c in ("open", "high", "low", "close", "volume"):
+        d[c] = pd.to_numeric(d[c], errors="coerce")
+    d = d.dropna(subset=["open", "high", "low", "close"])
+    if len(d) < 35:
+        return wait
+    # Exclude last two bars from pivot detection to avoid look-ahead bias.
+    pivots = [i for i in range(2, len(d)-3)
+              if d.at[i, "high"] > max(d.at[i-1, "high"], d.at[i-2, "high"])
+              and d.at[i, "high"] >= max(d.at[i+1, "high"], d.at[i+2, "high"])]
+    if len(pivots) < 2:
+        return wait
+    prev_i, lh_i = pivots[-2:]
+    if d.at[lh_i, "high"] >= d.at[prev_i, "high"]:
+        return wait
+    level = float(d.at[lh_i, "high"])
+    close = float(d.iloc[-1]["close"])
+    prev_close = float(d.iloc[-2]["close"])
+    vol = float(d.iloc[-1]["volume"]) if pd.notna(d.iloc[-1]["volume"]) else 0.0
+    avg = float(d["volume"].iloc[-21:-1].mean())
+    rvol = vol / avg if avg > 0 else 0.0
+    out = {**wait, "LH Level": round(level, 2), "LH Close": round(close, 2), "LH RVOL": round(rvol, 2)}
+    if close > level and prev_close <= level:
+        if rvol < 1.5:
+            out["LH Signal"] = "WATCH — VOLUME LOW"
+        elif close <= float(d["close"].ewm(span=21, adjust=False).mean().iloc[-1]):
+            out["LH Signal"] = "WATCH — EMA21"
+        else:
+            risk = max(close - float(d["low"].iloc[-10:].min()), close * 0.002)
+            out.update({"LH Signal": "LH BREAKOUT BUY", "LH Entry": round(close, 2),
+                        "LH SL": round(close-risk, 2), "LH T1": round(close+risk, 2),
+                        "LH T2": round(close+2*risk, 2), "LH T3": round(close+3*risk, 2)})
+    elif close < level and prev_close > level:
+        out["LH Signal"] = "FALSE BREAKOUT / BELOW LH"
+    return out
+
+
 def _render_total_index_movement_search(
     fyers: Any,
     strike_count: int = 40,
@@ -5273,52 +5359,69 @@ def _render_total_index_movement_search(
             st.info("ℹ️ Total Index scan completed, but no CE/PE movement rows were returned.")
         return
 
-    out = (
-        pd.DataFrame(rows)
-        .sort_values(
-            ["Score", "Early Score", "Instrument", "Strike"],
-            ascending=[False, False, True, True],
+    all_rows = pd.DataFrame(rows)
+    all_rows["Spot"] = pd.to_numeric(all_rows.get("Spot", 0), errors="coerce")
+    all_rows["Strike"] = pd.to_numeric(all_rows.get("Strike", 0), errors="coerce")
+    all_rows["ATM Distance"] = (all_rows["Strike"] - all_rows["Spot"]).abs()
+    # Use the actual strike grid returned per instrument rather than assuming
+    # a fixed strike interval for every index.
+    def _atm_step(group):
+        strikes = sorted(set(group["Strike"].dropna()))
+        gaps = [y-x for x,y in zip(strikes, strikes[1:]) if y > x]
+        return min(gaps) if gaps else 50.0
+    steps = all_rows.groupby("Instrument").apply(_atm_step).to_dict()
+    all_rows["ATM Step"] = all_rows["Instrument"].map(steps).fillna(50.0)
+    all_rows["ATM Strike"] = (all_rows["Spot"] / all_rows["ATM Step"]).round() * all_rows["ATM Step"]
+    all_rows["ATM Distance"] = (all_rows["Strike"] - all_rows["ATM Strike"]).abs()
+    # LH breakout uses 5-minute underlying candles, not CE/PE option premiums.
+    lh_by_index = {}
+    for idx_name in indices:
+        lh_candles = None
+        if fyers is not None:
+            for candidate in _fyers_index_candidates(idx_name):
+                lh_candles = fetch_fyers_candles(fyers, candidate, 5, count=100)
+                if lh_candles is not None and not lh_candles.empty:
+                    break
+        lh_by_index[idx_name] = _lh_breakout_signal(lh_candles)
+    for col in ("LH Signal", "LH Level", "LH Close", "LH RVOL", "LH Entry", "LH SL", "LH T1", "LH T2", "LH T3"):
+        all_rows[col] = all_rows["Instrument"].map(lambda x, k=col: lh_by_index.get(x, {}).get(k))
+    st.caption("LH breakout = 5M underlying-index pivot confirmation (not individual option strike breakout). WAIT when FYERS candles are missing.")
+    tab_atm, tab_big = st.tabs(["🎯 ATM / NEAR ATM", "🚀 BIG MOVEMENT — ALL STRIKES"])
+
+    def _display_index_report(frame, label, file_slug):
+        if frame.empty:
+            st.info("No strikes meet this filter. Try the other tab or refresh the scan.")
+            return
+        st.success(f"📊 {label}: {len(frame)} strike(s) found.")
+        show_cols = [
+            "Instrument", "Spot", "ATM Strike", "ATM Distance", "Strike", "Option",
+            "LH Signal", "LH Level", "LH Close", "LH RVOL", "LH Entry", "LH SL", "LH T1", "LH T2", "LH T3",
+            "Direction", "Status", "CE Score", "PE Score", "Movement Bias",
+            "CE Price", "PE Price", "Price Delta", "Price Change %",
+            "Price Direction Source", "Signal Time", "Entry", "Stop Loss",
+            "Price Reversal", "Reversal Status", "Score", "Early Score",
+            "Early Status", "Rising Scans", "Score Delta", "Confidence", "Source",
+        ]
+        view = frame[[c for c in show_cols if c in frame.columns]].copy()
+        st.dataframe(view, use_container_width=True, hide_index=True)
+        excel_buf = _movement_search_excel(frame, label)
+        st.download_button(
+            f"📥 Download {label} Excel", data=excel_buf,
+            file_name=f"{file_slug}_{_india_now().strftime('%H%M%S')}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True, key=f"movement_excel_{file_slug}",
         )
-        .head(60)
-        .reset_index(drop=True)
-    )
 
-    st.success(f"📊 TOTAL INDEX REPORT: {len(out)} CE/PE movement strike(s) found.")
+    with tab_atm:
+        st.caption("ATM uses the live Spot value and the strike spacing observed in returned data. Near ATM = within one strike step on either side.")
+        atm = all_rows[(all_rows["Spot"] > 0) & (all_rows["ATM Distance"] <= all_rows["ATM Step"] + 0.001)]
+        atm = atm.sort_values(["Instrument", "ATM Distance", "Score"], ascending=[True, True, False]).reset_index(drop=True)
+        _display_index_report(atm, "ATM / NEAR ATM INDEX", "index_atm_near_atm")
 
-    show_cols = [
-        "Instrument", "Strike", "Option", "Direction", "Status",
-        "CE Score", "PE Score", "Movement Bias", "CE Price", "PE Price",
-        "Price Delta", "Price Change %", "Price Direction Source",
-        "Signal Time", "Entry", "Stop Loss", "Price Reversal", "Reversal Status",
-        "Score", "Early Score", "Early Status", "Rising Scans",
-        "Score Delta", "Confidence", "Spot", "Source",
-    ]
-    out_view = out[[c for c in show_cols if c in out.columns]].copy()
-    for col in ("Entry", "Stop Loss", "Price Reversal", "Spot"):
-        if col in out_view.columns:
-            out_view[col] = out_view[col].map(
-                lambda x: f"₹{float(x):,.2f}" if float(x) else "—"
-            )
-
-    st.dataframe(out_view, use_container_width=True, hide_index=True)
-
-    excel_buf = _movement_search_excel(out, "Total Index CE PE Movement Search")
-    st.download_button(
-        "📥 Download Total Index CE/PE Excel",
-        data=excel_buf,
-        file_name=f"movement_total_index_ce_pe_{datetime.now().strftime('%H%M%S')}.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        use_container_width=True,
-        key="movement_excel_total_index_ce_pe",
-    )
-
-    compact = "  •  ".join(
-        f"{r['Instrument']} {r['Strike']:,.0f} {r['Option']} {r['Direction']} "
-        f"{r['Status']} ({r['Score']:.0f})"
-        for _, r in out.head(15).iterrows()
-    )
-    st.markdown("**🎯 Total Index Selected Sides:**")
-    st.info(compact)
+    with tab_big:
+        st.caption("All available strikes ranked by movement score; far OTM/ITM strikes are not labeled ATM. High score is a watchlist signal, not proof of a future big move.")
+        big = all_rows.sort_values(["Score", "Early Score", "Instrument", "Strike"], ascending=[False, False, True, True]).head(60).reset_index(drop=True)
+        _display_index_report(big, "BIG MOVEMENT ALL STRIKES", "index_big_movement_all_strikes")
 
 
 def _render_total_fno_movement_search(
@@ -5863,6 +5966,7 @@ def _render_movement_search_sidebar() -> dict:
             "Search Type",
             ["Index Search", "F&O Search"],
             key="oc_movement_search_type",
+            on_change=_oc_sync_movement_mode,
         )
 
         if search_mode == "Index Search":
@@ -5870,6 +5974,7 @@ def _render_movement_search_sidebar() -> dict:
                 "Select Index",
                 list(INDEX_SYMBOLS.keys()),
                 key="oc_movement_index",
+                on_change=_oc_sync_movement_index,
             )
             is_index = True
         else:
@@ -5877,10 +5982,13 @@ def _render_movement_search_sidebar() -> dict:
                 "F&O Stock",
                 value="RELIANCE",
                 key="oc_movement_fno",
+                on_change=_oc_sync_movement_stock,
                 help="Example: RELIANCE, TCS, INFY",
             )
             search_symbol = normalize_stock_symbol(search_raw)
             is_index = False
+
+        st.caption(f"Active Movement Search: {'INDEX' if is_index else 'F&O STOCK'} — {search_symbol}")
 
         search_clicked = st.button(
             "🔎 SEARCH UP MOVEMENT",
