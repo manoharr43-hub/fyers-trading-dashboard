@@ -4649,6 +4649,8 @@ def _movement_search_excel(df: pd.DataFrame, report_name: str = "Movement Search
         "Instrument", "Strike", "Option", "Direction", "Status",
         "Signal Time", "Entry", "Stop Loss", "Price Reversal", "Reversal Status",
         "Score", "Early Score", "CE Score", "PE Score",
+        "Validated Status", "Validated Direction", "Direction Confirmed",
+        "Validation Confidence", "Signal Valid", "Direction Source Validated",
         "Movement Bias", "Price Delta", "Price Change %", "Price Direction Source",
         "CE Price", "PE Price", "Early Status", "Rising Scans",
         "Score Delta", "Confidence", "Spot", "Source",
@@ -4732,15 +4734,16 @@ def _validate_movement_signal_additive(
         if pdir not in {"UP", "DOWN", "FLAT"}:
             pdir = "FLAT" if abs(pd) < 1e-9 else ("UP" if pd > 0 else "DOWN")
 
+        # CE/PE activity scores choose the option side; they do NOT predict
+        # whether that option premium is rising or falling. Keep these concepts
+        # separate to avoid the old score-side/direction mix-up.
         score_gap = abs(ce_score - pe_score)
-        score_side = "UP" if ce_score > pe_score + 7 else (
-            "DOWN" if pe_score > ce_score + 7 else "BOTH"
-        )
+        score_side = str(row.get("Option", "")).upper().strip()
 
-        # A score alone is never enough to call a confirmed movement.
+        # A direction is confirmed only by a non-flat observed premium change.
         price_confirmed = (
-            (pdir == "UP" and pd > 0) or
-            (pdir == "DOWN" and pd < 0)
+            (pdir == "UP" and pd > 0.005) or
+            (pdir == "DOWN" and pd < -0.005)
         )
 
         # Early/pre-move requires some developing evidence.
@@ -4786,11 +4789,8 @@ def _validate_movement_signal_additive(
             final_direction = "WAIT"
             direction_source = "NO PRICE CONFIRMATION"
 
-        # If score says one side but price is moving opposite, block it.
-        if score_side != "BOTH" and final_direction != "WAIT":
-            if score_side != final_direction and abs(score_delta) < 3:
-                final_direction = "WAIT"
-                direction_source = "SCORE/PRICE CONFLICT"
+        # CE-vs-PE score is a contract-side ranking, not an UP/DOWN forecast.
+        # Do not compare "CE"/"PE" with "UP"/"DOWN"; that caused false blocks.
 
         confidence = 35.0
         confidence += min(score, 100.0) * 0.25
@@ -4799,8 +4799,8 @@ def _validate_movement_signal_additive(
         confidence += min(abs(pp), 5.0) * 2.0
         if price_confirmed:
             confidence += 10.0
-        if score_side == final_direction and final_direction != "WAIT":
-            confidence += 5.0
+        if score_side in {"CE", "PE"}:
+            confidence += min(score_gap, 20.0) * 0.15
         if final_direction == "WAIT":
             confidence -= 15.0
         confidence = max(0.0, min(95.0, confidence))
@@ -4815,11 +4815,8 @@ def _validate_movement_signal_additive(
             final_direction != "WAIT"
         )
         out["validated_confidence"] = round(confidence, 1)
-        out["score_price_conflict"] = bool(
-            score_side != "BOTH" and
-            price_confirmed and
-            score_side != final_direction
-        )
+        out["score_price_conflict"] = False
+        out["selected_option_side"] = score_side or "UNKNOWN"
         return out
     except Exception:
         return dict(row)
@@ -5161,6 +5158,32 @@ def _movement_search_one(
 
         if not rows:
             return pd.DataFrame()
+
+        # ADDITIVE VALIDATION: retain all legacy fields and append confirmed
+        # direction/status columns for both INDEX and F&O Total Scanner rows.
+        validated_rows = []
+        for item in rows:
+            validation_input = {
+                "Option": item.get("Option", ""),
+                "movement_score": item.get("Score", 0.0),
+                "ce_movement_score": item.get("CE Score", 0.0),
+                "pe_movement_score": item.get("PE Score", 0.0),
+                "early_score": item.get("Early Score", 0.0),
+                "rising_scans": item.get("Rising Scans", 0),
+                "score_delta": item.get("Score Delta", 0.0),
+                "price_delta": item.get("Price Delta", 0.0),
+                "price_change_pct": item.get("Price Change %", 0.0),
+                "price_direction": item.get("Direction", "FLAT"),
+            }
+            checked = _validate_movement_signal_additive(validation_input)
+            item["Validated Status"] = checked.get("validated_status", "WAIT")
+            item["Validated Direction"] = checked.get("validated_direction", "WAIT")
+            item["Direction Confirmed"] = bool(checked.get("price_confirmed", False))
+            item["Validation Confidence"] = _pin_num(checked.get("validated_confidence"), 0.0)
+            item["Signal Valid"] = bool(checked.get("movement_signal_valid", False))
+            item["Direction Source Validated"] = checked.get("direction_source", "NO PRICE CONFIRMATION")
+            validated_rows.append(item)
+        rows = validated_rows
 
         return (
             pd.DataFrame(rows)
@@ -5769,9 +5792,9 @@ def _render_big_movement_scan(
         unsafe_allow_html=True,
     )
     st.caption(
-        f"Showing only existing movement-engine strikes with CE or PE score "
-        f"≥ {BIG_MOVEMENT_SCAN_MIN_SCORE:.0f}. CE/PE is selected at the SAME strike; "
-        "Direction is based on the selected option-premium movement."
+        f"Showing existing movement-engine strikes with CE or PE score "
+        f"≥ {BIG_MOVEMENT_SCAN_MIN_SCORE:.0f}. CE/PE is selected at the SAME strike. "
+        "UP/DOWN is measured separately from that option's premium; score alone is not a BUY confirmation."
     )
 
     if not universe:
@@ -5818,6 +5841,16 @@ def _render_big_movement_scan(
         return
 
     out = _decorate_live_big_movement_rows(pd.DataFrame(rows))
+
+    # Explicit confirmation label helps distinguish early alerts from entries.
+    if "Validated Status" in out.columns:
+        out["Confirmation"] = out.apply(
+            lambda r: (
+                "CONFIRMED" if bool(r.get("Direction Confirmed", False))
+                and str(r.get("Validated Direction", "WAIT")) in {"UP", "DOWN"}
+                else ("PRE-MOVE / BUILDING" if str(r.get("Validated Status", "WAIT")) in {"PRE-MOVE", "BUILDING"} else "WAIT FOR PRICE")
+            ), axis=1
+        )
 
     out["_phase_rank"] = out.get("Live Phase", "WAIT").map({
         "BIG MOVEMENT CONFIRMED": 0,
