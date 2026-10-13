@@ -4653,6 +4653,51 @@ def _movement_trade_levels(
     }
 
 
+def _movement_signal_extras(row: dict) -> dict:
+    """Conservative option-premium interpretation; never treat WATCH as trade-ready."""
+    side = str(row.get("Option", "")).upper()
+    direction = str(row.get("Direction", "")).upper()
+    score = _pin_num(row.get("Score"), 0)
+    early = str(row.get("Early Status", "")).upper()
+    rising = int(_pin_num(row.get("Rising Scans"), 0))
+    delta = _pin_num(row.get("Price Delta"), 0)
+    entry = _pin_num(row.get("Entry"), 0)
+    sl = _pin_num(row.get("Stop Loss"), 0)
+    rev = _pin_num(row.get("Price Reversal"), 0)
+    if direction == "UP":
+        view = "BULLISH" if side == "CE" else "BEARISH"
+        reversal_status = "ABOVE REVERSAL" if entry > rev > 0 else "BELOW REVERSAL / WAIT"
+        level_ok = entry > sl > 0 and entry > rev > 0
+        direction_ok = delta > 0
+    elif direction == "DOWN":
+        view = "BEARISH" if side == "CE" else "BULLISH"
+        reversal_status = "BELOW REVERSAL" if 0 < entry < rev else "ABOVE REVERSAL / WAIT"
+        level_ok = 0 < entry < sl and 0 < entry < rev
+        direction_ok = delta < 0
+    else:
+        view, reversal_status, level_ok, direction_ok = "NEUTRAL", "WAIT DIRECTION", False, False
+    checks = []
+    if score < 78: checks.append("SCORE < 78")
+    if early not in ("CONFIRMED", "BIG MOVE", "BREAKOUT", "ACTIVE"): checks.append("EARLY PHASE UNCONFIRMED")
+    if rising < 2: checks.append("NEED 2 TIMED RISING SCANS")
+    if not direction_ok: checks.append("NO PREMIUM MOMENTUM")
+    if not level_ok: checks.append("LEVELS NOT VALID")
+    # Explicitly avoid automatic BUY/SELL: scanner has no independent candle / OI confirmation.
+    return {"Underlying View": view, "Reversal Status": reversal_status,
+            "Confirmation Reason": "; ".join(checks) if checks else "PRELIMINARY ONLY — NEED CANDLE/OI CONFIRMATION",
+            "Signal Validity": "WATCH — NOT CONFIRMED",
+            "Status": "WATCH"}
+
+
+def _enrich_movement_report(frame: pd.DataFrame) -> pd.DataFrame:
+    if frame.empty: return frame
+    frame = frame.copy()
+    for i, row in frame.iterrows():
+        extras = _movement_signal_extras(row.to_dict())
+        for key, value in extras.items(): frame.at[i, key] = value
+    return frame
+
+
 def _movement_search_excel(df: pd.DataFrame, report_name: str = "Movement Search") -> io.BytesIO:
     """Create an Excel workbook for movement-search results."""
     wb = Workbook()
@@ -4660,11 +4705,11 @@ def _movement_search_excel(df: pd.DataFrame, report_name: str = "Movement Search
     ws.title = "Movement Search"
 
     export_cols = [
-        "Instrument", "Strike", "Option", "Direction", "Status",
+        "Instrument", "Strike", "Option", "Direction", "Underlying View", "Status", "Signal Validity", "Confirmation Reason",
         "Signal Time", "Entry", "Stop Loss", "Price Reversal", "Reversal Status",
         "Score", "Early Score", "CE Score", "PE Score",
         "Movement Bias", "Price Delta", "Price Change %", "Price Direction Source",
-        "CE Price", "PE Price", "Early Status", "Rising Scans",
+        "CE Price", "PE Price", "LH Signal", "LH Level", "LH Close", "LH RVOL", "LH Entry", "LH SL", "LH T1", "LH T2", "LH T3", "Early Status", "Rising Scans",
         "Score Delta", "Confidence", "Spot", "Source",
     ]
     cols = [c for c in export_cols if c in df.columns]
@@ -5240,11 +5285,12 @@ def _render_movement_search_results(
     )
 
     display_cols = [
-        "Instrument", "Strike", "Option", "Direction", "Status",
+        "Instrument", "Strike", "Option", "Direction", "Underlying View", "Status", "Signal Validity", "Confirmation Reason",
         "Signal Time", "Entry", "Stop Loss", "Price Reversal", "Reversal Status",
         "Score", "Early Score", "Early Status", "Rising Scans",
         "Score Delta", "Confidence", "Spot", "Source",
     ]
+    result_df = _enrich_movement_report(result_df)
     display_df = result_df[[c for c in display_cols if c in result_df.columns]].copy()
 
     display_df["Strike"] = display_df["Strike"].map(lambda x: f"{float(x):,.0f}")
@@ -5309,9 +5355,9 @@ def _lh_breakout_signal(candles: Optional[pd.DataFrame]) -> dict[str, Any]:
     vol = float(d.iloc[-1]["volume"]) if pd.notna(d.iloc[-1]["volume"]) else 0.0
     avg = float(d["volume"].iloc[-21:-1].mean())
     rvol = vol / avg if avg > 0 else 0.0
-    out = {**wait, "LH Level": round(level, 2), "LH Close": round(close, 2), "LH RVOL": round(rvol, 2)}
+    out = {**wait, "LH Level": round(level, 2), "LH Close": round(close, 2), "LH RVOL": round(rvol, 2) if avg > 0 else None}
     if close > level and prev_close <= level:
-        if rvol < 1.5:
+        if avg > 0 and rvol < 1.5:
             out["LH Signal"] = "WATCH — VOLUME LOW"
         elif close <= float(d["close"].ewm(span=21, adjust=False).mean().iloc[-1]):
             out["LH Signal"] = "WATCH — EMA21"
@@ -5375,7 +5421,7 @@ def _render_total_index_movement_search(
             st.info("ℹ️ Total Index scan completed, but no CE/PE movement rows were returned.")
         return
 
-    all_rows = pd.DataFrame(rows)
+    all_rows = _enrich_movement_report(pd.DataFrame(rows))
     all_rows["Spot"] = pd.to_numeric(all_rows.get("Spot", 0), errors="coerce")
     all_rows["Strike"] = pd.to_numeric(all_rows.get("Strike", 0), errors="coerce")
     all_rows["ATM Distance"] = (all_rows["Strike"] - all_rows["Spot"]).abs()
@@ -5412,7 +5458,7 @@ def _render_total_index_movement_search(
         show_cols = [
             "Instrument", "Spot", "ATM Strike", "ATM Distance", "Strike", "Option",
             "LH Signal", "LH Level", "LH Close", "LH RVOL", "LH Entry", "LH SL", "LH T1", "LH T2", "LH T3",
-            "Direction", "Status", "CE Score", "PE Score", "Movement Bias",
+            "Direction", "Underlying View", "Status", "Signal Validity", "Confirmation Reason", "CE Score", "PE Score", "Movement Bias",
             "CE Price", "PE Price", "Price Delta", "Price Change %",
             "Price Direction Source", "Signal Time", "Entry", "Stop Loss",
             "Price Reversal", "Reversal Status", "Score", "Early Score",
