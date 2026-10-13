@@ -4602,10 +4602,14 @@ def _movement_trade_levels(
     signal_time: Optional[datetime] = None,
     reversal_level: Optional[float] = None,
     reversal_status: str = "WAIT HISTORY",
+    side: str = "CE",
+    direction: str = "UP",
 ) -> dict[str, Any]:
-    """Build CE movement-scan levels with a live price-reversal check."""
-    ltp = _pin_num(row.get("ce_ltp"), 0.0)
-    ask = _pin_num(row.get("ce_ask"), 0.0)
+    """Build side-correct premium levels; DOWN setups use an upper invalidation."""
+    side = "PE" if str(side).upper() == "PE" else "CE"
+    direction = str(direction).upper()
+    ltp = _pin_num(row.get(f"{side.lower()}_ltp"), 0.0)
+    ask = _pin_num(row.get(f"{side.lower()}_ask"), 0.0)
     entry = ask if ask > 0 else ltp
     # Signal Time is always India Standard Time (IST), not the Streamlit
     # server timezone (often UTC). This fixes the 5:30 hour offset seen in UI.
@@ -4624,17 +4628,21 @@ def _movement_trade_levels(
             "Price Reversal": 0.0, "Reversal Status": "NO PRICE",
         }
 
-    # First scan fallback; later scans use the actual recent CE price history.
-    fallback_reversal = entry * 0.95
-    reversal = _pin_num(reversal_level, fallback_reversal)
-    if reversal <= 0 or reversal >= entry:
-        reversal = fallback_reversal
-
-    # Keep SL close to the actual reversal trigger instead of producing a
-    # misleading zero/very-distant stop. Scanner reference only.
-    stop_loss = max(0.0, reversal * 0.98)
-    if stop_loss >= entry:
-        stop_loss = max(0.0, entry * 0.93)
+    # These are reference invalidation levels, not executable orders.
+    if direction == "DOWN":
+        fallback_reversal = entry * 1.05
+        reversal = _pin_num(reversal_level, fallback_reversal)
+        if reversal <= entry:
+            reversal = fallback_reversal
+        stop_loss = max(reversal * 1.02, entry * 1.03)
+    else:
+        fallback_reversal = entry * 0.95
+        reversal = _pin_num(reversal_level, fallback_reversal)
+        if reversal <= 0 or reversal >= entry:
+            reversal = fallback_reversal
+        stop_loss = max(0.0, reversal * 0.98)
+        if stop_loss >= entry:
+            stop_loss = entry * 0.93
 
     return {
         "Signal Time": now_text,
@@ -5095,6 +5103,8 @@ def _movement_search_one(
                     row,
                     reversal_level=reversal_level,
                     reversal_status=reversal_status,
+                    side=side,
+                    direction=direction,
                 )
 
                 rows.append({
