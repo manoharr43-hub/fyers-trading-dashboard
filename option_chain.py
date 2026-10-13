@@ -339,12 +339,13 @@ def _fyers_call_history(fyers: Any, symbol: str, resolution: str, count: int = 1
     """Fetch OHLCV candles from FYERS using a valid historical date range."""
     try:
         end_dt = datetime.now(timezone.utc)
-        start_dt = end_dt - timedelta(days=7)
+        days = {"1D": 400, "D": 400, "60": 40, "30": 25}.get(str(resolution), 7)
+        start_dt = end_dt - timedelta(days=days)
 
         req = {
             "symbol": symbol,
             "resolution": str(resolution),
-            "date_format": "1",
+            "date_format": "0",
             "range_from": str(int(start_dt.timestamp())),
             "range_to": str(int(end_dt.timestamp())),
             "cont_flag": "1",
@@ -556,16 +557,21 @@ def detect_choch(df: pd.DataFrame, lookback: int = 10) -> bool:
     return bearish_shift or bullish_shift
 
 
+def _has_data(value: Any) -> bool:
+    """Check a candle DataFrame without ambiguous pandas truth testing."""
+    return isinstance(value, pd.DataFrame) and not value.empty
+
+
 def detect_mss(df_list: dict[str, pd.DataFrame]) -> dict[str, dict]:
     """Detect Market Structure Shift (MSS) across timeframes."""
     result = {tf: {"mss": False, "direction": "NONE", "strength": 0.0} for tf in df_list.keys()}
     
-    if not df_list or not all(df_list.values()):
+    if not df_list or not any(_has_data(v) for v in df_list.values()):
         return result
     
     if "5M" in df_list and not df_list["5M"].empty:
         df_5m = df_list["5M"]
-        levels_5m = detect_structure_levels(df_5m)
+        levels_5m = detect_structure_levels(df_5m.iloc[:-1])
         bos_5m = detect_bos(df_5m, levels_5m)
         
         if bos_5m and len(df_5m) >= 2:
@@ -817,7 +823,7 @@ def generate_trade_signal(df_dict: dict[str, pd.DataFrame], spot: float, mss: di
         logger.warning("FYERS not available - cannot generate trade signal")
         return None
     
-    if not df_dict or not any(df_dict.values()):
+    if not df_dict or not any(_has_data(v) for v in df_dict.values()):
         return None
     
     df_5m = df_dict.get("5M")
@@ -834,7 +840,7 @@ def generate_trade_signal(df_dict: dict[str, pd.DataFrame], spot: float, mss: di
     current_macd_hist = float(df_5m["macd_hist"].iloc[-1]) if "macd_hist" in df_5m.columns else 0.0
     current_rvol = float(df_5m["rvol"].iloc[-1]) if "rvol" in df_5m.columns else 1.0
     
-    levels_5m = detect_structure_levels(df_5m)
+    levels_5m = detect_structure_levels(df_5m.iloc[:-1])
     resistance = levels_5m.get("resistance", current_close)
     support = levels_5m.get("support", current_close)
     
@@ -3617,7 +3623,7 @@ def _do_fetch_and_process(cfg: dict, fyers: Any = None) -> Optional[dict]:
                 df_tf = fetch_fyers_candles(fyers, fyers_symbol, tf_mins, count=100)
                 df_dict[tf_name] = df_tf
             
-            if any(df_dict.values()):
+            if any(_has_data(v) for v in df_dict.values()):
                 for tf_name in df_dict:
                     if df_dict[tf_name] is not None and not df_dict[tf_name].empty:
                         df_dict[tf_name] = add_technical_indicators(df_dict[tf_name])
@@ -4649,8 +4655,6 @@ def _movement_search_excel(df: pd.DataFrame, report_name: str = "Movement Search
         "Instrument", "Strike", "Option", "Direction", "Status",
         "Signal Time", "Entry", "Stop Loss", "Price Reversal", "Reversal Status",
         "Score", "Early Score", "CE Score", "PE Score",
-        "Validated Status", "Validated Direction", "Direction Confirmed",
-        "Validation Confidence", "Signal Valid", "Direction Source Validated",
         "Movement Bias", "Price Delta", "Price Change %", "Price Direction Source",
         "CE Price", "PE Price", "Early Status", "Rising Scans",
         "Score Delta", "Confidence", "Spot", "Source",
@@ -4734,16 +4738,15 @@ def _validate_movement_signal_additive(
         if pdir not in {"UP", "DOWN", "FLAT"}:
             pdir = "FLAT" if abs(pd) < 1e-9 else ("UP" if pd > 0 else "DOWN")
 
-        # CE/PE activity scores choose the option side; they do NOT predict
-        # whether that option premium is rising or falling. Keep these concepts
-        # separate to avoid the old score-side/direction mix-up.
         score_gap = abs(ce_score - pe_score)
-        score_side = str(row.get("Option", "")).upper().strip()
+        score_side = "UP" if ce_score > pe_score + 7 else (
+            "DOWN" if pe_score > ce_score + 7 else "BOTH"
+        )
 
-        # A direction is confirmed only by a non-flat observed premium change.
+        # A score alone is never enough to call a confirmed movement.
         price_confirmed = (
-            (pdir == "UP" and pd > 0.005) or
-            (pdir == "DOWN" and pd < -0.005)
+            (pdir == "UP" and pd > 0) or
+            (pdir == "DOWN" and pd < 0)
         )
 
         # Early/pre-move requires some developing evidence.
@@ -4789,8 +4792,11 @@ def _validate_movement_signal_additive(
             final_direction = "WAIT"
             direction_source = "NO PRICE CONFIRMATION"
 
-        # CE-vs-PE score is a contract-side ranking, not an UP/DOWN forecast.
-        # Do not compare "CE"/"PE" with "UP"/"DOWN"; that caused false blocks.
+        # If score says one side but price is moving opposite, block it.
+        if score_side != "BOTH" and final_direction != "WAIT":
+            if score_side != final_direction and abs(score_delta) < 3:
+                final_direction = "WAIT"
+                direction_source = "SCORE/PRICE CONFLICT"
 
         confidence = 35.0
         confidence += min(score, 100.0) * 0.25
@@ -4799,8 +4805,8 @@ def _validate_movement_signal_additive(
         confidence += min(abs(pp), 5.0) * 2.0
         if price_confirmed:
             confidence += 10.0
-        if score_side in {"CE", "PE"}:
-            confidence += min(score_gap, 20.0) * 0.15
+        if score_side == final_direction and final_direction != "WAIT":
+            confidence += 5.0
         if final_direction == "WAIT":
             confidence -= 15.0
         confidence = max(0.0, min(95.0, confidence))
@@ -4815,8 +4821,11 @@ def _validate_movement_signal_additive(
             final_direction != "WAIT"
         )
         out["validated_confidence"] = round(confidence, 1)
-        out["score_price_conflict"] = False
-        out["selected_option_side"] = score_side or "UNKNOWN"
+        out["score_price_conflict"] = bool(
+            score_side != "BOTH" and
+            price_confirmed and
+            score_side != final_direction
+        )
         return out
     except Exception:
         return dict(row)
@@ -5158,32 +5167,6 @@ def _movement_search_one(
 
         if not rows:
             return pd.DataFrame()
-
-        # ADDITIVE VALIDATION: retain all legacy fields and append confirmed
-        # direction/status columns for both INDEX and F&O Total Scanner rows.
-        validated_rows = []
-        for item in rows:
-            validation_input = {
-                "Option": item.get("Option", ""),
-                "movement_score": item.get("Score", 0.0),
-                "ce_movement_score": item.get("CE Score", 0.0),
-                "pe_movement_score": item.get("PE Score", 0.0),
-                "early_score": item.get("Early Score", 0.0),
-                "rising_scans": item.get("Rising Scans", 0),
-                "score_delta": item.get("Score Delta", 0.0),
-                "price_delta": item.get("Price Delta", 0.0),
-                "price_change_pct": item.get("Price Change %", 0.0),
-                "price_direction": item.get("Direction", "FLAT"),
-            }
-            checked = _validate_movement_signal_additive(validation_input)
-            item["Validated Status"] = checked.get("validated_status", "WAIT")
-            item["Validated Direction"] = checked.get("validated_direction", "WAIT")
-            item["Direction Confirmed"] = bool(checked.get("price_confirmed", False))
-            item["Validation Confidence"] = _pin_num(checked.get("validated_confidence"), 0.0)
-            item["Signal Valid"] = bool(checked.get("movement_signal_valid", False))
-            item["Direction Source Validated"] = checked.get("direction_source", "NO PRICE CONFIRMATION")
-            validated_rows.append(item)
-        rows = validated_rows
 
         return (
             pd.DataFrame(rows)
@@ -5792,9 +5775,9 @@ def _render_big_movement_scan(
         unsafe_allow_html=True,
     )
     st.caption(
-        f"Showing existing movement-engine strikes with CE or PE score "
-        f"≥ {BIG_MOVEMENT_SCAN_MIN_SCORE:.0f}. CE/PE is selected at the SAME strike. "
-        "UP/DOWN is measured separately from that option's premium; score alone is not a BUY confirmation."
+        f"Showing only existing movement-engine strikes with CE or PE score "
+        f"≥ {BIG_MOVEMENT_SCAN_MIN_SCORE:.0f}. CE/PE is selected at the SAME strike; "
+        "Direction is based on the selected option-premium movement."
     )
 
     if not universe:
@@ -5841,16 +5824,6 @@ def _render_big_movement_scan(
         return
 
     out = _decorate_live_big_movement_rows(pd.DataFrame(rows))
-
-    # Explicit confirmation label helps distinguish early alerts from entries.
-    if "Validated Status" in out.columns:
-        out["Confirmation"] = out.apply(
-            lambda r: (
-                "CONFIRMED" if bool(r.get("Direction Confirmed", False))
-                and str(r.get("Validated Direction", "WAIT")) in {"UP", "DOWN"}
-                else ("PRE-MOVE / BUILDING" if str(r.get("Validated Status", "WAIT")) in {"PRE-MOVE", "BUILDING"} else "WAIT FOR PRICE")
-            ), axis=1
-        )
 
     out["_phase_rank"] = out.get("Live Phase", "WAIT").map({
         "BIG MOVEMENT CONFIRMED": 0,
@@ -6191,6 +6164,13 @@ def run_dashboard(fyers: Any = None) -> None:
     state = st.session_state.get("oc_state")
     if state is None:
         st.info("👈 Choose an instrument and click **Fetch Live Data**.")
+        # Keep the independent Movement Tracker running even before the
+        # main option-chain dashboard has been fetched.
+        if (st.session_state.get(BIG_TRACKER_ACTIVE_KEY, False)
+                and movement_search_cfg.get("live_tracker_auto", True)):
+            interval = int(movement_search_cfg.get("live_tracker_interval", 20))
+            time.sleep(max(10, interval))
+            st.rerun()
         return
 
     df: pd.DataFrame = state["df"]
