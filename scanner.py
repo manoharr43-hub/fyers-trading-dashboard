@@ -972,18 +972,34 @@ def calculate_next_candle_bias(df, timeframe_analysis: Dict[str, Any]) -> Dict[s
 # NEW INDICATORS (MULTI-TIMEFRAME)
 # ════════════════════════════════════════════════════════════════════════════════
 def calculate_vwap(df) -> pd.Series:
-    """Calculate VWAP"""
-    if "Volume" not in df.columns or len(df) == 0:
-        return pd.Series([np.nan] * len(df), index=df.index)
-    
-    high = df["High"].astype(float)
-    low = df["Low"].astype(float)
-    close = df["Close"].astype(float)
-    volume = df["Volume"].astype(float)
-    
-    typical_price = (high + low + close) / 3
-    vwap = (typical_price * volume).cumsum() / volume.cumsum()
-    return vwap.fillna(method="ffill").fillna(close)
+    """Calculate session VWAP for intraday data; safely fall back if Time is absent."""
+    if df is None or len(df) == 0 or "Volume" not in df.columns:
+        return pd.Series(np.nan, index=getattr(df, "index", None), dtype=float)
+    required = {"High", "Low", "Close", "Volume"}
+    if not required.issubset(df.columns):
+        return pd.Series(np.nan, index=df.index, dtype=float)
+
+    high = pd.to_numeric(df["High"], errors="coerce")
+    low = pd.to_numeric(df["Low"], errors="coerce")
+    close = pd.to_numeric(df["Close"], errors="coerce")
+    volume = pd.to_numeric(df["Volume"], errors="coerce").clip(lower=0).fillna(0)
+    typical_price = (high + low + close) / 3.0
+    pv = (typical_price * volume).where(np.isfinite(typical_price), 0.0)
+
+    # Intraday VWAP must reset each trading session, otherwise previous days
+    # distort today's values. Keep cumulative behavior only when no Time exists.
+    if "Time" in df.columns:
+        ts = pd.to_datetime(df["Time"], errors="coerce")
+        if ts.notna().any():
+            session = ts.dt.strftime("%Y-%m-%d").fillna("UNKNOWN")
+            cum_pv = pv.groupby(session, sort=False).cumsum()
+            cum_vol = volume.groupby(session, sort=False).cumsum()
+        else:
+            cum_pv, cum_vol = pv.cumsum(), volume.cumsum()
+    else:
+        cum_pv, cum_vol = pv.cumsum(), volume.cumsum()
+    vwap = cum_pv.div(cum_vol.replace(0, np.nan))
+    return vwap.ffill().fillna(close)
 
 def calculate_ema(close, period: int = 9) -> pd.Series:
     """Calculate EMA"""
@@ -1534,9 +1550,21 @@ def fetch_options_chain_data(fyers, symbol: str, expiry_timestamp: str = "") -> 
             nearest = expiry_data[0]
             expiry_timestamp = str(nearest.get("expiry", ""))
             if expiry_timestamp:
+                # Validate the second request independently; never silently use a
+                # possibly stale/invalid first response as if it matched this expiry.
                 resp = _fyers_optionchain_request(fyers, symbol, timestamp=expiry_timestamp)
-                data = resp.get("data", resp) if isinstance(resp, dict) else {}
-                chain = data.get("optionsChain") or chain
+                if not isinstance(resp, dict) or resp.get("s") not in (None, "ok"):
+                    empty["message"] = str(resp.get("message", "Nearest-expiry option-chain request failed")) if isinstance(resp, dict) else "Invalid nearest-expiry response"
+                    return empty
+                data = resp.get("data", resp)
+                if not isinstance(data, dict):
+                    empty["message"] = "Invalid nearest-expiry response data"
+                    return empty
+                chain = data.get("optionsChain") or []
+                if not chain:
+                    empty["message"] = "Nearest-expiry option chain is empty"
+                    return empty
+                expiry_data = data.get("expiryData") or expiry_data
         spot_row = next((x for x in chain if x.get("option_type", "") == ""), None)
         spot = float(spot_row.get("ltp")) if spot_row and spot_row.get("ltp") is not None else None
         legs = [x for x in chain if x.get("option_type") in ("CE","PE") and x.get("strike_price") not in (None,-1)]
@@ -3478,7 +3506,11 @@ def detect_pre_big_move_identity(df: pd.DataFrame) -> Dict[str, Any]:
         # context only; the caller's BIG MOVE engine takes precedence.
         if buy_break or sell_break:
             status = "⚡ TRIGGERED — BIG MOVE CHECK"
-            direction = "BUY" if buy_break else "SELL"
+            # This module is the PRE-BIG context layer. A range break alone is
+            # not enough to call a confirmed BUY/SELL; the BIG MOVE engine must
+            # validate candle strength and volume first.
+            direction = "NONE"
+            reason = (reason + " + " if reason else "") + "Range break awaiting BIG MOVE confirmation"
 
         out.update({
             "status": status, "direction": direction,
@@ -3522,7 +3554,9 @@ def _fetch_momentum_signal(fyers, symbol: str, is_fo: bool = False):
         # Confirm an actual BIG MOVE first. Only when it is not confirmed do we
         # expose the unified PRE-BIG identity as the primary movement status.
         candidates = []
-        for idx in range(max(12, len(d) - 12), len(d)):
+        # Do not surface a stale historical move as a current live signal.
+        # Only accept a confirmed move from the latest 3 five-minute candles.
+        for idx in range(max(0, len(d) - 3), len(d)):
             sub = d.iloc[:idx+1]
             mv = detect_live_sudden_move(sub)
             if mv.get("direction") in ("BUY", "SELL"):
