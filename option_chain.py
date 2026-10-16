@@ -3414,6 +3414,27 @@ def _inject_css() -> None:
         border: 2px solid {BLUE}; border-radius: 12px; padding: 16px 18px; margin: 12px 0; }}
     .trade-signal-buy {{ border-left: 4px solid {GREEN}; }}
     .trade-signal-sell {{ border-left: 4px solid {RED}; }}
+    @keyframes bigMoveBlink {{
+        0%, 100% {{ opacity: 1; box-shadow: 0 0 0 2px var(--alert-color); }}
+        50% {{ opacity: .48; box-shadow: 0 0 12px 4px var(--alert-color); }}
+    }}
+    @keyframes preMovePulse {{
+        0%, 100% {{ box-shadow: 0 0 0 1px #F4B942; }}
+        50% {{ box-shadow: 0 0 8px 2px #F4B942; }}
+    }}
+    .big-move-blink {{
+        animation: bigMoveBlink 1s steps(2, end) infinite;
+        border: 2px solid var(--alert-color) !important;
+        background: #161B22;
+    }}
+    .big-move-premove {{
+        animation: preMovePulse 1.4s ease-in-out infinite;
+        border: 2px dashed #F4B942 !important;
+        background: #2B2516;
+    }}
+    @media (prefers-reduced-motion: reduce) {{
+        .big-move-blink, .big-move-premove {{ animation: none !important; }}
+    }}
     </style>
     """, unsafe_allow_html=True)
 
@@ -5988,14 +6009,36 @@ def _render_big_movement_scan(
         pre_side = str(r.get("Pre-Move Side", "WAIT"))
         movement_time = str(r.get("Movement Time", "—"))
         text = (
-            f"{phase} | {side} {direction} | {score:.0f}/100<br>"
+            f"<strong>{phase} | {side} {direction} | {score:.0f}/100</strong><br>"
             f"Strike {strike:,.0f} | PRE {pre_side}<br>"
             f"CE ₹{ce_price:.2f} | PE ₹{pe_price:.2f}<br>"
             f"Movement Time {movement_time}"
         )
+        # Blink only when the scanner marks a movement event; PRE-MOVE gets
+        # a slower amber pulse. The alert is visual only and never places orders.
+        phase_upper = phase.upper()
+        direction_upper = direction.upper()
+        is_confirmed_move = phase_upper in ("BIG MOVEMENT CONFIRMED", "BIG MOVEMENT")
+        is_premove = phase_upper == "PRE-MOVE"
+        if is_confirmed_move:
+            alert_color = "#20E080" if direction_upper == "UP" else "#FF5252"
+            card_class = "big-move-blink"
+            inline_style = f"--alert-color:{alert_color};color:{TEXT_MAIN};"
+            st.markdown(
+                f'<div style="font-weight:700;color:{alert_color};margin:0 0 6px 0;">'
+                f'🚨 {side} BIG MOVE ALERT — {r.get("Instrument", "—")} '
+                f'{strike:,.0f} {direction_upper}</div>',
+                unsafe_allow_html=True,
+            )
+        elif is_premove:
+            card_class = "big-move-premove"
+            inline_style = "color:#F4B942;"
+        else:
+            card_class = ""
+            inline_style = f"color:{TEXT_MAIN};"
         col.markdown(
-            f'<div style="padding:10px;border:1px solid {BORDER_COLOR};'
-            f'border-radius:8px;margin-bottom:8px;">{text}</div>',
+            f'<div class="{card_class}" style="--alert-color:{alert_color if is_confirmed_move else "#F4B942"};'
+            f'{inline_style}padding:10px;border-radius:8px;margin-bottom:8px;">{text}</div>',
             unsafe_allow_html=True,
         )
 
