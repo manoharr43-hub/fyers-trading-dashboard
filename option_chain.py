@@ -6296,13 +6296,81 @@ def run_dashboard(fyers: Any = None) -> None:
     st.divider()
 
     if state.get("price_action_data") and state["price_action_data"].get("df_dict"):
-        tab_chain, tab_charts, tab_pressure, tab_orderflow, tab_movement, tab_greeks, tab_ai, tab_gex, tab_po3, tab_price_action, tab_sell_confirm, tab_export = st.tabs([
-            "📋 Chain", "📈 OI", "💪 Pressure", "📊 Order Flow", "🎯 Strike Movement", "🧮 Greeks", "🤖 AI", "⚡ GEX", "🧠 PO3 Intelligence", "💹 Price Action", "🔴 SELL CONFIRM", "📥 Export",
+        tab_chain, tab_charts, tab_pressure, tab_orderflow, tab_movement, tab_greeks, tab_ai, tab_gex, tab_po3, tab_price_action, tab_sell_confirm, tab_export, tab_intraday = st.tabs([
+            "📋 Chain", "📈 OI", "💪 Pressure", "📊 Order Flow", "🎯 Strike Movement", "🧮 Greeks", "🤖 AI", "⚡ GEX", "🧠 PO3 Intelligence", "💹 Price Action", "🔴 SELL CONFIRM", "📥 Export", "📅 INTRADAY PLAN",
         ])
     else:
-        tab_chain, tab_charts, tab_pressure, tab_orderflow, tab_movement, tab_greeks, tab_ai, tab_gex, tab_po3, tab_sell_confirm, tab_export = st.tabs([
-            "📋 Chain", "📈 OI", "💪 Pressure", "📊 Order Flow", "🎯 Strike Movement", "🧮 Greeks", "🤖 AI", "⚡ GEX", "🧠 PO3 Intelligence", "🔴 SELL CONFIRM", "📥 Export",
+        tab_chain, tab_charts, tab_pressure, tab_orderflow, tab_movement, tab_greeks, tab_ai, tab_gex, tab_po3, tab_sell_confirm, tab_export, tab_intraday = st.tabs([
+            "📋 Chain", "📈 OI", "💪 Pressure", "📊 Order Flow", "🎯 Strike Movement", "🧮 Greeks", "🤖 AI", "⚡ GEX", "🧠 PO3 Intelligence", "🔴 SELL CONFIRM", "📥 Export", "📅 INTRADAY PLAN",
         ])
+
+
+    # ADDITIVE INTRADAY PLAN: reads existing candle/signal data; does not replace old logic.
+    with tab_intraday:
+        st.markdown('<div class="block-title">📅 INTRADAY PLAN — TREND + CONFIRMATION</div>', unsafe_allow_html=True)
+        st.caption("Use completed-candle confirmation. This is an analysis aid, not a guaranteed prediction or automatic order.")
+        now_ist = _india_now()
+        st.metric("SIGNAL / REVIEW TIME (IST)", now_ist.strftime("%d-%b-%Y %H:%M:%S"))
+        pa = state.get("price_action_data") or {}
+        tf_data = pa.get("df_dict") or {}
+        rows = []
+        for tf_name in ("1M", "3M", "5M", "15M", "30M", "1H", "1D"):
+            dft = tf_data.get(tf_name)
+            if not isinstance(dft, pd.DataFrame) or dft.empty:
+                continue
+            dft = dft.copy()
+            close = float(dft["close"].iloc[-1])
+            ema9 = float(calculate_ema(dft, 9).iloc[-1])
+            ema21 = float(calculate_ema(dft, 21).iloc[-1])
+            vwap_s = calculate_vwap(dft)
+            vwap = float(vwap_s.iloc[-1]) if len(vwap_s) else close
+            rsi_s = calculate_rsi(dft)
+            rsi = float(rsi_s.iloc[-1]) if len(rsi_s) else 50.0
+            rvol_s = calculate_rvol(dft)
+            rvol = float(rvol_s.iloc[-1]) if len(rvol_s) else 1.0
+            trend = "UP" if close > ema9 > ema21 else ("DOWN" if close < ema9 < ema21 else "MIXED")
+            rows.append({
+                "Timeframe": tf_name, "Candle Time (IST)": (
+                    datetime.fromtimestamp(float(dft["timestamp"].iloc[-1]), tz=timezone.utc).astimezone(INDIA_TZ).strftime("%H:%M")
+                    if "timestamp" in dft.columns and pd.notna(dft["timestamp"].iloc[-1]) else "N/A"
+                ),
+                "Close": round(close, 2), "Trend": trend, "EMA 9": round(ema9, 2),
+                "EMA 21": round(ema21, 2), "VWAP": round(vwap, 2),
+                "RSI": round(rsi, 1), "RVOL": round(rvol, 2),
+                "Above VWAP": "YES" if close > vwap else "NO",
+            })
+        if rows:
+            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+            trend_map = {r["Timeframe"]: r["Trend"] for r in rows}
+            t5, t15 = trend_map.get("5M", "N/A"), trend_map.get("15M", "N/A")
+            if t5 == "UP" and t15 == "UP":
+                st.success("5M + 15M trend aligned UP. Wait for price/volume confirmation near trigger.")
+            elif t5 == "DOWN" and t15 == "DOWN":
+                st.error("5M + 15M trend aligned DOWN. Wait for breakdown/volume confirmation near trigger.")
+            else:
+                st.warning(f"5M/15M trend not fully aligned (5M: {t5}, 15M: {t15}). Prefer WAIT until confirmation.")
+        else:
+            st.info("Intraday candle data is not available yet. Check FYERS connection and selected symbol; existing option-chain tabs remain available.")
+        ts = state.get("trade_signal")
+        if ts is not None:
+            try:
+                sig = ts.signal
+                a, b, c, d = st.columns(4)
+                a.metric("Existing Signal", str(sig))
+                b.metric("Entry", f"₹{float(ts.entry):,.2f}")
+                c.metric("Stop Loss", f"₹{float(ts.stop_loss):,.2f}")
+                d.metric("Risk : Reward", f"1 : {float(ts.risk_reward_ratio):.2f}")
+                st.caption(
+                    f"T1 ₹{float(ts.target_1):,.2f} | T2 ₹{float(ts.target_2):,.2f} | "
+                    f"T3 ₹{float(ts.target_3):,.2f} | Confidence {float(ts.confidence):.0f}/100"
+                )
+            except (AttributeError, TypeError, ValueError):
+                st.info("Existing trade signal is not in the expected format; no changes were made to signal generation.")
+        st.markdown("#### Intraday checklist")
+        st.write("- Prefer BUY only when 5M and 15M trend agree UP and price/volume confirm.")
+        st.write("- Prefer SELL only when 5M and 15M trend agree DOWN and price/volume confirm.")
+        st.write("- If trends conflict, data is stale, or RVOL is weak, treat the setup as WAIT.")
+        st.write("- Re-check spread, liquidity, position size and stop-loss before any decision.")
 
     with tab_chain:
         st.markdown(render_chain_table_html(df, cfg["show_greeks"]), unsafe_allow_html=True)
