@@ -3637,6 +3637,44 @@ def _do_fetch_and_process(cfg: dict, fyers: Any = None) -> Optional[dict]:
                     "trade_signal": trade_signal,
                 }
 
+    # ADDITIVE INTRADAY PLAN DATA: fetch independently of the optional Price Action checkbox.
+    # This keeps the old Price Action/MSS toggle and signal-generation logic unchanged.
+    intraday_data = {"df_dict": {}, "fyers_symbol": None, "error": None}
+    if fyers is None:
+        intraday_data["error"] = "No connected FYERS client. Use FETCH LIVE after connecting FYERS; FREE RUN does not provide candles."
+    else:
+        intraday_candidates = (
+            _fyers_index_candidates(cfg["symbol"]) if cfg["is_index"]
+            else fyers_stock_symbol_candidates(stock_name)
+        )
+        for intraday_symbol in intraday_candidates:
+            intraday_frames = {}
+            for tf_name, tf_mins in {"5M": 5, "15M": 15, "30M": 30, "1H": 60, "1D": 1440}.items():
+                intraday_frames[tf_name] = fetch_fyers_candles(
+                    fyers, intraday_symbol, tf_mins, count=100
+                )
+            usable_5m = isinstance(intraday_frames.get("5M"), pd.DataFrame) and not intraday_frames["5M"].empty
+            usable_15m = isinstance(intraday_frames.get("15M"), pd.DataFrame) and not intraday_frames["15M"].empty
+            any_usable = any(
+                isinstance(v, pd.DataFrame) and not v.empty for v in intraday_frames.values()
+            )
+            if any_usable:
+                for tf_name, frame in intraday_frames.items():
+                    if isinstance(frame, pd.DataFrame) and not frame.empty:
+                        intraday_frames[tf_name] = add_technical_indicators(frame)
+                candidate_result = {
+                    "df_dict": intraday_frames,
+                    "fyers_symbol": intraday_symbol,
+                    "error": None if (usable_5m and usable_15m) else "FYERS returned some candles, but 5M and/or 15M confirmation data is missing.",
+                }
+                # Keep a partial fallback, but continue looking for a symbol with both confirmation timeframes.
+                if not intraday_data["df_dict"] or (usable_5m and usable_15m):
+                    intraday_data = candidate_result
+                if usable_5m and usable_15m:
+                    break
+        if not intraday_data["df_dict"]:
+            intraday_data["error"] = "FYERS returned no usable candles for the selected symbol. Check symbol mapping, market-data permissions, and the FYERS session."
+
     scalping_data = None
     if cfg.get("scalping_mode") and fyers is not None:
         fyers_symbol_candidates = (
@@ -3696,6 +3734,7 @@ def _do_fetch_and_process(cfg: dict, fyers: Any = None) -> Optional[dict]:
         "atm_iv": atm_iv, "iv_rank": iv_rank, "iv_percentile": iv_percentile, "gex_dex": gex_dex,
         "oi_shift_notes": oi_shift_notes, "data_source": data_source,
         "price_action_data": price_action_data, "trade_signal": trade_signal,
+        "intraday_data": intraday_data,
         "market_pressure": market_pressure,
         "order_flow": order_flow,
         "po3_intelligence": po3_intelligence,
@@ -6311,8 +6350,13 @@ def run_dashboard(fyers: Any = None) -> None:
         st.caption("Use completed-candle confirmation. This is an analysis aid, not a guaranteed prediction or automatic order.")
         now_ist = _india_now()
         st.metric("SIGNAL / REVIEW TIME (IST)", now_ist.strftime("%d-%b-%Y %H:%M:%S"))
-        pa = state.get("price_action_data") or {}
+        # Prefer the dedicated Intraday Plan fetch; fall back to existing Price Action data.
+        pa = state.get("intraday_data") or state.get("price_action_data") or {}
         tf_data = pa.get("df_dict") or {}
+        if pa.get("fyers_symbol"):
+            st.caption(f"Candle source symbol: {pa['fyers_symbol']}")
+        if pa.get("error"):
+            st.warning(str(pa["error"]))
         rows = []
         for tf_name in ("1M", "3M", "5M", "15M", "30M", "1H", "1D"):
             dft = tf_data.get(tf_name)
@@ -6350,7 +6394,7 @@ def run_dashboard(fyers: Any = None) -> None:
             else:
                 st.warning(f"5M/15M trend not fully aligned (5M: {t5}, 15M: {t15}). Prefer WAIT until confirmation.")
         else:
-            st.info("Intraday candle data is not available yet. Check FYERS connection and selected symbol; existing option-chain tabs remain available.")
+            st.info("Intraday candle data is not available yet. Click FETCH LIVE with a connected FYERS session. FREE RUN provides option-chain data only; existing option-chain tabs remain available.")
         ts = state.get("trade_signal")
         if ts is not None:
             try:
