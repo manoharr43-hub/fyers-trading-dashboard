@@ -5336,7 +5336,11 @@ def show_scanner(fyers) -> None:
             elif "STOCK NAME" not in view.columns:
                 view.insert(0, "STOCK NAME", "N/A")
             view = _add_reversal_columns(view)
-            _before_cols = ["STOCK NAME", "LTP", "BEFORE MOVE SIGNAL", "BEFORE MOVE SCORE", "PRE-MOVE SCORE", "PRE-MOVE STATUS", "PRE BUY/SELL SCORE", "PRE SCORE GAP", "BREAKOUT LEVEL", "BREAKDOWN LEVEL", "PRE-MOVE RVOL", "PRE-MOVE REASON", "REVERSAL SIGNAL", "REVERSAL SCORE", "REVERSAL LEVEL", "REVERSAL ZONE", "REVERSAL REASON", "SIGNAL TYPE", "COMBINED BIAS"]
+            # Preserve the candle-based signal timestamp in the BEFORE MOVE report.
+            # Older scan paths may expose it as "Signal Time" rather than "SIGNAL TIME".
+            if "SIGNAL TIME" not in view.columns and "Signal Time" in view.columns:
+                view = view.rename(columns={"Signal Time": "SIGNAL TIME"})
+            _before_cols = ["STOCK NAME", "LTP", "SIGNAL TIME", "Signal Time", "BEFORE MOVE SIGNAL", "BEFORE MOVE SCORE", "PRE-MOVE SCORE", "PRE-MOVE STATUS", "PRE BUY/SELL SCORE", "PRE SCORE GAP", "BREAKOUT LEVEL", "BREAKDOWN LEVEL", "PRE-MOVE RVOL", "PRE-MOVE REASON", "REVERSAL SIGNAL", "REVERSAL SCORE", "REVERSAL LEVEL", "REVERSAL ZONE", "REVERSAL REASON", "SIGNAL TYPE", "COMBINED BIAS"]
             cols = [c for c in _before_cols if c in view.columns]
             view = view[cols].copy() if cols else view.copy()
             if "BEFORE MOVE SIGNAL" in view.columns:
