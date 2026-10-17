@@ -282,6 +282,19 @@ VOL_BIGMOVE_MIN_RVOL = 2.5
 VOL_BIGMOVE_MIN_BODY_PCT = 0.8
 VOL_BIGMOVE_LOOKBACK = 20
 
+# BIG MOVE detector thresholds (required by detect_last_consolidation / detect_big_move_setup).
+# Kept separate from the original VOL_BIGMOVE_* settings to avoid changing old logic.
+BIGMOVE_LOOKBACK_BARS = 20
+BIGMOVE_CONSOLIDATION_MIN_BARS = 4
+BIGMOVE_CONSOLIDATION_MAX_BARS = 12
+BIGMOVE_MAX_RANGE_PCT = 1.8
+BIGMOVE_MAX_BAR_ATR_MULT = 1.25
+BIGMOVE_MIN_BODY_ATR = 0.60
+BIGMOVE_MIN_BODY_PCT = 55.0
+BIGMOVE_MIN_RVOL = 1.50
+BIGMOVE_MIN_BREAK_PCT = 0.05
+BIGMOVE_STRONG_SCORE = 80.0
+
 # ════════════════════════════════════════════════════════════════════════════════
 # MULTI-TIMEFRAME CONSTANTS (NEW)
 # ════════════════════════════════════════════════════════════════════════════════
@@ -479,6 +492,66 @@ def _bigmove_pivots(df: pd.DataFrame, left: int = 2, right: int = 2):
         if lows[i] <= min(lows[i-left:i]) and lows[i] < min(lows[i+1:i+right+1]):
             pl.append((i, float(lows[i])))
     return ph, pl
+
+
+def _detect_amd_phase(df: pd.DataFrame) -> Dict[str, Any]:
+    """Heuristic Accumulation-Manipulation-Distribution phase estimate from OHLCV.
+
+    This is a candle-based estimate, not proof of institutional activity.
+    Uses only available completed candles and returns a safe WAIT fallback.
+    """
+    result = {"phase": "INSUFFICIENT_DATA", "direction": "NONE", "signal": "WAIT", "reason": "Need at least 20 candles"}
+    if df is None or len(df) < 20:
+        return result
+    try:
+        d = df.reset_index(drop=True).copy()
+        required = ["Open", "High", "Low", "Close", "Volume"]
+        if any(c not in d.columns for c in required):
+            result["reason"] = "Missing OHLCV columns"
+            return result
+        d[required] = d[required].apply(pd.to_numeric, errors="coerce")
+        d = d.dropna(subset=required)
+        if len(d) < 20:
+            return result
+        last = d.iloc[-1]
+        prior = d.iloc[-13:-1]
+        if len(prior) < 8:
+            return result
+        range_high = float(prior["High"].max())
+        range_low = float(prior["Low"].min())
+        close = float(last["Close"])
+        high = float(last["High"])
+        low = float(last["Low"])
+        open_ = float(last["Open"])
+        avg_volume = float(prior["Volume"].mean())
+        rvol = float(last["Volume"] / avg_volume) if avg_volume > 0 else 0.0
+        width_pct = ((range_high - range_low) / max((range_high + range_low) / 2.0, 1e-9)) * 100
+        swept_low = low < range_low and close > range_low
+        swept_high = high > range_high and close < range_high
+        breakout_up = close > range_high
+        breakout_down = close < range_low
+        bullish_candle = close > open_
+        bearish_candle = close < open_
+
+        if swept_low:
+            result.update(phase="MANIPULATION", direction="UP", signal="WATCH BUY", reason=f"Low sweep reclaimed range; RVOL {rvol:.2f}x")
+        elif swept_high:
+            result.update(phase="MANIPULATION", direction="DOWN", signal="WATCH SELL", reason=f"High sweep rejected back into range; RVOL {rvol:.2f}x")
+        elif breakout_up and bullish_candle and rvol >= 1.2:
+            result.update(phase="CONFIRMATION", direction="UP", signal="BUY WATCH", reason=f"Upside range break with bullish candle; RVOL {rvol:.2f}x")
+        elif breakout_down and bearish_candle and rvol >= 1.2:
+            result.update(phase="CONFIRMATION", direction="DOWN", signal="SELL WATCH", reason=f"Downside range break with bearish candle; RVOL {rvol:.2f}x")
+        elif breakout_up:
+            result.update(phase="DISTRIBUTION", direction="UP", signal="WAIT CONFIRMATION", reason=f"Upside break lacks volume/candle confirmation; RVOL {rvol:.2f}x")
+        elif breakout_down:
+            result.update(phase="DISTRIBUTION", direction="DOWN", signal="WAIT CONFIRMATION", reason=f"Downside break lacks volume/candle confirmation; RVOL {rvol:.2f}x")
+        elif width_pct <= 2.0:
+            result.update(phase="ACCUMULATION", direction="NONE", signal="WAIT", reason=f"Tight prior range ({width_pct:.2f}%)")
+        else:
+            result.update(phase="ACCUMULATION", direction="NONE", signal="WAIT", reason=f"Range-bound; waiting for sweep/breakout ({width_pct:.2f}%)")
+        return result
+    except Exception as e:
+        return {"phase": "ERROR", "direction": "NONE", "signal": "WAIT", "reason": f"AMD error: {type(e).__name__}"}
 
 
 def detect_last_consolidation(df: pd.DataFrame) -> Dict[str, Any]:
@@ -3398,6 +3471,8 @@ def calculate_pin_rules(df_5m: pd.DataFrame, data_5m: Dict[str, Any], data_15m: 
         "BOTTOM LIQUIDITY SIDE": "SELL-SIDE", "BOTTOM LIQUIDITY STATUS": "NONE",
         "SWEEP": "NONE", "REVERSAL": "NONE", "EQUAL HIGH": "NO", "EQUAL LOW": "NO",
         "BIG MOVEMENT": "NO", "BIG MOVE SCORE": 0.0, "STRUCTURE": "NONE",
+        "AMD PHASE": "INSUFFICIENT_DATA", "AMD DIRECTION": "NONE",
+        "AMD SIGNAL": "WAIT", "AMD REASON": "Need at least 20 candles",
         "5M TREND": data_5m.get("structure_trend", "N/A"),
         "15M TREND": data_15m.get("structure_trend", "N/A"),
         "1H TREND": data_1h.get("structure_trend", "N/A"),
@@ -3469,6 +3544,7 @@ def calculate_pin_rules(df_5m: pd.DataFrame, data_5m: Dict[str, Any], data_15m: 
 
         # Existing BIG MOVE engine is reused; no duplicate scan logic.
         bm = detect_big_move_setup(d)
+        amd = _detect_amd_phase(d)
         structure = bm.get("structure", "NONE")
         liquidity = "EQ HIGH" if eq_hi else "EQ LOW" if eq_lo else "HIGH" if last_hi is not None else "LOW" if last_lo is not None else "NONE"
 
@@ -3526,6 +3602,10 @@ def calculate_pin_rules(df_5m: pd.DataFrame, data_5m: Dict[str, Any], data_15m: 
             "EQUAL HIGH": "YES" if eq_hi else "NO", "EQUAL LOW": "YES" if eq_lo else "NO",
             "BIG MOVEMENT": bm.get("signal", "NO BIG MOVE"),
             "BIG MOVE SCORE": bm.get("score", 0.0), "STRUCTURE": structure,
+            "AMD PHASE": amd.get("phase", "INSUFFICIENT_DATA"),
+            "AMD DIRECTION": amd.get("direction", "NONE"),
+            "AMD SIGNAL": amd.get("signal", "WAIT"),
+            "AMD REASON": amd.get("reason", "N/A"),
             "REASON": " | ".join([x for x in [
                 "EQ HIGH" if eq_hi else "", "EQ LOW" if eq_lo else "",
                 "LOW SWEEP" if bullish_sweep else "HIGH SWEEP" if bearish_sweep else "",
@@ -6279,10 +6359,15 @@ if __name__ == "__main__":
             st.stop()
         
         try:
-            from fyers_api import fyersModel
-        except ImportError as ie:
-            st.error("❌ fyers-api not installed")
-            st.code("pip install fyers-api", language="bash")
+            # Prefer the current FYERS SDK; retain legacy fallback for existing deployments.
+            try:
+                from fyers_apiv3 import fyersModel
+            except ImportError:
+                from fyers_api import fyersModel
+        except ImportError:
+            st.error("❌ FYERS SDK not installed")
+            st.code("pip install fyers-apiv3", language="bash")
+            st.info("Legacy environments may still use: pip install fyers-api")
             st.stop()
         
         app_id = os.environ.get("FYERS_APP_ID", "DEMO")
