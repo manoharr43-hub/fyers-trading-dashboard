@@ -12,6 +12,8 @@ Pressure Signals: Buy Pressure, Sell Pressure, Net Bias, Aggression, Volume/OI A
 
 This version includes institutional buy/sell pressure indicators
 while preserving all original functionality.
+Additive intraday safeguards: completed-candle filtering, 1M/3M plan data,
+minimum 5M/15M history for alignment, and trade-level validation before display.
 """
 
 from __future__ import annotations
@@ -404,6 +406,48 @@ def fetch_fyers_candles(fyers: Any, symbol: str, timeframe_minutes: int, count: 
     df = pd.DataFrame(rows)
     df = df.sort_values("timestamp").reset_index(drop=True)
     return df.tail(max(1, int(count))).reset_index(drop=True)
+
+
+def _completed_intraday_candles(df: Optional[pd.DataFrame], timeframe_minutes: int) -> Optional[pd.DataFrame]:
+    """Return only completed intraday candles; leave missing/invalid data safely unchanged."""
+    if not isinstance(df, pd.DataFrame) or df.empty or "timestamp" not in df.columns:
+        return df
+    try:
+        now_epoch = datetime.now(timezone.utc).timestamp()
+        candle_seconds = max(1, int(timeframe_minutes)) * 60
+        timestamps = pd.to_numeric(df["timestamp"], errors="coerce")
+        # FYERS timestamps are epoch seconds. Keep rows whose full candle interval has ended.
+        completed_mask = timestamps.notna() & ((timestamps + candle_seconds) <= now_epoch)
+        completed = df.loc[completed_mask].copy().reset_index(drop=True)
+        return completed
+    except (TypeError, ValueError, OverflowError):
+        logger.exception("Could not filter incomplete candles; retaining source frame")
+        return df
+
+
+def _trade_signal_levels_valid(signal: Any) -> tuple[bool, str]:
+    """Additive safety check for displayed legacy trade levels; does not rewrite signal logic."""
+    try:
+        side = str(signal.signal).upper()
+        entry = float(signal.entry)
+        sl = float(signal.stop_loss)
+        t1 = float(signal.target_1)
+        t2 = float(signal.target_2)
+        t3 = float(signal.target_3)
+        vals = (entry, sl, t1, t2, t3)
+        if not all(math.isfinite(v) and v > 0 for v in vals):
+            return False, "Trade levels contain a missing, non-finite, or non-positive price."
+        if side == "BUY" and not (sl < entry < t1 <= t2 <= t3):
+            return False, "BUY levels are inconsistent: expected Stop Loss < Entry < T1 ≤ T2 ≤ T3."
+        if side == "SELL" and not (t3 <= t2 <= t1 < entry < sl):
+            return False, "SELL levels are inconsistent: expected T3 ≤ T2 ≤ T1 < Entry < Stop Loss."
+        if side not in ("BUY", "SELL", "HOLD"):
+            return False, f"Unknown signal side: {side}."
+        if side == "HOLD" and sl == entry:
+            return False, "HOLD signal has zero stop distance; risk/reward is not meaningful."
+        return True, ""
+    except (AttributeError, TypeError, ValueError, OverflowError):
+        return False, "Trade levels could not be validated."
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -3670,9 +3714,14 @@ def _do_fetch_and_process(cfg: dict, fyers: Any = None) -> Optional[dict]:
         )
         for intraday_symbol in intraday_candidates:
             intraday_frames = {}
-            for tf_name, tf_mins in {"5M": 5, "15M": 15, "30M": 30, "1H": 60, "1D": 1440}.items():
-                intraday_frames[tf_name] = fetch_fyers_candles(
-                    fyers, intraday_symbol, tf_mins, count=100
+            for tf_name, tf_mins in {"1M": 1, "3M": 3, "5M": 5, "15M": 15, "30M": 30, "1H": 60, "1D": 1440}.items():
+                fetched_frame = fetch_fyers_candles(
+                    fyers, intraday_symbol, tf_mins, count=120 if tf_mins <= 5 else 100
+                )
+                # Filter incomplete candles for intraday timeframes; leave daily candles untouched.
+                intraday_frames[tf_name] = (
+                    _completed_intraday_candles(fetched_frame, tf_mins)
+                    if tf_mins <= 60 else fetched_frame
                 )
             usable_5m = isinstance(intraday_frames.get("5M"), pd.DataFrame) and not intraday_frames["5M"].empty
             usable_15m = isinstance(intraday_frames.get("15M"), pd.DataFrame) and not intraday_frames["15M"].empty
@@ -3708,9 +3757,10 @@ def _do_fetch_and_process(cfg: dict, fyers: Any = None) -> Optional[dict]:
         for candidate in fyers_symbol_candidates:
             test_dict = {}
             for tf_name, tf_mins in SCALPING_TIMEFRAMES.items():
-                test_dict[tf_name] = fetch_fyers_candles(
+                fetched_frame = fetch_fyers_candles(
                     fyers, candidate, tf_mins, count=120
                 )
+                test_dict[tf_name] = _completed_intraday_candles(fetched_frame, tf_mins)
 
             usable = sum(
                 1 for df_tf in test_dict.values()
@@ -6430,7 +6480,16 @@ def run_dashboard(fyers: Any = None) -> None:
             st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
             trend_map = {r["Timeframe"]: r["Trend"] for r in rows}
             t5, t15 = trend_map.get("5M", "N/A"), trend_map.get("15M", "N/A")
-            if t5 == "UP" and t15 == "UP":
+            df5, df15 = tf_data.get("5M"), tf_data.get("15M")
+            enough_5m = isinstance(df5, pd.DataFrame) and len(df5) >= 21
+            enough_15m = isinstance(df15, pd.DataFrame) and len(df15) >= 21
+            if not (enough_5m and enough_15m):
+                st.warning(
+                    f"WAIT — need at least 21 completed candles on both 5M and 15M "
+                    f"(available: 5M {len(df5) if isinstance(df5, pd.DataFrame) else 0}, "
+                    f"15M {len(df15) if isinstance(df15, pd.DataFrame) else 0})."
+                )
+            elif t5 == "UP" and t15 == "UP":
                 st.success("5M + 15M trend aligned UP. Wait for price/volume confirmation near trigger.")
             elif t5 == "DOWN" and t15 == "DOWN":
                 st.error("5M + 15M trend aligned DOWN. Wait for breakdown/volume confirmation near trigger.")
@@ -6441,16 +6500,20 @@ def run_dashboard(fyers: Any = None) -> None:
         ts = state.get("trade_signal")
         if ts is not None:
             try:
-                sig = ts.signal
-                a, b, c, d = st.columns(4)
-                a.metric("Existing Signal", str(sig))
-                b.metric("Entry", f"₹{float(ts.entry):,.2f}")
-                c.metric("Stop Loss", f"₹{float(ts.stop_loss):,.2f}")
-                d.metric("Risk : Reward", f"1 : {float(ts.risk_reward_ratio):.2f}")
-                st.caption(
-                    f"T1 ₹{float(ts.target_1):,.2f} | T2 ₹{float(ts.target_2):,.2f} | "
-                    f"T3 ₹{float(ts.target_3):,.2f} | Confidence {float(ts.confidence):.0f}/100"
-                )
+                levels_ok, levels_message = _trade_signal_levels_valid(ts)
+                if not levels_ok:
+                    st.warning(f"Legacy trade signal hidden by safety check: {levels_message} Treat this setup as WAIT and review the levels.")
+                else:
+                    sig = ts.signal
+                    a, b, c, d = st.columns(4)
+                    a.metric("Existing Signal", str(sig))
+                    b.metric("Entry", f"₹{float(ts.entry):,.2f}")
+                    c.metric("Stop Loss", f"₹{float(ts.stop_loss):,.2f}")
+                    d.metric("Risk : Reward", f"1 : {float(ts.risk_reward_ratio):.2f}")
+                    st.caption(
+                        f"T1 ₹{float(ts.target_1):,.2f} | T2 ₹{float(ts.target_2):,.2f} | "
+                        f"T3 ₹{float(ts.target_3):,.2f} | Confidence {float(ts.confidence):.0f}/100"
+                    )
             except (AttributeError, TypeError, ValueError):
                 st.info("Existing trade signal is not in the expected format; no changes were made to signal generation.")
         st.markdown("#### Intraday checklist")
