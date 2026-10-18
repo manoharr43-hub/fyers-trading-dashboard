@@ -6493,7 +6493,14 @@ def run_dashboard(fyers: Any = None) -> None:
                 if not chain_for_intraday.empty and required_chain_cols.issubset(chain_for_intraday.columns):
                     chain_for_intraday["strike_price"] = pd.to_numeric(chain_for_intraday["strike_price"], errors="coerce")
                     chain_for_intraday = chain_for_intraday.dropna(subset=["strike_price"])
-                    spot_ref = float(spot) if spot is not None and pd.notna(spot) and float(spot) > 0 else float(chain_for_intraday["strike_price"].median())
+                    # run_dashboard() has the current spot inside option-chain metadata; do not
+                    # reference the local `spot` variable from the separate fetch helper.
+                    spot_value = meta.get("spot_price", 0.0) if isinstance(meta, dict) else 0.0
+                    try:
+                        spot_value = float(spot_value)
+                    except (TypeError, ValueError):
+                        spot_value = 0.0
+                    spot_ref = spot_value if pd.notna(spot_value) and spot_value > 0 else float(chain_for_intraday["strike_price"].median())
                     atm_index = (chain_for_intraday["strike_price"] - spot_ref).abs().idxmin()
                     atm_row = chain_for_intraday.loc[atm_index]
                     for candle_row in rows:
