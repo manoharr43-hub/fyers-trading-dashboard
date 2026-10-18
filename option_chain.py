@@ -6478,6 +6478,53 @@ def run_dashboard(fyers: Any = None) -> None:
             })
         if rows:
             st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+            # ADDITIVE: map each underlying timeframe direction to a nearby option strike.
+            # This uses the currently loaded option chain; it does not fetch or invent option candles.
+            st.markdown("#### 🎯 Intraday Direction + Strike Suggestions")
+            st.caption(
+                "Strike is selected from the current option chain nearest to spot. UP maps to CE, "
+                "DOWN maps to PE; MIXED maps to WAIT. These are watch candidates, not guaranteed entries."
+            )
+            strike_rows = []
+            try:
+                chain_for_intraday = df.copy() if isinstance(df, pd.DataFrame) else pd.DataFrame()
+                required_chain_cols = {"strike_price", "ce_ltp", "pe_ltp"}
+                if not chain_for_intraday.empty and required_chain_cols.issubset(chain_for_intraday.columns):
+                    chain_for_intraday["strike_price"] = pd.to_numeric(chain_for_intraday["strike_price"], errors="coerce")
+                    chain_for_intraday = chain_for_intraday.dropna(subset=["strike_price"])
+                    spot_ref = float(spot) if spot is not None and pd.notna(spot) and float(spot) > 0 else float(chain_for_intraday["strike_price"].median())
+                    atm_index = (chain_for_intraday["strike_price"] - spot_ref).abs().idxmin()
+                    atm_row = chain_for_intraday.loc[atm_index]
+                    for candle_row in rows:
+                        direction = candle_row["Trend"]
+                        if direction == "UP":
+                            option_side, premium_col, signal = "CE", "ce_ltp", "BUY WATCH"
+                        elif direction == "DOWN":
+                            option_side, premium_col, signal = "PE", "pe_ltp", "BUY WATCH"
+                        else:
+                            option_side, premium_col, signal = "—", None, "WAIT"
+                        premium = pd.to_numeric(atm_row.get(premium_col), errors="coerce") if premium_col else None
+                        if premium is not None and pd.notna(premium) and float(premium) <= 0:
+                            premium = None
+                        if option_side == "—" or premium is None:
+                            signal = "WAIT"
+                        strike_rows.append({
+                            "Timeframe": candle_row["Timeframe"],
+                            "Index/Spot Direction": direction,
+                            "Strike": round(float(atm_row["strike_price"]), 2),
+                            "Option": option_side,
+                            "Option LTP": round(float(premium), 2) if premium is not None else "N/A",
+                            "Signal": signal,
+                        })
+                else:
+                    st.info("Strike suggestions need strike_price, ce_ltp and pe_ltp in the loaded option chain. Refresh live data first.")
+            except (TypeError, ValueError, KeyError, IndexError) as strike_exc:
+                st.warning(f"Strike suggestions unavailable for this refresh: {strike_exc}")
+            if strike_rows:
+                st.dataframe(pd.DataFrame(strike_rows), use_container_width=True, hide_index=True)
+                st.caption("Note: this uses one nearest-ATM strike for the current chain. It does not prove that the option premium itself is moving in the same direction; check option volume, spread and premium confirmation before trading.")
+
             trend_map = {r["Timeframe"]: r["Trend"] for r in rows}
             t5, t15 = trend_map.get("5M", "N/A"), trend_map.get("15M", "N/A")
             df5, df15 = tf_data.get("5M"), tf_data.get("15M")
