@@ -6,6 +6,7 @@ import time
 import io
 import os
 import re
+import html
 import json
 import csv
 import gc
@@ -5083,6 +5084,52 @@ def _show_ai_chart_analysis_tab():
 
 
 
+def _show_big_movement_alert_box() -> None:
+    """Show confirmed stock big-movement names in a blinking box across scanner tabs."""
+    df = st.session_state.get("momentum_df")
+    st.markdown("""
+    <style>
+    @keyframes bigMoveBlink { 0%, 48% { opacity: 1; } 49%, 100% { opacity: .42; } }
+    .bigmove-alert-wrap { border: 1px solid #d94b4b; border-radius: 12px; padding: 12px 14px;
+        margin: 8px 0 16px 0; background: rgba(130, 20, 20, 0.08); }
+    .bigmove-alert-title { font-size: 18px; font-weight: 800; margin-bottom: 8px; }
+    .bigmove-chip { display: inline-block; margin: 4px 7px 4px 0; padding: 7px 10px;
+        border-radius: 8px; font-weight: 750; animation: bigMoveBlink 1.05s steps(2, start) infinite; }
+    .bigmove-up { color: #b7ffd0; background: #14532d; border: 1px solid #22a05a; }
+    .bigmove-down { color: #ffd0d0; background: #7f1d1d; border: 1px solid #ef4444; }
+    .bigmove-empty { color: #777; font-size: 13px; }
+    @media (prefers-reduced-motion: reduce) { .bigmove-chip { animation: none; } }
+    </style>
+    """, unsafe_allow_html=True)
+    st.markdown('<div class="bigmove-alert-wrap"><div class="bigmove-alert-title">🚨 STOCK BIG MOVEMENT ALERT BOX</div>', unsafe_allow_html=True)
+    if df is None or df.empty or "MOVEMENT STATUS" not in df.columns:
+        st.markdown('<div class="bigmove-empty">Run SCAN INTRADAY MOVEMENT to show detected stock names here.</div></div>', unsafe_allow_html=True)
+        return
+    status = df["MOVEMENT STATUS"].astype(str).str.upper()
+    confirmed = df[status.str.contains("BIG BUY|BIG SELL", regex=True, na=False)].copy()
+    if confirmed.empty:
+        st.markdown('<div class="bigmove-empty">No confirmed BIG BUY / BIG SELL signal in the last scan. This box will update after the next scan.</div></div>', unsafe_allow_html=True)
+        return
+    symbol_col = next((c for c in ["STOCK NAME", "SYMBOL", "Symbol", "symbol"] if c in confirmed.columns), None)
+    if symbol_col is None:
+        st.markdown('<div class="bigmove-empty">Confirmed movement found, but the stock-name column is unavailable.</div></div>', unsafe_allow_html=True)
+        return
+    confirmed = confirmed.head(20)
+    chips = []
+    for _, row in confirmed.iterrows():
+        name = html.escape(str(row.get(symbol_col, "N/A")))
+        movement = str(row.get("MOVEMENT STATUS", "")).upper()
+        direction = "UP ↑" if "BIG BUY" in movement else "DOWN ↓"
+        cls = "bigmove-up" if "BIG BUY" in movement else "bigmove-down"
+        score = row.get("SCORE", "")
+        try:
+            score_text = f" · Score {float(score):.0f}" if pd.notna(score) and str(score).strip() else ""
+        except Exception:
+            score_text = ""
+        chips.append(f'<span class="bigmove-chip {cls}">{name} · {direction}{html.escape(score_text)}</span>')
+    st.markdown("".join(chips) + "</div>", unsafe_allow_html=True)
+
+
 def show_scanner(fyers) -> None:
     """Streamlit main app - NSE AI PRO V17 with MOMENTUM MOVERS"""
     
@@ -5093,6 +5140,7 @@ def show_scanner(fyers) -> None:
     
     st.title("🚀 NSE AI PRO V17 — Professional Intraday + Swing Scanner")
     st.caption(f"🕒 Current Time (IST): {_now_ist().strftime('%d-%b-%Y %H:%M:%S')} IST | Multi-Timeframe + Momentum Engine")
+    _show_big_movement_alert_box()
     
     try:
         all_symbols = load_nse_equity_symbols()
