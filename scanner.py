@@ -5130,6 +5130,122 @@ def _show_big_movement_alert_box() -> None:
     st.markdown("".join(chips) + "</div>", unsafe_allow_html=True)
 
 
+
+# ===== ADDITIVE HIGH/LOW BREAKOUT AND AMD SCANNERS =====
+def _new_signal_time_ist(candle_time, minutes=5):
+    """Signal confirmation time = completed candle end, in IST."""
+    ts = pd.Timestamp(candle_time)
+    if ts.tzinfo is None:
+        ts = ts.tz_localize("UTC")
+    return (ts.tz_convert("Asia/Kolkata") + pd.Timedelta(minutes=minutes)).strftime("%d-%b-%Y %H:%M:%S IST")
+
+
+def _new_breakout_signal(df):
+    if df is None or len(df) < 10 or "Time" not in df.columns:
+        return None
+    d = df.copy().sort_values("Time")
+    t = pd.to_datetime(d["Time"], utc=True).dt.tz_convert("Asia/Kolkata")
+    d["_date"] = t.dt.date
+    dates = sorted(d["_date"].unique())
+    if len(dates) < 2:
+        return None
+    today, previous = dates[-1], dates[-2]
+    prev = d[d["_date"] == previous]
+    cur = d[d["_date"] == today].copy()
+    if cur.empty or prev.empty:
+        return None
+    # FYERS 5-minute candles: first three candles cover 09:15–09:30 IST.
+    first = cur[(pd.to_datetime(cur["Time"], utc=True).dt.tz_convert("Asia/Kolkata").dt.hour == 9) &
+                (pd.to_datetime(cur["Time"], utc=True).dt.tz_convert("Asia/Kolkata").dt.minute.isin([15,20,25]))]
+    if len(first) != 3:
+        return None
+    last = cur.iloc[-1]
+    before = cur.iloc[-2] if len(cur) > 1 else None
+    price = float(last["Close"])
+    p_high, p_low = float(prev["High"].max()), float(prev["Low"].min())
+    o_high, o_low = float(first["High"].max()), float(first["Low"].min())
+    avgvol = float(d["Volume"].iloc[-21:-1].mean()) if len(d) >= 21 else float(d["Volume"].iloc[:-1].mean())
+    rvol = float(last["Volume"]) / avgvol if avgvol > 0 else 0.0
+    result = {"LTP": round(price,2), "PREVIOUS DAY": str(previous),
+              "PREV HIGH": round(p_high,2), "PREV LOW": round(p_low,2),
+              "FIRST 15M HIGH": round(o_high,2), "FIRST 15M LOW": round(o_low,2),
+              "RVOL": round(rvol,2), "CANDLE TIME": str(last["Time"]),
+              "SIGNAL TIME": ""}
+    for label, hi, lo in [("PREVIOUS DAY",p_high,p_low),("TODAY 15M",o_high,o_low)]:
+        # Only show a new cross on the latest completed candle, not stale breaks.
+        prior_close = float(before["Close"]) if before is not None else price
+        eligible = label == "PREVIOUS DAY" or len(cur) > 3
+        up = eligible and prior_close <= hi and price > hi
+        down = eligible and prior_close >= lo and price < lo
+        if up or down:
+            direction = "BUY" if up else "SELL"
+            result[label+" SIGNAL"] = direction if rvol >= 1.2 else "WAIT VOLUME"
+            if rvol >= 1.2:
+                result[label+" SIGNAL TIME"] = _new_signal_time_ist(last["Time"])
+                result["SIGNAL TIME"] = _new_signal_time_ist(last["Time"])
+            else:
+                result[label+" SIGNAL TIME"] = ""
+            result[label+" LEVEL"] = round(hi if up else lo,2)
+        else:
+            result[label+" SIGNAL"] = "WAIT"
+            result[label+" SIGNAL TIME"] = ""
+            result[label+" LEVEL"] = None
+    return result
+
+
+def _new_scan_tab(fyers, all_symbols, fo_symbols, kind):
+    title = "📈 PREVIOUS DAY + TODAY 15M HIGH/LOW BREAKOUT" if kind == "breakout" else "🧠 AMD — ACCUMULATION / MANIPULATION / DISTRIBUTION"
+    st.subheader(title)
+    universe_type = st.radio("Universe", ["F&O Stocks", "NSE Stocks"], horizontal=True, key=kind+"_universe")
+    universe = fo_symbols if universe_type == "F&O Stocks" else all_symbols
+    if not universe:
+        st.warning("No symbols available")
+        return
+    limit = st.number_input("Stocks to scan (0 = ALL)", 0, len(universe), 0, 10, key=kind+"_limit")
+    symbols = universe if limit == 0 else universe[:limit]
+    if st.button("🔍 RUN " + kind.upper() + " SCAN", key=kind+"_run", type="primary"):
+        rows, errors = [], []
+        progress = st.progress(0)
+        for idx, sym in enumerate(symbols):
+            try:
+                d = _fetch_timeframe_data(fyers, sym, "5", lookback_days=8)
+                if d is None:
+                    errors.append(sym+": data unavailable")
+                elif kind == "breakout":
+                    row = _new_breakout_signal(d)
+                    if row is not None:
+                        rows.append({"SYMBOL":sym, **row})
+                else:
+                    phase = _detect_amd_phase(d)
+                    rows.append({"SYMBOL":sym,"LTP":round(float(d["Close"].iloc[-1]),2),
+                                 "CANDLE TIME":str(d["Time"].iloc[-1]),
+                                 "SIGNAL TIME": _new_signal_time_ist(d["Time"].iloc[-1]) if phase.get("signal") not in ("WAIT", "WAIT CONFIRMATION", None) else "",
+                                 "AMD PHASE":phase.get("phase"),"DIRECTION":phase.get("direction"),
+                                 "SIGNAL":phase.get("signal"),"REASON":phase.get("reason")})
+            except Exception as exc:
+                errors.append(sym+": "+str(exc)[:100])
+            progress.progress((idx+1)/len(symbols))
+        st.session_state[kind+"_results"] = pd.DataFrame(rows)
+        st.session_state[kind+"_errors"] = errors
+    result = st.session_state.get(kind+"_results")
+    if isinstance(result,pd.DataFrame):
+        st.caption(f"Results: {len(result)} | Failed/skipped: {len(st.session_state.get(kind+'_errors',[]))}")
+        if not result.empty:
+            if kind == "breakout":
+                view_type = st.selectbox("Breakout view",["ALL","PREVIOUS DAY","TODAY 15M"],key="breakout_view")
+                if view_type != "ALL":
+                    result = result[result[view_type+" SIGNAL"].ne("WAIT")]
+            else:
+                phase_filter = st.selectbox("AMD Phase",["ALL","ACCUMULATION","MANIPULATION","DISTRIBUTION","CONFIRMATION"],key="amd_phase_filter")
+                if phase_filter != "ALL":
+                    result = result[result["AMD PHASE"].eq(phase_filter)]
+            st.dataframe(result,use_container_width=True,hide_index=True,height=550)
+            st.download_button("📥 DOWNLOAD CSV",result.to_csv(index=False).encode("utf-8-sig"),
+                               file_name=kind+"_scanner.csv",mime="text/csv",key=kind+"_csv")
+        else:
+            st.info("No matching results; check data availability and scan conditions.")
+    st.caption("Signals use completed 5-minute candles. WAIT is not a confirmed trade signal. AMD is heuristic, not proof of institutional activity.")
+
 def show_scanner(fyers) -> None:
     """Streamlit main app - NSE AI PRO V17 with MOMENTUM MOVERS"""
     
@@ -5173,7 +5289,9 @@ def show_scanner(fyers) -> None:
         "🎯 F&O OPTION CHECK",
         "🔄 REVERSAL",
         "🤖 AI CHART ANALYSIS",
-        "🎯 PRE-MOVE CONFIRM"
+        "🎯 PRE-MOVE CONFIRM",
+        "📈 HIGH/LOW BREAKOUT",
+        "🧠 AMD SCANNER"
     ])
     
     # ════════════════════════════════════════════════════════════════════════════════
@@ -6392,6 +6510,12 @@ def show_scanner(fyers) -> None:
         if errs:
             with st.expander(f"⚠️ Data/API issues ({len(errs)})"):
                 st.write("\n".join(errs[:100]))
+
+    with tabs[16]:
+        _new_scan_tab(fyers, all_symbols, fo_symbols, "breakout")
+
+    with tabs[17]:
+        _new_scan_tab(fyers, all_symbols, fo_symbols, "amd")
 
     gc.collect()
 
