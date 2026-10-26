@@ -3376,77 +3376,6 @@ def run_nse_scan(fyers, symbols):
     
     progress.empty()
 
-    # ════════════════════════════════════════════════════════════════════════════════
-    # TAB 16: PREVIOUS DAY HIGH / LOW BREAKOUT STOCKS
-    # ════════════════════════════════════════════════════════════════════════════════
-    with tabs[16]:
-        st.markdown("### 🚦 Previous Day High / Low Breakout Scanner")
-        st.caption("గత ట్రేడింగ్ సెషన్ High/Low ను ఈ రోజు ధర దాటి, అదే వైపు నిలిచిన symbols మాత్రమే చూపిస్తుంది.")
-        st.warning("Breakout signal అనేది confirmation కాదు. False breakout రావచ్చు; volume, VWAP, trend, risk/reward కూడా తనిఖీ చేయండి.")
-        universe_choice = st.radio("Universe", ["F&O Stocks", "NSE Stocks"], horizontal=True, key="pdh_pdl_universe")
-        symbols_for_breakout = fo_symbols if universe_choice == "F&O Stocks" else all_symbols
-        max_scan = st.number_input("Maximum symbols per run (API load control)", min_value=1, max_value=max(len(symbols_for_breakout),1), value=min(50,len(symbols_for_breakout)), step=10, key="pdh_pdl_limit")
-        st.caption(f"Available: {len(symbols_for_breakout)} | This run: {min(int(max_scan),len(symbols_for_breakout))}. Full NSE scans can take longer and may hit broker rate limits.")
-        if st.button("▶ SCAN PREVIOUS DAY HIGH / LOW BREAKS", key="pdh_pdl_run", type="primary"):
-            with st.spinner("Checking daily candles and today's breakout status…"):
-                result, errs = _scan_previous_day_breakouts(fyers, symbols_for_breakout, int(max_scan))
-                st.session_state['pdh_pdl_df'] = result
-                st.session_state['pdh_pdl_errors'] = errs
-                st.session_state['pdh_pdl_time'] = _now_ist().strftime('%d-%b-%Y %H:%M:%S IST')
-        result = st.session_state.get('pdh_pdl_df', pd.DataFrame())
-        if isinstance(result, pd.DataFrame) and not result.empty:
-            st.success(f"Found {len(result)} possible previous-day level break(s). Last scan: {st.session_state.get('pdh_pdl_time','N/A')}")
-            filter_signal = st.selectbox("Show", ["ALL", "HIGH BREAKS", "LOW BREAKS"], key="pdh_pdl_filter")
-            display = result.copy()
-            if filter_signal == "HIGH BREAKS":
-                display = display[display['Signal'].str.contains('HIGH BREAK', na=False)]
-            elif filter_signal == "LOW BREAKS":
-                display = display[display['Signal'].str.contains('LOW BREAK', na=False)]
-            st.dataframe(display, use_container_width=True, hide_index=True)
-            st.download_button("⬇ Download breakout CSV", to_csv_bytes(display), f"previous_day_breakouts_{_now_ist().strftime('%Y%m%d_%H%M')}.csv", "text/csv", key="pdh_pdl_csv")
-        else:
-            st.info("Click SCAN to check. No result may mean no confirmed break, or today's partial daily candle/data is not available yet.")
-        errs = st.session_state.get('pdh_pdl_errors', [])
-        if errs:
-            with st.expander(f"⚠️ Data/API issues ({len(errs)})"):
-                st.write("\n".join(errs[:80]))
-
-    # ════════════════════════════════════════════════════════════════════════════════
-    # TAB 17: MULTI-CONFIRMATION PRO STRATEGY LAB
-    # ════════════════════════════════════════════════════════════════════════════════
-    with tabs[17]:
-        st.markdown("### 🌍 Pro Strategy Lab — Multi-Confirmation Breakout")
-        st.caption("ఒకే 'world best' strategy అన్ని markets/రోజుల్లో పనిచేయదు. ఇది backtest చేయాల్సిన rule-based framework; profit guarantee కాదు.")
-        st.markdown("#### Strategy checklist")
-        st.markdown("""
-        1. **Market bias:** 15M trend direction తో trade direction సరిపోవాలి.
-        2. **Key level:** Previous Day High/Low లేదా clearly defined consolidation range breakout.
-        3. **Candle close:** wick మాత్రమే level దాటితే entry వద్దు; candle close level బయట ఉండాలి.
-        4. **Volume confirmation:** breakout candle volume recent average కంటే బలంగా ఉండాలి.
-        5. **VWAP confirmation:** BUY కోసం price VWAP పైన; SELL కోసం VWAP కింద ఉండటం అదనపు filter.
-        6. **Retest / structure:** possible అయితే breakout level retest hold/fail మరియు HH/HL లేదా LH/LL structure చూడండి.
-        7. **Risk control:** stop-loss recent swing/level అవతల; trade తీసుకునే ముందు target కనీసం 1.5–2R ఉందో లెక్కించండి.
-        8. **No-trade rule:** low volume, sideways/choppy market, conflicting timeframes, or poor reward/risk ఉంటే WAIT.
-        """)
-        st.markdown("#### Adjustable research filters")
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            min_rr = st.select_slider("Minimum reward:risk", options=[1.0,1.5,2.0,2.5,3.0], value=2.0, key="strategy_min_rr")
-        with c2:
-            min_vol_multiple = st.slider("Volume vs average (minimum ×)", min_value=1.0, max_value=3.0, value=1.5, step=0.25, key="strategy_vol_multiple")
-        with c3:
-            need_retest = st.checkbox("Prefer breakout retest confirmation", value=True, key="strategy_need_retest")
-        st.markdown("#### Signal decision guide")
-        st.dataframe(pd.DataFrame([
-            {"Check":"15M trend alignment","BUY condition":"Bullish / HH-HL","SELL condition":"Bearish / LH-LL"},
-            {"Check":"Key-level breakout","BUY condition":"Close above PDH/range high","SELL condition":"Close below PDL/range low"},
-            {"Check":"Volume","BUY condition":f"At least {min_vol_multiple:.2f}× average","SELL condition":f"At least {min_vol_multiple:.2f}× average"},
-            {"Check":"VWAP","BUY condition":"Price above VWAP","SELL condition":"Price below VWAP"},
-            {"Check":"Retest","BUY condition":"Level holds as support" if need_retest else "Optional filter","SELL condition":"Level rejects as resistance" if need_retest else "Optional filter"},
-            {"Check":"Risk / reward","BUY condition":f"Target ≥ {min_rr:.1f}R","SELL condition":f"Target ≥ {min_rr:.1f}R"},
-        ]), use_container_width=True, hide_index=True)
-        st.info("Use this tab as a decision framework, not as an automatic buy/sell promise. Before live use, backtest at least several market regimes, include brokerage/slippage, and paper-trade. Options strikes need separate liquidity, spread, OI and expiry checks.")
-
     gc.collect()
     return results, errors, stats
 
@@ -5201,76 +5130,6 @@ def _show_big_movement_alert_box() -> None:
     st.markdown("".join(chips) + "</div>", unsafe_allow_html=True)
 
 
-
-def _scan_previous_day_breakouts(fyers, symbols: List[str], max_symbols: int = 50) -> Tuple[pd.DataFrame, List[str]]:
-    """Find symbols breaking the previous completed session high/low using FYERS daily candles.
-    Uses a bounded universe to reduce API load; not a promise of continuation.
-    """
-    rows, errors = [], []
-    today = _now_ist().date()
-    universe = list(symbols[:max_symbols])
-    for ix, symbol in enumerate(universe, start=1):
-        try:
-            date_from = (today - timedelta(days=18)).strftime('%Y-%m-%d')
-            date_to = today.strftime('%Y-%m-%d')
-            resp, err = _safe_history(fyers, {
-                'symbol': symbol, 'resolution': '1D', 'date_format': '1',
-                'range_from': date_from, 'range_to': date_to, 'cont_flag': '1'
-            }, max_retries=2, base_delay=0.5)
-            if err or not resp or not resp.get('candles'):
-                errors.append(f"{symbol}: {err or 'daily data unavailable'}")
-                continue
-            df = pd.DataFrame(resp['candles'], columns=['Time','Open','High','Low','Close','Volume'])
-            df['Time'] = pd.to_datetime(df['Time'], unit='s', utc=True).dt.tz_convert('Asia/Kolkata')
-            for col in ['Open','High','Low','Close','Volume']:
-                df[col] = pd.to_numeric(df[col], errors='coerce')
-            df = df.dropna(subset=['High','Low','Close']).sort_values('Time').reset_index(drop=True)
-            if len(df) < 2:
-                errors.append(f"{symbol}: not enough daily candles")
-                continue
-            df['SessionDate'] = df['Time'].dt.date
-            completed = df[df['SessionDate'] < today]
-            if completed.empty:
-                errors.append(f"{symbol}: previous completed session not available")
-                continue
-            prev = completed.iloc[-1]
-            current_rows = df[df['SessionDate'] == today]
-            if current_rows.empty:
-                # Daily feed has not supplied today's partial candle yet; do not invent a live breakout.
-                continue
-            cur = current_rows.iloc[-1]
-            ltp = float(cur['Close'])
-            pdh, pdl = float(prev['High']), float(prev['Low'])
-            high_break = float(cur['High']) > pdh and ltp > pdh
-            low_break = float(cur['Low']) < pdl and ltp < pdl
-            if not (high_break or low_break):
-                continue
-            direction = '🔼 PREVIOUS DAY HIGH BREAK' if high_break else '🔻 PREVIOUS DAY LOW BREAK'
-            breakout_level = pdh if high_break else pdl
-            vol_ratio = None
-            try:
-                prior_vol = pd.to_numeric(completed['Volume'].tail(5), errors='coerce').mean()
-                if prior_vol and prior_vol > 0:
-                    vol_ratio = float(cur['Volume']) / float(prior_vol)
-            except Exception:
-                pass
-            rows.append({
-                'Symbol': symbol.replace('NSE:', '').replace('-EQ',''),
-                'Signal': direction, 'LTP': round(ltp, 2),
-                'Previous Day High': round(pdh, 2), 'Previous Day Low': round(pdl, 2),
-                'Breakout Level': round(breakout_level, 2),
-                'Distance %': round((ltp / breakout_level - 1) * 100, 2) if breakout_level else None,
-                'Volume vs 5D Avg': round(vol_ratio, 2) if vol_ratio is not None else None,
-                'Signal Time': str(cur['Time'])
-            })
-        except Exception as exc:
-            errors.append(f"{symbol}: {type(exc).__name__}: {exc}")
-    out = pd.DataFrame(rows)
-    if not out.empty:
-        out['_rank'] = out['Volume vs 5D Avg'].fillna(0)
-        out = out.sort_values('_rank', ascending=False).drop(columns=['_rank']).reset_index(drop=True)
-    return out, errors
-
 def show_scanner(fyers) -> None:
     """Streamlit main app - NSE AI PRO V17 with MOMENTUM MOVERS"""
     
@@ -5314,9 +5173,7 @@ def show_scanner(fyers) -> None:
         "🎯 F&O OPTION CHECK",
         "🔄 REVERSAL",
         "🤖 AI CHART ANALYSIS",
-        "🎯 PRE-MOVE CONFIRM",
-        "🚦 PREVIOUS DAY H/L BREAK",
-        "🌍 PRO STRATEGY LAB"
+        "🎯 PRE-MOVE CONFIRM"
     ])
     
     # ════════════════════════════════════════════════════════════════════════════════
