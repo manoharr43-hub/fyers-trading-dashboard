@@ -3270,6 +3270,111 @@ def detect_live_sudden_move(df: pd.DataFrame) -> Dict[str, Any]:
         return result
 
 
+def _assess_breakout_quality(df: pd.DataFrame) -> Dict[str, Any]:
+    """Rule-based breakout quality / failed-breakout warning using completed OHLCV bars.
+
+    This is a filter, not a guarantee. The reference range excludes the latest candle
+    so the current candle cannot manufacture its own breakout level.
+    """
+    out = {
+        "BREAKOUT CHECK": "WAIT", "FALSE BREAKOUT RISK": "UNKNOWN",
+        "RALLY OUTLOOK": "WAIT", "EST. CONTINUATION": "N/A",
+        "RANGE HIGH": None, "RANGE LOW": None, "BREAKOUT QUALITY SCORE": 0,
+        "BREAKOUT CHECK REASON": "Insufficient candles",
+    }
+    try:
+        if df is None or len(df) < 25:
+            return out
+        d = df.reset_index(drop=True).copy()
+        required = ["Open", "High", "Low", "Close", "Volume"]
+        if any(c not in d.columns for c in required):
+            return out
+        for col in required:
+            d[col] = pd.to_numeric(d[col], errors="coerce")
+        d = d.dropna(subset=required).reset_index(drop=True)
+        if len(d) < 25:
+            return out
+
+        # Use the ten bars immediately before the latest completed bar as the range.
+        prior = d.iloc[-11:-1]
+        last = d.iloc[-1]
+        prev = d.iloc[-2]
+        rh, rl = float(prior["High"].max()), float(prior["Low"].min())
+        close, opn = float(last["Close"]), float(last["Open"])
+        high, low = float(last["High"]), float(last["Low"])
+        rng = max(high - low, 1e-9)
+        body_pct = abs(close - opn) / rng * 100.0
+        close_location = (close - low) / rng  # 0=low of candle, 1=high
+        avg_vol = float(d["Volume"].iloc[-21:-1].mean())
+        rvol = float(last["Volume"]) / avg_vol if avg_vol > 0 else 0.0
+        atr_s = calculate_atr(d, 14)
+        atr = float(atr_s.iloc[-1]) if len(atr_s) and pd.notna(atr_s.iloc[-1]) else max(close * 0.001, 0.01)
+        prior_close = float(prev["Close"])
+
+        up_break = close > rh
+        down_break = close < rl
+        # A recent poke outside the range that closes back inside is a failed-breakout warning.
+        recent = d.iloc[-4:]
+        prior_high = float(d["High"].iloc[-11:-1].max())
+        prior_low = float(d["Low"].iloc[-11:-1].min())
+        failed_up = (float(recent["High"].max()) > prior_high and close <= rh)
+        failed_down = (float(recent["Low"].min()) < prior_low and close >= rl)
+
+        score = 0
+        reasons = []
+        if up_break:
+            direction = "UP"
+            if close > rh + 0.05 * atr: score += 20; reasons.append("close beyond range high")
+            if body_pct >= 55 and close_location >= 0.70: score += 20; reasons.append("strong bullish close")
+            if rvol >= 1.5: score += 25; reasons.append(f"volume confirmation {rvol:.2f}x")
+            if close - rh <= 1.5 * atr: score += 10; reasons.append("not excessively extended")
+            if failed_up: score -= 35; reasons.append("recent upside rejection")
+        elif down_break:
+            direction = "DOWN"
+            if close < rl - 0.05 * atr: score += 20; reasons.append("close beyond range low")
+            if body_pct >= 55 and close_location <= 0.30: score += 20; reasons.append("strong bearish close")
+            if rvol >= 1.5: score += 25; reasons.append(f"volume confirmation {rvol:.2f}x")
+            if rl - close <= 1.5 * atr: score += 10; reasons.append("not excessively extended")
+            if failed_down: score -= 35; reasons.append("recent downside rejection")
+        else:
+            direction = "NONE"
+            if failed_up or failed_down:
+                out["BREAKOUT CHECK"] = "FAILED BREAKOUT"
+                out["FALSE BREAKOUT RISK"] = "HIGH"
+                reasons.append("price returned inside prior range after a wick-through")
+            else:
+                out["BREAKOUT CHECK"] = "WAIT — RANGE"
+                out["FALSE BREAKOUT RISK"] = "MEDIUM"
+                reasons.append("no confirmed close outside prior range")
+
+        if direction in ("UP", "DOWN"):
+            risk = "LOW" if score >= 55 else "MEDIUM" if score >= 30 else "HIGH"
+            out["BREAKOUT CHECK"] = f"{direction} BREAKOUT — CONFIRM" if score >= 45 else f"{direction} BREAKOUT — WEAK"
+            out["FALSE BREAKOUT RISK"] = risk
+            if score >= 55:
+                out["RALLY OUTLOOK"] = "CONTINUATION SETUP" if direction == "UP" else "DOWNSIDE CONTINUATION SETUP"
+                out["EST. CONTINUATION"] = "15–30 min watch" if rvol >= 1.5 else "5–15 min watch"
+            elif score >= 30:
+                out["RALLY OUTLOOK"] = "WAIT FOR RETEST"
+                out["EST. CONTINUATION"] = "Not reliable yet"
+            else:
+                out["RALLY OUTLOOK"] = "AVOID CHASING"
+                out["EST. CONTINUATION"] = "Not reliable"
+        else:
+            out["RALLY OUTLOOK"] = "WAIT FOR CONFIRMATION"
+            out["EST. CONTINUATION"] = "N/A"
+
+        out.update({
+            "RANGE HIGH": round(rh, 2), "RANGE LOW": round(rl, 2),
+            "BREAKOUT QUALITY SCORE": max(0, min(100, int(score))),
+            "BREAKOUT CHECK REASON": " | ".join(reasons),
+        })
+        return out
+    except Exception as exc:
+        out["BREAKOUT CHECK REASON"] = f"Assessment error: {type(exc).__name__}"
+        return out
+
+
 def _fetch_momentum_signal(fyers, symbol: str, is_fo: bool = False):
     """Intraday movement worker. Checks recent completed 5M candles and adds early-warning status."""
     stock_ticker = symbol.replace("NSE:", "").replace("-EQ", "") if isinstance(symbol,str) else str(symbol)
@@ -3281,6 +3386,7 @@ def _fetch_momentum_signal(fyers, symbol: str, is_fo: bool = False):
         block=detect_block_order_activity(d)
         pre=_pre_move_signal(d, block=block)
         before=_before_move_signal(d, pre)
+        breakout_check=_assess_breakout_quality(d)
         # Search the latest 12 completed candles so a signal is not lost on the next candle.
         candidates=[]
         for idx in range(max(12,len(d)-12),len(d)):
@@ -3311,7 +3417,7 @@ def _fetch_momentum_signal(fyers, symbol: str, is_fo: bool = False):
             age=max(0,(_now_ist()-sig_time).total_seconds()/60)
             signal=pre["status"] if pre["direction"] in ("BUY","SELL") else "NO MOVE"
         ltp=float(d["Close"].iloc[-1])
-        result={"Symbol":stock_ticker,"LTP":round(ltp,2),"SIGNAL TIME":sig_time.strftime("%d-%b-%Y %H:%M:%S"),"SIGNAL AGE (MIN)":round(age,1),"SIGNAL":signal,"DIRECTION":mv.get("direction") if candidates else pre["direction"],"MOVE %":mv.get("move_pct",0.0),"BODY %":mv.get("body_pct",0.0),"BODY / ATR":mv.get("body_atr",0.0),"RVOL":mv.get("rvol",0.0),"STRUCTURE":mv.get("structure", "NONE"),"HH/HL":"✅" if mv.get("hh_hl") else "−","LH/LL":"✅" if mv.get("lh_ll") else "−","ACCELERATION":mv.get("price_acceleration",0.0),"VOLUME SPIKE":"🔥" if mv.get("volume_spike") else "−","SCORE":mv.get("score",0.0),"BEFORE MOVE SIGNAL":before["signal"],"BEFORE MOVE DIRECTION":before["direction"],"BEFORE MOVE SCORE":before["score"],"BEFORE MOVE REASON":before["reason"],"BEFORE MOVE TRIGGER":before["trigger"],"PRE-MOVE":pre["direction"],"PRE-MOVE SCORE":pre["score"],"PRE-MOVE STATUS":pre["status"],"PRE BUY SCORE":pre.get("buy_score",0),"PRE SELL SCORE":pre.get("sell_score",0),"PRE SCORE GAP":pre.get("score_gap",0),"PRE-MOVE REASON":pre["reason"],"BREAKOUT LEVEL":pre.get("breakout_level"),"BREAKDOWN LEVEL":pre.get("breakdown_level"),"PRE-MOVE RVOL":pre.get("rvol",0),"BLOCK ORDER SCORE":block["block_score"],"BLOCK ACTIVITY":block["block_signal"],"BLOCK SIDE":block["block_side"],"BLOCK LEVEL":block["block_level"],"BLOCK RVOL":block["block_rvol"],"BLOCK REASON":block["block_reason"],"REASON":mv.get("reason",pre["reason"]),"MOVEMENT STATUS": signal if candidates else pre["status"]}
+        result={"Symbol":stock_ticker,"LTP":round(ltp,2),"SIGNAL TIME":sig_time.strftime("%d-%b-%Y %H:%M:%S"),"SIGNAL AGE (MIN)":round(age,1),"SIGNAL":signal,"DIRECTION":mv.get("direction") if candidates else pre["direction"],"MOVE %":mv.get("move_pct",0.0),"BODY %":mv.get("body_pct",0.0),"BODY / ATR":mv.get("body_atr",0.0),"RVOL":mv.get("rvol",0.0),"STRUCTURE":mv.get("structure", "NONE"),"HH/HL":"✅" if mv.get("hh_hl") else "−","LH/LL":"✅" if mv.get("lh_ll") else "−","ACCELERATION":mv.get("price_acceleration",0.0),"VOLUME SPIKE":"🔥" if mv.get("volume_spike") else "−","SCORE":mv.get("score",0.0),"BEFORE MOVE SIGNAL":before["signal"],"BEFORE MOVE DIRECTION":before["direction"],"BEFORE MOVE SCORE":before["score"],"BEFORE MOVE REASON":before["reason"],"BEFORE MOVE TRIGGER":before["trigger"],"PRE-MOVE":pre["direction"],"PRE-MOVE SCORE":pre["score"],"PRE-MOVE STATUS":pre["status"],"PRE BUY SCORE":pre.get("buy_score",0),"PRE SELL SCORE":pre.get("sell_score",0),"PRE SCORE GAP":pre.get("score_gap",0),"PRE-MOVE REASON":pre["reason"],"BREAKOUT LEVEL":pre.get("breakout_level"),"BREAKDOWN LEVEL":pre.get("breakdown_level"),"PRE-MOVE RVOL":pre.get("rvol",0),"BLOCK ORDER SCORE":block["block_score"],"BLOCK ACTIVITY":block["block_signal"],"BLOCK SIDE":block["block_side"],"BLOCK LEVEL":block["block_level"],"BLOCK RVOL":block["block_rvol"],"BLOCK REASON":block["block_reason"],"REASON":mv.get("reason",pre["reason"]),"MOVEMENT STATUS": signal if candidates else pre["status"],**breakout_check}
         if is_fo and result["DIRECTION"] in ("BUY","SELL"):
             try:
                 od=fetch_options_chain_data(fyers,symbol); result["PCR"]=od.get("pcr","N/A"); result["OPTIONS BIAS"]=od.get("options_bias","N/A")
@@ -5557,7 +5663,8 @@ def show_scanner(fyers) -> None:
                 mdf=mdf.rename(columns={_momentum_symbol_col:"STOCK NAME"})
             if "STOCK NAME" not in mdf.columns:
                 mdf.insert(0,"STOCK NAME","N/A")
-            _momentum_cols=["STOCK NAME"]+[c for c in mdf.columns if c!="STOCK NAME"]
+            _priority_cols=["STOCK NAME", "MOVEMENT STATUS", "BREAKOUT CHECK", "FALSE BREAKOUT RISK", "BREAKOUT QUALITY SCORE", "RALLY OUTLOOK", "EST. CONTINUATION", "BREAKOUT CHECK REASON"]
+            _momentum_cols=[c for c in _priority_cols if c in mdf.columns]+[c for c in mdf.columns if c not in _priority_cols]
             mdf=mdf[_momentum_cols]
             mdf=_add_reversal_columns(mdf)
             st.markdown("### 🚦 MOVEMENT STATUS")
