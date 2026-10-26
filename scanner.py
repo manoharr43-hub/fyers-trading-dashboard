@@ -6395,6 +6395,136 @@ def show_scanner(fyers) -> None:
 
     gc.collect()
 
+
+# ============================================================
+# FOCUSED PREVIOUS-DAY + TODAY 15M BREAKOUT SCANNER
+# ============================================================
+def _breakout_15m_signal(daily, intraday, min_rvol=1.2, buffer_pct=0.03):
+    """Only CLOSED 15-minute candles; no future bars or partial-session high leakage."""
+    result = {"Signal": "WAIT", "Reason": "Insufficient data"}
+    if daily is None or intraday is None or daily.empty or intraday.empty:
+        return result
+    d = daily.copy().sort_values("Time")
+    i = intraday.copy().sort_values("Time")
+    d["Day"] = pd.to_datetime(d["Time"]).dt.date
+    i["Day"] = pd.to_datetime(i["Time"]).dt.date
+    session_day = i["Day"].max()
+    previous = d[d["Day"] < session_day]
+    today = i[i["Day"] == session_day]
+    if previous.empty or today.empty:
+        result["Reason"] = "Previous trading day or today's completed 15M candles unavailable"
+        return result
+    prev = previous.iloc[-1]
+    last = today.iloc[-1]
+    prev_high, prev_low = float(prev["High"]), float(prev["Low"])
+    close, high, low = float(last["Close"]), float(last["High"]), float(last["Low"])
+    opening = float(last["Open"])
+    prior_today = today.iloc[:-1]
+    today_high = float(prior_today["High"].max()) if not prior_today.empty else None
+    today_low = float(prior_today["Low"].min()) if not prior_today.empty else None
+    prev_close_15 = float(i.iloc[-2]["Close"]) if len(i) >= 2 else opening
+    vol = float(last.get("Volume", 0) or 0)
+    avg = float(i["Volume"].iloc[-21:-1].mean()) if len(i) >= 11 else 0.0
+    rvol = vol / avg if avg > 0 else None
+    buffer = buffer_pct / 100.0
+    levels = [("PREV DAY HIGH", prev_high, "BUY"), ("PREV DAY LOW", prev_low, "SELL")]
+    if today_high is not None:
+        levels.append(("TODAY 15M HIGH", today_high, "BUY"))
+        levels.append(("TODAY 15M LOW", today_low, "SELL"))
+    triggers = []
+    for name, level, side in levels:
+        if side == "BUY" and prev_close_15 <= level * (1 + buffer) and close > level * (1 + buffer) and close > opening:
+            triggers.append((name, level, side))
+        if side == "SELL" and prev_close_15 >= level * (1 - buffer) and close < level * (1 - buffer) and close < opening:
+            triggers.append((name, level, side))
+    selected = None
+    if triggers:
+        # Prefer a breakout crossing both the previous-day and today's range.
+        selected = next((x for x in triggers if x[0].startswith("PREV DAY")), triggers[0])
+    signal = "WAIT"
+    reason = "No fresh closed-candle breakout"
+    if selected:
+        name, level, side = selected
+        volume_ok = rvol is not None and rvol >= min_rvol
+        signal = ("CONFIRMED " if volume_ok else "WATCH ") + side
+        reason = f"{name} crossed on closed 15M candle" + ("; volume confirmed" if volume_ok else "; volume not confirmed")
+    else:
+        name, level, side = "NONE", None, "NONE"
+    atr = calculate_atr(i, 14)
+    a = float(atr.iloc[-1]) if len(atr) and pd.notna(atr.iloc[-1]) and atr.iloc[-1] > 0 else max(close * .005, .01)
+    sl = (min(low, level) - 0.25 * a) if selected and side == "BUY" else ((max(high, level) + 0.25 * a) if selected else None)
+    risk = abs(close - sl) if sl is not None else None
+    return {
+        "Signal": signal, "Reason": reason, "Breakout Type": name,
+        "Breakout Level": round(level, 2) if level is not None else None,
+        "Entry (15M Close)": round(close, 2), "Stop Loss": round(sl, 2) if sl is not None else None,
+        "Target 1 (1.5R)": round(close + (1.5 * risk if side == "BUY" else -1.5 * risk), 2) if risk else None,
+        "Target 2 (2R)": round(close + (2 * risk if side == "BUY" else -2 * risk), 2) if risk else None,
+        "Previous Day High": round(prev_high, 2), "Previous Day Low": round(prev_low, 2),
+        "Today 15M High (before signal)": round(today_high, 2) if today_high is not None else None,
+        "Today 15M Low (before signal)": round(today_low, 2) if today_low is not None else None,
+        "15M RVOL": round(rvol, 2) if rvol is not None else None,
+        "Candle Time": str(last["Time"]), "Last Price": round(close, 2),
+    }
+
+
+def show_scanner(fyers):
+    """Focused UI. Legacy scanner code remains available but its unneeded tabs are hidden."""
+    st.title("📈 NSE AI PRO V17 — High/Low Breakout")
+    st.caption("Previous trading day H/L + today's completed 15-minute candle H/L. Signals are setups, not guaranteed trades.")
+    with st.spinner("Loading NSE / F&O universe..."):
+        all_symbols = load_nse_equity_symbols()
+        fo_symbols = load_fo_stocks()
+    if not all_symbols:
+        st.error("NSE symbols unavailable. Check FYERS symbol master/network.")
+        return
+    tabs = st.tabs(["🎯 ALL BREAKOUTS", "📅 PREVIOUS DAY H/L", "⏱ TODAY 15M H/L", "🤖 AI CHART ANALYSIS"])
+    with tabs[0]:
+        universe = st.radio("Stock Universe", ["F&O Stocks", "NSE Stocks"], horizontal=True, key="hl_universe")
+        symbols = fo_symbols if universe == "F&O Stocks" else all_symbols
+        if not symbols:
+            st.warning("No symbols found for this universe")
+        scan_limit = st.number_input("Scan limit (0 = ALL)", min_value=0, max_value=max(len(symbols), 1), value=min(40, len(symbols)), step=10, key="hl_limit")
+        min_rvol = st.slider("Minimum RVOL for CONFIRMED", 1.0, 3.0, 1.2, 0.1, key="hl_rvol")
+        selected = symbols if scan_limit == 0 else symbols[:int(scan_limit)]
+        if st.button(f"▶ SCAN {len(selected)} STOCKS", type="primary", key="hl_run"):
+            rows, errors = [], []
+            progress = st.progress(0)
+            for n, sym in enumerate(selected, 1):
+                try:
+                    daily = _fetch_timeframe_data(fyers, sym, "1D", lookback_days=15)
+                    fifteen = _fetch_timeframe_data(fyers, sym, "15", lookback_days=7)
+                    out = _breakout_15m_signal(daily, fifteen, min_rvol=min_rvol)
+                    rows.append({"Symbol": sym.replace("NSE:", "").replace("-EQ", ""), **out})
+                except Exception as exc:
+                    errors.append(f"{sym}: {type(exc).__name__}: {str(exc)[:80]}")
+                progress.progress(n / max(len(selected), 1))
+            progress.empty()
+            st.session_state["hl_breakout_rows"] = pd.DataFrame(rows)
+            st.session_state["hl_breakout_errors"] = errors
+            st.session_state["hl_breakout_at"] = _now_ist().strftime("%d-%b-%Y %H:%M:%S IST")
+        df = st.session_state.get("hl_breakout_rows", pd.DataFrame())
+        if isinstance(df, pd.DataFrame) and not df.empty:
+            st.caption(f"Last scan: {st.session_state.get('hl_breakout_at', 'N/A')}")
+            only = st.checkbox("Show only breakout signals (hide WAIT)", value=True, key="hl_only")
+            view = df[df["Signal"] != "WAIT"].copy() if only else df.copy()
+            st.metric("Breakout setups", int((df["Signal"] != "WAIT").sum()))
+            st.dataframe(view, use_container_width=True, hide_index=True)
+            st.download_button("📥 Download CSV", view.to_csv(index=False).encode("utf-8-sig"), "high_low_breakouts.csv", "text/csv", key="hl_csv")
+        for err in st.session_state.get("hl_breakout_errors", [])[:8]:
+            st.caption("⚠️ " + err)
+    for tab, term, label in [(tabs[1], "PREV DAY", "Previous-day"), (tabs[2], "TODAY 15M", "Today 15M")]:
+        with tab:
+            st.subheader(f"{label} High/Low Breakouts")
+            df = st.session_state.get("hl_breakout_rows", pd.DataFrame())
+            if isinstance(df, pd.DataFrame) and not df.empty:
+                view = df[df["Breakout Type"].astype(str).str.contains(term, regex=False)].copy()
+                st.dataframe(view, use_container_width=True, hide_index=True)
+            else:
+                st.info("Run the scan in ALL BREAKOUTS tab first")
+    with tabs[3]:
+        _show_ai_chart_analysis_tab()
+
 # ════════════════════════════════════════════════════════════════════════════════
 # ENTRY POINT
 # ════════════════════════════════════════════════════════════════════════════════
