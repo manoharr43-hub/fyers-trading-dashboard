@@ -4302,6 +4302,133 @@ def _apply_future_direction_engine(depth_df: pd.DataFrame) -> pd.DataFrame:
     out["FUTURE REASON"] = [x["reason"] for x in results]
     return out
 
+def _apply_depth_movement_engine(depth_df: pd.DataFrame, previous_df: Optional[pd.DataFrame] = None) -> pd.DataFrame:
+    """Compare consecutive FYERS depth snapshots to detect building/fading pressure.
+
+    This does not replace the existing depth/future-direction logic. It only adds
+    movement columns by comparing the current scan with the previous scan stored
+    in Streamlit session state.
+    """
+    if depth_df is None or depth_df.empty:
+        return depth_df
+
+    out = depth_df.copy()
+    prev_lookup = {}
+    if isinstance(previous_df, pd.DataFrame) and not previous_df.empty and "Symbol" in previous_df.columns:
+        for _, r in previous_df.iterrows():
+            prev_lookup[str(r.get("Symbol", "")).strip().upper()] = r.to_dict()
+
+    rows = []
+    for _, r in out.iterrows():
+        cur = r.to_dict()
+        sym = str(cur.get("Symbol", "")).strip().upper()
+        prev = prev_lookup.get(sym, {})
+
+        bid_now = _safe_float(cur.get("TOTAL BUY QTY", 0))
+        ask_now = _safe_float(cur.get("TOTAL SELL QTY", 0))
+        ltp_now = _safe_float(cur.get("LTP", 0))
+        imb_now = _safe_float(cur.get("DEPTH IMBALANCE %", 0))
+
+        bid_prev = _safe_float(prev.get("TOTAL BUY QTY", 0))
+        ask_prev = _safe_float(prev.get("TOTAL SELL QTY", 0))
+        ltp_prev = _safe_float(prev.get("LTP", 0))
+        imb_prev = _safe_float(prev.get("DEPTH IMBALANCE %", 0))
+
+        bid_chg = ((bid_now - bid_prev) / bid_prev * 100.0) if bid_prev > 0 else 0.0
+        ask_chg = ((ask_now - ask_prev) / ask_prev * 100.0) if ask_prev > 0 else 0.0
+        ltp_chg = ((ltp_now - ltp_prev) / ltp_prev * 100.0) if ltp_prev > 0 else 0.0
+        imb_chg = imb_now - imb_prev if prev else 0.0
+
+        # Detect unusually large current-side quantity relative to opposite side.
+        bid_wall = bid_now >= max(ask_now * DEPTH_BIG_QTY_MULTIPLIER, 1.0)
+        ask_wall = ask_now >= max(bid_now * DEPTH_BIG_QTY_MULTIPLIER, 1.0)
+        wall = "🟢 BIG BID WALL" if bid_wall else "🔴 BIG ASK WALL" if ask_wall else "NONE"
+
+        buy = 0.0
+        sell = 0.0
+        reasons = []
+
+        # Current depth pressure.
+        if imb_now >= DEPTH_STRONG_IMBALANCE:
+            buy += 35; reasons.append(f"strong bid imbalance +{imb_now:.1f}%")
+        elif imb_now >= DEPTH_MIN_IMBALANCE:
+            buy += 22; reasons.append(f"bid imbalance +{imb_now:.1f}%")
+        elif imb_now <= -DEPTH_STRONG_IMBALANCE:
+            sell += 35; reasons.append(f"strong ask imbalance {imb_now:.1f}%")
+        elif imb_now <= -DEPTH_MIN_IMBALANCE:
+            sell += 22; reasons.append(f"ask imbalance {imb_now:.1f}%")
+
+        # Snapshot-to-snapshot pressure change.
+        if prev:
+            if bid_chg >= 10:
+                buy += min(20.0, 8.0 + bid_chg * 0.25); reasons.append(f"bid qty +{bid_chg:.1f}%")
+            if ask_chg <= -10:
+                buy += min(15.0, 6.0 + abs(ask_chg) * 0.20); reasons.append(f"ask qty {ask_chg:.1f}%")
+            if ask_chg >= 10:
+                sell += min(20.0, 8.0 + ask_chg * 0.25); reasons.append(f"ask qty +{ask_chg:.1f}%")
+            if bid_chg <= -10:
+                sell += min(15.0, 6.0 + abs(bid_chg) * 0.20); reasons.append(f"bid qty {bid_chg:.1f}%")
+            if imb_chg >= 8:
+                buy += min(15.0, 5.0 + imb_chg * 0.35); reasons.append(f"imbalance improving +{imb_chg:.1f}")
+            elif imb_chg <= -8:
+                sell += min(15.0, 5.0 + abs(imb_chg) * 0.35); reasons.append(f"imbalance weakening {imb_chg:.1f}")
+
+        # Price confirmation.
+        if ltp_chg >= 0.05:
+            buy += min(15.0, 6.0 + ltp_chg * 20.0); reasons.append(f"LTP +{ltp_chg:.2f}%")
+        elif ltp_chg <= -0.05:
+            sell += min(15.0, 6.0 + abs(ltp_chg) * 20.0); reasons.append(f"LTP {ltp_chg:.2f}%")
+
+        if bid_wall:
+            buy += 10; reasons.append("big bid wall")
+        if ask_wall:
+            sell += 10; reasons.append("big ask wall")
+
+        buy = min(100.0, buy)
+        sell = min(100.0, sell)
+        score = round(max(buy, sell), 1)
+        gap = abs(buy - sell)
+
+        if not prev:
+            status = "⚪ BASELINE — SCAN AGAIN"
+            trend = "BASELINE"
+        elif buy >= 70 and gap >= 20:
+            status = "🔥 STRONG UP MOVE"; trend = "UP"
+        elif sell >= 70 and gap >= 20:
+            status = "🔥 STRONG DOWN MOVE"; trend = "DOWN"
+        elif buy >= 45 and gap >= 12:
+            status = "🟢 UP BUILDING"; trend = "UP"
+        elif sell >= 45 and gap >= 12:
+            status = "🔴 DOWN BUILDING"; trend = "DOWN"
+        elif imb_prev >= DEPTH_MIN_IMBALANCE and imb_now < imb_prev - 12:
+            status = "⚠️ BUY PRESSURE FADING"; trend = "FADING"
+        elif imb_prev <= -DEPTH_MIN_IMBALANCE and imb_now > imb_prev + 12:
+            status = "⚠️ SELL PRESSURE FADING"; trend = "FADING"
+        elif (imb_prev > 15 and imb_now < -15) or (imb_prev < -15 and imb_now > 15):
+            status = "🔄 POSSIBLE REVERSAL"; trend = "REVERSAL"
+        else:
+            status = "⚪ WAIT"; trend = "WAIT"
+
+        rows.append({
+            "DEPTH TREND": trend,
+            "BID CHANGE %": round(bid_chg, 1),
+            "ASK CHANGE %": round(ask_chg, 1),
+            "IMBALANCE CHANGE": round(imb_chg, 1),
+            "LTP CHANGE %": round(ltp_chg, 2),
+            "DEPTH WALL": wall,
+            "DEPTH MOVE SCORE": score,
+            "DEPTH BUY MOVE SCORE": round(buy, 1),
+            "DEPTH SELL MOVE SCORE": round(sell, 1),
+            "MOVE STATUS": status,
+            "DEPTH MOVE REASON": " | ".join(reasons[:6]) if reasons else "Need next snapshot for movement comparison",
+        })
+
+    add = pd.DataFrame(rows, index=out.index)
+    for c in add.columns:
+        out[c] = add[c]
+    return out
+
+
 def _show_live_order_flow_tab(fyers, all_symbols):
     """Actual FYERS exchange depth tab: current bid/ask book -> direction -> PIN."""
     fo_symbols = st.session_state.get("fo_symbols", [])
@@ -4337,6 +4464,8 @@ def _show_live_order_flow_tab(fyers, all_symbols):
         with st.spinner(f"Reading live FYERS bid/ask market depth for {len(candidates)} symbols…"):
             depth_df, depth_errors = run_live_depth_scan(fyers, candidates)
         depth_df = _apply_future_direction_engine(depth_df)
+        previous_depth_df = st.session_state.get("depth_df")
+        depth_df = _apply_depth_movement_engine(depth_df, previous_depth_df)
         st.session_state["depth_df"] = depth_df
         st.session_state["depth_errors"] = depth_errors
         st.session_state["depth_scanned_at"] = _generated_timestamp()
@@ -4361,7 +4490,10 @@ def _show_live_order_flow_tab(fyers, all_symbols):
                 "Symbol", "LTP", "BEST BID", "BEST ASK", "TOTAL BUY QTY", "TOTAL SELL QTY",
                 "DEPTH IMBALANCE %", "BUY SCORE", "SELL SCORE", "NEXT DIRECTION",
                 "DIRECTION STRENGTH %", "FUTURE DIRECTION", "FUTURE CONFIDENCE %",
-                "FUTURE BUY SCORE", "FUTURE SELL SCORE", "PIN SIGNAL", "SPREAD %", "REASON", "FUTURE REASON"
+                "FUTURE BUY SCORE", "FUTURE SELL SCORE", "PIN SIGNAL", "SPREAD %",
+                "DEPTH TREND", "BID CHANGE %", "ASK CHANGE %", "IMBALANCE CHANGE",
+                "LTP CHANGE %", "DEPTH WALL", "DEPTH MOVE SCORE", "MOVE STATUS",
+                "DEPTH MOVE REASON", "REASON", "FUTURE REASON"
             ]],
             use_container_width=True, height=500
         )
