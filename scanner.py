@@ -6649,7 +6649,10 @@ def show_scanner(fyers) -> None:
         - **EMA 50/200:** longer trend alignment (Golden/Death Cross when fresh).
         - **RSI 14:** momentum; 70+ overbought, 30− oversold.
         - **MACD:** MACD line vs signal line and fresh crossover.
-        - **VWAP:** price position relative to session/cumulative VWAP (most useful intraday).
+        - **VWAP:** session VWAP for intraday charts; shows whether price is above/below fair intraday average.
+        - **VWAP GAP %:** percentage distance between LTP and VWAP; large positive/negative distance warns that price may be extended.
+        - **Fair Value Gap (FVG):** three-candle imbalance zone (bullish: current Low > High two candles ago; bearish: current High < Low two candles ago). This is a price-imbalance estimate, not proof of an unfilled institutional order.
+        - **FVG DISTANCE %:** distance from LTP to the nearest detected recent FVG zone.
         - **RVOL:** latest volume compared with the preceding 20-candle average.
         """)
         if st.button("▶ RUN ADDITIONAL INDICATORS", key="additional_ind_run", type="primary"):
@@ -6676,7 +6679,17 @@ def show_scanner(fyers) -> None:
                     e50, e200 = calculate_ema(close, 50), calculate_ema(close, 200)
                     rsi_s = calculate_rsi(close, 14)
                     macd_line, macd_sig, macd_hist = calculate_macd(close)
-                    vwap_s = calculate_vwap(d)
+                    # Intraday VWAP must reset each trading session; cumulative VWAP across
+                    # several downloaded days can distort the current session reading.
+                    if "Time" in d.columns and ind_tf_label != "Daily":
+                        session_key = pd.to_datetime(d["Time"]).dt.strftime("%Y-%m-%d")
+                        typical_price = (d["High"].astype(float) + d["Low"].astype(float) + close.astype(float)) / 3.0
+                        pv = typical_price * volume.astype(float)
+                        session_pv = pv.groupby(session_key).cumsum()
+                        session_vol = volume.astype(float).groupby(session_key).cumsum().replace(0, np.nan)
+                        vwap_s = (session_pv / session_vol).fillna(close)
+                    else:
+                        vwap_s = calculate_vwap(d)
                     vol_base = volume.shift(1).rolling(20, min_periods=5).mean()
                     rvol = float(volume.iloc[-1] / vol_base.iloc[-1]) if pd.notna(vol_base.iloc[-1]) and vol_base.iloc[-1] > 0 else 0.0
                     up_921 = e9.iloc[-2] <= e21.iloc[-2] and e9.iloc[-1] > e21.iloc[-1]
@@ -6690,6 +6703,36 @@ def show_scanner(fyers) -> None:
                     rsi = float(rsi_s.iloc[-1])
                     close_last = float(close.iloc[-1])
                     vwap_last = float(vwap_s.iloc[-1]) if pd.notna(vwap_s.iloc[-1]) else close_last
+                    vwap_gap_pct = ((close_last - vwap_last) / vwap_last * 100.0) if vwap_last else 0.0
+                    vwap_position = "ABOVE" if close_last > vwap_last else "BELOW" if close_last < vwap_last else "AT VWAP"
+
+                    # Find the most recent three-candle Fair Value Gap in the last 30 bars.
+                    fvg_type, fvg_low, fvg_high, fvg_idx = "NONE", np.nan, np.nan, None
+                    fvg_start = max(2, len(d) - 30)
+                    for fi in range(len(d) - 1, fvg_start - 1, -1):
+                        candle_now = d.iloc[fi]
+                        candle_two_back = d.iloc[fi - 2]
+                        if float(candle_now["Low"]) > float(candle_two_back["High"]):
+                            fvg_type = "BULLISH FVG"
+                            fvg_low, fvg_high, fvg_idx = float(candle_two_back["High"]), float(candle_now["Low"]), fi
+                            break
+                        if float(candle_now["High"]) < float(candle_two_back["Low"]):
+                            fvg_type = "BEARISH FVG"
+                            fvg_low, fvg_high, fvg_idx = float(candle_now["High"]), float(candle_two_back["Low"]), fi
+                            break
+                    if fvg_type == "NONE":
+                        fvg_distance_pct = np.nan
+                        fvg_relation = "NO RECENT FVG"
+                    else:
+                        if fvg_low <= close_last <= fvg_high:
+                            fvg_distance_pct = 0.0
+                            fvg_relation = "INSIDE FVG"
+                        else:
+                            nearest_fvg_edge = fvg_low if close_last < fvg_low else fvg_high
+                            fvg_distance_pct = abs(close_last - nearest_fvg_edge) / close_last * 100.0 if close_last else np.nan
+                            fvg_relation = "BELOW FVG" if close_last < fvg_low else "ABOVE FVG"
+                    # Gap zone may be stale/filled; expose the bar age so it can be reviewed.
+                    fvg_bars_ago = (len(d) - 1 - fvg_idx) if fvg_idx is not None else np.nan
                     signal_parts = []
                     if up_921: signal_parts.append("🟢 EMA 9/21 BULL CROSS")
                     elif dn_921: signal_parts.append("🔴 EMA 9/21 BEAR CROSS")
@@ -6699,6 +6742,14 @@ def show_scanner(fyers) -> None:
                     elif dn_50200: signal_parts.append("🔴 DEATH CROSS 50/200")
                     if up_macd: signal_parts.append("MACD BULL CROSS")
                     elif dn_macd: signal_parts.append("MACD BEAR CROSS")
+                    if close_last > vwap_last and vwap_gap_pct >= 0:
+                        signal_parts.append("PRICE ABOVE VWAP")
+                    elif close_last < vwap_last:
+                        signal_parts.append("PRICE BELOW VWAP")
+                    if abs(vwap_gap_pct) >= 1.0:
+                        signal_parts.append("⚠️ FAR FROM VWAP")
+                    if fvg_type != "NONE":
+                        signal_parts.append(fvg_type)
                     if rvol >= 1.5: signal_parts.append("VOLUME SPIKE")
                     if not signal_parts: signal_parts.append("WAIT / NO FRESH CROSS")
                     ind_rows.append({
@@ -6719,7 +6770,15 @@ def show_scanner(fyers) -> None:
                         "MACD Signal": round(float(macd_sig.iloc[-1]), 4),
                         "MACD Cross": "BULLISH CROSS" if up_macd else "BEARISH CROSS" if dn_macd else "NONE",
                         "VWAP": round(vwap_last, 2),
-                        "Price vs VWAP": "ABOVE" if close_last > vwap_last else "BELOW" if close_last < vwap_last else "AT VWAP",
+                        "Price vs VWAP": vwap_position,
+                        "VWAP Gap %": round(vwap_gap_pct, 2),
+                        "VWAP Distance Warning": "FAR ABOVE VWAP" if vwap_gap_pct >= 1.0 else "FAR BELOW VWAP" if vwap_gap_pct <= -1.0 else "NEAR VWAP",
+                        "Fair Value Gap": fvg_type,
+                        "FVG Low": round(float(fvg_low), 2) if pd.notna(fvg_low) else np.nan,
+                        "FVG High": round(float(fvg_high), 2) if pd.notna(fvg_high) else np.nan,
+                        "FVG Distance %": round(float(fvg_distance_pct), 2) if pd.notna(fvg_distance_pct) else np.nan,
+                        "Price vs FVG": fvg_relation,
+                        "FVG Age (bars)": int(fvg_bars_ago) if pd.notna(fvg_bars_ago) else np.nan,
                         "RVOL": round(rvol, 2),
                         "Indicator Summary": " | ".join(signal_parts)
                     })
@@ -6739,7 +6798,7 @@ def show_scanner(fyers) -> None:
         ind_result = st.session_state.get("additional_indicators_df", pd.DataFrame())
         if isinstance(ind_result, pd.DataFrame) and not ind_result.empty:
             st.caption(f"Last scan: {st.session_state.get('additional_indicators_scanned_at', 'N/A')} | Results: {len(ind_result)}")
-            cross_filter = st.selectbox("Show results", ["All results", "Fresh EMA/MACD crosses", "Bullish EMA trend", "Bearish EMA trend", "Volume spike (RVOL ≥ 1.5)"], key="additional_ind_filter")
+            cross_filter = st.selectbox("Show results", ["All results", "Fresh EMA/MACD crosses", "Bullish EMA trend", "Bearish EMA trend", "Price above VWAP", "Price below VWAP", "FVG detected", "Far from VWAP (≥ 1%)", "Volume spike (RVOL ≥ 1.5)"], key="additional_ind_filter")
             ind_view = ind_result.copy()
             if cross_filter == "Fresh EMA/MACD crosses":
                 ind_view = ind_view[
@@ -6751,6 +6810,14 @@ def show_scanner(fyers) -> None:
                 ind_view = ind_view[ind_view["EMA Trend"] == "BULLISH"]
             elif cross_filter == "Bearish EMA trend":
                 ind_view = ind_view[ind_view["EMA Trend"] == "BEARISH"]
+            elif cross_filter == "Price above VWAP":
+                ind_view = ind_view[ind_view["Price vs VWAP"] == "ABOVE"]
+            elif cross_filter == "Price below VWAP":
+                ind_view = ind_view[ind_view["Price vs VWAP"] == "BELOW"]
+            elif cross_filter == "FVG detected":
+                ind_view = ind_view[ind_view["Fair Value Gap"] != "NONE"]
+            elif cross_filter == "Far from VWAP (≥ 1%)":
+                ind_view = ind_view[ind_view["VWAP Gap %"].abs() >= 1.0]
             elif cross_filter == "Volume spike (RVOL ≥ 1.5)":
                 ind_view = ind_view[ind_view["RVOL"] >= 1.5]
             st.dataframe(ind_view, use_container_width=True, height=520, hide_index=True)
