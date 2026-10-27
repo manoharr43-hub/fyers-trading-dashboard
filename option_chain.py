@@ -4723,21 +4723,65 @@ def _render_option_chain_liquidity_tab(df: pd.DataFrame, state: dict, cfg: dict)
     )
     tf_label = st.selectbox("Liquidity Timeframe", ["5 Minute", "15 Minute", "1 Day"], key="oc_liq_tf")
     tf_key = {"5 Minute": "5M", "15 Minute": "15M", "1 Day": "1D"}[tf_label]
+    # Bind every liquidity result to the CURRENT instrument + symbol + timeframe.
+    # This prevents a previous NIFTY liquidity result from remaining visible after
+    # the sidebar is changed to an F&O stock (or vice versa).
+    current_mode = "INDEX" if cfg.get("is_index") else "F&O"
+    current_symbol = str(cfg.get("symbol", "")).strip().upper()
+    result_key = f"{current_mode}|{current_symbol}|{tf_key}"
+
+    st.caption(f"Current selection: {current_mode} • {current_symbol} • {tf_label}")
+
     if st.button(f"▶ RUN OPTION CHAIN LIQUIDITY — {tf_label.upper()}", type="primary", use_container_width=True, key="oc_liq_run"):
         pa = state.get("intraday_data") or state.get("price_action_data") or {}
         tf_data = pa.get("df_dict") or {}
         candles = tf_data.get(tf_key)
+        source_symbol = str(pa.get("fyers_symbol") or "")
+
+        # Safety: do not silently reuse stale/empty candle data.
+        if not isinstance(candles, pd.DataFrame) or candles.empty:
+            st.session_state.pop("oc_liq_result", None)
+            st.error(
+                f"No {tf_label} FYERS candle data for {current_mode} {current_symbol}. "
+                "Click RUN SCANNER / REFRESH NOW for the selected instrument, then run liquidity again."
+            )
+            return
+
         snap = _oc_liquidity_snapshot(candles)
-        st.session_state["oc_liq_result"] = (tf_label, snap)
+        st.session_state["oc_liq_result"] = {
+            "key": result_key,
+            "mode": current_mode,
+            "symbol": current_symbol,
+            "tf_label": tf_label,
+            "tf_key": tf_key,
+            "source_symbol": source_symbol,
+            "snap": snap,
+        }
 
     saved = st.session_state.get("oc_liq_result")
     if not saved:
         st.info("Choose 5 Minute / 15 Minute / 1 Day and click RUN LIQUIDITY.")
         return
-    saved_tf, snap = saved
-    if saved_tf != tf_label:
-        st.warning("Timeframe changed. Click RUN again to refresh liquidity for the selected timeframe.")
+
+    # Backward compatibility: reject old tuple-format cached results instead of
+    # showing them under a newly selected instrument.
+    if not isinstance(saved, dict):
+        st.session_state.pop("oc_liq_result", None)
+        st.warning("Instrument/timeframe changed. Click RUN LIQUIDITY again for the current selection.")
         return
+
+    if saved.get("key") != result_key:
+        st.warning(
+            f"Previous liquidity result belongs to {saved.get('mode','')} {saved.get('symbol','')} "
+            f"({saved.get('tf_label','')}). Click RUN to calculate {current_mode} {current_symbol} {tf_label}."
+        )
+        return
+
+    snap = saved.get("snap") or {}
+    st.success(
+        f"Showing liquidity for {saved.get('mode')} {saved.get('symbol')} • {saved.get('tf_label')}"
+        + (f" • FYERS: {saved.get('source_symbol')}" if saved.get('source_symbol') else "")
+    )
 
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("LIQUIDITY SIGNAL", snap.get("signal", "WAIT"))
@@ -6467,10 +6511,15 @@ def run_dashboard(fyers: Any = None) -> None:
         if fyers is None:
             cfg["analyze_price_action"] = False
 
-    if cfg["symbol"] != st.session_state.get("oc_last_symbol"):
+    # Treat instrument TYPE + symbol as one identity. NIFTY Index and an F&O
+    # selection must never share cached analytics/liquidity state.
+    current_instrument_key = f"{'INDEX' if cfg.get('is_index') else 'F&O'}|{cfg['symbol']}"
+    if current_instrument_key != st.session_state.get("oc_last_instrument_key"):
+        st.session_state["oc_last_instrument_key"] = current_instrument_key
         st.session_state["oc_last_symbol"] = cfg["symbol"]
         st.session_state.pop("oc_state", None)
         st.session_state.pop("oc_selected_expiry", None)
+        st.session_state.pop("oc_liq_result", None)
 
     if cfg["fetch_clicked"] or cfg["auto_refresh"]:
         # RUN SCANNER / FREE RUN intentionally works with NSE-only option-chain data.
