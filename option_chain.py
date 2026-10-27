@@ -4653,6 +4653,140 @@ def _movement_price_reversal_from_history(
     return 0.0, "NO PRICE"
 
 
+
+# ══════════════════════════════════════════════════════════════════════════
+# ADDITIVE OPTION-CHAIN LIQUIDITY — 5M / 15M / 1D
+# Existing option-chain / movement / PIN logic is not replaced.
+# ══════════════════════════════════════════════════════════════════════════
+
+def _oc_liquidity_snapshot(candles: pd.DataFrame, pivot_lookback: int = 12) -> dict[str, Any]:
+    """Confirmed-candle liquidity map for one selected timeframe."""
+    result = {
+        "buy_liq_level": 0.0, "sell_liq_level": 0.0,
+        "buy_liq_status": "N/A", "sell_liq_status": "N/A",
+        "sweep": "NONE", "signal": "WAIT", "trend": "MIXED",
+        "rvol": 1.0, "rsi": 50.0, "candle_time": "N/A",
+    }
+    if not isinstance(candles, pd.DataFrame) or len(candles) < max(20, pivot_lookback + 3):
+        return result
+    d = candles.copy().reset_index(drop=True)
+    # Use only prior candles to define liquidity; latest completed candle tests the level.
+    hist = d.iloc[:-1].tail(max(pivot_lookback, 5))
+    last = d.iloc[-1]
+    if hist.empty:
+        return result
+    buy_level = float(hist["high"].max())       # liquidity resting above prior highs
+    sell_level = float(hist["low"].min())       # liquidity resting below prior lows
+    o, h, l, c = map(float, (last["open"], last["high"], last["low"], last["close"]))
+    body = max(abs(c - o), 1e-9)
+    upper_wick = max(0.0, h - max(o, c))
+    lower_wick = max(0.0, min(o, c) - l)
+    buy_swept = h > buy_level and c < buy_level and upper_wick >= body * 0.35
+    sell_swept = l < sell_level and c > sell_level and lower_wick >= body * 0.35
+    ema9 = float(calculate_ema(d, 9).iloc[-1])
+    ema21 = float(calculate_ema(d, 21).iloc[-1])
+    trend = "BULLISH" if c > ema9 > ema21 else ("BEARISH" if c < ema9 < ema21 else "MIXED")
+    rvol = float(calculate_rvol(d, 20).iloc[-1])
+    rsi = float(calculate_rsi(d).iloc[-1])
+    signal = "WAIT"
+    sweep = "NONE"
+    if sell_swept:
+        sweep = "🟢 SELL-SIDE SWEPT"
+        signal = "🟢 BUY LIQ"
+        if trend == "BULLISH" and rvol >= 1.2:
+            signal = "🔥 STRONG BUY LIQ"
+    elif buy_swept:
+        sweep = "🔴 BUY-SIDE SWEPT"
+        signal = "🔴 SELL LIQ"
+        if trend == "BEARISH" and rvol >= 1.2:
+            signal = "🔥 STRONG SELL LIQ"
+    try:
+        ts = float(last.get("timestamp", 0) or 0)
+        candle_time = datetime.fromtimestamp(ts, tz=timezone.utc).astimezone(INDIA_TZ).strftime("%d-%b-%Y %H:%M") if ts else "N/A"
+    except Exception:
+        candle_time = "N/A"
+    result.update({
+        "buy_liq_level": round(buy_level, 2), "sell_liq_level": round(sell_level, 2),
+        "buy_liq_status": "SWEPT" if buy_swept else "ACTIVE",
+        "sell_liq_status": "SWEPT" if sell_swept else "ACTIVE",
+        "sweep": sweep, "signal": signal, "trend": trend,
+        "rvol": round(rvol, 2), "rsi": round(rsi, 1), "candle_time": candle_time,
+    })
+    return result
+
+
+def _render_option_chain_liquidity_tab(df: pd.DataFrame, state: dict, cfg: dict) -> None:
+    st.markdown('<div class="block-title">💧 OPTION CHAIN LIQUIDITY — 5M / 15M / 1D</div>', unsafe_allow_html=True)
+    st.caption(
+        "Select a timeframe and run. Liquidity levels/sweeps come from the selected underlying candle timeframe; "
+        "the option-chain table adds current CE/PE OI, OI change and volume context."
+    )
+    tf_label = st.selectbox("Liquidity Timeframe", ["5 Minute", "15 Minute", "1 Day"], key="oc_liq_tf")
+    tf_key = {"5 Minute": "5M", "15 Minute": "15M", "1 Day": "1D"}[tf_label]
+    if st.button(f"▶ RUN OPTION CHAIN LIQUIDITY — {tf_label.upper()}", type="primary", use_container_width=True, key="oc_liq_run"):
+        pa = state.get("intraday_data") or state.get("price_action_data") or {}
+        tf_data = pa.get("df_dict") or {}
+        candles = tf_data.get(tf_key)
+        snap = _oc_liquidity_snapshot(candles)
+        st.session_state["oc_liq_result"] = (tf_label, snap)
+
+    saved = st.session_state.get("oc_liq_result")
+    if not saved:
+        st.info("Choose 5 Minute / 15 Minute / 1 Day and click RUN LIQUIDITY.")
+        return
+    saved_tf, snap = saved
+    if saved_tf != tf_label:
+        st.warning("Timeframe changed. Click RUN again to refresh liquidity for the selected timeframe.")
+        return
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("LIQUIDITY SIGNAL", snap.get("signal", "WAIT"))
+    m2.metric("BUY-SIDE LIQ LEVEL", f"{float(snap.get('buy_liq_level', 0)):,.2f}" if snap.get("buy_liq_level") else "N/A")
+    m3.metric("SELL-SIDE LIQ LEVEL", f"{float(snap.get('sell_liq_level', 0)):,.2f}" if snap.get("sell_liq_level") else "N/A")
+    m4.metric("TF TREND", snap.get("trend", "MIXED"))
+    st.caption(
+        f"Sweep: {snap.get('sweep','NONE')} | RVOL: {snap.get('rvol',1.0)}x | RSI: {snap.get('rsi',50.0)} | "
+        f"Candle time: {snap.get('candle_time','N/A')}"
+    )
+
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        st.warning("Option-chain rows are unavailable.")
+        return
+    d = df.copy()
+    spot = float((state.get("meta") or {}).get("spot_price", 0) or state.get("spot", 0) or 0)
+    if not spot and "strike_price" in d.columns:
+        spot = float(d["strike_price"].median())
+    d["ATM DIST"] = (pd.to_numeric(d["strike_price"], errors="coerce") - spot).abs()
+    d = d.sort_values("ATM DIST").head(15).copy()
+    max_ce_oi = max(float(pd.to_numeric(d.get("ce_oi", 0), errors="coerce").max() or 0), 1.0)
+    max_pe_oi = max(float(pd.to_numeric(d.get("pe_oi", 0), errors="coerce").max() or 0), 1.0)
+    rows = []
+    for _, r in d.iterrows():
+        ce_oi = _safe_num(r.get("ce_oi")); pe_oi = _safe_num(r.get("pe_oi"))
+        ce_vol = _safe_num(r.get("ce_volume")); pe_vol = _safe_num(r.get("pe_volume"))
+        ce_chg = _safe_num(r.get("ce_chng_oi")); pe_chg = _safe_num(r.get("pe_chng_oi"))
+        base_sig = snap.get("signal", "WAIT")
+        side = "CE" if "BUY" in base_sig else ("PE" if "SELL" in base_sig else "WAIT")
+        score = 0.0
+        if side == "CE":
+            score = min(100.0, 55.0 + 20.0 * ce_oi / max_ce_oi + (10.0 if ce_chg > 0 else 0) + (10.0 if ce_vol > 0 else 0))
+        elif side == "PE":
+            score = min(100.0, 55.0 + 20.0 * pe_oi / max_pe_oi + (10.0 if pe_chg > 0 else 0) + (10.0 if pe_vol > 0 else 0))
+        rows.append({
+            "STRIKE": _safe_num(r.get("strike_price")), "TF": tf_label,
+            "CE LTP": _safe_num(r.get("ce_ltp")), "CE OI": ce_oi, "CE OI CHG": ce_chg, "CE VOL": ce_vol,
+            "PE LTP": _safe_num(r.get("pe_ltp")), "PE OI": pe_oi, "PE OI CHG": pe_chg, "PE VOL": pe_vol,
+            "BUY-SIDE LIQ": snap.get("buy_liq_level", 0), "SELL-SIDE LIQ": snap.get("sell_liq_level", 0),
+            "SWEEP": snap.get("sweep", "NONE"), "LIQ SIGNAL": base_sig,
+            "OPTION SIDE WATCH": side, "LIQ SCORE": round(score, 1) if side != "WAIT" else 0.0,
+            "SIGNAL TIME": snap.get("candle_time", "N/A"),
+        })
+    out = pd.DataFrame(rows)
+    if "LIQ SCORE" in out.columns:
+        out = out.sort_values(["LIQ SCORE", "ATM DIST"] if "ATM DIST" in out.columns else ["LIQ SCORE"], ascending=False)
+    st.dataframe(out, use_container_width=True, hide_index=True, height=520)
+    st.caption("BUY LIQ maps to CE watch; SELL LIQ maps to PE watch. Confirm with price action/volume; this is not a guaranteed trade signal.")
+
 # ══════════════════════════════════════════════════════════════════════════
 # ADDITIVE MOVEMENT SEARCH — INDEX + F&O
 # ══════════════════════════════════════════════════════════════════════════
@@ -6428,12 +6562,12 @@ def run_dashboard(fyers: Any = None) -> None:
     st.divider()
 
     if state.get("price_action_data") and state["price_action_data"].get("df_dict"):
-        tab_chain, tab_charts, tab_pressure, tab_orderflow, tab_movement, tab_greeks, tab_ai, tab_gex, tab_po3, tab_price_action, tab_sell_confirm, tab_export, tab_intraday = st.tabs([
-            "📋 Chain", "📈 OI", "💪 Pressure", "📊 Order Flow", "🎯 Strike Movement", "🧮 Greeks", "🤖 AI", "⚡ GEX", "🧠 PO3 Intelligence", "💹 Price Action", "🔴 SELL CONFIRM", "📥 Export", "📅 INTRADAY PLAN",
+        tab_chain, tab_charts, tab_pressure, tab_orderflow, tab_movement, tab_greeks, tab_ai, tab_gex, tab_po3, tab_price_action, tab_sell_confirm, tab_export, tab_intraday, tab_liquidity = st.tabs([
+            "📋 Chain", "📈 OI", "💪 Pressure", "📊 Order Flow", "🎯 Strike Movement", "🧮 Greeks", "🤖 AI", "⚡ GEX", "🧠 PO3 Intelligence", "💹 Price Action", "🔴 SELL CONFIRM", "📥 Export", "📅 INTRADAY PLAN", "💧 OPTION LIQUIDITY",
         ])
     else:
-        tab_chain, tab_charts, tab_pressure, tab_orderflow, tab_movement, tab_greeks, tab_ai, tab_gex, tab_po3, tab_sell_confirm, tab_export, tab_intraday = st.tabs([
-            "📋 Chain", "📈 OI", "💪 Pressure", "📊 Order Flow", "🎯 Strike Movement", "🧮 Greeks", "🤖 AI", "⚡ GEX", "🧠 PO3 Intelligence", "🔴 SELL CONFIRM", "📥 Export", "📅 INTRADAY PLAN",
+        tab_chain, tab_charts, tab_pressure, tab_orderflow, tab_movement, tab_greeks, tab_ai, tab_gex, tab_po3, tab_sell_confirm, tab_export, tab_intraday, tab_liquidity = st.tabs([
+            "📋 Chain", "📈 OI", "💪 Pressure", "📊 Order Flow", "🎯 Strike Movement", "🧮 Greeks", "🤖 AI", "⚡ GEX", "🧠 PO3 Intelligence", "🔴 SELL CONFIRM", "📥 Export", "📅 INTRADAY PLAN", "💧 OPTION LIQUIDITY",
         ])
 
 
@@ -6868,6 +7002,10 @@ def run_dashboard(fyers: Any = None) -> None:
                 )
             except Exception as e:
                 st.error(f"CSV export failed: {e}")
+
+    # ADDITIVE OPTION-CHAIN LIQUIDITY TAB
+    with tab_liquidity:
+        _render_option_chain_liquidity_tab(df, state, cfg)
 
     # NEW: PIN + Option Chain Confluence — additive only.
     # Existing tabs/export/refresh logic above remain untouched.
