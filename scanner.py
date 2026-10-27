@@ -4302,133 +4302,6 @@ def _apply_future_direction_engine(depth_df: pd.DataFrame) -> pd.DataFrame:
     out["FUTURE REASON"] = [x["reason"] for x in results]
     return out
 
-def _apply_depth_movement_engine(depth_df: pd.DataFrame, previous_df: Optional[pd.DataFrame] = None) -> pd.DataFrame:
-    """Compare consecutive FYERS depth snapshots to detect building/fading pressure.
-
-    This does not replace the existing depth/future-direction logic. It only adds
-    movement columns by comparing the current scan with the previous scan stored
-    in Streamlit session state.
-    """
-    if depth_df is None or depth_df.empty:
-        return depth_df
-
-    out = depth_df.copy()
-    prev_lookup = {}
-    if isinstance(previous_df, pd.DataFrame) and not previous_df.empty and "Symbol" in previous_df.columns:
-        for _, r in previous_df.iterrows():
-            prev_lookup[str(r.get("Symbol", "")).strip().upper()] = r.to_dict()
-
-    rows = []
-    for _, r in out.iterrows():
-        cur = r.to_dict()
-        sym = str(cur.get("Symbol", "")).strip().upper()
-        prev = prev_lookup.get(sym, {})
-
-        bid_now = _safe_float(cur.get("TOTAL BUY QTY", 0))
-        ask_now = _safe_float(cur.get("TOTAL SELL QTY", 0))
-        ltp_now = _safe_float(cur.get("LTP", 0))
-        imb_now = _safe_float(cur.get("DEPTH IMBALANCE %", 0))
-
-        bid_prev = _safe_float(prev.get("TOTAL BUY QTY", 0))
-        ask_prev = _safe_float(prev.get("TOTAL SELL QTY", 0))
-        ltp_prev = _safe_float(prev.get("LTP", 0))
-        imb_prev = _safe_float(prev.get("DEPTH IMBALANCE %", 0))
-
-        bid_chg = ((bid_now - bid_prev) / bid_prev * 100.0) if bid_prev > 0 else 0.0
-        ask_chg = ((ask_now - ask_prev) / ask_prev * 100.0) if ask_prev > 0 else 0.0
-        ltp_chg = ((ltp_now - ltp_prev) / ltp_prev * 100.0) if ltp_prev > 0 else 0.0
-        imb_chg = imb_now - imb_prev if prev else 0.0
-
-        # Detect unusually large current-side quantity relative to opposite side.
-        bid_wall = bid_now >= max(ask_now * DEPTH_BIG_QTY_MULTIPLIER, 1.0)
-        ask_wall = ask_now >= max(bid_now * DEPTH_BIG_QTY_MULTIPLIER, 1.0)
-        wall = "🟢 BIG BID WALL" if bid_wall else "🔴 BIG ASK WALL" if ask_wall else "NONE"
-
-        buy = 0.0
-        sell = 0.0
-        reasons = []
-
-        # Current depth pressure.
-        if imb_now >= DEPTH_STRONG_IMBALANCE:
-            buy += 35; reasons.append(f"strong bid imbalance +{imb_now:.1f}%")
-        elif imb_now >= DEPTH_MIN_IMBALANCE:
-            buy += 22; reasons.append(f"bid imbalance +{imb_now:.1f}%")
-        elif imb_now <= -DEPTH_STRONG_IMBALANCE:
-            sell += 35; reasons.append(f"strong ask imbalance {imb_now:.1f}%")
-        elif imb_now <= -DEPTH_MIN_IMBALANCE:
-            sell += 22; reasons.append(f"ask imbalance {imb_now:.1f}%")
-
-        # Snapshot-to-snapshot pressure change.
-        if prev:
-            if bid_chg >= 10:
-                buy += min(20.0, 8.0 + bid_chg * 0.25); reasons.append(f"bid qty +{bid_chg:.1f}%")
-            if ask_chg <= -10:
-                buy += min(15.0, 6.0 + abs(ask_chg) * 0.20); reasons.append(f"ask qty {ask_chg:.1f}%")
-            if ask_chg >= 10:
-                sell += min(20.0, 8.0 + ask_chg * 0.25); reasons.append(f"ask qty +{ask_chg:.1f}%")
-            if bid_chg <= -10:
-                sell += min(15.0, 6.0 + abs(bid_chg) * 0.20); reasons.append(f"bid qty {bid_chg:.1f}%")
-            if imb_chg >= 8:
-                buy += min(15.0, 5.0 + imb_chg * 0.35); reasons.append(f"imbalance improving +{imb_chg:.1f}")
-            elif imb_chg <= -8:
-                sell += min(15.0, 5.0 + abs(imb_chg) * 0.35); reasons.append(f"imbalance weakening {imb_chg:.1f}")
-
-        # Price confirmation.
-        if ltp_chg >= 0.05:
-            buy += min(15.0, 6.0 + ltp_chg * 20.0); reasons.append(f"LTP +{ltp_chg:.2f}%")
-        elif ltp_chg <= -0.05:
-            sell += min(15.0, 6.0 + abs(ltp_chg) * 20.0); reasons.append(f"LTP {ltp_chg:.2f}%")
-
-        if bid_wall:
-            buy += 10; reasons.append("big bid wall")
-        if ask_wall:
-            sell += 10; reasons.append("big ask wall")
-
-        buy = min(100.0, buy)
-        sell = min(100.0, sell)
-        score = round(max(buy, sell), 1)
-        gap = abs(buy - sell)
-
-        if not prev:
-            status = "⚪ BASELINE — SCAN AGAIN"
-            trend = "BASELINE"
-        elif buy >= 70 and gap >= 20:
-            status = "🔥 STRONG UP MOVE"; trend = "UP"
-        elif sell >= 70 and gap >= 20:
-            status = "🔥 STRONG DOWN MOVE"; trend = "DOWN"
-        elif buy >= 45 and gap >= 12:
-            status = "🟢 UP BUILDING"; trend = "UP"
-        elif sell >= 45 and gap >= 12:
-            status = "🔴 DOWN BUILDING"; trend = "DOWN"
-        elif imb_prev >= DEPTH_MIN_IMBALANCE and imb_now < imb_prev - 12:
-            status = "⚠️ BUY PRESSURE FADING"; trend = "FADING"
-        elif imb_prev <= -DEPTH_MIN_IMBALANCE and imb_now > imb_prev + 12:
-            status = "⚠️ SELL PRESSURE FADING"; trend = "FADING"
-        elif (imb_prev > 15 and imb_now < -15) or (imb_prev < -15 and imb_now > 15):
-            status = "🔄 POSSIBLE REVERSAL"; trend = "REVERSAL"
-        else:
-            status = "⚪ WAIT"; trend = "WAIT"
-
-        rows.append({
-            "DEPTH TREND": trend,
-            "BID CHANGE %": round(bid_chg, 1),
-            "ASK CHANGE %": round(ask_chg, 1),
-            "IMBALANCE CHANGE": round(imb_chg, 1),
-            "LTP CHANGE %": round(ltp_chg, 2),
-            "DEPTH WALL": wall,
-            "DEPTH MOVE SCORE": score,
-            "DEPTH BUY MOVE SCORE": round(buy, 1),
-            "DEPTH SELL MOVE SCORE": round(sell, 1),
-            "MOVE STATUS": status,
-            "DEPTH MOVE REASON": " | ".join(reasons[:6]) if reasons else "Need next snapshot for movement comparison",
-        })
-
-    add = pd.DataFrame(rows, index=out.index)
-    for c in add.columns:
-        out[c] = add[c]
-    return out
-
-
 def _show_live_order_flow_tab(fyers, all_symbols):
     """Actual FYERS exchange depth tab: current bid/ask book -> direction -> PIN."""
     fo_symbols = st.session_state.get("fo_symbols", [])
@@ -4464,8 +4337,6 @@ def _show_live_order_flow_tab(fyers, all_symbols):
         with st.spinner(f"Reading live FYERS bid/ask market depth for {len(candidates)} symbols…"):
             depth_df, depth_errors = run_live_depth_scan(fyers, candidates)
         depth_df = _apply_future_direction_engine(depth_df)
-        previous_depth_df = st.session_state.get("depth_df")
-        depth_df = _apply_depth_movement_engine(depth_df, previous_depth_df)
         st.session_state["depth_df"] = depth_df
         st.session_state["depth_errors"] = depth_errors
         st.session_state["depth_scanned_at"] = _generated_timestamp()
@@ -4490,10 +4361,7 @@ def _show_live_order_flow_tab(fyers, all_symbols):
                 "Symbol", "LTP", "BEST BID", "BEST ASK", "TOTAL BUY QTY", "TOTAL SELL QTY",
                 "DEPTH IMBALANCE %", "BUY SCORE", "SELL SCORE", "NEXT DIRECTION",
                 "DIRECTION STRENGTH %", "FUTURE DIRECTION", "FUTURE CONFIDENCE %",
-                "FUTURE BUY SCORE", "FUTURE SELL SCORE", "PIN SIGNAL", "SPREAD %",
-                "DEPTH TREND", "BID CHANGE %", "ASK CHANGE %", "IMBALANCE CHANGE",
-                "LTP CHANGE %", "DEPTH WALL", "DEPTH MOVE SCORE", "MOVE STATUS",
-                "DEPTH MOVE REASON", "REASON", "FUTURE REASON"
+                "FUTURE BUY SCORE", "FUTURE SELL SCORE", "PIN SIGNAL", "SPREAD %", "REASON", "FUTURE REASON"
             ]],
             use_container_width=True, height=500
         )
@@ -4517,49 +4385,154 @@ def _show_live_order_flow_tab(fyers, all_symbols):
             st.dataframe(pd.DataFrame({"Error": errors}), use_container_width=True)
 
 
+
+
+def _pin_selected_tf_worker(fyers, symbol, resolution: str, tf_label: str):
+    """Analyze one symbol on the timeframe selected in the PIN tab."""
+    display_symbol = _pin_display_symbol(symbol)
+    try:
+        analysis = analyze_timeframe(fyers, symbol, resolution)
+        df = analysis.get("df")
+        data = analysis.get("data", {}) or {}
+        if analysis.get("status") != "OK" or df is None or len(df) < 30:
+            return None, f"{display_symbol}: {tf_label} unavailable/insufficient candles"
+
+        # calculate_pin_rules is candle/timeframe agnostic internally.  The first
+        # dataframe/data arguments are the active timeframe selected by the user.
+        pin = calculate_pin_rules(df, data, {}, {})
+        sweep = str(pin.get("SWEEP", "NONE")).upper()
+        reversal = str(pin.get("REVERSAL", "NONE")).upper()
+
+        buy_liq_signal = "WAIT"
+        sell_liq_signal = "WAIT"
+        if "LOW SWEPT" in sweep:
+            buy_liq_signal = "🔥 STRONG BUY LIQ" if "BULL REVERSAL" in reversal else "🟢 BUY LIQ"
+        if "HIGH SWEPT" in sweep:
+            sell_liq_signal = "🔥 STRONG SELL LIQ" if "BEAR REVERSAL" in reversal else "🔴 SELL LIQ"
+
+        if buy_liq_signal != "WAIT":
+            final_liq_signal = buy_liq_signal
+        elif sell_liq_signal != "WAIT":
+            final_liq_signal = sell_liq_signal
+        else:
+            final_liq_signal = "⚪ WAIT"
+
+        pin["Symbol"] = display_symbol
+        pin["LTP"] = round(float(df["Close"].iloc[-1]), 2)
+        pin["TIMEFRAME"] = tf_label
+        pin["BUY LIQ SIGNAL"] = buy_liq_signal
+        pin["SELL LIQ SIGNAL"] = sell_liq_signal
+        pin["LIQUIDITY SIGNAL"] = final_liq_signal
+        pin["TF TREND"] = data.get("structure_trend", "N/A")
+        if "Time" in df.columns:
+            try:
+                pin["SIGNAL TIME"] = pd.Timestamp(df["Time"].iloc[-1]).strftime("%d-%b-%Y %H:%M")
+            except Exception:
+                pin["SIGNAL TIME"] = str(df["Time"].iloc[-1])
+        else:
+            pin["SIGNAL TIME"] = _now_ist().strftime("%d-%b-%Y %H:%M")
+        return pin, None
+    except Exception as e:
+        return None, f"{display_symbol}: {type(e).__name__}: {str(e)[:100]}"
+
+
+def _run_pin_selected_timeframe_scan(fyers, universe, resolution: str, tf_label: str,
+                                     pin_min=PIN_MIN_CONFIDENCE, pin_mode="ALL"):
+    """PIN scan for NSE/F&O on user-selected 5M, 15M or Daily candles."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    seen, symbols = set(), []
+    for symbol in list(universe or []):
+        normalized = _pin_normalize_symbol(symbol)
+        if normalized and normalized not in seen:
+            seen.add(normalized)
+            symbols.append(normalized)
+    if not symbols:
+        return pd.DataFrame(), ["No valid symbols available"]
+
+    rows, errors = [], []
+    progress = st.progress(0.0, text=f"PIN {tf_label}: 0 / {len(symbols)}")
+    with ThreadPoolExecutor(max_workers=PIN_FAST_WORKERS) as executor:
+        futures = {
+            executor.submit(_pin_selected_tf_worker, fyers, symbol, resolution, tf_label): symbol
+            for symbol in symbols
+        }
+        for done, future in enumerate(as_completed(futures), start=1):
+            try:
+                row, error = future.result()
+            except Exception as e:
+                row, error = None, f"{futures[future]}: worker error: {str(e)[:100]}"
+            if row is not None:
+                rows.append(row)
+            if error:
+                errors.append(error)
+            progress.progress(done / max(len(symbols), 1), text=f"PIN {tf_label}: {done} / {len(symbols)} | Results: {len(rows)}")
+    progress.empty()
+
+    result = pd.DataFrame(rows)
+    if result.empty:
+        return result, errors
+
+    score = pd.to_numeric(result.get("PIN SCORE", 0), errors="coerce").fillna(0)
+    liq_signal = result.get("LIQUIDITY SIGNAL", pd.Series("⚪ WAIT", index=result.index)).astype(str).str.upper()
+    # Keep confirmed liquidity sweep signals even if the general PIN score is below
+    # the slider; otherwise use the normal PIN score threshold.
+    result = result[(score >= float(pin_min)) | liq_signal.str.contains("BUY LIQ|SELL LIQ", regex=True, na=False)].copy()
+
+    if not result.empty:
+        pin_text = result.get("PIN SIGNAL", pd.Series("", index=result.index)).astype(str).str.upper()
+        liq_text = result.get("LIQUIDITY SIGNAL", pd.Series("", index=result.index)).astype(str).str.upper()
+        combined = pin_text + " " + liq_text
+        if pin_mode == "BUY ONLY":
+            result = result[combined.str.contains("BUY", na=False)]
+        elif pin_mode == "SELL ONLY":
+            result = result[combined.str.contains("SELL", na=False)]
+        elif pin_mode == "STRONG ONLY":
+            result = result[combined.str.contains("STRONG", na=False)]
+
+    if not result.empty:
+        result["__liq_rank"] = result["LIQUIDITY SIGNAL"].astype(str).str.contains("STRONG", na=False).astype(int) * 2 + result["LIQUIDITY SIGNAL"].astype(str).str.contains("BUY LIQ|SELL LIQ", regex=True, na=False).astype(int)
+        result["__score"] = pd.to_numeric(result.get("PIN SCORE", 0), errors="coerce").fillna(0)
+        result = result.sort_values(["__liq_rank", "__score"], ascending=[False, False]).drop(columns=["__liq_rank", "__score"]).reset_index(drop=True)
+    return result, errors
+
 def _show_pin_rules_tab(fyers, all_symbols=None, fo_symbols=None) -> None:
-    """PIN Rules scanner. Runs independently from the main scanners."""
-    st.markdown("### 📌 PIN RULES — Liquidity + Reversal + Big Movement")
-    st.caption("Independent PIN scanner. It does not modify NSE, F&O, Momentum, or other scanner results.")
+    """PIN Rules scanner with NSE/F&O + 5M/15M/Daily selection."""
+    st.markdown("### 📌 PIN RULES — BUY / SELL LIQUIDITY SIGNALS")
+    st.caption("Select NSE or F&O, select 5 Minute / 15 Minute / 1 Day, then RUN. Existing scanner tabs are unchanged.")
 
-    source = st.selectbox(
-        "Source",
-        ["NSE Stocks", "F&O Stocks"],
-        key="pin_source"
-    )
+    c_src, c_tf, c_count = st.columns(3)
+    with c_src:
+        source = st.selectbox("Market", ["NSE Stocks", "F&O Stocks"], key="pin_source")
+    with c_tf:
+        tf_label = st.selectbox("Timeframe", ["5 Minute", "15 Minute", "1 Day"], key="pin_timeframe")
+    with c_count:
+        selected_universe = list(all_symbols or []) if source == "NSE Stocks" else list(fo_symbols or [])
+        st.metric("AVAILABLE", f"{len(selected_universe):,}")
 
-    selected_universe = list(all_symbols or []) if source == "NSE Stocks" else list(fo_symbols or [])
     if not selected_universe:
         st.error(f"❌ No {source} symbols are available. Check symbol loading/FYERS access.")
         return
 
-    with st.expander("📖 PIN Rules", expanded=False):
-        st.markdown("""
-        **Liquidity:** TOP = Buy-side liquidity above the latest confirmed Pivot/Equal High; BOTTOM = Sell-side liquidity below the latest confirmed Pivot/Equal Low.
+    resolution = {"5 Minute": "5", "15 Minute": "15", "1 Day": "1D"}[tf_label]
 
-        **Liquidity Status:** ACTIVE = not swept; SWEPT = current 5M candle crossed the liquidity level and closed back through it.
-        
-        **Liquidity Score:** 0–100 setup-strength score based on confirmed level, equal-level confluence and current sweep evidence. It is not actual exchange quantity.
-        
-        **Sweep:** High breaks and closes back below = bearish; Low breaks and closes back above = bullish.
-        
-        **Reversal:** Sweep + candle direction + VWAP + RSI confirmation.
-        
-        **Confluence:** Trend + RSI + VWAP + MACD + RVOL + candle + sweep + reversal.
-        
-        **Big Movement:** existing consolidation-breakout + candle + RVOL + structure engine.
+    with st.expander("📖 Liquidity Signal Rules", expanded=False):
+        st.markdown("""
+        **🟢 BUY LIQ SIGNAL:** selected-timeframe candle sweeps below confirmed sell-side liquidity and closes back above it.
+
+        **🔴 SELL LIQ SIGNAL:** selected-timeframe candle sweeps above confirmed buy-side liquidity and closes back below it.
+
+        **🔥 STRONG:** liquidity sweep also satisfies the existing reversal confirmation (candle direction + VWAP + RSI).
+
+        Liquidity levels/signals are candle-based technical evidence, not exchange order-book quantity and not a guaranteed future move.
         """)
 
-    # FULL UNIVERSE MODE: PIN is completely independent from nse_df/fo_df.
-    # It always scans all symbols loaded for the selected source.
-    candidate_symbols = []
-    seen = set()
+    candidate_symbols, seen = [], set()
     for symbol in selected_universe:
         normalized = _pin_normalize_symbol(symbol)
         if normalized and normalized not in seen:
             seen.add(normalized)
             candidate_symbols.append(normalized)
-
     total_available = len(candidate_symbols)
     if total_available == 0:
         st.warning("⚠️ No valid symbols found for PIN scanning.")
@@ -4567,67 +4540,62 @@ def _show_pin_rules_tab(fyers, all_symbols=None, fo_symbols=None) -> None:
 
     c1, c2, c3 = st.columns(3)
     with c1:
-        pin_min = st.slider(
-            "Minimum PIN score", min_value=50, max_value=100,
-            value=PIN_MIN_CONFIDENCE, step=1, key="pin_min_score"
-        )
+        pin_min = st.slider("Minimum PIN score", 50, 100, PIN_MIN_CONFIDENCE, 1, key="pin_min_score")
     with c2:
-        pin_mode = st.selectbox(
-            "Show", ["ALL", "BUY ONLY", "SELL ONLY", "STRONG ONLY"],
-            key="pin_mode"
-        )
+        pin_mode = st.selectbox("Show", ["ALL", "BUY ONLY", "SELL ONLY", "STRONG ONLY"], key="pin_mode")
     with c3:
-        st.metric("TOTAL STOCKS TO SCAN", f"{total_available:,}")
+        st.metric("TO SCAN", f"{total_available:,}")
 
-    st.info(f"📊 Ready to scan ALL {total_available:,} available {source} symbols. No 100-stock limit.")
+    st.info(f"📌 PIN-{('F&O' if source == 'F&O Stocks' else 'NSE')}-{tf_label.upper()} | {total_available:,} symbols")
 
-    if st.button("📌 RUN FULL PIN RULES SCAN", key="pin_run", type="primary", use_container_width=True):
-        with st.spinner("Analyzing PIN liquidity, sweeps, reversals and big movement…"):
-            result, errors = _run_pin_scan(
-                fyers,
-                candidate_symbols,
-                pin_min=pin_min,
-                pin_mode=pin_mode
+    run_label = f"▶ RUN PIN — {'F&O' if source == 'F&O Stocks' else 'NSE'} — {tf_label.upper()}"
+    if st.button(run_label, key="pin_run", type="primary", use_container_width=True):
+        with st.spinner(f"Scanning {source} {tf_label} liquidity signals…"):
+            result, errors = _run_pin_selected_timeframe_scan(
+                fyers, candidate_symbols, resolution, tf_label,
+                pin_min=pin_min, pin_mode=pin_mode
             )
         st.session_state["pin_df"] = result
         st.session_state["pin_errors"] = errors
         st.session_state["pin_last_scan_count"] = total_available
+        st.session_state["pin_last_source"] = source
+        st.session_state["pin_last_timeframe"] = tf_label
+        st.session_state["pin_scanned_at"] = _now_ist().strftime("%d-%b-%Y %H:%M:%S IST")
 
     pin_df = st.session_state.get("pin_df")
     if isinstance(pin_df, pd.DataFrame) and not pin_df.empty:
+        liq_series = pin_df.get("LIQUIDITY SIGNAL", pd.Series("", index=pin_df.index)).astype(str).str.upper()
         pc1, pc2, pc3, pc4 = st.columns(4)
-        signal_series = pin_df["PIN SIGNAL"].astype(str).str.upper() if "PIN SIGNAL" in pin_df.columns else pd.Series(dtype=str)
-        sweep_series = pin_df["SWEEP"].astype(str) if "SWEEP" in pin_df.columns else pd.Series(dtype=str)
-        pc1.metric("📌 PIN SETUPS", len(pin_df))
-        pc2.metric("🟢 BUY", int(signal_series.str.contains("BUY", na=False).sum()))
-        pc3.metric("🔴 SELL", int(signal_series.str.contains("SELL", na=False).sum()))
-        pc4.metric("💧 SWEEPS", int((sweep_series != "NONE").sum()))
+        pc1.metric("📌 RESULTS", len(pin_df))
+        pc2.metric("🟢 BUY LIQ", int(liq_series.str.contains("BUY LIQ", na=False).sum()))
+        pc3.metric("🔴 SELL LIQ", int(liq_series.str.contains("SELL LIQ", na=False).sum()))
+        pc4.metric("🔥 STRONG LIQ", int(liq_series.str.contains("STRONG", na=False).sum()))
+        st.caption(f"Last scan: {st.session_state.get('pin_last_source','')} | {st.session_state.get('pin_last_timeframe','')} | {st.session_state.get('pin_scanned_at','N/A')}")
 
         display_cols = [
-            "Symbol", "LTP", "PIN SIGNAL", "PIN SCORE", "LIQUIDITY",
-            "TOP LIQUIDITY", "TOP LIQUIDITY LEVEL", "TOP LIQUIDITY SIDE", "TOP LIQUIDITY STATUS",
-            "BOTTOM LIQUIDITY", "BOTTOM LIQUIDITY LEVEL", "BOTTOM LIQUIDITY SIDE", "BOTTOM LIQUIDITY STATUS",
+            "Symbol", "TIMEFRAME", "LTP", "LIQUIDITY SIGNAL", "BUY LIQ SIGNAL", "SELL LIQ SIGNAL",
+            "TOP LIQUIDITY LEVEL", "TOP LIQUIDITY STATUS", "BOTTOM LIQUIDITY LEVEL", "BOTTOM LIQUIDITY STATUS",
             "BUY LIQUIDITY", "BUY LIQUIDITY SCORE", "SELL LIQUIDITY", "SELL LIQUIDITY SCORE",
-            "SWEEP", "REVERSAL", "EQUAL HIGH", "EQUAL LOW", "BIG MOVEMENT", "BIG MOVE SCORE",
-            "STRUCTURE", "5M TREND", "15M TREND", "1H TREND", "RVOL", "RSI",
-            "PRESSURE", "AI CONFIDENCE %", "AI SIGNAL", "REASON"
+            "SWEEP", "REVERSAL", "EQUAL HIGH", "EQUAL LOW", "TF TREND", "RVOL", "RSI",
+            "PIN SIGNAL", "PIN SCORE", "BIG MOVEMENT", "BIG MOVE SCORE", "SIGNAL TIME", "REASON"
         ]
         display_cols = [c for c in display_cols if c in pin_df.columns]
-        st.dataframe(pin_df[display_cols], use_container_width=True, height=500)
+        st.dataframe(pin_df[display_cols], use_container_width=True, height=540, hide_index=True)
 
         try:
+            safe_tf = st.session_state.get("pin_last_timeframe", "TF").replace(" ", "_")
+            safe_src = "FO" if st.session_state.get("pin_last_source") == "F&O Stocks" else "NSE"
             st.download_button(
-                "📥 DOWNLOAD PIN RULES EXCEL",
-                _format_excel_output(pin_df, "PIN_RULES"),
-                f"PIN_RULES_{_now_ist().strftime('%Y%m%d_%H%M')}.xlsx",
+                "📥 DOWNLOAD PIN LIQUIDITY EXCEL",
+                _format_excel_output(pin_df, "PIN_LIQUIDITY"),
+                f"PIN_{safe_src}_{safe_tf}_{_now_ist().strftime('%Y%m%d_%H%M')}.xlsx",
                 "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                key="pin_excel",
-                use_container_width=True,
+                key="pin_excel", use_container_width=True,
             )
         except Exception as e:
             st.error(f"❌ PIN Excel export failed: {str(e)[:150]}")
     elif "pin_df" in st.session_state:
-        st.warning("⚠️ No stocks matched the selected PIN rules/score.")
+        st.warning("⚠️ No stocks matched the selected PIN/liquidity rules.")
 
     errors = st.session_state.get("pin_errors", [])
     if errors:
