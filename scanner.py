@@ -5397,7 +5397,8 @@ def show_scanner(fyers) -> None:
         "🤖 AI CHART ANALYSIS",
         "🎯 PRE-MOVE CONFIRM",
         "📈 HIGH/LOW BREAKOUT",
-        "🧠 AMD SCANNER"
+        "🧠 AMD SCANNER",
+        "📊 ADDITIONAL INDICATORS"
     ])
     
     # ════════════════════════════════════════════════════════════════════════════════
@@ -6623,6 +6624,151 @@ def show_scanner(fyers) -> None:
 
     with tabs[17]:
         _new_scan_tab(fyers, all_symbols, fo_symbols, "amd")
+
+    # TAB 18: ADDITIONAL INDICATORS — independent; does not alter existing scanners.
+    with tabs[18]:
+        st.markdown("### 📊 Additional Indicators — EMA Crossover + Momentum")
+        st.caption("Uses candle data from FYERS. Signals are technical conditions, not guaranteed predictions.")
+        src_col, tf_col, lim_col = st.columns(3)
+        with src_col:
+            ind_source = st.selectbox("Universe", ["F&O Stocks", "NSE Stocks"], key="additional_ind_source")
+        with tf_col:
+            ind_tf_label = st.selectbox("Timeframe", ["5 Minute", "15 Minute", "Daily"], index=1, key="additional_ind_tf")
+        with lim_col:
+            ind_symbols_all = fo_symbols if ind_source == "F&O Stocks" else all_symbols
+            ind_limit = st.number_input("Scan limit (0 = ALL)", min_value=0,
+                                        max_value=max(len(ind_symbols_all), 1),
+                                        value=min(50, len(ind_symbols_all)), step=25,
+                                        key="additional_ind_limit")
+        ind_resolution = {"5 Minute": "5", "15 Minute": "15", "Daily": "1D"}[ind_tf_label]
+        ind_universe = ind_symbols_all if int(ind_limit) == 0 else ind_symbols_all[:int(ind_limit)]
+        st.info(f"Universe: {ind_source} | Timeframe: {ind_tf_label} | Selected: {len(ind_universe)}")
+        st.markdown("""
+        **Indicator rules**
+        - **EMA 9/21 CROSS:** fresh bullish or bearish crossover on the latest candle.
+        - **EMA 50/200:** longer trend alignment (Golden/Death Cross when fresh).
+        - **RSI 14:** momentum; 70+ overbought, 30− oversold.
+        - **MACD:** MACD line vs signal line and fresh crossover.
+        - **VWAP:** price position relative to session/cumulative VWAP (most useful intraday).
+        - **RVOL:** latest volume compared with the preceding 20-candle average.
+        """)
+        if st.button("▶ RUN ADDITIONAL INDICATORS", key="additional_ind_run", type="primary"):
+            ind_rows, ind_errors = [], []
+            ind_bar = st.progress(0.0, text=f"Scanning indicator candles: 0 / {len(ind_universe)}")
+            for ind_i, ind_symbol in enumerate(ind_universe, start=1):
+                try:
+                    ind_df = _fetch_timeframe_data(
+                        fyers, ind_symbol, ind_resolution,
+                        lookback_days=260 if ind_tf_label == "Daily" else 5
+                    )
+                    if ind_df is None or len(ind_df) < 35:
+                        ind_errors.append(f"{ind_symbol}: insufficient candle data")
+                        continue
+                    d = ind_df.copy().reset_index(drop=True)
+                    for col in ["Open", "High", "Low", "Close", "Volume"]:
+                        d[col] = pd.to_numeric(d[col], errors="coerce")
+                    d = d.dropna(subset=["Close", "Volume"]).reset_index(drop=True)
+                    if len(d) < 35:
+                        ind_errors.append(f"{ind_symbol}: insufficient clean candles")
+                        continue
+                    close, volume = d["Close"], d["Volume"]
+                    e9, e21 = calculate_ema(close, 9), calculate_ema(close, 21)
+                    e50, e200 = calculate_ema(close, 50), calculate_ema(close, 200)
+                    rsi_s = calculate_rsi(close, 14)
+                    macd_line, macd_sig, macd_hist = calculate_macd(close)
+                    vwap_s = calculate_vwap(d)
+                    vol_base = volume.shift(1).rolling(20, min_periods=5).mean()
+                    rvol = float(volume.iloc[-1] / vol_base.iloc[-1]) if pd.notna(vol_base.iloc[-1]) and vol_base.iloc[-1] > 0 else 0.0
+                    up_921 = e9.iloc[-2] <= e21.iloc[-2] and e9.iloc[-1] > e21.iloc[-1]
+                    dn_921 = e9.iloc[-2] >= e21.iloc[-2] and e9.iloc[-1] < e21.iloc[-1]
+                    up_50200 = e50.iloc[-2] <= e200.iloc[-2] and e50.iloc[-1] > e200.iloc[-1]
+                    dn_50200 = e50.iloc[-2] >= e200.iloc[-2] and e50.iloc[-1] < e200.iloc[-1]
+                    up_macd = macd_line.iloc[-2] <= macd_sig.iloc[-2] and macd_line.iloc[-1] > macd_sig.iloc[-1]
+                    dn_macd = macd_line.iloc[-2] >= macd_sig.iloc[-2] and macd_line.iloc[-1] < macd_sig.iloc[-1]
+                    trend = "BULLISH" if e9.iloc[-1] > e21.iloc[-1] else "BEARISH" if e9.iloc[-1] < e21.iloc[-1] else "NEUTRAL"
+                    macd_state = "BULLISH" if macd_line.iloc[-1] > macd_sig.iloc[-1] else "BEARISH"
+                    rsi = float(rsi_s.iloc[-1])
+                    close_last = float(close.iloc[-1])
+                    vwap_last = float(vwap_s.iloc[-1]) if pd.notna(vwap_s.iloc[-1]) else close_last
+                    signal_parts = []
+                    if up_921: signal_parts.append("🟢 EMA 9/21 BULL CROSS")
+                    elif dn_921: signal_parts.append("🔴 EMA 9/21 BEAR CROSS")
+                    elif trend == "BULLISH": signal_parts.append("BULLISH EMA ALIGNMENT")
+                    elif trend == "BEARISH": signal_parts.append("BEARISH EMA ALIGNMENT")
+                    if up_50200: signal_parts.append("🟢 GOLDEN CROSS 50/200")
+                    elif dn_50200: signal_parts.append("🔴 DEATH CROSS 50/200")
+                    if up_macd: signal_parts.append("MACD BULL CROSS")
+                    elif dn_macd: signal_parts.append("MACD BEAR CROSS")
+                    if rvol >= 1.5: signal_parts.append("VOLUME SPIKE")
+                    if not signal_parts: signal_parts.append("WAIT / NO FRESH CROSS")
+                    ind_rows.append({
+                        "Symbol": ind_symbol.replace("NSE:", "").replace("-EQ", ""),
+                        "Timeframe": ind_tf_label,
+                        "Signal Time": str(d["Time"].iloc[-1]) if "Time" in d.columns else "N/A",
+                        "LTP": round(close_last, 2),
+                        "EMA 9": round(float(e9.iloc[-1]), 2),
+                        "EMA 21": round(float(e21.iloc[-1]), 2),
+                        "EMA 9/21 Cross": "BULLISH CROSS" if up_921 else "BEARISH CROSS" if dn_921 else "NONE",
+                        "EMA 50": round(float(e50.iloc[-1]), 2),
+                        "EMA 200": round(float(e200.iloc[-1]), 2),
+                        "50/200 Cross": "GOLDEN CROSS" if up_50200 else "DEATH CROSS" if dn_50200 else "NONE",
+                        "EMA Trend": trend,
+                        "RSI 14": round(rsi, 1),
+                        "RSI Status": "OVERBOUGHT" if rsi >= 70 else "OVERSOLD" if rsi <= 30 else "BULLISH" if rsi >= 50 else "BEARISH",
+                        "MACD": round(float(macd_line.iloc[-1]), 4),
+                        "MACD Signal": round(float(macd_sig.iloc[-1]), 4),
+                        "MACD Cross": "BULLISH CROSS" if up_macd else "BEARISH CROSS" if dn_macd else "NONE",
+                        "VWAP": round(vwap_last, 2),
+                        "Price vs VWAP": "ABOVE" if close_last > vwap_last else "BELOW" if close_last < vwap_last else "AT VWAP",
+                        "RVOL": round(rvol, 2),
+                        "Indicator Summary": " | ".join(signal_parts)
+                    })
+                except Exception as ind_exc:
+                    ind_errors.append(f"{ind_symbol}: {type(ind_exc).__name__}")
+                ind_bar.progress(ind_i / max(len(ind_universe), 1),
+                                 text=f"Indicator scan: {ind_i} / {len(ind_universe)}")
+            ind_bar.empty()
+            ind_result = pd.DataFrame(ind_rows)
+            if not ind_result.empty:
+                ind_result["_sort"] = ind_result["RVOL"].fillna(0)
+                ind_result = ind_result.sort_values("_sort", ascending=False).drop(columns="_sort").reset_index(drop=True)
+            st.session_state["additional_indicators_df"] = ind_result
+            st.session_state["additional_indicators_errors"] = ind_errors
+            st.session_state["additional_indicators_scanned_at"] = _now_ist().strftime("%Y-%m-%d %H:%M:%S IST")
+
+        ind_result = st.session_state.get("additional_indicators_df", pd.DataFrame())
+        if isinstance(ind_result, pd.DataFrame) and not ind_result.empty:
+            st.caption(f"Last scan: {st.session_state.get('additional_indicators_scanned_at', 'N/A')} | Results: {len(ind_result)}")
+            cross_filter = st.selectbox("Show results", ["All results", "Fresh EMA/MACD crosses", "Bullish EMA trend", "Bearish EMA trend", "Volume spike (RVOL ≥ 1.5)"], key="additional_ind_filter")
+            ind_view = ind_result.copy()
+            if cross_filter == "Fresh EMA/MACD crosses":
+                ind_view = ind_view[
+                    ind_view["EMA 9/21 Cross"].ne("NONE") |
+                    ind_view["50/200 Cross"].ne("NONE") |
+                    ind_view["MACD Cross"].ne("NONE")
+                ]
+            elif cross_filter == "Bullish EMA trend":
+                ind_view = ind_view[ind_view["EMA Trend"] == "BULLISH"]
+            elif cross_filter == "Bearish EMA trend":
+                ind_view = ind_view[ind_view["EMA Trend"] == "BEARISH"]
+            elif cross_filter == "Volume spike (RVOL ≥ 1.5)":
+                ind_view = ind_view[ind_view["RVOL"] >= 1.5]
+            st.dataframe(ind_view, use_container_width=True, height=520, hide_index=True)
+            dc1, dc2 = st.columns(2)
+            with dc1:
+                st.download_button("📊 Download Excel", _format_excel_output(ind_view, "ADDITIONAL_INDICATORS"),
+                                   f"ADDITIONAL_INDICATORS_{_now_ist().strftime('%Y%m%d_%H%M')}.xlsx",
+                                   "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="additional_indicators_xlsx")
+            with dc2:
+                st.download_button("📄 Download CSV", to_csv_bytes(ind_view),
+                                   f"ADDITIONAL_INDICATORS_{_now_ist().strftime('%Y%m%d_%H%M')}.csv",
+                                   "text/csv", key="additional_indicators_csv")
+        else:
+            st.info("Click RUN ADDITIONAL INDICATORS. Start with 30–50 symbols to reduce FYERS API load.")
+        ind_errors = st.session_state.get("additional_indicators_errors", [])
+        if ind_errors:
+            with st.expander(f"⚠️ Candle/API issues ({len(ind_errors)})"):
+                st.write("\\n".join(ind_errors[:100]))
 
     gc.collect()
 
