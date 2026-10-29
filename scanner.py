@@ -12,6 +12,7 @@ import csv
 import gc
 import logging
 import sys
+import threading
 from datetime import datetime, timedelta
 from typing import List, Optional, Tuple, Dict, Any
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -3792,18 +3793,77 @@ def _detect_20m_range_setup(df: pd.DataFrame) -> Dict[str, Any]:
         return out
 
 
+# Small, thread-safe cache for repeated clicks on the independent 20M scan.
+# It avoids refetching every symbol immediately after a user reruns the scan.
+_RANGE20_CACHE: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+_RANGE20_CACHE_LOCK = threading.Lock()
+_RANGE20_CACHE_TTL_SECONDS = 45
+
+
+def _prepare_20m_completed_session_candles(df1: pd.DataFrame) -> pd.DataFrame:
+    """Keep only completed 1-minute candles from the current/latest session.
+
+    During NSE market hours, do not mix yesterday's candles into today's 20-bar
+    range. Also drop the still-forming current minute candle to avoid repainting.
+    """
+    if df1 is None or df1.empty or "Time" not in df1.columns:
+        return pd.DataFrame() if df1 is None else df1
+    d = df1.copy()
+    ts = pd.to_datetime(d["Time"], errors="coerce")
+    if getattr(ts.dt, "tz", None) is None:
+        ts = ts.dt.tz_localize("UTC").dt.tz_convert(IST)
+    else:
+        ts = ts.dt.tz_convert(IST)
+    d["Time"] = ts
+    d = d.dropna(subset=["Time"]).sort_values("Time").reset_index(drop=True)
+    if d.empty:
+        return d
+
+    now = _now_ist()
+    market_open = now.replace(hour=9, minute=15, second=0, microsecond=0)
+    market_close = now.replace(hour=15, minute=30, second=0, microsecond=0)
+    if now.weekday() < 5 and market_open <= now <= market_close:
+        # Intraday: only today's session is valid. If the feed is stale, return
+        # insufficient data rather than silently mixing sessions.
+        d = d[d["Time"].dt.date == now.date()].copy().reset_index(drop=True)
+    else:
+        # Outside market hours, use only the most recent session in the feed.
+        latest_day = d["Time"].iloc[-1].date()
+        d = d[d["Time"].dt.date == latest_day].copy().reset_index(drop=True)
+
+    # Candle timestamps mark candle start. A candle is completed only after its
+    # one-minute interval has elapsed; drop a live candle if it is still forming.
+    if not d.empty:
+        latest_start = d["Time"].iloc[-1]
+        if now < latest_start + timedelta(minutes=1):
+            d = d.iloc[:-1].copy().reset_index(drop=True)
+    return d
+
+
 def _fetch_20m_range_signal(fyers, symbol: str):
-    """Fetch 1M candles for a single symbol and detect 20M consolidation/breakout."""
+    """Fetch completed same-session 1M candles and detect 20M setup."""
     ticker = symbol.replace("NSE:", "").replace("-EQ", "") if isinstance(symbol, str) else str(symbol)
     if not isinstance(symbol, str) or not _VALID_EQ_SYMBOL_RE.match(symbol):
         return None, f"{symbol}: invalid symbol format"
     try:
-        # Short lookback reduces response size; only the most recent candles are used.
+        now_ts = time.time()
+        with _RANGE20_CACHE_LOCK:
+            cached = _RANGE20_CACHE.get(symbol)
+            if cached and now_ts - cached[0] <= _RANGE20_CACHE_TTL_SECONDS:
+                cached_row = dict(cached[1])
+                cached_row["SYMBOL"] = ticker
+                return cached_row, None
+
+        # Two-day request is retained for compatibility with the FYERS history
+        # endpoint; preprocessing below removes previous-session candles.
         df1 = _fetch_timeframe_data(fyers, symbol, "1", lookback_days=2)
+        df1 = _prepare_20m_completed_session_candles(df1)
         if df1 is None or len(df1) < 21:
-            return None, f"{symbol}: insufficient 1M candles"
+            return None, f"{symbol}: need 21 completed 1M candles in the latest session"
         setup = _detect_20m_range_setup(df1)
         setup.update({"SYMBOL": ticker, "LTP": round(float(df1["Close"].iloc[-1]), 2)})
+        with _RANGE20_CACHE_LOCK:
+            _RANGE20_CACHE[symbol] = (time.time(), dict(setup))
         if setup["20M STATUS"] == "⚪ WAIT" and setup["20M PRE-MOVE SCORE"] == 0:
             return setup, None
         return setup, None
@@ -7255,7 +7315,7 @@ def show_scanner(fyers) -> None:
     # ════════════════════════════════════════════════════════════════════════════════
     with tabs[19]:
         st.markdown("### ⏱️ 20-MINUTE RANGE → BIG MOVE UP / DOWN")
-        st.caption("Uses 1-minute candles. The previous 20 completed candles define the range; the latest completed candle is checked separately for breakout confirmation.")
+        st.caption("Uses 1-minute candles. Only completed 1-minute candles from the latest session are used; the previous 20 define the range and the latest completed candle is checked separately. Repeat scans briefly use a 45-second cache.")
         range_universe_choice = st.radio(
             "Scan universe", ["NSE ALL + F&O (combined)", "NSE ALL only", "F&O only"],
             horizontal=True, key="range20_universe"
