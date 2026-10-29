@@ -3375,6 +3375,118 @@ def _assess_breakout_quality(df: pd.DataFrame) -> Dict[str, Any]:
         return out
 
 
+
+
+def _detect_pre_move_volume_setup(df: pd.DataFrame) -> Dict[str, Any]:
+    """Find unusual volume building while price is still near a short-term range.
+
+    This is a heuristic early-warning signal, not a prediction or proof of future movement.
+    Uses completed OHLCV bars; excludes the latest candle from the reference range.
+    """
+    out = {
+        "PRE-MOVE VOLUME STATUS": "⚪ WAIT",
+        "PRE-MOVE VOLUME SCORE": 0,
+        "VOLUME BUILDUP X": 0.0,
+        "RANGE COMPRESSION %": 0.0,
+        "DISTANCE TO RANGE HIGH %": None,
+        "DISTANCE TO RANGE LOW %": None,
+        "PRE-MOVE VOLUME DIRECTION": "NONE",
+        "PRE-MOVE VOLUME REASON": "Need at least 25 completed 5M candles",
+    }
+    try:
+        if df is None or len(df) < 25:
+            return out
+        d = df.reset_index(drop=True).copy()
+        required = ["Open", "High", "Low", "Close", "Volume"]
+        if any(c not in d.columns for c in required):
+            out["PRE-MOVE VOLUME REASON"] = "Missing OHLCV columns"
+            return out
+        d[required] = d[required].apply(pd.to_numeric, errors="coerce")
+        d = d.dropna(subset=required).reset_index(drop=True)
+        if len(d) < 25:
+            return out
+
+        # Reference range uses the previous 10 bars; latest candle excluded.
+        prior = d.iloc[-11:-1]
+        last = d.iloc[-1]
+        base_vol = float(d["Volume"].iloc[-21:-4].mean())
+        recent_vol = float(d["Volume"].iloc[-4:-1].mean())
+        if base_vol <= 0:
+            out["PRE-MOVE VOLUME REASON"] = "Volume baseline unavailable"
+            return out
+        buildup = recent_vol / base_vol
+        rh = float(prior["High"].max())
+        rl = float(prior["Low"].min())
+        close = float(last["Close"])
+        mid = (rh + rl) / 2.0
+        range_pct = ((rh - rl) / mid * 100.0) if mid > 0 else 0.0
+        dist_high = ((rh - close) / rh * 100.0) if rh > 0 else None
+        dist_low = ((close - rl) / rl * 100.0) if rl > 0 else None
+
+        score = 0
+        reasons = []
+        if buildup >= 2.0:
+            score += 35; reasons.append(f"volume buildup {buildup:.2f}x")
+        elif buildup >= 1.5:
+            score += 28; reasons.append(f"volume buildup {buildup:.2f}x")
+        elif buildup >= 1.2:
+            score += 18; reasons.append(f"volume buildup {buildup:.2f}x")
+        else:
+            reasons.append(f"volume buildup only {buildup:.2f}x")
+
+        if range_pct <= 1.0:
+            score += 25; reasons.append(f"tight range {range_pct:.2f}%")
+        elif range_pct <= 1.8:
+            score += 18; reasons.append(f"compressed range {range_pct:.2f}%")
+        elif range_pct <= 2.5:
+            score += 8; reasons.append(f"range {range_pct:.2f}%")
+
+        # Close-to-edge while not yet broken: useful for early warning, not confirmation.
+        near_high = dist_high is not None and -0.05 <= dist_high <= 0.50
+        near_low = dist_low is not None and -0.05 <= dist_low <= 0.50
+        last3_change = float(d["Close"].iloc[-1] / d["Close"].iloc[-4] - 1.0) * 100.0
+        direction = "NONE"
+        if near_high and close <= rh and last3_change > 0:
+            direction = "BUY"
+            score += 25; reasons.append("price near range high; breakout not confirmed")
+        elif near_low and close >= rl and last3_change < 0:
+            direction = "SELL"
+            score += 25; reasons.append("price near range low; breakdown not confirmed")
+        elif last3_change >= 0.15:
+            direction = "BUY"
+            score += 10; reasons.append("short-term price pressure up")
+        elif last3_change <= -0.15:
+            direction = "SELL"
+            score += 10; reasons.append("short-term price pressure down")
+        else:
+            reasons.append("direction not clear")
+
+        # Only call it a pre-move watch when volume is rising and range is reasonably tight.
+        if buildup >= 1.5 and range_pct <= 2.5 and score >= 50 and direction == "BUY":
+            status = "🟢 BIG VOLUME BUY WATCH"
+        elif buildup >= 1.5 and range_pct <= 2.5 and score >= 50 and direction == "SELL":
+            status = "🔴 BIG VOLUME SELL WATCH"
+        elif buildup >= 1.2 and range_pct <= 3.0 and score >= 35:
+            status = "🟡 VOLUME BUILDUP — WAIT"
+        else:
+            status = "⚪ WAIT"
+
+        out.update({
+            "PRE-MOVE VOLUME STATUS": status,
+            "PRE-MOVE VOLUME SCORE": int(min(100, score)),
+            "VOLUME BUILDUP X": round(buildup, 2),
+            "RANGE COMPRESSION %": round(range_pct, 2),
+            "DISTANCE TO RANGE HIGH %": round(dist_high, 2) if dist_high is not None else None,
+            "DISTANCE TO RANGE LOW %": round(dist_low, 2) if dist_low is not None else None,
+            "PRE-MOVE VOLUME DIRECTION": direction,
+            "PRE-MOVE VOLUME REASON": " | ".join(reasons),
+        })
+        return out
+    except Exception as e:
+        out["PRE-MOVE VOLUME REASON"] = f"Volume setup error: {type(e).__name__}"
+        return out
+
+
 def _fetch_momentum_signal(fyers, symbol: str, is_fo: bool = False):
     """Intraday movement worker. Checks recent completed 5M candles and adds early-warning status."""
     stock_ticker = symbol.replace("NSE:", "").replace("-EQ", "") if isinstance(symbol,str) else str(symbol)
@@ -3386,6 +3498,7 @@ def _fetch_momentum_signal(fyers, symbol: str, is_fo: bool = False):
         block=detect_block_order_activity(d)
         pre=_pre_move_signal(d, block=block)
         before=_before_move_signal(d, pre)
+        pre_volume=_detect_pre_move_volume_setup(d)
         breakout_check=_assess_breakout_quality(d)
         # Search the latest 12 completed candles so a signal is not lost on the next candle.
         candidates=[]
@@ -3415,9 +3528,9 @@ def _fetch_momentum_signal(fyers, symbol: str, is_fo: bool = False):
                 if sig_time.tzinfo is None: sig_time=sig_time.replace(tzinfo=_now_ist().tzinfo)
             except Exception: sig_time=_now_ist()
             age=max(0,(_now_ist()-sig_time).total_seconds()/60)
-            signal=pre["status"] if pre["direction"] in ("BUY","SELL") else "NO MOVE"
+            signal=pre["status"] if pre["direction"] in ("BUY","SELL") else (pre_volume["PRE-MOVE VOLUME STATUS"] if pre_volume["PRE-MOVE VOLUME STATUS"] != "⚪ WAIT" else "NO MOVE")
         ltp=float(d["Close"].iloc[-1])
-        result={"Symbol":stock_ticker,"LTP":round(ltp,2),"SIGNAL TIME":sig_time.strftime("%d-%b-%Y %H:%M:%S"),"SIGNAL AGE (MIN)":round(age,1),"SIGNAL":signal,"DIRECTION":mv.get("direction") if candidates else pre["direction"],"MOVE %":mv.get("move_pct",0.0),"BODY %":mv.get("body_pct",0.0),"BODY / ATR":mv.get("body_atr",0.0),"RVOL":mv.get("rvol",0.0),"STRUCTURE":mv.get("structure", "NONE"),"HH/HL":"✅" if mv.get("hh_hl") else "−","LH/LL":"✅" if mv.get("lh_ll") else "−","ACCELERATION":mv.get("price_acceleration",0.0),"VOLUME SPIKE":"🔥" if mv.get("volume_spike") else "−","SCORE":mv.get("score",0.0),"BEFORE MOVE SIGNAL":before["signal"],"BEFORE MOVE DIRECTION":before["direction"],"BEFORE MOVE SCORE":before["score"],"BEFORE MOVE REASON":before["reason"],"BEFORE MOVE TRIGGER":before["trigger"],"PRE-MOVE":pre["direction"],"PRE-MOVE SCORE":pre["score"],"PRE-MOVE STATUS":pre["status"],"PRE BUY SCORE":pre.get("buy_score",0),"PRE SELL SCORE":pre.get("sell_score",0),"PRE SCORE GAP":pre.get("score_gap",0),"PRE-MOVE REASON":pre["reason"],"BREAKOUT LEVEL":pre.get("breakout_level"),"BREAKDOWN LEVEL":pre.get("breakdown_level"),"PRE-MOVE RVOL":pre.get("rvol",0),"BLOCK ORDER SCORE":block["block_score"],"BLOCK ACTIVITY":block["block_signal"],"BLOCK SIDE":block["block_side"],"BLOCK LEVEL":block["block_level"],"BLOCK RVOL":block["block_rvol"],"BLOCK REASON":block["block_reason"],"REASON":mv.get("reason",pre["reason"]),"MOVEMENT STATUS": signal if candidates else pre["status"],**breakout_check}
+        result={"Symbol":stock_ticker,"LTP":round(ltp,2),"SIGNAL TIME":sig_time.strftime("%d-%b-%Y %H:%M:%S"),"SIGNAL AGE (MIN)":round(age,1),"SIGNAL":signal,"DIRECTION":mv.get("direction") if candidates else pre["direction"],"MOVE %":mv.get("move_pct",0.0),"BODY %":mv.get("body_pct",0.0),"BODY / ATR":mv.get("body_atr",0.0),"RVOL":mv.get("rvol",0.0),"STRUCTURE":mv.get("structure", "NONE"),"HH/HL":"✅" if mv.get("hh_hl") else "−","LH/LL":"✅" if mv.get("lh_ll") else "−","ACCELERATION":mv.get("price_acceleration",0.0),"VOLUME SPIKE":"🔥" if mv.get("volume_spike") else "−","SCORE":mv.get("score",0.0),"BEFORE MOVE SIGNAL":before["signal"],"BEFORE MOVE DIRECTION":before["direction"],"BEFORE MOVE SCORE":before["score"],"BEFORE MOVE REASON":before["reason"],"BEFORE MOVE TRIGGER":before["trigger"],"PRE-MOVE":pre["direction"],"PRE-MOVE SCORE":pre["score"],"PRE-MOVE STATUS":pre["status"],"PRE BUY SCORE":pre.get("buy_score",0),"PRE SELL SCORE":pre.get("sell_score",0),"PRE SCORE GAP":pre.get("score_gap",0),"PRE-MOVE REASON":pre["reason"],"BREAKOUT LEVEL":pre.get("breakout_level"),"BREAKDOWN LEVEL":pre.get("breakdown_level"),"PRE-MOVE RVOL":pre.get("rvol",0),"PRE-MOVE VOLUME STATUS":pre_volume["PRE-MOVE VOLUME STATUS"],"PRE-MOVE VOLUME SCORE":pre_volume["PRE-MOVE VOLUME SCORE"],"VOLUME BUILDUP X":pre_volume["VOLUME BUILDUP X"],"RANGE COMPRESSION %":pre_volume["RANGE COMPRESSION %"],"DISTANCE TO RANGE HIGH %":pre_volume["DISTANCE TO RANGE HIGH %"],"DISTANCE TO RANGE LOW %":pre_volume["DISTANCE TO RANGE LOW %"],"PRE-MOVE VOLUME DIRECTION":pre_volume["PRE-MOVE VOLUME DIRECTION"],"PRE-MOVE VOLUME REASON":pre_volume["PRE-MOVE VOLUME REASON"],"BLOCK ORDER SCORE":block["block_score"],"BLOCK ACTIVITY":block["block_signal"],"BLOCK SIDE":block["block_side"],"BLOCK LEVEL":block["block_level"],"BLOCK RVOL":block["block_rvol"],"BLOCK REASON":block["block_reason"],"REASON":mv.get("reason",pre["reason"]),"MOVEMENT STATUS": signal if candidates else (pre["status"] if pre["direction"] in ("BUY","SELL") else pre_volume["PRE-MOVE VOLUME STATUS"]),**breakout_check}
         if is_fo and result["DIRECTION"] in ("BUY","SELL"):
             try:
                 od=fetch_options_chain_data(fyers,symbol); result["PCR"]=od.get("pcr","N/A"); result["OPTIONS BIAS"]=od.get("options_bias","N/A")
@@ -3536,7 +3649,7 @@ def run_momentum_scan(fyers, symbols, is_fo: bool = False):
                     res, err = future.result()
                 except Exception as e:
                     res, err = None, f"{symbol}: worker error: {str(e)[:100]}"
-                if res and (res.get("DIRECTION") in ("BUY", "SELL") or str(res.get("MOVEMENT STATUS","")).startswith("🟡") or str(res.get("MOVEMENT STATUS","")).endswith("WATCH")):
+                if res and (res.get("DIRECTION") in ("BUY", "SELL") or str(res.get("MOVEMENT STATUS","")).startswith("🟡") or str(res.get("MOVEMENT STATUS","")).endswith("WATCH") or str(res.get("PRE-MOVE VOLUME STATUS","")) in ("🟢 BIG VOLUME BUY WATCH", "🔴 BIG VOLUME SELL WATCH", "🟡 VOLUME BUILDUP — WAIT")):
                     results.append(res)
                 if err:
                     errors.append(err)
@@ -5754,10 +5867,10 @@ def show_scanner(fyers) -> None:
             _display_scan_summary(st.session_state["momentum_stats"]); st.caption(f"Last scan: {st.session_state.get('momentum_scanned_at','N/A')}")
         mdf=st.session_state.get("momentum_df")
         if mdf is not None and not mdf.empty:
-            for col in ["SCORE","PRE-MOVE SCORE","BEFORE MOVE SCORE","RVOL","SIGNAL AGE (MIN)"]: mdf[col]=pd.to_numeric(mdf[col],errors="coerce") if col in mdf.columns else 0
-            status_order={"🔥 BIG BUY":0,"🔥 BIG SELL":0,"🟢 BUY BEFORE MOVE":1,"🔴 SELL BEFORE MOVE":1,"🟢 BIG BUY WATCH":2,"🔴 BIG SELL WATCH":2,"🟡 PRE-BIG BUY":3,"🟡 PRE-BIG SELL":3,"🟢 BUY":4,"🔴 SELL":4,"⚪ WAIT":9}
+            for col in ["SCORE","PRE-MOVE SCORE","BEFORE MOVE SCORE","RVOL","SIGNAL AGE (MIN)","PRE-MOVE VOLUME SCORE","VOLUME BUILDUP X"]: mdf[col]=pd.to_numeric(mdf[col],errors="coerce") if col in mdf.columns else 0
+            status_order={"🔥 BIG BUY":0,"🔥 BIG SELL":0,"🟢 BIG VOLUME BUY WATCH":1,"🔴 BIG VOLUME SELL WATCH":1,"🟢 BUY BEFORE MOVE":2,"🔴 SELL BEFORE MOVE":2,"🟢 BIG BUY WATCH":3,"🔴 BIG SELL WATCH":3,"🟡 VOLUME BUILDUP — WAIT":4,"🟡 PRE-BIG BUY":5,"🟡 PRE-BIG SELL":5,"🟢 BUY":6,"🔴 SELL":6,"⚪ WAIT":9}
             mdf["_order"]=mdf["MOVEMENT STATUS"].map(status_order).fillna(8)
-            mdf=mdf.sort_values(["_order","SCORE","PRE-MOVE SCORE","RVOL"],ascending=[True,False,False,False]).drop(columns=["_order"])
+            mdf=mdf.sort_values(["_order","PRE-MOVE VOLUME SCORE","SCORE","PRE-MOVE SCORE","RVOL"],ascending=[True,False,False,False,False]).drop(columns=["_order"])
             # Keep stock name as the first visible column in the movement table.
             _momentum_symbol_col = next((c for c in ["SYMBOL", "Symbol", "symbol"] if c in mdf.columns), None)
             if _momentum_symbol_col is not None and _momentum_symbol_col != "STOCK NAME":
@@ -5790,20 +5903,40 @@ def show_scanner(fyers) -> None:
             elif "STOCK NAME" not in view.columns:
                 view.insert(0, "STOCK NAME", "N/A")
             view = _add_reversal_columns(view)
+            st.markdown("#### 🔊 BIG VOLUME BEFORE-MOVE FILTER")
+            vc1, vc2 = st.columns(2)
+            with vc1:
+                min_volume_buildup = st.slider("Minimum volume buildup (x)", 1.0, 3.0, 1.5, 0.1, key="before_move_volume_buildup")
+            with vc2:
+                before_volume_filter = st.selectbox("Volume pre-move status", ["ALL", "BIG VOLUME BUY WATCH", "BIG VOLUME SELL WATCH", "VOLUME BUILDUP — WAIT"], key="before_move_volume_filter")
             # Preserve the candle-based signal timestamp in the BEFORE MOVE report.
             # Older scan paths may expose it as "Signal Time" rather than "SIGNAL TIME".
             if "SIGNAL TIME" not in view.columns and "Signal Time" in view.columns:
                 view = view.rename(columns={"Signal Time": "SIGNAL TIME"})
-            _before_cols = ["STOCK NAME", "LTP", "SIGNAL TIME", "Signal Time", "BEFORE MOVE SIGNAL", "BEFORE MOVE SCORE", "PRE-MOVE SCORE", "PRE-MOVE STATUS", "PRE BUY/SELL SCORE", "PRE SCORE GAP", "BREAKOUT LEVEL", "BREAKDOWN LEVEL", "PRE-MOVE RVOL", "PRE-MOVE REASON", "REVERSAL SIGNAL", "REVERSAL SCORE", "REVERSAL LEVEL", "REVERSAL ZONE", "REVERSAL REASON", "SIGNAL TYPE", "COMBINED BIAS"]
+            _before_cols = ["STOCK NAME", "LTP", "SIGNAL TIME", "Signal Time", "PRE-MOVE VOLUME STATUS", "PRE-MOVE VOLUME SCORE", "VOLUME BUILDUP X", "RANGE COMPRESSION %", "PRE-MOVE VOLUME DIRECTION", "DISTANCE TO RANGE HIGH %", "DISTANCE TO RANGE LOW %", "PRE-MOVE VOLUME REASON", "BEFORE MOVE SIGNAL", "BEFORE MOVE SCORE", "PRE-MOVE SCORE", "PRE-MOVE STATUS", "PRE BUY/SELL SCORE", "PRE SCORE GAP", "BREAKOUT LEVEL", "BREAKDOWN LEVEL", "PRE-MOVE RVOL", "RVOL", "VOLUME SPIKE", "PRE-MOVE REASON", "REVERSAL SIGNAL", "REVERSAL SCORE", "REVERSAL LEVEL", "REVERSAL ZONE", "REVERSAL REASON", "SIGNAL TYPE", "COMBINED BIAS"]
             cols = [c for c in _before_cols if c in view.columns]
             view = view[cols].copy() if cols else view.copy()
+            if "VOLUME BUILDUP X" in view.columns:
+                view["VOLUME BUILDUP X"] = pd.to_numeric(view["VOLUME BUILDUP X"], errors="coerce").fillna(0)
+                view = view[view["VOLUME BUILDUP X"] >= min_volume_buildup]
+            if before_volume_filter != "ALL" and "PRE-MOVE VOLUME STATUS" in view.columns:
+                if before_volume_filter == "BIG VOLUME BUY WATCH":
+                    view = view[view["PRE-MOVE VOLUME STATUS"] == "🟢 BIG VOLUME BUY WATCH"]
+                elif before_volume_filter == "BIG VOLUME SELL WATCH":
+                    view = view[view["PRE-MOVE VOLUME STATUS"] == "🔴 BIG VOLUME SELL WATCH"]
+                else:
+                    view = view[view["PRE-MOVE VOLUME STATUS"] == "🟡 VOLUME BUILDUP — WAIT"]
+            st.caption("Volume buildup is recent 3-bar average volume ÷ preceding 17-bar average volume. These are early-watch candidates, not guaranteed moves.")
             if "BEFORE MOVE SIGNAL" in view.columns:
                 order = {"🟢 BUY BEFORE MOVE": 0, "🔴 SELL BEFORE MOVE": 1, "🟡 WAIT": 2}
                 view["_sort"] = view["BEFORE MOVE SIGNAL"].map(order).fillna(9)
                 score_col = "BEFORE MOVE SCORE" if "BEFORE MOVE SCORE" in view.columns else "PRE-MOVE SCORE"
                 view = view.sort_values(["_sort", score_col], ascending=[True, False]).drop(columns=["_sort"])
-            st.dataframe(view, use_container_width=True, height=560, hide_index=True)
-            st.download_button("📊 Download BEFORE MOVE", _format_excel_output(view, "BEFORE_MOVE"), f"BEFORE_MOVE_{_now_ist().strftime('%Y%m%d_%H%M')}.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="before_move_xls")
+            if view.empty:
+                st.info("No stocks match the selected volume buildup/status filters. Lower the buildup threshold or choose ALL.")
+            else:
+                st.dataframe(view, use_container_width=True, height=560, hide_index=True)
+                st.download_button("📊 Download BEFORE MOVE", _format_excel_output(view, "BEFORE_MOVE"), f"BEFORE_MOVE_{_now_ist().strftime('%Y%m%d_%H%M')}.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="before_move_xls")
         else:
             st.info("Run SCAN INTRADAY MOVEMENT first. The separate BEFORE MOVE tab will then show the early-warning signals.")
 
