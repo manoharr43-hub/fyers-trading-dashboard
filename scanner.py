@@ -3666,6 +3666,185 @@ def run_momentum_scan(fyers, symbols, is_fo: bool = False):
 
 
 # ════════════════════════════════════════════════════════════════════════════════
+# 20-MINUTE RANGE CONSOLIDATION → PRE-MOVE / BREAKOUT SCANNER (ADDITIVE)
+# Uses 1-minute candles; existing scanner engines are not changed.
+# ════════════════════════════════════════════════════════════════════════════════
+def _detect_20m_range_setup(df: pd.DataFrame) -> Dict[str, Any]:
+    """Analyze 20 completed 1M candles and the latest completed candle separately.
+
+    The 20-candle range is df[-21:-1]; df[-1] is evaluated for pre-move pressure
+    or a confirmed close beyond that range. This is a heuristic, not a guarantee.
+    """
+    out = {
+        "20M STATUS": "⚪ WAIT", "20M DIRECTION": "NONE", "20M PRE-MOVE SCORE": 0,
+        "20M RANGE %": None, "20M RANGE HIGH": None, "20M RANGE LOW": None,
+        "20M VOLUME BUILDUP X": 0.0, "20M BUY PRESSURE %": 50.0,
+        "20M SELL PRESSURE %": 50.0, "20M DIST TO HIGH %": None,
+        "20M DIST TO LOW %": None, "20M BREAKOUT STATUS": "NOT CONFIRMED",
+        "20M REASON": "Need at least 21 completed 1M candles", "20M CANDLE TIME": ""
+    }
+    try:
+        required = ["Open", "High", "Low", "Close", "Volume"]
+        if df is None or len(df) < 21 or any(c not in df.columns for c in required):
+            return out
+        d = df.reset_index(drop=True).copy()
+        d[required] = d[required].apply(pd.to_numeric, errors="coerce")
+        d = d.dropna(subset=required).reset_index(drop=True)
+        if len(d) < 21:
+            return out
+        # The latest candle is tested against the preceding 20-candle range.
+        base = d.iloc[-21:-1]
+        last = d.iloc[-1]
+        rh = float(base["High"].max()); rl = float(base["Low"].min())
+        close = float(last["Close"]); open_ = float(last["Open"])
+        if rh <= 0 or rl <= 0 or close <= 0 or rh <= rl:
+            out["20M REASON"] = "Invalid price range"
+            return out
+        mid = (rh + rl) / 2.0
+        range_pct = (rh - rl) / mid * 100.0
+        dist_high = (rh - close) / rh * 100.0
+        dist_low = (close - rl) / rl * 100.0
+        vols = d["Volume"].clip(lower=0)
+        base_vol = float(vols.iloc[-21:-4].mean())
+        recent_vol = float(vols.iloc[-4:-1].mean())
+        buildup = recent_vol / base_vol if base_vol > 0 else 0.0
+        # Candle-body-volume pressure proxy (not actual exchange order-book depth).
+        sample = d.iloc[-20:]
+        up_vol = float(sample.loc[sample["Close"] > sample["Open"], "Volume"].sum())
+        down_vol = float(sample.loc[sample["Close"] < sample["Open"], "Volume"].sum())
+        total_pressure_vol = up_vol + down_vol
+        buy_pressure = 50.0 if total_pressure_vol <= 0 else 100.0 * up_vol / total_pressure_vol
+        sell_pressure = 100.0 - buy_pressure
+        score = 0; reasons = []
+        if range_pct <= 0.35:
+            score += 30; reasons.append(f"very tight 20M range {range_pct:.2f}%")
+        elif range_pct <= 0.60:
+            score += 25; reasons.append(f"tight 20M range {range_pct:.2f}%")
+        elif range_pct <= 0.90:
+            score += 15; reasons.append(f"compressed range {range_pct:.2f}%")
+        else:
+            reasons.append(f"range not tight ({range_pct:.2f}%)")
+        if buildup >= 2.0:
+            score += 25; reasons.append(f"volume buildup {buildup:.2f}x")
+        elif buildup >= 1.5:
+            score += 20; reasons.append(f"volume buildup {buildup:.2f}x")
+        elif buildup >= 1.2:
+            score += 12; reasons.append(f"volume buildup {buildup:.2f}x")
+        else:
+            reasons.append(f"volume buildup {buildup:.2f}x (weak)")
+        # Directional pressure is only a proxy; price location and momentum must agree.
+        last3_change = (float(d["Close"].iloc[-1]) / max(float(d["Close"].iloc[-4]), 1e-9) - 1.0) * 100.0
+        near_high = -0.10 <= dist_high <= 0.35
+        near_low = -0.10 <= dist_low <= 0.35
+        direction = "NONE"
+        if close > rh and close > open_:
+            direction = "BUY"; score += 35
+            reasons.append("latest completed candle closed above 20M range high")
+        elif close < rl and close < open_:
+            direction = "SELL"; score += 35
+            reasons.append("latest completed candle closed below 20M range low")
+        elif near_high and last3_change > 0 and buy_pressure >= 55:
+            direction = "BUY"; score += 20
+            reasons.append("near range high with upward price/volume pressure")
+        elif near_low and last3_change < 0 and sell_pressure >= 55:
+            direction = "SELL"; score += 20
+            reasons.append("near range low with downward price/volume pressure")
+        elif last3_change >= 0.10 and buy_pressure >= 60:
+            direction = "BUY"; score += 10
+            reasons.append("short-term buying pressure, but range edge not reached")
+        elif last3_change <= -0.10 and sell_pressure >= 60:
+            direction = "SELL"; score += 10
+            reasons.append("short-term selling pressure, but range edge not reached")
+        else:
+            reasons.append("direction unclear; wait for range edge or break")
+        confirmed = close > rh or close < rl
+        if close > rh and direction == "BUY" and buildup >= 1.2 and buy_pressure >= 50:
+            status = "🚀 BIG MOVE UP — BREAKOUT CONFIRMED"
+            breakout_status = "CONFIRMED UP"
+        elif close < rl and direction == "SELL" and buildup >= 1.2 and sell_pressure >= 50:
+            status = "🔻 BIG MOVE DOWN — BREAKDOWN CONFIRMED"
+            breakout_status = "CONFIRMED DOWN"
+        elif range_pct <= 0.90 and buildup >= 1.2 and score >= 45 and direction == "BUY":
+            status = "🟢 BIG MOVE UP WATCH"; breakout_status = "WATCH — NOT CONFIRMED"
+        elif range_pct <= 0.90 and buildup >= 1.2 and score >= 45 and direction == "SELL":
+            status = "🔴 BIG MOVE DOWN WATCH"; breakout_status = "WATCH — NOT CONFIRMED"
+        elif range_pct <= 1.2 and buildup >= 1.2:
+            status = "🟡 RANGE + VOLUME BUILDUP — WAIT"; breakout_status = "NOT CONFIRMED"
+        else:
+            status = "⚪ WAIT"; breakout_status = "NOT CONFIRMED"
+        candle_time = ""
+        if "Time" in d.columns:
+            try: candle_time = str(pd.Timestamp(d["Time"].iloc[-1]))
+            except Exception: candle_time = str(d["Time"].iloc[-1])
+        out.update({
+            "20M STATUS": status, "20M DIRECTION": direction,
+            "20M PRE-MOVE SCORE": int(min(100, score)), "20M RANGE %": round(range_pct, 3),
+            "20M RANGE HIGH": round(rh, 2), "20M RANGE LOW": round(rl, 2),
+            "20M VOLUME BUILDUP X": round(buildup, 2),
+            "20M BUY PRESSURE %": round(buy_pressure, 1), "20M SELL PRESSURE %": round(sell_pressure, 1),
+            "20M DIST TO HIGH %": round(dist_high, 3), "20M DIST TO LOW %": round(dist_low, 3),
+            "20M BREAKOUT STATUS": breakout_status,
+            "20M REASON": " | ".join(reasons), "20M CANDLE TIME": candle_time
+        })
+        return out
+    except Exception as e:
+        out["20M REASON"] = f"20M analysis error: {type(e).__name__}"
+        return out
+
+
+def _fetch_20m_range_signal(fyers, symbol: str):
+    """Fetch 1M candles for a single symbol and detect 20M consolidation/breakout."""
+    ticker = symbol.replace("NSE:", "").replace("-EQ", "") if isinstance(symbol, str) else str(symbol)
+    if not isinstance(symbol, str) or not _VALID_EQ_SYMBOL_RE.match(symbol):
+        return None, f"{symbol}: invalid symbol format"
+    try:
+        # Short lookback reduces response size; only the most recent candles are used.
+        df1 = _fetch_timeframe_data(fyers, symbol, "1", lookback_days=2)
+        if df1 is None or len(df1) < 21:
+            return None, f"{symbol}: insufficient 1M candles"
+        setup = _detect_20m_range_setup(df1)
+        setup.update({"SYMBOL": ticker, "LTP": round(float(df1["Close"].iloc[-1]), 2)})
+        if setup["20M STATUS"] == "⚪ WAIT" and setup["20M PRE-MOVE SCORE"] == 0:
+            return setup, None
+        return setup, None
+    except Exception as e:
+        return None, f"{symbol}: {type(e).__name__}: {str(e)[:100]}"
+
+
+def run_20m_range_scan(fyers, symbols):
+    """Scan a symbol universe for 20-minute range setups using 1M candles."""
+    symbols = _validate_symbols(list(dict.fromkeys(symbols)))
+    results, errors = [], []
+    stats = ScanStats(total=len(symbols))
+    if not symbols:
+        return results, ["No valid symbols in selected universe"], stats
+    progress = st.progress(0.0, text=f"20M Range scan 0 / {len(symbols)}")
+    done = 0
+    for i in range(0, len(symbols), BATCH_SIZE):
+        batch = symbols[i:i + BATCH_SIZE]
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            futures = {executor.submit(_fetch_20m_range_signal, fyers, sym): sym for sym in batch}
+            for future in as_completed(futures):
+                sym = futures[future]
+                try:
+                    res, err = future.result()
+                except Exception as e:
+                    res, err = None, f"{sym}: worker error ({type(e).__name__})"
+                if res:
+                    results.append(res)
+                if err:
+                    errors.append(err)
+                stats.record(has_result=bool(res), has_error=bool(err))
+                done += 1
+                progress.progress(done / max(len(symbols), 1), text=f"20M Range scan {done} / {len(symbols)}")
+        if i + BATCH_SIZE < len(symbols):
+            time.sleep(BATCH_PAUSE_SECONDS)
+    progress.empty()
+    results.sort(key=lambda x: (int(x.get("20M PRE-MOVE SCORE", 0)), float(x.get("20M VOLUME BUILDUP X", 0))), reverse=True)
+    return results, errors, stats
+
+
+# ════════════════════════════════════════════════════════════════════════════════
 # PIN RULES — ADDITIONAL LIQUIDITY / REVERSAL / BIG-MOVE ANALYSIS
 # Existing scanner logic is intentionally untouched. This tab runs only when used.
 # ════════════════════════════════════════════════════════════════════════════════
@@ -5611,7 +5790,8 @@ def show_scanner(fyers) -> None:
         "🎯 PRE-MOVE CONFIRM",
         "📈 HIGH/LOW BREAKOUT",
         "🧠 AMD SCANNER",
-        "📊 ADDITIONAL INDICATORS"
+        "📊 ADDITIONAL INDICATORS",
+        "⏱️ 20M RANGE BIG MOVE"
     ])
     
     # ════════════════════════════════════════════════════════════════════════════════
@@ -7069,6 +7249,71 @@ def show_scanner(fyers) -> None:
         if ind_errors:
             with st.expander(f"⚠️ Candle/API issues ({len(ind_errors)})"):
                 st.write("\\n".join(ind_errors[:100]))
+
+    # ════════════════════════════════════════════════════════════════════════════════
+    # TAB 19: 20-MINUTE RANGE CONSOLIDATION → BIG MOVE
+    # ════════════════════════════════════════════════════════════════════════════════
+    with tabs[19]:
+        st.markdown("### ⏱️ 20-MINUTE RANGE → BIG MOVE UP / DOWN")
+        st.caption("Uses 1-minute candles. The previous 20 completed candles define the range; the latest completed candle is checked separately for breakout confirmation.")
+        range_universe_choice = st.radio(
+            "Scan universe", ["NSE ALL + F&O (combined)", "NSE ALL only", "F&O only"],
+            horizontal=True, key="range20_universe"
+        )
+        if range_universe_choice == "NSE ALL only":
+            range_symbols = list(dict.fromkeys(all_symbols))
+        elif range_universe_choice == "F&O only":
+            range_symbols = list(dict.fromkeys(fo_symbols))
+        else:
+            range_symbols = list(dict.fromkeys(list(all_symbols) + list(fo_symbols)))
+        st.caption(f"Selected symbols: {len(range_symbols)} | 1-minute candle history requests may take time for the full universe.")
+        if st.button(f"🚀 SCAN 20M RANGE ({len(range_symbols)} symbols)", key="range20_run", type="primary"):
+            with st.spinner("Scanning 1-minute candles for 20-minute consolidation and volume pressure…"):
+                rr, re, rs = run_20m_range_scan(fyers, range_symbols)
+                st.session_state["range20_df"] = pd.DataFrame(rr) if rr else pd.DataFrame()
+                st.session_state["range20_errors"] = re
+                st.session_state["range20_stats"] = rs
+                st.session_state["range20_scanned_at"] = _now_ist().strftime("%d-%b-%Y %H:%M:%S IST")
+        r20 = st.session_state.get("range20_df", pd.DataFrame())
+        if isinstance(r20, pd.DataFrame) and not r20.empty:
+            st.caption(f"Last scan: {st.session_state.get('range20_scanned_at', 'N/A')} | Rows: {len(r20)}")
+            f1, f2, f3 = st.columns(3)
+            with f1:
+                status_filter = st.selectbox("20M Signal", ["ALL", "BIG MOVE UP WATCH", "BIG MOVE DOWN WATCH", "CONFIRMED BREAKOUT/BREAKDOWN", "RANGE + VOLUME BUILDUP — WAIT"], key="range20_status_filter")
+            with f2:
+                min_score = st.slider("Minimum pre-move score", 0, 100, 35, 5, key="range20_score_filter")
+            with f3:
+                min_buildup = st.slider("Minimum volume buildup (x)", 0.0, 3.0, 1.0, 0.1, key="range20_vol_filter")
+            rview = r20.copy()
+            if status_filter == "BIG MOVE UP WATCH":
+                rview = rview[rview["20M STATUS"] == "🟢 BIG MOVE UP WATCH"]
+            elif status_filter == "BIG MOVE DOWN WATCH":
+                rview = rview[rview["20M STATUS"] == "🔴 BIG MOVE DOWN WATCH"]
+            elif status_filter == "CONFIRMED BREAKOUT/BREAKDOWN":
+                rview = rview[rview["20M BREAKOUT STATUS"].astype(str).str.startswith("CONFIRMED")]
+            elif status_filter == "RANGE + VOLUME BUILDUP — WAIT":
+                rview = rview[rview["20M STATUS"] == "🟡 RANGE + VOLUME BUILDUP — WAIT"]
+            rview["20M PRE-MOVE SCORE"] = pd.to_numeric(rview["20M PRE-MOVE SCORE"], errors="coerce").fillna(0)
+            rview["20M VOLUME BUILDUP X"] = pd.to_numeric(rview["20M VOLUME BUILDUP X"], errors="coerce").fillna(0)
+            rview = rview[(rview["20M PRE-MOVE SCORE"] >= min_score) & (rview["20M VOLUME BUILDUP X"] >= min_buildup)]
+            cols = ["SYMBOL", "LTP", "20M CANDLE TIME", "20M STATUS", "20M DIRECTION", "20M PRE-MOVE SCORE", "20M RANGE %", "20M RANGE HIGH", "20M RANGE LOW", "20M VOLUME BUILDUP X", "20M BUY PRESSURE %", "20M SELL PRESSURE %", "20M DIST TO HIGH %", "20M DIST TO LOW %", "20M BREAKOUT STATUS", "20M REASON"]
+            rview = rview[[c for c in cols if c in rview.columns]]
+            if rview.empty:
+                st.info("No rows match these filters. Choose ALL or lower the score/volume threshold.")
+            else:
+                st.dataframe(rview, use_container_width=True, height=560, hide_index=True)
+                d1, d2 = st.columns(2)
+                with d1:
+                    st.download_button("📊 Download Excel", _format_excel_output(rview, "20M_RANGE_BIG_MOVE"), f"20M_RANGE_BIG_MOVE_{_now_ist().strftime('%Y%m%d_%H%M')}.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="range20_xlsx")
+                with d2:
+                    st.download_button("📄 Download CSV", to_csv_bytes(rview), f"20M_RANGE_BIG_MOVE_{_now_ist().strftime('%Y%m%d_%H%M')}.csv", "text/csv", key="range20_csv")
+        else:
+            st.info("Click SCAN 20M RANGE to run this independent scan. Existing scanner tabs and signals are unchanged.")
+        range_errors = st.session_state.get("range20_errors", [])
+        if range_errors:
+            with st.expander(f"⚠️ 1M candle/API issues ({len(range_errors)})"):
+                st.write("\n".join(range_errors[:100]))
+        st.caption("WATCH = early setup, not confirmed. CONFIRMED = latest completed 1M candle closed outside the previous 20-candle range and volume/pressure filters passed. Pressure is inferred from candle bodies and volume, not true exchange order-book depth.")
 
     gc.collect()
 
