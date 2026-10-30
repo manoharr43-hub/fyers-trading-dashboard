@@ -5955,7 +5955,8 @@ def show_scanner(fyers) -> None:
         "📈 HIGH/LOW BREAKOUT",
         "🧠 AMD SCANNER",
         "📊 ADDITIONAL INDICATORS",
-        "⏱️ 20M RANGE BIG MOVE"
+        "⏱️ 20M RANGE BIG MOVE",
+        "🎯 PRE-BIG STOCK FINDER"
     ])
     
     # ════════════════════════════════════════════════════════════════════════════════
@@ -7478,6 +7479,125 @@ def show_scanner(fyers) -> None:
             with st.expander(f"⚠️ 1M candle/API issues ({len(range_errors)})"):
                 st.write("\n".join(range_errors[:100]))
         st.caption("WATCH = early setup, not confirmed. CONFIRMED = latest completed 1M candle closed outside the previous 20-candle range and volume/pressure filters passed. Pressure is inferred from candle bodies and volume, not true exchange order-book depth.")
+
+
+    # ════════════════════════════════════════════════════════════════════════════════
+    # TAB 20: PRE-BIG MOVEMENT STOCK FINDER
+    # Ranks existing 20M scan results; does not issue trades or alter old scanners.
+    # ════════════════════════════════════════════════════════════════════════════════
+    with tabs[20]:
+        st.markdown("### 🎯 PRE-BIG MOVEMENT STOCK FINDER")
+        st.caption(
+            "Ranks stocks from the latest 20M range scan. First run the 20M RANGE BIG MOVE tab. "
+            "WATCH means a developing setup; it is not a guaranteed prediction."
+        )
+        finder_df = st.session_state.get("range20_df", pd.DataFrame())
+        if not isinstance(finder_df, pd.DataFrame) or finder_df.empty:
+            st.info("ముందుగా ⏱️ 20M RANGE BIG MOVE tab లో scan run చేయండి. ఆ results ఇక్కడ rank అవుతాయి.")
+        else:
+            fv = finder_df.copy()
+            for col in ["20M PRE-MOVE SCORE", "20M VOLUME BUILDUP X",
+                        "20M BUY PRESSURE %", "20M SELL PRESSURE %",
+                        "20M DIST TO HIGH %", "20M DIST TO LOW %"]:
+                if col in fv.columns:
+                    fv[col] = pd.to_numeric(fv[col], errors="coerce")
+
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                finder_direction = st.selectbox(
+                    "Direction", ["BOTH", "BUY ONLY", "SELL ONLY"], key="prebig_finder_direction"
+                )
+            with c2:
+                finder_min_score = st.slider(
+                    "Minimum setup score", 0, 100, 45, 5, key="prebig_finder_score"
+                )
+            with c3:
+                finder_top_n = st.selectbox(
+                    "Show top stocks", [10, 20, 30, 50, 100], index=1, key="prebig_finder_topn"
+                )
+
+            if "20M DIRECTION" in fv.columns:
+                if finder_direction == "BUY ONLY":
+                    fv = fv[fv["20M DIRECTION"].astype(str).str.upper() == "BUY"]
+                elif finder_direction == "SELL ONLY":
+                    fv = fv[fv["20M DIRECTION"].astype(str).str.upper() == "SELL"]
+
+            if "20M PRE-MOVE SCORE" in fv.columns:
+                fv = fv[fv["20M PRE-MOVE SCORE"].fillna(0) >= finder_min_score]
+
+            # Rank combines the existing setup score and volume buildup.
+            # Do not fabricate delta/market-depth data when it is absent.
+            score = pd.to_numeric(fv.get("20M PRE-MOVE SCORE", 0), errors="coerce")
+            buildup = pd.to_numeric(fv.get("20M VOLUME BUILDUP X", 0), errors="coerce").fillna(0)
+            fv["FINDER RANK SCORE"] = (
+                score.fillna(0) * 0.80
+                + (buildup.clip(0, 3) / 3.0 * 20.0)
+            ).round(1)
+
+            def _finder_label(row):
+                status = str(row.get("20M STATUS", ""))
+                direction = str(row.get("20M DIRECTION", "NONE")).upper()
+                confirmed = str(row.get("20M BREAKOUT STATUS", "")).startswith("CONFIRMED")
+                if confirmed and direction == "BUY":
+                    return "🔥 BIG BUY CONFIRMED"
+                if confirmed and direction == "SELL":
+                    return "🔥 BIG SELL CONFIRMED"
+                if direction == "BUY" and float(row.get("FINDER RANK SCORE", 0) or 0) >= 60:
+                    return "🟢 PRE-BIG BUY WATCH"
+                if direction == "SELL" and float(row.get("FINDER RANK SCORE", 0) or 0) >= 60:
+                    return "🔴 PRE-BIG SELL WATCH"
+                if "RANGE" in status.upper():
+                    return "🟡 RANGE READY — WAIT"
+                return "⚪ WAIT"
+
+            fv["FINDER SIGNAL"] = fv.apply(_finder_label, axis=1)
+            fv = fv.sort_values(
+                ["FINDER RANK SCORE", "20M VOLUME BUILDUP X"],
+                ascending=[False, False]
+            ).head(finder_top_n)
+
+            if fv.empty:
+                st.warning("ఈ filters కి సరిపోయే stocks లేవు. Minimum score తగ్గించి చూడండి.")
+            else:
+                buy_count = int(fv["FINDER SIGNAL"].astype(str).str.contains("BUY", na=False).sum())
+                sell_count = int(fv["FINDER SIGNAL"].astype(str).str.contains("SELL", na=False).sum())
+                confirmed_count = int(fv["FINDER SIGNAL"].astype(str).str.contains("CONFIRMED", na=False).sum())
+                m1, m2, m3 = st.columns(3)
+                m1.metric("BUY WATCH / CONFIRMED", buy_count)
+                m2.metric("SELL WATCH / CONFIRMED", sell_count)
+                m3.metric("CONFIRMED BREAKOUTS", confirmed_count)
+
+                show_cols = [
+                    "SYMBOL", "LTP", "FINDER SIGNAL", "FINDER RANK SCORE",
+                    "20M PRE-MOVE SCORE", "20M DIRECTION", "20M RANGE %",
+                    "20M RANGE HIGH", "20M RANGE LOW", "20M VOLUME BUILDUP X",
+                    "20M BUY PRESSURE %", "20M SELL PRESSURE %",
+                    "20M BREAKOUT STATUS", "20M REASON"
+                ]
+                show_cols = [c for c in show_cols if c in fv.columns]
+                st.dataframe(fv[show_cols], use_container_width=True, height=560, hide_index=True)
+                x1, x2 = st.columns(2)
+                with x1:
+                    st.download_button(
+                        "📊 Download Finder Excel",
+                        _format_excel_output(fv[show_cols], "PRE_BIG_STOCK_FINDER"),
+                        f"PRE_BIG_STOCK_FINDER_{_now_ist().strftime('%Y%m%d_%H%M')}.xlsx",
+                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        key="prebig_finder_xlsx"
+                    )
+                with x2:
+                    st.download_button(
+                        "📄 Download Finder CSV",
+                        to_csv_bytes(fv[show_cols]),
+                        f"PRE_BIG_STOCK_FINDER_{_now_ist().strftime('%Y%m%d_%H%M')}.csv",
+                        "text/csv",
+                        key="prebig_finder_csv"
+                    )
+            st.caption(
+                "Important: Current finder ranks the 20M range scan's candle/volume-derived evidence. "
+                "It does not claim true aggressor-side trade delta or guaranteed future movement. "
+                "Use the LIVE ORDER BOOK tab separately for FYERS bid/ask depth snapshot."
+            )
 
     gc.collect()
 
