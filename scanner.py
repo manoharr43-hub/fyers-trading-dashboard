@@ -7551,6 +7551,83 @@ def show_scanner(fyers) -> None:
                 return "⚪ WAIT"
 
             fv["FINDER SIGNAL"] = fv.apply(_finder_label, axis=1)
+
+            # High-priced, unusually active stocks: blink when LTP >= user threshold
+            # and 20M volume buildup is above the selected multiple.
+            if "LTP" in fv.columns:
+                fv["LTP"] = pd.to_numeric(fv["LTP"], errors="coerce")
+            else:
+                fv["LTP"] = pd.NA
+            fv["20M VOLUME BUILDUP X"] = pd.to_numeric(
+                fv.get("20M VOLUME BUILDUP X", 0), errors="coerce"
+            ).fillna(0)
+
+            blink_c1, blink_c2 = st.columns(2)
+            with blink_c1:
+                blink_price_min = st.number_input(
+                    "Blink stocks when price is above (₹)",
+                    min_value=1.0, value=1000.0, step=100.0,
+                    key="prebig_blink_price_min"
+                )
+            with blink_c2:
+                blink_volume_min = st.number_input(
+                    "Big volume threshold (x average volume)",
+                    min_value=1.0, max_value=20.0, value=2.0, step=0.5,
+                    key="prebig_blink_volume_min"
+                )
+
+            blink_df = fv[
+                (fv["LTP"] >= blink_price_min)
+                & (fv["20M VOLUME BUILDUP X"] >= blink_volume_min)
+            ].copy()
+
+            st.markdown(
+                """
+                <style>
+                @keyframes preBigBlink {
+                    0%, 100% { opacity: 1; box-shadow: 0 0 5px rgba(255,180,0,.25); }
+                    50% { opacity: .35; box-shadow: 0 0 18px rgba(255,180,0,.9); }
+                }
+                .prebig-blink-card {
+                    animation: preBigBlink 1s infinite;
+                    border: 2px solid #f59e0b;
+                    border-radius: 10px;
+                    padding: 10px 14px;
+                    margin: 7px 0;
+                    background: rgba(245,158,11,.10);
+                    font-weight: 700;
+                }
+                .prebig-blink-sub { font-size: 12px; font-weight: 500; opacity: .85; }
+                </style>
+                """,
+                unsafe_allow_html=True
+            )
+            st.markdown("#### 🚨 PRICE ₹1,000+ & BIG VOLUME — BLINK ALERT")
+            if blink_df.empty:
+                st.info(
+                    f"ప్రస్తుతం ₹{blink_price_min:,.0f}+ price మరియు "
+                    f"{blink_volume_min:.1f}x+ 20M volume buildup ఉన్న stock లేదు."
+                )
+            else:
+                st.success(f"{len(blink_df)} stocks matched — alert list")
+                for _, blink_row in blink_df.sort_values(
+                    "20M VOLUME BUILDUP X", ascending=False
+                ).head(30).iterrows():
+                    blink_symbol = str(blink_row.get("SYMBOL", "UNKNOWN"))
+                    blink_direction = str(blink_row.get("20M DIRECTION", "WAIT"))
+                    blink_ltp = pd.to_numeric(blink_row.get("LTP"), errors="coerce")
+                    blink_vol = float(blink_row.get("20M VOLUME BUILDUP X", 0) or 0)
+                    blink_score = float(blink_row.get("FINDER RANK SCORE", 0) or 0)
+                    blink_price_text = f"₹{blink_ltp:,.2f}" if pd.notna(blink_ltp) else "N/A"
+                    st.markdown(
+                        f'<div class="prebig-blink-card">🚨 {blink_symbol} '
+                        f'| {blink_price_text} | {blink_direction} '
+                        f'| VOLUME {blink_vol:.2f}x | SCORE {blink_score:.1f}'
+                        f'<div class="prebig-blink-sub">Price threshold and volume buildup conditions matched. '
+                        f'Watch for range breakout confirmation.</div></div>',
+                        unsafe_allow_html=True
+                    )
+
             fv = fv.sort_values(
                 ["FINDER RANK SCORE", "20M VOLUME BUILDUP X"],
                 ascending=[False, False]
