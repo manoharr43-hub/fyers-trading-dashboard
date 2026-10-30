@@ -441,6 +441,77 @@ def calculate_buying_selling_pressure(df) -> Dict[str, Any]:
     }
 
 # ════════════════════════════════════════════════════════════════════════════════
+# ESTIMATED ORDER-FLOW DELTA (OHLCV PROXY)
+# ════════════════════════════════════════════════════════════════════════════════
+def calculate_order_flow_delta(df: pd.DataFrame, lookback: int = 20) -> Dict[str, Any]:
+    """Estimate buy/sell volume using each candle's close location in its range.
+
+    IMPORTANT: OHLCV candles do not identify the aggressor for each trade.
+    These are estimated buy/sell volumes and delta, NOT true exchange trade delta.
+    A true delta requires trade-by-trade prints with aggressor-side classification.
+    """
+    empty = {
+        "estimated_buy_volume": 0.0, "estimated_sell_volume": 0.0,
+        "volume_delta": 0.0, "delta_pct": 0.0, "cumulative_delta": 0.0,
+        "order_flow_signal": "WAIT", "delta_divergence": "NONE",
+        "last_candle_delta": 0.0,
+    }
+    required = ["Open", "High", "Low", "Close", "Volume"]
+    if df is None or len(df) < 2 or any(c not in df.columns for c in required):
+        return empty
+    try:
+        d = df.tail(max(2, int(lookback))).copy()
+        for col in required:
+            d[col] = pd.to_numeric(d[col], errors="coerce")
+        d = d.dropna(subset=required)
+        if d.empty:
+            return empty
+        candle_range = (d["High"] - d["Low"]).clip(lower=0)
+        # Close Location Value: 0 at candle low, 1 at candle high.
+        clv = ((d["Close"] - d["Low"]) / candle_range.replace(0, np.nan)).clip(0, 1).fillna(0.5)
+        volume = d["Volume"].clip(lower=0)
+        buy_vol = volume * clv
+        sell_vol = volume - buy_vol
+        delta_series = buy_vol - sell_vol
+        total_volume = float(volume.sum())
+        delta = float(delta_series.sum())
+        delta_pct = (delta / total_volume * 100.0) if total_volume > 0 else 0.0
+        buy_total = float(buy_vol.sum())
+        sell_total = float(sell_vol.sum())
+        last_delta = float(delta_series.iloc[-1])
+        if delta_pct >= 20:
+            signal = "STRONG BUYING"
+        elif delta_pct >= 7:
+            signal = "BUYING"
+        elif delta_pct <= -20:
+            signal = "STRONG SELLING"
+        elif delta_pct <= -7:
+            signal = "SELLING"
+        else:
+            signal = "BALANCED"
+        price_change = float(d["Close"].iloc[-1] - d["Close"].iloc[0])
+        if price_change > 0 and delta < 0:
+            divergence = "BEARISH DIVERGENCE"
+        elif price_change < 0 and delta > 0:
+            divergence = "BULLISH DIVERGENCE"
+        else:
+            divergence = "NONE"
+        return {
+            "estimated_buy_volume": round(buy_total, 0),
+            "estimated_sell_volume": round(sell_total, 0),
+            "volume_delta": round(delta, 0),
+            "delta_pct": round(delta_pct, 1),
+            "cumulative_delta": round(float(delta_series.cumsum().iloc[-1]), 0),
+            "order_flow_signal": signal,
+            "delta_divergence": divergence,
+            "last_candle_delta": round(last_delta, 0),
+        }
+    except Exception as exc:
+        logger.debug("Order-flow delta calculation failed: %s", exc)
+        return empty
+
+
+# ════════════════════════════════════════════════════════════════════════════════
 # MOMENTUM SCORING ENGINE (NEW - V17)
 # ════════════════════════════════════════════════════════════════════════════════
 def calculate_movement_metrics(df) -> Dict[str, float]:
@@ -1404,6 +1475,7 @@ def analyze_timeframe(fyers, symbol: str, resolution: str) -> Dict[str, Any]:
         ema200 = calculate_ema(df["Close"], 200)
         
         pressure = calculate_buying_selling_pressure(df)
+        order_flow = calculate_order_flow_delta(df, lookback=20)
         
         structure = detect_structure(df)
         choch = detect_choch(df)
@@ -1481,6 +1553,14 @@ def analyze_timeframe(fyers, symbol: str, resolution: str) -> Dict[str, Any]:
                 "buying_volume": pressure["buying_volume"],
                 "selling_volume": pressure["selling_volume"],
                 "pressure_ratio": pressure["pressure_ratio"],
+                "estimated_buy_volume": order_flow["estimated_buy_volume"],
+                "estimated_sell_volume": order_flow["estimated_sell_volume"],
+                "volume_delta": order_flow["volume_delta"],
+                "delta_pct": order_flow["delta_pct"],
+                "cumulative_delta": order_flow["cumulative_delta"],
+                "order_flow_signal": order_flow["order_flow_signal"],
+                "delta_divergence": order_flow["delta_divergence"],
+                "last_candle_delta": order_flow["last_candle_delta"],
             },
             "df": df,
         }
@@ -2471,6 +2551,18 @@ def _fetch_nse_signal(fyers, symbol: str):
             "🟢 BUY PRESSURE %": data_5m.get("buying_pressure", "N/A"),
             "🔴 SELL PRESSURE %": data_5m.get("selling_pressure", "N/A"),
             "PRESSURE SIGNAL": data_5m.get("pressure_trend", "N/A"),
+            "EST. BUY VOLUME (20x5M)": data_5m.get("estimated_buy_volume", 0),
+            "EST. SELL VOLUME (20x5M)": data_5m.get("estimated_sell_volume", 0),
+            "VOLUME DELTA (20x5M)": data_5m.get("volume_delta", 0),
+            "DELTA % (20x5M)": data_5m.get("delta_pct", 0),
+            "CUMULATIVE DELTA": data_5m.get("cumulative_delta", 0),
+            "LAST 5M DELTA": data_5m.get("last_candle_delta", 0),
+            "ORDER FLOW SIGNAL": data_5m.get("order_flow_signal", "WAIT"),
+            "DELTA DIVERGENCE": data_5m.get("delta_divergence", "NONE"),
+            "15M ORDER FLOW": data_15m.get("order_flow_signal", "N/A"),
+            "15M DELTA %": data_15m.get("delta_pct", "N/A"),
+            "1H ORDER FLOW": data_1h.get("order_flow_signal", "N/A"),
+            "1H DELTA %": data_1h.get("delta_pct", "N/A"),
             "NEXT CANDLE BIAS": next_bias.get("bias", "NEUTRAL"),
             "NEXT CANDLE CONFIDENCE %": next_bias.get("confidence", 0.0),
             "AI SIGNAL": master["final_signal"],
@@ -2555,6 +2647,18 @@ def _fetch_fo_signal(fyers, symbol: str):
             "🟢 BUY PRESSURE %": data_5m.get("buying_pressure", "N/A"),
             "🔴 SELL PRESSURE %": data_5m.get("selling_pressure", "N/A"),
             "PRESSURE SIGNAL": data_5m.get("pressure_trend", "N/A"),
+            "EST. BUY VOLUME (20x5M)": data_5m.get("estimated_buy_volume", 0),
+            "EST. SELL VOLUME (20x5M)": data_5m.get("estimated_sell_volume", 0),
+            "VOLUME DELTA (20x5M)": data_5m.get("volume_delta", 0),
+            "DELTA % (20x5M)": data_5m.get("delta_pct", 0),
+            "CUMULATIVE DELTA": data_5m.get("cumulative_delta", 0),
+            "LAST 5M DELTA": data_5m.get("last_candle_delta", 0),
+            "ORDER FLOW SIGNAL": data_5m.get("order_flow_signal", "WAIT"),
+            "DELTA DIVERGENCE": data_5m.get("delta_divergence", "NONE"),
+            "15M ORDER FLOW": data_15m.get("order_flow_signal", "N/A"),
+            "15M DELTA %": data_15m.get("delta_pct", "N/A"),
+            "1H ORDER FLOW": data_1h.get("order_flow_signal", "N/A"),
+            "1H DELTA %": data_1h.get("delta_pct", "N/A"),
             "NEXT CANDLE BIAS": next_bias.get("bias", "NEUTRAL"),
             "NEXT CANDLE CONFIDENCE %": next_bias.get("confidence", 0.0),
             "ATM STRIKE": round(options_data.get("atm_strike", 0), 2) if options_data.get("atm_strike") else "N/A",
