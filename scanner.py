@@ -1438,7 +1438,7 @@ def _fetch_timeframe_data(fyers, symbol, resolution: str, lookback_days: int = 3
         if len(df) > 1:
             last_time = df["Time"].iloc[-1]
             candle_age = (_now_ist() - last_time).total_seconds() / 60
-            res_minutes = int(resolution)
+            res_minutes = 1440 if resolution == "D" else int(resolution)
             if candle_age < res_minutes + 1:
                 df = df.iloc[:-1].reset_index(drop=True)
         
@@ -1627,15 +1627,25 @@ def fetch_options_chain_data(fyers, symbol: str, expiry_timestamp: str = "") -> 
             nearest = expiry_data[0]
             expiry_timestamp = str(nearest.get("expiry", ""))
             if expiry_timestamp:
-                resp = _fyers_optionchain_request(fyers, symbol, timestamp=expiry_timestamp)
-                data = resp.get("data", resp) if isinstance(resp, dict) else {}
-                chain = data.get("optionsChain") or chain
+                exp_resp = _fyers_optionchain_request(fyers, symbol, timestamp=expiry_timestamp)
+                if isinstance(exp_resp, dict) and exp_resp.get("s") in (None, "ok"):
+                    new_data = exp_resp.get("data", exp_resp)
+                    if isinstance(new_data, dict) and new_data.get("optionsChain"):
+                        data, chain = new_data, new_data["optionsChain"]
         spot_row = next((x for x in chain if x.get("option_type", "") == ""), None)
         spot = float(spot_row.get("ltp")) if spot_row and spot_row.get("ltp") is not None else None
         legs = [x for x in chain if x.get("option_type") in ("CE","PE") and x.get("strike_price") not in (None,-1)]
         strikes = sorted({float(x["strike_price"]) for x in legs})
         atm = min(strikes, key=lambda k: abs(k-spot)) if strikes and spot is not None else None
-        call_oi = float(data.get("callOi", 0) or 0); put_oi = float(data.get("putOi", 0) or 0)
+        # Prefer provided aggregate OI, otherwise sum the returned strikes.
+        # Restrict interpretation to returned strikes when aggregates are unavailable.
+        call_oi_raw = data.get("callOi")
+        put_oi_raw = data.get("putOi")
+        call_oi = float(call_oi_raw) if call_oi_raw is not None else sum(float(x.get("oi", 0) or 0) for x in legs if x.get("option_type") == "CE")
+        put_oi = float(put_oi_raw) if put_oi_raw is not None else sum(float(x.get("oi", 0) or 0) for x in legs if x.get("option_type") == "PE")
+        if not legs:
+            empty["message"] = "FYERS returned no CE/PE contracts; check symbol, expiry and data permissions"
+            return empty
         call_chg = sum(float(x.get("oich",0) or 0) for x in legs if x.get("option_type")=="CE")
         put_chg = sum(float(x.get("oich",0) or 0) for x in legs if x.get("option_type")=="PE")
         ce_vol = sum(float(x.get("volume",0) or 0) for x in legs if x.get("option_type")=="CE")
@@ -3590,6 +3600,139 @@ def _detect_pre_move_volume_setup(df: pd.DataFrame) -> Dict[str, Any]:
     except Exception as e:
         out["PRE-MOVE VOLUME REASON"] = f"Volume setup error: {type(e).__name__}"
         return out
+
+
+
+# ================================================================
+# EARLY BIG MOVE WATCH — independent UI summary, no old tab changes
+# ================================================================
+def _early_move_table(momentum_df: pd.DataFrame) -> pd.DataFrame:
+    """Rank unbroken consolidation candidates; scores are NOT probabilities."""
+    columns = ["STOCK NAME", "LTP", "ENERGY SCORE", "VOLUME BUILDUP X",
+               "5M DIRECTION", "15M DIRECTION", "PRE-MOVE STATUS", "RANGE COMPRESSION %",
+               "DISTANCE TO RANGE HIGH %", "DISTANCE TO RANGE LOW %", "SIGNAL TIME"]
+    if momentum_df is None or momentum_df.empty:
+        return pd.DataFrame(columns=columns)
+    src = momentum_df.copy()
+    def nums(col, default=0):
+        return pd.to_numeric(src[col], errors="coerce").fillna(default) if col in src else pd.Series(default, index=src.index, dtype=float)
+    symbol_col = next((c for c in ["STOCK NAME", "Symbol", "SYMBOL", "symbol"] if c in src), None)
+    if symbol_col is None:
+        return pd.DataFrame(columns=columns)
+    vol = nums("VOLUME BUILDUP X")
+    comp = nums("RANGE COMPRESSION %", 100)
+    high_dist = nums("DISTANCE TO RANGE HIGH %", 100)
+    low_dist = nums("DISTANCE TO RANGE LOW %", 100)
+    base_score = nums("PRE-MOVE VOLUME SCORE")
+    raw_dir = src["PRE-MOVE VOLUME DIRECTION"].astype(str).str.upper() if "PRE-MOVE VOLUME DIRECTION" in src else pd.Series("NONE", index=src.index)
+    before = src["BEFORE MOVE DIRECTION"].astype(str).str.upper() if "BEFORE MOVE DIRECTION" in src else pd.Series("NONE", index=src.index)
+    direction = raw_dir.where(raw_dir.isin(["BUY", "SELL"]), before)
+    # The reference range must not have been broken already.
+    in_range = (high_dist >= 0) & (low_dist >= 0)
+    near_edge = ((direction.eq("BUY") & high_dist.le(0.5)) |
+                 (direction.eq("SELL") & low_dist.le(0.5)))
+    # ENERGY is a heuristic, distinct from prediction confidence.
+    energy = (base_score.clip(0, 80) + (near_edge & in_range).astype(int)*15 +
+              (vol.ge(1.5) & comp.le(2.5)).astype(int)*5).clip(0, 100)
+    status = np.select([
+        in_range & near_edge & vol.ge(1.5) & comp.le(2.5) & energy.ge(70),
+        in_range & vol.ge(1.2) & comp.le(3.0) & energy.ge(35),
+    ], ["🟠 PRE-MOVE WATCH", "🟡 ENERGY BUILDING"], default="⚪ WAIT")
+    out = pd.DataFrame({
+        "STOCK NAME": src[symbol_col].astype(str),
+        "LTP": nums("LTP"),
+        "ENERGY SCORE": energy.round().astype(int),
+        "VOLUME BUILDUP X": vol.round(2),
+        "5M DIRECTION": direction.where(direction.isin(["BUY", "SELL"]), "NONE"),
+        "15M DIRECTION": "NOT CHECKED",
+        "PRE-MOVE STATUS": status,
+        "RANGE COMPRESSION %": comp.round(2),
+        "DISTANCE TO RANGE HIGH %": high_dist.round(2),
+        "DISTANCE TO RANGE LOW %": low_dist.round(2),
+        "SIGNAL TIME": src["SIGNAL TIME"].astype(str) if "SIGNAL TIME" in src else "N/A",
+    })
+    return out.sort_values(["ENERGY SCORE", "VOLUME BUILDUP X"], ascending=False).reset_index(drop=True)
+
+
+def _early_15m_direction(fyers, symbol: str) -> str:
+    """Trend estimate from completed 15M candles; no guaranteed next move."""
+    try:
+        d = _fetch_timeframe_data(fyers, symbol, "15", lookback_days=7)
+        if d is None or len(d) < 25:
+            return "INSUFFICIENT DATA"
+        close = pd.to_numeric(d["Close"], errors="coerce").dropna()
+        if len(close) < 25:
+            return "INSUFFICIENT DATA"
+        ema9 = close.ewm(span=9, adjust=False).mean().iloc[-1]
+        ema21 = close.ewm(span=21, adjust=False).mean().iloc[-1]
+        last = close.iloc[-1]
+        if last > ema9 > ema21:
+            return "BUY"
+        if last < ema9 < ema21:
+            return "SELL"
+        return "NEUTRAL"
+    except Exception:
+        return "DATA ERROR"
+
+
+def _show_early_big_move_tab(fyers, all_symbols, fo_symbols):
+    st.markdown("### ⚡ EARLY BIG MOVE WATCH — BEFORE BREAKOUT")
+    st.caption("Energy buildup and price proximity are screening heuristics, not win rates or future-price guarantees.")
+    c1, c2, c3 = st.columns([2,2,1])
+    with c1:
+        selection = st.selectbox("Select universe", ["NSE Stocks", "F&O Stocks"], key="early_universe")
+    universe = all_symbols if selection == "NSE Stocks" else fo_symbols
+    if not universe:
+        st.warning("No symbols available for this universe")
+        return
+    with c2:
+        limit = st.number_input("Stocks to scan", min_value=1, max_value=len(universe), value=min(100,len(universe)), step=25, key="early_scan_limit")
+    with c3:
+        st.metric("Available", len(universe))
+    if st.button("⚡ RUN EARLY BIG MOVE SCAN", key="early_big_move_run", type="primary", use_container_width=True):
+        with st.spinner("Scanning completed 5M candles; then checking 15M trend for top candidates..."):
+            results, errors, stats = run_momentum_scan(fyers, universe[:limit], is_fo=(selection=="F&O Stocks"))
+            base = _early_move_table(pd.DataFrame(results))
+            # Avoid numerous extra requests: limit 15M verification to 30 highest-ranked watch candidates.
+            candidates = base.index[base["PRE-MOVE STATUS"].ne("⚪ WAIT")][:30]
+            for i in candidates:
+                symbol = str(base.at[i, "STOCK NAME"])
+                try:
+                    base.at[i, "15M DIRECTION"] = _early_15m_direction(fyers, symbol)
+                except Exception:
+                    base.at[i, "15M DIRECTION"] = "DATA ERROR"
+            st.session_state["early_move_df"] = base
+            st.session_state["early_move_stats"] = stats
+            st.session_state["early_move_time"] = _generated_timestamp()
+            st.session_state["early_move_errors"] = errors
+    table = st.session_state.get("early_move_df")
+    if table is None:
+        st.info("Select NSE/F&O, then press RUN EARLY BIG MOVE SCAN. Existing tabs remain unchanged.")
+        return
+    st.caption(f"Last scan: {st.session_state.get('early_move_time','N/A')} | 15M verification: top 30 watch candidates only")
+    if table.empty:
+        st.warning("No valid stock data returned. Check FYERS token, session, and error logs.")
+        return
+    f1, f2 = st.columns(2)
+    with f1:
+        status_filter = st.selectbox("Show candidates", ["PRE-MOVE WATCH + ENERGY BUILDING", "PRE-MOVE WATCH", "ENERGY BUILDING", "ALL"], key="early_status_filter")
+    with f2:
+        mtf_filter = st.checkbox("Only 5M / 15M matching direction", value=False, key="early_mtf_filter")
+    view = table.copy()
+    if status_filter == "PRE-MOVE WATCH":
+        view = view[view["PRE-MOVE STATUS"].str.contains("PRE-MOVE WATCH", na=False)]
+    elif status_filter == "ENERGY BUILDING":
+        view = view[view["PRE-MOVE STATUS"].str.contains("ENERGY BUILDING", na=False)]
+    elif status_filter != "ALL":
+        view = view[view["PRE-MOVE STATUS"].ne("⚪ WAIT")]
+    if mtf_filter:
+        view = view[view["5M DIRECTION"].eq(view["15M DIRECTION"]) & view["5M DIRECTION"].isin(["BUY", "SELL"])]
+    st.metric("Candidates shown", len(view))
+    st.dataframe(view, use_container_width=True, height=520, hide_index=True)
+    st.download_button("📥 DOWNLOAD EARLY MOVE EXCEL", data=_format_excel_output(view, "EARLY_BIG_MOVE"),
+        file_name=f"EARLY_BIG_MOVE_{_now_ist().strftime('%Y%m%d_%H%M')}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="early_move_download")
+    st.caption("15M NOT CHECKED = not validated, not an agreement. Watch signals require separate confirmation and backtesting.")
 
 
 def _fetch_momentum_signal(fyers, symbol: str, is_fo: bool = False):
@@ -5908,6 +6051,149 @@ def _new_scan_tab(fyers, all_symbols, fo_symbols, kind):
             st.info("No matching results; check data availability and scan conditions.")
     st.caption("Signals use completed 5-minute candles. WAIT is not a confirmed trade signal. AMD is heuristic, not proof of institutional activity.")
 
+
+# ========================================================================
+# ADD-ON: HH/HL / LH/LL + CANDLESTICK PATTERN SEARCH
+# Uses existing FYERS history fetcher and scans only completed candles.
+# ========================================================================
+def _pattern_and_structure_summary(df):
+    """Return confirmed swing structure plus latest complete candle patterns."""
+    import math
+    out = {"STRUCTURE": "NEUTRAL", "PATTERN": "NONE", "PATTERN BIAS": "NEUTRAL",
+           "LAST CLOSE": None, "BREAKOUT LEVEL": None, "BREAKDOWN LEVEL": None,
+           "DIST HIGH %": None, "DIST LOW %": None, "RVOL": None,
+           "PRE-MOVE STATUS": "WAIT", "REASON": "Insufficient data"}
+    if df is None or len(df) < 25:
+        return out
+    d = df.reset_index(drop=True)
+    a, b = d.iloc[-2], d.iloc[-1]
+    o, h, l, c = [float(b[k]) for k in ("Open", "High", "Low", "Close")]
+    po, pc = float(a["Open"]), float(a["Close"])
+    if not all(math.isfinite(x) for x in (o,h,l,c,po,pc)) or h < l or min(o,c) <= 0:
+        return out
+    rng = max(h-l, 1e-10)
+    body = abs(c-o)
+    upper = h-max(o,c)
+    lower = min(o,c)-l
+    bull_engulf = pc < po and c > o and o <= pc and c >= po and c > po
+    bear_engulf = pc > po and c < o and o >= pc and c <= po and c < po
+    if bull_engulf:
+        pattern, bias = "BULLISH ENGULFING", "UP WATCH"
+    elif bear_engulf:
+        pattern, bias = "BEARISH ENGULFING", "DOWN WATCH"
+    elif body/rng <= .10:
+        pattern, bias = "DOJI", "NEUTRAL"
+    elif lower >= 2 * max(body, .001*rng) and upper <= .30*rng and body/rng < .40:
+        pattern, bias = "HAMMER-SHAPE", "POTENTIAL UP REVERSAL"
+    elif upper >= 2 * max(body, .001*rng) and lower <= .30*rng and body/rng < .40:
+        pattern, bias = "SHOOTING-STAR-SHAPE", "POTENTIAL DOWN REVERSAL"
+    else:
+        pattern, bias = "NONE", "NEUTRAL"
+    ph, pl = _confirmed_pivots(d, left=2, right=2)
+    structure = "NEUTRAL"
+    if len(ph) >= 2 and len(pl) >= 2:
+        if ph[-1][1] > ph[-2][1] and pl[-1][1] > pl[-2][1]:
+            structure = "HH/HL"
+        elif ph[-1][1] < ph[-2][1] and pl[-1][1] < pl[-2][1]:
+            structure = "LH/LL"
+        elif ph[-1][1] > ph[-2][1]:
+            structure = "HH ONLY"
+        elif pl[-1][1] > pl[-2][1]:
+            structure = "HL ONLY"
+        elif ph[-1][1] < ph[-2][1]:
+            structure = "LH ONLY"
+        elif pl[-1][1] < pl[-2][1]:
+            structure = "LL ONLY"
+    # Previous closed-candle range: don't include current candle in levels
+    previous = d.iloc[-11:-1]
+    top, bottom = float(previous["High"].max()), float(previous["Low"].min())
+    dv = pd.to_numeric(d["Volume"], errors="coerce")
+    prior_mean = float(dv.iloc[-21:-1].mean())
+    rvol = float(dv.iloc[-1])/prior_mean if prior_mean > 0 else 0.0
+    dist_hi = 100*(top-c)/top if top > 0 else None
+    dist_lo = 100*(c-bottom)/bottom if bottom > 0 else None
+    premove = "WAIT"
+    if structure == "HH/HL" and dist_hi is not None and 0 <= dist_hi <= .5 and rvol >= 1.15:
+        premove = "UP PRE-MOVE WATCH"
+    elif structure == "LH/LL" and dist_lo is not None and 0 <= dist_lo <= .5 and rvol >= 1.15:
+        premove = "DOWN PRE-MOVE WATCH"
+    elif dist_hi is not None and dist_hi < 0 and structure == "HH/HL":
+        premove = "UP BREAKOUT ALREADY STARTED"
+    elif dist_lo is not None and dist_lo < 0 and structure == "LH/LL":
+        premove = "DOWN BREAKOUT ALREADY STARTED"
+    out.update({"STRUCTURE": structure, "PATTERN": pattern, "PATTERN BIAS": bias,
+                "LAST CLOSE": round(c,2), "BREAKOUT LEVEL": round(top,2),
+                "BREAKDOWN LEVEL": round(bottom,2), "DIST HIGH %": round(dist_hi,2) if dist_hi is not None else None,
+                "DIST LOW %": round(dist_lo,2) if dist_lo is not None else None,
+                "RVOL": round(rvol,2), "PRE-MOVE STATUS": premove,
+                "REASON": "Price structure + pattern are screening evidence, not confirmed predictions"})
+    return out
+
+
+def _run_pattern_scan(fyers, symbols, resolution, scan_limit):
+    rows, errors = [], []
+    chosen = symbols if scan_limit == 0 else symbols[:scan_limit]
+    progress = st.progress(0)
+    for i, sym in enumerate(chosen):
+        try:
+            df = _fetch_timeframe_data(fyers, sym, resolution, lookback_days=12 if resolution in ("5","15") else 55)
+            if df is None or len(df) < 25:
+                errors.append({"SYMBOL":sym,"ISSUE":"Insufficient closed OHLCV candles"})
+            else:
+                result = _pattern_and_structure_summary(df)
+                rows.append({"SYMBOL":sym,"TIMEFRAME":resolution+"m" if resolution != "D" else "1D",
+                             "CANDLE TIME":str(df["Time"].iloc[-1]),**result})
+        except Exception as exc:
+            errors.append({"SYMBOL":sym,"ISSUE":str(exc)[:120]})
+        progress.progress((i+1)/max(len(chosen),1))
+    progress.empty()
+    return pd.DataFrame(rows), pd.DataFrame(errors)
+
+
+def _show_pattern_scan_tab(fyers, all_symbols, fo_symbols, mode):
+    st.markdown("### " + ("📈 HH/HL • LH/LL Structure Search" if mode == "structure" else "🕯️ Candlestick Pattern Search"))
+    st.caption("Completed candle data only. Pattern recognition is indicative; not an assured BUY/SELL or predictive confidence.")
+    u, t, n = st.columns(3)
+    with u:
+        universe = st.selectbox("Universe",["F&O Stocks","NSE Stocks"],key=f"{mode}_universe")
+    stocks = fo_symbols if universe == "F&O Stocks" else all_symbols
+    with t:
+        tf = st.selectbox("Timeframe",["5","15","60","D"],format_func=lambda v: "1 Day" if v=="D" else f"{v} min",key=f"{mode}_tf")
+    with n:
+        limit = st.number_input("Stock count (0 = ALL)",min_value=0,max_value=max(0,len(stocks)),value=min(50,len(stocks)),key=f"{mode}_limit")
+    if st.button("🔎 RUN " + ("HH/HL SEARCH" if mode=="structure" else "CANDLESTICK SEARCH"),key=f"{mode}_run",type="primary"):
+        if not stocks:
+            st.warning("No stocks available for this universe")
+        else:
+            with st.spinner("Fetching completed candles from FYERS..."):
+                result, errors = _run_pattern_scan(fyers,stocks,tf,int(limit))
+                st.session_state[f"{mode}_results"] = result
+                st.session_state[f"{mode}_errors"] = errors
+    result = st.session_state.get(f"{mode}_results")
+    if result is not None:
+        if result.empty:
+            st.warning("No candle data returned. Check market history permissions and selected timeframe.")
+        else:
+            options = (["ALL","HH/HL","LH/LL","HH ONLY","HL ONLY","LH ONLY","LL ONLY","NEUTRAL"]
+                       if mode == "structure" else
+                       ["ALL","BULLISH ENGULFING","BEARISH ENGULFING","DOJI","HAMMER-SHAPE","SHOOTING-STAR-SHAPE","NONE"])
+            label = "Structure" if mode=="structure" else "Candlestick pattern"
+            selected = st.selectbox(label,options,key=f"{mode}_filter")
+            field = "STRUCTURE" if mode=="structure" else "PATTERN"
+            view = result if selected == "ALL" else result[result[field].eq(selected)]
+            pre_only = st.checkbox("Only PRE-MOVE WATCH candidates",key=f"{mode}_preonly")
+            if pre_only:
+                view = view[view["PRE-MOVE STATUS"].str.contains("PRE-MOVE WATCH",na=False)]
+            st.write(f"Matches: {len(view)} / Scanned with candles: {len(result)}")
+            st.dataframe(view,use_container_width=True,hide_index=True,height=520)
+            st.download_button("📥 Download results CSV",view.to_csv(index=False).encode("utf-8-sig"),
+                               file_name=f"{mode}_search.csv",mime="text/csv",key=f"{mode}_download")
+    errors = st.session_state.get(f"{mode}_errors")
+    if isinstance(errors,pd.DataFrame) and not errors.empty:
+        with st.expander(f"Skipped/errors: {len(errors)}"):
+            st.dataframe(errors,use_container_width=True,hide_index=True)
+
+
 def show_scanner(fyers) -> None:
     """Streamlit main app - NSE AI PRO V17 with MOMENTUM MOVERS"""
     
@@ -5956,7 +6242,10 @@ def show_scanner(fyers) -> None:
         "🧠 AMD SCANNER",
         "📊 ADDITIONAL INDICATORS",
         "⏱️ 20M RANGE BIG MOVE",
-        "🎯 PRE-BIG STOCK FINDER"
+        "🎯 PRE-BIG STOCK FINDER",
+        "📈 HH/HL STRUCTURE SEARCH",
+        "🕯️ CANDLESTICK SEARCH",
+        "⚡ EARLY BIG MOVE WATCH"
     ])
     
     # ════════════════════════════════════════════════════════════════════════════════
@@ -6804,7 +7093,9 @@ def show_scanner(fyers) -> None:
             st.session_state["fo_option_live_symbol"] = fo_pick
 
         live_opt = st.session_state.get("fo_option_live")
-        if live_opt:
+        if live_opt and st.session_state.get("fo_option_live_symbol") != fo_pick:
+            st.info("Selected stock changed. Press RUN LIVE OPTION CHECK to fetch this stock's chain.")
+        elif live_opt:
             if live_opt.get("status") == "OK":
                 spot = live_opt.get("spot")
                 if spot is None: spot = 0.0
@@ -7675,6 +7966,15 @@ def show_scanner(fyers) -> None:
                 "It does not claim true aggressor-side trade delta or guaranteed future movement. "
                 "Use the LIVE ORDER BOOK tab separately for FYERS bid/ask depth snapshot."
             )
+
+    with tabs[21]:
+        _show_pattern_scan_tab(fyers, all_symbols, fo_symbols, mode="structure")
+
+    with tabs[22]:
+        _show_pattern_scan_tab(fyers, all_symbols, fo_symbols, mode="candle")
+
+    with tabs[23]:
+        _show_early_big_move_tab(fyers, all_symbols, fo_symbols)
 
     gc.collect()
 
