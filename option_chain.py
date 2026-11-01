@@ -6461,166 +6461,6 @@ def _render_movement_search_sidebar() -> dict:
 
 
 
-
-# =============================================================
-# TOP CE/PE STRIKE MOVEMENT ALERTS (ADDITIVE)
-# Estimates only. Requires two fresh snapshots for surge checks.
-# =============================================================
-TOP_BLAST_SNAPSHOTS_KEY = "oc_top_blast_snapshots_v1"
-
-
-def _blast_number(value, default=float("nan")):
-    try:
-        x = float(value)
-        return x if math.isfinite(x) else default
-    except (TypeError, ValueError):
-        return default
-
-
-def _top_blast_rows(chain, symbol, expiry, instrument, now_seconds=None):
-    """Evaluate one instrument's two-snapshot changes, without invented missing data."""
-    if not isinstance(chain, pd.DataFrame) or chain.empty:
-        return []
-    now_seconds = time.time() if now_seconds is None else float(now_seconds)
-    history = st.session_state.setdefault(TOP_BLAST_SNAPSHOTS_KEY, {})
-    record_key = f"{instrument}|{symbol}|{expiry}"
-    old = history.get(record_key, {})
-    old_time = old.get("time", 0)
-    age = now_seconds - old_time
-    valid_comparison = (5 <= age <= 600)
-    prev = old.get("strikes", {}) if valid_comparison else {}
-    new = {}
-    alerts = []
-
-    for _, row in chain.iterrows():
-        strike = _blast_number(row.get("strike_price"))
-        if not math.isfinite(strike) or strike <= 0:
-            continue
-        for side in ("CE", "PE"):
-            prefix = side.lower()
-            price = _blast_number(row.get(f"{prefix}_ltp"))
-            volume = _blast_number(row.get(f"{prefix}_volume"))
-            delta = _blast_number(row.get(f"{prefix}_delta"))
-            gamma = _blast_number(row.get(f"{prefix}_gamma"))
-            oi = _blast_number(row.get(f"{prefix}_oi"))
-            key = f"{strike:g}|{side}"
-            new[key] = {"price": price, "volume": volume, "delta": delta,
-                        "gamma": gamma, "oi": oi}
-            earlier = prev.get(key, {})
-            p0 = _blast_number(earlier.get("price"))
-            v0 = _blast_number(earlier.get("volume"))
-            d0 = _blast_number(earlier.get("delta"))
-            g0 = _blast_number(earlier.get("gamma"))
-            if not (math.isfinite(price) and price > 0 and math.isfinite(volume) and volume >= 0):
-                continue
-            if not (valid_comparison and math.isfinite(p0) and p0 > 0 and math.isfinite(v0)):
-                continue
-            # NSE/FYERS chain 'volume' may be daily cumulative lots: compare snapshot INCREASE.
-            price_pct = 100 * (price - p0) / p0
-            volume_added = volume - v0
-            if volume_added < 0:  # reset / source change: not a surge
-                continue
-            baseline = max(v0, 1.0)
-            volume_increase_pct = 100 * volume_added / baseline
-            delta_change = delta - d0 if all(map(math.isfinite, (delta, d0))) else float("nan")
-            gamma_change_pct = (100 * (gamma - g0) / abs(g0) if all(map(math.isfinite, (gamma, g0))) and abs(g0) > 1e-10 else float("nan"))
-            # Requiring both appreciable price and volume change prevents false positives.
-            if price_pct >= 2 and volume_added >= 10 and volume_increase_pct >= 2:
-                status = "🚨 PRICE + VOLUME SURGE"
-            elif price_pct <= -2 and volume_added >= 10 and volume_increase_pct >= 2:
-                status = "🔻 PREMIUM DROP + VOLUME"
-            else:
-                continue
-            # Flag simultaneous model-Greek expansion only when the data exists.
-            # An increase in absolute delta/gamma does NOT prove that premium will blast.
-            greek_expansion = (math.isfinite(delta_change) and math.isfinite(d0)
-                               and abs(delta) > abs(d0) and abs(delta_change) >= 0.05
-                               and math.isfinite(gamma_change_pct) and gamma_change_pct >= 10)
-            if greek_expansion and price_pct >= 2:
-                status = "🚨 PRICE + VOLUME + DELTA/GAMMA EXPANSION"
-            score = min(100, round(min(abs(price_pct), 15) * 3 + min(volume_increase_pct, 30) + (10 if greek_expansion else 0), 1))
-            alerts.append({
-                "Instrument": instrument, "Symbol": symbol, "Expiry": expiry,
-                "Strike": strike, "Side": side, "LTP": round(price, 2),
-                "Price Change %": round(price_pct, 2),
-                "Volume": int(volume), "Added Volume": int(volume_added),
-                "Volume Increase %": round(volume_increase_pct, 2),
-                "OI": int(oi) if math.isfinite(oi) else None,
-                "Delta (model)": round(delta, 4) if math.isfinite(delta) else None,
-                "Delta Change": round(delta_change, 4) if math.isfinite(delta_change) else None,
-                "Gamma (model)": round(gamma, 6) if math.isfinite(gamma) else None,
-                "Gamma Change %": round(gamma_change_pct, 1) if math.isfinite(gamma_change_pct) else None,
-                "Watch Score": score, "Alert": status,
-                "Snapshot Gap (sec)": int(age),
-            })
-    # Don't overwrite a snapshot on UI reruns without new data: caller controls this.
-    history[record_key] = {"time": now_seconds, "strikes": new}
-    if len(history) > 60:
-        for k in list(history)[:-60]:
-            history.pop(k, None)
-    return sorted(alerts, key=lambda x: x["Watch Score"], reverse=True)
-
-
-def _show_top_blasting_alerts(state, cfg, fresh_data=False):
-    st.markdown("### 🚨 TOP ALERT BOX — INDEX & F&O CE / PE STRIKE MOVEMENTS")
-    st.caption("Price + volume changes between two fresh chain snapshots. Delta/Gamma are theoretical estimates, not actual trade flow or guaranteed moves.")
-    last_key = "oc_top_blast_alerts_latest"
-    identity = ("INDEX" if cfg["is_index"] else "F&O", cfg["symbol"], state.get("expiry_label", ""))
-    if fresh_data:
-        rows = _top_blast_rows(state["df"], identity[1], identity[2], identity[0])
-        st.session_state[last_key] = {"identity": identity, "rows": rows, "at": _india_now().strftime("%H:%M:%S IST")}
-    recent = st.session_state.get(last_key, {})
-    if recent.get("identity") != identity:
-        st.info("Choose an instrument and RUN / REFRESH twice to compare snapshots.")
-        return
-    rows = recent.get("rows", [])
-    if not rows:
-        st.info("No verified surge yet. Two refreshes at least 5 seconds apart are required; results remain WAIT if the conditions do not match.")
-    else:
-        st.warning(f"🚨 {len(rows)} strike movement alert(s) detected | Last processed: {recent.get('at', 'N/A')}")
-        st.dataframe(pd.DataFrame(rows).head(15), use_container_width=True, hide_index=True)
-    st.caption("Volume Increase % compares cumulative volume between snapshots; it is NOT RVOL. Gamma is not a predicted premium blast. Thresholds are screening heuristics.")
-
-
-def _render_multi_blast_watchlist(fyers=None):
-    with st.expander("🔎 MULTI INDEX + F&O STOCK STRIKE WATCHLIST", expanded=False):
-        indices = st.multiselect("Indices", ["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "SENSEX"], default=["NIFTY", "BANKNIFTY"], key="oc_blast_indices")
-        stocks = st.text_input("F&O stock symbols (comma-separated, maximum 5)", "RELIANCE,TCS", key="oc_blast_stocks")
-        strike_count = st.slider("ATM strikes each side", 3, 15, 6, key="oc_blast_strikes")
-        run = st.button("🚨 SCAN INDEX + F&O TOP ALERTS", key="oc_run_multi_blast", use_container_width=True)
-        if run:
-            instruments = [(x, True) for x in indices]
-            instruments += [(normalize_stock_symbol(x), False) for x in stocks.split(",") if x.strip()][:5]
-            results, errors = [], []
-            for symbol, is_index in instruments:
-                if is_index and symbol in NSE_UNSUPPORTED_INDICES and fyers is None:
-                    errors.append(f"{symbol}: FYERS connection required")
-                    continue
-                try:
-                    fetched = fetch_chain_unified(fyers, symbol, is_index, "" if is_index else symbol, "", strike_count)
-                    if not fetched.get("ok"):
-                        errors.append(f"{symbol}: {fetched.get('error', 'No data')}")
-                        continue
-                    frame, meta = fetched["df"], fetched["meta"]
-                    spot = _blast_number(meta.get("spot_price"), 0)
-                    frame = filter_strikes_around_atm(frame, spot, strike_count)
-                    frame = add_greeks_columns(frame, spot, meta.get("selected_expiry", ""))
-                    results.extend(_top_blast_rows(frame, symbol, meta.get("selected_expiry", ""), "INDEX" if is_index else "F&O"))
-                except Exception as exc:
-                    errors.append(f"{symbol}: {type(exc).__name__}: {str(exc)[:100]}")
-            st.session_state["oc_multi_blast_alerts"] = sorted(results, key=lambda x: x["Watch Score"], reverse=True)
-            st.session_state["oc_multi_blast_errors"] = errors
-            st.session_state["oc_multi_blast_time"] = _india_now().strftime("%H:%M:%S IST")
-        alerts = st.session_state.get("oc_multi_blast_alerts", [])
-        if alerts:
-            st.dataframe(pd.DataFrame(alerts).head(25), use_container_width=True, hide_index=True)
-        else:
-            st.info("No multi-instrument alerts. Run twice at least 5 seconds apart for snapshot comparison.")
-        if st.session_state.get("oc_multi_blast_errors"):
-            st.warning("Unavailable: " + "; ".join(st.session_state["oc_multi_blast_errors"][:8]))
-        st.caption("Batch scanning makes several provider calls. Data availability, rate limits and eligible derivative symbols vary.")
-
-
 def run_dashboard(fyers: Any = None) -> None:
     _configure_page()
     _inject_css()
@@ -6681,7 +6521,6 @@ def run_dashboard(fyers: Any = None) -> None:
         st.session_state.pop("oc_selected_expiry", None)
         st.session_state.pop("oc_liq_result", None)
 
-    blast_fresh = False
     if cfg["fetch_clicked"] or cfg["auto_refresh"]:
         # RUN SCANNER / FREE RUN intentionally works with NSE-only option-chain data.
         # Price-action/MSS signals require a connected FYERS client.
@@ -6691,7 +6530,6 @@ def run_dashboard(fyers: Any = None) -> None:
             result = _do_fetch_and_process(cfg, fyers)
         if result is not None:
             st.session_state["oc_state"] = result
-            blast_fresh = True
             st.session_state["oc_selected_expiry"] = result["expiry_label"]
 
     state = st.session_state.get("oc_state")
@@ -6729,9 +6567,6 @@ def run_dashboard(fyers: Any = None) -> None:
             st.write(f"Rows: {meta.get('total_rows_seen')} seen, {meta.get('rows_parsed')} parsed")
             st.write(f"Source: {state.get('data_source', 'UNKNOWN')}")
             st.dataframe(df.head(3), use_container_width=True)
-
-    _show_top_blasting_alerts(state, cfg, fresh_data=blast_fresh)
-    _render_multi_blast_watchlist(fyers)
 
     _render_summary_cards(state)
 
