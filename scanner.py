@@ -913,27 +913,43 @@ def calculate_momentum_score(analysis_5m: Dict, analysis_15m: Dict, analysis_1h:
         
         score = max(0, min(100, score))
         
-        if score >= 85:
-            if is_bullish:
-                status = "🟢 STRONG MOMENTUM BUY"
-            else:
-                status = "🔴 STRONG MOMENTUM SELL"
+        # Multi-timeframe safety gate: a high numeric score must never override
+        # missing or contradictory 5M/15M direction data.
+        expected = "BULLISH" if is_bullish else "BEARISH"
+        opposite = "BEARISH" if is_bullish else "BULLISH"
+        tf_5m = str(data_5m.get("structure_trend", "NEUTRAL")).upper()
+        tf_15m = str(data_15m.get("structure_trend", "NEUTRAL")).upper()
+        tf_1h = str(data_1h.get("structure_trend", "NEUTRAL")).upper()
+
+        if tf_5m not in ("BULLISH", "BEARISH") or tf_15m not in ("BULLISH", "BEARISH"):
+            status = "⚪ UNCONFIRMED — WAIT"
+            confirmation = "INSUFFICIENT DATA"
+        elif tf_5m != tf_15m:
+            status = "🟠 5M/15M CONFLICT — WAIT"
+            confirmation = "CONFLICT"
+        elif tf_5m != expected:
+            status = "🟠 DIRECTION CONFLICT — WAIT"
+            confirmation = "OPPOSITE TO SCORE DIRECTION"
+        elif tf_1h == opposite:
+            status = "🟡 5M/15M ALIGNED; 1H COUNTER-TREND — WATCH"
+            confirmation = "5M/15M ALIGNED; 1H COUNTER-TREND"
+        elif score >= 85:
+            status = "🟢 STRONG MOMENTUM BUY" if is_bullish else "🔴 STRONG MOMENTUM SELL"
+            confirmation = "5M/15M ALIGNED"
         elif score >= 70:
-            if is_bullish:
-                status = "🟢 MOMENTUM BUY"
-            else:
-                status = "🔴 MOMENTUM SELL"
+            status = "🟢 MOMENTUM BUY" if is_bullish else "🔴 MOMENTUM SELL"
+            confirmation = "5M/15M ALIGNED"
         elif score >= 55:
-            if is_bullish:
-                status = "🟡 DEVELOPING BUY"
-            else:
-                status = "🟠 DEVELOPING SELL"
+            status = "🟡 DEVELOPING BUY" if is_bullish else "🟠 DEVELOPING SELL"
+            confirmation = "5M/15M ALIGNED"
         else:
             status = "NONE"
-        
+            confirmation = "5M/15M ALIGNED; SCORE LOW"
+
         return {
             "score": round(score, 1),
             "status": status,
+            "confirmation": confirmation,
             "breakdown": score_breakdown,
         }
     
@@ -3602,139 +3618,6 @@ def _detect_pre_move_volume_setup(df: pd.DataFrame) -> Dict[str, Any]:
         return out
 
 
-
-# ================================================================
-# EARLY BIG MOVE WATCH — independent UI summary, no old tab changes
-# ================================================================
-def _early_move_table(momentum_df: pd.DataFrame) -> pd.DataFrame:
-    """Rank unbroken consolidation candidates; scores are NOT probabilities."""
-    columns = ["STOCK NAME", "LTP", "ENERGY SCORE", "VOLUME BUILDUP X",
-               "5M DIRECTION", "15M DIRECTION", "PRE-MOVE STATUS", "RANGE COMPRESSION %",
-               "DISTANCE TO RANGE HIGH %", "DISTANCE TO RANGE LOW %", "SIGNAL TIME"]
-    if momentum_df is None or momentum_df.empty:
-        return pd.DataFrame(columns=columns)
-    src = momentum_df.copy()
-    def nums(col, default=0):
-        return pd.to_numeric(src[col], errors="coerce").fillna(default) if col in src else pd.Series(default, index=src.index, dtype=float)
-    symbol_col = next((c for c in ["STOCK NAME", "Symbol", "SYMBOL", "symbol"] if c in src), None)
-    if symbol_col is None:
-        return pd.DataFrame(columns=columns)
-    vol = nums("VOLUME BUILDUP X")
-    comp = nums("RANGE COMPRESSION %", 100)
-    high_dist = nums("DISTANCE TO RANGE HIGH %", 100)
-    low_dist = nums("DISTANCE TO RANGE LOW %", 100)
-    base_score = nums("PRE-MOVE VOLUME SCORE")
-    raw_dir = src["PRE-MOVE VOLUME DIRECTION"].astype(str).str.upper() if "PRE-MOVE VOLUME DIRECTION" in src else pd.Series("NONE", index=src.index)
-    before = src["BEFORE MOVE DIRECTION"].astype(str).str.upper() if "BEFORE MOVE DIRECTION" in src else pd.Series("NONE", index=src.index)
-    direction = raw_dir.where(raw_dir.isin(["BUY", "SELL"]), before)
-    # The reference range must not have been broken already.
-    in_range = (high_dist >= 0) & (low_dist >= 0)
-    near_edge = ((direction.eq("BUY") & high_dist.le(0.5)) |
-                 (direction.eq("SELL") & low_dist.le(0.5)))
-    # ENERGY is a heuristic, distinct from prediction confidence.
-    energy = (base_score.clip(0, 80) + (near_edge & in_range).astype(int)*15 +
-              (vol.ge(1.5) & comp.le(2.5)).astype(int)*5).clip(0, 100)
-    status = np.select([
-        in_range & near_edge & vol.ge(1.5) & comp.le(2.5) & energy.ge(70),
-        in_range & vol.ge(1.2) & comp.le(3.0) & energy.ge(35),
-    ], ["🟠 PRE-MOVE WATCH", "🟡 ENERGY BUILDING"], default="⚪ WAIT")
-    out = pd.DataFrame({
-        "STOCK NAME": src[symbol_col].astype(str),
-        "LTP": nums("LTP"),
-        "ENERGY SCORE": energy.round().astype(int),
-        "VOLUME BUILDUP X": vol.round(2),
-        "5M DIRECTION": direction.where(direction.isin(["BUY", "SELL"]), "NONE"),
-        "15M DIRECTION": "NOT CHECKED",
-        "PRE-MOVE STATUS": status,
-        "RANGE COMPRESSION %": comp.round(2),
-        "DISTANCE TO RANGE HIGH %": high_dist.round(2),
-        "DISTANCE TO RANGE LOW %": low_dist.round(2),
-        "SIGNAL TIME": src["SIGNAL TIME"].astype(str) if "SIGNAL TIME" in src else "N/A",
-    })
-    return out.sort_values(["ENERGY SCORE", "VOLUME BUILDUP X"], ascending=False).reset_index(drop=True)
-
-
-def _early_15m_direction(fyers, symbol: str) -> str:
-    """Trend estimate from completed 15M candles; no guaranteed next move."""
-    try:
-        d = _fetch_timeframe_data(fyers, symbol, "15", lookback_days=7)
-        if d is None or len(d) < 25:
-            return "INSUFFICIENT DATA"
-        close = pd.to_numeric(d["Close"], errors="coerce").dropna()
-        if len(close) < 25:
-            return "INSUFFICIENT DATA"
-        ema9 = close.ewm(span=9, adjust=False).mean().iloc[-1]
-        ema21 = close.ewm(span=21, adjust=False).mean().iloc[-1]
-        last = close.iloc[-1]
-        if last > ema9 > ema21:
-            return "BUY"
-        if last < ema9 < ema21:
-            return "SELL"
-        return "NEUTRAL"
-    except Exception:
-        return "DATA ERROR"
-
-
-def _show_early_big_move_tab(fyers, all_symbols, fo_symbols):
-    st.markdown("### ⚡ EARLY BIG MOVE WATCH — BEFORE BREAKOUT")
-    st.caption("Energy buildup and price proximity are screening heuristics, not win rates or future-price guarantees.")
-    c1, c2, c3 = st.columns([2,2,1])
-    with c1:
-        selection = st.selectbox("Select universe", ["NSE Stocks", "F&O Stocks"], key="early_universe")
-    universe = all_symbols if selection == "NSE Stocks" else fo_symbols
-    if not universe:
-        st.warning("No symbols available for this universe")
-        return
-    with c2:
-        limit = st.number_input("Stocks to scan", min_value=1, max_value=len(universe), value=min(100,len(universe)), step=25, key="early_scan_limit")
-    with c3:
-        st.metric("Available", len(universe))
-    if st.button("⚡ RUN EARLY BIG MOVE SCAN", key="early_big_move_run", type="primary", use_container_width=True):
-        with st.spinner("Scanning completed 5M candles; then checking 15M trend for top candidates..."):
-            results, errors, stats = run_momentum_scan(fyers, universe[:limit], is_fo=(selection=="F&O Stocks"))
-            base = _early_move_table(pd.DataFrame(results))
-            # Avoid numerous extra requests: limit 15M verification to 30 highest-ranked watch candidates.
-            candidates = base.index[base["PRE-MOVE STATUS"].ne("⚪ WAIT")][:30]
-            for i in candidates:
-                symbol = str(base.at[i, "STOCK NAME"])
-                try:
-                    base.at[i, "15M DIRECTION"] = _early_15m_direction(fyers, symbol)
-                except Exception:
-                    base.at[i, "15M DIRECTION"] = "DATA ERROR"
-            st.session_state["early_move_df"] = base
-            st.session_state["early_move_stats"] = stats
-            st.session_state["early_move_time"] = _generated_timestamp()
-            st.session_state["early_move_errors"] = errors
-    table = st.session_state.get("early_move_df")
-    if table is None:
-        st.info("Select NSE/F&O, then press RUN EARLY BIG MOVE SCAN. Existing tabs remain unchanged.")
-        return
-    st.caption(f"Last scan: {st.session_state.get('early_move_time','N/A')} | 15M verification: top 30 watch candidates only")
-    if table.empty:
-        st.warning("No valid stock data returned. Check FYERS token, session, and error logs.")
-        return
-    f1, f2 = st.columns(2)
-    with f1:
-        status_filter = st.selectbox("Show candidates", ["PRE-MOVE WATCH + ENERGY BUILDING", "PRE-MOVE WATCH", "ENERGY BUILDING", "ALL"], key="early_status_filter")
-    with f2:
-        mtf_filter = st.checkbox("Only 5M / 15M matching direction", value=False, key="early_mtf_filter")
-    view = table.copy()
-    if status_filter == "PRE-MOVE WATCH":
-        view = view[view["PRE-MOVE STATUS"].str.contains("PRE-MOVE WATCH", na=False)]
-    elif status_filter == "ENERGY BUILDING":
-        view = view[view["PRE-MOVE STATUS"].str.contains("ENERGY BUILDING", na=False)]
-    elif status_filter != "ALL":
-        view = view[view["PRE-MOVE STATUS"].ne("⚪ WAIT")]
-    if mtf_filter:
-        view = view[view["5M DIRECTION"].eq(view["15M DIRECTION"]) & view["5M DIRECTION"].isin(["BUY", "SELL"])]
-    st.metric("Candidates shown", len(view))
-    st.dataframe(view, use_container_width=True, height=520, hide_index=True)
-    st.download_button("📥 DOWNLOAD EARLY MOVE EXCEL", data=_format_excel_output(view, "EARLY_BIG_MOVE"),
-        file_name=f"EARLY_BIG_MOVE_{_now_ist().strftime('%Y%m%d_%H%M')}.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="early_move_download")
-    st.caption("15M NOT CHECKED = not validated, not an agreement. Watch signals require separate confirmation and backtesting.")
-
-
 def _fetch_momentum_signal(fyers, symbol: str, is_fo: bool = False):
     """Intraday movement worker. Checks recent completed 5M candles and adds early-warning status."""
     stock_ticker = symbol.replace("NSE:", "").replace("-EQ", "") if isinstance(symbol,str) else str(symbol)
@@ -6244,8 +6127,7 @@ def show_scanner(fyers) -> None:
         "⏱️ 20M RANGE BIG MOVE",
         "🎯 PRE-BIG STOCK FINDER",
         "📈 HH/HL STRUCTURE SEARCH",
-        "🕯️ CANDLESTICK SEARCH",
-        "⚡ EARLY BIG MOVE WATCH"
+        "🕯️ CANDLESTICK SEARCH"
     ])
     
     # ════════════════════════════════════════════════════════════════════════════════
@@ -7972,9 +7854,6 @@ def show_scanner(fyers) -> None:
 
     with tabs[22]:
         _show_pattern_scan_tab(fyers, all_symbols, fo_symbols, mode="candle")
-
-    with tabs[23]:
-        _show_early_big_move_tab(fyers, all_symbols, fo_symbols)
 
     gc.collect()
 
