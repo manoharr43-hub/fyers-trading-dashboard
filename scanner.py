@@ -1438,7 +1438,7 @@ def _fetch_timeframe_data(fyers, symbol, resolution: str, lookback_days: int = 3
         if len(df) > 1:
             last_time = df["Time"].iloc[-1]
             candle_age = (_now_ist() - last_time).total_seconds() / 60
-            res_minutes = 1440 if resolution == "D" else int(resolution)
+            res_minutes = 1440 if str(resolution).upper() in ("D", "1D") else int(resolution)
             if candle_age < res_minutes + 1:
                 df = df.iloc[:-1].reset_index(drop=True)
         
@@ -1453,9 +1453,11 @@ def _fetch_timeframe_data(fyers, symbol, resolution: str, lookback_days: int = 3
 # ════════════════════════════════════════════════════════════════════════════════
 # TIMEFRAME ANALYSIS ENGINE (NEW - WITH PRESSURE)
 # ════════════════════════════════════════════════════════════════════════════════
-def analyze_timeframe(fyers, symbol: str, resolution: str) -> Dict[str, Any]:
-    """Analyze a specific timeframe."""
-    df = _fetch_timeframe_data(fyers, symbol, resolution, lookback_days=30)
+def analyze_timeframe(
+    fyers, symbol: str, resolution: str, lookback_days: int = 30
+) -> Dict[str, Any]:
+    """Analyze a specific timeframe; callers may tune history length."""
+    df = _fetch_timeframe_data(fyers, symbol, resolution, lookback_days=lookback_days)
     
     if df is None or len(df) < 10:
         return {
@@ -1499,11 +1501,14 @@ def analyze_timeframe(fyers, symbol: str, resolution: str) -> Dict[str, Any]:
         rsi_oversold = rsi_val < 30
         
         macd_bullish = macd_line.iloc[-1] > macd_sig.iloc[-1]
-        candle_date, candle_close_time = _candle_signal_timestamp(df, is_daily=False, resolution=resolution)
+        candle_date, candle_close_time = _candle_signal_timestamp(
+            df, is_daily=str(resolution).upper() in ("D", "1D"), resolution=resolution
+        )
         
         return {
             "timeframe": resolution,
             "status": "OK",
+            "df": df,  # Reuse fetched candles in PIN; do not request history twice.
             "data": {
                 "last_close": last_close,
                 "last_high": last_high,
@@ -4990,7 +4995,8 @@ def _pin_selected_tf_worker(fyers, symbol, resolution: str, tf_label: str):
     """Analyze one symbol on the timeframe selected in the PIN tab."""
     display_symbol = _pin_display_symbol(symbol)
     try:
-        analysis = analyze_timeframe(fyers, symbol, resolution)
+        pin_lookback = 7 if resolution == "5" else 20 if resolution == "15" else 365
+        analysis = analyze_timeframe(fyers, symbol, resolution, lookback_days=pin_lookback)
         df = analysis.get("df")
         data = analysis.get("data", {}) or {}
         if analysis.get("status") != "OK" or df is None or len(df) < 30:
@@ -5018,6 +5024,20 @@ def _pin_selected_tf_worker(fyers, symbol, resolution: str, tf_label: str):
 
         pin["Symbol"] = display_symbol
         pin["LTP"] = round(float(df["Close"].iloc[-1]), 2)
+        # Relative volume: latest candle volume vs. mean of the previous 20 candles.
+        # This is candle-volume buildup, not exchange trade-by-trade delta.
+        try:
+            vol_series = pd.to_numeric(df.get("Volume", pd.Series(dtype=float)), errors="coerce").fillna(0)
+            latest_vol = float(vol_series.iloc[-1]) if len(vol_series) else 0.0
+            prior_vol = vol_series.iloc[-21:-1] if len(vol_series) > 1 else vol_series.iloc[:0]
+            avg_prior_vol = float(prior_vol.mean()) if len(prior_vol) else 0.0
+            rvol = latest_vol / avg_prior_vol if avg_prior_vol > 0 else 0.0
+        except Exception:
+            latest_vol, avg_prior_vol, rvol = 0.0, 0.0, 0.0
+        pin["VOLUME"] = int(latest_vol) if latest_vol > 0 else 0
+        pin["AVG 20 CANDLE VOLUME"] = round(avg_prior_vol, 0)
+        pin["RVOL"] = round(rvol, 2)
+        pin["VOLUME STATUS"] = "🔥 HIGH VOLUME" if rvol >= 1.5 else "NORMAL VOLUME"
         pin["TIMEFRAME"] = tf_label
         pin["BUY LIQ SIGNAL"] = buy_liq_signal
         pin["SELL LIQ SIGNAL"] = sell_liq_signal
@@ -5035,9 +5055,12 @@ def _pin_selected_tf_worker(fyers, symbol, resolution: str, tf_label: str):
         return None, f"{display_symbol}: {type(e).__name__}: {str(e)[:100]}"
 
 
-def _run_pin_selected_timeframe_scan(fyers, universe, resolution: str, tf_label: str,
-                                     pin_min=PIN_MIN_CONFIDENCE, pin_mode="ALL"):
-    """PIN scan for NSE/F&O on user-selected 5M, 15M or Daily candles."""
+def _run_pin_selected_timeframe_scan(
+    fyers, universe, resolution: str, tf_label: str,
+    pin_min=PIN_MIN_CONFIDENCE, pin_mode="ALL", max_workers=None,
+    batch_size=100,
+):
+    """PIN scan with bounded futures; avoids queuing the whole NSE universe at once."""
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
     seen, symbols = set(), []
@@ -5049,34 +5072,45 @@ def _run_pin_selected_timeframe_scan(fyers, universe, resolution: str, tf_label:
     if not symbols:
         return pd.DataFrame(), ["No valid symbols available"]
 
+    workers = max(2, min(int(max_workers or PIN_FAST_WORKERS), 12))
+    batch_size = max(workers, int(batch_size))
     rows, errors = [], []
-    progress = st.progress(0.0, text=f"PIN {tf_label}: 0 / {len(symbols)}")
-    with ThreadPoolExecutor(max_workers=PIN_FAST_WORKERS) as executor:
-        futures = {
-            executor.submit(_pin_selected_tf_worker, fyers, symbol, resolution, tf_label): symbol
-            for symbol in symbols
-        }
-        for done, future in enumerate(as_completed(futures), start=1):
-            try:
-                row, error = future.result()
-            except Exception as e:
-                row, error = None, f"{futures[future]}: worker error: {str(e)[:100]}"
-            if row is not None:
-                rows.append(row)
-            if error:
-                errors.append(error)
-            progress.progress(done / max(len(symbols), 1), text=f"PIN {tf_label}: {done} / {len(symbols)} | Results: {len(rows)}")
-    progress.empty()
+    total, done = len(symbols), 0
+    progress = st.progress(0.0, text=f"PIN {tf_label}: 0 / {total:,}")
 
+    for offset in range(0, total, batch_size):
+        batch = symbols[offset:offset + batch_size]
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = {
+                executor.submit(_pin_selected_tf_worker, fyers, symbol, resolution, tf_label): symbol
+                for symbol in batch
+            }
+            for future in as_completed(futures):
+                try:
+                    row, error = future.result()
+                except Exception as exc:
+                    row, error = None, f"{_pin_display_symbol(futures[future])}: worker error: {type(exc).__name__}: {str(exc)[:100]}"
+                if row is not None:
+                    rows.append(row)
+                if error:
+                    errors.append(error)
+                done += 1
+                progress.progress(
+                    done / max(total, 1),
+                    text=f"PIN {tf_label}: {done:,}/{total:,} | Results: {len(rows):,} | Errors: {len(errors):,}",
+                )
+
+    progress.empty()
     result = pd.DataFrame(rows)
     if result.empty:
         return result, errors
 
-    score = pd.to_numeric(result.get("PIN SCORE", 0), errors="coerce").fillna(0)
+    score = pd.to_numeric(result.get("PIN SCORE", pd.Series(0, index=result.index)), errors="coerce").fillna(0)
     liq_signal = result.get("LIQUIDITY SIGNAL", pd.Series("⚪ WAIT", index=result.index)).astype(str).str.upper()
-    # Keep confirmed liquidity sweep signals even if the general PIN score is below
-    # the slider; otherwise use the normal PIN score threshold.
-    result = result[(score >= float(pin_min)) | liq_signal.str.contains("BUY LIQ|SELL LIQ", regex=True, na=False)].copy()
+    result = result[
+        (score >= float(pin_min))
+        | liq_signal.str.contains("BUY LIQ|SELL LIQ", regex=True, na=False)
+    ].copy()
 
     if not result.empty:
         pin_text = result.get("PIN SIGNAL", pd.Series("", index=result.index)).astype(str).str.upper()
@@ -5090,10 +5124,16 @@ def _run_pin_selected_timeframe_scan(fyers, universe, resolution: str, tf_label:
             result = result[combined.str.contains("STRONG", na=False)]
 
     if not result.empty:
-        result["__liq_rank"] = result["LIQUIDITY SIGNAL"].astype(str).str.contains("STRONG", na=False).astype(int) * 2 + result["LIQUIDITY SIGNAL"].astype(str).str.contains("BUY LIQ|SELL LIQ", regex=True, na=False).astype(int)
-        result["__score"] = pd.to_numeric(result.get("PIN SCORE", 0), errors="coerce").fillna(0)
-        result = result.sort_values(["__liq_rank", "__score"], ascending=[False, False]).drop(columns=["__liq_rank", "__score"]).reset_index(drop=True)
+        result["__liq_rank"] = (
+            result["LIQUIDITY SIGNAL"].astype(str).str.contains("STRONG", na=False).astype(int) * 2
+            + result["LIQUIDITY SIGNAL"].astype(str).str.contains("BUY LIQ|SELL LIQ", regex=True, na=False).astype(int)
+        )
+        result["__score"] = pd.to_numeric(result.get("PIN SCORE", pd.Series(0, index=result.index)), errors="coerce").fillna(0)
+        result = result.sort_values(["__liq_rank", "__score"], ascending=[False, False]).drop(
+            columns=["__liq_rank", "__score"]
+        ).reset_index(drop=True)
     return result, errors
+
 
 def _show_pin_rules_tab(fyers, all_symbols=None, fo_symbols=None) -> None:
     """PIN Rules scanner with NSE/F&O + 5M/15M/Daily selection."""
@@ -5113,7 +5153,8 @@ def _show_pin_rules_tab(fyers, all_symbols=None, fo_symbols=None) -> None:
         st.error(f"❌ No {source} symbols are available. Check symbol loading/FYERS access.")
         return
 
-    resolution = {"5 Minute": "5", "15 Minute": "15", "1 Day": "1D"}[tf_label]
+    # FYERS History API daily resolution is "D" (not "1D").
+    resolution = {"5 Minute": "5", "15 Minute": "15", "1 Day": "D"}[tf_label]
 
     with st.expander("📖 Liquidity Signal Rules", expanded=False):
         st.markdown("""
@@ -5137,26 +5178,37 @@ def _show_pin_rules_tab(fyers, all_symbols=None, fo_symbols=None) -> None:
         st.warning("⚠️ No valid symbols found for PIN scanning.")
         return
 
-    c1, c2, c3 = st.columns(3)
+    c1, c2, c3, c4 = st.columns(4)
     with c1:
         pin_min = st.slider("Minimum PIN score", 50, 100, PIN_MIN_CONFIDENCE, 1, key="pin_min_score")
     with c2:
         pin_mode = st.selectbox("Show", ["ALL", "BUY ONLY", "SELL ONLY", "STRONG ONLY"], key="pin_mode")
     with c3:
-        st.metric("TO SCAN", f"{total_available:,}")
+        pin_scan_limit = st.number_input(
+            "Scan limit (0 = ALL)", min_value=0, max_value=total_available,
+            value=min(300, total_available), step=100, key="pin_scan_limit",
+            help="Start with 300–500. Full NSE requires one FYERS history request per stock."
+        )
+    with c4:
+        st.metric("AVAILABLE", f"{total_available:,}")
 
-    st.info(f"📌 PIN-{('F&O' if source == 'F&O Stocks' else 'NSE')}-{tf_label.upper()} | {total_available:,} symbols")
+    pin_symbols_to_scan = candidate_symbols if int(pin_scan_limit) == 0 else candidate_symbols[:int(pin_scan_limit)]
+    st.info(
+        f"📌 PIN-{('F&O' if source == 'F&O Stocks' else 'NSE')}-{tf_label.upper()} "
+        f"| Selected: {len(pin_symbols_to_scan):,} / {total_available:,}"
+    )
 
-    run_label = f"▶ RUN PIN — {'F&O' if source == 'F&O Stocks' else 'NSE'} — {tf_label.upper()}"
+    run_label = f"▶ RUN PIN — {'F&O' if source == 'F&O Stocks' else 'NSE'} — {tf_label.upper()} ({len(pin_symbols_to_scan):,})"
     if st.button(run_label, key="pin_run", type="primary", use_container_width=True):
         with st.spinner(f"Scanning {source} {tf_label} liquidity signals…"):
             result, errors = _run_pin_selected_timeframe_scan(
-                fyers, candidate_symbols, resolution, tf_label,
-                pin_min=pin_min, pin_mode=pin_mode
+                fyers, pin_symbols_to_scan, resolution, tf_label,
+                pin_min=pin_min, pin_mode=pin_mode,
+                max_workers=PIN_FAST_WORKERS, batch_size=100
             )
         st.session_state["pin_df"] = result
         st.session_state["pin_errors"] = errors
-        st.session_state["pin_last_scan_count"] = total_available
+        st.session_state["pin_last_scan_count"] = len(pin_symbols_to_scan)
         st.session_state["pin_last_source"] = source
         st.session_state["pin_last_timeframe"] = tf_label
         st.session_state["pin_scanned_at"] = _now_ist().strftime("%d-%b-%Y %H:%M:%S IST")
@@ -5171,11 +5223,47 @@ def _show_pin_rules_tab(fyers, all_symbols=None, fo_symbols=None) -> None:
         pc4.metric("🔥 STRONG LIQ", int(liq_series.str.contains("STRONG", na=False).sum()))
         st.caption(f"Last scan: {st.session_state.get('pin_last_source','')} | {st.session_state.get('pin_last_timeframe','')} | {st.session_state.get('pin_scanned_at','N/A')}")
 
+        # PIN Alert Box: only ₹1,000+ stocks with a confirmed liquidity sweep.
+        # High-volume list is shown separately so volume buildup is not mistaken for a sweep.
+        pin_view = pin_df.copy()
+        pin_view["LTP"] = pd.to_numeric(pin_view.get("LTP", 0), errors="coerce").fillna(0)
+        pin_view["RVOL"] = pd.to_numeric(pin_view.get("RVOL", 0), errors="coerce").fillna(0)
+        price_alerts = pin_view[pin_view["LTP"] >= 1000].copy()
+        sweep_mask = price_alerts.get("LIQUIDITY SIGNAL", pd.Series("", index=price_alerts.index)).astype(str).str.upper().str.contains("BUY LIQ|SELL LIQ", regex=True)
+        sweep_alerts = price_alerts[sweep_mask].copy()
+
+        st.markdown("#### 🚨 ₹1,000+ BUY / SELL LIQUIDITY SWEEP — BLINK ALERT BOX")
+        if not sweep_alerts.empty:
+            st.markdown("""<style>
+            @keyframes pinSweepBlink { 0%, 100% {background:#fff1c2; opacity:1;} 50% {background:#ffcc66; opacity:.55;} }
+            .pin-sweep-alert { animation:pinSweepBlink 1s infinite; border:2px solid #d97706; border-radius:9px; padding:10px 14px; margin:7px 0; color:#111827; font-weight:700; }
+            </style>""", unsafe_allow_html=True)
+            for _, ar in sweep_alerts.sort_values("PIN SCORE" if "PIN SCORE" in sweep_alerts.columns else "LTP", ascending=False).iterrows():
+                sym = html.escape(str(ar.get("Symbol", "")))
+                sig = html.escape(str(ar.get("LIQUIDITY SIGNAL", "")))
+                sweep_text = html.escape(str(ar.get("SWEEP", "")))
+                rvol_text = float(ar.get("RVOL", 0) or 0)
+                ltp_text = float(ar.get("LTP", 0) or 0)
+                st.markdown(
+                    f'<div class="pin-sweep-alert">🚨 {sym} | ₹{ltp_text:,.2f} | {sig} | SWEEP: {sweep_text} | RVOL: {rvol_text:.2f}x</div>',
+                    unsafe_allow_html=True,
+                )
+        else:
+            st.info("₹1,000+ price stocks lo confirmed BUY/SELL liquidity sweep alert ippudu ledu.")
+
+        st.markdown("#### 🔊 HIGH VOLUME STOCKS — PIN SCAN")
+        high_volume_min = st.number_input("High volume threshold (RVOL x)", min_value=1.0, max_value=10.0, value=1.5, step=0.25, key="pin_high_volume_rvol")
+        high_volume_df = pin_view[pin_view["RVOL"] >= float(high_volume_min)].copy() if "RVOL" in pin_view.columns else pd.DataFrame()
+        if not high_volume_df.empty:
+            st.dataframe(high_volume_df.sort_values("RVOL", ascending=False), use_container_width=True, height=300, hide_index=True)
+        else:
+            st.caption(f"RVOL {high_volume_min:.2f}x or above high-volume stocks not found in this scan.")
+
         display_cols = [
             "Symbol", "TIMEFRAME", "LTP", "LIQUIDITY SIGNAL", "BUY LIQ SIGNAL", "SELL LIQ SIGNAL",
             "TOP LIQUIDITY LEVEL", "TOP LIQUIDITY STATUS", "BOTTOM LIQUIDITY LEVEL", "BOTTOM LIQUIDITY STATUS",
             "BUY LIQUIDITY", "BUY LIQUIDITY SCORE", "SELL LIQUIDITY", "SELL LIQUIDITY SCORE",
-            "SWEEP", "REVERSAL", "EQUAL HIGH", "EQUAL LOW", "TF TREND", "RVOL", "RSI",
+            "SWEEP", "REVERSAL", "EQUAL HIGH", "EQUAL LOW", "TF TREND", "VOLUME", "AVG 20 CANDLE VOLUME", "RVOL", "VOLUME STATUS", "RSI",
             "PIN SIGNAL", "PIN SCORE", "BIG MOVEMENT", "BIG MOVE SCORE", "SIGNAL TIME", "REASON"
         ]
         display_cols = [c for c in display_cols if c in pin_df.columns]
