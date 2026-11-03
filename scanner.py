@@ -896,7 +896,7 @@ def calculate_momentum_score(analysis_5m: Dict, analysis_15m: Dict, analysis_1h:
         
         # 8. RVOL (10 points)
         rvol = data_5m.get("rvol", 1.0)
-        if rvol >= 2.0:
+        if rvol >= float(min_rvol):
             score += 10
             score_breakdown["rvol"] = 10
         elif rvol >= 1.5:
@@ -2745,7 +2745,7 @@ def detect_block_order_activity(df: pd.DataFrame) -> Dict[str, Any]:
         # High-volume candle close behavior.
         buy_points = sell_points = 0.0
         reasons=[]
-        if rvol >= 2.0:
+        if rvol >= float(min_rvol):
             buy_points += 20; sell_points += 20; reasons.append(f"RVOL {rvol:.1f}x")
         elif rvol >= 1.5:
             buy_points += 12; sell_points += 12; reasons.append(f"RVOL {rvol:.1f}x")
@@ -6315,89 +6315,404 @@ def _best_move_quality_score(row: Dict[str, Any]) -> float:
     return round(max(0.0, min(100.0, score)), 1)
 
 
-def _show_best_buy_sell_big_move_tab(fyers, all_symbols, fo_symbols) -> None:
-    st.subheader("🏆 BEST BUY / SELL BIG MOVE")
-    st.caption("Ranks completed-candle movement signals using momentum, relative volume, candle strength and market structure. Score is a ranking score, not a win probability.")
+def _best_move_tf_direction(fyers, symbol: str, resolution: str) -> str:
+    """EMA/price structure direction on completed candles; used as a filter, not prediction."""
+    try:
+        lookback = 12 if resolution == "60" else 7
+        d = _fetch_timeframe_data(fyers, symbol, resolution, lookback_days=lookback)
+        if d is None or len(d) < 25:
+            return "INSUFFICIENT DATA"
+        close = pd.to_numeric(d["Close"], errors="coerce").dropna()
+        if len(close) < 25:
+            return "INSUFFICIENT DATA"
+        ema9 = close.ewm(span=9, adjust=False).mean().iloc[-1]
+        ema21 = close.ewm(span=21, adjust=False).mean().iloc[-1]
+        last = float(close.iloc[-1])
+        if last > ema9 > ema21:
+            return "BUY"
+        if last < ema9 < ema21:
+            return "SELL"
+        return "NEUTRAL"
+    except Exception:
+        return "DATA ERROR"
 
-    universe_name = st.radio("Stock universe", ["NSE Stocks", "F&O Stocks"], horizontal=True,
-                             key="best_move_universe")
-    universe = fo_symbols if universe_name == "F&O Stocks" else all_symbols
-    if not universe:
-        st.warning("No symbols are available for this universe.")
+
+def _best_move_quality_score(row: Dict[str, Any]) -> float:
+    """Transparent evidence score (0-100); explicitly not a probability."""
+    def num(key, default=0.0):
+        try:
+            value = pd.to_numeric(row.get(key, default), errors="coerce")
+            return float(value) if pd.notna(value) else float(default)
+        except Exception:
+            return float(default)
+
+    base = max(0.0, min(100.0, num("SCORE")))
+    rvol = max(0.0, num("RVOL"))
+    body = max(0.0, min(100.0, num("BODY %")))
+    body_atr = max(0.0, num("BODY / ATR"))
+    structure = str(row.get("STRUCTURE", "")).upper()
+    direction = str(row.get("DIRECTION", "")).upper()
+    volume_points = min(100.0, rvol / 2.5 * 100.0)
+    candle_points = min(100.0, body / 75.0 * 100.0)
+    atr_points = min(100.0, body_atr / 1.5 * 100.0)
+    structure_points = 100.0 if ((direction == "BUY" and structure == "HH/HL") or
+                                 (direction == "SELL" and structure == "LH/LL")) else 35.0
+    return round(max(0.0, min(100.0, 0.30 * base + 0.20 * volume_points +
+                              0.20 * candle_points + 0.15 * atr_points +
+                              0.15 * structure_points)), 1)
+
+
+def _show_best_buy_sell_big_move_tab(fyers, all_symbols, fo_symbols) -> None:
+    """Combined NSE+F&O workflow: pre-move buildup and separately confirmed moves."""
+    st.subheader("🏆 BEST BUY / SELL BIG MOVE — PRE-BUILDUP + CONFIRMED")
+    st.caption("NSE + F&O combined universe. PRE-BIG is an early watchlist; CONFIRMED requires direction, volume/candle strength and 15M/1H alignment. Scores are evidence rankings, not win probabilities.")
+
+    nse_set = set(_validate_symbols(all_symbols or []))
+    fo_set = set(_validate_symbols(fo_symbols or []))
+    combined = list(dict.fromkeys(list(fo_symbols or []) + list(all_symbols or [])))
+    combined = _validate_symbols(combined)
+    if not combined:
+        st.warning("NSE/F&O symbol lists are empty. Check symbol master and FYERS setup.")
         return
 
-    limit = st.number_input("Stocks to scan (0 = ALL)", min_value=0, max_value=len(universe),
-                            value=min(100, len(universe)), step=25, key="best_move_limit")
-    selected = universe if int(limit) == 0 else universe[:int(limit)]
-    min_quality = st.slider("Minimum quality score", min_value=50, max_value=95,
-                            value=75, step=5, key="best_move_min_quality")
-    c1, c2 = st.columns(2)
-    c1.metric("Available symbols", len(universe))
-    c2.metric("Selected for scan", len(selected))
+    c1, c2, c3 = st.columns(3)
+    c1.metric("NSE symbols", len(nse_set))
+    c2.metric("F&O symbols", len(fo_set))
+    c3.metric("Unique combined", len(combined))
+    scan_all = st.checkbox("Scan ALL unique NSE + F&O symbols (may take several minutes)", value=False,
+                           key="best_move_scan_all")
+    default_n = min(500, len(combined))
+    scan_limit = len(combined) if scan_all else int(st.number_input(
+        "Scan limit (from combined universe)", min_value=50, max_value=len(combined),
+        value=max(50, default_n), step=50, key="best_move_scan_limit"))
+    min_quality = st.slider("Minimum confirmation quality score", 60, 95, 80, 5,
+                            key="best_move_min_quality")
+    verify_count = st.slider("15M + 1H verification candidates", 10, 100, 40, 10,
+                             key="best_move_verify_count")
+    st.info("Default scans 500 unique symbols for speed. Tick 'Scan ALL' to cover the complete combined NSE + F&O universe.")
 
-    if st.button("🔍 SCAN BEST BUY / SELL BIG MOVES", key="best_move_run", type="primary"):
-        with st.spinner(f"Scanning {len(selected)} symbols using completed 5-minute candles…"):
-            rows, errors, stats = run_momentum_scan(fyers, selected, is_fo=(universe_name == "F&O Stocks"))
-        enriched = []
-        for item in rows:
-            row = dict(item)
-            row["QUALITY SCORE"] = _best_move_quality_score(row)
-            direction = str(row.get("DIRECTION", "")).upper()
-            rvol = float(pd.to_numeric(row.get("RVOL", 0), errors="coerce") or 0)
-            body = float(pd.to_numeric(row.get("BODY %", 0), errors="coerce") or 0)
-            body_atr = float(pd.to_numeric(row.get("BODY / ATR", 0), errors="coerce") or 0)
-            structure = str(row.get("STRUCTURE", "")).upper()
-            aligned_structure = ((direction == "BUY" and structure == "HH/HL") or
-                                 (direction == "SELL" and structure == "LH/LL"))
-            strict_confirm = (direction in ("BUY", "SELL") and
-                              row["QUALITY SCORE"] >= min_quality and
-                              rvol >= BIGMOVE_MIN_RVOL and
-                              body >= BIGMOVE_MIN_BODY_PCT and
-                              body_atr >= BIGMOVE_MIN_BODY_ATR and aligned_structure)
-            row["SETUP GRADE"] = "CONFIRMED QUALITY SETUP" if strict_confirm else "WATCH / NOT FULLY CONFIRMED"
-            enriched.append(row)
-        out = pd.DataFrame(enriched)
-        st.session_state["best_move_results"] = out
+    if st.button("🚀 RUN BOTH STRATEGIES — PRE-BUILDUP + CONFIRMED", key="best_move_run_both",
+                 type="primary", use_container_width=True):
+        selected = combined[:scan_limit]
+        with st.spinner(f"Scanning {len(selected)} unique NSE + F&O symbols on completed 5M candles..."):
+            # Symbols are NSE cash-equity symbols in the FYERS symbol format; the union
+            # is deduplicated so overlapping F&O names are not scanned twice.
+            rows, errors, stats = run_momentum_scan(fyers, selected, is_fo=False)
+
+        if rows:
+            raw = pd.DataFrame(rows)
+        else:
+            raw = pd.DataFrame()
+        if not raw.empty:
+            sym_col = next((c for c in ["STOCK NAME", "SYMBOL", "Symbol", "symbol"] if c in raw.columns), None)
+            if sym_col:
+                raw["SOURCE"] = raw[sym_col].astype(str).map(
+                    lambda x: "NSE + F&O" if x in nse_set and x in fo_set else
+                              "F&O" if x in fo_set else "NSE")
+            raw["QUALITY SCORE"] = raw.apply(lambda r: _best_move_quality_score(r.to_dict()), axis=1)
+            raw["5M DIRECTION"] = raw.get("DIRECTION", "NONE").astype(str).str.upper()
+            raw["15M DIRECTION"] = "NOT CHECKED"
+            raw["1H DIRECTION"] = "NOT CHECKED"
+
+            # PRE-BUILDUP is evaluated independently from breakout confirmation.
+            pre = _early_move_table(raw)
+            if not pre.empty:
+                pre = pre.rename(columns={"STOCK NAME": "SYMBOL"})
+                source_lookup = raw.set_index(sym_col)["SOURCE"].to_dict() if sym_col and "SOURCE" in raw else {}
+                pre["SOURCE"] = pre["SYMBOL"].map(source_lookup).fillna("NSE/F&O")
+                # Verify the strongest early candidates on 15M and 1H, but cap calls.
+                pre_candidates = pre.index[pre["PRE-MOVE STATUS"].ne("⚪ WAIT")][:verify_count]
+                for idx in pre_candidates:
+                    sym = str(pre.at[idx, "SYMBOL"])
+                    pre.at[idx, "15M DIRECTION"] = _best_move_tf_direction(fyers, sym, "15")
+                    pre.at[idx, "1H DIRECTION"] = _best_move_tf_direction(fyers, sym, "60")
+                pre["MTF MATCH"] = ((pre["5M DIRECTION"].eq(pre["15M DIRECTION"])) &
+                                    (pre["15M DIRECTION"].eq(pre["1H DIRECTION"])) &
+                                    pre["5M DIRECTION"].isin(["BUY", "SELL"]))
+                pre["FINAL PRE-MOVE STATUS"] = np.where(
+                    pre["PRE-MOVE STATUS"].eq("🟠 PRE-MOVE WATCH") & pre["MTF MATCH"],
+                    "🟠 HIGH-QUALITY PRE-BIG WATCH",
+                    np.where(pre["PRE-MOVE STATUS"].ne("⚪ WAIT"), "🟡 BUILDUP — WAIT FOR CONFIRMATION", "⚪ WAIT"))
+
+            # CONFIRMED movement: strict candle/volume/structure filters + 15M & 1H alignment.
+            confirmed = raw.copy()
+            # Cap extra timeframe requests: verify only the strongest candidates.
+            # Unchecked rows remain WATCH and can never be mislabeled CONFIRMED.
+            if "QUALITY SCORE" in confirmed.columns:
+                verify_idx = confirmed.sort_values("QUALITY SCORE", ascending=False).head(verify_count).index
+            else:
+                verify_idx = confirmed.index[:verify_count]
+            for idx in verify_idx:
+                row = confirmed.loc[idx]
+                direction = str(row.get("DIRECTION", "")).upper()
+                if direction in ("BUY", "SELL"):
+                    sym = str(row.get(sym_col, "")) if sym_col else ""
+                    confirmed.at[idx, "15M DIRECTION"] = _best_move_tf_direction(fyers, sym, "15")
+                    confirmed.at[idx, "1H DIRECTION"] = _best_move_tf_direction(fyers, sym, "60")
+            def nval(row, key):
+                try:
+                    v = pd.to_numeric(row.get(key, 0), errors="coerce")
+                    return float(v) if pd.notna(v) else 0.0
+                except Exception:
+                    return 0.0
+            grades = []
+            for _, row in confirmed.iterrows():
+                d = str(row.get("DIRECTION", "")).upper()
+                structure = str(row.get("STRUCTURE", "")).upper()
+                aligned_structure = ((d == "BUY" and structure == "HH/HL") or
+                                     (d == "SELL" and structure == "LH/LL"))
+                mtf = (str(row.get("15M DIRECTION", "")) == d and
+                       str(row.get("1H DIRECTION", "")) == d)
+                strict = (d in ("BUY", "SELL") and
+                          nval(row, "QUALITY SCORE") >= min_quality and
+                          nval(row, "RVOL") >= BIGMOVE_MIN_RVOL and
+                          nval(row, "BODY %") >= BIGMOVE_MIN_BODY_PCT and
+                          nval(row, "BODY / ATR") >= BIGMOVE_MIN_BODY_ATR and
+                          aligned_structure and mtf)
+                grades.append("✅ CONFIRMED BIG BUY" if strict and d == "BUY" else
+                              "✅ CONFIRMED BIG SELL" if strict and d == "SELL" else
+                              "🟡 WATCH — NOT CONFIRMED")
+            confirmed["FINAL STATUS"] = grades
+
+        else:
+            pre = pd.DataFrame()
+            confirmed = pd.DataFrame()
+
+        st.session_state["best_move_pre_results"] = pre
+        st.session_state["best_move_confirmed_results"] = confirmed
         st.session_state["best_move_errors"] = errors
         st.session_state["best_move_stats"] = stats
+        st.session_state["best_move_scan_time"] = _generated_timestamp()
 
-    out = st.session_state.get("best_move_results")
-    if isinstance(out, pd.DataFrame):
-        errors = st.session_state.get("best_move_errors", [])
-        st.caption(f"Returned rows: {len(out)} | Errors/skipped: {len(errors)}")
-        if not out.empty:
-            confirmed = out[out["SETUP GRADE"].eq("CONFIRMED QUALITY SETUP")].copy()
-            watches = out[out["SETUP GRADE"].ne("CONFIRMED QUALITY SETUP")].copy()
-            for frame in (confirmed, watches):
-                if not frame.empty:
-                    frame.sort_values("QUALITY SCORE", ascending=False, inplace=True)
-            st.markdown("#### 🟢 BEST BUY MOVES")
-            buy = confirmed[confirmed["DIRECTION"].astype(str).str.upper().eq("BUY")]
-            if buy.empty:
-                st.info("No BUY setup passed all strict filters in this scan.")
-            else:
-                st.dataframe(buy, use_container_width=True, hide_index=True, height=350)
-            st.markdown("#### 🔴 BEST SELL MOVES")
-            sell = confirmed[confirmed["DIRECTION"].astype(str).str.upper().eq("SELL")]
-            if sell.empty:
-                st.info("No SELL setup passed all strict filters in this scan.")
-            else:
-                st.dataframe(sell, use_container_width=True, hide_index=True, height=350)
-            with st.expander(f"⚠️ WATCH / NOT FULLY CONFIRMED ({len(watches)})"):
-                if watches.empty:
-                    st.info("No watch candidates.")
-                else:
-                    st.dataframe(watches.sort_values("QUALITY SCORE", ascending=False),
-                                 use_container_width=True, hide_index=True, height=350)
-            st.download_button("📥 DOWNLOAD BEST MOVE CSV", out.to_csv(index=False).encode("utf-8-sig"),
-                               file_name="best_buy_sell_big_move.csv", mime="text/csv", key="best_move_csv")
+    pre = st.session_state.get("best_move_pre_results")
+    confirmed = st.session_state.get("best_move_confirmed_results")
+    if pre is None or confirmed is None:
+        st.info("Choose scan limit or ALL, then press RUN. The tab runs both stages together.")
+        return
+    st.caption(f"Last scan: {st.session_state.get('best_move_scan_time', 'N/A')} | Unique scan universe: NSE + F&O")
+
+    st.markdown("#### 🟠 A. PRE-BIG MOVEMENT BUILDUP — BEFORE BREAKOUT")
+    if pre.empty:
+        st.info("No PRE-BIG buildup candidates found in this scan. Do not force a trade.")
+    else:
+        pre_view = pre[pre["FINAL PRE-MOVE STATUS"].ne("⚪ WAIT")].copy()
+        if pre_view.empty:
+            st.info("No qualifying buildup candidates. Market may be ranging or data may be insufficient.")
         else:
-            st.info("No movement candidates returned. Check symbol data availability or scan a smaller universe first.")
-        if errors:
-            with st.expander(f"Skipped / errors ({len(errors)})"):
-                st.write(errors[:200])
+            pre_view = pre_view.sort_values(["ENERGY SCORE", "VOLUME BUILDUP X"], ascending=False)
+            st.dataframe(pre_view, use_container_width=True, hide_index=True, height=360)
+            st.download_button("📥 Download PRE-BIG BUILDUP CSV", pre_view.to_csv(index=False).encode("utf-8-sig"),
+                               "pre_big_buildup.csv", "text/csv", key="best_move_pre_csv")
 
-    st.caption("Strict filter: direction + quality score + RVOL + candle body + body/ATR + matching HH/HL (BUY) or LH/LL (SELL). A WATCH row is not a confirmed trade. Backtest and paper-trade before live use.")
+    st.markdown("#### 🟢 B. CONFIRMED BIG BUY")
+    if confirmed.empty:
+        st.info("No movement rows returned by the 5M scan.")
+    else:
+        buys = confirmed[confirmed["FINAL STATUS"].eq("✅ CONFIRMED BIG BUY")].sort_values("QUALITY SCORE", ascending=False)
+        st.dataframe(buys, use_container_width=True, hide_index=True, height=280)
+        if buys.empty:
+            st.caption("No BUY row passed every strict filter. This is intentional; no forced signals.")
+
+        st.markdown("#### 🔴 C. CONFIRMED BIG SELL")
+        sells = confirmed[confirmed["FINAL STATUS"].eq("✅ CONFIRMED BIG SELL")].sort_values("QUALITY SCORE", ascending=False)
+        st.dataframe(sells, use_container_width=True, hide_index=True, height=280)
+        if sells.empty:
+            st.caption("No SELL row passed every strict filter. This is intentional; no forced signals.")
+
+        with st.expander("🟡 WATCH — movement not fully confirmed"):
+            watch = confirmed[confirmed["FINAL STATUS"].eq("🟡 WATCH — NOT CONFIRMED")].sort_values("QUALITY SCORE", ascending=False)
+            st.dataframe(watch, use_container_width=True, hide_index=True, height=350)
+        st.download_button("📥 Download CONFIRMED / WATCH CSV", confirmed.to_csv(index=False).encode("utf-8-sig"),
+                           "confirmed_big_move_results.csv", "text/csv", key="best_move_confirmed_csv")
+
+    errors = st.session_state.get("best_move_errors", [])
+    stats = st.session_state.get("best_move_stats")
+    if stats is not None:
+        st.caption(f"Scan total: {getattr(stats, 'total', 'N/A')} | Errors/skipped: {len(errors)}")
+    if errors:
+        with st.expander(f"⚠️ Skipped / data errors ({len(errors)})"):
+            st.write(errors[:200])
+    st.warning("80% accuracy is a research target, not a live guarantee. Measure actual win rate using historical/out-of-sample backtests, with fixed entry, stop-loss, target, brokerage and slippage. Quality score is NOT an 80% probability.")
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# LAST 5-MINUTE BIG-VOLUME SIGNAL SCANNER (ADDITIVE TAB)
+# ════════════════════════════════════════════════════════════════════════════════
+def _last5_rsi(series: pd.Series, period: int = 14) -> pd.Series:
+    delta = pd.to_numeric(series, errors="coerce").diff()
+    gain = delta.clip(lower=0).ewm(alpha=1/period, adjust=False, min_periods=period).mean()
+    loss = (-delta.clip(upper=0)).ewm(alpha=1/period, adjust=False, min_periods=period).mean()
+    rs = gain / loss.replace(0, np.nan)
+    return 100 - (100 / (1 + rs))
+
+
+def _analyze_last5m_big_volume(df: pd.DataFrame, symbol: str, max_age_minutes: int = 5, min_rvol: float = 2.0) -> List[Dict[str, Any]]:
+    """Create only fresh signals from completed 1-minute candles; OHLCV proxies, not tape data."""
+    found: List[Dict[str, Any]] = []
+    if df is None or len(df) < 25 or not {"Time", "Open", "High", "Low", "Close", "Volume"}.issubset(df.columns):
+        return found
+    try:
+        d = df.copy().sort_values("Time").dropna(subset=["Open", "High", "Low", "Close", "Volume"]).reset_index(drop=True)
+        for c in ["Open", "High", "Low", "Close", "Volume"]:
+            d[c] = pd.to_numeric(d[c], errors="coerce")
+        d = d.dropna(subset=["Open", "High", "Low", "Close", "Volume"]).reset_index(drop=True)
+        if len(d) < 25:
+            return found
+        last = d.iloc[-1]
+        prev = d.iloc[-2]
+        candle_start = pd.Timestamp(last["Time"])
+        if candle_start.tzinfo is None:
+            candle_start = candle_start.tz_localize("Asia/Kolkata")
+        else:
+            candle_start = candle_start.tz_convert("Asia/Kolkata")
+        signal_time = candle_start + pd.Timedelta(minutes=1)
+        now = _now_ist()
+        age = max(0.0, (now - signal_time).total_seconds() / 60.0)
+        # Ignore future timestamps and stale signals. The age uses candle-close time.
+        if age > max_age_minutes or signal_time > now + pd.Timedelta(seconds=30):
+            return found
+
+        o, h, l, c = map(float, [last["Open"], last["High"], last["Low"], last["Close"]])
+        pc = float(prev["Close"])
+        vol = float(last["Volume"])
+        avg_vol = float(d["Volume"].iloc[-21:-1].mean())
+        rvol = vol / avg_vol if avg_vol > 0 else 0.0
+        candle_range = max(h-l, 1e-9)
+        body_pct = abs(c-o) / candle_range * 100.0
+        atr_s = calculate_atr(d, 14)
+        atr = float(atr_s.iloc[-1]) if len(atr_s) and pd.notna(atr_s.iloc[-1]) else max(c*0.003, 0.01)
+        body_atr = abs(c-o) / atr if atr > 0 else 0.0
+        move_pct = abs(c-pc) / pc * 100.0 if pc else 0.0
+        direction = "BUY" if c > o else "SELL" if c < o else "NONE"
+        ema9 = d["Close"].ewm(span=9, adjust=False).mean()
+        ema21 = d["Close"].ewm(span=21, adjust=False).mean()
+        rsi = _last5_rsi(d["Close"])
+        rsi_now = float(rsi.iloc[-1]) if pd.notna(rsi.iloc[-1]) else 50.0
+        rsi_prev = float(rsi.iloc[-2]) if pd.notna(rsi.iloc[-2]) else 50.0
+        prior = d.iloc[-21:-1]
+        prior_high = float(prior["High"].max())
+        prior_low = float(prior["Low"].min())
+        prev_ema_diff = float(ema9.iloc[-2] - ema21.iloc[-2])
+        curr_ema_diff = float(ema9.iloc[-1] - ema21.iloc[-1])
+        ema_cross = "BUY" if prev_ema_diff <= 0 < curr_ema_diff else "SELL" if prev_ema_diff >= 0 > curr_ema_diff else ""
+        swept_low = float(last["Low"]) < prior_low and c > prior_low and c > o
+        swept_high = float(last["High"]) > prior_high and c < prior_high and c < o
+        bullish_engulf = (c > o and float(prev["Close"]) < float(prev["Open"]) and o <= float(prev["Close"]) and c >= float(prev["Open"]))
+        bearish_engulf = (c < o and float(prev["Close"]) > float(prev["Open"]) and o >= float(prev["Close"]) and c <= float(prev["Open"]))
+
+        base = {"SYMBOL": symbol.replace("NSE:", "").replace("-EQ", ""), "LTP": round(c, 2),
+                "SIGNAL TIME (IST)": signal_time.strftime("%H:%M:%S"), "SIGNAL CLOSE DATETIME": signal_time.isoformat(), "AGE (MIN)": round(age, 1),
+                "RVOL": round(rvol, 2), "MOVE %": round(move_pct, 3), "BODY %": round(body_pct, 1),
+                "BODY / ATR": round(body_atr, 2), "RSI 1M": round(rsi_now, 1), "EMA9": round(float(ema9.iloc[-1]), 2),
+                "EMA21": round(float(ema21.iloc[-1]), 2), "VOLUME": int(vol)}
+
+        # A volume spike is a mandatory quality gate for every displayed event.
+        if rvol >= float(min_rvol):
+            if direction in ("BUY", "SELL") and move_pct >= 0.20 and body_pct >= 55 and body_atr >= 0.45:
+                found.append({**base, "SIGNAL TYPE": "BIG MOVE " + direction, "DIRECTION": direction,
+                              "STRENGTH": min(100, round(35 + min(rvol, 5)*10 + min(body_pct,100)*0.2 + min(body_atr,2)*7, 1)),
+                              "REASON": f"1M move {move_pct:.2f}% | RVOL {rvol:.2f}x | body {body_pct:.0f}%"})
+            if swept_low:
+                found.append({**base, "SIGNAL TYPE": "LIQUIDITY SWEEP BUY", "DIRECTION": "BUY",
+                              "STRENGTH": min(100, round(45 + min(rvol,4)*10 + body_pct*0.15,1)),
+                              "REASON": f"Prior 20-bar low swept and reclaimed | RVOL {rvol:.2f}x"})
+            if swept_high:
+                found.append({**base, "SIGNAL TYPE": "LIQUIDITY SWEEP SELL", "DIRECTION": "SELL",
+                              "STRENGTH": min(100, round(45 + min(rvol,4)*10 + body_pct*0.15,1)),
+                              "REASON": f"Prior 20-bar high swept and rejected | RVOL {rvol:.2f}x"})
+            if ema_cross:
+                found.append({**base, "SIGNAL TYPE": "EMA 9/21 CROSS " + ema_cross, "DIRECTION": ema_cross,
+                              "STRENGTH": min(100, round(50 + min(rvol,4)*8 + body_pct*0.15,1)),
+                              "REASON": f"EMA9/EMA21 fresh crossover | RVOL {rvol:.2f}x"})
+            if (bullish_engulf or (rsi_prev < 30 <= rsi_now and c > o)):
+                found.append({**base, "SIGNAL TYPE": "REVERSAL BUY", "DIRECTION": "BUY",
+                              "STRENGTH": min(100, round(48 + min(rvol,4)*8 + body_pct*0.15,1)),
+                              "REASON": "Bullish engulfing / RSI recovery with volume spike"})
+            if (bearish_engulf or (rsi_prev > 70 >= rsi_now and c < o)):
+                found.append({**base, "SIGNAL TYPE": "REVERSAL SELL", "DIRECTION": "SELL",
+                              "STRENGTH": min(100, round(48 + min(rvol,4)*8 + body_pct*0.15,1)),
+                              "REASON": "Bearish engulfing / RSI rollover with volume spike"})
+        return found
+    except Exception:
+        return []
+
+
+def _show_last5m_big_volume_tab(fyers, all_symbols, fo_symbols) -> None:
+    st.subheader("⚡ LAST 5-MIN BIG VOLUME SIGNALS")
+    st.caption("Only completed 1-minute candle events whose close time is within the last 5 minutes. Volume-based OHLCV signals; not exchange tick-by-tick aggressor flow.")
+    nse_set, fo_set = set(all_symbols or []), set(fo_symbols or [])
+    combined = sorted(nse_set | fo_set, key=lambda x: (x not in fo_set, x))
+    if not combined:
+        st.warning("No NSE / F&O symbols available.")
+        return
+    c1, c2, c3 = st.columns(3)
+    c1.metric("NSE", len(nse_set)); c2.metric("F&O", len(fo_set)); c3.metric("Unique", len(combined))
+    universe_mode = st.radio("Universe", ["NSE + F&O (combined)", "F&O first / F&O only", "NSE only"], horizontal=True, key="last5_universe")
+    universe = combined if universe_mode == "NSE + F&O (combined)" else (sorted(fo_set) if universe_mode == "F&O first / F&O only" else sorted(nse_set))
+    scan_all = st.checkbox("Scan ALL selected symbols (may take time; late results can expire)", value=False, key="last5_scan_all")
+    default_limit = min(200, len(universe))
+    limit = len(universe) if scan_all else int(st.number_input("Scan limit", min_value=1, max_value=len(universe), value=max(1, default_limit), step=25, key="last5_scan_limit"))
+    workers = st.select_slider("Parallel requests", options=[2, 3, 4, 5, 6], value=4, key="last5_workers")
+    rvol_min = st.slider("Minimum RVOL (x)", 1.5, 5.0, 2.0, 0.25, key="last5_rvol_min")
+    st.info("Default 200 symbols for fresher results. Use ALL only if your FYERS rate limit allows it. F&O symbols are prioritized in combined mode.")
+    if st.button("🔎 SCAN LAST 5 MINUTES", type="primary", use_container_width=True, key="last5_run"):
+        symbols = universe[:limit]
+        rows, errors = [], []
+        progress = st.progress(0.0, text=f"Fetching 1-minute candles: 0/{len(symbols)}")
+        completed = 0
+        def fetch_one(sym):
+            frame = _fetch_timeframe_data(fyers, sym, "1", lookback_days=2)
+            return sym, frame
+        with ThreadPoolExecutor(max_workers=int(workers)) as pool:
+            futures = {pool.submit(fetch_one, sym): sym for sym in symbols}
+            for future in as_completed(futures):
+                sym = futures[future]
+                try:
+                    got_sym, frame = future.result()
+                    if frame is None:
+                        errors.append(f"{sym}: 1M data unavailable")
+                    else:
+                        sigs = _analyze_last5m_big_volume(frame, got_sym, max_age_minutes=5, min_rvol=float(rvol_min))
+                        rows.extend([x for x in sigs if float(x.get("RVOL", 0)) >= float(rvol_min)])
+                except Exception as exc:
+                    errors.append(f"{sym}: {type(exc).__name__}: {str(exc)[:100]}")
+                completed += 1
+                progress.progress(completed / max(1, len(symbols)), text=f"1M candles: {completed}/{len(symbols)} | signals: {len(rows)}")
+        progress.empty()
+        out = pd.DataFrame(rows)
+        if not out.empty:
+            # Re-check freshness after the entire universe scan; early rows may expire while later symbols are fetched.
+            now_utc = pd.Timestamp(_now_ist()).tz_convert("UTC")
+            close_utc = pd.to_datetime(out["SIGNAL CLOSE DATETIME"], utc=True, errors="coerce")
+            age_after_scan = (now_utc - close_utc).dt.total_seconds() / 60.0
+            out = out[(age_after_scan >= -0.5) & (age_after_scan <= 5.0)].copy()
+            out["AGE (MIN)"] = age_after_scan.loc[out.index].clip(lower=0).round(1)
+            out = out.sort_values(["STRENGTH", "RVOL", "AGE (MIN)"], ascending=[False, False, True]).drop_duplicates(subset=["SYMBOL", "SIGNAL TYPE"], keep="first").reset_index(drop=True)
+        st.session_state["last5_signal_rows"] = out
+        st.session_state["last5_signal_errors"] = errors
+        st.session_state["last5_scan_at"] = _generated_timestamp()
+    out = st.session_state.get("last5_signal_rows")
+    if out is None:
+        st.info("Press SCAN LAST 5 MINUTES to fetch fresh signals.")
+        return
+    st.caption(f"Last scan: {st.session_state.get('last5_scan_at','N/A')} | Signals: {len(out)} | Data age is rechecked at scan time.")
+    if out.empty:
+        st.warning("No qualifying fresh signal found in the selected universe. This is better than displaying stale or weak signals.")
+    else:
+        type_filter = st.multiselect("Signal types", sorted(out["SIGNAL TYPE"].unique().tolist()), default=sorted(out["SIGNAL TYPE"].unique().tolist()), key="last5_type_filter")
+        dir_filter = st.multiselect("Direction", ["BUY", "SELL"], default=["BUY", "SELL"], key="last5_dir_filter")
+        view = out[out["SIGNAL TYPE"].isin(type_filter) & out["DIRECTION"].isin(dir_filter)].copy()
+        buys = view[view["DIRECTION"].eq("BUY")]
+        sells = view[view["DIRECTION"].eq("SELL")]
+        m1, m2, m3 = st.columns(3); m1.metric("Fresh BUY", len(buys)); m2.metric("Fresh SELL", len(sells)); m3.metric("High RVOL ≥ 3x", int((view["RVOL"] >= 3).sum()))
+        st.dataframe(view, use_container_width=True, hide_index=True, height=520)
+        st.download_button("📥 Download Last 5-Min Signals CSV", view.to_csv(index=False).encode("utf-8-sig"),
+                           "last_5_min_big_volume_signals.csv", "text/csv", key="last5_download")
+    errors = st.session_state.get("last5_signal_errors", [])
+    if errors:
+        with st.expander(f"Skipped / API errors ({len(errors)})"):
+            st.write(errors[:150])
+    st.warning("A 1-minute candle signal is considered fresh only when its close time is ≤5 minutes old. EMA/RSI/sweep conditions are OHLCV estimates, not proof of real-time order-book liquidity. Validate signals with backtesting before trading.")
 
 
 def show_scanner(fyers) -> None:
@@ -6452,7 +6767,8 @@ def show_scanner(fyers) -> None:
         "📈 HH/HL STRUCTURE SEARCH",
         "🕯️ CANDLESTICK SEARCH",
         "⚡ EARLY BIG MOVE WATCH",
-        "🏆 BEST BUY/SELL BIG MOVE"
+        "🏆 BEST BUY/SELL BIG MOVE",
+        "⚡ LAST 5-MIN BIG VOLUME SIGNALS"
     ])
     
     # ════════════════════════════════════════════════════════════════════════════════
@@ -8185,6 +8501,9 @@ def show_scanner(fyers) -> None:
 
     with tabs[24]:
         _show_best_buy_sell_big_move_tab(fyers, all_symbols, fo_symbols)
+
+    with tabs[25]:
+        _show_last5m_big_volume_tab(fyers, all_symbols, fo_symbols)
 
     gc.collect()
 
