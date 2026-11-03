@@ -1808,7 +1808,7 @@ def calculate_master_signal(symbol: str, analysis_5m: Dict, analysis_15m: Dict, 
                 "pressure": 50,
                 "options": 50,
             },
-            "signal_reason": f"VWAP conflict: Price {last_close:.2f} vs VWAP {vwap:.2f if vwap else 'N/A'}",
+            "signal_reason": f"VWAP conflict: Price {last_close:.2f} vs VWAP {f'{vwap:.2f}' if vwap is not None else 'N/A'}",
         }
     
     ema_trend = data_5m.get("ema_trend", "NEUTRAL")
@@ -6282,6 +6282,124 @@ def _show_pattern_scan_tab(fyers, all_symbols, fo_symbols, mode):
             st.dataframe(errors,use_container_width=True,hide_index=True)
 
 
+
+# ========================================================================
+# ADD-ON: BEST BUY / SELL BIG MOVE RANKER
+# Uses the existing momentum scanner and applies a transparent quality score.
+# It does not change the existing scan engines or their output columns.
+# ========================================================================
+def _best_move_quality_score(row: Dict[str, Any]) -> float:
+    """Rank confirmed moves from existing candle, volume and structure metrics."""
+    def num(key, default=0.0):
+        try:
+            value = pd.to_numeric(row.get(key, default), errors="coerce")
+            return float(value) if pd.notna(value) else float(default)
+        except Exception:
+            return float(default)
+
+    base = max(0.0, min(100.0, num("SCORE")))
+    rvol = max(0.0, num("RVOL"))
+    body = max(0.0, min(100.0, num("BODY %")))
+    body_atr = max(0.0, num("BODY / ATR"))
+    structure = str(row.get("STRUCTURE", "")).upper()
+    direction = str(row.get("DIRECTION", "")).upper()
+
+    # Components are capped so one extreme metric cannot dominate the ranking.
+    volume_points = min(100.0, (rvol / 2.5) * 100.0)
+    candle_points = min(100.0, (body / 75.0) * 100.0)
+    atr_points = min(100.0, (body_atr / 1.5) * 100.0)
+    structure_points = 100.0 if ((direction == "BUY" and structure == "HH/HL") or
+                                 (direction == "SELL" and structure == "LH/LL")) else 35.0
+    score = (0.35 * base + 0.20 * volume_points + 0.20 * candle_points +
+             0.15 * atr_points + 0.10 * structure_points)
+    return round(max(0.0, min(100.0, score)), 1)
+
+
+def _show_best_buy_sell_big_move_tab(fyers, all_symbols, fo_symbols) -> None:
+    st.subheader("🏆 BEST BUY / SELL BIG MOVE")
+    st.caption("Ranks completed-candle movement signals using momentum, relative volume, candle strength and market structure. Score is a ranking score, not a win probability.")
+
+    universe_name = st.radio("Stock universe", ["NSE Stocks", "F&O Stocks"], horizontal=True,
+                             key="best_move_universe")
+    universe = fo_symbols if universe_name == "F&O Stocks" else all_symbols
+    if not universe:
+        st.warning("No symbols are available for this universe.")
+        return
+
+    limit = st.number_input("Stocks to scan (0 = ALL)", min_value=0, max_value=len(universe),
+                            value=min(100, len(universe)), step=25, key="best_move_limit")
+    selected = universe if int(limit) == 0 else universe[:int(limit)]
+    min_quality = st.slider("Minimum quality score", min_value=50, max_value=95,
+                            value=75, step=5, key="best_move_min_quality")
+    c1, c2 = st.columns(2)
+    c1.metric("Available symbols", len(universe))
+    c2.metric("Selected for scan", len(selected))
+
+    if st.button("🔍 SCAN BEST BUY / SELL BIG MOVES", key="best_move_run", type="primary"):
+        with st.spinner(f"Scanning {len(selected)} symbols using completed 5-minute candles…"):
+            rows, errors, stats = run_momentum_scan(fyers, selected, is_fo=(universe_name == "F&O Stocks"))
+        enriched = []
+        for item in rows:
+            row = dict(item)
+            row["QUALITY SCORE"] = _best_move_quality_score(row)
+            direction = str(row.get("DIRECTION", "")).upper()
+            rvol = float(pd.to_numeric(row.get("RVOL", 0), errors="coerce") or 0)
+            body = float(pd.to_numeric(row.get("BODY %", 0), errors="coerce") or 0)
+            body_atr = float(pd.to_numeric(row.get("BODY / ATR", 0), errors="coerce") or 0)
+            structure = str(row.get("STRUCTURE", "")).upper()
+            aligned_structure = ((direction == "BUY" and structure == "HH/HL") or
+                                 (direction == "SELL" and structure == "LH/LL"))
+            strict_confirm = (direction in ("BUY", "SELL") and
+                              row["QUALITY SCORE"] >= min_quality and
+                              rvol >= BIGMOVE_MIN_RVOL and
+                              body >= BIGMOVE_MIN_BODY_PCT and
+                              body_atr >= BIGMOVE_MIN_BODY_ATR and aligned_structure)
+            row["SETUP GRADE"] = "CONFIRMED QUALITY SETUP" if strict_confirm else "WATCH / NOT FULLY CONFIRMED"
+            enriched.append(row)
+        out = pd.DataFrame(enriched)
+        st.session_state["best_move_results"] = out
+        st.session_state["best_move_errors"] = errors
+        st.session_state["best_move_stats"] = stats
+
+    out = st.session_state.get("best_move_results")
+    if isinstance(out, pd.DataFrame):
+        errors = st.session_state.get("best_move_errors", [])
+        st.caption(f"Returned rows: {len(out)} | Errors/skipped: {len(errors)}")
+        if not out.empty:
+            confirmed = out[out["SETUP GRADE"].eq("CONFIRMED QUALITY SETUP")].copy()
+            watches = out[out["SETUP GRADE"].ne("CONFIRMED QUALITY SETUP")].copy()
+            for frame in (confirmed, watches):
+                if not frame.empty:
+                    frame.sort_values("QUALITY SCORE", ascending=False, inplace=True)
+            st.markdown("#### 🟢 BEST BUY MOVES")
+            buy = confirmed[confirmed["DIRECTION"].astype(str).str.upper().eq("BUY")]
+            if buy.empty:
+                st.info("No BUY setup passed all strict filters in this scan.")
+            else:
+                st.dataframe(buy, use_container_width=True, hide_index=True, height=350)
+            st.markdown("#### 🔴 BEST SELL MOVES")
+            sell = confirmed[confirmed["DIRECTION"].astype(str).str.upper().eq("SELL")]
+            if sell.empty:
+                st.info("No SELL setup passed all strict filters in this scan.")
+            else:
+                st.dataframe(sell, use_container_width=True, hide_index=True, height=350)
+            with st.expander(f"⚠️ WATCH / NOT FULLY CONFIRMED ({len(watches)})"):
+                if watches.empty:
+                    st.info("No watch candidates.")
+                else:
+                    st.dataframe(watches.sort_values("QUALITY SCORE", ascending=False),
+                                 use_container_width=True, hide_index=True, height=350)
+            st.download_button("📥 DOWNLOAD BEST MOVE CSV", out.to_csv(index=False).encode("utf-8-sig"),
+                               file_name="best_buy_sell_big_move.csv", mime="text/csv", key="best_move_csv")
+        else:
+            st.info("No movement candidates returned. Check symbol data availability or scan a smaller universe first.")
+        if errors:
+            with st.expander(f"Skipped / errors ({len(errors)})"):
+                st.write(errors[:200])
+
+    st.caption("Strict filter: direction + quality score + RVOL + candle body + body/ATR + matching HH/HL (BUY) or LH/LL (SELL). A WATCH row is not a confirmed trade. Backtest and paper-trade before live use.")
+
+
 def show_scanner(fyers) -> None:
     """Streamlit main app - NSE AI PRO V17 with MOMENTUM MOVERS"""
     
@@ -6333,7 +6451,8 @@ def show_scanner(fyers) -> None:
         "🎯 PRE-BIG STOCK FINDER",
         "📈 HH/HL STRUCTURE SEARCH",
         "🕯️ CANDLESTICK SEARCH",
-        "⚡ EARLY BIG MOVE WATCH"
+        "⚡ EARLY BIG MOVE WATCH",
+        "🏆 BEST BUY/SELL BIG MOVE"
     ])
     
     # ════════════════════════════════════════════════════════════════════════════════
@@ -8063,6 +8182,9 @@ def show_scanner(fyers) -> None:
 
     with tabs[23]:
         _show_early_big_move_tab(fyers, all_symbols, fo_symbols)
+
+    with tabs[24]:
+        _show_best_buy_sell_big_move_tab(fyers, all_symbols, fo_symbols)
 
     gc.collect()
 
