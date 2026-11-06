@@ -277,7 +277,13 @@ def show_advanced_ai(client):
 # Compatibility aliases for existing callers.
 def show_advanced_ai_time_machine(client):
     show_advanced_ai(client)
-
+# Compatibility with scanner.py
+def show_advanced_ai_tab(
+    client,
+    history_fetcher=None,
+    **kwargs
+):
+    show_advanced_ai(client)
 
 def ai_backtest_ui(client):
     show_advanced_ai(client)# Compatibility function for scanner.py
