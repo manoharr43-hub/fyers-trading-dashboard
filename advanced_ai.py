@@ -1157,12 +1157,30 @@ def ai_backtest_ui(
     history_fetcher=None,
     **kwargs
 ):
+# ============================================================
+# SCANNER COMPATIBILITY
+# Handles positional and keyword arguments safely.
+# ============================================================
+
+def show_advanced_ai_tab(*args, **kwargs):
+
+    client = kwargs.pop("client", None)
+    history_fetcher = kwargs.pop("history_fetcher", None)
+
+    # First positional argument = FYERS client
+    if client is None and len(args) >= 1:
+        client = args[0]
+
+    # Second positional argument may be history_fetcher
+    if history_fetcher is None and len(args) >= 2:
+        history_fetcher = args[1]
+
+    if client is None:
+        st.error("FYERS client is missing.")
+        return
 
     show_advanced_ai(
-
         client=client,
-
-        history_fetcher=history_fetcher,
-
-        **kwargs
+        history_fetcher=history_fetcher
     )
+    
