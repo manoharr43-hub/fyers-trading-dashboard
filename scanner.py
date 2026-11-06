@@ -5977,6 +5977,95 @@ def _show_ai_chart_analysis_tab():
 
 
 
+
+def _big_move_continuation_report(row: pd.Series) -> dict:
+    """Build one deterministic continuation view from the cached scan row.
+
+    This is an evidence score, not a statistical probability. It deliberately
+    does not fetch candles or rerun a scan when a user changes the selected stock.
+    """
+    def num(key, default=0.0):
+        try:
+            value = pd.to_numeric(row.get(key, default), errors="coerce")
+            return float(value) if pd.notna(value) else float(default)
+        except Exception:
+            return float(default)
+
+    direction = str(row.get("DIRECTION", "NONE")).strip().upper()
+    status = str(row.get("MOVEMENT STATUS", row.get("SIGNAL", ""))).upper()
+    if direction not in ("BUY", "SELL"):
+        if "BIG BUY" in status or status.endswith("BUY"):
+            direction = "BUY"
+        elif "BIG SELL" in status or status.endswith("SELL"):
+            direction = "SELL"
+        else:
+            direction = "WAIT"
+
+    structure = str(row.get("STRUCTURE", "NONE")).upper()
+    breakout = str(row.get("BREAKOUT CHECK", "WAIT")).upper()
+    false_risk = str(row.get("FALSE BREAKOUT RISK", "UNKNOWN")).upper()
+    quality = max(0.0, min(100.0, num("BREAKOUT QUALITY SCORE")))
+    rvol = num("RVOL")
+    base_score = max(0.0, min(100.0, num("SCORE")))
+
+    aligned_structure = (direction == "BUY" and structure == "HH/HL") or (direction == "SELL" and structure == "LH/LL")
+    opposite_structure = (direction == "BUY" and structure == "LH/LL") or (direction == "SELL" and structure == "HH/HL")
+    breakout_aligned = (direction == "BUY" and "UP BREAKOUT" in breakout) or (direction == "SELL" and "DOWN BREAKOUT" in breakout)
+    failed = "FAILED" in breakout or false_risk == "HIGH"
+
+    score = 0
+    if direction in ("BUY", "SELL"):
+        score += 25 if quality >= 55 else 15 if quality >= 30 else 0
+        score += 20 if aligned_structure else 0
+        score += 20 if rvol >= 1.5 else 10 if rvol >= 1.2 else 0
+        score += 20 if breakout_aligned else 0
+        score += 15 if base_score >= 70 else 8 if base_score >= 55 else 0
+        if opposite_structure:
+            score -= 25
+        if failed:
+            score -= 35
+        if false_risk == "MEDIUM":
+            score -= 8
+    score = int(max(0, min(100, score)))
+
+    if direction == "WAIT":
+        outlook = "WAIT — NO CONFIRMED DIRECTION"
+        reversal = "NOT APPLICABLE"
+    elif failed or opposite_structure:
+        outlook = "REVERSAL / FAILED BREAKOUT WARNING"
+        reversal = "HIGH"
+    elif score >= 75:
+        outlook = "STRONG CONTINUATION SETUP — WAIT FOR RETEST"
+        reversal = "LOW–MEDIUM"
+    elif score >= 55:
+        outlook = "CONTINUATION POSSIBLE — NEEDS NEXT CANDLE"
+        reversal = "MEDIUM"
+    else:
+        outlook = "WEAK / UNCONFIRMED — WAIT"
+        reversal = "MEDIUM–HIGH"
+
+    ltp = num("LTP")
+    range_high = num("RANGE HIGH", num("BREAKOUT LEVEL"))
+    range_low = num("RANGE LOW", num("BREAKDOWN LEVEL"))
+    trigger = range_high if direction == "BUY" else range_low if direction == "SELL" else 0.0
+    invalidation = range_low if direction == "BUY" else range_high if direction == "SELL" else 0.0
+    return {
+        "DIRECTION": direction,
+        "CONTINUATION OUTLOOK": outlook,
+        "CONTINUATION SCORE (NOT %)": score,
+        "REVERSAL RISK": reversal,
+        "NEXT CONFIRMATION LEVEL": round(trigger, 2) if trigger else "N/A",
+        "INVALIDATION LEVEL": round(invalidation, 2) if invalidation else "N/A",
+        "LTP": round(ltp, 2) if ltp else "N/A",
+        "SIGNAL TIME": row.get("SIGNAL TIME", "N/A"),
+        "5M STRUCTURE": structure,
+        "RVOL": round(rvol, 2),
+        "BREAKOUT QUALITY": round(quality, 1),
+        "FALSE BREAKOUT RISK": false_risk,
+        "REASON": str(row.get("BREAKOUT CHECK REASON", row.get("REASON", "No reason available"))),
+    }
+
+
 def _show_big_movement_alert_box() -> None:
     """Show confirmed stock big-movement names in a blinking box across scanner tabs."""
     df = st.session_state.get("momentum_df")
@@ -6000,8 +6089,30 @@ def _show_big_movement_alert_box() -> None:
         return
     status = df["MOVEMENT STATUS"].astype(str).str.upper()
     confirmed = df[status.str.contains("BIG BUY|BIG SELL", regex=True, na=False)].copy()
+    symbol_col = next((c for c in ["STOCK NAME", "SYMBOL", "Symbol", "symbol"] if c in df.columns), None)
+    if symbol_col is not None:
+        snapshot = df.copy()
+        snapshot[symbol_col] = snapshot[symbol_col].astype(str)
+        choices = sorted(snapshot[symbol_col].dropna().unique().tolist())
+        if choices:
+            st.markdown("#### 🧭 BIG MOVE CONTINUATION — CACHED STOCK REPORT")
+            st.caption("Stock selection reads the last completed scan snapshot only. It does not rerun the scanner or change BUY/SELL direction. New direction is accepted only after you run a fresh scan.")
+            selected_symbol = st.selectbox("Select stock for continuation report", choices, key="bigmove_continuation_stock")
+            selected_rows = snapshot[snapshot[symbol_col] == selected_symbol]
+            if not selected_rows.empty:
+                report = _big_move_continuation_report(selected_rows.iloc[0])
+                a1, a2, a3, a4 = st.columns(4)
+                a1.metric("BIG MOVE", report["DIRECTION"])
+                a2.metric("Continuation score", f'{report["CONTINUATION SCORE (NOT %)"]}/100')
+                a3.metric("Reversal risk", report["REVERSAL RISK"])
+                a4.metric("LTP", report["LTP"])
+                st.write(f'**Outlook:** {report["CONTINUATION OUTLOOK"]}')
+                st.dataframe(pd.DataFrame([report]), use_container_width=True, hide_index=True)
+                st.caption("Score ranks rule-based evidence; it is not a calibrated probability or a guaranteed price target. Confirmation/invalidation levels are taken from the cached scan range.")
+    else:
+        st.markdown('<div class="bigmove-empty">Stock-name column is unavailable for continuation report.</div>', unsafe_allow_html=True)
     if confirmed.empty:
-        st.markdown('<div class="bigmove-empty">No confirmed BIG BUY / BIG SELL signal in the last scan. This box will update after the next scan.</div></div>', unsafe_allow_html=True)
+        st.markdown('<div class="bigmove-empty">No confirmed BIG BUY / BIG SELL signal in the last scan. Continuation report above uses the cached scan rows.</div></div>', unsafe_allow_html=True)
         return
     symbol_col = next((c for c in ["STOCK NAME", "SYMBOL", "Symbol", "symbol"] if c in confirmed.columns), None)
     if symbol_col is None:
