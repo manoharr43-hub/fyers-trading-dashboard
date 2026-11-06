@@ -6766,11 +6766,8 @@ def _show_last5m_big_volume_tab(fyers, all_symbols, fo_symbols) -> None:
 def show_scanner(fyers) -> None:
     """Streamlit main app - NSE AI PRO V17 with MOMENTUM MOVERS"""
     
-    try:
-        st.set_page_config(page_title="NSE AI PRO V17", layout="wide")
-    except:
-        pass
-    
+    # Page configuration is set once in app.py; do not call it from this module.
+
     st.title("🚀 NSE AI PRO V17 — Professional Intraday + Swing Scanner")
     st.caption(f"🕒 Current Time (IST): {_now_ist().strftime('%d-%b-%Y %H:%M:%S')} IST | Multi-Timeframe + Momentum Engine")
     _show_big_movement_alert_box()
