@@ -5,16 +5,19 @@ import numpy as np
 import datetime as dt
 import inspect
 
+
 # ============================================================
-# NSE AI PRO V17 - ADVANCED AI TIME MACHINE
+# NSE AI PRO V17
+# ADVANCED AI — TIME MACHINE
 #
 # Reusable module for scanner.py
 #
 # IMPORTANT:
-# - No st.set_page_config() in this file.
-# - No FYERS login here.
-# - FYERS client comes from app.py / scanner.py.
-# - Compatible with show_advanced_ai_tab().
+# 1. No st.set_page_config() in this file.
+# 2. No FYERS login in this file.
+# 3. FYERS client comes from app.py / scanner.py.
+# 4. Scanner history fetcher is optional.
+# 5. If Scanner data is empty, use direct FYERS fallback.
 # ============================================================
 
 
@@ -158,17 +161,15 @@ def adx(df, period=14):
 
 
 # ============================================================
-# DATA NORMALIZATION
+# NORMALIZE HISTORY DATA
 # ============================================================
 
 def normalize_history(raw):
 
     if raw is None:
-        raise RuntimeError(
-            "History fetcher returned empty data."
-        )
+        raise ValueError("History data is None.")
 
-    # Handle common tuple responses.
+    # Handle tuple responses.
     if isinstance(raw, tuple):
 
         candidates = [
@@ -180,17 +181,19 @@ def normalize_history(raw):
         ]
 
         if not candidates:
-            raise RuntimeError(
-                "History fetcher returned an invalid tuple."
+            raise ValueError(
+                "History fetcher returned an empty tuple."
             )
 
         raw = candidates[0]
 
-    # Handle FYERS dictionaries or wrapped data.
+    # Handle API dictionary.
     if isinstance(raw, dict):
 
-        if raw.get("s") not in (None, "ok"):
-            raise RuntimeError(
+        status = raw.get("s")
+
+        if status is not None and status != "ok":
+            raise ValueError(
                 f"History API error: {raw}"
             )
 
@@ -203,32 +206,35 @@ def normalize_history(raw):
             "df",
             "result"
         ]:
+
             if key in raw and raw[key] is not None:
                 extracted = raw[key]
                 break
 
         if extracted is None:
-            raise RuntimeError(
-                "No candles/data found in history response."
+            raise ValueError(
+                "No candles found in history response."
             )
 
         raw = extracted
 
-    # DataFrame or FYERS candle list.
+    # Convert input into DataFrame.
     if isinstance(raw, pd.DataFrame):
 
         df = raw.copy()
 
     else:
 
-        try:
-            df = pd.DataFrame(raw)
-        except Exception as exc:
-            raise RuntimeError(
-                f"Cannot convert history data: {exc}"
-            )
+        if raw is None or len(raw) == 0:
+            raise ValueError("History data is empty.")
 
-    # Handle FYERS six-column candle arrays.
+        df = pd.DataFrame(raw)
+
+    if df.empty:
+        raise ValueError("History DataFrame is empty.")
+
+    # FYERS list format:
+    # Timestamp, Open, High, Low, Close, Volume
     if list(df.columns) == list(range(6)):
 
         df.columns = [
@@ -240,21 +246,27 @@ def normalize_history(raw):
             "Volume"
         ]
 
+    # Column name aliases.
     aliases = {
         "timestamp": "Timestamp",
         "time": "Timestamp",
         "datetime": "Timestamp",
         "date": "Timestamp",
         "ts": "Timestamp",
+
         "open": "Open",
         "o": "Open",
+
         "high": "High",
         "h": "High",
+
         "low": "Low",
         "l": "Low",
+
         "close": "Close",
         "c": "Close",
         "ltp": "Close",
+
         "volume": "Volume",
         "vol": "Volume",
         "v": "Volume"
@@ -264,15 +276,15 @@ def normalize_history(raw):
 
     for column in df.columns:
 
-        normalized = (
+        key = (
             str(column)
             .strip()
             .lower()
             .replace(" ", "_")
         )
 
-        if normalized in aliases:
-            rename[column] = aliases[normalized]
+        if key in aliases:
+            rename[column] = aliases[key]
 
     df = df.rename(columns=rename)
 
@@ -289,11 +301,11 @@ def normalize_history(raw):
     ]
 
     if missing:
-        raise RuntimeError(
+        raise ValueError(
             f"Missing OHLC columns: {missing}"
         )
 
-    # Some index data sources may not provide volume.
+    # Volume can be zero for index data.
     if "Volume" not in df.columns:
         df["Volume"] = 0.0
 
@@ -329,14 +341,18 @@ def normalize_history(raw):
             keep="last"
         )
 
+    elif isinstance(df.index, pd.DatetimeIndex):
+
+        df["Timestamp"] = df.index
+
     df = df.reset_index(
         drop=True
     )
 
     if len(df) < 100:
 
-        raise RuntimeError(
-            f"Only {len(df)} candles received. "
+        raise ValueError(
+            f"Only {len(df)} valid candles found. "
             "At least 100 candles are required."
         )
 
@@ -355,11 +371,9 @@ def call_history_fetcher(
     resolution
 ):
 
-    if history_fetcher is None:
-        return None
-
     if not callable(history_fetcher):
-        raise RuntimeError(
+
+        raise ValueError(
             "history_fetcher must be a callable function."
         )
 
@@ -371,6 +385,7 @@ def call_history_fetcher(
 
     values = {
 
+        # Client aliases
         "client": client,
         "fyers": client,
         "fyers_client": client,
@@ -378,22 +393,26 @@ def call_history_fetcher(
         "api": client,
         "api_client": client,
 
+        # Symbol aliases
         "symbol": symbol,
         "ticker": symbol,
         "stock": symbol,
         "stock_symbol": symbol,
 
+        # Timeframe aliases
         "resolution": str(resolution),
         "timeframe": str(resolution),
         "time_frame": str(resolution),
         "interval": str(resolution),
         "tf": str(resolution),
 
+        # Period aliases
         "days": int(days),
         "history_days": int(days),
         "lookback_days": int(days),
         "period_days": int(days),
 
+        # Date aliases
         "start_date": start_date.strftime("%Y-%m-%d"),
         "from_date": start_date.strftime("%Y-%m-%d"),
         "range_from": start_date.strftime("%Y-%m-%d"),
@@ -404,30 +423,27 @@ def call_history_fetcher(
     }
 
     try:
+
         signature = inspect.signature(
             history_fetcher
         )
 
-    except (TypeError, ValueError):
+    except (TypeError, ValueError) as exc:
 
-        raise RuntimeError(
-            "Cannot inspect history_fetcher signature. "
-            "Please check scanner.py."
+        raise ValueError(
+            f"Cannot inspect history_fetcher: {exc}"
         )
 
     positional = []
     keyword = {}
-
-    has_var_keyword = False
     unresolved = []
 
     for parameter in signature.parameters.values():
 
-        if parameter.kind == inspect.Parameter.VAR_POSITIONAL:
-            continue
-
-        if parameter.kind == inspect.Parameter.VAR_KEYWORD:
-            has_var_keyword = True
+        if parameter.kind in (
+            inspect.Parameter.VAR_POSITIONAL,
+            inspect.Parameter.VAR_KEYWORD
+        ):
             continue
 
         name = parameter.name.lower()
@@ -448,23 +464,10 @@ def call_history_fetcher(
 
     if unresolved:
 
-        raise RuntimeError(
-            "Cannot match these required history_fetcher "
-            f"parameters: {unresolved}. "
-            "Please check the function signature in scanner.py."
+        raise ValueError(
+            "Unknown required history_fetcher parameters: "
+            f"{unresolved}"
         )
-
-    if has_var_keyword:
-
-        for key in [
-            "client",
-            "symbol",
-            "resolution",
-            "days"
-        ]:
-
-            if key not in keyword:
-                keyword[key] = values[key]
 
     return history_fetcher(
         *positional,
@@ -473,30 +476,18 @@ def call_history_fetcher(
 
 
 # ============================================================
-# FYERS HISTORY
+# DIRECT FYERS HISTORY
 # ============================================================
 
-def fetch_history(
+def fetch_direct_fyers_history(
     client,
     symbol,
     days,
-    resolution,
-    history_fetcher=None
+    resolution
 ):
 
-    if history_fetcher is not None:
-
-        raw = call_history_fetcher(
-            history_fetcher=history_fetcher,
-            client=client,
-            symbol=symbol,
-            days=days,
-            resolution=resolution
-        )
-
-        return normalize_history(raw)
-
     if client is None:
+
         raise RuntimeError(
             "FYERS client is not connected."
         )
@@ -533,6 +524,75 @@ def fetch_history(
     return normalize_history(
         response
     )
+
+
+# ============================================================
+# HISTORY FETCHING WITH FALLBACK
+# ============================================================
+
+def fetch_history(
+    client,
+    symbol,
+    days,
+    resolution,
+    history_fetcher=None
+):
+
+    callback_error = None
+
+    # First try Scanner's history function.
+    if history_fetcher is not None:
+
+        try:
+
+            raw = call_history_fetcher(
+
+                history_fetcher=history_fetcher,
+
+                client=client,
+
+                symbol=symbol,
+
+                days=days,
+
+                resolution=resolution
+            )
+
+            return normalize_history(raw)
+
+        except Exception as exc:
+
+            callback_error = str(exc)
+
+    # Scanner data unavailable or invalid:
+    # fallback to direct FYERS API.
+    try:
+
+        return fetch_direct_fyers_history(
+
+            client=client,
+
+            symbol=symbol,
+
+            days=days,
+
+            resolution=resolution
+        )
+
+    except Exception as exc:
+
+        if callback_error:
+
+            raise RuntimeError(
+                "Scanner history fetcher failed: "
+                f"{callback_error}. "
+                "Direct FYERS fallback also failed: "
+                f"{exc}"
+            )
+
+        raise RuntimeError(
+            f"FYERS history failed: {exc}"
+        )
 
 
 # ============================================================
@@ -589,23 +649,25 @@ def build_features(df):
         min_periods=20
     ).mean()
 
-    relative_volume = (
+    features["rel_vol"] = (
         volume / average_volume.replace(0, np.nan)
     )
 
-    # Neutral value when volume is unavailable.
-    features["rel_vol"] = relative_volume.fillna(1.0)
+    # Index volume may be unavailable.
+    features["rel_vol"] = features[
+        "rel_vol"
+    ].fillna(1.0)
 
     features["ret1"] = close.pct_change()
 
-    # Next-candle direction target.
+    # Next-candle direction.
     next_close = close.shift(-1)
 
     features["target"] = (
         next_close > close
     ).astype(float)
 
-    # Last candle has no known future outcome.
+    # Last candle has no known next-candle result.
     features.loc[
         next_close.isna(),
         "target"
@@ -634,7 +696,7 @@ def make_model():
 
     return xgb.XGBClassifier(
 
-        n_estimators=120,
+        n_estimators=100,
 
         max_depth=3,
 
@@ -694,9 +756,7 @@ def run_time_machine(
         history_fetcher=history_fetcher
     )
 
-    data = build_features(
-        raw
-    )
+    data = build_features(raw)
 
     if len(data) < 100:
 
@@ -713,7 +773,7 @@ def run_time_machine(
     if test_bars < 1:
 
         raise RuntimeError(
-            "Not enough data for testing."
+            "Not enough data for walk-forward testing."
         )
 
     feature_columns = [
@@ -724,16 +784,12 @@ def run_time_machine(
     ]
 
     actual = []
-
     predicted = []
-
     probabilities = []
 
-    first_test_index = (
-        len(data) - test_bars
-    )
+    first_test_index = len(data) - test_bars
 
-    # Expanding-window walk-forward testing.
+    # Train only with candles preceding each test candle.
     for index in range(
         first_test_index,
         len(data)
@@ -754,7 +810,6 @@ def run_time_machine(
         )
 
         probability_up = float(
-
             model.predict_proba(
                 test[feature_columns]
             )[0, 1]
@@ -853,7 +908,7 @@ def run_time_machine(
 
 
 # ============================================================
-# ADVANCED AI USER INTERFACE
+# ADVANCED AI UI
 # ============================================================
 
 def show_advanced_ai(
@@ -897,21 +952,13 @@ def show_advanced_ai(
             "Select Symbol",
 
             [
-
                 "NSE:RELIANCE-EQ",
-
                 "NSE:TCS-EQ",
-
                 "NSE:HDFCBANK-EQ",
-
                 "NSE:INFY-EQ",
-
                 "NSE:SBIN-EQ",
-
                 "NSE:ICICIBANK-EQ",
-
                 "NSE:NIFTYBANK-INDEX",
-
                 "NSE:NIFTY50-INDEX"
             ],
 
@@ -924,18 +971,14 @@ def show_advanced_ai(
 
             ["5", "15", "30", "60", "D"],
 
-            index=3,
+            index=0,
 
             format_func=lambda value: {
 
                 "5": "5 Minutes",
-
                 "15": "15 Minutes",
-
                 "30": "30 Minutes",
-
                 "60": "1 Hour",
-
                 "D": "Daily"
 
             }[value],
@@ -992,7 +1035,7 @@ def show_advanced_ai(
         try:
 
             with st.spinner(
-                "Fetching FYERS data and running AI backtest..."
+                "Fetching historical candles and running AI..."
             ):
 
                 result = run_time_machine(
@@ -1056,8 +1099,7 @@ def show_advanced_ai(
     if saved_key != current_key:
 
         st.info(
-            "Settings changed. Run the analysis again "
-            "to generate a fresh report."
+            "Settings changed. Run the analysis again."
         )
 
         return
@@ -1177,8 +1219,7 @@ def show_advanced_ai(
 
 # ============================================================
 # SCANNER COMPATIBILITY
-# IMPORTANT: Define this function only once.
-# *args and **kwargs prevent duplicate argument binding.
+# Define this function only once.
 # ============================================================
 
 def show_advanced_ai_tab(*args, **kwargs):
@@ -1206,14 +1247,12 @@ def show_advanced_ai_tab(*args, **kwargs):
     )
 
     if history_fetcher is None:
-
         history_fetcher = kwargs.pop(
             "data_fetcher",
             None
         )
 
     if history_fetcher is None:
-
         history_fetcher = kwargs.pop(
             "history_func",
             None
@@ -1221,18 +1260,15 @@ def show_advanced_ai_tab(*args, **kwargs):
 
     # First positional argument is normally FYERS client.
     if client is None and len(args) >= 1:
-
         client = args[0]
 
-    # Find a positional callback without binding it twice.
-    if history_fetcher is None:
+    # Second positional argument may be a callback.
+    if history_fetcher is None and len(args) >= 2:
 
         for value in args[1:]:
 
             if callable(value):
-
                 history_fetcher = value
-
                 break
 
     if client is None:
