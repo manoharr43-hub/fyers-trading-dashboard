@@ -139,9 +139,15 @@ def features(df):
     out["macd_hist"] = ml - ml.ewm(span=9, adjust=False, min_periods=9).mean()
     out["atr"] = atr(df)
     out["adx"] = adx(df)
-    out["rel_vol"] = volume / volume.rolling(20, min_periods=20).mean()
+    avg_volume = volume.rolling(20, min_periods=20).mean()
+    out["rel_vol"] = volume / avg_volume.replace(0, np.nan)
     out["ret1"] = close.pct_change()
-    out["target"] = (close.shift(-1) > close).astype(int)
+
+    # The last candle has no known next-candle outcome. Keep it out of training.
+    future_close = close.shift(-1)
+    out["target"] = (future_close > close).astype(float)
+    out.loc[future_close.isna(), "target"] = np.nan
+    out = out.replace([np.inf, -np.inf], np.nan)
     return out.dropna()
 
 def make_model():
