@@ -6365,7 +6365,7 @@ def _best_move_quality_score(row: Dict[str, Any]) -> float:
 def _show_best_buy_sell_big_move_tab(fyers, all_symbols, fo_symbols) -> None:
     """Combined NSE+F&O workflow: pre-move buildup and separately confirmed moves."""
     st.subheader("🏆 BEST BUY / SELL BIG MOVE — PRE-BUILDUP + CONFIRMED")
-    st.caption("NSE + F&O combined universe. PRE-BIG is an early watchlist; CONFIRMED requires direction, volume/candle strength and 15M/1H alignment. Scores are evidence rankings, not win probabilities.")
+    st.caption("NSE + F&O combined universe. PRE-BIG is an early watchlist; CONFIRMED requires price/volume/structure, 15M + 1H alignment and live FYERS market-depth agreement. Post-signal reversal is an EXIT WATCH, not a guarantee. Scores are evidence rankings, not probabilities.")
 
     nse_set = set(_validate_symbols(all_symbols or []))
     fo_set = set(_validate_symbols(fo_symbols or []))
@@ -6442,6 +6442,14 @@ def _show_best_buy_sell_big_move_tab(fyers, all_symbols, fo_symbols) -> None:
                 verify_idx = confirmed.sort_values("QUALITY SCORE", ascending=False).head(verify_count).index
             else:
                 verify_idx = confirmed.index[:verify_count]
+            # Add real FYERS order-book confirmation only for the capped verification set.
+            # This intentionally avoids fetching depth for every symbol and slowing the scan.
+            confirmed["MARKET DEPTH"] = "NOT CHECKED"
+            confirmed["DEPTH IMBALANCE %"] = np.nan
+            confirmed["DEPTH DIRECTION"] = "NOT CHECKED"
+            confirmed["DIRECTION CONFIRMATION"] = "NOT CHECKED"
+            confirmed["POST-SIGNAL REVERSAL"] = "NOT CHECKED"
+            confirmed["REVERSAL REASON"] = ""
             for idx in verify_idx:
                 row = confirmed.loc[idx]
                 direction = str(row.get("DIRECTION", "")).upper()
@@ -6449,6 +6457,40 @@ def _show_best_buy_sell_big_move_tab(fyers, all_symbols, fo_symbols) -> None:
                     sym = str(row.get(sym_col, "")) if sym_col else ""
                     confirmed.at[idx, "15M DIRECTION"] = _best_move_tf_direction(fyers, sym, "15")
                     confirmed.at[idx, "1H DIRECTION"] = _best_move_tf_direction(fyers, sym, "60")
+                    try:
+                        depth = fetch_live_market_depth(fyers, sym)
+                        depth_dir = str(depth.get("direction", "WAIT")).upper()
+                        imbalance = float(depth.get("depth_imbalance", 0) or 0)
+                        confirmed.at[idx, "MARKET DEPTH"] = "LIVE" if depth.get("status") == "OK" else "UNAVAILABLE"
+                        confirmed.at[idx, "DEPTH IMBALANCE %"] = imbalance
+                        confirmed.at[idx, "DEPTH DIRECTION"] = depth_dir
+                        depth_match = ((direction == "BUY" and depth_dir == "BUY" and imbalance >= DEPTH_MIN_IMBALANCE) or
+                                       (direction == "SELL" and depth_dir == "SELL" and imbalance <= -DEPTH_MIN_IMBALANCE))
+                        confirmed.at[idx, "DIRECTION CONFIRMATION"] = "✅ PRICE + MTF + DEPTH" if depth_match else "⚠️ DEPTH CONFLICT / WEAK"
+                        # Post-signal reversal warning: opposing live depth plus opposing MTF/structure.
+                        structure_now = str(row.get("STRUCTURE", "")).upper()
+                        mtf_opposes = (str(confirmed.at[idx, "15M DIRECTION"]) not in (direction, "INSUFFICIENT DATA") or
+                                       str(confirmed.at[idx, "1H DIRECTION"]) not in (direction, "INSUFFICIENT DATA"))
+                        structure_opposes = ((direction == "BUY" and structure_now == "LH/LL") or
+                                             (direction == "SELL" and structure_now == "HH/HL"))
+                        depth_opposes = ((direction == "BUY" and depth_dir == "SELL" and imbalance <= -DEPTH_MIN_IMBALANCE) or
+                                         (direction == "SELL" and depth_dir == "BUY" and imbalance >= DEPTH_MIN_IMBALANCE))
+                        if depth_opposes and (mtf_opposes or structure_opposes):
+                            reversal = "🔻 REVERSAL DOWN — EXIT WATCH" if direction == "BUY" else "🔺 REVERSAL UP — EXIT WATCH"
+                            reason_parts = ["opposite live depth"]
+                            if mtf_opposes: reason_parts.append("15M/1H conflict")
+                            if structure_opposes: reason_parts.append("opposite structure")
+                            confirmed.at[idx, "POST-SIGNAL REVERSAL"] = reversal
+                            confirmed.at[idx, "REVERSAL REASON"] = " + ".join(reason_parts)
+                        else:
+                            confirmed.at[idx, "POST-SIGNAL REVERSAL"] = "🟢 NO REVERSAL CONFIRMED"
+                            confirmed.at[idx, "REVERSAL REASON"] = "No combined opposite-depth and structure/timeframe confirmation"
+                    except Exception as depth_error:
+                        confirmed.at[idx, "MARKET DEPTH"] = "ERROR"
+                        confirmed.at[idx, "DEPTH DIRECTION"] = "WAIT"
+                        confirmed.at[idx, "DIRECTION CONFIRMATION"] = "⚠️ DEPTH NOT AVAILABLE"
+                        confirmed.at[idx, "POST-SIGNAL REVERSAL"] = "⚪ REVERSAL NOT CHECKED"
+                        confirmed.at[idx, "REVERSAL REASON"] = f"Depth check error: {type(depth_error).__name__}"
             def nval(row, key):
                 try:
                     v = pd.to_numeric(row.get(key, 0), errors="coerce")
@@ -6468,7 +6510,8 @@ def _show_best_buy_sell_big_move_tab(fyers, all_symbols, fo_symbols) -> None:
                           nval(row, "RVOL") >= BIGMOVE_MIN_RVOL and
                           nval(row, "BODY %") >= BIGMOVE_MIN_BODY_PCT and
                           nval(row, "BODY / ATR") >= BIGMOVE_MIN_BODY_ATR and
-                          aligned_structure and mtf)
+                          aligned_structure and mtf and
+                          str(row.get("DIRECTION CONFIRMATION", "")) == "✅ PRICE + MTF + DEPTH")
                 grades.append("✅ CONFIRMED BIG BUY" if strict and d == "BUY" else
                               "✅ CONFIRMED BIG SELL" if strict and d == "SELL" else
                               "🟡 WATCH — NOT CONFIRMED")
