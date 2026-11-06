@@ -1,2236 +1,287 @@
 """
-ai_market_intelligence.py
-==============================================================================
-Standalone AI-powered "Market Intelligence" dashboard module for a FYERS
-Streamlit trading dashboard.
+AI Multi-Agent Scanner for NSE AI PRO V17
+Uses the existing FYERS client and existing scanner.py data helpers.
+This module does not place orders or modify existing scanner logic.
 """
 
-from __future__ import annotations
+import concurrent.futures
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
-import datetime as dt
-import time
-from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
-
-import numpy as np
 import pandas as pd
-import requests
-import feedparser
 import streamlit as st
 
-try:
-    from streamlit_autorefresh import st_autorefresh
-    _HAS_AUTOREFRESH = True
-except Exception:  # pragma: no cover - optional dependency
-    _HAS_AUTOREFRESH = False
-
-
-REFRESH_INTERVAL_MS: int = 30_000
-DATA_NA: str = "Data Not Available"
-LOADING_MSG: str = "Loading..."
-FETCHING_MSG: str = "Fetching..."
-DEFAULT_RETRIES: int = 2
-RETRY_DELAY_SECONDS: float = 0.35
-
-INDEX_SYMBOLS: Dict[str, str] = {
-    "NIFTY": "NSE:NIFTY50-INDEX",
-    "BANKNIFTY": "NSE:NIFTYBANK-INDEX",
-    "FINNIFTY": "NSE:FINNIFTY-INDEX",
-    "MIDCPNIFTY": "NSE:MIDCPNIFTY-INDEX",
-    "SENSEX": "BSE:SENSEX-INDEX",
-    "INDIA VIX": "NSE:INDIAVIX-INDEX",
-}
-
-FUTURES_UNDERLYINGS: Dict[str, str] = {
-    "NIFTY Futures": "NIFTY",
-    "BANKNIFTY Futures": "BANKNIFTY",
-    "FINNIFTY Futures": "FINNIFTY",
-}
-
-NEWS_FEEDS: Dict[str, str] = {
-    "MoneyControl": "https://www.moneycontrol.com/rss/marketreports.xml",
-    "Economic Times": "https://economictimes.indiatimes.com/markets/rssfeeds/1977021501.cms",
-    "Business Standard": "https://www.business-standard.com/rss/markets-106.rss",
-    "Reuters": "https://www.reutersagency.com/feed/?best-topics=markets&post_type=best",
-    "Yahoo Finance": "https://finance.yahoo.com/news/rssindex",
-}
-
-WATCHLIST_DEFAULT: List[str] = [
-    "NSE:RELIANCE-EQ",
-    "NSE:TCS-EQ",
-    "NSE:HDFCBANK-EQ",
-    "NSE:INFY-EQ",
-    "NSE:ICICIBANK-EQ",
-]
-
-BULLISH_KEYWORDS: List[str] = [
-    "surge", "rally", "record high", "upgrade", "beat estimates", "strong growth",
-    "bullish", "buy rating", "outperform", "gains", "rises", "jump", "soar",
-    "upbeat", "positive outlook", "expansion", "profit rise", "inflow",
-    "upgraded to buy", "all-time high", "recovery",
-]
-
-BEARISH_KEYWORDS: List[str] = [
-    "crash", "plunge", "selloff", "sell-off", "downgrade", "miss estimates",
-    "weak growth", "bearish", "sell rating", "underperform", "loss", "falls",
-    "tumble", "slump", "negative outlook", "contraction", "profit fall",
-    "outflow", "downgraded to sell", "recession", "default", "fraud",
-]
-
-HIGH_IMPACT_KEYWORDS: List[str] = [
-    "rbi", "fed", "federal reserve", "war", "crash", "budget", "gdp",
-    "inflation", "rate hike", "rate cut", "election", "geopolitical",
-    "crisis", "recession", "default", "bankruptcy", "emergency",
-]
-
-MEDIUM_IMPACT_KEYWORDS: List[str] = [
-    "earnings", "results", "ipo", "merger", "acquisition", "guidance",
-    "policy", "tariff", "export", "import", "stake sale", "block deal",
-]
-
-KNOWN_STOCK_TOKENS: List[str] = [
-    "RELIANCE", "TCS", "HDFC", "INFOSYS", "INFY", "ICICI", "SBI", "ITC",
-    "L&T", "LT", "ADANI", "TATA", "WIPRO", "AXIS", "MARUTI", "BAJAJ",
-    "KOTAK", "HCLTECH", "SUNPHARMA", "TITAN",
-]
-
-DIRECTION_WEIGHTS: Dict[str, float] = {
-    "trend": 0.25,
-    "option_chain": 0.20,
-    "smc": 0.15,
-    "news": 0.10,
-    "institutional": 0.10,
-    "momentum": 0.10,
-    "volume": 0.10,
-}
-
-BUY_SELL_SCORE_THRESHOLD: float = 80.0
-MIN_CONFIRMATIONS_REQUIRED: int = 4
-
-NIFTY50_CONSTITUENTS: Dict[str, float] = {
-    "NSE:RELIANCE-EQ": 9.5, "NSE:HDFCBANK-EQ": 12.5, "NSE:ICICIBANK-EQ": 8.5,
-    "NSE:INFY-EQ": 5.5, "NSE:TCS-EQ": 4.0, "NSE:BHARTIARTL-EQ": 4.5,
-    "NSE:ITC-EQ": 3.5, "NSE:LT-EQ": 3.5, "NSE:KOTAKBANK-EQ": 3.0,
-    "NSE:AXISBANK-EQ": 3.0, "NSE:SBIN-EQ": 2.8, "NSE:BAJFINANCE-EQ": 2.5,
-    "NSE:HINDUNILVR-EQ": 2.2, "NSE:MARUTI-EQ": 1.8, "NSE:SUNPHARMA-EQ": 1.7,
-    "NSE:HCLTECH-EQ": 1.6, "NSE:TITAN-EQ": 1.4, "NSE:ULTRACEMCO-EQ": 1.3,
-    "NSE:ASIANPAINT-EQ": 1.2, "NSE:NTPC-EQ": 1.2, "NSE:M&M-EQ": 1.5,
-    "NSE:POWERGRID-EQ": 1.1, "NSE:WIPRO-EQ": 1.0, "NSE:ADANIENT-EQ": 1.0,
-    "NSE:TATAMOTORS-EQ": 1.3, "NSE:TATASTEEL-EQ": 1.0, "NSE:JSWSTEEL-EQ": 0.9,
-    "NSE:BAJAJFINSV-EQ": 0.9, "NSE:NESTLEIND-EQ": 0.9, "NSE:ONGC-EQ": 0.8,
-    "NSE:COALINDIA-EQ": 0.8, "NSE:INDUSINDBK-EQ": 0.8, "NSE:GRASIM-EQ": 0.7,
-    "NSE:TECHM-EQ": 0.7, "NSE:HINDALCO-EQ": 0.7, "NSE:DRREDDY-EQ": 0.6,
-    "NSE:CIPLA-EQ": 0.6, "NSE:APOLLOHOSP-EQ": 0.6, "NSE:DIVISLAB-EQ": 0.6,
-    "NSE:BRITANNIA-EQ": 0.5, "NSE:EICHERMOT-EQ": 0.5, "NSE:HEROMOTOCO-EQ": 0.5,
-    "NSE:BPCL-EQ": 0.5, "NSE:SBILIFE-EQ": 0.6, "NSE:HDFCLIFE-EQ": 0.6,
-    "NSE:UPL-EQ": 0.4, "NSE:BAJAJ-AUTO-EQ": 0.6, "NSE:SHRIRAMFIN-EQ": 0.5,
-    "NSE:LTIM-EQ": 0.6, "NSE:ADANIPORTS-EQ": 0.7,
-}
-
-SECTOR_INDICES: Dict[str, str] = {
-    "NIFTY BANK": "NSE:NIFTYBANK-INDEX",
-    "NIFTY IT": "NSE:NIFTYIT-INDEX",
-    "NIFTY AUTO": "NSE:NIFTYAUTO-INDEX",
-    "NIFTY PHARMA": "NSE:NIFTYPHARMA-INDEX",
-    "NIFTY FMCG": "NSE:NIFTYFMCG-INDEX",
-    "NIFTY METAL": "NSE:NIFTYMETAL-INDEX",
-    "NIFTY ENERGY": "NSE:NIFTYENERGY-INDEX",
-    "NIFTY REALTY": "NSE:NIFTYREALTY-INDEX",
-    "NIFTY PSU BANK": "NSE:NIFTYPSUBANK-INDEX",
-    "NIFTY FIN SERVICE": "NSE:FINNIFTY-INDEX",
-}
-
-GLOBAL_FYERS_SYMBOLS: Dict[str, str] = {
-    "USDINR": "NSE:USDINR-INDEX",
-    "Crude Oil (MCX)": "MCX:CRUDEOIL25AUGFUT",
-    "Gold (MCX)": "MCX:GOLD25AUGFUT",
-}
-
-GLOBAL_EXTERNAL_SYMBOLS: Dict[str, str] = {
-    "Gift Nifty / SGX Nifty": "NIFTY_F1.NS",
-    "Dow Futures": "YM=F",
-    "S&P 500 Futures": "ES=F",
-    "Nasdaq Futures": "NQ=F",
-    "Nikkei 225": "^N225",
-    "Hang Seng": "^HSI",
-    "FTSE 100": "^FTSE",
-    "DAX": "^GDAXI",
-}
-
-IV_HISTORY_LOOKBACK_DAYS: int = 252
-
-
-def _safe_call(fn, *args: Any, default: Any = None, **kwargs: Any) -> Any:
-    try:
-        return fn(*args, **kwargs)
-    except Exception:
-        return default
-
-
-def _render_safely(section_name: str, fn, *args: Any, **kwargs: Any) -> None:
-    try:
-        fn(*args, **kwargs)
-    except Exception as exc:  # noqa: BLE001 - intentional catch-all for UI resilience
-        st.error(f"⚠️ The '{section_name}' section could not be loaded ({exc}). Other sections are unaffected.")
-        st.info(DATA_NA)
-
-
-def _retry_call(fn, *args: Any, retries: int = DEFAULT_RETRIES, delay: float = RETRY_DELAY_SECONDS,
-                 default: Any = None, **kwargs: Any) -> Any:
-    last_result = default
-    for attempt in range(retries + 1):
-        try:
-            result = fn(*args, **kwargs)
-            if result is not None:
-                return result
-            last_result = result
-        except Exception:
-            last_result = default
-        if attempt < retries:
-            time.sleep(delay)
-    return last_result
-
-
-def _is_valid_response(resp: Any) -> bool:
-    try:
-        return isinstance(resp, dict) and resp.get("s") == "ok"
-    except Exception:
-        return False
-
-
-def _fmt_num(value: Any, decimals: int = 2, suffix: str = "") -> str:
-    try:
-        if value is None:
-            return DATA_NA
-        if isinstance(value, float) and (np.isnan(value) or np.isinf(value)):
-            return DATA_NA
-        return f"{float(value):.{decimals}f}{suffix}"
-    except Exception:
-        return DATA_NA
-
-
-def _fmt_int(value: Any, suffix: str = "") -> str:
-    try:
-        if value is None:
-            return DATA_NA
-        if isinstance(value, float) and (np.isnan(value) or np.isinf(value)):
-            return DATA_NA
-        return f"{int(value):,}{suffix}"
-    except Exception:
-        return DATA_NA
-
-
-def _fmt_text(value: Any) -> str:
-    if value is None or (isinstance(value, str) and not value.strip()):
-        return DATA_NA
-    return str(value)
-
-
-def _sentiment_color(label: str) -> str:
-    return {"Bullish": "🟢", "Bearish": "🔴", "Neutral": "🟡"}.get(label, "⚪")
-
-
-def _trend_color(trend: str) -> str:
-    return {"UP": "🟢", "DOWN": "🔴", "FLAT": "🟡", "NA": "⚪"}.get(trend, "⚪")
-
-
-def ema(series: pd.Series, period: int) -> pd.Series:
-    return series.ewm(span=period, adjust=False).mean()
-
-
-def rsi(series: pd.Series, period: int = 14) -> pd.Series:
-    delta = series.diff()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
-    avg_gain = gain.ewm(alpha=1 / period, adjust=False).mean()
-    avg_loss = loss.ewm(alpha=1 / period, adjust=False).mean()
-    rs = avg_gain / avg_loss.replace(0, np.nan)
-    rsi_val = 100 - (100 / (1 + rs))
-    return rsi_val.fillna(50.0)
-
-
-def macd(series: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9) -> Tuple[pd.Series, pd.Series, pd.Series]:
-    ema_fast = ema(series, fast)
-    ema_slow = ema(series, slow)
-    macd_line = ema_fast - ema_slow
-    signal_line = macd_line.ewm(span=signal, adjust=False).mean()
-    hist = macd_line - signal_line
-    return macd_line, signal_line, hist
-
-
-def _true_range(df: pd.DataFrame) -> pd.Series:
-    high, low, close = df["high"], df["low"], df["close"]
-    prev_close = close.shift(1)
-    return pd.concat(
-        [high - low, (high - prev_close).abs(), (low - prev_close).abs()], axis=1
-    ).max(axis=1)
-
-
-def atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
-    tr = _true_range(df)
-    return tr.ewm(alpha=1 / period, adjust=False).mean()
-
-
-def adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
-    high, low = df["high"], df["low"]
-    tr = _true_range(df)
-    atr_val = tr.ewm(alpha=1 / period, adjust=False).mean()
-
-    up_move = high.diff()
-    down_move = -low.diff()
-    plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
-    minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
-
-    plus_di = 100 * pd.Series(plus_dm, index=df.index).ewm(alpha=1 / period, adjust=False).mean() / atr_val.replace(0, np.nan)
-    minus_di = 100 * pd.Series(minus_dm, index=df.index).ewm(alpha=1 / period, adjust=False).mean() / atr_val.replace(0, np.nan)
-
-    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
-    return dx.ewm(alpha=1 / period, adjust=False).mean().fillna(0.0)
-
-
-def vwap(df: pd.DataFrame) -> pd.Series:
-    typical_price = (df["high"] + df["low"] + df["close"]) / 3
-    cum_vol = df["volume"].cumsum().replace(0, np.nan)
-    cum_tp_vol = (typical_price * df["volume"]).cumsum()
-    return (cum_tp_vol / cum_vol).bfill().ffill()
-
-
-def support_resistance(df: pd.DataFrame, window: int = 20) -> Tuple[float, float]:
-    recent = df.tail(window)
-    return float(recent["low"].min()), float(recent["high"].max())
-
-
-def supertrend(df: pd.DataFrame, period: int = 10, multiplier: float = 3.0) -> Tuple[pd.Series, pd.Series]:
-    try:
-        atr_val = atr(df, period)
-        hl2 = (df["high"] + df["low"]) / 2
-        upperband = hl2 + multiplier * atr_val
-        lowerband = hl2 - multiplier * atr_val
-
-        final_upper = upperband.copy()
-        final_lower = lowerband.copy()
-        st_line = pd.Series(index=df.index, dtype=float)
-        direction = pd.Series(index=df.index, dtype=int)
-        close = df["close"]
-
-        for i in range(len(df)):
-            if i == 0:
-                final_upper.iloc[i] = upperband.iloc[i]
-                final_lower.iloc[i] = lowerband.iloc[i]
-                direction.iloc[i] = 1
-                st_line.iloc[i] = final_lower.iloc[i]
-                continue
-
-            final_upper.iloc[i] = (
-                upperband.iloc[i]
-                if (upperband.iloc[i] < final_upper.iloc[i - 1] or close.iloc[i - 1] > final_upper.iloc[i - 1])
-                else final_upper.iloc[i - 1]
-            )
-            final_lower.iloc[i] = (
-                lowerband.iloc[i]
-                if (lowerband.iloc[i] > final_lower.iloc[i - 1] or close.iloc[i - 1] < final_lower.iloc[i - 1])
-                else final_lower.iloc[i - 1]
-            )
-
-            if direction.iloc[i - 1] == 1 and close.iloc[i] < final_lower.iloc[i]:
-                direction.iloc[i] = -1
-            elif direction.iloc[i - 1] == -1 and close.iloc[i] > final_upper.iloc[i]:
-                direction.iloc[i] = 1
-            else:
-                direction.iloc[i] = direction.iloc[i - 1]
-
-            st_line.iloc[i] = final_lower.iloc[i] if direction.iloc[i] == 1 else final_upper.iloc[i]
-
-        return st_line, direction
-    except Exception:
-        empty = pd.Series(dtype=float)
-        return empty, empty
-
-
-def fetch_quote(_fyers: Any, symbol: str, retries: int = DEFAULT_RETRIES) -> Optional[Dict[str, Any]]:
-    def _do() -> Optional[Dict[str, Any]]:
-        resp = _fyers.quotes({"symbols": symbol})
-        if _is_valid_response(resp) and resp.get("d"):
-            v = resp["d"][0].get("v")
-            if isinstance(v, dict):
-                return v
-        return None
-
-    return _retry_call(_do, retries=retries, default=None)
-
-
-def fetch_quotes_batch(_fyers: Any, symbols: List[str], retries: int = DEFAULT_RETRIES) -> Dict[str, Dict[str, Any]]:
-    out: Dict[str, Dict[str, Any]] = {}
-    if not symbols:
-        return out
-
-    chunk_size = 50
-    for i in range(0, len(symbols), chunk_size):
-        chunk = symbols[i:i + chunk_size]
-
-        def _do(chunk=chunk) -> Optional[Dict[str, Dict[str, Any]]]:
-            resp = _fyers.quotes({"symbols": ",".join(chunk)})
-            if _is_valid_response(resp) and resp.get("d"):
-                result: Dict[str, Dict[str, Any]] = {}
-                for item in resp["d"]:
-                    sym = item.get("n") or item.get("symbol")
-                    v = item.get("v")
-                    if sym and isinstance(v, dict):
-                        result[sym] = v
-                return result if result else None
-            return None
-
-        chunk_result = _retry_call(_do, retries=retries, default=None)
-        if chunk_result:
-            out.update(chunk_result)
-    return out
-
-
-def fetch_history(_fyers: Any, symbol: str, resolution: str = "15", days: int = 30,
-                   retries: int = DEFAULT_RETRIES) -> Optional[pd.DataFrame]:
-    def _do() -> Optional[pd.DataFrame]:
-        to_date = dt.date.today()
-        from_date = to_date - dt.timedelta(days=days)
-        payload = {
-            "symbol": symbol,
-            "resolution": resolution,
-            "date_format": "1",
-            "range_from": from_date.strftime("%Y-%m-%d"),
-            "range_to": to_date.strftime("%Y-%m-%d"),
-            "cont_flag": "1",
-        }
-        resp = _fyers.history(payload)
-        if _is_valid_response(resp) and resp.get("candles"):
-            df = pd.DataFrame(resp["candles"], columns=["timestamp", "open", "high", "low", "close", "volume"])
-            df["timestamp"] = pd.to_datetime(df["timestamp"], unit="s")
-            if len(df) > 0:
-                return df
-        return None
-
-    return _retry_call(_do, retries=retries, default=None)
-
-
-@st.cache_data(ttl=120, show_spinner=False)
-def fetch_history_cached(_fyers: Any, symbol: str, resolution: str, days: int) -> Optional[pd.DataFrame]:
-    return fetch_history(_fyers, symbol, resolution, days)
-
-
-def _compute_max_pain(option_chain: List[Dict[str, Any]]) -> Optional[float]:
-    try:
-        strikes: Dict[float, Dict[str, float]] = {}
-        for o in option_chain:
-            strike = o.get("strike_price")
-            if strike is None:
-                continue
-            oi = o.get("oi", 0) or 0
-            opt_type = o.get("option_type")
-            bucket = strikes.setdefault(float(strike), {"CE": 0.0, "PE": 0.0})
-            if opt_type == "CE":
-                bucket["CE"] += float(oi)
-            elif opt_type == "PE":
-                bucket["PE"] += float(oi)
-        if not strikes:
-            return None
-
-        best_strike, min_pain = None, None
-        for candidate in strikes:
-            total_pain = 0.0
-            for k, v in strikes.items():
-                total_pain += v["CE"] * max(0.0, candidate - k)
-                total_pain += v["PE"] * max(0.0, k - candidate)
-            if min_pain is None or total_pain < min_pain:
-                min_pain = total_pain
-                best_strike = candidate
-        return float(best_strike) if best_strike is not None else None
-    except Exception:
-        return None
-
-
-_EMPTY_OPTION_CHAIN_METRICS: Dict[str, Any] = {
-    "pcr": None, "total_oi": None, "ce_oi": None, "pe_oi": None,
-    "put_writing": None, "call_writing": None, "oi_change_pct": None,
-    "max_pain": None, "gamma_exposure": None, "delta_oi": None,
-    "avg_call_delta": None, "avg_put_delta": None, "avg_theta": None,
-    "avg_vega": None, "atm_iv": None, "iv_rank": None, "iv_percentile": None,
-    "delta_exposure": None, "atm_strike": None, "chain_detail": None,
+IST = ZoneInfo("Asia/Kolkata")
+
+INDEX_NAMES = {
+    "NIFTY", "NIFTY50", "BANKNIFTY", "NIFTYBANK", "FINNIFTY",
+    "MIDCPNIFTY", "NIFTYNEXT50", "SENSEX", "BANKEX",
 }
 
 
-def fetch_option_chain_data(_fyers: Any, symbol: str, retries: int = DEFAULT_RETRIES) -> Dict[str, Any]:
-    def _do() -> Optional[Dict[str, Any]]:
-        resp = _fyers.optionchain({"symbol": symbol, "strikecount": 10, "timestamp": ""})
-        if not _is_valid_response(resp):
-            return None
-        data = resp.get("data", {})
-        chain = data.get("optionsChain", [])
-        if not chain:
-            return None
-
-        spot = None
-        try:
-            spot = float(data.get("optionsChain", [{}])[0].get("fp") or data.get("spot") or 0.0) or None
-        except Exception:
-            spot = None
-
-        put_oi = sum(float(o.get("oi", 0) or 0) for o in chain if o.get("option_type") == "PE")
-        call_oi = sum(float(o.get("oi", 0) or 0) for o in chain if o.get("option_type") == "CE")
-        total_oi = put_oi + call_oi
-        pcr = round(put_oi / call_oi, 2) if call_oi else None
-        put_writing = "Active" if put_oi > call_oi else "Weak"
-        call_writing = "Active" if call_oi > put_oi else "Weak"
-
-        def _clean_num(v: Any) -> float:
-            try:
-                v = float(v)
-            except (TypeError, ValueError):
-                return 0.0
-            return 0.0 if np.isnan(v) or np.isinf(v) else v
-
-        put_oi_chg = sum(_clean_num(o.get("oich", o.get("oi_change", 0))) for o in chain if o.get("option_type") == "PE")
-        call_oi_chg = sum(_clean_num(o.get("oich", o.get("oi_change", 0))) for o in chain if o.get("option_type") == "CE")
-        oi_change_pct = None
-        if total_oi:
-            try:
-                oi_change_pct = round(((put_oi_chg + call_oi_chg) / total_oi) * 100, 2)
-            except Exception:
-                oi_change_pct = None
-
-        max_pain = _compute_max_pain(chain)
-
-        atm_strike = None
-        try:
-            strikes_available = sorted({float(o["strike_price"]) for o in chain if o.get("strike_price") is not None})
-            if strikes_available:
-                if spot:
-                    atm_strike = min(strikes_available, key=lambda s: abs(s - spot))
-                else:
-                    atm_strike = strikes_available[len(strikes_available) // 2]
-        except Exception:
-            atm_strike = None
-
-        gammas, deltas_ce, deltas_pe, thetas, vegas, ivs_atm = [], [], [], [], [], []
-        chain_detail: List[Dict[str, Any]] = []
-        for o in chain:
-            greeks = o.get("greeks") if isinstance(o.get("greeks"), dict) else {}
-            strike = o.get("strike_price")
-            opt_type = o.get("option_type")
-            delta_val = greeks.get("delta")
-            theta_val = greeks.get("theta")
-            vega_val = greeks.get("vega")
-            gamma_val = greeks.get("gamma")
-            iv_val = o.get("iv") if o.get("iv") is not None else greeks.get("iv")
-
-            if gamma_val is not None:
-                gammas.append(gamma_val)
-            if theta_val is not None:
-                thetas.append(theta_val)
-            if vega_val is not None:
-                vegas.append(vega_val)
-            if opt_type == "CE" and delta_val is not None:
-                deltas_ce.append(delta_val)
-            if opt_type == "PE" and delta_val is not None:
-                deltas_pe.append(delta_val)
-
-            moneyness = "NONE"
-            try:
-                if strike is not None and spot:
-                    strike_f = float(strike)
-                    if atm_strike is not None and abs(strike_f - atm_strike) < 1e-6:
-                        moneyness = "ATM"
-                    elif opt_type == "CE":
-                        moneyness = "ITM" if strike_f < spot else "OTM"
-                    elif opt_type == "PE":
-                        moneyness = "ITM" if strike_f > spot else "OTM"
-            except Exception:
-                moneyness = "NONE"
-
-            if atm_strike is not None and strike is not None and abs(float(strike) - atm_strike) < 1e-6 and iv_val is not None:
-                ivs_atm.append(iv_val)
-
-            chain_detail.append({
-                "Strike": strike, "Type": opt_type, "Moneyness": moneyness,
-                "OI": o.get("oi"), "Volume": o.get("volume"),
-                "Delta": delta_val, "Theta": theta_val, "Vega": vega_val,
-                "Gamma": gamma_val, "IV": iv_val,
-            })
-
-        gamma_exposure = round(float(sum(gammas)), 4) if gammas else None
-        avg_call_delta = round(float(np.mean(deltas_ce)), 4) if deltas_ce else None
-        avg_put_delta = round(float(np.mean(deltas_pe)), 4) if deltas_pe else None
-        avg_theta = round(float(np.mean(thetas)), 4) if thetas else None
-        avg_vega = round(float(np.mean(vegas)), 4) if vegas else None
-        atm_iv = round(float(np.mean(ivs_atm)), 2) if ivs_atm else None
-        delta_oi = round(put_oi - call_oi, 0)
-
-        delta_exposure = None
-        try:
-            if avg_call_delta is not None and avg_put_delta is not None:
-                delta_exposure = round(call_oi * avg_call_delta + put_oi * avg_put_delta, 2)
-        except Exception:
-            delta_exposure = None
-
-        iv_rank, iv_percentile = _compute_iv_rank_percentile(symbol, atm_iv)
-
-        return {
-            "pcr": pcr, "total_oi": int(total_oi) if total_oi else None,
-            "ce_oi": int(call_oi) if call_oi else None, "pe_oi": int(put_oi) if put_oi else None,
-            "put_writing": put_writing, "call_writing": call_writing,
-            "oi_change_pct": oi_change_pct, "max_pain": max_pain,
-            "gamma_exposure": gamma_exposure, "delta_oi": delta_oi,
-            "avg_call_delta": avg_call_delta, "avg_put_delta": avg_put_delta,
-            "avg_theta": avg_theta, "avg_vega": avg_vega, "atm_iv": atm_iv,
-            "iv_rank": iv_rank, "iv_percentile": iv_percentile,
-            "delta_exposure": delta_exposure, "atm_strike": atm_strike,
-            "chain_detail": chain_detail,
-        }
-
-    result = _retry_call(_do, retries=retries, default=None)
-    return result if result is not None else dict(_EMPTY_OPTION_CHAIN_METRICS)
-
-
-def _compute_iv_rank_percentile(symbol: str, current_iv: Optional[float]) -> Tuple[Optional[float], Optional[float]]:
-    try:
-        if current_iv is None:
-            return None, None
-        key = f"_iv_hist_{symbol}"
-        hist: List[float] = st.session_state.get(key, [])
-        hist.append(float(current_iv))
-        hist = hist[-IV_HISTORY_LOOKBACK_DAYS:]
-        st.session_state[key] = hist
-
-        if len(hist) < 3:
-            return None, None
-
-        hist_min, hist_max = min(hist), max(hist)
-        iv_rank = round(((current_iv - hist_min) / (hist_max - hist_min)) * 100, 1) if hist_max > hist_min else 50.0
-        iv_percentile = round((sum(1 for v in hist if v <= current_iv) / len(hist)) * 100, 1)
-        return iv_rank, iv_percentile
-    except Exception:
-        return None, None
-
-
-def get_market_summary(_fyers: Any, symbols: Dict[str, str]) -> pd.DataFrame:
-    rows: List[Dict[str, Any]] = []
-    for name, sym in symbols.items():
-        q = fetch_quote(_fyers, sym)
-        if q:
-            ltp = q.get("lp", np.nan)
-            prev_close = q.get("prev_close_price", ltp)
-            change = q.get("ch", (ltp - prev_close) if prev_close else 0.0)
-            change_pct = q.get("chp", (change / prev_close * 100) if prev_close else 0.0)
-            rows.append({
-                "Index": name,
-                "LTP": ltp,
-                "Change": change,
-                "Change %": change_pct,
-                "High": q.get("high_price", np.nan),
-                "Low": q.get("low_price", np.nan),
-                "Open": q.get("open_price", np.nan),
-                "Prev Close": prev_close,
-                "Volume": q.get("volume", 0),
-                "Trend": "UP" if change > 0 else ("DOWN" if change < 0 else "FLAT"),
-            })
+def _normalise_symbols(values):
+    """Accept a list/tuple/set or a DataFrame returned by scanner.py."""
+    if values is None:
+        return []
+    if isinstance(values, pd.DataFrame):
+        for col in ("symbol", "Symbol", "fyers_symbol", "tradingsymbol"):
+            if col in values.columns:
+                values = values[col].dropna().astype(str).tolist()
+                break
         else:
-            rows.append({
-                "Index": name, "LTP": np.nan, "Change": np.nan, "Change %": np.nan,
-                "High": np.nan, "Low": np.nan, "Open": np.nan, "Prev Close": np.nan,
-                "Volume": 0, "Trend": "NA",
-            })
-    return pd.DataFrame(rows)
-
-
-def _current_month_future_symbol(underlying: str) -> str:
-    today = dt.date.today()
-    exch = "BSE" if underlying == "SENSEX" else "NSE"
-    month_code = today.strftime("%b").upper()
-    yy = today.strftime("%y")
-    return f"{exch}:{underlying}{yy}{month_code}FUT"
-
-
-def fetch_futures_oi_nse_fallback(underlying: str, retries: int = 1) -> Optional[Dict[str, Any]]:
-    def _do() -> Optional[Dict[str, Any]]:
-        headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
-        session = requests.Session()
-        session.get("https://www.nseindia.com", headers=headers, timeout=5)
-        resp = session.get(
-            f"https://www.nseindia.com/api/quote-derivative?symbol={underlying}",
-            headers=headers, timeout=5,
-        )
-        if resp.status_code != 200:
-            return None
-        data = resp.json()
-        stocks = data.get("stocks", [])
-        if not stocks:
-            return None
-        near = stocks[0].get("marketDeets", {}) or stocks[0].get("metadata", {})
-        oi = near.get("openInterest") or stocks[0].get("metadata", {}).get("openInterest")
-        oi_chg_pct = near.get("changeinOpenInterest") or 0.0
-        if oi is None:
-            return None
-        return {"oi": float(oi), "oi_change_pct": float(oi_chg_pct)}
-
-    return _retry_call(_do, retries=retries, default=None)
-
-
-def _find_swings(df: pd.DataFrame, left: int = 3, right: int = 3) -> Tuple[List[int], List[int]]:
-    highs, lows = [], []
-    h, l = df["high"].values, df["low"].values
-    n = len(df)
-    for i in range(left, n - right):
-        window_h = h[i - left:i + right + 1]
-        window_l = l[i - left:i + right + 1]
-        if h[i] == window_h.max():
-            highs.append(i)
-        if l[i] == window_l.min():
-            lows.append(i)
-    return highs, lows
-
-
-def compute_smc(df: pd.DataFrame) -> Dict[str, Any]:
-    result: Dict[str, Any] = {
-        "swing_high": None, "swing_low": None, "bos": "NONE", "choch": "NONE",
-        "order_block": "NONE", "breaker_block": "NONE", "mitigation_block": "NONE",
-        "fvg": "NONE", "liquidity_sweep": "NONE", "liquidity_pool": "NONE",
-        "equal_high": False, "equal_low": False, "cisd": "NONE", "zone": "NEUTRAL",
-        "demand_zone": None, "supply_zone": None,
-    }
-    try:
-        if df is None or len(df) < 20:
-            return result
-
-        highs_idx, lows_idx = _find_swings(df)
-        if not highs_idx or not lows_idx:
-            return result
-
-        last_swing_high = float(df["high"].iloc[highs_idx[-1]])
-        last_swing_low = float(df["low"].iloc[lows_idx[-1]])
-        result["swing_high"] = last_swing_high
-        result["swing_low"] = last_swing_low
-
-        close = float(df["close"].iloc[-1])
-        prev_trend_up = df["close"].iloc[-1] > df["close"].iloc[-10] if len(df) >= 10 else True
-
-        if close > last_swing_high:
-            result["bos"] = "BULLISH BOS" if prev_trend_up else "NONE"
-            result["choch"] = "BULLISH CHOCH" if not prev_trend_up else "NONE"
-        elif close < last_swing_low:
-            result["bos"] = "BEARISH BOS" if not prev_trend_up else "NONE"
-            result["choch"] = "BEARISH CHOCH" if prev_trend_up else "NONE"
-
-        if close > last_swing_high:
-            down_candles = df[df["close"] < df["open"]].tail(1)
-            if not down_candles.empty:
-                result["order_block"] = f"Bullish OB @ {down_candles['low'].iloc[-1]:.2f}"
-                result["demand_zone"] = f"{down_candles['low'].iloc[-1]:.2f} - {down_candles['high'].iloc[-1]:.2f}"
-        elif close < last_swing_low:
-            up_candles = df[df["close"] > df["open"]].tail(1)
-            if not up_candles.empty:
-                result["order_block"] = f"Bearish OB @ {up_candles['high'].iloc[-1]:.2f}"
-                result["supply_zone"] = f"{up_candles['low'].iloc[-1]:.2f} - {up_candles['high'].iloc[-1]:.2f}"
-
-        if len(df) >= 3:
-            c1, c3 = df.iloc[-3], df.iloc[-1]
-            if c1["high"] < c3["low"]:
-                result["fvg"] = f"Bullish FVG {c1['high']:.2f}-{c3['low']:.2f}"
-            elif c1["low"] > c3["high"]:
-                result["fvg"] = f"Bearish FVG {c3['high']:.2f}-{c1['low']:.2f}"
-
-        last_candle = df.iloc[-1]
-        if last_candle["high"] > last_swing_high and last_candle["close"] < last_swing_high:
-            result["liquidity_sweep"] = "Sell-side sweep of swing high"
-        elif last_candle["low"] < last_swing_low and last_candle["close"] > last_swing_low:
-            result["liquidity_sweep"] = "Buy-side sweep of swing low"
-
-        if len(highs_idx) >= 2:
-            h1, h2 = df["high"].iloc[highs_idx[-1]], df["high"].iloc[highs_idx[-2]]
-            if h2 and abs(h1 - h2) / h2 < 0.0015:
-                result["equal_high"] = True
-        if len(lows_idx) >= 2:
-            l1, l2 = df["low"].iloc[lows_idx[-1]], df["low"].iloc[lows_idx[-2]]
-            if l2 and abs(l1 - l2) / l2 < 0.0015:
-                result["equal_low"] = True
-        if result["equal_high"] or result["equal_low"]:
-            result["liquidity_pool"] = "Equal highs/lows liquidity pool detected"
-
-        if result["bos"] != "NONE" and result["order_block"] != "NONE":
-            result["breaker_block"] = "Potential breaker block at former order block"
-            result["mitigation_block"] = "Mitigation zone active near order block"
-
-        if result["liquidity_sweep"] != "NONE":
-            bullish_confirm = (last_candle["close"] - last_candle["open"]) > 0
-            expects_bullish = "Buy" in result["liquidity_sweep"]
-            result["cisd"] = "CISD confirmed" if bullish_confirm == expects_bullish else "Pending"
-
-        rng = last_swing_high - last_swing_low
-        if rng > 0:
-            midpoint = last_swing_low + rng * 0.5
-            result["zone"] = "PREMIUM" if close > midpoint else "DISCOUNT"
-    except Exception:
-        pass
+            return []
+    if isinstance(values, dict):
+        values = values.get("symbols", values.get("data", []))
+    result = []
+    for item in values:
+        if isinstance(item, dict):
+            item = item.get("symbol") or item.get("Symbol") or item.get("fyers_symbol")
+        if item:
+            symbol = str(item).strip()
+            if symbol and symbol not in result:
+                result.append(symbol)
     return result
 
 
-def _classify_sentiment(text: str) -> Tuple[str, float]:
-    text_l = text.lower()
-    bull_score = sum(1 for kw in BULLISH_KEYWORDS if kw in text_l)
-    bear_score = sum(1 for kw in BEARISH_KEYWORDS if kw in text_l)
-    if bull_score == 0 and bear_score == 0:
-        return "Neutral", 50.0
-    if bull_score > bear_score:
-        return "Bullish", round(min(95.0, 55 + (bull_score - bear_score) * 8), 1)
-    if bear_score > bull_score:
-        return "Bearish", round(min(95.0, 55 + (bear_score - bull_score) * 8), 1)
-    return "Neutral", 50.0
-
-
-def _classify_impact(text: str) -> str:
-    text_l = text.lower()
-    if any(kw in text_l for kw in HIGH_IMPACT_KEYWORDS):
-        return "High"
-    if any(kw in text_l for kw in MEDIUM_IMPACT_KEYWORDS):
-        return "Medium"
-    return "Low"
-
-
-def _affected_assets(text: str) -> Tuple[str, List[str]]:
-    text_u = text.upper()
-    affected_index = "NONE"
-    for idx_name in INDEX_SYMBOLS:
-        if idx_name in text_u:
-            affected_index = idx_name
-            break
-    stocks = [tok for tok in KNOWN_STOCK_TOKENS if tok in text_u]
-    return affected_index, stocks
-
-
-@st.cache_data(ttl=180, show_spinner=False)
-def fetch_all_news(max_per_source: int = 6) -> pd.DataFrame:
-    rows: List[Dict[str, Any]] = []
-    for source, url in NEWS_FEEDS.items():
-        try:
-            feed = _retry_call(feedparser.parse, url, retries=1, default=None)
-            if feed is None:
-                continue
-            for entry in feed.entries[:max_per_source]:
-                title = getattr(entry, "title", "").strip()
-                if not title:
-                    continue
-                published = getattr(entry, "published", "") or getattr(entry, "updated", "") or ""
-                sentiment, confidence = _classify_sentiment(title)
-                impact = _classify_impact(title)
-                affected_index, affected_stocks = _affected_assets(title)
-                category = "Global" if any(
-                    kw in title.lower() for kw in ("fed", "federal reserve", "wall street", "china", "europe", "asia")
-                ) else ("Economic" if any(
-                    kw in title.lower() for kw in ("rbi", "gdp", "inflation", "budget", "policy")
-                ) else "Corporate")
-                rows.append({
-                    "Time": published,
-                    "Headline": title,
-                    "Category": category,
-                    "Source": source,
-                    "Sentiment": sentiment,
-                    "Confidence": confidence,
-                    "Impact": impact,
-                    "Affected Index": affected_index,
-                    "Affected Stocks": ", ".join(affected_stocks) if affected_stocks else "NONE",
-                })
-        except Exception:
-            continue
-    columns = ["Time", "Headline", "Category", "Source", "Sentiment", "Confidence",
-               "Impact", "Affected Index", "Affected Stocks"]
-    return pd.DataFrame(rows, columns=columns) if rows else pd.DataFrame(columns=columns)
-
-
-@st.cache_data(ttl=300, show_spinner=False)
-def fetch_fii_dii() -> Optional[Dict[str, float]]:
-    def _do() -> Optional[Dict[str, float]]:
-        headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
-        session = requests.Session()
-        session.get("https://www.nseindia.com", headers=headers, timeout=5)
-        resp = session.get("https://www.nseindia.com/api/fiidiiTradeReact", headers=headers, timeout=5)
-        if resp.status_code == 200:
-            data = resp.json()
-            fii = next((d for d in data if "FII" in str(d.get("category", ""))), None)
-            dii = next((d for d in data if "DII" in str(d.get("category", ""))), None)
-            if fii and dii:
-                return {
-                    "fii_buy": float(fii.get("buyValue", 0)),
-                    "fii_sell": float(fii.get("sellValue", 0)),
-                    "dii_buy": float(dii.get("buyValue", 0)),
-                    "dii_sell": float(dii.get("sellValue", 0)),
-                }
-        return None
-
-    return _retry_call(_do, retries=1, default=None)
-
-
-def classify_futures_buildup(price_change_pct: float, oi_change_pct: float) -> str:
-    price_change_pct = price_change_pct if price_change_pct is not None else 0.0
-    oi_change_pct = oi_change_pct if oi_change_pct is not None else 0.0
-    if isinstance(price_change_pct, float) and np.isnan(price_change_pct):
-        price_change_pct = 0.0
-    if isinstance(oi_change_pct, float) and np.isnan(oi_change_pct):
-        oi_change_pct = 0.0
-    if price_change_pct > 0 and oi_change_pct > 0:
-        return "Long Build Up"
-    if price_change_pct < 0 and oi_change_pct > 0:
-        return "Short Build Up"
-    if price_change_pct > 0 and oi_change_pct < 0:
-        return "Short Covering"
-    if price_change_pct < 0 and oi_change_pct < 0:
-        return "Long Unwinding"
-    return "Neutral"
-
-
-@st.cache_data(ttl=20, show_spinner=False)
-def _fetch_external_quote_cached(ticker: str) -> Optional[Dict[str, float]]:
-    return _fetch_external_quote(ticker)
-
-
-def _fetch_external_quote(ticker: str) -> Optional[Dict[str, float]]:
-    def _do() -> Optional[Dict[str, float]]:
-        headers = {"User-Agent": "Mozilla/5.0"}
-        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
-        resp = requests.get(url, headers=headers, timeout=5)
-        if resp.status_code != 200:
-            return None
-        data = resp.json()
-        result = data.get("chart", {}).get("result")
-        if not result:
-            return None
-        meta = result[0].get("meta", {})
-        price = meta.get("regularMarketPrice")
-        prev_close = meta.get("previousClose") or meta.get("chartPreviousClose")
-        if price is None:
-            return None
-        change = (price - prev_close) if prev_close else None
-        change_pct = (change / prev_close * 100) if (change is not None and prev_close) else None
-        return {"price": float(price), "change": change, "change_pct": change_pct}
-
-    return _retry_call(_do, retries=1, default=None)
-
-
-def get_global_markets_summary(_fyers: Any) -> pd.DataFrame:
-    rows: List[Dict[str, Any]] = []
-
-    for name, sym in GLOBAL_FYERS_SYMBOLS.items():
-        q = _safe_call(fetch_quote, _fyers, sym, default=None)
-        if q:
-            ltp = q.get("lp")
-            change = q.get("ch")
-            change_pct = q.get("chp")
-            rows.append({"Instrument": name, "Source": "FYERS", "Price": ltp,
-                         "Change": change, "Change %": change_pct})
-        else:
-            rows.append({"Instrument": name, "Source": "FYERS", "Price": None,
-                         "Change": None, "Change %": None})
-
-    for name, ticker in GLOBAL_EXTERNAL_SYMBOLS.items():
-        q = _safe_call(_fetch_external_quote_cached, ticker, default=None)
-        if q:
-            rows.append({"Instrument": name, "Source": "External", "Price": q.get("price"),
-                         "Change": q.get("change"), "Change %": q.get("change_pct")})
-        else:
-            rows.append({"Instrument": name, "Source": "External", "Price": None,
-                         "Change": None, "Change %": None})
-
-    return pd.DataFrame(rows)
-
-
-def score_global_markets(global_df: Optional[pd.DataFrame]) -> float:
-    try:
-        if global_df is None or global_df.empty:
-            return 0.0
-        risk_rows = global_df[global_df["Instrument"].isin(
-            ["Dow Futures", "S&P 500 Futures", "Nasdaq Futures", "Nikkei 225",
-             "Hang Seng", "FTSE 100", "DAX", "Gift Nifty / SGX Nifty"]
-        )]
-        pct_values = risk_rows["Change %"].dropna()
-        if pct_values.empty:
-            return 0.0
-        avg_pct = float(pct_values.mean())
-        return max(-100.0, min(100.0, avg_pct * 20.0))
-    except Exception:
-        return 0.0
-
-
-def compute_true_market_breadth(_fyers: Any) -> Dict[str, Any]:
-    empty: Dict[str, Any] = {
-        "advances": None, "declines": None, "unchanged": None,
-        "top_gainers": pd.DataFrame(), "top_losers": pd.DataFrame(),
-        "volume_leaders": pd.DataFrame(), "heavyweight_contribution": pd.DataFrame(),
-    }
-    try:
-        symbols = list(NIFTY50_CONSTITUENTS.keys())
-        quotes = _safe_call(fetch_quotes_batch, _fyers, symbols, default={})
-        if not quotes:
-            return empty
-
-        rows: List[Dict[str, Any]] = []
-        for sym in symbols:
-            q = quotes.get(sym)
-            if not q:
-                continue
-            chp = q.get("chp")
-            if chp is None:
-                continue
-            rows.append({
-                "Symbol": sym.replace("NSE:", "").replace("-EQ", ""),
-                "LTP": q.get("lp"), "Change %": chp, "Volume": q.get("volume", 0),
-                "Weight": NIFTY50_CONSTITUENTS.get(sym, 0.0),
-                "Contribution": round(chp * NIFTY50_CONSTITUENTS.get(sym, 0.0), 3),
-            })
-        if not rows:
-            return empty
-
-        df = pd.DataFrame(rows)
-        advances = int((df["Change %"] > 0).sum())
-        declines = int((df["Change %"] < 0).sum())
-        unchanged = int((df["Change %"] == 0).sum())
-
-        top_gainers = df.sort_values("Change %", ascending=False).head(5).reset_index(drop=True)
-        top_losers = df.sort_values("Change %", ascending=True).head(5).reset_index(drop=True)
-        volume_leaders = df.sort_values("Volume", ascending=False).head(5).reset_index(drop=True)
-        heavyweight_contribution = df.reindex(
-            df["Contribution"].abs().sort_values(ascending=False).index
-        ).head(10).reset_index(drop=True)
-
-        return {
-            "advances": advances, "declines": declines, "unchanged": unchanged,
-            "top_gainers": top_gainers, "top_losers": top_losers,
-            "volume_leaders": volume_leaders, "heavyweight_contribution": heavyweight_contribution,
-        }
-    except Exception:
-        return empty
-
-
-def get_sector_rotation(_fyers: Any) -> pd.DataFrame:
-    rows: List[Dict[str, Any]] = []
-    for name, sym in SECTOR_INDICES.items():
-        q = _safe_call(fetch_quote, _fyers, sym, default=None)
-        rows.append({
-            "Sector": name,
-            "Change %": q.get("chp") if q else None,
-            "LTP": q.get("lp") if q else None,
-        })
-    df = pd.DataFrame(rows)
-    if not df.empty and df["Change %"].notna().any():
-        df = df.sort_values("Change %", ascending=False, na_position="last").reset_index(drop=True)
-    return df
-
-
-def score_true_breadth(breadth: Dict[str, Any]) -> float:
-    try:
-        adv, dec = breadth.get("advances"), breadth.get("declines")
-        if adv is None or dec is None or (adv + dec) == 0:
-            return 0.0
-        return max(-100.0, min(100.0, ((adv - dec) / (adv + dec)) * 100.0))
-    except Exception:
-        return 0.0
-
-
-def score_trend(close: float, e20: float, e50: float, e200: Optional[float],
-                 vwap_val: float, adx_val: float, supertrend_dir: Optional[int]) -> float:
-    try:
-        score, count = 0.0, 0
-        if not np.isnan(e20) and not np.isnan(e50):
-            if close > e20 > e50:
-                score += 100.0
-            elif close < e20 < e50:
-                score -= 100.0
-            else:
-                score += 30.0 if close > e50 else -30.0
-            count += 1
-        if e200 is not None and not np.isnan(e200):
-            score += 50.0 if close > e200 else -50.0
-            count += 1
-        if not np.isnan(vwap_val):
-            score += 40.0 if close > vwap_val else -40.0
-            count += 1
-        if supertrend_dir is not None and not (isinstance(supertrend_dir, float) and np.isnan(supertrend_dir)):
-            score += 60.0 * float(supertrend_dir)
-            count += 1
-        avg = score / count if count else 0.0
-        adx_safe = adx_val if adx_val and not np.isnan(adx_val) else 15.0
-        strength_mult = min(1.3, max(0.6, adx_safe / 20.0))
-        return max(-100.0, min(100.0, avg * strength_mult))
-    except Exception:
-        return 0.0
-
-
-def score_option_chain(pcr: Optional[float], oi_change_pct: Optional[float],
-                        spot: Optional[float], max_pain: Optional[float],
-                        put_writing: Optional[str], call_writing: Optional[str]) -> float:
-    try:
-        score, count = 0.0, 0
-        if pcr is not None:
-            if pcr > 1.2:
-                score += 60.0
-            elif pcr < 0.8:
-                score -= 60.0
-            else:
-                score += (pcr - 1.0) * 100.0
-            count += 1
-        if put_writing == "Active" and call_writing == "Weak":
-            score += 40.0
-            count += 1
-        elif call_writing == "Active" and put_writing == "Weak":
-            score -= 40.0
-            count += 1
-        if oi_change_pct is not None:
-            score += max(-40.0, min(40.0, oi_change_pct))
-            count += 1
-        if max_pain is not None and spot:
-            diff_pct = (spot - max_pain) / max_pain * 100.0
-            score += max(-30.0, min(30.0, -diff_pct * 3.0))
-            count += 1
-        return max(-100.0, min(100.0, score / count if count else 0.0))
-    except Exception:
-        return 0.0
-
-
-def score_smc(smc: Dict[str, Any]) -> float:
-    try:
-        score = 0.0
-        bos = smc.get("bos", "")
-        choch = smc.get("choch", "")
-        if "BULLISH" in bos:
-            score += 60.0
-        if "BEARISH" in bos:
-            score -= 60.0
-        if "BULLISH" in choch:
-            score += 40.0
-        if "BEARISH" in choch:
-            score -= 40.0
-        if smc.get("zone") == "DISCOUNT":
-            score += 20.0
-        elif smc.get("zone") == "PREMIUM":
-            score -= 20.0
-        sweep = smc.get("liquidity_sweep", "")
-        if sweep.startswith("Sell-side"):
-            score -= 15.0
-        elif sweep.startswith("Buy-side"):
-            score += 15.0
-        return max(-100.0, min(100.0, score))
-    except Exception:
-        return 0.0
-
-
-def score_news(news_df: Optional[pd.DataFrame]) -> float:
-    try:
-        if news_df is None or news_df.empty:
-            return 0.0
-        bull = int((news_df["Sentiment"] == "Bullish").sum())
-        bear = int((news_df["Sentiment"] == "Bearish").sum())
-        total = max(1, len(news_df))
-        return max(-100.0, min(100.0, ((bull - bear) / total) * 150.0))
-    except Exception:
-        return 0.0
-
-
-def score_institutional(fii_dii_net: Optional[float], buildup: Optional[str],
-                         rel_vol: Optional[float], bullish_candle: bool) -> float:
-    try:
-        score, count = 0.0, 0
-        if fii_dii_net is not None:
-            score += max(-60.0, min(60.0, fii_dii_net / 40.0))
-            count += 1
-        if buildup:
-            if buildup in ("Long Build Up", "Short Covering"):
-                score += 50.0
-                count += 1
-            elif buildup in ("Short Build Up", "Long Unwinding"):
-                score -= 50.0
-                count += 1
-        if rel_vol is not None and rel_vol > 1.5:
-            score += 30.0 if bullish_candle else -30.0
-            count += 1
-        return max(-100.0, min(100.0, score / count if count else 0.0))
-    except Exception:
-        return 0.0
-
-
-def score_momentum(rsi_val: float, macd_hist: float) -> float:
-    try:
-        rsi_score = (rsi_val - 50.0) / 50.0 * 100.0
-        macd_score = max(-100.0, min(100.0, macd_hist * 1000.0))
-        return max(-100.0, min(100.0, (rsi_score + macd_score) / 2.0))
-    except Exception:
-        return 0.0
-
-
-def score_volume(rel_vol: Optional[float], bullish_candle: bool) -> float:
-    try:
-        if rel_vol is None:
-            return 0.0
-        base = max(-100.0, min(100.0, (rel_vol - 1.0) * 60.0))
-        return base if bullish_candle else -base
-    except Exception:
-        return 0.0
-
-
-def score_greeks(option_chain: Dict[str, Any]) -> float:
-    try:
-        call_delta = option_chain.get("avg_call_delta")
-        put_delta = option_chain.get("avg_put_delta")
-        iv_rank = option_chain.get("iv_rank")
-        score, count = 0.0, 0
-        if call_delta is not None and put_delta is not None:
-            skew = call_delta + put_delta
-            score += max(-100.0, min(100.0, skew * 150.0))
-            count += 1
-        if iv_rank is not None:
-            score += max(-15.0, min(15.0, (50.0 - iv_rank) * 0.3))
-            count += 1
-        return max(-100.0, min(100.0, score / count if count else 0.0))
-    except Exception:
-        return 0.0
-
-
-def compute_weighted_direction(
-    trend_score: float,
-    option_chain_score: float,
-    smc_score: float,
-    news_score: float,
-    institutional_score: float,
-    momentum_score: float,
-    volume_score: float,
-    vix_value: Optional[float] = None,
-    atr_pct: Optional[float] = None,
-) -> Dict[str, Any]:
-    try:
-        raw = {
-            "trend": trend_score, "option_chain": option_chain_score, "smc": smc_score,
-            "news": news_score, "institutional": institutional_score,
-            "momentum": momentum_score, "volume": volume_score,
-        }
-        components = {k: max(-100.0, min(100.0, float(v) if v is not None else 0.0)) for k, v in raw.items()}
-
-        bullish_score = sum(DIRECTION_WEIGHTS[k] * max(0.0, components[k]) for k in DIRECTION_WEIGHTS)
-        bearish_score = sum(DIRECTION_WEIGHTS[k] * max(0.0, -components[k]) for k in DIRECTION_WEIGHTS)
-        net_score = bullish_score - bearish_score
-
-        confirming_factors = ("trend", "smc", "option_chain", "news", "institutional", "momentum")
-        confirmations = sum(
-            1 for k in confirming_factors
-            if abs(components[k]) >= 25.0 and (
-                (net_score >= 0 and components[k] > 0) or (net_score < 0 and components[k] < 0)
-            )
-        )
-
-        if net_score >= 50:
-            direction = "Strong Bullish"
-        elif net_score >= 20:
-            direction = "Bullish"
-        elif net_score <= -50:
-            direction = "Strong Bearish"
-        elif net_score <= -20:
-            direction = "Bearish"
-        else:
-            direction = "Neutral"
-
-        prob_up = round(max(5.0, min(95.0, 50 + net_score * 0.45)), 1)
-        prob_down = round(100.0 - prob_up, 1)
-        market_strength = round(min(100.0, bullish_score + bearish_score), 1)
-
-        vix_for_calc = vix_value if vix_value else 15.0
-        risk_pct = round(max(5.0, min(95.0, vix_for_calc * 3.0 + (atr_pct or 0.0) * 2.0)), 1)
-        opportunity_pct = round(max(5.0, min(95.0, 50 + net_score / 2.0)), 1)
-        confidence = round(max(30.0, min(97.0, 50 + max(bullish_score, bearish_score) * 0.4 + confirmations * 3.0)), 1)
-
-        if bullish_score > BUY_SELL_SCORE_THRESHOLD and confirmations >= MIN_CONFIRMATIONS_REQUIRED:
-            recommendation = "STRONG BUY" if bullish_score >= 90 else "BUY"
-        elif bearish_score > BUY_SELL_SCORE_THRESHOLD and confirmations >= MIN_CONFIRMATIONS_REQUIRED:
-            recommendation = "STRONG SELL" if bearish_score >= 90 else "SELL"
-        else:
-            recommendation = "WAIT"
-
-        return {
-            "components": components,
-            "bullish_score": round(bullish_score, 1),
-            "bearish_score": round(bearish_score, 1),
-            "net_score": round(net_score, 1),
-            "direction": direction,
-            "prob_up": prob_up,
-            "prob_down": prob_down,
-            "market_strength": market_strength,
-            "risk_pct": risk_pct,
-            "opportunity_pct": opportunity_pct,
-            "confidence": confidence,
-            "recommendation": recommendation,
-            "confirmations": confirmations,
-            "confirmations_required": MIN_CONFIRMATIONS_REQUIRED,
-            "professional_notes": [],
-        }
-    except Exception:
-        return {
-            "components": {k: 0.0 for k in DIRECTION_WEIGHTS},
-            "bullish_score": 0.0, "bearish_score": 0.0, "net_score": 0.0,
-            "direction": "Neutral", "prob_up": 50.0, "prob_down": 50.0,
-            "market_strength": 0.0, "risk_pct": 50.0, "opportunity_pct": 50.0,
-            "confidence": 50.0, "recommendation": "WAIT", "confirmations": 0,
-            "confirmations_required": MIN_CONFIRMATIONS_REQUIRED,
-            "professional_notes": [],
-        }
-
-
-def apply_professional_rules(
-    direction: Dict[str, Any],
-    greeks_score: float,
-    global_score: float,
-    breadth_score: float,
-    futures_vs_spot_agree: Optional[bool],
-    option_chain_vs_futures_agree: Optional[bool],
-    greeks_vs_oi_agree: Optional[bool],
-) -> Dict[str, Any]:
-    out = dict(direction)
-    notes: List[str] = list(out.get("professional_notes", []))
-    confidence = out.get("confidence", 50.0)
-    recommendation = out.get("recommendation", "WAIT")
-
-    if futures_vs_spot_agree is False:
-        confidence = max(20.0, confidence - 15.0)
-        notes.append("Futures and Spot are disagreeing on direction - confidence reduced.")
-
-    if option_chain_vs_futures_agree is False:
-        if recommendation not in ("WAIT",):
-            notes.append("Option Chain and Futures are disagreeing on direction - overridden to WAIT.")
-        recommendation = "WAIT"
-
-    if greeks_vs_oi_agree is False:
-        if recommendation not in ("WAIT",):
-            notes.append("Greeks and Open Interest are disagreeing on direction - overridden to WAIT.")
-        recommendation = "WAIT"
-
-    net_score = out.get("net_score", 0.0)
-    if net_score > 0 and (global_score < -25.0 or breadth_score < -25.0):
-        confidence = max(20.0, confidence - 10.0)
-        notes.append("Bullish verdict against a risk-off Global Markets / weak True Breadth backdrop - confidence reduced.")
-    elif net_score < 0 and (global_score > 25.0 or breadth_score > 25.0):
-        confidence = max(20.0, confidence - 10.0)
-        notes.append("Bearish verdict against a risk-on Global Markets / strong True Breadth backdrop - confidence reduced.")
-
-    out["confidence"] = round(confidence, 1)
-    out["recommendation"] = recommendation
-    out["professional_notes"] = notes
-    out["greeks_score"] = round(greeks_score, 1)
-    out["global_score"] = round(global_score, 1)
-    out["breadth_score"] = round(breadth_score, 1)
-    return out
-
-
-@dataclass
-class InstrumentSignals:
-    close: float
-    e20: float
-    e50: float
-    e200: Optional[float]
-    vwap_val: float
-    rsi_val: float
-    macd_hist: float
-    adx_val: float
-    atr_val: float
-    supertrend_dir: Optional[int]
-    support: float
-    resistance: float
-    smc: Dict[str, Any]
-    option_chain: Dict[str, Any]
-    rel_vol: Optional[float]
-    bullish_candle: bool
-    buildup: Optional[str]
-
-
-def evaluate_instrument_direction(
-    signals: InstrumentSignals,
-    news_df: Optional[pd.DataFrame],
-    fii_dii_net: Optional[float],
-    vix_value: Optional[float],
-) -> Dict[str, Any]:
-    trend_s = score_trend(signals.close, signals.e20, signals.e50, signals.e200,
-                           signals.vwap_val, signals.adx_val, signals.supertrend_dir)
-    oc_s = score_option_chain(
-        signals.option_chain.get("pcr"), signals.option_chain.get("oi_change_pct"),
-        signals.close, signals.option_chain.get("max_pain"),
-        signals.option_chain.get("put_writing"), signals.option_chain.get("call_writing"),
-    )
-    smc_s = score_smc(signals.smc)
-    news_s = score_news(news_df)
-    inst_s = score_institutional(fii_dii_net, signals.buildup, signals.rel_vol, signals.bullish_candle)
-    mom_s = score_momentum(signals.rsi_val, signals.macd_hist)
-    vol_s = score_volume(signals.rel_vol, signals.bullish_candle)
-
-    atr_pct = None
-    try:
-        if signals.close:
-            atr_pct = (signals.atr_val / signals.close) * 100.0
-    except Exception:
-        atr_pct = None
-
-    return compute_weighted_direction(
-        trend_score=trend_s, option_chain_score=oc_s, smc_score=smc_s, news_score=news_s,
-        institutional_score=inst_s, momentum_score=mom_s, volume_score=vol_s,
-        vix_value=vix_value, atr_pct=atr_pct,
+def _is_index_symbol(symbol):
+    text = str(symbol).upper().replace("-INDEX", "").replace("NSE:", "")
+    token = text.split("-")[0].split("_")[0]
+    return token in INDEX_NAMES or any(
+        token.startswith(name) for name in INDEX_NAMES
     )
 
 
-def check_agreement(a_direction_positive: Optional[bool], b_direction_positive: Optional[bool]) -> Optional[bool]:
-    if a_direction_positive is None or b_direction_positive is None:
-        return None
-    return a_direction_positive == b_direction_positive
-
-
-def compute_market_breadth(market_df: pd.DataFrame) -> Dict[str, int]:
-    try:
-        changes = market_df["Change %"].dropna() if not market_df.empty else pd.Series(dtype=float)
-        bullish = int((changes > 0).sum())
-        bearish = int((changes < 0).sum())
-        neutral = int((changes == 0).sum()) + (int(market_df["Change %"].isna().sum()) if not market_df.empty else 0)
-        return {"bullish": bullish, "bearish": bearish, "neutral": neutral}
-    except Exception:
-        return {"bullish": 0, "bearish": 0, "neutral": 0}
-
-
-def classify_vix(vix_value: float) -> Dict[str, Any]:
-    try:
-        if vix_value < 12:
-            regime, risk, confidence, size = "Low Volatility", 20, 85, "Large (75-100% of normal size)"
-        elif vix_value < 16:
-            regime, risk, confidence, size = "Normal", 35, 78, "Normal (100% of standard size)"
-        elif vix_value < 22:
-            regime, risk, confidence, size = "High Volatility", 60, 65, "Reduced (50-60% of normal size)"
+def _closed_candles(df, minutes):
+    """Keep only candles whose full interval has completed (IST)."""
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        return pd.DataFrame()
+    out = df.copy()
+    if "Time" not in out.columns:
+        if "Timestamp" in out.columns:
+            out["Time"] = out["Timestamp"]
         else:
-            regime, risk, confidence, size = "Very High", 85, 50, "Minimal (20-30% of normal size)"
-        return {"regime": regime, "risk_pct": risk, "confidence_pct": confidence, "position_size": size}
-    except Exception:
-        return {"regime": "Unknown", "risk_pct": 50, "confidence_pct": 50, "position_size": "Normal"}
+            return pd.DataFrame()
+    out["Time"] = pd.to_datetime(out["Time"], errors="coerce")
+    out = out.dropna(subset=["Time"]).sort_values("Time")
+    now = datetime.now(IST)
+    times = out["Time"]
+    if times.dt.tz is None:
+        times = times.dt.tz_localize(IST, ambiguous="NaT", nonexistent="shift_forward")
+    else:
+        times = times.dt.tz_convert(IST)
+    out = out.loc[(times + pd.Timedelta(minutes=minutes)) <= now].copy()
+    for col in ("Open", "High", "Low", "Close", "Volume"):
+        if col not in out.columns:
+            return pd.DataFrame()
+        out[col] = pd.to_numeric(out[col], errors="coerce")
+    return out.dropna(subset=["Open", "High", "Low", "Close", "Volume"])
 
 
-def _analyze_instrument(fyers: Any, symbol: str) -> Optional[Dict[str, Any]]:
-    df = fetch_history_cached(fyers, symbol, "15", 30)
-    if df is None or df.empty or len(df) < 5:
-        return None
+def _agent_analysis(df):
+    """Deterministic technical agent; returns direction, score and reasons."""
+    if df is None or len(df) < 25:
+        return {"direction": "NO TRADE", "score": 0, "reasons": ["Insufficient completed candles"]}
+    d = df.copy()
+    close = d["Close"]
+    volume = d["Volume"]
+    ema9 = close.ewm(span=9, adjust=False).mean()
+    ema21 = close.ewm(span=21, adjust=False).mean()
+    ema50 = close.ewm(span=50, adjust=False).mean()
+    delta = close.diff()
+    gain = delta.clip(lower=0).ewm(alpha=1/14, adjust=False).mean()
+    loss = (-delta.clip(upper=0)).ewm(alpha=1/14, adjust=False).mean()
+    rs = gain / loss.replace(0, float("nan"))
+    rsi = 100 - (100 / (1 + rs))
+    avg_vol = volume.rolling(20).mean()
+    rvol = float(volume.iloc[-1] / avg_vol.iloc[-1]) if pd.notna(avg_vol.iloc[-1]) and avg_vol.iloc[-1] > 0 else 0.0
 
-    e20_series = ema(df["close"], 20)
-    e50_series = ema(df["close"], 50)
-    e20 = float(e20_series.iloc[-1])
-    e50 = float(e50_series.iloc[-1])
-    e200 = float(ema(df["close"], 200).iloc[-1]) if len(df) >= 200 else None
-    vwap_series = vwap(df)
-    vwap_val = float(vwap_series.iloc[-1])
-    rsi_val = float(rsi(df["close"]).iloc[-1])
-    macd_line, macd_signal, macd_hist = macd(df["close"])
-    adx_val = float(adx(df).iloc[-1])
-    atr_val = float(atr(df).iloc[-1])
-    support, resistance = support_resistance(df)
-    st_line, st_dir = supertrend(df)
-    supertrend_dir = int(st_dir.iloc[-1]) if len(st_dir) else None
-    close = float(df["close"].iloc[-1])
-    open_ = float(df["open"].iloc[-1])
-    bullish_candle = close > open_
-
-    avg_vol = df["volume"].tail(20).mean()
-    rel_vol = (
-        round(float(df["volume"].iloc[-1] / avg_vol), 2)
-        if avg_vol and not np.isnan(avg_vol)
-        else None
-    )
-
-    smc = compute_smc(df)
-    option_chain = _safe_call(fetch_option_chain_data, fyers, symbol, default=dict(_EMPTY_OPTION_CHAIN_METRICS))
-
+    last = float(close.iloc[-1])
+    score = 0
+    reasons = []
+    if ema9.iloc[-1] > ema21.iloc[-1]:
+        score += 1
+        reasons.append("EMA 9 above EMA 21")
+    else:
+        score -= 1
+        reasons.append("EMA 9 below EMA 21")
+    if last > ema50.iloc[-1]:
+        score += 1
+        reasons.append("Price above EMA 50")
+    else:
+        score -= 1
+        reasons.append("Price below EMA 50")
+    if pd.notna(rsi.iloc[-1]):
+        if rsi.iloc[-1] >= 55:
+            score += 1
+            reasons.append(f"RSI bullish ({rsi.iloc[-1]:.1f})")
+        elif rsi.iloc[-1] <= 45:
+            score -= 1
+            reasons.append(f"RSI bearish ({rsi.iloc[-1]:.1f})")
+        else:
+            reasons.append(f"RSI neutral ({rsi.iloc[-1]:.1f})")
+    prior_high = d["High"].iloc[-21:-1].max()
+    prior_low = d["Low"].iloc[-21:-1].min()
+    if last > prior_high:
+        score += 1
+        reasons.append("20-candle upside breakout")
+    elif last < prior_low:
+        score -= 1
+        reasons.append("20-candle downside breakdown")
+    if rvol >= 1.5:
+        reasons.append(f"Relative volume elevated ({rvol:.2f}x)")
+        if score > 0:
+            score += 1
+        elif score < 0:
+            score -= 1
+    direction = "BUY" if score >= 3 else "SELL" if score <= -3 else "HOLD"
     return {
-        "df": df, "e20": e20, "e50": e50, "e200": e200, "vwap": vwap_val,
-        "rsi": rsi_val, "macd_line": macd_line, "macd_signal": macd_signal, "macd_hist": macd_hist,
-        "adx": adx_val, "atr": atr_val, "support": support, "resistance": resistance,
-        "supertrend_line": st_line, "supertrend_dir": supertrend_dir,
-        "close": close, "open": open_, "bullish_candle": bullish_candle,
-        "rel_vol": rel_vol, "smc": smc, "option_chain": option_chain,
-        "breakout": close > resistance, "breakdown": close < support,
+        "direction": direction,
+        "score": int(score),
+        "rsi": round(float(rsi.iloc[-1]), 2) if pd.notna(rsi.iloc[-1]) else None,
+        "rvol": round(rvol, 2),
+        "close": round(last, 2),
+        "reasons": reasons,
     }
 
 
-def render_ai_dashboard(direction: Dict[str, Any], breadth: Dict[str, int], true_breadth: Dict[str, Any]) -> None:
-    st.subheader("🧠 AI Dashboard")
-
-    status_emoji = {
-        "Strong Bullish": "🟢🟢", "Bullish": "🟢", "Neutral": "🟡",
-        "Bearish": "🔴", "Strong Bearish": "🔴🔴",
-    }.get(direction["direction"], "⚪")
-    st.markdown(f"### Market Direction: {status_emoji} **{direction['direction']}**")
-
-    rec_emoji = {"STRONG BUY": "🟢", "BUY": "🟢", "WAIT": "🟡", "SELL": "🔴", "STRONG SELL": "🔴"}.get(
-        direction["recommendation"], "⚪"
-    )
-    st.markdown(
-        f"**AI Signal:** {rec_emoji} {direction['recommendation']}  "
-        f"·  Confirmations: {direction['confirmations']}/{direction['confirmations_required']} required"
-    )
-
-    for note in direction.get("professional_notes", []):
-        st.caption(f"ℹ️ {note}")
-
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Bullish Breadth (Legacy, 6 Indices)", breadth["bullish"])
-    c2.metric("Bearish Breadth (Legacy, 6 Indices)", breadth["bearish"])
-    c3.metric("Neutral Breadth (Legacy, 6 Indices)", breadth["neutral"])
-
-    adv, dec, unch = true_breadth.get("advances"), true_breadth.get("declines"), true_breadth.get("unchanged")
-    c1b, c2b, c3b = st.columns(3)
-    c1b.metric("Advances (NIFTY 50)", adv if adv is not None else DATA_NA)
-    c2b.metric("Declines (NIFTY 50)", dec if dec is not None else DATA_NA)
-    c3b.metric("Unchanged (NIFTY 50)", unch if unch is not None else DATA_NA)
-
-    c4, c5, c6 = st.columns(3)
-    c4.metric("Bullish Score %", f"{direction['bullish_score']}%")
-    c4.progress(min(1.0, max(0.0, direction["bullish_score"] / 100)))
-    c5.metric("Bearish Score %", f"{direction['bearish_score']}%")
-    c5.progress(min(1.0, max(0.0, direction["bearish_score"] / 100)))
-    c6.metric("Confidence %", f"{direction['confidence']}%")
-    c6.progress(min(1.0, max(0.0, direction["confidence"] / 100)))
-
-    c7, c8, c9 = st.columns(3)
-    c7.metric("Probability Up %", f"{direction['prob_up']}%")
-    c8.metric("Probability Down %", f"{direction['prob_down']}%")
-    c9.metric("Market Strength %", f"{direction['market_strength']}%")
-
-    c10, c11 = st.columns(2)
-    c10.metric("Risk %", f"{direction['risk_pct']}%")
-    c10.progress(min(1.0, max(0.0, direction["risk_pct"] / 100)))
-    c11.metric("Opportunity %", f"{direction['opportunity_pct']}%")
-    c11.progress(min(1.0, max(0.0, direction["opportunity_pct"] / 100)))
-
-    with st.expander("AI Direction Factor Breakdown (NIFTY-based composite)"):
-        comp_df = pd.DataFrame(
-            [{"Factor": k.replace("_", " ").title(), "Weight %": DIRECTION_WEIGHTS[k] * 100,
-              "Score (-100..100)": direction["components"].get(k, 0.0)} for k in DIRECTION_WEIGHTS]
-        )
-        st.dataframe(comp_df, use_container_width=True, hide_index=True)
-        st.caption(
-            "BUY requires Bullish Score > 80% with at least "
-            f"{direction['confirmations_required']} of 6 factors confirming. "
-            "SELL requires the same on the Bearish Score. Otherwise the AI shows WAIT. "
-            "Greeks / Global Markets / True Breadth (below) act only as confidence "
-            "modifiers on this verdict, per the professional cross-check rules."
-        )
-        if "greeks_score" in direction:
-            extra_df = pd.DataFrame([
-                {"Factor": "Greeks (informational)", "Score (-100..100)": direction.get("greeks_score")},
-                {"Factor": "Global Markets (informational)", "Score (-100..100)": direction.get("global_score")},
-                {"Factor": "True Breadth (informational)", "Score (-100..100)": direction.get("breadth_score")},
-            ])
-            st.dataframe(extra_df, use_container_width=True, hide_index=True)
+def _fetch_one(client, symbol, fetcher):
+    frames = {}
+    errors = []
+    for label, resolution, mins in (("5M", "5", 5), ("15M", "15", 15), ("1H", "60", 60)):
+        try:
+            raw = fetcher(client, symbol, resolution, lookback_days=30)
+            frames[label] = _closed_candles(raw, mins)
+        except Exception as exc:
+            frames[label] = pd.DataFrame()
+            errors.append(f"{label}: {exc}")
+    analyses = {tf: _agent_analysis(data) for tf, data in frames.items()}
+    valid = [a for a in analyses.values() if a["direction"] != "NO TRADE"]
+    if len(valid) != 3:
+        signal = "NO TRADE"
+        confidence = 0
+    else:
+        weights = {"5M": 0.30, "15M": 0.40, "1H": 0.30}
+        weighted = sum(analyses[tf]["score"] * weights[tf] for tf in weights)
+        all_buy = all(analyses[tf]["direction"] == "BUY" for tf in weights)
+        all_sell = all(analyses[tf]["direction"] == "SELL" for tf in weights)
+        signal = "BUY" if all_buy and weighted >= 3 else "SELL" if all_sell and weighted <= -3 else "HOLD"
+        confidence = min(99, round(abs(weighted) / 4 * 100))
+    return {
+        "Symbol": symbol,
+        "Signal": signal,
+        "Confidence %": confidence,
+        "5M": analyses["5M"]["direction"],
+        "15M": analyses["15M"]["direction"],
+        "1H": analyses["1H"]["direction"],
+        "5M Score": analyses["5M"]["score"],
+        "15M Score": analyses["15M"]["score"],
+        "1H Score": analyses["1H"]["score"],
+        "Last Price": analyses["15M"].get("close"),
+        "15M RSI": analyses["15M"].get("rsi"),
+        "15M RVOL": analyses["15M"].get("rvol"),
+        "Reason": " | ".join(analyses["15M"]["reasons"]),
+        "Errors": " | ".join(errors),
+    }
 
 
-def render_market_summary(market_df: pd.DataFrame) -> None:
-    st.subheader("📊 Market Summary (Live)")
-    if market_df.empty:
-        st.warning(DATA_NA)
+def show_ai_multi_agent_scanner(client):
+    st.title("🤖 AI Multi-Agent Scanner")
+    st.caption("FYERS data • Completed 5M / 15M / 1H candles • Multi-timeframe confirmation")
+    st.warning("Signals are technical research outputs, not guaranteed predictions. No orders are placed.")
+
+    try:
+        from scanner import load_nse_equity_symbols, load_fo_stocks, _fetch_timeframe_data
+    except Exception as exc:
+        st.error(f"Could not import existing scanner.py helpers: {exc}")
+        st.info("Check that the existing file is named scanner.py and contains load_nse_equity_symbols, load_fo_stocks and _fetch_timeframe_data.")
         return
-    for _, row in market_df.iterrows():
-        color = _trend_color(row.get("Trend", "NA"))
-        with st.container():
-            cols = st.columns([1.4, 1, 1, 1, 1, 1, 1, 1, 1])
-            cols[0].markdown(f"**{color} {row['Index']}**")
-            cols[1].metric("LTP", _fmt_num(row["LTP"]))
-            cols[2].metric("Change", _fmt_num(row["Change"]))
-            cols[3].metric("Change %", _fmt_num(row["Change %"], suffix="%"))
-            cols[4].write(f"High: {_fmt_num(row['High'])}")
-            cols[5].write(f"Low: {_fmt_num(row['Low'])}")
-            cols[6].write(f"Open: {_fmt_num(row['Open'])}")
-            cols[7].write(f"Prev: {_fmt_num(row['Prev Close'])}")
-            cols[8].write(f"Vol: {_fmt_int(row['Volume'])}")
-        st.divider()
 
-
-def render_vix_analysis(vix_value: Optional[float]) -> None:
-    st.subheader("📈 India VIX Analysis")
-    if vix_value is None:
-        st.warning(DATA_NA)
-        return
-    info = classify_vix(vix_value)
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("India VIX", _fmt_num(vix_value))
-    c2.metric("Regime", _fmt_text(info["regime"]))
-    c3.metric("Risk %", f"{info['risk_pct']}%")
-    c4.metric("Confidence %", f"{info['confidence_pct']}%")
-    st.info(f"**Suggested Position Size:** {info['position_size']}")
-
-
-def render_live_news(news_df: pd.DataFrame) -> None:
-    st.subheader("📰 Live News")
-    if news_df.empty:
-        st.warning(DATA_NA)
-        return
-    display_df = news_df[["Time", "Headline", "Category", "Source", "Sentiment", "Confidence"]].copy()
-    display_df["Sentiment"] = display_df["Sentiment"].apply(lambda s: f"{_sentiment_color(s)} {s}")
-    display_df["Time"] = display_df["Time"].apply(lambda t: t if t else DATA_NA)
-    st.dataframe(display_df, use_container_width=True, hide_index=True)
-
-
-def render_ai_news_analysis(news_df: pd.DataFrame) -> None:
-    st.subheader("🤖 AI News Analysis")
-    if news_df.empty:
-        st.warning(DATA_NA)
-        return
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Bullish", int((news_df["Sentiment"] == "Bullish").sum()))
-    c2.metric("Bearish", int((news_df["Sentiment"] == "Bearish").sum()))
-    c3.metric("Neutral", int((news_df["Sentiment"] == "Neutral").sum()))
-
-    c4, c5, c6 = st.columns(3)
-    c4.metric("High Impact", int((news_df["Impact"] == "High").sum()))
-    c5.metric("Medium Impact", int((news_df["Impact"] == "Medium").sum()))
-    c6.metric("Low Impact", int((news_df["Impact"] == "Low").sum()))
-
-    avg_conf = news_df["Confidence"].mean() if "Confidence" in news_df.columns and not news_df.empty else None
-    st.metric("Avg. Sentiment Confidence %", _fmt_num(avg_conf, decimals=1, suffix="%") if avg_conf is not None else DATA_NA)
-
-    with st.expander("Detailed Market Impact Analysis"):
-        detail_df = news_df[["Headline", "Sentiment", "Impact", "Affected Index", "Affected Stocks"]].rename(
-            columns={"Impact": "Market Impact"}
-        )
-        st.dataframe(detail_df, use_container_width=True, hide_index=True)
-
-
-def render_fii_dii() -> Dict[str, float]:
-    st.subheader("🏦 FII / DII Activity")
-    data = fetch_fii_dii()
-    if data is None:
-        st.warning("Live FII/DII data unavailable. Please enter today's figures manually.")
-        if "manual_fii_dii" not in st.session_state:
-            st.session_state.manual_fii_dii = {"fii_buy": 0.0, "fii_sell": 0.0, "dii_buy": 0.0, "dii_sell": 0.0}
-        with st.form("manual_fii_dii_form"):
-            c1, c2 = st.columns(2)
-            fii_buy = c1.number_input("FII Buy (₹ Cr)", value=st.session_state.manual_fii_dii["fii_buy"])
-            fii_sell = c2.number_input("FII Sell (₹ Cr)", value=st.session_state.manual_fii_dii["fii_sell"])
-            dii_buy = c1.number_input("DII Buy (₹ Cr)", value=st.session_state.manual_fii_dii["dii_buy"])
-            dii_sell = c2.number_input("DII Sell (₹ Cr)", value=st.session_state.manual_fii_dii["dii_sell"])
-            if st.form_submit_button("Save"):
-                st.session_state.manual_fii_dii = {
-                    "fii_buy": fii_buy, "fii_sell": fii_sell, "dii_buy": dii_buy, "dii_sell": dii_sell,
-                }
-                st.success("Manual FII/DII data saved.")
-        data = st.session_state.manual_fii_dii
-
-    net_fii = data["fii_buy"] - data["fii_sell"]
-    net_dii = data["dii_buy"] - data["dii_sell"]
     c1, c2, c3 = st.columns(3)
     with c1:
-        st.metric("FII Buy", f"₹{data['fii_buy']:.1f} Cr")
-        st.metric("FII Sell", f"₹{data['fii_sell']:.1f} Cr")
+        universe = st.selectbox("Universe", ["F&O Stocks", "NSE Equity"], key="ma_universe")
     with c2:
-        st.metric("Net FII", f"₹{net_fii:.1f} Cr")
+        limit = st.selectbox("Maximum symbols", [10, 25, 50, 100, 200], index=1, key="ma_limit")
     with c3:
-        st.metric("DII Buy", f"₹{data['dii_buy']:.1f} Cr")
-        st.metric("DII Sell", f"₹{data['dii_sell']:.1f} Cr")
-    st.metric("Net DII", f"₹{net_dii:.1f} Cr")
-    return data
+        workers = st.selectbox("Parallel workers", [1, 2, 3, 4], index=1, key="ma_workers")
 
+    if universe == "F&O Stocks":
+        try:
+            symbols = _normalise_symbols(load_fo_stocks())
+        except Exception as exc:
+            st.error(f"F&O symbol list error: {exc}")
+            return
+    else:
+        try:
+            symbols = _normalise_symbols(load_nse_equity_symbols())
+        except Exception as exc:
+            st.error(f"NSE symbol list error: {exc}")
+            return
 
-def render_index_analysis(fyers: Any) -> None:
-    st.subheader("📐 Index Analysis")
-    for name, symbol in INDEX_SYMBOLS.items():
-        if name == "INDIA VIX":
-            continue
-        with st.expander(f"{name} — Technical Analysis", expanded=False):
-            with st.spinner(f"{FETCHING_MSG} {name} data..."):
-                a = _analyze_instrument(fyers, symbol)
-            if a is None:
-                st.warning(DATA_NA)
-                continue
-            try:
-                trend = "UP" if a["close"] > a["e50"] else "DOWN"
-
-                c1, c2, c3, c4 = st.columns(4)
-                c1.metric("Trend", trend)
-                c2.metric("EMA20", _fmt_num(a["e20"]))
-                c3.metric("EMA50", _fmt_num(a["e50"]))
-                c4.metric("EMA200", _fmt_num(a["e200"]) if a["e200"] is not None else DATA_NA)
-
-                c5, c6, c7, c8 = st.columns(4)
-                c5.metric("VWAP", _fmt_num(a["vwap"]))
-                c6.metric("RSI", _fmt_num(a["rsi"], decimals=1))
-                c7.metric("MACD Hist", _fmt_num(a["macd_hist"].iloc[-1], decimals=3))
-                c8.metric("ADX", _fmt_num(a["adx"], decimals=1))
-
-                c9, c10, c11, c12 = st.columns(4)
-                c9.metric("ATR", _fmt_num(a["atr"]))
-                c10.metric("Support", _fmt_num(a["support"]))
-                c11.metric("Resistance", _fmt_num(a["resistance"]))
-                st_dir_label = "UP" if a["supertrend_dir"] == 1 else ("DOWN" if a["supertrend_dir"] == -1 else DATA_NA)
-                c12.metric("Supertrend", st_dir_label)
-
-                oc = a["option_chain"]
-                c13, c14, c15, c16 = st.columns(4)
-                c13.metric("PCR", _fmt_num(oc.get("pcr")) if oc.get("pcr") is not None else DATA_NA)
-                c14.metric("Total OI", _fmt_int(oc.get("total_oi")))
-                c15.metric("Max Pain", _fmt_num(oc.get("max_pain")) if oc.get("max_pain") is not None else DATA_NA)
-                c16.metric("Delta OI (PE-CE)", _fmt_int(oc.get("delta_oi")))
-
-                c17, c18 = st.columns(2)
-                c17.metric("Breakout", "Yes 🚀" if a["breakout"] else "No")
-                c18.metric("Breakdown", "Yes ⚠️" if a["breakdown"] else "No")
-
-                st.caption(
-                    f"Put Writing: {_fmt_text(oc.get('put_writing'))} · "
-                    f"Call Writing: {_fmt_text(oc.get('call_writing'))} · "
-                    f"OI Change: {_fmt_num(oc.get('oi_change_pct'), suffix='%') if oc.get('oi_change_pct') is not None else DATA_NA}"
-                )
-            except Exception as exc:
-                st.warning(f"Unable to complete technical analysis for {name} ({exc}). {DATA_NA}")
-
-
-def render_futures_analysis(fyers: Any) -> None:
-    st.subheader("📉 Futures Analysis")
-    for label, underlying in FUTURES_UNDERLYINGS.items():
-        with st.expander(label, expanded=False):
-            try:
-                fut_symbol = _current_month_future_symbol(underlying)
-                with st.spinner(f"{FETCHING_MSG} {label}..."):
-                    q = fetch_quote(fyers, fut_symbol)
-                if not q:
-                    st.warning(f"{DATA_NA} for {label} ({fut_symbol}).")
-                    continue
-                price_change_pct = q.get("chp", 0.0)
-                oi = q.get("oi")
-                oi_change_pct = q.get("oipercent")
-                oi_source = "FYERS"
-
-                if oi is None or oi_change_pct is None:
-                    fallback = _safe_call(fetch_futures_oi_nse_fallback, underlying, default=None)
-                    if fallback:
-                        oi = fallback.get("oi") if oi is None else oi
-                        oi_change_pct = fallback.get("oi_change_pct") if oi_change_pct is None else oi_change_pct
-                        oi_source = "NSE (fallback)"
-
-                volume = q.get("volume", 0)
-                have_oi_data = oi is not None and oi_change_pct is not None
-                buildup = classify_futures_buildup(price_change_pct, oi_change_pct) if have_oi_data else "Data Not Available"
-                strength = min(100.0, abs(price_change_pct) * 10 + abs(oi_change_pct or 0.0) * 5) if have_oi_data else None
-
-                if not have_oi_data:
-                    signal = "WAIT"
-                elif buildup in ("Long Build Up", "Short Covering"):
-                    signal = "BUY"
-                elif buildup in ("Short Build Up", "Long Unwinding"):
-                    signal = "SELL"
-                else:
-                    signal = "WAIT"
-
-                c1, c2, c3 = st.columns(3)
-                c1.metric("Build Up", buildup)
-                c2.metric("Trend Strength", _fmt_num(strength, decimals=1, suffix="%") if strength is not None else DATA_NA)
-                c3.metric("AI Signal", signal)
-
-                c4, c5, c6 = st.columns(3)
-                c4.metric("Volume", _fmt_int(volume) if volume else DATA_NA)
-                c5.metric("OI", _fmt_int(oi) if oi is not None else DATA_NA)
-                c6.metric("Price %", _fmt_num(price_change_pct, suffix="%"))
-                if have_oi_data:
-                    st.caption(f"OI source: {oi_source} · OI Change: {_fmt_num(oi_change_pct, suffix='%')}")
-                else:
-                    st.caption(f"OI data unavailable from FYERS and NSE fallback for {fut_symbol}.")
-            except Exception as exc:
-                st.warning(f"Unable to analyze futures for {label} ({exc}). {DATA_NA}")
-
-
-def render_stock_analysis(fyers: Any) -> None:
-    st.subheader("📌 Stock Analysis (Watchlist)")
-    if "ai_watchlist" not in st.session_state:
-        st.session_state.ai_watchlist = list(WATCHLIST_DEFAULT)
-
-    c1, c2 = st.columns([3, 1])
-    new_symbol = c1.text_input("Add symbol (e.g. NSE:TATAMOTORS-EQ)", key="ai_new_symbol")
-    if c2.button("Add to Watchlist"):
-        symbol_clean = new_symbol.strip()
-        if symbol_clean and symbol_clean not in st.session_state.ai_watchlist:
-            st.session_state.ai_watchlist.append(symbol_clean)
-
-    for symbol in list(st.session_state.ai_watchlist):
-        with st.expander(symbol, expanded=False):
-            remove_col, _ = st.columns([1, 5])
-            if remove_col.button("Remove", key=f"remove_{symbol}"):
-                st.session_state.ai_watchlist.remove(symbol)
-                st.rerun()
-
-            with st.spinner(f"{FETCHING_MSG} {symbol}..."):
-                a = _analyze_instrument(fyers, symbol)
-            if a is None:
-                st.warning(DATA_NA)
-                continue
-
-            try:
-                e20_series = ema(a["df"]["close"], 20)
-                e50_series = ema(a["df"]["close"], 50)
-                golden_cross = len(a["df"]) >= 2 and a["e20"] > a["e50"] and e20_series.iloc[-2] <= e50_series.iloc[-2]
-                death_cross = len(a["df"]) >= 2 and a["e20"] < a["e50"] and e20_series.iloc[-2] >= e50_series.iloc[-2]
-
-                rel_vol = a["rel_vol"] if a["rel_vol"] is not None else 0.0
-                vol_spike = rel_vol > 2.0
-                institutional_buying = rel_vol > 1.5 and a["bullish_candle"]
-                institutional_selling = rel_vol > 1.5 and not a["bullish_candle"]
-
-                c1a, c2a, c3a, c4a = st.columns(4)
-                c1a.metric("EMA20", _fmt_num(a["e20"]))
-                c2a.metric("EMA50", _fmt_num(a["e50"]))
-                c3a.metric("EMA200", _fmt_num(a["e200"]) if a["e200"] is not None else DATA_NA)
-                c4a.metric("VWAP", _fmt_num(a["vwap"]))
-
-                c5a, c6a, c7a, c8a = st.columns(4)
-                c5a.metric("RSI", _fmt_num(a["rsi"], decimals=1))
-                c6a.metric("MACD Hist", _fmt_num(a["macd_hist"].iloc[-1], decimals=3))
-                c7a.metric("ADX", _fmt_num(a["adx"], decimals=1))
-                c8a.metric("ATR", _fmt_num(a["atr"]))
-
-                c9a, c10a = st.columns(2)
-                c9a.metric("Support", _fmt_num(a["support"]))
-                c10a.metric("Resistance", _fmt_num(a["resistance"]))
-
-                tags = []
-                if golden_cross:
-                    tags.append("🟢 Golden Cross")
-                if death_cross:
-                    tags.append("🔴 Death Cross")
-                if a["breakout"]:
-                    tags.append("🚀 Breakout")
-                if a["breakdown"]:
-                    tags.append("⚠️ Breakdown")
-                if vol_spike:
-                    tags.append("📊 Volume Spike")
-                if institutional_buying:
-                    tags.append("🏦 Institutional Buying")
-                if institutional_selling:
-                    tags.append("🏦 Institutional Selling")
-
-                st.write(f"Relative Volume: **{rel_vol}x**" if a["rel_vol"] is not None else f"Relative Volume: {DATA_NA}")
-                st.write(" | ".join(tags) if tags else "No special patterns detected.")
-            except Exception as exc:
-                st.warning(f"Unable to compute indicators for {symbol} ({exc}). {DATA_NA}")
-
-
-def render_smc_section(fyers: Any) -> None:
-    st.subheader("🧩 Smart Money Concepts (SMC)")
-    watchlist = st.session_state.get("ai_watchlist", WATCHLIST_DEFAULT)
-    options = [v for k, v in INDEX_SYMBOLS.items() if k != "INDIA VIX"] + list(watchlist)
-    selected = st.selectbox("Select instrument for SMC analysis", options, key="smc_symbol_select")
-
-    with st.spinner(f"{FETCHING_MSG} SMC data for {selected}..."):
-        df = fetch_history_cached(fyers, selected, "15", 30)
-    if df is None or df.empty:
-        st.warning(DATA_NA)
+    symbols = [s for s in symbols if not _is_index_symbol(s)]
+    if not symbols:
+        st.error("No stock symbols were returned by the existing scanner symbol loader.")
         return
+    symbols = symbols[:limit]
+    st.caption(f"Selected universe: {len(symbols)} stocks. Index symbols are excluded.")
 
-    smc = compute_smc(df)
-    c1, c2 = st.columns(2)
-    c1.metric("Swing High", _fmt_num(smc["swing_high"]) if smc["swing_high"] else DATA_NA)
-    c2.metric("Swing Low", _fmt_num(smc["swing_low"]) if smc["swing_low"] else DATA_NA)
+    if st.button("🚀 RUN MULTI-AGENT SCAN", type="primary", use_container_width=True, key="run_multi_agent"):
+        progress = st.progress(0)
+        status = st.empty()
+        rows = []
+        errors = []
+        completed = 0
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {pool.submit(_fetch_one, client, sym, _fetch_timeframe_data): sym for sym in symbols}
+            for future in concurrent.futures.as_completed(futures):
+                sym = futures[future]
+                try:
+                    rows.append(future.result())
+                except Exception as exc:
+                    errors.append({"Symbol": sym, "Error": str(exc)})
+                completed += 1
+                progress.progress(completed / len(futures))
+                status.write(f"Scanned {completed}/{len(futures)}: {sym}")
+        result = pd.DataFrame(rows)
+        if not result.empty:
+            result = result.sort_values(["Confidence %", "Symbol"], ascending=[False, True])
+            st.session_state["multi_agent_results"] = result
+        st.session_state["multi_agent_errors"] = errors
+        status.success(f"Scan completed: {len(rows)} results, {len(errors)} errors.")
 
-    c3, c4 = st.columns(2)
-    c3.metric("BOS", smc["bos"])
-    c4.metric("CHOCH", smc["choch"])
-
-    st.write(f"**Order Block:** {smc['order_block']}")
-    st.write(f"**Demand Zone:** {smc.get('demand_zone') or 'NONE'}")
-    st.write(f"**Supply Zone:** {smc.get('supply_zone') or 'NONE'}")
-    st.write(f"**Breaker Block:** {smc['breaker_block']}")
-    st.write(f"**Mitigation Block:** {smc['mitigation_block']}")
-    st.write(f"**Fair Value Gap:** {smc['fvg']}")
-    st.write(f"**Liquidity Sweep:** {smc['liquidity_sweep']}")
-    st.write(f"**Liquidity Pool:** {smc['liquidity_pool']}")
-    st.write(f"**Equal High:** {'Yes' if smc['equal_high'] else 'No'}")
-    st.write(f"**Equal Low:** {'Yes' if smc['equal_low'] else 'No'}")
-    st.write(f"**CISD:** {smc['cisd']}")
-    zone_emoji = "🔴" if smc["zone"] == "PREMIUM" else ("🟢" if smc["zone"] == "DISCOUNT" else "⚪")
-    st.write(f"**Premium/Discount Zone:** {zone_emoji} {smc['zone']}")
-
-
-def render_greeks_section(fyers: Any) -> None:
-    st.subheader("🧮 Options Greeks Engine")
-    options = [v for k, v in INDEX_SYMBOLS.items() if k != "INDIA VIX"]
-    selected = st.selectbox("Select instrument for Greeks analysis", options, key="greeks_symbol_select")
-
-    with st.spinner(f"{FETCHING_MSG} option chain greeks for {selected}..."):
-        oc = _safe_call(fetch_option_chain_data, fyers, selected, default=dict(_EMPTY_OPTION_CHAIN_METRICS))
-
-    if oc.get("chain_detail") is None:
-        st.warning(f"{DATA_NA} - the FYERS option-chain response for this symbol did not include a 'greeks' payload.")
-        return
-
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Avg Call Delta", _fmt_num(oc.get("avg_call_delta"), decimals=3) if oc.get("avg_call_delta") is not None else DATA_NA)
-    c2.metric("Avg Put Delta", _fmt_num(oc.get("avg_put_delta"), decimals=3) if oc.get("avg_put_delta") is not None else DATA_NA)
-    c3.metric("Avg Theta", _fmt_num(oc.get("avg_theta"), decimals=3) if oc.get("avg_theta") is not None else DATA_NA)
-    c4.metric("Avg Vega", _fmt_num(oc.get("avg_vega"), decimals=3) if oc.get("avg_vega") is not None else DATA_NA)
-
-    c5, c6, c7, c8 = st.columns(4)
-    c5.metric("ATM IV", _fmt_num(oc.get("atm_iv"), suffix="%") if oc.get("atm_iv") is not None else DATA_NA)
-    c6.metric("IV Rank (session)", _fmt_num(oc.get("iv_rank"), decimals=1, suffix="%") if oc.get("iv_rank") is not None else DATA_NA)
-    c7.metric("IV Percentile (session)", _fmt_num(oc.get("iv_percentile"), decimals=1, suffix="%") if oc.get("iv_percentile") is not None else DATA_NA)
-    c8.metric("Gamma Exposure", _fmt_num(oc.get("gamma_exposure"), decimals=4) if oc.get("gamma_exposure") is not None else DATA_NA)
-
-    c9, c10 = st.columns(2)
-    c9.metric("Delta Exposure", _fmt_num(oc.get("delta_exposure")) if oc.get("delta_exposure") is not None else DATA_NA)
-    c10.metric("ATM Strike", _fmt_num(oc.get("atm_strike")) if oc.get("atm_strike") is not None else DATA_NA)
-
-    st.caption(
-        "IV Rank / IV Percentile are computed against ATM-IV observations made "
-        "live during this session (no external historical-IV feed is wired in) - "
-        "they become more meaningful as the session progresses, and start near "
-        "50% with few observations. This is disclosed rather than presented as "
-        "a full 252-day IV Rank."
-    )
-
-    if any(v.get("Gamma") is not None for v in oc.get("chain_detail", [])) or True:
-        with st.expander("What High Gamma / High Vega / Theta Decay mean here"):
-            st.write(
-                "- **High Gamma** near the ATM strike means Delta (and therefore the "
-                "position's directional exposure) can change quickly for a small "
-                "move in the underlying - option prices become more reactive.\n"
-                "- **High Vega** means the option's price is more sensitive to "
-                "changes in implied volatility - a spike or crush in IV moves the "
-                "premium a lot even if the underlying doesn't move.\n"
-                "- **Theta Decay** is the daily erosion of an option's time value; "
-                "it accelerates as expiry approaches, especially for ATM strikes.\n"
-                "- **Premium Expansion** happens when IV Rank/Percentile is rising "
-                "(often around events) - premiums richen independent of direction."
+    result = st.session_state.get("multi_agent_results")
+    if isinstance(result, pd.DataFrame) and not result.empty:
+        buy_count = int((result["Signal"] == "BUY").sum())
+        sell_count = int((result["Signal"] == "SELL").sum())
+        hold_count = int((result["Signal"] == "HOLD").sum())
+        a, b, c = st.columns(3)
+        a.metric("BUY", buy_count)
+        b.metric("SELL", sell_count)
+        c.metric("HOLD", hold_count)
+        filter_signal = st.selectbox("Show signals", ["ALL", "BUY", "SELL", "HOLD", "NO TRADE"], key="ma_filter")
+        view = result if filter_signal == "ALL" else result[result["Signal"] == filter_signal]
+        st.dataframe(view, use_container_width=True, hide_index=True)
+        st.download_button(
+            "⬇️ Download CSV",
+            result.to_csv(index=False).encode("utf-8-sig"),
+            file_name=f"multi_agent_scan_{datetime.now(IST):%Y%m%d_%H%M%S}.csv",
+            mime="text/csv",
+            key="ma_csv",
+        )
+        try:
+            import io
+            buffer = io.BytesIO()
+            with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+                result.to_excel(writer, index=False, sheet_name="AI Scanner")
+            st.download_button(
+                "⬇️ Download Excel",
+                buffer.getvalue(),
+                file_name=f"multi_agent_scan_{datetime.now(IST):%Y%m%d_%H%M%S}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="ma_xlsx",
             )
-
-    with st.expander("Per-Strike ATM / ITM / OTM Table"):
-        detail = oc.get("chain_detail") or []
-        if detail:
-            st.dataframe(pd.DataFrame(detail), use_container_width=True, hide_index=True)
-        else:
-            st.info(DATA_NA)
-
-
-def render_global_markets(fyers: Any) -> pd.DataFrame:
-    st.subheader("🌍 Global Markets")
-    with st.spinner(f"{FETCHING_MSG} global market data..."):
-        global_df = _safe_call(get_global_markets_summary, fyers, default=pd.DataFrame())
-    if global_df.empty:
-        st.warning(DATA_NA)
-        return global_df
-
-    for _, row in global_df.iterrows():
-        c1, c2, c3, c4 = st.columns([2, 1, 1, 1])
-        c1.write(f"**{row['Instrument']}**  \n_{row['Source']}_")
-        c2.metric("Price", _fmt_num(row["Price"]) if row["Price"] is not None else DATA_NA)
-        c3.metric("Change", _fmt_num(row["Change"]) if row["Change"] is not None else DATA_NA)
-        c4.metric("Change %", _fmt_num(row["Change %"], suffix="%") if row["Change %"] is not None else DATA_NA)
-    st.caption(
-        "USDINR / Crude / Gold are sourced live from FYERS. Gift Nifty, US "
-        "Futures, and Asian/European indices are not served by FYERS and use "
-        "a best-effort external quote lookup - shown as Data Not Available if "
-        "that lookup also fails."
-    )
-    return global_df
-
-
-def render_true_breadth_section(fyers: Any) -> Dict[str, Any]:
-    st.subheader("📊 True Market Breadth (NIFTY 50)")
-    with st.spinner(f"{FETCHING_MSG} market breadth..."):
-        breadth = _safe_call(compute_true_market_breadth, fyers, default={})
-    if not breadth or breadth.get("advances") is None:
-        st.warning(DATA_NA)
-        return breadth or {}
-
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Advances", breadth["advances"])
-    c2.metric("Declines", breadth["declines"])
-    c3.metric("Unchanged", breadth["unchanged"])
-
-    col_a, col_b = st.columns(2)
-    with col_a:
-        st.markdown("**Top Gainers**")
-        if not breadth["top_gainers"].empty:
-            st.dataframe(breadth["top_gainers"][["Symbol", "LTP", "Change %"]], use_container_width=True, hide_index=True)
-        else:
-            st.info(DATA_NA)
-    with col_b:
-        st.markdown("**Top Losers**")
-        if not breadth["top_losers"].empty:
-            st.dataframe(breadth["top_losers"][["Symbol", "LTP", "Change %"]], use_container_width=True, hide_index=True)
-        else:
-            st.info(DATA_NA)
-
-    st.markdown("**Volume Leaders**")
-    if not breadth["volume_leaders"].empty:
-        st.dataframe(breadth["volume_leaders"][["Symbol", "Volume", "Change %"]], use_container_width=True, hide_index=True)
-    else:
-        st.info(DATA_NA)
-
-    st.markdown("**Heavyweight Contribution** (approx. weight × change %, ranked by |contribution|)")
-    if not breadth["heavyweight_contribution"].empty:
-        st.dataframe(
-            breadth["heavyweight_contribution"][["Symbol", "Weight", "Change %", "Contribution"]],
-            use_container_width=True, hide_index=True,
-        )
-    else:
-        st.info(DATA_NA)
-
-    st.markdown("**Sector Rotation**")
-    sector_df = _safe_call(get_sector_rotation, fyers, default=pd.DataFrame())
-    if not sector_df.empty:
-        st.dataframe(sector_df, use_container_width=True, hide_index=True)
-    else:
-        st.info(DATA_NA)
-
-    return breadth
-
-
-def render_ai_prediction_section(fyers: Any, news_df: pd.DataFrame, fii_dii_net: float,
-                                  vix_value: Optional[float], global_df: Optional[pd.DataFrame],
-                                  true_breadth: Optional[Dict[str, Any]]) -> None:
-    st.subheader("🎯 AI Prediction")
-    watchlist = st.session_state.get("ai_watchlist", WATCHLIST_DEFAULT)
-    options = [v for k, v in INDEX_SYMBOLS.items() if k != "INDIA VIX"] + list(watchlist)
-    selected = st.selectbox("Select instrument for AI prediction", options, key="prediction_symbol_select")
-
-    with st.spinner(f"{FETCHING_MSG} prediction inputs for {selected}..."):
-        a = _analyze_instrument(fyers, selected)
-    if a is None:
-        st.warning(DATA_NA)
-        return
-
-    try:
-        rel_vol = a["rel_vol"]
-        oi_change_pct = a["option_chain"].get("oi_change_pct") or 0.0
-        price_change_pct_now = (
-            (a["close"] - a["df"]["close"].iloc[-2]) / a["df"]["close"].iloc[-2] * 100 if len(a["df"]) > 1 else 0.0
-        )
-        buildup = classify_futures_buildup(price_change_pct_now, oi_change_pct)
-
-        signals = InstrumentSignals(
-            close=a["close"], e20=a["e20"], e50=a["e50"], e200=a["e200"], vwap_val=a["vwap"],
-            rsi_val=a["rsi"], macd_hist=float(a["macd_hist"].iloc[-1]), adx_val=a["adx"], atr_val=a["atr"],
-            supertrend_dir=a["supertrend_dir"], support=a["support"], resistance=a["resistance"],
-            smc=a["smc"], option_chain=a["option_chain"], rel_vol=rel_vol,
-            bullish_candle=a["bullish_candle"], buildup=buildup,
-        )
-        direction = evaluate_instrument_direction(signals, news_df, fii_dii_net, vix_value)
-
-        greeks_s = score_greeks(a["option_chain"])
-        global_s = score_global_markets(global_df)
-        breadth_s = score_true_breadth(true_breadth or {})
-
-        spot_positive = price_change_pct_now > 0
-        fut_symbol_guess = None
-        for label, underlying in FUTURES_UNDERLYINGS.items():
-            if underlying in selected:
-                fut_symbol_guess = _current_month_future_symbol(underlying)
-                break
-        fut_q = _safe_call(fetch_quote, fyers, fut_symbol_guess, default=None) if fut_symbol_guess else None
-        fut_positive = fut_q.get("chp") > 0 if (fut_q and fut_q.get("chp") is not None) else None
-
-        futures_vs_spot_agree = check_agreement(spot_positive, fut_positive) if fut_positive is not None else None
-
-        oc_positive = None
-        pcr = a["option_chain"].get("pcr")
-        if pcr is not None:
-            oc_positive = pcr > 1.0
-        option_chain_vs_futures_agree = check_agreement(oc_positive, fut_positive)
-
-        greeks_positive = None
-        call_d, put_d = a["option_chain"].get("avg_call_delta"), a["option_chain"].get("avg_put_delta")
-        if call_d is not None and put_d is not None:
-            greeks_positive = (call_d + put_d) > 0
-        oi_positive = None
-        delta_oi = a["option_chain"].get("delta_oi")
-        if delta_oi is not None:
-            oi_positive = delta_oi < 0
-        greeks_vs_oi_agree = check_agreement(greeks_positive, oi_positive)
-
-        direction = apply_professional_rules(
-            direction, greeks_s, global_s, breadth_s,
-            futures_vs_spot_agree=futures_vs_spot_agree,
-            option_chain_vs_futures_agree=option_chain_vs_futures_agree,
-            greeks_vs_oi_agree=greeks_vs_oi_agree,
-        )
-
-        atr_val = a["atr"] if a["atr"] and a["atr"] > 0 else a["close"] * 0.005
-        net = direction["net_score"]
-        trade_direction = 1 if net >= 0 else -1
-        target1 = round(a["close"] + trade_direction * atr_val * 1.5, 2)
-        target2 = round(a["close"] + trade_direction * atr_val * 3.0, 2)
-        stoploss = round(a["close"] - trade_direction * atr_val * 1.0, 2)
-        risk = abs(a["close"] - stoploss)
-        reward = abs(target1 - a["close"])
-        rr = round(reward / risk, 2) if risk > 0 else 0.0
-
-        rec_colors = {"STRONG BUY": "🟢", "BUY": "🟢", "WAIT": "🟡", "SELL": "🔴", "STRONG SELL": "🔴"}
-        st.markdown(f"### {rec_colors.get(direction['recommendation'], '⚪')} {direction['recommendation']}")
-        st.caption(
-            f"Market Direction: {direction['direction']} · "
-            f"Confirmations: {direction['confirmations']}/{direction['confirmations_required']} required "
-            "(Trend, SMC, Option Chain, News, Institutional Flow, Momentum)"
-        )
-        for note in direction.get("professional_notes", []):
-            st.caption(f"ℹ️ {note}")
-        if direction["recommendation"] == "WAIT":
-            st.info(
-                "Confirmation threshold not met, or a professional cross-check "
-                "(Futures vs Spot, Option Chain vs Futures, Greeks vs OI) disagreed - "
-                "showing WAIT to avoid a false signal."
-            )
-
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Bullish Score %", f"{direction['bullish_score']}%")
-        c2.metric("Bearish Score %", f"{direction['bearish_score']}%")
-        c3.metric("Confidence %", f"{direction['confidence']}%")
-
-        c4, c5, c6 = st.columns(3)
-        c4.metric("Probability Up %", f"{direction['prob_up']}%")
-        c5.metric("Probability Down %", f"{direction['prob_down']}%")
-        c6.metric("Risk:Reward", f"1:{rr}")
-
-        c7, c8, c9 = st.columns(3)
-        c7.metric("Target 1", _fmt_num(target1))
-        c8.metric("Target 2", _fmt_num(target2))
-        c9.metric("Stop Loss", _fmt_num(stoploss))
-
-        st.progress(min(1.0, max(0.0, direction["confidence"] / 100)))
-
-        with st.expander("Factor Breakdown"):
-            comp_df = pd.DataFrame(
-                [{"Factor": k.replace("_", " ").title(), "Weight %": DIRECTION_WEIGHTS[k] * 100,
-                  "Score (-100..100)": direction["components"].get(k, 0.0)} for k in DIRECTION_WEIGHTS]
-            )
-            st.dataframe(comp_df, use_container_width=True, hide_index=True)
-            st.caption(
-                f"Greeks (informational): {direction.get('greeks_score', DATA_NA)} · "
-                f"Global Markets (informational): {direction.get('global_score', DATA_NA)} · "
-                f"True Breadth (informational): {direction.get('breadth_score', DATA_NA)}"
-            )
-    except Exception as exc:
-        st.warning(f"Unable to generate AI prediction for {selected} ({exc}). {DATA_NA}")
-
-
-def show_ai_market_intelligence(fyers: Any) -> None:
-    st.markdown("## 🧠 AI Market Intelligence")
-    st.caption(f"Last updated: {dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} · Auto-refresh: 30s")
-
-    if _HAS_AUTOREFRESH:
-        st_autorefresh(interval=REFRESH_INTERVAL_MS, key="ai_market_intel_autorefresh")
-    else:
-        st.caption("Install `streamlit-autorefresh` to enable automatic 30-second refresh.")
-
-    with st.spinner(f"{FETCHING_MSG} live market data..."):
-        market_df = _safe_call(get_market_summary, fyers, INDEX_SYMBOLS, default=pd.DataFrame())
-
-    vix_value: Optional[float] = None
-    if not market_df.empty:
-        vix_row = market_df[market_df["Index"] == "INDIA VIX"]
-        if not vix_row.empty and pd.notna(vix_row["LTP"].iloc[0]):
-            vix_value = float(vix_row["LTP"].iloc[0])
-
-    with st.spinner(f"{FETCHING_MSG} latest news..."):
-        news_df = _safe_call(fetch_all_news, default=pd.DataFrame())
-
-    fii_dii_data = _safe_call(fetch_fii_dii, default=None)
-    fii_dii_net = 0.0
-    if fii_dii_data:
-        fii_dii_net = (fii_dii_data["fii_buy"] - fii_dii_data["fii_sell"]) - (fii_dii_data["dii_buy"] - fii_dii_data["dii_sell"])
-
-    breadth = compute_market_breadth(market_df)
-
-    with st.spinner(f"{FETCHING_MSG} global markets..."):
-        global_df = _safe_call(get_global_markets_summary, fyers, default=pd.DataFrame())
-
-    with st.spinner(f"{FETCHING_MSG} true market breadth..."):
-        true_breadth = _safe_call(compute_true_market_breadth, fyers, default={})
-
-    with st.spinner(f"{FETCHING_MSG} AI direction inputs..."):
-        nifty_analysis = _analyze_instrument(fyers, INDEX_SYMBOLS["NIFTY"])
-
-    if nifty_analysis is not None:
-        oi_change_pct = nifty_analysis["option_chain"].get("oi_change_pct") or 0.0
-        prev_close_series = nifty_analysis["df"]["close"]
-        price_change_pct = (
-            (nifty_analysis["close"] - prev_close_series.iloc[-2]) / prev_close_series.iloc[-2] * 100
-            if len(prev_close_series) > 1 else 0.0
-        )
-        buildup = classify_futures_buildup(price_change_pct, oi_change_pct)
-        signals = InstrumentSignals(
-            close=nifty_analysis["close"], e20=nifty_analysis["e20"], e50=nifty_analysis["e50"],
-            e200=nifty_analysis["e200"], vwap_val=nifty_analysis["vwap"], rsi_val=nifty_analysis["rsi"],
-            macd_hist=float(nifty_analysis["macd_hist"].iloc[-1]), adx_val=nifty_analysis["adx"],
-            atr_val=nifty_analysis["atr"], supertrend_dir=nifty_analysis["supertrend_dir"],
-            support=nifty_analysis["support"], resistance=nifty_analysis["resistance"],
-            smc=nifty_analysis["smc"], option_chain=nifty_analysis["option_chain"],
-            rel_vol=nifty_analysis["rel_vol"], bullish_candle=nifty_analysis["bullish_candle"], buildup=buildup,
-        )
-        direction = evaluate_instrument_direction(signals, news_df, fii_dii_net, vix_value)
-
-        greeks_s = score_greeks(nifty_analysis["option_chain"])
-        global_s = score_global_markets(global_df)
-        breadth_s = score_true_breadth(true_breadth)
-
-        nifty_fut_q = _safe_call(fetch_quote, fyers, _current_month_future_symbol("NIFTY"), default=None)
-        futures_vs_spot_agree = None
-        if nifty_fut_q and nifty_fut_q.get("chp") is not None:
-            futures_vs_spot_agree = check_agreement(price_change_pct > 0, nifty_fut_q.get("chp") > 0)
-
-        pcr = nifty_analysis["option_chain"].get("pcr")
-        option_chain_vs_futures_agree = None
-        if pcr is not None and nifty_fut_q and nifty_fut_q.get("chp") is not None:
-            option_chain_vs_futures_agree = check_agreement(pcr > 1.0, nifty_fut_q.get("chp") > 0)
-
-        call_d = nifty_analysis["option_chain"].get("avg_call_delta")
-        put_d = nifty_analysis["option_chain"].get("avg_put_delta")
-        delta_oi = nifty_analysis["option_chain"].get("delta_oi")
-        greeks_vs_oi_agree = None
-        if call_d is not None and put_d is not None and delta_oi is not None:
-            greeks_vs_oi_agree = check_agreement((call_d + put_d) > 0, delta_oi > 0)
-
-        direction = apply_professional_rules(
-            direction, greeks_s, global_s, breadth_s,
-            futures_vs_spot_agree=futures_vs_spot_agree,
-            option_chain_vs_futures_agree=option_chain_vs_futures_agree,
-            greeks_vs_oi_agree=greeks_vs_oi_agree,
-        )
-    else:
-        direction = compute_weighted_direction(0, 0, 0, score_news(news_df), 0, 0, 0, vix_value=vix_value)
-        direction["greeks_score"] = 0.0
-        direction["global_score"] = score_global_markets(global_df)
-        direction["breadth_score"] = score_true_breadth(true_breadth)
-
-    tabs = st.tabs([
-        "🧠 AI Dashboard", "📊 Market Summary", "📈 India VIX", "📰 Live News",
-        "🤖 News Analysis", "🏦 FII/DII", "📐 Index Analysis", "📉 Futures",
-        "📌 Stocks", "🧩 SMC", "🧮 Greeks", "🌍 Global Markets", "📊 True Breadth",
-        "🎯 AI Prediction",
-    ])
-
-    with tabs[0]:
-        _render_safely("AI Dashboard", render_ai_dashboard, direction, breadth, true_breadth)
-    with tabs[1]:
-        market_only_df = market_df[market_df["Index"] != "INDIA VIX"] if not market_df.empty else market_df
-        _render_safely("Market Summary", render_market_summary, market_only_df)
-    with tabs[2]:
-        _render_safely("India VIX Analysis", render_vix_analysis, vix_value)
-    with tabs[3]:
-        _render_safely("Live News", render_live_news, news_df)
-    with tabs[4]:
-        _render_safely("AI News Analysis", render_ai_news_analysis, news_df)
-    with tabs[5]:
-        _render_safely("FII DII", render_fii_dii)
-    with tabs[6]:
-        _render_safely("Index Analysis", render_index_analysis, fyers)
-    with tabs[7]:
-        _render_safely("Futures Analysis", render_futures_analysis, fyers)
-    with tabs[8]:
-        _render_safely("Stock Analysis", render_stock_analysis, fyers)
-    with tabs[9]:
-        _render_safely("Smart Money Concepts", render_smc_section, fyers)
-    with tabs[10]:
-        _render_safely("Options Greeks", render_greeks_section, fyers)
-    with tabs[11]:
-        _render_safely("Global Markets", render_global_markets, fyers)
-    with tabs[12]:
-        _render_safely("True Market Breadth", render_true_breadth_section, fyers)
-    with tabs[13]:
-        _render_safely(
-            "AI Prediction", render_ai_prediction_section, fyers, news_df, fii_dii_net,
-            vix_value, global_df, true_breadth,
-        )
+        except Exception as exc:
+            st.info(f"Excel export unavailable: {exc}")
+        errors = st.session_state.get("multi_agent_errors", [])
+        if errors:
+            with st.expander(f"Scan errors ({len(errors)})"):
+                st.dataframe(pd.DataFrame(errors), use_container_width=True, hide_index=True)
