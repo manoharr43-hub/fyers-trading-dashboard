@@ -280,4 +280,6 @@ def show_advanced_ai_time_machine(client):
 
 
 def ai_backtest_ui(client):
+    show_advanced_ai(client)# Compatibility function for scanner.py
+def show_advanced_ai_tab(client):
     show_advanced_ai(client)
