@@ -302,6 +302,10 @@ def render_page(menu, client):
             from ai_chart_analysis import show_ai_chart_analysis
             show_ai_chart_analysis(client)
 
+        elif menu == "🤖 AI Multi-Agent Scanner":
+            from ai_multi_agent_scanner import show_ai_multi_agent_scanner
+            show_ai_multi_agent_scanner(client)
+
     except Exception as e:
         st.error(f"❌ Error loading {menu}: {e}")
         st.exception(e)
@@ -313,7 +317,7 @@ with st.sidebar:
         "🏠 Dashboard","📈 Market","🧠 AI Market Intelligence",
         "💼 Portfolio","📋 Orders","⚙️ Option Chain","🤖 Scanner",
         "📊 Charts","💹 Trading","👤 Profile","⚙️ Settings",
-        "🤖 AI Chart Analysis"
+        "🤖 AI Chart Analysis","🤖 AI Multi-Agent Scanner"
     ]
     current = st.session_state.get("main_navigation", items[0])
     if current not in items:
