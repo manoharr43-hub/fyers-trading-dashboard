@@ -6,16 +6,15 @@ import datetime as dt
 import inspect
 
 # ============================================================
-# NSE AI PRO V17
-# ADVANCED AI - TIME MACHINE
+# NSE AI PRO V17 - ADVANCED AI TIME MACHINE
 #
 # Reusable module for scanner.py
 #
 # IMPORTANT:
-# 1. Do not call st.set_page_config() here.
-# 2. Do not create another FYERS login.
-# 3. FYERS client comes from app.py.
-# 4. Supports scanner history_fetcher callback.
+# - No st.set_page_config() in this file.
+# - No FYERS login here.
+# - FYERS client comes from app.py / scanner.py.
+# - Compatible with show_advanced_ai_tab().
 # ============================================================
 
 
@@ -36,7 +35,6 @@ except Exception:
 # ============================================================
 
 def ema(series, period):
-
     return series.ewm(
         span=period,
         adjust=False,
@@ -45,7 +43,6 @@ def ema(series, period):
 
 
 def rsi(series, period=14):
-
     delta = series.diff()
 
     gain = delta.clip(lower=0)
@@ -69,7 +66,6 @@ def rsi(series, period=14):
 
 
 def atr(df, period=14):
-
     previous_close = df["Close"].shift(1)
 
     true_range = pd.concat(
@@ -89,7 +85,6 @@ def atr(df, period=14):
 
 
 def adx(df, period=14):
-
     up_move = df["High"].diff()
     down_move = -df["Low"].diff()
 
@@ -133,7 +128,8 @@ def adx(df, period=14):
             alpha=1 / period,
             adjust=False,
             min_periods=period
-        ).mean() / avg_tr.replace(0, np.nan)
+        ).mean()
+        / avg_tr.replace(0, np.nan)
     )
 
     minus_di = (
@@ -141,13 +137,17 @@ def adx(df, period=14):
             alpha=1 / period,
             adjust=False,
             min_periods=period
-        ).mean() / avg_tr.replace(0, np.nan)
+        ).mean()
+        / avg_tr.replace(0, np.nan)
     )
 
-    denominator = (plus_di + minus_di).replace(0, np.nan)
+    denominator = (
+        plus_di + minus_di
+    ).replace(0, np.nan)
 
     dx = (
-        100 * (plus_di - minus_di).abs() / denominator
+        100 * (plus_di - minus_di).abs()
+        / denominator
     )
 
     return dx.ewm(
@@ -164,31 +164,57 @@ def adx(df, period=14):
 def normalize_history(raw):
 
     if raw is None:
-        raise RuntimeError("History fetcher returned empty data.")
+        raise RuntimeError(
+            "History fetcher returned empty data."
+        )
 
-    if isinstance(raw, tuple) and len(raw) > 0:
-        raw = raw[0]
+    # Handle common tuple responses.
+    if isinstance(raw, tuple):
 
+        candidates = [
+            item for item in raw
+            if isinstance(
+                item,
+                (pd.DataFrame, dict, list, tuple)
+            )
+        ]
+
+        if not candidates:
+            raise RuntimeError(
+                "History fetcher returned an invalid tuple."
+            )
+
+        raw = candidates[0]
+
+    # Handle FYERS dictionaries or wrapped data.
     if isinstance(raw, dict):
 
-        status = raw.get("s")
-
-        if status is not None and status != "ok":
+        if raw.get("s") not in (None, "ok"):
             raise RuntimeError(
                 f"History API error: {raw}"
             )
 
-        raw = (
-            raw.get("candles")
-            or raw.get("data")
-            or raw.get("history")
-        )
+        extracted = None
 
-        if raw is None:
+        for key in [
+            "candles",
+            "data",
+            "history",
+            "df",
+            "result"
+        ]:
+            if key in raw and raw[key] is not None:
+                extracted = raw[key]
+                break
+
+        if extracted is None:
             raise RuntimeError(
-                "History response has no candles/data."
+                "No candles/data found in history response."
             )
 
+        raw = extracted
+
+    # DataFrame or FYERS candle list.
     if isinstance(raw, pd.DataFrame):
 
         df = raw.copy()
@@ -196,107 +222,119 @@ def normalize_history(raw):
     else:
 
         try:
-            df = pd.DataFrame(
-                raw,
-                columns=[
-                    "Timestamp",
-                    "Open",
-                    "High",
-                    "Low",
-                    "Close",
-                    "Volume"
-                ]
-            )
+            df = pd.DataFrame(raw)
         except Exception as exc:
             raise RuntimeError(
-                f"Cannot convert history to DataFrame: {exc}"
+                f"Cannot convert history data: {exc}"
             )
 
-    # Normalize column names.
-    normalized_names = {}
+    # Handle FYERS six-column candle arrays.
+    if list(df.columns) == list(range(6)):
+
+        df.columns = [
+            "Timestamp",
+            "Open",
+            "High",
+            "Low",
+            "Close",
+            "Volume"
+        ]
+
+    aliases = {
+        "timestamp": "Timestamp",
+        "time": "Timestamp",
+        "datetime": "Timestamp",
+        "date": "Timestamp",
+        "ts": "Timestamp",
+        "open": "Open",
+        "o": "Open",
+        "high": "High",
+        "h": "High",
+        "low": "Low",
+        "l": "Low",
+        "close": "Close",
+        "c": "Close",
+        "ltp": "Close",
+        "volume": "Volume",
+        "vol": "Volume",
+        "v": "Volume"
+    }
+
+    rename = {}
 
     for column in df.columns:
 
-        name = str(column).strip().lower()
+        normalized = (
+            str(column)
+            .strip()
+            .lower()
+            .replace(" ", "_")
+        )
 
-        normalized_names[name] = column
+        if normalized in aliases:
+            rename[column] = aliases[normalized]
 
-    aliases = {
-        "Timestamp": [
-            "timestamp", "time", "datetime",
-            "date", "ts"
-        ],
-        "Open": ["open", "o"],
-        "High": ["high", "h"],
-        "Low": ["low", "l"],
-        "Close": ["close", "c", "ltp"],
-        "Volume": [
-            "volume", "vol", "v", "traded_volume"
-        ]
-    }
-
-    rename_columns = {}
-
-    for standard, possible_names in aliases.items():
-
-        for alias in possible_names:
-
-            if alias in normalized_names:
-
-                rename_columns[
-                    normalized_names[alias]
-                ] = standard
-
-                break
-
-    df = df.rename(columns=rename_columns)
+    df = df.rename(columns=rename)
 
     required = [
         "Open",
         "High",
         "Low",
-        "Close",
-        "Volume"
+        "Close"
     ]
 
     missing = [
-        column for column in required
-        if column not in df.columns
+        col for col in required
+        if col not in df.columns
     ]
 
     if missing:
         raise RuntimeError(
-            f"Missing OHLCV columns: {missing}"
+            f"Missing OHLC columns: {missing}"
         )
 
-    if "Timestamp" not in df.columns:
+    # Some index data sources may not provide volume.
+    if "Volume" not in df.columns:
+        df["Volume"] = 0.0
 
-        if isinstance(df.index, pd.DatetimeIndex):
-            df["Timestamp"] = df.index
+    for col in [
+        "Open",
+        "High",
+        "Low",
+        "Close",
+        "Volume"
+    ]:
 
-    for column in required:
-
-        df[column] = pd.to_numeric(
-            df[column],
+        df[col] = pd.to_numeric(
+            df[col],
             errors="coerce"
         )
 
-    df = df.dropna(subset=required)
+    df = df.dropna(
+        subset=required
+    )
 
     if "Timestamp" in df.columns:
 
-        df = df.dropna(subset=["Timestamp"])
+        df = df.dropna(
+            subset=["Timestamp"]
+        )
 
-        df = df.sort_values("Timestamp")
+        df = df.sort_values(
+            "Timestamp"
+        )
 
         df = df.drop_duplicates(
             subset=["Timestamp"],
             keep="last"
         )
 
-    df = df.reset_index(drop=True)
+    df = df.reset_index(
+        drop=True
+    )
 
     if len(df) < 100:
+
         raise RuntimeError(
             f"Only {len(df)} candles received. "
             "At least 100 candles are required."
@@ -326,33 +364,34 @@ def call_history_fetcher(
         )
 
     today = dt.date.today()
-    start_date = today - dt.timedelta(days=int(days))
 
-    available_values = {
+    start_date = today - dt.timedelta(
+        days=int(days)
+    )
 
-        # FYERS client aliases
+    values = {
+
         "client": client,
         "fyers": client,
         "fyers_client": client,
+        "fyers_obj": client,
         "api": client,
         "api_client": client,
 
-        # Symbol aliases
         "symbol": symbol,
         "ticker": symbol,
         "stock": symbol,
         "stock_symbol": symbol,
 
-        # Timeframe aliases
         "resolution": str(resolution),
         "timeframe": str(resolution),
+        "time_frame": str(resolution),
         "interval": str(resolution),
         "tf": str(resolution),
 
-        # Historical range aliases
         "days": int(days),
-        "lookback_days": int(days),
         "history_days": int(days),
+        "lookback_days": int(days),
         "period_days": int(days),
 
         "start_date": start_date.strftime("%Y-%m-%d"),
@@ -365,36 +404,37 @@ def call_history_fetcher(
     }
 
     try:
-
-        signature = inspect.signature(history_fetcher)
+        signature = inspect.signature(
+            history_fetcher
+        )
 
     except (TypeError, ValueError):
 
-        # Fallback for callables without inspectable signatures.
-        return history_fetcher(
-            client,
-            symbol,
-            str(resolution)
+        raise RuntimeError(
+            "Cannot inspect history_fetcher signature. "
+            "Please check scanner.py."
         )
 
     positional = []
     keyword = {}
 
+    has_var_keyword = False
     unresolved = []
 
     for parameter in signature.parameters.values():
 
-        if parameter.kind in (
-            inspect.Parameter.VAR_POSITIONAL,
-            inspect.Parameter.VAR_KEYWORD
-        ):
+        if parameter.kind == inspect.Parameter.VAR_POSITIONAL:
+            continue
+
+        if parameter.kind == inspect.Parameter.VAR_KEYWORD:
+            has_var_keyword = True
             continue
 
         name = parameter.name.lower()
 
-        if name in available_values:
+        if name in values:
 
-            value = available_values[name]
+            value = values[name]
 
             if parameter.kind == inspect.Parameter.POSITIONAL_ONLY:
                 positional.append(value)
@@ -406,17 +446,29 @@ def call_history_fetcher(
 
             unresolved.append(parameter.name)
 
-    if not unresolved:
+    if unresolved:
 
-        return history_fetcher(
-            *positional,
-            **keyword
+        raise RuntimeError(
+            "Cannot match these required history_fetcher "
+            f"parameters: {unresolved}. "
+            "Please check the function signature in scanner.py."
         )
 
-    raise RuntimeError(
-        "Cannot match required parameters in history_fetcher: "
-        f"{unresolved}. Please check the function signature "
-        "in scanner.py."
+    if has_var_keyword:
+
+        for key in [
+            "client",
+            "symbol",
+            "resolution",
+            "days"
+        ]:
+
+            if key not in keyword:
+                keyword[key] = values[key]
+
+    return history_fetcher(
+        *positional,
+        **keyword
     )
 
 
@@ -432,20 +484,18 @@ def fetch_history(
     history_fetcher=None
 ):
 
-    # Prefer Scanner's existing history fetcher when supplied.
     if history_fetcher is not None:
 
         raw = call_history_fetcher(
-            history_fetcher,
-            client,
-            symbol,
-            days,
-            resolution
+            history_fetcher=history_fetcher,
+            client=client,
+            symbol=symbol,
+            days=days,
+            resolution=resolution
         )
 
         return normalize_history(raw)
 
-    # Otherwise use FYERS directly.
     if client is None:
         raise RuntimeError(
             "FYERS client is not connected."
@@ -465,16 +515,24 @@ def fetch_history(
 
         "date_format": "1",
 
-        "range_from": start_date.strftime("%Y-%m-%d"),
+        "range_from": start_date.strftime(
+            "%Y-%m-%d"
+        ),
 
-        "range_to": end_date.strftime("%Y-%m-%d"),
+        "range_to": end_date.strftime(
+            "%Y-%m-%d"
+        ),
 
         "cont_flag": "1"
     }
 
-    response = client.history(data=payload)
+    response = client.history(
+        data=payload
+    )
 
-    return normalize_history(response)
+    return normalize_history(
+        response
+    )
 
 
 # ============================================================
@@ -486,58 +544,79 @@ def build_features(df):
     df = normalize_history(df)
 
     close = df["Close"]
+
     volume = df["Volume"]
 
-    out = pd.DataFrame(index=df.index)
+    features = pd.DataFrame(
+        index=df.index
+    )
 
-    out["ema20"] = ema(close, 20)
+    features["ema20"] = ema(
+        close,
+        20
+    )
 
-    out["ema50"] = ema(close, 50)
+    features["ema50"] = ema(
+        close,
+        50
+    )
 
-    out["rsi"] = rsi(close, 14)
+    features["rsi"] = rsi(
+        close,
+        14
+    )
 
     macd_line = (
         ema(close, 12) - ema(close, 26)
     )
 
-    out["macd_hist"] = (
+    features["macd_hist"] = (
         macd_line - ema(macd_line, 9)
     )
 
-    out["atr"] = atr(df, 14)
+    features["atr"] = atr(
+        df,
+        14
+    )
 
-    out["adx"] = adx(df, 14)
+    features["adx"] = adx(
+        df,
+        14
+    )
 
     average_volume = volume.rolling(
         20,
         min_periods=20
     ).mean()
 
-    out["rel_vol"] = (
+    relative_volume = (
         volume / average_volume.replace(0, np.nan)
     )
 
-    out["ret1"] = close.pct_change()
+    # Neutral value when volume is unavailable.
+    features["rel_vol"] = relative_volume.fillna(1.0)
 
-    # Predict next candle direction.
+    features["ret1"] = close.pct_change()
+
+    # Next-candle direction target.
     next_close = close.shift(-1)
 
-    out["target"] = (
+    features["target"] = (
         next_close > close
     ).astype(float)
 
-    # Last candle has no known future result.
-    out.loc[
+    # Last candle has no known future outcome.
+    features.loc[
         next_close.isna(),
         "target"
     ] = np.nan
 
-    out = out.replace(
+    features = features.replace(
         [np.inf, -np.inf],
         np.nan
     )
 
-    return out.dropna()
+    return features.dropna()
 
 
 # ============================================================
@@ -555,7 +634,7 @@ def make_model():
 
     return xgb.XGBClassifier(
 
-        n_estimators=100,
+        n_estimators=120,
 
         max_depth=3,
 
@@ -615,16 +694,17 @@ def run_time_machine(
         history_fetcher=history_fetcher
     )
 
-    data = build_features(raw)
+    data = build_features(
+        raw
+    )
 
     if len(data) < 100:
 
         raise RuntimeError(
-            f"Only {len(data)} usable rows. "
+            f"Only {len(data)} usable feature rows. "
             "At least 100 are required."
         )
 
-    # Keep at least 80 previous observations for training.
     test_bars = min(
         int(test_bars),
         len(data) - 80
@@ -633,14 +713,14 @@ def run_time_machine(
     if test_bars < 1:
 
         raise RuntimeError(
-            "Not enough candles for walk-forward testing."
+            "Not enough data for testing."
         )
 
     feature_columns = [
 
-        column for column in data.columns
+        col for col in data.columns
 
-        if column != "target"
+        if col != "target"
     ]
 
     actual = []
@@ -649,8 +729,11 @@ def run_time_machine(
 
     probabilities = []
 
-    first_test_index = len(data) - test_bars
+    first_test_index = (
+        len(data) - test_bars
+    )
 
+    # Expanding-window walk-forward testing.
     for index in range(
         first_test_index,
         len(data)
@@ -692,14 +775,13 @@ def run_time_machine(
     if not actual:
 
         raise RuntimeError(
-            "No valid walk-forward predictions generated."
+            "No valid walk-forward predictions."
         )
 
     y_true = np.asarray(actual)
 
     y_pred = np.asarray(predicted)
 
-    # Confusion matrix
     tp = int(
         ((y_true == 1) & (y_pred == 1)).sum()
     )
@@ -738,11 +820,20 @@ def run_time_machine(
 
         "History Days": int(days),
 
-        "Accuracy %": round(accuracy, 2),
+        "Accuracy %": round(
+            accuracy,
+            2
+        ),
 
-        "Precision UP %": round(precision, 2),
+        "Precision UP %": round(
+            precision,
+            2
+        ),
 
-        "Recall UP %": round(recall, 2),
+        "Recall UP %": round(
+            recall,
+            2
+        ),
 
         "Average P(UP) %": round(
             100 * float(np.mean(probabilities)),
@@ -783,7 +874,7 @@ def show_advanced_ai(
     if client is None:
 
         st.error(
-            "FYERS client is not connected. Please login."
+            "FYERS client is not connected."
         )
 
         return
@@ -791,15 +882,11 @@ def show_advanced_ai(
     if not XGB_AVAILABLE:
 
         st.error(
-            "XGBoost is missing. Add "
+            "XGBoost missing. Add "
             "xgboost>=2.1.0 to requirements.txt."
         )
 
         return
-
-    # --------------------------------------------------------
-    # INPUTS
-    # --------------------------------------------------------
 
     left, right = st.columns(2)
 
@@ -839,7 +926,7 @@ def show_advanced_ai(
 
             index=3,
 
-            format_func=lambda x: {
+            format_func=lambda value: {
 
                 "5": "5 Minutes",
 
@@ -851,7 +938,7 @@ def show_advanced_ai(
 
                 "D": "Daily"
 
-            }[x],
+            }[value],
 
             key="advanced_ai_resolution"
         )
@@ -864,7 +951,7 @@ def show_advanced_ai(
 
             [90, 180, 270, 365, 500],
 
-            index=3,
+            index=1,
 
             key="advanced_ai_days"
         )
@@ -884,11 +971,14 @@ def show_advanced_ai(
             key="advanced_ai_test_bars"
         )
 
-    # --------------------------------------------------------
-    # RUN
-    # --------------------------------------------------------
+    current_key = (
+        symbol,
+        resolution,
+        days,
+        test_bars
+    )
 
-    run_button = st.button(
+    if st.button(
 
         "🚀 RUN AI TIME MACHINE",
 
@@ -897,21 +987,12 @@ def show_advanced_ai(
         use_container_width=True,
 
         key="advanced_ai_run"
-    )
-
-    current_key = (
-        symbol,
-        resolution,
-        days,
-        test_bars
-    )
-
-    if run_button:
+    ):
 
         try:
 
             with st.spinner(
-                "Fetching market data and running AI backtest..."
+                "Fetching FYERS data and running AI backtest..."
             ):
 
                 result = run_time_machine(
@@ -955,10 +1036,6 @@ def show_advanced_ai(
 
             return
 
-    # --------------------------------------------------------
-    # RESULTS
-    # --------------------------------------------------------
-
     result = st.session_state.get(
         "advanced_ai_result"
     )
@@ -979,7 +1056,7 @@ def show_advanced_ai(
     if saved_key != current_key:
 
         st.info(
-            "Settings changed. Click RUN AI TIME MACHINE "
+            "Settings changed. Run the analysis again "
             "to generate a fresh report."
         )
 
@@ -1020,9 +1097,7 @@ def show_advanced_ai(
     )
 
     st.metric(
-
         "Average Probability of UP",
-
         f"{result['Average P(UP) %']:.2f}%"
     )
 
@@ -1033,24 +1108,19 @@ def show_advanced_ai(
     )
 
     breakdown = pd.DataFrame(
-
         [
-
             {
                 "Metric": "True Positive",
                 "Count": result["TP"]
             },
-
             {
                 "Metric": "True Negative",
                 "Count": result["TN"]
             },
-
             {
                 "Metric": "False Positive",
                 "Count": result["FP"]
             },
-
             {
                 "Metric": "False Negative",
                 "Count": result["FN"]
@@ -1059,11 +1129,8 @@ def show_advanced_ai(
     )
 
     st.dataframe(
-
         breakdown,
-
         use_container_width=True,
-
         hide_index=True
     )
 
@@ -1078,11 +1145,8 @@ def show_advanced_ai(
     )
 
     st.dataframe(
-
         report,
-
         use_container_width=True,
-
         hide_index=True
     )
 
@@ -1104,31 +1168,86 @@ def show_advanced_ai(
     )
 
     st.warning(
-
         "This report measures historical next-candle "
-        "direction classification. It is not a live trading "
-        "signal or a guarantee of future returns. "
-        "Brokerage and slippage are not included."
+        "direction classification. It is not a guaranteed "
+        "future trading signal. Brokerage, slippage and "
+        "live execution are not included."
     )
 
 
 # ============================================================
-# SCANNER COMPATIBILITY FUNCTION
+# SCANNER COMPATIBILITY
+# IMPORTANT: Define this function only once.
+# *args and **kwargs prevent duplicate argument binding.
 # ============================================================
 
-def show_advanced_ai_tab(
-    client,
-    history_fetcher=None,
-    **kwargs
-):
+def show_advanced_ai_tab(*args, **kwargs):
 
-    show_advanced_ai(
+    client = kwargs.pop(
+        "client",
+        None
+    )
+
+    if client is None:
+        client = kwargs.pop(
+            "fyers",
+            None
+        )
+
+    if client is None:
+        client = kwargs.pop(
+            "fyers_client",
+            None
+        )
+
+    history_fetcher = kwargs.pop(
+        "history_fetcher",
+        None
+    )
+
+    if history_fetcher is None:
+
+        history_fetcher = kwargs.pop(
+            "data_fetcher",
+            None
+        )
+
+    if history_fetcher is None:
+
+        history_fetcher = kwargs.pop(
+            "history_func",
+            None
+        )
+
+    # First positional argument is normally FYERS client.
+    if client is None and len(args) >= 1:
+
+        client = args[0]
+
+    # Find a positional callback without binding it twice.
+    if history_fetcher is None:
+
+        for value in args[1:]:
+
+            if callable(value):
+
+                history_fetcher = value
+
+                break
+
+    if client is None:
+
+        st.error(
+            "Advanced AI: FYERS client is missing."
+        )
+
+        return
+
+    return show_advanced_ai(
 
         client=client,
 
-        history_fetcher=history_fetcher,
-
-        **kwargs
+        history_fetcher=history_fetcher
     )
 
 
@@ -1142,13 +1261,11 @@ def show_advanced_ai_time_machine(
     **kwargs
 ):
 
-    show_advanced_ai(
+    return show_advanced_ai(
 
         client=client,
 
-        history_fetcher=history_fetcher,
-
-        **kwargs
+        history_fetcher=history_fetcher
     )
 
 
@@ -1157,30 +1274,10 @@ def ai_backtest_ui(
     history_fetcher=None,
     **kwargs
 ):
-# ============================================================
-# SCANNER COMPATIBILITY
-# Handles positional and keyword arguments safely.
-# ============================================================
 
-def show_advanced_ai_tab(*args, **kwargs):
+    return show_advanced_ai(
 
-    client = kwargs.pop("client", None)
-    history_fetcher = kwargs.pop("history_fetcher", None)
-
-    # First positional argument = FYERS client
-    if client is None and len(args) >= 1:
-        client = args[0]
-
-    # Second positional argument may be history_fetcher
-    if history_fetcher is None and len(args) >= 2:
-        history_fetcher = args[1]
-
-    if client is None:
-        st.error("FYERS client is missing.")
-        return
-
-    show_advanced_ai(
         client=client,
+
         history_fetcher=history_fetcher
     )
-    
