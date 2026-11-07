@@ -6763,6 +6763,311 @@ def _show_last5m_big_volume_tab(fyers, all_symbols, fo_symbols) -> None:
     st.warning("A 1-minute candle signal is considered fresh only when its close time is ≤5 minutes old. EMA/RSI/sweep conditions are OHLCV estimates, not proof of real-time order-book liquidity. Validate signals with backtesting before trading.")
 
 
+
+# ============================================================================
+# 11-AGENT TRADER SYSTEM (ADDITIVE MODULE — DOES NOT REPLACE EXISTING SCANNERS)
+# ============================================================================
+# Stage 1 uses Yahoo Finance daily candles in batches (cached). Stage 2 uses
+# FYERS quotes only for the highest-ranked candidates. All 11 agents are
+# deterministic Python analysis modules sharing the same data; they do not
+# issue independent API calls or place orders.
+
+_AGENT_YAHOO_BATCH_SIZE = 20
+_AGENT_YAHOO_TTL_SECONDS = 900
+_AGENT_MAX_UNIVERSE_DEFAULT = 1000
+_AGENT_FYERS_CONFIRM_LIMIT = 50
+
+
+def _agent_yahoo_symbol(fyers_symbol: str) -> str:
+    s = str(fyers_symbol or '').strip().upper()
+    if s.startswith('NSE:'):
+        s = s.split(':', 1)[1]
+    s = s.replace('-EQ', '').replace('&', '%26')
+    return s + '.NS'
+
+
+@st.cache_data(ttl=_AGENT_YAHOO_TTL_SECONDS, show_spinner=False)
+def _agent_fetch_yahoo_batch(yahoo_symbols: tuple) -> dict:
+    """Fetch daily OHLCV for up to 20 symbols in one Yahoo Spark request."""
+    if not yahoo_symbols:
+        return {}
+    url = 'https://query1.finance.yahoo.com/v7/finance/spark'
+    params = {'symbols': ','.join(yahoo_symbols), 'range': '3mo', 'interval': '1d',
+              'indicators': 'close,high,low,open,volume'}
+    headers = {'User-Agent': 'Mozilla/5.0 (compatible; NSE-Agent-Scanner/1.0)'}
+    try:
+        response = requests.get(url, params=params, headers=headers, timeout=15)
+        response.raise_for_status()
+        payload = response.json()
+    except Exception as exc:
+        logger.warning('Yahoo batch fetch failed (%s): %s', ','.join(yahoo_symbols[:3]), exc)
+        return {}
+
+    # Yahoo Spark normally returns a list of per-symbol objects. Keep parsing
+    # defensive because this is an unofficial endpoint and its shape can change.
+    items = payload.get('spark', {}).get('result', []) if isinstance(payload, dict) else []
+    result = {}
+    for item in items or []:
+        try:
+            symbol = str(item.get('symbol', '')).upper()
+            # Spark payloads commonly nest chart data under response[0].
+            chart = (item.get('response') or [item])[0]
+            indicators = chart.get('indicators', {})
+            quote_list = indicators.get('quote', [])
+            if not quote_list:
+                continue
+            q = quote_list[0]
+            timestamps = chart.get('timestamp') or []
+            frame = pd.DataFrame({
+                'Timestamp': timestamps,
+                'Open': q.get('open', []), 'High': q.get('high', []),
+                'Low': q.get('low', []), 'Close': q.get('close', []),
+                'Volume': q.get('volume', []),
+            })
+            for col in ['Open', 'High', 'Low', 'Close', 'Volume']:
+                frame[col] = pd.to_numeric(frame[col], errors='coerce')
+            frame = frame.dropna(subset=['Open', 'High', 'Low', 'Close']).tail(65).reset_index(drop=True)
+            if len(frame) >= 25:
+                result[symbol] = frame.to_dict(orient='list')
+        except Exception:
+            continue
+    return result
+
+
+@st.cache_data(ttl=_AGENT_YAHOO_TTL_SECONDS, show_spinner=False)
+def _agent_market_context():
+    """Agent 1: cached NIFTY 50 and BANKNIFTY daily trend context."""
+    payload = _agent_fetch_yahoo_batch(("^NSEI", "^NSEBANK"))
+    out = {}
+    for ticker, label in [("^NSEI", "NIFTY"), ("^NSEBANK", "BANKNIFTY")]:
+        raw = payload.get(ticker)
+        if not raw:
+            out[label] = "DATA UNAVAILABLE"
+            continue
+        try:
+            closes = pd.to_numeric(pd.Series(raw.get("Close", [])), errors="coerce").dropna()
+            if len(closes) < 20:
+                out[label] = "DATA UNAVAILABLE"
+                continue
+            last = float(closes.iloc[-1])
+            ema = float(closes.ewm(span=20, adjust=False).mean().iloc[-1])
+            out[label] = "BULLISH" if last > ema else "BEARISH"
+        except Exception:
+            out[label] = "DATA UNAVAILABLE"
+    return out
+
+
+def _agent_fetch_yahoo_universe(symbol_pairs, progress=None):
+    """Fetch/cache Yahoo daily bars in batches; no FYERS calls in this stage."""
+    data, errors = {}, []
+    yahoo_pairs = [(_agent_yahoo_symbol(s), s) for s in symbol_pairs]
+    for start in range(0, len(yahoo_pairs), _AGENT_YAHOO_BATCH_SIZE):
+        batch = yahoo_pairs[start:start + _AGENT_YAHOO_BATCH_SIZE]
+        batch_data = _agent_fetch_yahoo_batch(tuple(x[0] for x in batch))
+        for yahoo_sym, fyers_sym in batch:
+            raw = batch_data.get(yahoo_sym)
+            if raw:
+                try:
+                    data[fyers_sym] = pd.DataFrame(raw)
+                except Exception:
+                    errors.append(fyers_sym)
+            else:
+                errors.append(fyers_sym)
+        if progress:
+            progress(min(start + len(batch), len(yahoo_pairs)), len(yahoo_pairs))
+        # Keep a polite gap between uncached external requests.
+        if start + _AGENT_YAHOO_BATCH_SIZE < len(yahoo_pairs):
+            time.sleep(0.20)
+    return data, errors
+
+
+def _agent_analyze_daily(symbol, df, fo_set):
+    """Run the 10 evidence agents on one shared daily OHLCV frame."""
+    if df is None or len(df) < 25:
+        return None
+    d = df.copy()
+    close = pd.to_numeric(d['Close'], errors='coerce')
+    high = pd.to_numeric(d['High'], errors='coerce')
+    low = pd.to_numeric(d['Low'], errors='coerce')
+    opn = pd.to_numeric(d['Open'], errors='coerce')
+    vol = pd.to_numeric(d['Volume'], errors='coerce').fillna(0)
+    d = pd.DataFrame({'Open': opn, 'High': high, 'Low': low, 'Close': close, 'Volume': vol}).dropna()
+    if len(d) < 25:
+        return None
+    c, h, l, o, v = (d[x] for x in ['Close', 'High', 'Low', 'Open', 'Volume'])
+    last = float(c.iloc[-1]); prev = float(c.iloc[-2])
+    ema20 = float(c.ewm(span=20, adjust=False).mean().iloc[-1])
+    ema50 = float(c.ewm(span=50, adjust=False).mean().iloc[-1])
+    avgvol20 = float(v.iloc[-21:-1].mean()) if len(v) >= 21 else float(v.mean())
+    rvol = float(v.iloc[-1] / avgvol20) if avgvol20 > 0 else 0.0
+    prior_high20 = float(h.iloc[-21:-1].max())
+    prior_low10 = float(l.iloc[-11:-1].min())
+    prior_high10 = float(h.iloc[-11:-1].max())
+    change_pct = ((last / prev) - 1) * 100 if prev else 0.0
+    # RSI(14)
+    delta = c.diff(); gain = delta.clip(lower=0).rolling(14).mean(); loss = (-delta.clip(upper=0)).rolling(14).mean()
+    rs = gain.iloc[-1] / loss.iloc[-1] if loss.iloc[-1] and pd.notna(loss.iloc[-1]) else 99
+    rsi = float(100 - (100 / (1 + rs))) if pd.notna(rs) else 50.0
+    # Agent 3: simple bull-flag / bear-flag proxy (impulse followed by tight range).
+    recent = d.tail(6); range_pct = ((recent['High'].max() - recent['Low'].min()) / last * 100) if last else 99
+    impulse = ((float(c.iloc[-6]) / float(c.iloc[-11])) - 1) * 100 if len(c) >= 11 and c.iloc[-11] else 0
+    bull_flag = impulse >= 4 and range_pct <= 5 and last >= ema20
+    bear_flag = impulse <= -4 and range_pct <= 5 and last <= ema20
+    # Agent 7: OHLCV liquidity sweep proxy; not true order-book liquidity.
+    sweep_buy = float(l.iloc[-1]) < prior_low10 and last > prior_low10
+    sweep_sell = float(h.iloc[-1]) > prior_high10 and last < prior_high10
+    # Agent 8: accumulation/distribution proxy based on close location and volume.
+    bar_range = max(float(h.iloc[-1] - l.iloc[-1]), 1e-9)
+    close_location = (last - float(l.iloc[-1])) / bar_range
+    accumulation = rvol >= 1.3 and close_location >= 0.70 and last >= ema20
+    distribution = rvol >= 1.3 and close_location <= 0.30 and last <= ema20
+    # Agent 9: three-candle fair-value-gap proxy.
+    fvg_bull = len(d) >= 3 and float(l.iloc[-1]) > float(h.iloc[-3])
+    fvg_bear = len(d) >= 3 and float(h.iloc[-1]) < float(l.iloc[-3])
+    # Agent 4/5/6: trend, volume and 20-day breakout.
+    trend_buy = last > ema20 > ema50
+    trend_sell = last < ema20 < ema50
+    breakout_buy = last > prior_high20
+    breakout_sell = last < float(l.iloc[-21:-1].min())
+    oversold = rsi < 30
+    overbought = rsi > 70
+    # Agent 2: liquidity / tradability proxy; no recommendation on illiquid symbols.
+    traded_value = last * float(v.iloc[-1])
+    liquid = avgvol20 > 0 and traded_value >= 2_000_000
+    # Agent 10: mark F&O membership; no option-chain call at this stage.
+    is_fo = symbol in fo_set
+    buy_points = sum([trend_buy, breakout_buy, bull_flag, sweep_buy, accumulation, fvg_bull, rsi < 68, rvol >= 1.2])
+    sell_points = sum([trend_sell, breakout_sell, bear_flag, sweep_sell, distribution, fvg_bear, rsi > 32, rvol >= 1.2])
+    # Agent 11: final consensus; score is evidence score, not win probability.
+    direction = 'BUY WATCH' if buy_points >= 5 and buy_points > sell_points else ('SELL WATCH' if sell_points >= 5 and sell_points > buy_points else 'WAIT')
+    score = int(round(max(buy_points, sell_points) / 8 * 100))
+    reasons = []
+    for ok, label in [(trend_buy, 'EMA uptrend'), (trend_sell, 'EMA downtrend'), (breakout_buy, '20D high breakout'), (breakout_sell, '20D low breakdown'), (bull_flag, 'Bull flag proxy'), (bear_flag, 'Bear flag proxy'), (sweep_buy, 'Low sweep/reclaim'), (sweep_sell, 'High sweep/rejection'), (accumulation, 'Accumulation proxy'), (distribution, 'Distribution proxy'), (fvg_bull, 'Bullish FVG proxy'), (fvg_bear, 'Bearish FVG proxy'), (oversold, 'RSI oversold'), (overbought, 'RSI overbought')]:
+        if ok: reasons.append(label)
+    return {
+        'Symbol': symbol.replace('NSE:', '').replace('-EQ', ''), 'FYERS SYMBOL': symbol,
+        'LTP (YAHOO)': round(last, 2), 'CHANGE %': round(change_pct, 2),
+        'AGENT SCORE': score, 'DIRECTION': direction, 'BUY VOTES': int(buy_points), 'SELL VOTES': int(sell_points),
+        'RSI 14': round(rsi, 1), 'RVOL': round(rvol, 2), 'EMA20': round(ema20, 2), 'EMA50': round(ema50, 2),
+        '20D BREAKOUT': 'BUY' if breakout_buy else ('SELL' if breakout_sell else 'NO'),
+        'LIQUIDITY SWEEP': 'BUY' if sweep_buy else ('SELL' if sweep_sell else 'NONE'),
+        'AMD PROXY': 'ACCUMULATION' if accumulation else ('DISTRIBUTION' if distribution else 'NEUTRAL'),
+        'FVG PROXY': 'BULLISH' if fvg_bull else ('BEARISH' if fvg_bear else 'NONE'),
+        'F&O': 'YES' if is_fo else 'NO', 'TRADED VALUE': round(traded_value, 0),
+        'LIQUID': bool(liquid), 'REASONS': ' | '.join(reasons) if reasons else 'No strong confluence',
+    }
+
+
+def _agent_fyers_confirm(fyers, rows):
+    """Batch-confirm top candidates with FYERS quotes; at most 50 symbols."""
+    if fyers is None or not rows:
+        return {}
+    symbols = [r['FYERS SYMBOL'] for r in rows[:_AGENT_FYERS_CONFIRM_LIMIT]]
+    confirmed = {}
+    for start in range(0, len(symbols), 50):
+        batch = symbols[start:start + 50]
+        try:
+            response = fyers.quotes(data={'symbols': ','.join(batch)})
+            if not isinstance(response, dict) or response.get('s') != 'ok':
+                continue
+            for item in response.get('d', []) or []:
+                try:
+                    v = item.get('v', {})
+                    sym = item.get('n') or item.get('symbol')
+                    if not sym and isinstance(item.get('v'), dict):
+                        sym = v.get('symbol')
+                    if sym:
+                        try:
+                            confirmed[str(sym)] = float(v.get('lp')) if v.get('lp') is not None else None
+                        except (TypeError, ValueError):
+                            confirmed[str(sym)] = None
+                except Exception:
+                    continue
+        except Exception as exc:
+            logger.warning('11-agent FYERS quote confirmation failed: %s', exc)
+    return confirmed
+
+
+def _show_11_agent_trader_tab(fyers, all_symbols, fo_symbols):
+    st.markdown('### 🧠 11-Agent Trader System — NSE + F&O')
+    st.caption('Yahoo daily data for broad screening + FYERS batch quotes for selected candidates. All agents share one dataset; no orders are placed.')
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        universe_mode = st.selectbox('Universe', ['NSE + F&O (combined)', 'NSE only', 'F&O only'], key='agent_universe_mode')
+    with c2:
+        scan_limit = st.selectbox('Maximum stocks to scan', [200, 500, 1000, 1500, 2500], index=2, key='agent_scan_limit')
+    with c3:
+        fyers_confirm = st.checkbox('FYERS live quote confirmation (top 50)', value=True, key='agent_fyers_confirm')
+    if universe_mode == 'NSE only':
+        universe = list(dict.fromkeys(all_symbols))
+    elif universe_mode == 'F&O only':
+        universe = list(dict.fromkeys(fo_symbols))
+    else:
+        universe = list(dict.fromkeys(list(all_symbols) + list(fo_symbols)))
+    universe = universe[:int(scan_limit)]
+    st.info(f'Universe: {len(universe)} symbols | Yahoo batches: approximately {(len(universe) + 19) // 20} | FYERS confirmation cap: 50 symbols')
+    st.warning('Yahoo Finance is an unofficial external data source and may be delayed or incomplete. FVG/AMD/liquidity sweep are OHLCV proxies, not verified institutional order flow. Scores are not win probabilities.')
+    if st.button('🚀 RUN 11-AGENT SCAN', type='primary', use_container_width=True, key='run_11_agent_scan'):
+        bar = st.progress(0.0, text='Fetching cached Yahoo daily candles...')
+        status = st.empty()
+        def _progress(done, total):
+            pct = done / max(total, 1)
+            bar.progress(pct, text=f'Yahoo daily scan: {done}/{total}')
+        daily_data, failed = _agent_fetch_yahoo_universe(universe, _progress)
+        market_context = _agent_market_context()
+        bar.progress(1.0, text='Running 11 agents...')
+        fo_set = set(fo_symbols)
+        rows = []
+        for sym, frame in daily_data.items():
+            try:
+                row = _agent_analyze_daily(sym, frame, fo_set)
+                if row and row['LIQUID']:
+                    rows.append(row)
+            except Exception as exc:
+                logger.debug('Agent analysis failed for %s: %s', sym, exc)
+        rows.sort(key=lambda x: (x['AGENT SCORE'], x['TRADED VALUE']), reverse=True)
+        quote_map = _agent_fyers_confirm(fyers, rows) if fyers_confirm else {}
+        for row in rows:
+            row['NIFTY TREND'] = market_context.get('NIFTY', 'DATA UNAVAILABLE')
+            row['BANKNIFTY TREND'] = market_context.get('BANKNIFTY', 'DATA UNAVAILABLE')
+            q = quote_map.get(row['FYERS SYMBOL'])
+            if q is not None:
+                row['FYERS LTP'] = round(float(q), 2)
+                yahoo_ltp = row['LTP (YAHOO)']
+                row['FYERS vs YAHOO %'] = round((float(q) / yahoo_ltp - 1) * 100, 2) if yahoo_ltp else None
+            else:
+                row['FYERS LTP'] = None
+                row['FYERS vs YAHOO %'] = None
+        result = pd.DataFrame(rows)
+        st.session_state['agent_11_results'] = result
+        st.session_state['agent_11_stats'] = {
+            'universe': len(universe), 'fetched': len(daily_data), 'failed': len(failed),
+            'candidates': len(result), 'fyers_confirmed': sum(v is not None for v in quote_map.values()),
+            'partial': len(daily_data) < len(universe), 'market_context': market_context,
+            'updated': _now_ist().strftime('%d-%b-%Y %H:%M:%S IST')
+        }
+        bar.empty(); status.empty()
+    result = st.session_state.get('agent_11_results')
+    stats = st.session_state.get('agent_11_stats')
+    if isinstance(stats, dict):
+        if stats.get('partial'):
+            st.warning('PARTIAL SCAN: some Yahoo symbols did not return usable daily candles. See failed count below.')
+        m = st.columns(5)
+        m[0].metric('Universe', stats['universe']); m[1].metric('Data received', stats['fetched'])
+        m[2].metric('Failed / Missing', stats['failed']); m[3].metric('Candidates', stats['candidates'])
+        m[4].metric('FYERS confirmed', stats['fyers_confirmed'])
+        st.caption(f"Last run: {stats['updated']} | Agent 1 market context: NIFTY {stats.get('market_context', {}).get('NIFTY', 'N/A')} / BANKNIFTY {stats.get('market_context', {}).get('BANKNIFTY', 'N/A')} | Agent score = rule confluence score, not probability.")
+    if isinstance(result, pd.DataFrame) and not result.empty:
+        view = result.drop(columns=['FYERS SYMBOL'], errors='ignore')
+        st.dataframe(view, use_container_width=True, height=520, hide_index=True)
+        st.download_button('⬇️ Download 11-Agent CSV', to_csv_bytes(view),
+                           f"11_AGENT_NSE_FO_{_now_ist().strftime('%Y%m%d_%H%M')}.csv",
+                           'text/csv', key='download_11_agent_csv')
+        st.markdown('**Agent responsibilities:** 1 Market/Universe context · 2 Liquidity filter · 3 Chart pattern · 4 Trend · 5 Volume · 6 Breakout · 7 Sweep proxy · 8 AMD proxy · 9 FVG proxy · 10 F&O tagging · 11 Final consensus.')
+    elif result is not None:
+        st.info('No qualifying candidates. Check data availability or run after market data has updated.')
+
+
 def show_scanner(fyers) -> None:
     """Streamlit main app - NSE AI PRO V17 with MOMENTUM MOVERS"""
     
@@ -6814,7 +7119,8 @@ def show_scanner(fyers) -> None:
         "⚡ EARLY BIG MOVE WATCH",
         "🏆 BEST BUY/SELL BIG MOVE",
         "⚡ LAST 5-MIN BIG VOLUME SIGNALS",
-        "🧠 ADVANCED AI — TIME MACHINE"
+        "🧠 ADVANCED AI — TIME MACHINE",
+        "🤖 11 AGENT TRADER SYSTEM"
     ])
     
     # ════════════════════════════════════════════════════════════════════════════════
@@ -8562,6 +8868,9 @@ def show_scanner(fyers) -> None:
         except Exception as advanced_ai_error:
             st.error(f"Advanced AI module failed to load: {advanced_ai_error}")
             logger.exception("Advanced AI tab error")
+
+    with tabs[27]:
+        _show_11_agent_trader_tab(fyers, all_symbols, fo_symbols)
 
     gc.collect()
 
