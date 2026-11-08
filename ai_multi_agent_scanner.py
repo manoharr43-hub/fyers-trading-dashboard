@@ -525,17 +525,13 @@ def _batch_download_and_analyse(symbol_items, batch_size, period, retry_count=1)
         return batch_result
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
-        future_map = {
-            pool.submit(process_batch, batch): batch
-            for batch in batches
-        }
-        for future in concurrent.futures.as_completed(future_map):
-            batch = future_map[future]
+        futures = [pool.submit(process_batch, batch) for batch in batches]
+        for future in concurrent.futures.as_completed(futures):
             try:
                 output.update(future.result())
             except Exception as exc:
                 # A failed batch must not stop all other batches.
-                for original, _ in batch:
+                for original, _ in batches[futures.index(future)]:
                     output[original] = {
                         "frames": {tf: pd.DataFrame() for tf in TIMEFRAMES},
                         "errors": [f"Batch error: {exc}"],
@@ -644,62 +640,28 @@ def show_ai_multi_agent_scanner(client=None):
 
     c1, c2, c3 = st.columns(3)
     with c1:
-        universe = st.selectbox(
-            "Universe",
-            ["NSE + F&O ALL STOCKS", "F&O Stocks", "NSE Equity"],
-            index=0,
-            key="ma_universe",
-        )
+        universe = st.selectbox("Universe", ["F&O Stocks", "NSE Equity"], key="ma_universe")
     with c2:
         batch_size = st.selectbox("Batch size", [25, 40, 50, 75, 100], index=2, key="ma_batch_size")
     with c3:
         st.metric("Analysis model", "12 Agents × 3 TF")
 
     try:
-        if universe == "NSE + F&O ALL STOCKS":
-            # Combine both loaders, then de-duplicate by Yahoo ticker so
-            # the same company is not downloaded twice.
-            nse_symbols = _normalise_symbols(load_nse_equity_symbols())
-            fo_symbols = _normalise_symbols(load_fo_stocks())
-            combined_symbols = nse_symbols + fo_symbols
-
-            unique_by_yahoo = {}
-            for symbol in combined_symbols:
-                if not _is_index_symbol(symbol):
-                    yahoo_ticker = _to_yahoo_symbol(symbol)
-                    if yahoo_ticker not in unique_by_yahoo:
-                        unique_by_yahoo[yahoo_ticker] = symbol
-            symbols = list(unique_by_yahoo.values())
-
-        elif universe == "F&O Stocks":
+        if universe == "F&O Stocks":
             symbols = _normalise_symbols(load_fo_stocks())
         else:
             symbols = _normalise_symbols(load_nse_equity_symbols())
-
     except Exception as exc:
         st.error(f"Symbol list error: {exc}")
         return
 
-    # Remove index instruments and duplicate symbols in every universe.
-    seen_yahoo = set()
-    clean_symbols = []
-    for symbol in symbols:
-        if _is_index_symbol(symbol):
-            continue
-        yahoo_ticker = _to_yahoo_symbol(symbol)
-        if yahoo_ticker not in seen_yahoo:
-            seen_yahoo.add(yahoo_ticker)
-            clean_symbols.append(symbol)
-    symbols = clean_symbols
+    symbols = list(dict.fromkeys(s for s in symbols if not _is_index_symbol(s)))
     if not symbols:
         st.error("No stock symbols returned by scanner.py.")
         return
 
     st.caption(f"Available symbols: {len(symbols)}. Index symbols are excluded.")
-    st.caption(
-        "NSE + F&O ALL STOCKS combines both scanner.py loaders and removes duplicate "
-        "Yahoo tickers. Full Scan selects every symbol returned by the chosen loader(s)."
-    )
+    st.caption("Full Scan selects every symbol returned by the chosen universe loader.")
 
     period = st.selectbox("Yahoo history", ["60d"], index=0, key="ma_period")
     if st.button("🚀 RUN FULL BATCH SCAN", type="primary", use_container_width=True, key="run_multi_agent"):
