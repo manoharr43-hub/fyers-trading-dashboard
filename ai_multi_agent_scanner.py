@@ -43,6 +43,8 @@ AGENT_NAMES = [
     "Accumulation", "Distribution", "Liquidity Sweep", "Volume Expansion",
     "VWAP", "EMA Trend", "RSI Momentum", "Fair Value Gap",
     "HH/HL Structure", "LH/LL Structure", "Pre-Big Movement", "Chart Pattern",
+    "Volume Analysis", "SMC Structure", "Order Block",
+    "Buy/Sell Pressure", "Momentum Divergence",
 ]
 SIGNAL_PRIORITY = {
     "BUY": 0, "SELL": 0, "PRE-BIG BUY": 1, "PRE-BIG SELL": 1,
@@ -273,8 +275,8 @@ def _agent_result(direction="WAIT", score=0, reason="No clear setup"):
     return {"direction": direction, "score": int(score), "reason": reason}
 
 
-def _run_12_agents(df):
-    """12 deterministic OHLCV rule engines; scores are not probabilities."""
+def _run_17_agents(df):
+    """17 deterministic OHLCV rule engines; scores are not probabilities."""
     if df is None or len(df) < 30:
         return {n: _agent_result("NO DATA", 0, "Need 30 completed candles")
                 for n in AGENT_NAMES}
@@ -400,6 +402,79 @@ def _run_12_agents(df):
     else:
         result["Chart Pattern"] = _agent_result("WAIT", 0, "No confirmed pattern / volume-backed break")
 
+    # Five additional completed-candle agents.
+    # 13) Volume Analysis: relative volume and directional volume balance.
+    vol_avg = v.shift(1).rolling(20, min_periods=10).mean()
+    vol_rvol = _safe_num(v.iloc[-1] / vol_avg.iloc[-1]) if pd.notna(vol_avg.iloc[-1]) and vol_avg.iloc[-1] > 0 else 0.0
+    up_volume = _safe_num(v.iloc[-5:][c.iloc[-5:] >= o.iloc[-5:]].sum())
+    down_volume = _safe_num(v.iloc[-5:][c.iloc[-5:] < o.iloc[-5:]].sum())
+    volume_total = up_volume + down_volume
+    volume_balance = (up_volume - down_volume) / volume_total if volume_total > 0 else 0.0
+    if vol_rvol >= 1.5 and volume_balance >= 0.20:
+        result["Volume Analysis"] = _agent_result("BUY", 2, f"Positive volume balance; RVOL {vol_rvol:.2f}x")
+    elif vol_rvol >= 1.5 and volume_balance <= -0.20:
+        result["Volume Analysis"] = _agent_result("SELL", -2, f"Negative volume balance; RVOL {vol_rvol:.2f}x")
+    else:
+        result["Volume Analysis"] = _agent_result("WAIT", 0, f"Volume not directional; RVOL {vol_rvol:.2f}x")
+
+    # 14) SMC: completed close beyond the previous 10-candle structure.
+    smc_high = _safe_num(h.iloc[-11:-1].max())
+    smc_low = _safe_num(l.iloc[-11:-1].min())
+    prior_trend_up = _safe_num(c.iloc[-6]) > _safe_num(c.iloc[-11])
+    prior_trend_down = _safe_num(c.iloc[-6]) < _safe_num(c.iloc[-11])
+    if last > smc_high:
+        label = "Bullish CHoCH/BOS" if prior_trend_down else "Bullish BOS"
+        result["SMC Structure"] = _agent_result("BUY", 2, f"{label}: close above prior structure")
+    elif last < smc_low:
+        label = "Bearish CHoCH/BOS" if prior_trend_up else "Bearish BOS"
+        result["SMC Structure"] = _agent_result("SELL", -2, f"{label}: close below prior structure")
+    else:
+        result["SMC Structure"] = _agent_result("WAIT", 0, "No completed structure break")
+
+    # 15) Order Block: identify a recent opposing candle and check retest.
+    ob_window = d.iloc[-11:-1]
+    bullish_ob = next(
+        ((float(row.Low), float(row.High)) for row in ob_window.iloc[::-1].itertuples()
+         if row.Close < row.Open), None
+    )
+    bearish_ob = next(
+        ((float(row.Low), float(row.High)) for row in ob_window.iloc[::-1].itertuples()
+         if row.Close > row.Open), None
+    )
+    bullish_retest = bullish_ob is not None and bullish_ob[0] <= last <= bullish_ob[1] * 1.003
+    bearish_retest = bearish_ob is not None and bearish_ob[0] * 0.997 <= last <= bearish_ob[1]
+    if bullish_retest and last >= _safe_num(o.iloc[-1]):
+        result["Order Block"] = _agent_result("BUY", 2, f"Bullish OB retest {bullish_ob[0]:.2f}-{bullish_ob[1]:.2f}")
+    elif bearish_retest and last <= _safe_num(o.iloc[-1]):
+        result["Order Block"] = _agent_result("SELL", -2, f"Bearish OB retest {bearish_ob[0]:.2f}-{bearish_ob[1]:.2f}")
+    else:
+        result["Order Block"] = _agent_result("WAIT", 0, "No confirmed order-block retest")
+
+    # 16) Buy/Sell Pressure: candle close location plus directional volume.
+    pressure_close = (last - _safe_num(l.iloc[-1])) / span
+    pressure_score = (pressure_close - 0.5) * 2 + volume_balance
+    if pressure_score >= 0.65:
+        result["Buy/Sell Pressure"] = _agent_result("BUY", 2, f"Buying pressure dominant ({pressure_score:.2f})")
+    elif pressure_score <= -0.65:
+        result["Buy/Sell Pressure"] = _agent_result("SELL", -2, f"Selling pressure dominant ({pressure_score:.2f})")
+    else:
+        result["Buy/Sell Pressure"] = _agent_result("WAIT", 0, f"Pressure balanced ({pressure_score:.2f})")
+
+    # 17) Momentum Divergence: compare recent price extremes with RSI windows.
+    rsi_series = _rsi(c)
+    old_price_low = _safe_num(l.iloc[-10:-5].min())
+    new_price_low = _safe_num(l.iloc[-5:].min())
+    old_price_high = _safe_num(h.iloc[-10:-5].max())
+    new_price_high = _safe_num(h.iloc[-5:].max())
+    old_rsi = _safe_num(rsi_series.iloc[-10:-5].mean(), 50.0)
+    new_rsi = _safe_num(rsi_series.iloc[-5:].mean(), 50.0)
+    if new_price_low < old_price_low and new_rsi > old_rsi + 2:
+        result["Momentum Divergence"] = _agent_result("BUY", 2, "Possible bullish RSI divergence")
+    elif new_price_high > old_price_high and new_rsi < old_rsi - 2:
+        result["Momentum Divergence"] = _agent_result("SELL", -2, "Possible bearish RSI divergence")
+    else:
+        result["Momentum Divergence"] = _agent_result("WAIT", 0, "No clear regular RSI divergence")
+
     return result
 
 
@@ -472,7 +547,7 @@ def _news_agent(yahoo_symbol):
 
 
 def _analyse_timeframe(df):
-    agents = _run_12_agents(df)
+    agents = _run_17_agents(df)
     score = int(sum(x["score"] for x in agents.values()))
     buy_votes = sum(x["direction"] in ("BUY", "PRE-BIG BUY") for x in agents.values())
     sell_votes = sum(x["direction"] in ("SELL", "PRE-BIG SELL") for x in agents.values())
@@ -612,7 +687,7 @@ def _sort_results(result):
 def show_ai_multi_agent_scanner(client=None):
     """Streamlit page. client is retained for app.py compatibility."""
     st.title("🤖 AI Multi-Agent Scanner — Yahoo Batch")
-    st.caption("12 OHLCV rule engines × 5M / 15M / 1H + optional Yahoo News Context")
+    st.caption("17 OHLCV rule engines × 5M / 15M / 1H + optional Yahoo News Context")
     st.info("scanner.py supplies only the stock universe. Yahoo Finance supplies candles; this module does not call FYERS.")
     st.warning(
         "Yahoo intraday data may be delayed, missing or rate-limited. "
@@ -634,7 +709,7 @@ def show_ai_multi_agent_scanner(client=None):
     with c2:
         batch_size = st.selectbox("Batch size", [25, 40, 50, 75, 100], index=2, key="ma_batch_size")
     with c3:
-        st.metric("Analysis", "12 Agents × 3 TF")
+        st.metric("Analysis", "17 Agents × 3 TF")
 
     try:
         raw_symbols = load_fo_stocks() if universe == "F&O Stocks" else load_nse_equity_symbols()
@@ -757,7 +832,7 @@ def show_ai_multi_agent_scanner(client=None):
         "News Agent", "News Score", "News Reason", "Errors",
     ]
     st.dataframe(view[summary_cols], hide_index=True, **_stretch())
-    st.caption("CSV/Excel include all 36 timeframe-agent outputs and each agent's reason.")
+    st.caption("CSV/Excel include all 51 timeframe-agent outputs and each agent's reason.")
 
     file_stamp = info.get("file_stamp", datetime.now(IST).strftime("%Y%m%d_%H%M%S"))
     if st.session_state.get("multi_agent_csv"):
@@ -789,8 +864,9 @@ def show_ai_multi_agent_scanner(client=None):
     with st.expander("12 Agents — logic and limitations"):
         st.write(
             "Accumulation, Distribution, Liquidity Sweep, Volume Expansion, VWAP, EMA Trend, "
-            "RSI Momentum, Fair Value Gap, HH/HL Structure, LH/LL Structure, Pre-Big Movement "
-            "and Chart Pattern run on 5M, 15M and 1H candles. These are deterministic technical "
+            "RSI Momentum, Fair Value Gap, HH/HL Structure, LH/LL Structure, Pre-Big Movement, "
+            "Chart Pattern, Volume Analysis, SMC Structure, Order Block, Buy/Sell Pressure and "
+            "Momentum Divergence run on 5M, 15M and 1H candles. These are deterministic technical "
             "rules, not 12 independent AI language models. News is a separate keyword-based "
             "headline context check, not a standalone trade signal. Chart Pattern uses OHLCV, "
             "not chart screenshots. Signals are screening outputs, not guaranteed entries."
