@@ -2,10 +2,11 @@
 AI Multi-Agent Scanner for NSE AI PRO V17
 Yahoo Finance batch edition — revised.
 
-- scanner.py only supplies the NSE / F&O symbol universe.
+- scanner.py only supplies the NSE / F&O symbol universe; this module combines both loaders without modifying scanner.py.
 - Yahoo Finance supplies all OHLCV candles and technical-analysis data.
 - FYERS is used ONLY for 5-level Market Depth on shortlisted BUY/SELL/PRE-BIG stocks.
 - 17 OHLCV rule-based agents on completed 5M, 15M and 1H candles.
+- Separate 20-candle 1M compression / volume buildup / breakout detector.
 - Optional Yahoo headline context for the strongest technical shortlist.
 - Compatible entry point: show_ai_multi_agent_scanner(client=None)
 
@@ -42,6 +43,7 @@ INDEX_NAMES = {
     "MIDCPNIFTY", "NIFTYNEXT50", "SENSEX", "BANKEX",
 }
 TIMEFRAMES = {"5M": ("5m", 5), "15M": ("15m", 15), "1H": ("60m", 60)}
+EARLY_TIMEFRAME = ("1m", 1)  # separate 1-minute feed; does not alter the 17-agent timeframes
 AGENT_NAMES = [
     "Accumulation", "Distribution", "Liquidity Sweep", "Volume Expansion",
     "VWAP", "EMA Trend", "RSI Momentum", "Fair Value Gap",
@@ -104,6 +106,36 @@ def _save_candle_memory(batch, per_tf):
             open=excluded.open, high=excluded.high, low=excluded.low,
             close=excluded.close, volume=excluded.volume, saved_at=excluded.saved_at""", records)
     return len(records)
+
+def _load_candle_memory(symbol, timeframe):
+    """Load previously saved candles for one source symbol/timeframe."""
+    try:
+        with _memory_connect() as conn:
+            rows = conn.execute(
+                """SELECT candle_time, open, high, low, close, volume
+                   FROM candles WHERE symbol=? AND timeframe=? ORDER BY candle_time""",
+                (str(symbol), str(timeframe)),
+            ).fetchall()
+        if not rows:
+            return pd.DataFrame(columns=["Time", "Open", "High", "Low", "Close", "Volume"])
+        frame = pd.DataFrame(rows, columns=["Time", "Open", "High", "Low", "Close", "Volume"])
+        frame["Time"] = pd.to_datetime(frame["Time"], errors="coerce", utc=True).dt.tz_convert(IST)
+        for col in ("Open", "High", "Low", "Close", "Volume"):
+            frame[col] = pd.to_numeric(frame[col], errors="coerce")
+        frame = frame.dropna(subset=["Time", "Open", "High", "Low", "Close", "Volume"])
+        return frame.sort_values("Time").drop_duplicates("Time", keep="last").reset_index(drop=True)
+    except Exception:
+        return pd.DataFrame(columns=["Time", "Open", "High", "Low", "Close", "Volume"])
+
+def _merge_candle_frames(cached, fresh):
+    """Merge stored and fresh Yahoo candles; fresh overlapping bars take precedence."""
+    parts = [x for x in (cached, fresh) if isinstance(x, pd.DataFrame) and not x.empty]
+    if not parts:
+        return pd.DataFrame(columns=["Time", "Open", "High", "Low", "Close", "Volume"])
+    merged = pd.concat(parts, ignore_index=True)
+    merged["Time"] = pd.to_datetime(merged["Time"], errors="coerce", utc=True).dt.tz_convert(IST)
+    return (merged.dropna(subset=["Time"]).sort_values("Time")
+            .drop_duplicates("Time", keep="last").reset_index(drop=True))
 
 def _save_scan_history(result, scanned_at):
     if result is None or result.empty:
@@ -646,6 +678,83 @@ def _analyse_timeframe(df):
             "close": close, "rsi": rsi_value, "candles": len(df) if has_data else 0}
 
 
+def _early_20m_analysis(df):
+    """20 completed 1-minute candles: compression, volume buildup, pressure and breakout."""
+    empty = {
+        "20M Status": "NO DATA", "20M Direction": "WAIT", "20M Pre-Move Score": 0,
+        "20M Range High": None, "20M Range Low": None, "20M Range %": None,
+        "20M RVOL": None, "20M Pressure %": None, "20M Last Close": None,
+        "20M Reason": "Need at least 21 completed 1-minute candles",
+    }
+    if df is None or not isinstance(df, pd.DataFrame) or len(df) < 21:
+        return empty
+    d = df.sort_values("Time").drop_duplicates("Time", keep="last").tail(21).reset_index(drop=True)
+    # The latest completed candle is the test candle; range boundaries use the previous 20.
+    base = d.iloc[-21:-1]
+    last = d.iloc[-1]
+    high = _safe_num(base["High"].max())
+    low = _safe_num(base["Low"].min())
+    close = _safe_num(last["Close"])
+    if low <= 0 or high <= low or close <= 0:
+        return empty
+    range_pct = (high - low) / close * 100.0
+    previous = d.iloc[-21:-6]
+    recent5 = d.iloc[-6:-1]
+    prev_avg = _safe_num(previous["Volume"].mean())
+    recent_avg = _safe_num(recent5["Volume"].mean())
+    last_vol = _safe_num(last["Volume"])
+    rvol = last_vol / max(_safe_num(base["Volume"].mean()), 1.0)
+    buildup = recent_avg / max(prev_avg, 1.0)
+    candle_span = max(_safe_num(last["High"] - last["Low"]), 1e-9)
+    close_location = max(0.0, min(1.0, (close - _safe_num(last["Low"])) / candle_span))
+    pressure = (close_location - 0.5) * 200.0
+    breakout_up = close > high
+    breakout_down = close < low
+    # Compare 20-minute width to the preceding 20 completed candles when available.
+    prior_compression = False
+    if len(df) >= 41:
+        prior = df.sort_values("Time").drop_duplicates("Time", keep="last").iloc[-41:-21]
+        prior_width = _safe_num(prior["High"].max() - prior["Low"].min())
+        current_width = high - low
+        prior_compression = prior_width > 0 and current_width <= prior_width * 0.75
+    else:
+        # Without a prior 20-minute comparator, use a conservative absolute range cap.
+        prior_compression = range_pct <= 1.0
+    near_high = close >= high * 0.997
+    near_low = close <= low * 1.003
+    score = 0
+    score += 25 if prior_compression else 0
+    score += 20 if buildup >= 1.20 else 10 if buildup >= 1.05 else 0
+    score += 20 if rvol >= 1.50 else 10 if rvol >= 1.20 else 0
+    score += 20 if abs(pressure) >= 35 else 10 if abs(pressure) >= 15 else 0
+    score += 15 if near_high or near_low else 0
+    score = min(100, score)
+    if breakout_up:
+        status, direction = "CONFIRMED BREAKOUT", "UP"
+        reason = "Latest completed 1M close broke above previous 20-candle high"
+        score = max(score, 80)
+    elif breakout_down:
+        status, direction = "CONFIRMED BREAKOUT", "DOWN"
+        reason = "Latest completed 1M close broke below previous 20-candle low"
+        score = max(score, 80)
+    elif prior_compression and buildup >= 1.05 and pressure >= 15 and near_high:
+        status, direction = "WATCH", "UP"
+        reason = "20M range compression + volume buildup + buying pressure near range high"
+    elif prior_compression and buildup >= 1.05 and pressure <= -15 and near_low:
+        status, direction = "WATCH", "DOWN"
+        reason = "20M range compression + volume buildup + selling pressure near range low"
+    else:
+        status, direction = "WAIT", "WAIT"
+        reason = "20M setup conditions are not aligned"
+    return {
+        "20M Status": status, "20M Direction": direction,
+        "20M Pre-Move Score": int(score), "20M Range High": round(high, 2),
+        "20M Range Low": round(low, 2), "20M Range %": round(range_pct, 3),
+        "20M RVOL": round(rvol, 2), "20M Pressure %": round(pressure, 1),
+        "20M Last Close": round(close, 2), "20M Reason": reason,
+    }
+
+
 def _make_result_row(symbol, yahoo_symbol, payload):
     frames = payload.get("frames", {})
     analyses = {tf: _analyse_timeframe(frames.get(tf, pd.DataFrame())) for tf in TIMEFRAMES}
@@ -728,6 +837,7 @@ def _make_result_row(symbol, yahoo_symbol, payload):
         "1H Candles": analyses["1H"]["candles"], "Last Price": analyses["15M"]["close"],
         "15M RSI": analyses["15M"]["rsi"], "Errors": " | ".join(payload.get("errors", [])),
     }
+    row.update(_early_20m_analysis(payload.get("early_1m", pd.DataFrame())))
     for tf in TIMEFRAMES:
         for name in AGENT_NAMES:
             item = analyses[tf]["agents"][name]
@@ -779,22 +889,47 @@ def _fetch_interval(tickers, interval, minutes, period, retries=2):
 def _scan_batch(batch, period):
     tickers = [ticker for _, ticker in batch]
     per_tf, problems = {}, {ticker: [] for ticker in tickers}
+    original_by_ticker = {ticker: original for original, ticker in batch}
+
+    # If SQLite already has data for every ticker, fetch only a short overlap window.
+    # First scan remains a full-history warm-up. The overlap refreshes late/adjusted bars.
     for label, (interval, minutes) in TIMEFRAMES.items():
-        frames, errors = _fetch_interval(tickers, interval, minutes, period)
-        per_tf[label] = frames
+        cached = {ticker: _load_candle_memory(original_by_ticker[ticker], label) for ticker in tickers}
+        all_cached = all(not cached[t].empty for t in tickers)
+        fetch_period = "2d" if all_cached else period
+        fresh_frames, errors = _fetch_interval(tickers, interval, minutes, fetch_period)
+        frames = {}
         for ticker in tickers:
+            frames[ticker] = _merge_candle_frames(cached[ticker], fresh_frames.get(ticker))
             if frames[ticker].empty:
-                problems[ticker].append(f"{label}: {errors.get(ticker, 'No data')}")
-    # Save all fetched completed candles, including stocks that later receive WAIT/NO DATA.
+                problems[ticker].append(f"{label}: {errors.get(ticker, 'No cached or fresh data')}")
+        per_tf[label] = frames
+
+    # Dedicated 1-minute feed for the 20-candle early-movement detector.
+    early_cached = {ticker: _load_candle_memory(original_by_ticker[ticker], "1M") for ticker in tickers}
+    early_all_cached = all(not early_cached[t].empty for t in tickers)
+    early_period = "2d" if early_all_cached else "7d"  # Yahoo 1m history is limited
+    early_fresh, early_errors = _fetch_interval(tickers, "1m", 1, early_period)
+    early_frames = {
+        ticker: _merge_candle_frames(early_cached[ticker], early_fresh.get(ticker))
+        for ticker in tickers
+    }
+    per_tf["1M"] = early_frames
+    for ticker in tickers:
+        if early_frames[ticker].empty:
+            problems[ticker].append(f"1M: {early_errors.get(ticker, 'No 1M data')}")
+
     try:
         _save_candle_memory(batch, per_tf)
     except Exception:
         pass
+
     rows = []
     for original, ticker in batch:
         try:
             rows.append(_make_result_row(original, ticker, {
                 "frames": {tf: per_tf[tf][ticker] for tf in TIMEFRAMES},
+                "early_1m": per_tf["1M"][ticker],
                 "errors": problems[ticker],
             }))
         except Exception as exc:
@@ -990,8 +1125,9 @@ def _direction_movement(row):
 def show_ai_multi_agent_scanner(client=None):
     """Streamlit page. client is retained for app.py compatibility."""
     st.title("🤖 AI Multi-Agent Scanner — Yahoo Batch")
-    st.caption("17 OHLCV rule engines × 5M / 15M / 1H + optional Yahoo News Context")
-    st.info("scanner.py supplies the stock universe. Yahoo Finance supplies all candles/indicators. FYERS is used only for 5-level Market Depth on shortlisted BUY/SELL/PRE-BIG stocks.")
+    st.caption("17 OHLCV rule engines × 5M / 15M / 1H + 20-candle 1M early-movement detector + optional Yahoo News")
+    st.info("scanner.py supplies NSE/F&O symbols only (unchanged). Yahoo Finance supplies candles. FYERS is used only for 5-level Market Depth on the technical shortlist.")
+    st.caption("Smart Memory: SQLite candles are loaded first; after the initial warm-up, the scanner refreshes a short 2-day overlap and merges it with saved candles. Yahoo 1-minute history is limited, so the first 1M warm-up uses 7 days.")
     st.warning(
         "Yahoo intraday data may be delayed, missing or rate-limited. "
         "Confirmation Strength is a heuristic consensus score, not a probability or win rate."
@@ -1008,14 +1144,20 @@ def show_ai_multi_agent_scanner(client=None):
 
     c1, c2, c3 = st.columns(3)
     with c1:
-        universe = st.selectbox("Universe", ["F&O Stocks", "NSE Equity"], key="ma_universe")
+        universe = st.selectbox("Universe", ["Both (NSE + F&O)", "F&O Stocks", "NSE Equity"], key="ma_universe")
     with c2:
         batch_size = st.selectbox("Batch size", [25, 40, 50, 75, 100], index=2, key="ma_batch_size")
     with c3:
         st.metric("Analysis", "17 Agents × 3 TF")
 
     try:
-        raw_symbols = load_fo_stocks() if universe == "F&O Stocks" else load_nse_equity_symbols()
+        if universe == "Both (NSE + F&O)":
+            # Keep scanner.py untouched: call its existing loaders and combine here.
+            raw_symbols = _normalise_symbols(load_nse_equity_symbols()) + _normalise_symbols(load_fo_stocks())
+        elif universe == "F&O Stocks":
+            raw_symbols = _normalise_symbols(load_fo_stocks())
+        else:
+            raw_symbols = _normalise_symbols(load_nse_equity_symbols())
         symbols = _normalise_symbols(raw_symbols)
     except Exception as exc:
         st.error(f"Symbol list error: {exc}")
@@ -1162,7 +1304,17 @@ def show_ai_multi_agent_scanner(client=None):
 
     if "Direction Movement" not in result.columns:
         result["Direction Movement"] = result.apply(_direction_movement, axis=1)
-        st.session_state["multi_agent_results"] = result
+    # Backward compatibility for results retained in Streamlit session_state from an older version.
+    early_defaults = {
+        "20M Status": "NO DATA", "20M Direction": "WAIT", "20M Pre-Move Score": 0,
+        "20M Range High": None, "20M Range Low": None, "20M Range %": None,
+        "20M RVOL": None, "20M Pressure %": None, "20M Last Close": None,
+        "20M Reason": "Run a fresh scan to calculate the 1M early-movement detector",
+    }
+    for col_name, default_value in early_defaults.items():
+        if col_name not in result.columns:
+            result[col_name] = default_value
+    st.session_state["multi_agent_results"] = result
 
     info = st.session_state.get("multi_agent_scan_info", {})
     candle_count, scan_count, memory_symbols = _memory_stats()
@@ -1178,24 +1330,37 @@ def show_ai_multi_agent_scanner(client=None):
     )
 
     # Data coverage is shown separately from the final signal count.
-    coverage_cols = st.columns(4)
+    coverage_cols = st.columns(5)
     coverage_cols[0].metric("Rows attempted", len(result))
-    for col, tf in zip(coverage_cols[1:], ("5M", "15M", "1H")):
+    for col, tf in zip(coverage_cols[1:4], ("5M", "15M", "1H")):
         col.metric(f"{tf} valid data", int((result[f"{tf} Candles"] >= 30).sum()))
+    coverage_cols[4].metric("20M data", int((result["20M Status"] != "NO DATA").sum()))
 
     counts = result["Final Signal"].value_counts()
     metric_cols = st.columns(6)
     for col, label in zip(metric_cols, ["BUY", "SELL", "PRE-BIG BUY", "PRE-BIG SELL", "WAIT", "NO DATA"]):
         col.metric(label, int(counts.get(label, 0)))
 
-    signal_filter = st.selectbox(
-        "Show signals", ["ALL", "BUY", "SELL", "PRE-BIG BUY", "PRE-BIG SELL", "WAIT", "NO DATA"],
-        key="ma_filter",
-    )
+    filter_col1, filter_col2 = st.columns(2)
+    with filter_col1:
+        signal_filter = st.selectbox(
+            "Show technical signals", ["ALL", "BUY", "SELL", "PRE-BIG BUY", "PRE-BIG SELL", "WAIT", "NO DATA"],
+            key="ma_filter",
+        )
+    with filter_col2:
+        early_filter = st.selectbox(
+            "20M Early Movement", ["ALL", "WATCH", "CONFIRMED BREAKOUT", "WAIT", "NO DATA"],
+            key="ma_early_filter",
+        )
     view = result if signal_filter == "ALL" else result[result["Final Signal"] == signal_filter]
+    if early_filter != "ALL":
+        view = view[view["20M Status"] == early_filter]
+    view = view.sort_values(["20M Pre-Move Score", "Confirmation Strength %"], ascending=[False, False])
     summary_cols = [
         "Symbol", "Final Signal", "Direction Movement", "Signal Time (IST)", "Entry Price", "Stop Loss", "15M ATR",
         "Confirmation Strength %", "Consensus Score",
+        "20M Status", "20M Direction", "20M Pre-Move Score", "20M Range High", "20M Range Low",
+        "20M Range %", "20M RVOL", "20M Pressure %", "20M Last Close", "20M Reason",
         "5M", "15M", "1H", "5M Score", "15M Score", "1H Score",
         "5M Candles", "15M Candles", "1H Candles", "Last Price", "15M RSI",
         "News Agent", "News Score", "News Reason", "Depth Status", "Depth Signal",
@@ -1219,7 +1384,7 @@ def show_ai_multi_agent_scanner(client=None):
         )
     else:
         st.info("No BUY / SELL / PRE-BIG shortlist rows yet, or Market Depth has not been requested.")
-    st.caption("CSV/Excel include all 51 timeframe-agent outputs and each agent's reason.")
+    st.caption("CSV/Excel include all 51 timeframe-agent outputs, each agent reason, and the separate 20-candle 1M early-movement fields.")
     st.caption("Signal Time = latest completed 15M candle close (IST). Entry = 15M close. Stop Loss = 1.5 × 15M ATR; shown only for BUY/SELL and PRE-BIG signals.")
 
     file_stamp = info.get("file_stamp", datetime.now(IST).strftime("%Y%m%d_%H%M%S"))
