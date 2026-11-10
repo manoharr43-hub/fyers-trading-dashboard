@@ -3,8 +3,9 @@ AI Multi-Agent Scanner for NSE AI PRO V17
 Yahoo Finance batch edition — revised.
 
 - scanner.py only supplies the NSE / F&O symbol universe.
-- Yahoo Finance supplies candles; no FYERS history, quotes or orders.
-- 12 OHLCV rule-based agents on completed 5M, 15M and 1H candles.
+- Yahoo Finance supplies all OHLCV candles and technical-analysis data.
+- FYERS is used ONLY for 5-level Market Depth on shortlisted BUY/SELL/PRE-BIG stocks.
+- 17 OHLCV rule-based agents on completed 5M, 15M and 1H candles.
 - Optional Yahoo headline context for the strongest technical shortlist.
 - Compatible entry point: show_ai_multi_agent_scanner(client=None)
 
@@ -51,6 +52,9 @@ SIGNAL_PRIORITY = {
     "WAIT": 2, "NO DATA": 3,
 }
 _YF_LOCK = threading.Lock()
+FYERS_DEPTH_CACHE_TTL = 20       # seconds; prevents repeated depth calls on Streamlit reruns
+FYERS_DEPTH_CALL_GAP = 1.05      # conservative one-call-per-second pacing
+FYERS_DEPTH_DEFAULT_LIMIT = 20  # configurable shortlist cap per scan
 
 
 def _stretch():
@@ -718,6 +722,152 @@ def _scan_batch(batch, period):
     return rows
 
 
+
+def _to_fyers_equity_symbol(symbol):
+    """Convert scanner universe symbols to FYERS NSE cash-market symbols."""
+    raw = str(symbol or "").strip().upper()
+    if raw.startswith("NSE:"):
+        body = raw[4:]
+    elif raw.startswith("BSE:"):
+        return ""  # This scanner is configured for NSE equity/F&O universe.
+    else:
+        body = raw
+    body = body.replace(".NS", "").replace(".BO", "")
+    for suffix in ("-EQ", "-BE", "-INDEX", "_EQ"):
+        if body.endswith(suffix):
+            body = body[:-len(suffix)]
+    if not body or body in INDEX_NAMES:
+        return ""
+    return f"NSE:{body}-EQ"
+
+
+def _depth_levels(payload):
+    """Return the FYERS symbol depth object across common SDK response wrappers."""
+    if not isinstance(payload, dict):
+        return None
+    data = payload.get("d", payload.get("data", payload))
+    if isinstance(data, dict):
+        # FYERS normally keys d by the requested symbol.
+        for value in data.values():
+            if isinstance(value, dict) and any(k in value for k in ("bids", "ask", "asks")):
+                return value
+        if any(k in data for k in ("bids", "ask", "asks")):
+            return data
+    return None
+
+
+def _normalise_depth_row(symbol, fyers_symbol, response, fetched_at=None):
+    """Convert FYERS 5-level depth into transparent quantities and imbalance."""
+    stamp = fetched_at or datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST")
+    if not isinstance(response, dict) or str(response.get("s", "")).lower() not in ("ok", "success"):
+        message = response.get("message", "FYERS depth response not successful") if isinstance(response, dict) else "Invalid FYERS response"
+        return {"Symbol": symbol, "FYERS Symbol": fyers_symbol, "Depth Status": "DEPTH UNAVAILABLE",
+                "Depth Signal": "N/A", "Best Bid": None, "Best Ask": None, "Spread": None,
+                "Buy Qty (5L)": None, "Sell Qty (5L)": None, "Depth Imbalance %": None,
+                "Depth Time (IST)": stamp, "Depth Message": str(message)[:180]}
+
+    book = _depth_levels(response)
+    if not book:
+        return {"Symbol": symbol, "FYERS Symbol": fyers_symbol, "Depth Status": "DEPTH UNAVAILABLE",
+                "Depth Signal": "N/A", "Best Bid": None, "Best Ask": None, "Spread": None,
+                "Buy Qty (5L)": None, "Sell Qty (5L)": None, "Depth Imbalance %": None,
+                "Depth Time (IST)": stamp, "Depth Message": "No bids/asks in FYERS response"}
+
+    bids = book.get("bids") or book.get("buy") or []
+    asks = book.get("ask") or book.get("asks") or book.get("sell") or []
+    def level_price(level):
+        return _safe_num(level.get("price"), np.nan) if isinstance(level, dict) else np.nan
+    def level_qty(level):
+        if not isinstance(level, dict):
+            return 0.0
+        return _safe_num(level.get("volume", level.get("qty", level.get("quantity", 0))))
+
+    bids = list(bids)[:5] if isinstance(bids, (list, tuple)) else []
+    asks = list(asks)[:5] if isinstance(asks, (list, tuple)) else []
+    buy_qty = sum(level_qty(x) for x in bids)
+    sell_qty = sum(level_qty(x) for x in asks)
+    bid_prices = [level_price(x) for x in bids]
+    ask_prices = [level_price(x) for x in asks]
+    bid_prices = [x for x in bid_prices if np.isfinite(x) and x > 0]
+    ask_prices = [x for x in ask_prices if np.isfinite(x) and x > 0]
+    best_bid = max(bid_prices) if bid_prices else np.nan
+    best_ask = min(ask_prices) if ask_prices else np.nan
+    spread = best_ask - best_bid if np.isfinite(best_bid) and np.isfinite(best_ask) else np.nan
+    total = buy_qty + sell_qty
+    imbalance = ((buy_qty - sell_qty) / total * 100.0) if total > 0 else np.nan
+    if not bids or not asks or total <= 0:
+        depth_signal = "INSUFFICIENT DEPTH"
+        status = "PARTIAL DEPTH"
+    elif imbalance >= 15:
+        depth_signal, status = "BUY-SIDE DOMINANT", "OK"
+    elif imbalance <= -15:
+        depth_signal, status = "SELL-SIDE DOMINANT", "OK"
+    else:
+        depth_signal, status = "BALANCED", "OK"
+
+    return {
+        "Symbol": symbol, "FYERS Symbol": fyers_symbol, "Depth Status": status,
+        "Depth Signal": depth_signal,
+        "Best Bid": round(best_bid, 2) if np.isfinite(best_bid) else None,
+        "Best Ask": round(best_ask, 2) if np.isfinite(best_ask) else None,
+        "Spread": round(spread, 2) if np.isfinite(spread) else None,
+        "Buy Qty (5L)": int(buy_qty), "Sell Qty (5L)": int(sell_qty),
+        "Depth Imbalance %": round(imbalance, 2) if np.isfinite(imbalance) else None,
+        "Depth Time (IST)": stamp, "Depth Message": "5-level bid/ask quantities; snapshot only",
+    }
+
+
+def _fetch_fyers_depth_shortlist(client, shortlist, limit=FYERS_DEPTH_DEFAULT_LIMIT):
+    """Fetch FYERS depth only for technical BUY/SELL/PRE-BIG shortlist rows.
+
+    Cache is stored in Streamlit session_state. Calls are paced conservatively;
+    missing client/API errors are reported as unavailable, never fabricated.
+    """
+    columns = ["Symbol", "FYERS Symbol", "Depth Status", "Depth Signal", "Best Bid", "Best Ask",
+               "Spread", "Buy Qty (5L)", "Sell Qty (5L)", "Depth Imbalance %", "Depth Time (IST)", "Depth Message"]
+    if shortlist is None or shortlist.empty:
+        return pd.DataFrame(columns=columns)
+
+    cache = st.session_state.setdefault("ma_fyers_depth_cache", {})
+    now = time.time()
+    rows = []
+    selected = shortlist.head(int(limit))
+    if client is None or not callable(getattr(client, "depth", None)):
+        for _, item in selected.iterrows():
+            sym = str(item["Symbol"])
+            fy_sym = _to_fyers_equity_symbol(sym)
+            rows.append(_normalise_depth_row(sym, fy_sym, {"s": "error", "message": "FYERS client/depth() not supplied by app.py"}))
+        return pd.DataFrame(rows, columns=columns)
+
+    last_call = float(st.session_state.get("ma_fyers_depth_last_call", 0.0))
+    for _, item in selected.iterrows():
+        symbol = str(item["Symbol"])
+        fyers_symbol = _to_fyers_equity_symbol(symbol)
+        if not fyers_symbol:
+            rows.append(_normalise_depth_row(symbol, "", {"s": "error", "message": "Unsupported/non-NSE symbol"}))
+            continue
+        cached = cache.get(fyers_symbol)
+        if cached and now - cached.get("ts", 0) < FYERS_DEPTH_CACHE_TTL:
+            rows.append(cached["row"])
+            continue
+
+        wait_for = FYERS_DEPTH_CALL_GAP - (time.time() - last_call)
+        if wait_for > 0:
+            time.sleep(wait_for)
+        try:
+            # FYERS API v3 market-depth endpoint; no history/quotes/orders are called here.
+            response = client.depth(data={"symbol": fyers_symbol, "ohlcv_flag": "1"})
+            row = _normalise_depth_row(symbol, fyers_symbol, response)
+        except Exception as exc:
+            row = _normalise_depth_row(symbol, fyers_symbol, {"s": "error", "message": str(exc)[:180]})
+        last_call = time.time()
+        st.session_state["ma_fyers_depth_last_call"] = last_call
+        cache[fyers_symbol] = {"ts": last_call, "row": row}
+        rows.append(row)
+
+    st.session_state["ma_fyers_depth_cache"] = cache
+    return pd.DataFrame(rows, columns=columns)
+
 def _sort_results(result):
     result = result.copy()
     result["_priority"] = result["Final Signal"].map(SIGNAL_PRIORITY).fillna(9)
@@ -731,7 +881,7 @@ def show_ai_multi_agent_scanner(client=None):
     """Streamlit page. client is retained for app.py compatibility."""
     st.title("🤖 AI Multi-Agent Scanner — Yahoo Batch")
     st.caption("17 OHLCV rule engines × 5M / 15M / 1H + optional Yahoo News Context")
-    st.info("scanner.py supplies only the stock universe. Yahoo Finance supplies candles; this module does not call FYERS.")
+    st.info("scanner.py supplies the stock universe. Yahoo Finance supplies all candles/indicators. FYERS is used only for 5-level Market Depth on shortlisted BUY/SELL/PRE-BIG stocks.")
     st.warning(
         "Yahoo intraday data may be delayed, missing or rate-limited. "
         "Confirmation Strength is a heuristic consensus score, not a probability or win rate."
@@ -784,6 +934,12 @@ def show_ai_multi_agent_scanner(client=None):
     with c:
         news_limit = st.selectbox("News limit", [25, 50, 100, 200], index=1, key="ma_news_limit")
 
+    depth_limit = st.selectbox(
+        "FYERS Market Depth shortlist limit", [5, 10, 20, 30, 50], index=2,
+        help="FYERS Market Depth is requested only for the strongest BUY/SELL/PRE-BIG rows. Calls are paced and cached.",
+        key="ma_depth_limit",
+    )
+
     if st.button("🚀 RUN FULL BATCH SCAN", type="primary", key="run_multi_agent", **_stretch()):
         batches = [unique_items[i:i + batch_size] for i in range(0, len(unique_items), batch_size)]
         progress, status = st.progress(0.0), st.empty()
@@ -817,6 +973,24 @@ def show_ai_multi_agent_scanner(client=None):
         else:
             result["News Agent"], result["News Score"], result["News Reason"] = "DISABLED", 0, "News disabled"
 
+        # FYERS is called ONLY for the technical BUY/SELL/PRE-BIG shortlist.
+        depth_candidates = result[result["Final Signal"].isin(
+            ["BUY", "SELL", "PRE-BIG BUY", "PRE-BIG SELL"]
+        )].head(depth_limit)
+        depth_table = _fetch_fyers_depth_shortlist(client, depth_candidates, depth_limit)
+        if not depth_table.empty:
+            depth_columns = [c for c in depth_table.columns if c != "Symbol"]
+            result = result.merge(depth_table[["Symbol"] + depth_columns], on="Symbol", how="left")
+        else:
+            for col in ["FYERS Symbol", "Depth Status", "Depth Signal", "Best Bid", "Best Ask", "Spread",
+                        "Buy Qty (5L)", "Sell Qty (5L)", "Depth Imbalance %", "Depth Time (IST)", "Depth Message"]:
+                result[col] = None
+        # Rows outside the technical shortlist must never receive FYERS depth data.
+        result.loc[~result["Final Signal"].isin(["BUY", "SELL", "PRE-BIG BUY", "PRE-BIG SELL"]),
+                   ["FYERS Symbol", "Depth Status", "Depth Signal", "Best Bid", "Best Ask", "Spread",
+                    "Buy Qty (5L)", "Sell Qty (5L)", "Depth Imbalance %", "Depth Time (IST)", "Depth Message"]] = None
+        st.session_state["multi_agent_depth"] = depth_table
+
         stamp = datetime.now(IST)
         csv_bytes = result.to_csv(index=False).encode("utf-8-sig")
         xlsx_bytes, xlsx_error = None, ""
@@ -838,7 +1012,10 @@ def show_ai_multi_agent_scanner(client=None):
             "completed_at": stamp.strftime("%Y-%m-%d %H:%M:%S IST"),
             "file_stamp": stamp.strftime("%Y%m%d_%H%M%S"),
         }
-        status.success(f"Scan completed: {len(result)} rows attempted from {len(unique_items)} unique Yahoo tickers.")
+        status.success(
+            f"Scan completed: {len(result)} Yahoo rows; FYERS depth requested for "
+            f"{len(depth_candidates)} shortlisted stocks (limit {depth_limit})."
+        )
 
     result = st.session_state.get("multi_agent_results")
     if not isinstance(result, pd.DataFrame) or result.empty:
@@ -873,9 +1050,27 @@ def show_ai_multi_agent_scanner(client=None):
         "Confirmation Strength %", "Consensus Score",
         "5M", "15M", "1H", "5M Score", "15M Score", "1H Score",
         "5M Candles", "15M Candles", "1H Candles", "Last Price", "15M RSI",
-        "News Agent", "News Score", "News Reason", "Errors",
+        "News Agent", "News Score", "News Reason", "Depth Status", "Depth Signal",
+        "Best Bid", "Best Ask", "Spread", "Buy Qty (5L)", "Sell Qty (5L)",
+        "Depth Imbalance %", "Depth Time (IST)", "Errors",
     ]
     st.dataframe(view[summary_cols], hide_index=True, **_stretch())
+
+    st.subheader("📚 FYERS Live Market Depth — Shortlist Only")
+    depth_view = st.session_state.get("multi_agent_depth")
+    if isinstance(depth_view, pd.DataFrame) and not depth_view.empty:
+        st.caption(
+            f"FYERS depth requests: {len(depth_view)} • cache TTL: {FYERS_DEPTH_CACHE_TTL}s • "
+            "one request per symbol, paced at approximately one call/second."
+        )
+        st.dataframe(depth_view, hide_index=True, **_stretch())
+        st.caption(
+            "Buy Qty / Sell Qty = sum of displayed first five bid/ask levels. "
+            "Depth Imbalance = (Buy Qty − Sell Qty) ÷ total × 100. "
+            "This is a displayed-book snapshot, not executed buying/selling or a guaranteed direction."
+        )
+    else:
+        st.info("No BUY / SELL / PRE-BIG shortlist rows yet, or Market Depth has not been requested.")
     st.caption("CSV/Excel include all 51 timeframe-agent outputs and each agent's reason.")
     st.caption("Signal Time = latest completed 15M candle close (IST). Entry = 15M close. Stop Loss = 1.5 × 15M ATR; shown only for BUY/SELL and PRE-BIG signals.")
 
@@ -906,13 +1101,13 @@ def show_ai_multi_agent_scanner(client=None):
                 hide_index=True, **_stretch(),
             )
 
-    with st.expander("12 Agents — logic and limitations"):
+    with st.expander("17 Agents — logic and limitations"):
         st.write(
             "Accumulation, Distribution, Liquidity Sweep, Volume Expansion, VWAP, EMA Trend, "
             "RSI Momentum, Fair Value Gap, HH/HL Structure, LH/LL Structure, Pre-Big Movement, "
             "Chart Pattern, Volume Analysis, SMC Structure, Order Block, Buy/Sell Pressure and "
             "Momentum Divergence run on 5M, 15M and 1H candles. These are deterministic technical "
-            "rules, not 12 independent AI language models. News is a separate keyword-based "
+            "rules, not 17 independent AI language models. News is a separate keyword-based "
             "headline context check, not a standalone trade signal. Chart Pattern uses OHLCV, "
             "not chart screenshots. Signals are screening outputs, not guaranteed entries."
         )
