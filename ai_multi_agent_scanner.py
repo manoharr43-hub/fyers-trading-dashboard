@@ -877,6 +877,36 @@ def _sort_results(result):
     ).drop(columns="_priority").reset_index(drop=True)
 
 
+def _direction_movement(row):
+    """Summarise 5M/15M/1H price direction; flag opposing FYERS book pressure."""
+    directions = [str(row.get(tf, "NO DATA")).upper() for tf in ("5M", "15M", "1H")]
+    buy_votes = sum(x == "BUY" for x in directions)
+    sell_votes = sum(x == "SELL" for x in directions)
+
+    if buy_votes >= 2 and sell_votes == 0:
+        movement = "UP"
+    elif sell_votes >= 2 and buy_votes == 0:
+        movement = "DOWN"
+    elif buy_votes == 0 and sell_votes == 0 and all(x == "WAIT" for x in directions):
+        movement = "SIDEWAYS"
+    elif directions.count("NO DATA") >= 2:
+        movement = "NO DATA"
+    else:
+        movement = "MIXED"
+
+    # FYERS depth is a displayed order-book snapshot, not executed trade flow.
+    depth = str(row.get("Depth Signal", "") or "").upper()
+    if movement == "UP" and depth == "SELL-SIDE DOMINANT":
+        return "CONFLICT (UP / FYERS SELL)"
+    if movement == "DOWN" and depth == "BUY-SIDE DOMINANT":
+        return "CONFLICT (DOWN / FYERS BUY)"
+    if movement == "UP" and depth == "BUY-SIDE DOMINANT":
+        return "UP (DEPTH ALIGNED)"
+    if movement == "DOWN" and depth == "SELL-SIDE DOMINANT":
+        return "DOWN (DEPTH ALIGNED)"
+    return movement
+
+
 def show_ai_multi_agent_scanner(client=None):
     """Streamlit page. client is retained for app.py compatibility."""
     st.title("🤖 AI Multi-Agent Scanner — Yahoo Batch")
@@ -991,6 +1021,10 @@ def show_ai_multi_agent_scanner(client=None):
                     "Buy Qty (5L)", "Sell Qty (5L)", "Depth Imbalance %", "Depth Time (IST)", "Depth Message"]] = None
         st.session_state["multi_agent_depth"] = depth_table
 
+        # Direction Movement is placed beside Final Signal. It uses 5M/15M/1H
+        # candle direction and flags disagreement with FYERS displayed depth.
+        result["Direction Movement"] = result.apply(_direction_movement, axis=1)
+
         stamp = datetime.now(IST)
         csv_bytes = result.to_csv(index=False).encode("utf-8-sig")
         xlsx_bytes, xlsx_error = None, ""
@@ -1022,6 +1056,10 @@ def show_ai_multi_agent_scanner(client=None):
         st.info("No results yet. Press RUN FULL BATCH SCAN.")
         return
 
+    if "Direction Movement" not in result.columns:
+        result["Direction Movement"] = result.apply(_direction_movement, axis=1)
+        st.session_state["multi_agent_results"] = result
+
     info = st.session_state.get("multi_agent_scan_info", {})
     st.caption(
         f"Last scan: {info.get('universe', '')} • scanner.py symbols {info.get('source_symbols', '')} "
@@ -1046,7 +1084,7 @@ def show_ai_multi_agent_scanner(client=None):
     )
     view = result if signal_filter == "ALL" else result[result["Final Signal"] == signal_filter]
     summary_cols = [
-        "Symbol", "Final Signal", "Signal Time (IST)", "Entry Price", "Stop Loss", "15M ATR",
+        "Symbol", "Final Signal", "Direction Movement", "Signal Time (IST)", "Entry Price", "Stop Loss", "15M ATR",
         "Confirmation Strength %", "Consensus Score",
         "5M", "15M", "1H", "5M Score", "15M Score", "1H Score",
         "5M Candles", "15M Candles", "1H Candles", "Last Price", "15M RSI",
