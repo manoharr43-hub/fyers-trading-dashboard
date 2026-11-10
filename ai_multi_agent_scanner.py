@@ -17,8 +17,10 @@ requirements.txt:
 import io
 import math
 import re
+import sqlite3
 import threading
 import time
+from pathlib import Path
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -56,6 +58,79 @@ FYERS_DEPTH_CACHE_TTL = 20       # seconds; prevents repeated depth calls on Str
 FYERS_DEPTH_CALL_GAP = 1.05      # conservative one-call-per-second pacing
 FYERS_DEPTH_DEFAULT_LIMIT = 20  # configurable shortlist cap per scan
 
+
+
+# SQLite candle memory: persists completed Yahoo candles between Streamlit reruns.
+# On hosted ephemeral filesystems, use a persistent mounted disk for survival across redeploys.
+MEMORY_DB_PATH = Path(__file__).with_name("ai_multi_agent_candle_memory.sqlite3")
+
+def _memory_connect():
+    conn = sqlite3.connect(str(MEMORY_DB_PATH), timeout=20)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("""CREATE TABLE IF NOT EXISTS candles (
+        symbol TEXT NOT NULL, timeframe TEXT NOT NULL, candle_time TEXT NOT NULL,
+        open REAL, high REAL, low REAL, close REAL, volume REAL, saved_at TEXT,
+        PRIMARY KEY(symbol, timeframe, candle_time))""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS scan_history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, scanned_at TEXT NOT NULL,
+        symbol TEXT NOT NULL, final_signal TEXT, direction_movement TEXT,
+        last_price REAL, yahoo_signal_time TEXT)""")
+    return conn
+
+def _save_candle_memory(batch, per_tf):
+    now_text = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S %Z")
+    records = []
+    for original, ticker in batch:
+        for tf, frame_map in per_tf.items():
+            frame = frame_map.get(ticker)
+            if frame is None or frame.empty:
+                continue
+            for r in frame[["Time", "Open", "High", "Low", "Close", "Volume"]].itertuples(index=False, name=None):
+                ts = pd.Timestamp(r[0])
+                if ts.tzinfo is None:
+                    ts = ts.tz_localize(IST)
+                else:
+                    ts = ts.tz_convert(IST)
+                records.append((str(original), tf, ts.isoformat(),
+                                float(r[1]), float(r[2]), float(r[3]),
+                                float(r[4]), float(r[5]), now_text))
+    if not records:
+        return 0
+    with _memory_connect() as conn:
+        conn.executemany("""INSERT INTO candles
+            (symbol,timeframe,candle_time,open,high,low,close,volume,saved_at)
+            VALUES (?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(symbol,timeframe,candle_time) DO UPDATE SET
+            open=excluded.open, high=excluded.high, low=excluded.low,
+            close=excluded.close, volume=excluded.volume, saved_at=excluded.saved_at""", records)
+    return len(records)
+
+def _save_scan_history(result, scanned_at):
+    if result is None or result.empty:
+        return 0
+    rows = [(scanned_at, str(r.get("Symbol", "")), str(r.get("Final Signal", "")),
+             str(r.get("Direction Movement", "")),
+             _safe_num(r.get("Last Price"), 0), str(r.get("Signal Time (IST)", "")))
+            for _, r in result.iterrows()]
+    with _memory_connect() as conn:
+        conn.executemany("""INSERT INTO scan_history
+            (scanned_at,symbol,final_signal,direction_movement,last_price,yahoo_signal_time)
+            VALUES (?,?,?,?,?,?)""", rows)
+    return len(rows)
+
+def _memory_stats():
+    try:
+        with _memory_connect() as conn:
+            candles = conn.execute("SELECT COUNT(*) FROM candles").fetchone()[0]
+            scans = conn.execute("SELECT COUNT(*) FROM scan_history").fetchone()[0]
+            symbols = conn.execute("SELECT COUNT(DISTINCT symbol) FROM candles").fetchone()[0]
+        return candles, scans, symbols
+    except Exception:
+        return 0, 0, 0
+
+def _is_market_hours(now=None):
+    now = now or datetime.now(IST)
+    return now.weekday() < 5 and (now.hour, now.minute) >= (9, 15) and (now.hour, now.minute) < (15, 30)
 
 def _stretch():
     try:
@@ -710,6 +785,11 @@ def _scan_batch(batch, period):
         for ticker in tickers:
             if frames[ticker].empty:
                 problems[ticker].append(f"{label}: {errors.get(ticker, 'No data')}")
+    # Save all fetched completed candles, including stocks that later receive WAIT/NO DATA.
+    try:
+        _save_candle_memory(batch, per_tf)
+    except Exception:
+        pass
     rows = []
     for original, ticker in batch:
         try:
@@ -970,7 +1050,27 @@ def show_ai_multi_agent_scanner(client=None):
         key="ma_depth_limit",
     )
 
-    if st.button("🚀 RUN FULL BATCH SCAN", type="primary", key="run_multi_agent", **_stretch()):
+    auto_col1, auto_col2 = st.columns(2)
+    with auto_col1:
+        auto_scan = st.checkbox("⏱️ On-Time Auto Scan (market hours only)", value=False, key="ma_auto_scan")
+    with auto_col2:
+        auto_interval = st.selectbox("Auto Scan Interval", [5, 10, 15, 30], index=2, key="ma_auto_interval")
+
+    # Streamlit fragments periodically request an app rerun. The scan itself still
+    # runs through the same guarded batch path as the manual button.
+    if hasattr(st, "fragment"):
+        @st.fragment(run_every=f"{int(auto_interval)}m" if auto_scan else None)
+        def _auto_scan_clock():
+            if auto_scan and _is_market_hours():
+                st.session_state["ma_auto_scan_due"] = True
+                st.rerun(scope="app")
+        _auto_scan_clock()
+    elif auto_scan:
+        st.warning("ఈ Streamlit version‌లో scheduled fragment లేదు. Auto Scan కోసం Streamlit 1.37+ అవసరం.")
+
+    run_scan_now = st.button("🚀 RUN FULL BATCH SCAN", type="primary", key="run_multi_agent", **_stretch())
+    auto_due = bool(st.session_state.pop("ma_auto_scan_due", False))
+    if run_scan_now or (auto_due and auto_scan and _is_market_hours()):
         batches = [unique_items[i:i + batch_size] for i in range(0, len(unique_items), batch_size)]
         progress, status = st.progress(0.0), st.empty()
         all_rows = []
@@ -1026,6 +1126,10 @@ def show_ai_multi_agent_scanner(client=None):
         result["Direction Movement"] = result.apply(_direction_movement, axis=1)
 
         stamp = datetime.now(IST)
+        try:
+            _save_scan_history(result, stamp.strftime("%Y-%m-%d %H:%M:%S %Z"))
+        except Exception as memory_exc:
+            st.warning(f"SQLite scan history save issue: {memory_exc}")
         csv_bytes = result.to_csv(index=False).encode("utf-8-sig")
         xlsx_bytes, xlsx_error = None, ""
         try:
@@ -1061,6 +1165,12 @@ def show_ai_multi_agent_scanner(client=None):
         st.session_state["multi_agent_results"] = result
 
     info = st.session_state.get("multi_agent_scan_info", {})
+    candle_count, scan_count, memory_symbols = _memory_stats()
+    mem_cols = st.columns(3)
+    mem_cols[0].metric("SQLite Candles", f"{candle_count:,}")
+    mem_cols[1].metric("Saved Scan Rows", f"{scan_count:,}")
+    mem_cols[2].metric("Memory Symbols", f"{memory_symbols:,}")
+    st.caption(f"Permanent candle database: {MEMORY_DB_PATH.name} • Auto Scan: {'ON' if st.session_state.get('ma_auto_scan', False) else 'OFF'} (weekdays 09:15–15:30 IST)")
     st.caption(
         f"Last scan: {info.get('universe', '')} • scanner.py symbols {info.get('source_symbols', '')} "
         f"• unique Yahoo tickers {info.get('unique_tickers', len(result))} "
