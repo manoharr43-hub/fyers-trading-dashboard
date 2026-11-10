@@ -596,8 +596,51 @@ def _make_result_row(symbol, yahoo_symbol, payload):
             final_signal = "WAIT"
         strength = min(100, round(abs(weighted) / 12 * 100))
 
+    # Signal timestamp is the close time of the latest completed 15M candle.
+    # Entry/SL are populated only for actionable BUY/SELL signals.
+    signal_time = None
+    entry_price = None
+    stop_loss = None
+    atr_15m = None
+    frame_15m = frames.get("15M", pd.DataFrame())
+    if frame_15m is not None and not frame_15m.empty and "Time" in frame_15m.columns:
+        try:
+            last_bar_time = pd.Timestamp(frame_15m["Time"].iloc[-1])
+            if last_bar_time.tzinfo is None:
+                last_bar_time = last_bar_time.tz_localize(IST)
+            else:
+                last_bar_time = last_bar_time.tz_convert(IST)
+            signal_time = (last_bar_time + pd.Timedelta(minutes=15)).strftime("%Y-%m-%d %H:%M:%S IST")
+        except Exception:
+            signal_time = None
+        try:
+            high = frame_15m["High"].astype(float)
+            low = frame_15m["Low"].astype(float)
+            close = frame_15m["Close"].astype(float)
+            previous_close = close.shift(1)
+            true_range = pd.concat(
+                [(high - low), (high - previous_close).abs(), (low - previous_close).abs()],
+                axis=1,
+            ).max(axis=1)
+            atr_value = true_range.rolling(14, min_periods=7).mean().iloc[-1]
+            if pd.notna(atr_value) and float(atr_value) > 0:
+                atr_15m = float(atr_value)
+        except Exception:
+            atr_15m = None
+
+    if final_signal in ("BUY", "PRE-BIG BUY") and analyses["15M"]["close"] is not None and atr_15m:
+        entry_price = float(analyses["15M"]["close"])
+        stop_loss = entry_price - (1.5 * atr_15m)
+    elif final_signal in ("SELL", "PRE-BIG SELL") and analyses["15M"]["close"] is not None and atr_15m:
+        entry_price = float(analyses["15M"]["close"])
+        stop_loss = entry_price + (1.5 * atr_15m)
+
     row = {
         "Symbol": symbol, "Yahoo Symbol": yahoo_symbol, "Final Signal": final_signal,
+        "Signal Time (IST)": signal_time,
+        "Entry Price": round(entry_price, 2) if entry_price is not None else None,
+        "Stop Loss": round(stop_loss, 2) if stop_loss is not None else None,
+        "15M ATR": round(atr_15m, 2) if atr_15m is not None else None,
         "Consensus Score": round(weighted, 2), "Confirmation Strength %": strength,
         "5M": analyses["5M"]["direction"], "15M": analyses["15M"]["direction"],
         "1H": analyses["1H"]["direction"], "5M Score": analyses["5M"]["score"],
@@ -826,13 +869,15 @@ def show_ai_multi_agent_scanner(client=None):
     )
     view = result if signal_filter == "ALL" else result[result["Final Signal"] == signal_filter]
     summary_cols = [
-        "Symbol", "Final Signal", "Confirmation Strength %", "Consensus Score",
+        "Symbol", "Final Signal", "Signal Time (IST)", "Entry Price", "Stop Loss", "15M ATR",
+        "Confirmation Strength %", "Consensus Score",
         "5M", "15M", "1H", "5M Score", "15M Score", "1H Score",
         "5M Candles", "15M Candles", "1H Candles", "Last Price", "15M RSI",
         "News Agent", "News Score", "News Reason", "Errors",
     ]
     st.dataframe(view[summary_cols], hide_index=True, **_stretch())
     st.caption("CSV/Excel include all 51 timeframe-agent outputs and each agent's reason.")
+    st.caption("Signal Time = latest completed 15M candle close (IST). Entry = 15M close. Stop Loss = 1.5 × 15M ATR; shown only for BUY/SELL and PRE-BIG signals.")
 
     file_stamp = info.get("file_stamp", datetime.now(IST).strftime("%Y%m%d_%H%M%S"))
     if st.session_state.get("multi_agent_csv"):
