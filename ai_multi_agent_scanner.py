@@ -386,6 +386,64 @@ def _agent_result(direction="WAIT", score=0, reason="No clear setup"):
     return {"direction": direction, "score": int(score), "reason": reason}
 
 
+def _liquidity_levels_and_sweeps(df, lookback=20):
+    """Estimate buy-side/sell-side liquidity and confirmed wick sweeps from OHLCV."""
+    empty = {
+        "Buy-side Liquidity": None, "Sell-side Liquidity": None,
+        "Upside Sweep": "NO", "Downside Sweep": "NO",
+        "Liquidity Sweep Detail": "NO DATA",
+    }
+    if df is None or not isinstance(df, pd.DataFrame) or len(df) < max(lookback + 1, 10):
+        return empty
+    d = df.tail(lookback + 1).reset_index(drop=True)
+    prior = d.iloc[:-1]
+    last = d.iloc[-1]
+    buy_liq = _safe_num(prior["High"].max(), np.nan)   # buy stops commonly rest above highs
+    sell_liq = _safe_num(prior["Low"].min(), np.nan)   # sell stops commonly rest below lows
+    high = _safe_num(last["High"], np.nan)
+    low = _safe_num(last["Low"], np.nan)
+    close = _safe_num(last["Close"], np.nan)
+    upside = bool(np.isfinite(buy_liq) and high > buy_liq and close < buy_liq)
+    downside = bool(np.isfinite(sell_liq) and low < sell_liq and close > sell_liq)
+    if upside and downside:
+        detail = "BOTH-SIDE SWEEP"
+    elif upside:
+        detail = "UPSIDE SWEEP — BUY-SIDE LIQUIDITY TAKEN; CLOSE BACK BELOW"
+    elif downside:
+        detail = "DOWNSIDE SWEEP — SELL-SIDE LIQUIDITY TAKEN; CLOSE BACK ABOVE"
+    else:
+        detail = "NO CONFIRMED SWEEP"
+    return {
+        "Buy-side Liquidity": round(buy_liq, 2) if np.isfinite(buy_liq) else None,
+        "Sell-side Liquidity": round(sell_liq, 2) if np.isfinite(sell_liq) else None,
+        "Upside Sweep": "YES" if upside else "NO",
+        "Downside Sweep": "YES" if downside else "NO",
+        "Liquidity Sweep Detail": detail,
+    }
+
+
+def _cached_candles_are_fresh(frame, minutes, now=None):
+    """Avoid a Yahoo request when SQLite already contains the latest completed bar."""
+    if frame is None or frame.empty or "Time" not in frame.columns:
+        return False
+    now = now or pd.Timestamp.now(tz=IST)
+    try:
+        last = pd.Timestamp(frame["Time"].iloc[-1])
+        last = last.tz_localize(IST) if last.tzinfo is None else last.tz_convert(IST)
+        if minutes == 60 and last.hour == 15 and last.minute == 15:
+            close_time = last.normalize() + SESSION_CLOSE
+        else:
+            close_time = last + pd.Timedelta(minutes=minutes)
+        # Outside market hours, today's completed candles are sufficient; do not
+        # repeatedly download the same 2-day overlap on every Streamlit rerun.
+        if not _is_market_hours(now.to_pydatetime()):
+            return last.date() == now.date()
+        age = (now - close_time).total_seconds() / 60.0
+        return -1.0 <= age <= (minutes + 3)
+    except Exception:
+        return False
+
+
 def _run_17_agents(df):
     """17 deterministic OHLCV rule engines; scores are not probabilities."""
     if df is None or len(df) < 30:
@@ -856,6 +914,12 @@ def _make_result_row(symbol, yahoo_symbol, payload):
     }
     row.update(_early_20m_analysis(payload.get("early_1m", pd.DataFrame())))
     for tf in TIMEFRAMES:
+        liquidity = _liquidity_levels_and_sweeps(frames.get(tf, pd.DataFrame()))
+        for key, value in liquidity.items():
+            row[f"{tf} {key}"] = value
+    # Keep simple unprefixed fields for the main report, using 15M as the reference.
+    row.update(_liquidity_levels_and_sweeps(frame_15m))
+    for tf in TIMEFRAMES:
         for name in AGENT_NAMES:
             item = analyses[tf]["agents"][name]
             safe = name.replace(" ", "_").replace("/", "_")
@@ -912,9 +976,14 @@ def _scan_batch(batch, period, include_early=True):
     # First scan remains a full-history warm-up. The overlap refreshes late/adjusted bars.
     for label, (interval, minutes) in TIMEFRAMES.items():
         cached = {ticker: _load_candle_memory(original_by_ticker[ticker], label) for ticker in tickers}
-        all_cached = all(not cached[t].empty for t in tickers)
-        fetch_period = "2d" if all_cached else period
-        fresh_frames, errors = _fetch_interval(tickers, interval, minutes, fetch_period)
+        stale_tickers = [t for t in tickers if not _cached_candles_are_fresh(cached[t], minutes)]
+        # Only request symbols whose saved candle set is stale or missing. This is
+        # faster than downloading a 2-day overlap for every stock on every scan.
+        if stale_tickers:
+            fetch_period = "2d" if all(not cached[t].empty for t in stale_tickers) else period
+            fresh_frames, errors = _fetch_interval(stale_tickers, interval, minutes, fetch_period)
+        else:
+            fresh_frames, errors = {}, {}
         frames = {}
         for ticker in tickers:
             frames[ticker] = _merge_candle_frames(cached[ticker], fresh_frames.get(ticker))
@@ -926,9 +995,12 @@ def _scan_batch(batch, period, include_early=True):
     # the fast core scan can finish without downloading 1M candles for every stock.
     if include_early:
         early_cached = {ticker: _load_candle_memory(original_by_ticker[ticker], "1M") for ticker in tickers}
-        early_all_cached = all(not early_cached[t].empty for t in tickers)
-        early_period = "2d" if early_all_cached else "7d"  # Yahoo 1m history is limited
-        early_fresh, early_errors = _fetch_interval(tickers, "1m", 1, early_period)
+        early_stale = [t for t in tickers if not _cached_candles_are_fresh(early_cached[t], 1)]
+        if early_stale:
+            early_period = "2d" if all(not early_cached[t].empty for t in early_stale) else "7d"
+            early_fresh, early_errors = _fetch_interval(early_stale, "1m", 1, early_period)
+        else:
+            early_fresh, early_errors = {}, {}
         early_frames = {
             ticker: _merge_candle_frames(early_cached[ticker], early_fresh.get(ticker))
             for ticker in tickers
@@ -1482,6 +1554,19 @@ def show_ai_multi_agent_scanner(client=None):
     for col_name, default_value in early_defaults.items():
         if col_name not in result.columns:
             result[col_name] = default_value
+    liquidity_defaults = {
+        "Buy-side Liquidity": None, "Sell-side Liquidity": None,
+        "Upside Sweep": "NO DATA", "Downside Sweep": "NO DATA",
+        "Liquidity Sweep Detail": "Run a fresh scan for liquidity levels",
+    }
+    for tf in TIMEFRAMES:
+        for key, default in liquidity_defaults.items():
+            col_name = f"{tf} {key}"
+            if col_name not in result.columns:
+                result[col_name] = default
+    for key, default in liquidity_defaults.items():
+        if key not in result.columns:
+            result[key] = default
     if "Depth Signal" not in result.columns:
         result["Depth Signal"] = None
     if "Confirmation Strength %" not in result.columns:
@@ -1563,6 +1648,10 @@ def show_ai_multi_agent_scanner(client=None):
         "5M Candle Close (IST)", "15M Candle Close (IST)", "1H Candle Close (IST)",
         "Entry Price", "Stop Loss", "15M ATR",
         "Confirmation Strength %", "Consensus Score",
+        "Buy-side Liquidity", "Sell-side Liquidity", "Upside Sweep", "Downside Sweep", "Liquidity Sweep Detail",
+        "5M Buy-side Liquidity", "5M Sell-side Liquidity", "5M Upside Sweep", "5M Downside Sweep",
+        "15M Buy-side Liquidity", "15M Sell-side Liquidity", "15M Upside Sweep", "15M Downside Sweep",
+        "1H Buy-side Liquidity", "1H Sell-side Liquidity", "1H Upside Sweep", "1H Downside Sweep",
         "18th Agent", "Best Stock Score", "Best Stock Side", "Best Stock Grade",
         "Best Stock Filter", "Best Stock Reason",
         "20M Status", "20M Direction", "20M Pre-Move Score", "20M Range High", "20M Range Low",
