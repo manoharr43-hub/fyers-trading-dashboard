@@ -1113,6 +1113,102 @@ def _sort_results(result):
     ).drop(columns="_priority").reset_index(drop=True)
 
 
+def _best_stock_analyst(row):
+    """18th agent: rank already-scanned stocks; never invent a trade signal.
+
+    The score is a transparent screening score (0-100), not a probability.
+    It rewards multi-timeframe alignment, agent consensus, volume/structure,
+    and optional FYERS depth confirmation.
+    """
+    signal = str(row.get("Final Signal", "NO DATA")).upper()
+    if signal in ("BUY", "PRE-BIG BUY"):
+        side, expected = "BUY", "BUY"
+    elif signal in ("SELL", "PRE-BIG SELL"):
+        side, expected = "SELL", "SELL"
+    else:
+        return {
+            "18th Agent": "REJECT / WAIT", "Best Stock Score": 0,
+            "Best Stock Side": "WAIT", "Best Stock Grade": "NOT QUALIFIED",
+            "Best Stock Reason": "No actionable BUY/SELL consensus",
+            "Best Stock Filter": "REJECT",
+        }
+
+    # Hard reject missing or opposing timeframe confirmation.
+    tfs = [str(row.get(tf, "NO DATA")).upper() for tf in ("5M", "15M", "1H")]
+    aligned = sum(x == expected for x in tfs)
+    opposing = sum(x in ("SELL", "PRE-BIG SELL") if expected == "BUY"
+                   else x in ("BUY", "PRE-BIG BUY") for x in tfs)
+    if aligned < 2 or opposing:
+        return {
+            "18th Agent": "REJECT / CONFLICT", "Best Stock Score": 0,
+            "Best Stock Side": side, "Best Stock Grade": "NOT QUALIFIED",
+            "Best Stock Reason": "Timeframes are mixed or an opposite timeframe exists",
+            "Best Stock Filter": "REJECT",
+        }
+
+    strength = max(0.0, min(100.0, _safe_num(row.get("Confirmation Strength %"))))
+    score_consensus = strength * 0.25                         # 25 points
+    score_alignment = 25 if aligned == 3 else 18             # 25 points
+    agent_votes = 0
+    agent_total = 0
+    for tf in ("5M", "15M", "1H"):
+        for name in AGENT_NAMES:
+            key = f"{tf} {name.replace(' ', '_').replace('/', '_')}"
+            direction = str(row.get(key, "WAIT")).upper()
+            if direction in ("BUY", "SELL", "PRE-BIG BUY", "PRE-BIG SELL"):
+                agent_total += 1
+                if (expected == "BUY" and direction in ("BUY", "PRE-BIG BUY")) or (
+                    expected == "SELL" and direction in ("SELL", "PRE-BIG SELL")
+                ):
+                    agent_votes += 1
+    vote_ratio = agent_votes / max(agent_total, 1)
+    # Do not award a high consensus score from only one isolated agent vote.
+    score_agents = (min(20.0, vote_ratio * 20.0) if agent_votes >= 3
+                    else agent_votes / 3.0 * 10.0)             # 20 points
+
+    volume_dirs = [str(row.get(f"{tf} Volume_Analysis", "WAIT")).upper()
+                   for tf in ("15M", "1H")]
+    volume_aligned = sum(
+        d in (("BUY", "PRE-BIG BUY") if expected == "BUY" else ("SELL", "PRE-BIG SELL"))
+        for d in volume_dirs
+    )
+    score_volume = 10 if volume_aligned == 2 else 5 if volume_aligned == 1 else 0
+
+    structure_names = ("SMC_Structure", "Order_Block", "Buy_Sell_Pressure")
+    structure_votes = 0
+    for tf in ("15M", "1H"):
+        for name in structure_names:
+            d = str(row.get(f"{tf} {name}", "WAIT")).upper()
+            if d in (("BUY", "PRE-BIG BUY") if expected == "BUY" else ("SELL", "PRE-BIG SELL")):
+                structure_votes += 1
+    score_structure = min(10.0, structure_votes / 6.0 * 10.0)
+
+    depth = str(row.get("Depth Signal", "") or "").upper()
+    if depth == ("BUY-SIDE DOMINANT" if expected == "BUY" else "SELL-SIDE DOMINANT"):
+        score_depth, depth_note = 10, "FYERS depth aligned"
+    elif depth in ("BUY-SIDE DOMINANT", "SELL-SIDE DOMINANT"):
+        score_depth, depth_note = 0, "FYERS depth opposing"
+    else:
+        score_depth, depth_note = 5, "FYERS depth unavailable/neutral"
+
+    total = int(round(score_consensus + score_alignment + score_agents
+                      + score_volume + score_structure + score_depth))
+    total = max(0, min(100, total))
+    qualified = total >= 75 and opposing == 0
+    grade = "A+" if total >= 90 else "A" if total >= 85 else "B" if total >= 75 else "BELOW 75"
+    reasons = [
+        f"{aligned}/3 timeframes aligned", f"agent agreement {vote_ratio:.0%}",
+        f"15M/1H volume confirmation {volume_aligned}/2", depth_note,
+    ]
+    return {
+        "18th Agent": "QUALIFIED" if qualified else "WATCHLIST",
+        "Best Stock Score": total, "Best Stock Side": side,
+        "Best Stock Grade": grade,
+        "Best Stock Reason": "; ".join(reasons),
+        "Best Stock Filter": "PASS" if qualified else "BELOW 75",
+    }
+
+
 def _direction_movement(row):
     """Summarise 5M/15M/1H price direction; flag opposing FYERS book pressure."""
     directions = [str(row.get(tf, "NO DATA")).upper() for tf in ("5M", "15M", "1H")]
@@ -1145,8 +1241,8 @@ def _direction_movement(row):
 
 def show_ai_multi_agent_scanner(client=None):
     """Streamlit page. client is retained for app.py compatibility."""
-    st.title("🤖 AI Multi-Agent Scanner — Yahoo Batch")
-    st.caption("17 OHLCV rule engines × 5M / 15M / 1H + 20-candle 1M early-movement detector + optional Yahoo News")
+    st.title("🤖 AI Multi-Agent Scanner V18 — Yahoo Batch")
+    st.caption("17 OHLCV agents × 5M / 15M / 1H + 18th Best Stock Analyst + optional 1M / News")
     st.info("scanner.py supplies NSE/F&O symbols only (unchanged). Yahoo Finance supplies candles. FYERS is used only for 5-level Market Depth on the technical shortlist.")
     st.caption("Smart Memory: SQLite candles are loaded first; after the initial warm-up, the scanner refreshes a short 2-day overlap and merges it with saved candles. For speed, the extra 1M/20M scan is optional.")
     st.warning(
@@ -1169,7 +1265,7 @@ def show_ai_multi_agent_scanner(client=None):
     with c2:
         batch_size = st.selectbox("Batch size", [25, 50, 75, 100, 125], index=2, key="ma_batch_size")
     with c3:
-        st.metric("Analysis", "17 Agents × 3 TF")
+        st.metric("Analysis", "18 Agents + Ranking")
 
     try:
         if universe == "Both (NSE + F&O)":
@@ -1242,16 +1338,52 @@ def show_ai_multi_agent_scanner(client=None):
     if run_scan_now or (auto_due and auto_scan and _is_market_hours()):
         batches = [unique_items[i:i + batch_size] for i in range(0, len(unique_items), batch_size)]
         progress, status = st.progress(0.0), st.empty()
+        live_best_report = st.empty()
         all_rows = []
+        live_best_cols = [
+            "Symbol", "Best Stock Side", "Final Signal", "Best Stock Score",
+            "Best Stock Grade", "Entry Price", "Stop Loss", "Signal Time (IST)",
+            "5M", "15M", "1H", "Best Stock Reason",
+        ]
         for idx, batch in enumerate(batches, 1):
             status.write(
                 f"Core scan batch {idx}/{len(batches)} — {len(batch)} symbols "
                 f"(5M + 15M + 1H; 1M extra scan {'ON' if early_scan_enabled else 'OFF'})"
             )
             try:
-                all_rows.extend(_scan_batch(batch, period, include_early=early_scan_enabled))
+                batch_rows = _scan_batch(batch, period, include_early=early_scan_enabled)
+                all_rows.extend(batch_rows)
             except Exception as exc:
-                all_rows.extend(_no_data_row(s, t, f"Batch failed: {exc}") for s, t in batch)
+                batch_rows = [_no_data_row(s, t, f"Batch failed: {exc}") for s, t in batch]
+                all_rows.extend(batch_rows)
+
+            # Live provisional report refreshes after every completed batch.
+            # FYERS depth is added later, so this in-scan ranking is provisional.
+            partial = pd.DataFrame(all_rows)
+            if not partial.empty:
+                partial["Depth Signal"] = None
+                partial_analyst = partial.apply(_best_stock_analyst, axis=1, result_type="expand")
+                partial = pd.concat([partial, partial_analyst], axis=1)
+                live_top = partial[
+                    (partial["Best Stock Filter"] == "PASS")
+                    & (partial["Best Stock Score"] >= 75)
+                ].sort_values(
+                    ["Best Stock Score", "Confirmation Strength %"],
+                    ascending=[False, False],
+                ).head(10)
+                live_best_report.empty()
+                live_best_report.write(
+                    f"🏆 Live Best Stocks — provisional ranking after batch {idx}/{len(batches)} "
+                    "(FYERS depth confirmation pending)"
+                )
+                if not live_top.empty:
+                    live_best_report.dataframe(
+                        live_top[live_best_cols], hide_index=True, **_stretch()
+                    )
+                else:
+                    live_best_report.info(
+                        "No stock has passed the live 75/100 quality filter yet."
+                    )
             progress.progress(idx / max(len(batches), 1))
 
         result = _sort_results(pd.DataFrame(all_rows))
@@ -1294,6 +1426,9 @@ def show_ai_multi_agent_scanner(client=None):
         # Direction Movement is placed beside Final Signal. It uses 5M/15M/1H
         # candle direction and flags disagreement with FYERS displayed depth.
         result["Direction Movement"] = result.apply(_direction_movement, axis=1)
+        # 18th Agent runs after technical consensus and optional FYERS depth are available.
+        analyst = result.apply(_best_stock_analyst, axis=1, result_type="expand")
+        result = pd.concat([result, analyst], axis=1)
 
         stamp = datetime.now(IST)
         try:
@@ -1342,6 +1477,13 @@ def show_ai_multi_agent_scanner(client=None):
     for col_name, default_value in early_defaults.items():
         if col_name not in result.columns:
             result[col_name] = default_value
+    if "Depth Signal" not in result.columns:
+        result["Depth Signal"] = None
+    if "Confirmation Strength %" not in result.columns:
+        result["Confirmation Strength %"] = 0
+    if "Best Stock Score" not in result.columns:
+        analyst = result.apply(_best_stock_analyst, axis=1, result_type="expand")
+        result = pd.concat([result, analyst], axis=1)
     st.session_state["multi_agent_results"] = result
 
     info = st.session_state.get("multi_agent_scan_info", {})
@@ -1356,6 +1498,33 @@ def show_ai_multi_agent_scanner(client=None):
         f"• unique Yahoo tickers {info.get('unique_tickers', len(result))} "
         f"• batches {info.get('batches', '')} • {info.get('completed_at', '')}"
     )
+
+    # 18th Agent report: rank only qualified, actionable stocks.
+    st.subheader("🏆 BEST PERFORMANCE STOCKS — 18th Agent")
+    min_best_score = st.selectbox(
+        "Minimum Best Stock Score", [75, 80, 85, 90], index=0, key="ma_best_min_score"
+    )
+    best_cols = [
+        "Symbol", "Best Stock Side", "Final Signal", "Best Stock Score",
+        "Best Stock Grade", "Entry Price", "Stop Loss", "Last Price",
+        "Signal Time (IST)", "5M", "15M", "1H", "Depth Signal",
+        "Best Stock Reason",
+    ]
+    best = result[
+        (result["Best Stock Filter"] == "PASS")
+        & (result["Best Stock Score"] >= int(min_best_score))
+    ].copy()
+    if not best.empty:
+        best = best.sort_values(
+            ["Best Stock Score", "Confirmation Strength %"], ascending=[False, False]
+        ).head(10)
+        st.dataframe(best[best_cols], hide_index=True, **_stretch())
+        st.caption(f"Showing top {len(best)} qualified stocks. Score threshold: {min_best_score}/100.")
+    else:
+        st.info(
+            f"No stock passed {min_best_score}/100 with aligned 5M, 15M and 1H signals. "
+            "The analyst will not force a BUY/SELL recommendation."
+        )
 
     # Data coverage is shown separately from the final signal count.
     coverage_cols = st.columns(5)
@@ -1389,6 +1558,8 @@ def show_ai_multi_agent_scanner(client=None):
         "5M Candle Close (IST)", "15M Candle Close (IST)", "1H Candle Close (IST)",
         "Entry Price", "Stop Loss", "15M ATR",
         "Confirmation Strength %", "Consensus Score",
+        "18th Agent", "Best Stock Score", "Best Stock Side", "Best Stock Grade",
+        "Best Stock Filter", "Best Stock Reason",
         "20M Status", "20M Direction", "20M Pre-Move Score", "20M Range High", "20M Range Low",
         "20M Range %", "20M RVOL", "20M Pressure %", "20M Last Close", "20M Reason",
         "5M", "15M", "1H", "5M Score", "15M Score", "1H Score",
@@ -1414,7 +1585,7 @@ def show_ai_multi_agent_scanner(client=None):
         )
     else:
         st.info("No BUY / SELL / PRE-BIG shortlist rows yet, or Market Depth has not been requested.")
-    st.caption("CSV/Excel include all 51 timeframe-agent outputs and each agent reason. 20M early-movement fields are populated when the optional 1M scan is enabled.")
+    st.caption("CSV/Excel include all 51 timeframe-agent outputs plus the 18th Best Stock Analyst report and each agent reason. 20M early-movement fields are populated when the optional 1M scan is enabled.")
     st.caption("Signal Time = latest completed 15M candle close (IST). Entry = 15M close. Stop Loss = 1.5 × 15M ATR; shown only for BUY/SELL and PRE-BIG signals.")
 
     file_stamp = info.get("file_stamp", datetime.now(IST).strftime("%Y%m%d_%H%M%S"))
@@ -1444,13 +1615,12 @@ def show_ai_multi_agent_scanner(client=None):
                 hide_index=True, **_stretch(),
             )
 
-    with st.expander("17 Agents — logic and limitations"):
+    with st.expander("18 Agents — logic and limitations"):
         st.write(
-            "Accumulation, Distribution, Liquidity Sweep, Volume Expansion, VWAP, EMA Trend, "
-            "RSI Momentum, Fair Value Gap, HH/HL Structure, LH/LL Structure, Pre-Big Movement, "
-            "Chart Pattern, Volume Analysis, SMC Structure, Order Block, Buy/Sell Pressure and "
-            "Momentum Divergence run on 5M, 15M and 1H candles. These are deterministic technical "
-            "rules, not 17 independent AI language models. News is a separate keyword-based "
+            "The first 17 agents are deterministic OHLCV rule engines on 5M, 15M and 1H candles. "
+            "The 18th Best Stock Analyst ranks actionable signals using timeframe alignment, "
+            "agent agreement, volume, structure and optional FYERS depth. It is a transparent "
+            "screening score, not a probability or an independent AI language model. News is a separate keyword-based "
             "headline context check, not a standalone trade signal. Chart Pattern uses OHLCV, "
             "not chart screenshots. Signals are screening outputs, not guaranteed entries."
         )
