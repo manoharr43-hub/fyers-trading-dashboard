@@ -1263,14 +1263,17 @@ def show_ai_multi_agent_scanner(client=None):
     with c1:
         universe = st.selectbox("Universe", ["Both (NSE + F&O)", "F&O Stocks", "NSE Equity"], key="ma_universe")
     with c2:
-        batch_size = st.selectbox("Batch size", [25, 50, 75, 100, 125], index=2, key="ma_batch_size")
+        batch_size = st.selectbox("Batch size", [25, 50, 75, 100, 125], index=4, key="ma_batch_size_v18")
     with c3:
         st.metric("Analysis", "18 Agents + Ranking")
 
     try:
         if universe == "Both (NSE + F&O)":
-            # Keep scanner.py untouched: call its existing loaders and combine here.
-            raw_symbols = _normalise_symbols(load_nse_equity_symbols()) + _normalise_symbols(load_fo_stocks())
+            # PRIORITY FIX: scan the smaller, fast-moving F&O universe FIRST.
+            # NSE equity scanning continues after F&O; scanner.py remains untouched.
+            fo_symbols = _normalise_symbols(load_fo_stocks())
+            nse_symbols = _normalise_symbols(load_nse_equity_symbols())
+            raw_symbols = fo_symbols + nse_symbols
         elif universe == "F&O Stocks":
             raw_symbols = _normalise_symbols(load_fo_stocks())
         else:
@@ -1292,12 +1295,13 @@ def show_ai_multi_agent_scanner(client=None):
             unique_items.append((original, ticker))
     st.caption(
         f"scanner.py symbols: {len(symbols)} • Unique Yahoo tickers: {len(unique_items)}. "
+        "Priority: F&O stocks first, then NSE equity (when Both is selected). "
         "Full Scan attempts every unique ticker in this universe."
     )
 
     a, b, c = st.columns(3)
     with a:
-        period = st.selectbox("Yahoo history", ["59d", "30d"], index=0, key="ma_period")
+        period = st.selectbox("Yahoo history", ["59d", "30d"], index=1, key="ma_period_v18")
     with b:
         news_enabled = st.checkbox("News Intelligence (shortlist only — slower)", value=False, key="ma_news_enabled")
     with c:
@@ -1305,7 +1309,7 @@ def show_ai_multi_agent_scanner(client=None):
 
     early_scan_enabled = st.checkbox(
         "Run extra 1M / 20M Early-Movement scan for all stocks (slower)",
-        value=False, key="ma_early_scan_enabled",
+        value=False, key="ma_early_scan_enabled_v18",
         help="OFF = faster core scan on 5M/15M/1H. ON = also downloads Yahoo 1-minute candles for every stock.",
     )
 
@@ -1347,8 +1351,9 @@ def show_ai_multi_agent_scanner(client=None):
         ]
         for idx, batch in enumerate(batches, 1):
             status.write(
-                f"Core scan batch {idx}/{len(batches)} — {len(batch)} symbols "
-                f"(5M + 15M + 1H; 1M extra scan {'ON' if early_scan_enabled else 'OFF'})"
+                f"Priority scan batch {idx}/{len(batches)} — {len(batch)} symbols "
+                f"(F&O first when Both is selected; 5M + 15M + 1H; "
+                f"1M extra scan {'ON' if early_scan_enabled else 'OFF'})"
             )
             try:
                 batch_rows = _scan_batch(batch, period, include_early=early_scan_enabled)
