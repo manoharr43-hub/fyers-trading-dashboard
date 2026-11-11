@@ -1636,12 +1636,30 @@ def show_ai_multi_agent_scanner(client=None):
         )
     with filter_col2:
         early_filter = st.selectbox(
-            "20M Early Movement", ["ALL", "WATCH", "CONFIRMED BREAKOUT", "WAIT", "NO DATA"],
+            "20M Early Movement / Liquidity",
+            [
+                "ALL", "WATCH", "CONFIRMED BREAKOUT", "WAIT", "NO DATA",
+                "BUY LIQUIDITY", "SELL LIQUIDITY", "SWEEP UP", "SWEEP DOWN",
+            ],
             key="ma_early_filter",
         )
     view = result if signal_filter == "ALL" else result[result["Final Signal"] == signal_filter]
-    if early_filter != "ALL":
+
+    # Liquidity filters use the completed 15M candle as the common reference.
+    # Buy-side liquidity is above prior highs; sell-side liquidity is below prior lows.
+    # Sweep UP means buy-side liquidity was taken and price closed back below.
+    # Sweep DOWN means sell-side liquidity was taken and price closed back above.
+    if early_filter in ("WATCH", "CONFIRMED BREAKOUT", "WAIT", "NO DATA"):
         view = view[view["20M Status"] == early_filter]
+    elif early_filter == "BUY LIQUIDITY":
+        view = view[view["15M Buy-side Liquidity"].notna()]
+    elif early_filter == "SELL LIQUIDITY":
+        view = view[view["15M Sell-side Liquidity"].notna()]
+    elif early_filter == "SWEEP UP":
+        view = view[view["15M Upside Sweep"] == "YES"]
+    elif early_filter == "SWEEP DOWN":
+        view = view[view["15M Downside Sweep"] == "YES"]
+
     view = view.sort_values(["20M Pre-Move Score", "Confirmation Strength %"], ascending=[False, False])
     summary_cols = [
         "Symbol", "Final Signal", "Direction Movement", "Signal Time (IST)",
