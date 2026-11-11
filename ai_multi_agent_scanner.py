@@ -317,7 +317,7 @@ def _closed_candles(df, minutes):
     return out.reset_index(drop=True)
 
 
-@st.cache_data(ttl=60, show_spinner=False, max_entries=8)
+@st.cache_data(ttl=180, show_spinner=False, max_entries=16)
 def _download_yahoo_batch_cached(tickers_tuple, interval, period):
     if yf is None:
         raise RuntimeError("yfinance is not installed. Add yfinance>=0.2.50.")
@@ -325,7 +325,7 @@ def _download_yahoo_batch_cached(tickers_tuple, interval, period):
         data = yf.download(
             tickers=list(tickers_tuple), period=period, interval=interval,
             auto_adjust=False, actions=False, progress=False, threads=False,
-            group_by="ticker", timeout=25,
+            group_by="ticker", timeout=15,
         )
     if data is None or data.empty:
         raise RuntimeError(f"Yahoo returned no data for {interval}.")
@@ -755,6 +755,23 @@ def _early_20m_analysis(df):
     }
 
 
+def _last_candle_close_time(frame, minutes):
+    """Return the close time of the latest completed candle in IST."""
+    if frame is None or frame.empty or "Time" not in frame.columns:
+        return None
+    try:
+        stamp = pd.Timestamp(frame["Time"].iloc[-1])
+        stamp = stamp.tz_localize(IST) if stamp.tzinfo is None else stamp.tz_convert(IST)
+        # Yahoo labels the NSE final 60-minute partial bar at 15:15; it closes at 15:30.
+        if minutes == 60 and stamp.hour == 15 and stamp.minute == 15:
+            close_stamp = stamp.normalize() + SESSION_CLOSE
+        else:
+            close_stamp = stamp + pd.Timedelta(minutes=minutes)
+        return close_stamp.strftime("%Y-%m-%d %H:%M:%S IST")
+    except Exception:
+        return None
+
+
 def _make_result_row(symbol, yahoo_symbol, payload):
     frames = payload.get("frames", {})
     analyses = {tf: _analyse_timeframe(frames.get(tf, pd.DataFrame())) for tf in TIMEFRAMES}
@@ -786,21 +803,18 @@ def _make_result_row(symbol, yahoo_symbol, payload):
 
     # Signal timestamp is the close time of the latest completed 15M candle.
     # Entry/SL are populated only for actionable BUY/SELL signals.
-    signal_time = None
     entry_price = None
     stop_loss = None
     atr_15m = None
+    frame_5m = frames.get("5M", pd.DataFrame())
     frame_15m = frames.get("15M", pd.DataFrame())
-    if frame_15m is not None and not frame_15m.empty and "Time" in frame_15m.columns:
-        try:
-            last_bar_time = pd.Timestamp(frame_15m["Time"].iloc[-1])
-            if last_bar_time.tzinfo is None:
-                last_bar_time = last_bar_time.tz_localize(IST)
-            else:
-                last_bar_time = last_bar_time.tz_convert(IST)
-            signal_time = (last_bar_time + pd.Timedelta(minutes=15)).strftime("%Y-%m-%d %H:%M:%S IST")
-        except Exception:
-            signal_time = None
+    frame_1h = frames.get("1H", pd.DataFrame())
+    # Signal Time is explicitly the latest completed 15M candle CLOSE, not scan-run time.
+    signal_time = _last_candle_close_time(frame_15m, 15)
+    candle_close_5m = _last_candle_close_time(frame_5m, 5)
+    candle_close_15m = _last_candle_close_time(frame_15m, 15)
+    candle_close_1h = _last_candle_close_time(frame_1h, 60)
+    if frame_15m is not None and not frame_15m.empty:
         try:
             high = frame_15m["High"].astype(float)
             low = frame_15m["Low"].astype(float)
@@ -826,6 +840,9 @@ def _make_result_row(symbol, yahoo_symbol, payload):
     row = {
         "Symbol": symbol, "Yahoo Symbol": yahoo_symbol, "Final Signal": final_signal,
         "Signal Time (IST)": signal_time,
+        "5M Candle Close (IST)": candle_close_5m,
+        "15M Candle Close (IST)": candle_close_15m,
+        "1H Candle Close (IST)": candle_close_1h,
         "Entry Price": round(entry_price, 2) if entry_price is not None else None,
         "Stop Loss": round(stop_loss, 2) if stop_loss is not None else None,
         "15M ATR": round(atr_15m, 2) if atr_15m is not None else None,
@@ -857,7 +874,7 @@ def _no_data_row(symbol, ticker, message):
     })
 
 
-def _fetch_interval(tickers, interval, minutes, period, retries=2):
+def _fetch_interval(tickers, interval, minutes, period, retries=1):
     frames = {t: pd.DataFrame() for t in tickers}
     errors, pending = {}, list(tickers)
     for attempt in range(retries + 1):
@@ -869,7 +886,7 @@ def _fetch_interval(tickers, interval, minutes, period, retries=2):
             for ticker in pending:
                 errors[ticker] = str(exc)[:200]
             if attempt < retries:
-                time.sleep(1.5 * (attempt + 1))
+                time.sleep(0.6)
             continue
         missing = []
         for ticker in pending:
@@ -886,7 +903,7 @@ def _fetch_interval(tickers, interval, minutes, period, retries=2):
     return frames, errors
 
 
-def _scan_batch(batch, period):
+def _scan_batch(batch, period, include_early=True):
     tickers = [ticker for _, ticker in batch]
     per_tf, problems = {}, {ticker: [] for ticker in tickers}
     original_by_ticker = {ticker: original for original, ticker in batch}
@@ -905,19 +922,23 @@ def _scan_batch(batch, period):
                 problems[ticker].append(f"{label}: {errors.get(ticker, 'No cached or fresh data')}")
         per_tf[label] = frames
 
-    # Dedicated 1-minute feed for the 20-candle early-movement detector.
-    early_cached = {ticker: _load_candle_memory(original_by_ticker[ticker], "1M") for ticker in tickers}
-    early_all_cached = all(not early_cached[t].empty for t in tickers)
-    early_period = "2d" if early_all_cached else "7d"  # Yahoo 1m history is limited
-    early_fresh, early_errors = _fetch_interval(tickers, "1m", 1, early_period)
-    early_frames = {
-        ticker: _merge_candle_frames(early_cached[ticker], early_fresh.get(ticker))
-        for ticker in tickers
-    }
-    per_tf["1M"] = early_frames
-    for ticker in tickers:
-        if early_frames[ticker].empty:
-            problems[ticker].append(f"1M: {early_errors.get(ticker, 'No 1M data')}")
+    # Optional 1-minute feed. It is the most expensive extra request set, so
+    # the fast core scan can finish without downloading 1M candles for every stock.
+    if include_early:
+        early_cached = {ticker: _load_candle_memory(original_by_ticker[ticker], "1M") for ticker in tickers}
+        early_all_cached = all(not early_cached[t].empty for t in tickers)
+        early_period = "2d" if early_all_cached else "7d"  # Yahoo 1m history is limited
+        early_fresh, early_errors = _fetch_interval(tickers, "1m", 1, early_period)
+        early_frames = {
+            ticker: _merge_candle_frames(early_cached[ticker], early_fresh.get(ticker))
+            for ticker in tickers
+        }
+        per_tf["1M"] = early_frames
+        for ticker in tickers:
+            if early_frames[ticker].empty:
+                problems[ticker].append(f"1M: {early_errors.get(ticker, 'No 1M data')}")
+    else:
+        per_tf["1M"] = {ticker: pd.DataFrame() for ticker in tickers}
 
     try:
         _save_candle_memory(batch, per_tf)
@@ -1127,7 +1148,7 @@ def show_ai_multi_agent_scanner(client=None):
     st.title("🤖 AI Multi-Agent Scanner — Yahoo Batch")
     st.caption("17 OHLCV rule engines × 5M / 15M / 1H + 20-candle 1M early-movement detector + optional Yahoo News")
     st.info("scanner.py supplies NSE/F&O symbols only (unchanged). Yahoo Finance supplies candles. FYERS is used only for 5-level Market Depth on the technical shortlist.")
-    st.caption("Smart Memory: SQLite candles are loaded first; after the initial warm-up, the scanner refreshes a short 2-day overlap and merges it with saved candles. Yahoo 1-minute history is limited, so the first 1M warm-up uses 7 days.")
+    st.caption("Smart Memory: SQLite candles are loaded first; after the initial warm-up, the scanner refreshes a short 2-day overlap and merges it with saved candles. For speed, the extra 1M/20M scan is optional.")
     st.warning(
         "Yahoo intraday data may be delayed, missing or rate-limited. "
         "Confirmation Strength is a heuristic consensus score, not a probability or win rate."
@@ -1146,7 +1167,7 @@ def show_ai_multi_agent_scanner(client=None):
     with c1:
         universe = st.selectbox("Universe", ["Both (NSE + F&O)", "F&O Stocks", "NSE Equity"], key="ma_universe")
     with c2:
-        batch_size = st.selectbox("Batch size", [25, 40, 50, 75, 100], index=2, key="ma_batch_size")
+        batch_size = st.selectbox("Batch size", [25, 50, 75, 100, 125], index=2, key="ma_batch_size")
     with c3:
         st.metric("Analysis", "17 Agents × 3 TF")
 
@@ -1182,12 +1203,18 @@ def show_ai_multi_agent_scanner(client=None):
     with a:
         period = st.selectbox("Yahoo history", ["59d", "30d"], index=0, key="ma_period")
     with b:
-        news_enabled = st.checkbox("News Intelligence (shortlist only)", value=True, key="ma_news_enabled")
+        news_enabled = st.checkbox("News Intelligence (shortlist only — slower)", value=False, key="ma_news_enabled")
     with c:
         news_limit = st.selectbox("News limit", [25, 50, 100, 200], index=1, key="ma_news_limit")
 
+    early_scan_enabled = st.checkbox(
+        "Run extra 1M / 20M Early-Movement scan for all stocks (slower)",
+        value=False, key="ma_early_scan_enabled",
+        help="OFF = faster core scan on 5M/15M/1H. ON = also downloads Yahoo 1-minute candles for every stock.",
+    )
+
     depth_limit = st.selectbox(
-        "FYERS Market Depth shortlist limit", [5, 10, 20, 30, 50], index=2,
+        "FYERS Market Depth shortlist limit", [5, 10, 20, 30, 50], index=1,
         help="FYERS Market Depth is requested only for the strongest BUY/SELL/PRE-BIG rows. Calls are paced and cached.",
         key="ma_depth_limit",
     )
@@ -1217,14 +1244,15 @@ def show_ai_multi_agent_scanner(client=None):
         progress, status = st.progress(0.0), st.empty()
         all_rows = []
         for idx, batch in enumerate(batches, 1):
-            status.write(f"Scanning batch {idx}/{len(batches)} — {len(batch)} symbols")
+            status.write(
+                f"Core scan batch {idx}/{len(batches)} — {len(batch)} symbols "
+                f"(5M + 15M + 1H; 1M extra scan {'ON' if early_scan_enabled else 'OFF'})"
+            )
             try:
-                all_rows.extend(_scan_batch(batch, period))
+                all_rows.extend(_scan_batch(batch, period, include_early=early_scan_enabled))
             except Exception as exc:
                 all_rows.extend(_no_data_row(s, t, f"Batch failed: {exc}") for s, t in batch)
             progress.progress(idx / max(len(batches), 1))
-            if idx < len(batches):
-                time.sleep(.5)
 
         result = _sort_results(pd.DataFrame(all_rows))
         if news_enabled:
@@ -1357,7 +1385,9 @@ def show_ai_multi_agent_scanner(client=None):
         view = view[view["20M Status"] == early_filter]
     view = view.sort_values(["20M Pre-Move Score", "Confirmation Strength %"], ascending=[False, False])
     summary_cols = [
-        "Symbol", "Final Signal", "Direction Movement", "Signal Time (IST)", "Entry Price", "Stop Loss", "15M ATR",
+        "Symbol", "Final Signal", "Direction Movement", "Signal Time (IST)",
+        "5M Candle Close (IST)", "15M Candle Close (IST)", "1H Candle Close (IST)",
+        "Entry Price", "Stop Loss", "15M ATR",
         "Confirmation Strength %", "Consensus Score",
         "20M Status", "20M Direction", "20M Pre-Move Score", "20M Range High", "20M Range Low",
         "20M Range %", "20M RVOL", "20M Pressure %", "20M Last Close", "20M Reason",
@@ -1384,7 +1414,7 @@ def show_ai_multi_agent_scanner(client=None):
         )
     else:
         st.info("No BUY / SELL / PRE-BIG shortlist rows yet, or Market Depth has not been requested.")
-    st.caption("CSV/Excel include all 51 timeframe-agent outputs, each agent reason, and the separate 20-candle 1M early-movement fields.")
+    st.caption("CSV/Excel include all 51 timeframe-agent outputs and each agent reason. 20M early-movement fields are populated when the optional 1M scan is enabled.")
     st.caption("Signal Time = latest completed 15M candle close (IST). Entry = 15M close. Stop Loss = 1.5 × 15M ATR; shown only for BUY/SELL and PRE-BIG signals.")
 
     file_stamp = info.get("file_stamp", datetime.now(IST).strftime("%Y%m%d_%H%M%S"))
