@@ -1,6 +1,6 @@
 """
 AI Multi-Agent Scanner for NSE AI PRO V17
-Yahoo Finance batch edition — Big Player Intelligence + Continuation + Backtest.
+Yahoo Finance batch edition — revised.
 
 - scanner.py only supplies the NSE / F&O symbol universe; this module combines both loaders without modifying scanner.py.
 - Yahoo Finance supplies all OHLCV candles and technical-analysis data.
@@ -105,6 +105,12 @@ def _save_candle_memory(batch, per_tf):
             ON CONFLICT(symbol,timeframe,candle_time) DO UPDATE SET
             open=excluded.open, high=excluded.high, low=excluded.low,
             close=excluded.close, volume=excluded.volume, saved_at=excluded.saved_at""", records)
+        # Bound local DB growth: retain 8 days of optional 1M bars and 65 days
+        # of 5M/15M/1H bars (more than the longest configured Yahoo lookback).
+        cutoff_1m = (pd.Timestamp.now(tz=IST) - pd.Timedelta(days=8)).isoformat()
+        cutoff_core = (pd.Timestamp.now(tz=IST) - pd.Timedelta(days=65)).isoformat()
+        conn.execute("DELETE FROM candles WHERE timeframe='1M' AND candle_time < ?", (cutoff_1m,))
+        conn.execute("DELETE FROM candles WHERE timeframe!='1M' AND candle_time < ?", (cutoff_core,))
     return len(records)
 
 def _load_candle_memory(symbol, timeframe):
@@ -387,30 +393,37 @@ def _agent_result(direction="WAIT", score=0, reason="No clear setup"):
 
 
 def _liquidity_levels_and_sweeps(df, lookback=20):
-    """Estimate buy-side/sell-side liquidity and confirmed wick sweeps from OHLCV."""
+    """Detect meaningful prior swing liquidity and reject unconfirmed wick pokes."""
     empty = {
         "Buy-side Liquidity": None, "Sell-side Liquidity": None,
         "Upside Sweep": "NO", "Downside Sweep": "NO",
         "Liquidity Sweep Detail": "NO DATA",
     }
-    if df is None or not isinstance(df, pd.DataFrame) or len(df) < max(lookback + 1, 10):
+    if df is None or not isinstance(df, pd.DataFrame) or len(df) < max(lookback + 1, 25):
         return empty
     d = df.tail(lookback + 1).reset_index(drop=True)
-    prior = d.iloc[:-1]
-    last = d.iloc[-1]
-    buy_liq = _safe_num(prior["High"].max(), np.nan)   # buy stops commonly rest above highs
-    sell_liq = _safe_num(prior["Low"].min(), np.nan)   # sell stops commonly rest below lows
-    high = _safe_num(last["High"], np.nan)
-    low = _safe_num(last["Low"], np.nan)
-    close = _safe_num(last["Close"], np.nan)
-    upside = bool(np.isfinite(buy_liq) and high > buy_liq and close < buy_liq)
-    downside = bool(np.isfinite(sell_liq) and low < sell_liq and close > sell_liq)
+    prior, last = d.iloc[:-1], d.iloc[-1]
+    buy_liq = _safe_num(prior["High"].max(), np.nan)
+    sell_liq = _safe_num(prior["Low"].min(), np.nan)
+    high, low = _safe_num(last["High"]), _safe_num(last["Low"])
+    opn, close = _safe_num(last["Open"]), _safe_num(last["Close"])
+    span = max(high - low, 1e-9)
+    upper_wick = high - max(opn, close)
+    lower_wick = min(opn, close) - low
+    vol_avg = _safe_num(prior["Volume"].tail(20).mean(), 0.0)
+    rvol = _safe_num(last["Volume"] / vol_avg, 0.0) if vol_avg > 0 else 0.0
+    # A sweep must pierce a prior extreme, close back inside, reject with a wick,
+    # and show at least modest participation. A mere high/low touch is not enough.
+    upside = bool(np.isfinite(buy_liq) and high > buy_liq and close < buy_liq
+                  and upper_wick / span >= 0.30 and close < opn and rvol >= 1.05)
+    downside = bool(np.isfinite(sell_liq) and low < sell_liq and close > sell_liq
+                    and lower_wick / span >= 0.30 and close > opn and rvol >= 1.05)
     if upside and downside:
-        detail = "BOTH-SIDE SWEEP"
+        detail = "BOTH-SIDE WICK — WAIT FOR NEXT-CANDLE CONFIRMATION"
     elif upside:
-        detail = "UPSIDE SWEEP — BUY-SIDE LIQUIDITY TAKEN; CLOSE BACK BELOW"
+        detail = "SWEEP UP: BUY-SIDE LIQUIDITY TAKEN; BEARISH REJECTION CONFIRMED"
     elif downside:
-        detail = "DOWNSIDE SWEEP — SELL-SIDE LIQUIDITY TAKEN; CLOSE BACK ABOVE"
+        detail = "SWEEP DOWN: SELL-SIDE LIQUIDITY TAKEN; BULLISH REJECTION CONFIRMED"
     else:
         detail = "NO CONFIRMED SWEEP"
     return {
@@ -420,6 +433,37 @@ def _liquidity_levels_and_sweeps(df, lookback=20):
         "Downside Sweep": "YES" if downside else "NO",
         "Liquidity Sweep Detail": detail,
     }
+
+
+def _breakout_breakdown_signal(df, lookback=20):
+    """Completed-candle breakout/breakdown confirmation; no intrabar predictions."""
+    empty = {"Breakout Signal": "WAIT", "Breakout Level": None,
+             "Breakdown Level": None, "Breakout Reason": "Insufficient completed candles"}
+    if df is None or not isinstance(df, pd.DataFrame) or len(df) < lookback + 21:
+        return empty
+    d = df.tail(lookback + 21).reset_index(drop=True)
+    base = d.iloc[-(lookback + 1):-1]
+    last = d.iloc[-1]
+    resistance = _safe_num(base["High"].max(), np.nan)
+    support = _safe_num(base["Low"].min(), np.nan)
+    o, h, l, c = (_safe_num(last[k]) for k in ("Open", "High", "Low", "Close"))
+    span = max(h - l, 1e-9)
+    body_ratio = abs(c - o) / span
+    close_loc = (c - l) / span
+    avg_vol = _safe_num(base["Volume"].tail(20).mean(), 0.0)
+    rvol = _safe_num(last["Volume"] / avg_vol, 0.0) if avg_vol > 0 else 0.0
+    # Require close beyond level (not wick-only), directional body, strong close location,
+    # and RVOL. This reduces false breakouts from low-volume spikes.
+    if c > resistance and c > o and body_ratio >= 0.55 and close_loc >= 0.75 and rvol >= 1.5:
+        signal, reason = "BREAKOUT", f"Close above {resistance:.2f}; body {body_ratio:.0%}; RVOL {rvol:.2f}x"
+    elif c < support and c < o and body_ratio >= 0.55 and close_loc <= 0.25 and rvol >= 1.5:
+        signal, reason = "BREAKDOWN", f"Close below {support:.2f}; body {body_ratio:.0%}; RVOL {rvol:.2f}x"
+    else:
+        signal, reason = "WAIT", f"No confirmed close/volume break; RVOL {rvol:.2f}x"
+    return {"Breakout Signal": signal,
+            "Breakout Level": round(resistance, 2) if np.isfinite(resistance) else None,
+            "Breakdown Level": round(support, 2) if np.isfinite(support) else None,
+            "Breakout Reason": reason}
 
 
 def _cached_candles_are_fresh(frame, minutes, now=None):
@@ -434,13 +478,12 @@ def _cached_candles_are_fresh(frame, minutes, now=None):
             close_time = last.normalize() + SESSION_CLOSE
         else:
             close_time = last + pd.Timedelta(minutes=minutes)
-        # During market hours, only trust a bar that closed recently.
-        # After hours/weekends, allow the latest completed session bar for up to
-        # 72h; this avoids treating an old morning candle as fresh all day.
+        # Outside market hours, today's completed candles are sufficient; do not
+        # repeatedly download the same 2-day overlap on every Streamlit rerun.
+        if not _is_market_hours(now.to_pydatetime()):
+            return last.date() == now.date()
         age = (now - close_time).total_seconds() / 60.0
-        if _is_market_hours(now.to_pydatetime()):
-            return -1.0 <= age <= (minutes + 5)
-        return -5.0 <= age <= (72 * 60)
+        return -1.0 <= age <= (minutes + 3)
     except Exception:
         return False
 
@@ -724,9 +767,9 @@ def _analyse_timeframe(df):
     valid = sum(x["direction"] != "NO DATA" for x in agents.values())
     if valid < 8:
         direction = "NO DATA"
-    elif score >= 5 and buy_votes >= 3:
+    elif score >= 7 and buy_votes >= 4 and buy_votes >= sell_votes + 3:
         direction = "BUY"
-    elif score <= -5 and sell_votes >= 3:
+    elif score <= -7 and sell_votes >= 4 and sell_votes >= buy_votes + 3:
         direction = "SELL"
     else:
         direction = "WAIT"
@@ -831,182 +874,6 @@ def _last_candle_close_time(frame, minutes):
         return None
 
 
-
-def _smart_money_profile(df):
-    """OHLCV-only institutional-activity proxies; never claims to see real orders."""
-    empty = {
-        "Smart Money Side": "NO DATA", "Smart Money Score": 0,
-        "Accumulation / Distribution": "INSUFFICIENT DATA",
-        "SM Liquidity Event": "NO CONFIRMED SWEEP",
-        "Bullish OB Zone": None, "Bearish OB Zone": None,
-        "FVG Zone": None, "Market Structure": "UNCONFIRMED",
-        "SM Explanation": "Need at least 40 completed 15M candles",
-        "Confirmed Reversal": None,
-    }
-    if not isinstance(df, pd.DataFrame) or len(df) < 40:
-        return empty
-    d = df.tail(80).copy().reset_index(drop=True)
-    o, h, l, c, v = (pd.to_numeric(d[k], errors="coerce") for k in
-                     ("Open", "High", "Low", "Close", "Volume"))
-    if c.isna().any() or v.isna().all() or _safe_num(c.iloc[-1]) <= 0:
-        return empty
-    last = float(c.iloc[-1])
-    prev = d.iloc[:-1].tail(20)
-    avg_vol = _safe_num(v.shift(1).rolling(20, min_periods=10).mean().iloc[-1])
-    rvol = _safe_num(v.iloc[-1] / avg_vol) if avg_vol > 0 else 0.0
-    span = max(_safe_num(h.iloc[-1] - l.iloc[-1]), 1e-9)
-    close_location = (_safe_num(c.iloc[-1]) - _safe_num(l.iloc[-1])) / span
-    ema9 = c.ewm(span=9, adjust=False).mean()
-    ema21 = c.ewm(span=21, adjust=False).mean()
-    prior_high = _safe_num(prev["High"].max())
-    prior_low = _safe_num(prev["Low"].min())
-    upside_sweep = _safe_num(h.iloc[-1]) > prior_high and last < prior_high
-    downside_sweep = _safe_num(l.iloc[-1]) < prior_low and last > prior_low
-
-    # Accumulation/distribution is only a proxy: tight range + volume balance + close location.
-    recent = d.tail(10)
-    range_pct = ((_safe_num(recent["High"].max()) - _safe_num(recent["Low"].min())) / last) * 100
-    up_vol = _safe_num(v.iloc[-10:][c.iloc[-10:] >= o.iloc[-10:]].sum())
-    down_vol = _safe_num(v.iloc[-10:][c.iloc[-10:] < o.iloc[-10:]].sum())
-    vol_balance = up_vol / max(up_vol + down_vol, 1.0)
-    accum = range_pct <= 3.5 and vol_balance >= .58 and close_location >= .55
-    distrib = range_pct <= 3.5 and vol_balance <= .42 and close_location <= .45
-
-    # Simple displacement + last opposing candle proxy for order-block zones.
-    tr = pd.concat([(h-l), (h-c.shift()).abs(), (l-c.shift()).abs()], axis=1).max(axis=1)
-    atr = _safe_num(tr.rolling(14, min_periods=7).mean().iloc[-1])
-    bull_ob = bear_ob = fvg = None
-    if atr > 0:
-        for j in range(len(d)-2, max(0, len(d)-13), -1):
-            displacement = _safe_num(c.iloc[j+1] - o.iloc[j+1])
-            if displacement >= 1.2 * atr and _safe_num(c.iloc[j]) < _safe_num(o.iloc[j]):
-                bull_ob = f"{_safe_num(l.iloc[j]):.2f}–{_safe_num(o.iloc[j]):.2f}"
-                break
-        for j in range(len(d)-2, max(0, len(d)-13), -1):
-            displacement = _safe_num(o.iloc[j+1] - c.iloc[j+1])
-            if displacement >= 1.2 * atr and _safe_num(c.iloc[j]) > _safe_num(o.iloc[j]):
-                bear_ob = f"{_safe_num(o.iloc[j]):.2f}–{_safe_num(h.iloc[j]):.2f}"
-                break
-    if len(d) >= 3 and _safe_num(l.iloc[-1]) > _safe_num(h.iloc[-3]):
-        fvg = f"Bullish {_safe_num(h.iloc[-3]):.2f}–{_safe_num(l.iloc[-1]):.2f}"
-    elif len(d) >= 3 and _safe_num(h.iloc[-1]) < _safe_num(l.iloc[-3]):
-        fvg = f"Bearish {_safe_num(h.iloc[-1]):.2f}–{_safe_num(l.iloc[-3]):.2f}"
-
-    higher = _safe_num(h.iloc[-5:].max()) > _safe_num(h.iloc[-10:-5].max()) and _safe_num(l.iloc[-5:].min()) > _safe_num(l.iloc[-10:-5].min())
-    lower = _safe_num(h.iloc[-5:].max()) < _safe_num(h.iloc[-10:-5].max()) and _safe_num(l.iloc[-5:].min()) < _safe_num(l.iloc[-10:-5].min())
-    structure = "HH/HL — BULLISH" if higher else "LH/LL — BEARISH" if lower else "RANGE / MIXED"
-
-    bull_points = (3 if downside_sweep else 0) + (2 if accum else 0) + (2 if higher else 0) + (1 if last > ema21.iloc[-1] else 0) + (1 if rvol >= 1.3 and close_location >= .65 else 0) + (1 if bull_ob else 0)
-    bear_points = (3 if upside_sweep else 0) + (2 if distrib else 0) + (2 if lower else 0) + (1 if last < ema21.iloc[-1] else 0) + (1 if rvol >= 1.3 and close_location <= .35 else 0) + (1 if bear_ob else 0)
-    if bull_points >= bear_points + 2:
-        side, score = "BULLISH SMART-MONEY PROXY", min(100, bull_points * 10)
-    elif bear_points >= bull_points + 2:
-        side, score = "BEARISH SMART-MONEY PROXY", min(100, bear_points * 10)
-    else:
-        side, score = "MIXED / WAIT", max(bull_points, bear_points) * 10
-    activity = "ACCUMULATION PROXY" if accum else "DISTRIBUTION PROXY" if distrib else "NO CLEAR ACCUMULATION / DISTRIBUTION"
-    liquidity = "SELL-SIDE SWEEP (LOW TAKEN, CLOSE RECLAIMED)" if downside_sweep else "BUY-SIDE SWEEP (HIGH TAKEN, CLOSE REJECTED)" if upside_sweep else "NO CONFIRMED SWEEP"
-
-    # Reversal must be structural and volume-confirmed; a mere stock selection or weak candle cannot flip the signal.
-    prior_10_low = _safe_num(l.iloc[-11:-1].min())
-    prior_10_high = _safe_num(h.iloc[-11:-1].max())
-    bear_reversal = last < prior_10_low and last < _safe_num(ema21.iloc[-1]) and rvol >= 1.3
-    bull_reversal = last > prior_10_high and last > _safe_num(ema21.iloc[-1]) and rvol >= 1.3
-    explanation = f"{activity}; {liquidity}; {structure}; RVOL {rvol:.2f}x. OHLCV proxy only — actual institutional orders are not visible."
-    return {
-        "Smart Money Side": side, "Smart Money Score": int(score),
-        "Accumulation / Distribution": activity, "SM Liquidity Event": liquidity,
-        "Bullish OB Zone": bull_ob, "Bearish OB Zone": bear_ob,
-        "FVG Zone": fvg, "Market Structure": structure,
-        "SM Explanation": explanation,
-        "Confirmed Reversal": "SELL" if bear_reversal else "BUY" if bull_reversal else None,
-    }
-
-
-def _continuation_status(base_signal, smart, frame_5m, frame_15m, frame_1h):
-    """Keep the original direction unless a volume-backed structure reversal is confirmed."""
-    base = str(base_signal or "WAIT").upper()
-    if base not in ("BUY", "SELL", "PRE-BIG BUY", "PRE-BIG SELL"):
-        return base, "NO ACTIVE DIRECTION", "No confirmed directional signal"
-    side = "BUY" if "BUY" in base else "SELL"
-    reversal = smart.get("Confirmed Reversal")
-    five = _analyse_timeframe(frame_5m).get("direction", "NO DATA") if isinstance(frame_5m, pd.DataFrame) else "NO DATA"
-    hour = _analyse_timeframe(frame_1h).get("direction", "NO DATA") if isinstance(frame_1h, pd.DataFrame) else "NO DATA"
-    if reversal and reversal != side and five == reversal and hour != side:
-        return reversal, "REVERSAL CONFIRMED", f"15M structure break + RVOL confirmation + 5M {reversal}; 1H no longer supports {side}"
-    if side == "BUY":
-        ema21 = frame_15m["Close"].astype(float).ewm(span=21, adjust=False).mean().iloc[-1] if isinstance(frame_15m, pd.DataFrame) and len(frame_15m) >= 21 else None
-        close = _safe_num(frame_15m["Close"].iloc[-1]) if isinstance(frame_15m, pd.DataFrame) and len(frame_15m) else 0
-        if ema21 is not None and close < ema21:
-            return base, "BUY WEAKENING — WAIT", "Below 15M EMA21 but reversal not fully confirmed; do not auto-flip to SELL"
-        return base, "BUY CONTINUATION WATCH", "No confirmed bearish structure break; original BUY bias retained"
-    ema21 = frame_15m["Close"].astype(float).ewm(span=21, adjust=False).mean().iloc[-1] if isinstance(frame_15m, pd.DataFrame) and len(frame_15m) >= 21 else None
-    close = _safe_num(frame_15m["Close"].iloc[-1]) if isinstance(frame_15m, pd.DataFrame) and len(frame_15m) else 0
-    if ema21 is not None and close > ema21:
-        return base, "SELL WEAKENING — WAIT", "Above 15M EMA21 but reversal not fully confirmed; do not auto-flip to BUY"
-    return base, "SELL CONTINUATION WATCH", "No confirmed bullish structure break; original SELL bias retained"
-
-
-def _backtest_15m_proxy(df, max_hold=12):
-    """Small, transparent historical breakout proxy; not a backtest of all 18 live agents."""
-    empty = {"BT Trades": 0, "BT Wins": 0, "BT Losses": 0, "BT Win Rate %": None,
-             "BT Profit Factor": None, "BT Net R": 0.0, "BT Method": "INSUFFICIENT DATA"}
-    if not isinstance(df, pd.DataFrame) or len(df) < 80:
-        return empty
-    d = df.reset_index(drop=True).copy()
-    c = pd.to_numeric(d["Close"], errors="coerce")
-    h = pd.to_numeric(d["High"], errors="coerce")
-    l = pd.to_numeric(d["Low"], errors="coerce")
-    o = pd.to_numeric(d["Open"], errors="coerce")
-    v = pd.to_numeric(d["Volume"], errors="coerce")
-    tr = pd.concat([(h-l), (h-c.shift()).abs(), (l-c.shift()).abs()], axis=1).max(axis=1)
-    atr = tr.rolling(14, min_periods=14).mean()
-    vol_avg = v.shift(1).rolling(20, min_periods=15).mean()
-    outcomes = []
-    i = 25
-    while i < len(d) - 1:
-        prior_high = h.iloc[i-20:i].max()
-        prior_low = l.iloc[i-20:i].min()
-        rv = (v.iloc[i] / vol_avg.iloc[i]) if pd.notna(vol_avg.iloc[i]) and vol_avg.iloc[i] > 0 else 0
-        side = "BUY" if c.iloc[i] > prior_high and c.iloc[i] > o.iloc[i] and rv >= 1.5 else "SELL" if c.iloc[i] < prior_low and c.iloc[i] < o.iloc[i] and rv >= 1.5 else None
-        a = atr.iloc[i]
-        if not side or pd.isna(a) or a <= 0:
-            i += 1
-            continue
-        entry = float(c.iloc[i]); risk = 1.5 * float(a)
-        stop = entry - risk if side == "BUY" else entry + risk
-        target = entry + 2*risk if side == "BUY" else entry - 2*risk
-        r_result = None
-        end = min(len(d), i + max_hold + 1)
-        for j in range(i+1, end):
-            hit_sl = l.iloc[j] <= stop if side == "BUY" else h.iloc[j] >= stop
-            hit_tp = h.iloc[j] >= target if side == "BUY" else l.iloc[j] <= target
-            if hit_sl and hit_tp:
-                r_result = -1.0  # conservative when both occur in same candle
-                break
-            if hit_sl:
-                r_result = -1.0; break
-            if hit_tp:
-                r_result = 2.0; break
-        if r_result is None:
-            exit_price = float(c.iloc[end-1])
-            r_result = ((exit_price-entry)/risk) if side == "BUY" else ((entry-exit_price)/risk)
-            r_result = max(-1.0, min(2.0, r_result))
-        outcomes.append(float(r_result))
-        i = end  # one position at a time; avoids overlapping trades
-    if not outcomes:
-        return {**empty, "BT Method": "15M breakout proxy; no qualifying trades"}
-    wins = sum(x > 0 for x in outcomes); losses = sum(x <= 0 for x in outcomes)
-    gross_win = sum(x for x in outcomes if x > 0)
-    gross_loss = abs(sum(x for x in outcomes if x < 0))
-    return {
-        "BT Trades": len(outcomes), "BT Wins": wins, "BT Losses": losses,
-        "BT Win Rate %": round(100*wins/len(outcomes), 1),
-        "BT Profit Factor": round(gross_win/gross_loss, 2) if gross_loss > 0 else ("INF" if gross_win > 0 else 0),
-        "BT Net R": round(sum(outcomes), 2),
-        "BT Method": "15M 20-bar breakout + RVOL≥1.5; SL 1.5 ATR; TP 3 ATR; max hold 12 bars; costs excluded",
-    }
-
 def _make_result_row(symbol, yahoo_symbol, payload):
     frames = payload.get("frames", {})
     analyses = {tf: _analyse_timeframe(frames.get(tf, pd.DataFrame())) for tf in TIMEFRAMES}
@@ -1044,12 +911,6 @@ def _make_result_row(symbol, yahoo_symbol, payload):
     frame_5m = frames.get("5M", pd.DataFrame())
     frame_15m = frames.get("15M", pd.DataFrame())
     frame_1h = frames.get("1H", pd.DataFrame())
-    base_signal = final_signal
-    smart_money = _smart_money_profile(frame_15m)
-    final_signal, continuation_status, continuation_reason = _continuation_status(
-        base_signal, smart_money, frame_5m, frame_15m, frame_1h
-    )
-    backtest = _backtest_15m_proxy(frame_15m)
     # Signal Time is explicitly the latest completed 15M candle CLOSE, not scan-run time.
     signal_time = _last_candle_close_time(frame_15m, 15)
     candle_close_5m = _last_candle_close_time(frame_5m, 5)
@@ -1079,9 +940,7 @@ def _make_result_row(symbol, yahoo_symbol, payload):
         stop_loss = entry_price + (1.5 * atr_15m)
 
     row = {
-        "Symbol": symbol, "Yahoo Symbol": yahoo_symbol, "Base Signal": base_signal,
-        "Final Signal": final_signal, "Continuation Status": continuation_status,
-        "Continuation Reason": continuation_reason,
+        "Symbol": symbol, "Yahoo Symbol": yahoo_symbol, "Final Signal": final_signal,
         "Signal Time (IST)": signal_time,
         "5M Candle Close (IST)": candle_close_5m,
         "15M Candle Close (IST)": candle_close_15m,
@@ -1098,14 +957,26 @@ def _make_result_row(symbol, yahoo_symbol, payload):
         "15M RSI": analyses["15M"]["rsi"], "Errors": " | ".join(payload.get("errors", [])),
     }
     row.update(_early_20m_analysis(payload.get("early_1m", pd.DataFrame())))
-    row.update(smart_money)
-    row.update(backtest)
     for tf in TIMEFRAMES:
         liquidity = _liquidity_levels_and_sweeps(frames.get(tf, pd.DataFrame()))
         for key, value in liquidity.items():
             row[f"{tf} {key}"] = value
     # Keep simple unprefixed fields for the main report, using 15M as the reference.
     row.update(_liquidity_levels_and_sweeps(frame_15m))
+    row.update(_breakout_breakdown_signal(frame_15m))
+    # Explicit event label is separate from the trend consensus. A sweep is a
+    # liquidity event, not an automatic BUY/SELL entry; breakout needs confirmation.
+    sweep_detail = str(row.get("Liquidity Sweep Detail", ""))
+    if row.get("Breakout Signal") in ("BREAKOUT", "BREAKDOWN"):
+        row["Action Signal"] = row["Breakout Signal"]
+    elif row.get("Upside Sweep") == "YES":
+        row["Action Signal"] = "SWEEP UP"
+    elif row.get("Downside Sweep") == "YES":
+        row["Action Signal"] = "SWEEP DOWN"
+    elif final_signal in ("BUY", "SELL"):
+        row["Action Signal"] = final_signal
+    else:
+        row["Action Signal"] = "WAIT"
     for tf in TIMEFRAMES:
         for name in AGENT_NAMES:
             item = analyses[tf]["agents"][name]
@@ -1414,8 +1285,8 @@ def _best_stock_analyst(row):
         for name in AGENT_NAMES:
             key = f"{tf} {name.replace(' ', '_').replace('/', '_')}"
             direction = str(row.get(key, "WAIT")).upper()
-            if direction != "NO DATA":
-                agent_total += 1  # WAIT is a real non-confirming vote; do not hide it.
+            if direction in ("BUY", "SELL", "PRE-BIG BUY", "PRE-BIG SELL"):
+                agent_total += 1
                 if (expected == "BUY" and direction in ("BUY", "PRE-BIG BUY")) or (
                     expected == "SELL" and direction in ("SELL", "PRE-BIG SELL")
                 ):
@@ -1456,7 +1327,7 @@ def _best_stock_analyst(row):
     qualified = total >= 75 and opposing == 0
     grade = "A+" if total >= 90 else "A" if total >= 85 else "B" if total >= 75 else "BELOW 75"
     reasons = [
-        f"{aligned}/3 timeframes aligned", f"directional votes {agent_votes}/{agent_total} ({vote_ratio:.0%}; WAIT included)",
+        f"{aligned}/3 timeframes aligned", f"agent agreement {vote_ratio:.0%}",
         f"15M/1H volume confirmation {volume_aligned}/2", depth_note,
     ]
     return {
@@ -1469,15 +1340,24 @@ def _best_stock_analyst(row):
 
 
 def _direction_movement(row):
-    """Summarise 5M/15M/1H price direction; flag opposing FYERS book pressure."""
-    directions = [str(row.get(tf, "NO DATA")).upper() for tf in ("5M", "15M", "1H")]
-    buy_votes = sum(x == "BUY" for x in directions)
-    sell_votes = sum(x == "SELL" for x in directions)
+    """Summarise 5M/15M/1H direction, including PRE-BIG votes.
+
+    FYERS depth is a displayed order-book snapshot, not executed trade flow;
+    it annotates alignment/conflict but never changes the technical direction.
+    """
+    directions = [str(row.get(tf, "NO DATA") or "NO DATA").upper()
+                  for tf in ("5M", "15M", "1H")]
+    buy_votes = sum(x in ("BUY", "PRE-BIG BUY") for x in directions)
+    sell_votes = sum(x in ("SELL", "PRE-BIG SELL") for x in directions)
+    direct_buy = sum(x == "BUY" for x in directions)
+    direct_sell = sum(x == "SELL" for x in directions)
+    pre_buy = sum(x == "PRE-BIG BUY" for x in directions)
+    pre_sell = sum(x == "PRE-BIG SELL" for x in directions)
 
     if buy_votes >= 2 and sell_votes == 0:
-        movement = "UP"
+        movement = "PRE-BIG UP" if pre_buy >= 2 and direct_buy == 0 else "UP"
     elif sell_votes >= 2 and buy_votes == 0:
-        movement = "DOWN"
+        movement = "PRE-BIG DOWN" if pre_sell >= 2 and direct_sell == 0 else "DOWN"
     elif buy_votes == 0 and sell_votes == 0 and all(x == "WAIT" for x in directions):
         movement = "SIDEWAYS"
     elif directions.count("NO DATA") >= 2:
@@ -1485,22 +1365,23 @@ def _direction_movement(row):
     else:
         movement = "MIXED"
 
-    # FYERS depth is a displayed order-book snapshot, not executed trade flow.
     depth = str(row.get("Depth Signal", "") or "").upper()
-    if movement == "UP" and depth == "SELL-SIDE DOMINANT":
-        return "CONFLICT (UP / FYERS SELL)"
-    if movement == "DOWN" and depth == "BUY-SIDE DOMINANT":
-        return "CONFLICT (DOWN / FYERS BUY)"
-    if movement == "UP" and depth == "BUY-SIDE DOMINANT":
-        return "UP (DEPTH ALIGNED)"
-    if movement == "DOWN" and depth == "SELL-SIDE DOMINANT":
-        return "DOWN (DEPTH ALIGNED)"
+    is_up = movement in ("UP", "PRE-BIG UP")
+    is_down = movement in ("DOWN", "PRE-BIG DOWN")
+    if is_up and depth == "SELL-SIDE DOMINANT":
+        return f"CONFLICT ({movement} / FYERS SELL)"
+    if is_down and depth == "BUY-SIDE DOMINANT":
+        return f"CONFLICT ({movement} / FYERS BUY)"
+    if is_up and depth == "BUY-SIDE DOMINANT":
+        return f"{movement} (DEPTH ALIGNED)"
+    if is_down and depth == "SELL-SIDE DOMINANT":
+        return f"{movement} (DEPTH ALIGNED)"
     return movement
 
 
 def show_ai_multi_agent_scanner(client=None):
     """Streamlit page. client is retained for app.py compatibility."""
-    st.title("🤖 AI Multi-Agent Scanner V18 — Yahoo Batch + Big Player Intelligence")
+    st.title("🤖 AI Multi-Agent Scanner V18 — Yahoo Batch")
     st.caption("17 OHLCV agents × 5M / 15M / 1H + 18th Best Stock Analyst + optional 1M / News")
     st.info("scanner.py supplies NSE/F&O symbols only (unchanged). Yahoo Finance supplies candles. FYERS is used only for 5-level Market Depth on the technical shortlist.")
     st.caption("Smart Memory: SQLite candles are loaded first; after the initial warm-up, the scanner refreshes a short 2-day overlap and merges it with saved candles. For speed, the extra 1M/20M scan is optional.")
@@ -1590,8 +1471,18 @@ def show_ai_multi_agent_scanner(client=None):
         @st.fragment(run_every=f"{int(auto_interval)}m" if auto_scan else None)
         def _auto_scan_clock():
             if auto_scan and _is_market_hours():
-                st.session_state["ma_auto_scan_due"] = True
-                st.rerun(scope="app")
+                now_epoch = time.time()
+                last_trigger = float(st.session_state.get("ma_auto_scan_last_trigger", 0.0))
+                interval_seconds = int(auto_interval) * 60
+                # The fragment also runs during a full app rerun. Initialise its
+                # clock first, then trigger only after the selected interval; this
+                # prevents st.rerun(scope='app') from creating a rerun loop.
+                if last_trigger <= 0:
+                    st.session_state["ma_auto_scan_last_trigger"] = now_epoch
+                elif now_epoch - last_trigger >= interval_seconds:
+                    st.session_state["ma_auto_scan_last_trigger"] = now_epoch
+                    st.session_state["ma_auto_scan_due"] = True
+                    st.rerun(scope="app")
         _auto_scan_clock()
     elif auto_scan:
         st.warning("ఈ Streamlit version‌లో scheduled fragment లేదు. Auto Scan కోసం Streamlit 1.37+ అవసరం.")
@@ -1604,7 +1495,7 @@ def show_ai_multi_agent_scanner(client=None):
         live_best_report = st.empty()
         all_rows = []
         live_best_cols = [
-            "Symbol", "Best Stock Side", "Final Signal", "Best Stock Score",
+            "Symbol", "Best Stock Side", "Final Signal", "Action Signal", "Breakout Signal", "Best Stock Score",
             "Best Stock Grade", "Entry Price", "Stop Loss", "Signal Time (IST)",
             "5M", "15M", "1H", "Best Stock Reason",
         ]
@@ -1687,8 +1578,8 @@ def show_ai_multi_agent_scanner(client=None):
                     "Buy Qty (5L)", "Sell Qty (5L)", "Depth Imbalance %", "Depth Time (IST)", "Depth Message"]] = None
         st.session_state["multi_agent_depth"] = depth_table
 
-        # Direction Movement is placed beside Final Signal. It uses 5M/15M/1H
-        # candle direction and flags disagreement with FYERS displayed depth.
+        # Direction Movement includes BUY/SELL and PRE-BIG direction votes.
+        # FYERS displayed depth only annotates alignment/conflict; it is not flow.
         result["Direction Movement"] = result.apply(_direction_movement, axis=1)
         # 18th Agent runs after technical consensus and optional FYERS depth are available.
         analyst = result.apply(_best_stock_analyst, axis=1, result_type="expand")
@@ -1754,23 +1645,16 @@ def show_ai_multi_agent_scanner(client=None):
     for key, default in liquidity_defaults.items():
         if key not in result.columns:
             result[key] = default
-    if "Depth Signal" not in result.columns:
-        result["Depth Signal"] = None
-    smart_defaults = {
-        "Base Signal": result.get("Final Signal", "WAIT"),
-        "Continuation Status": "RUN A FRESH SCAN",
-        "Continuation Reason": "New continuation engine requires fresh candle analysis",
-        "Smart Money Side": "RUN A FRESH SCAN", "Smart Money Score": 0,
-        "Accumulation / Distribution": "RUN A FRESH SCAN", "SM Liquidity Event": "RUN A FRESH SCAN",
-        "Bullish OB Zone": None, "Bearish OB Zone": None, "FVG Zone": None,
-        "Market Structure": "RUN A FRESH SCAN", "SM Explanation": "Run a fresh scan",
-        "Confirmed Reversal": None, "BT Trades": 0, "BT Wins": 0, "BT Losses": 0,
-        "BT Win Rate %": None, "BT Profit Factor": None, "BT Net R": 0.0,
-        "BT Method": "Run a fresh scan for historical proxy backtest",
+    new_signal_defaults = {
+        "Breakout Signal": "WAIT", "Breakout Level": None,
+        "Breakdown Level": None, "Breakout Reason": "Run a fresh scan",
+        "Action Signal": "WAIT",
     }
-    for col_name, default_value in smart_defaults.items():
+    for col_name, default_value in new_signal_defaults.items():
         if col_name not in result.columns:
             result[col_name] = default_value
+    if "Depth Signal" not in result.columns:
+        result["Depth Signal"] = None
     if "Confirmation Strength %" not in result.columns:
         result["Confirmation Strength %"] = 0
     if "Best Stock Score" not in result.columns:
@@ -1784,7 +1668,7 @@ def show_ai_multi_agent_scanner(client=None):
     mem_cols[0].metric("SQLite Candles", f"{candle_count:,}")
     mem_cols[1].metric("Saved Scan Rows", f"{scan_count:,}")
     mem_cols[2].metric("Memory Symbols", f"{memory_symbols:,}")
-    st.caption(f"Permanent candle database: {MEMORY_DB_PATH.name} • Auto Scan: {'ON' if st.session_state.get('ma_auto_scan', False) else 'OFF'} (weekdays 09:15–15:30 IST)")
+    st.caption(f"Local SQLite candle database: {MEMORY_DB_PATH.name} • Host persistence depends on the deployment disk • Auto Scan: {'ON' if st.session_state.get('ma_auto_scan', False) else 'OFF'} (weekdays 09:15–15:30 IST)")
     st.caption(
         f"Last scan: {info.get('universe', '')} • scanner.py symbols {info.get('source_symbols', '')} "
         f"• unique Yahoo tickers {info.get('unique_tickers', len(result))} "
@@ -1797,10 +1681,10 @@ def show_ai_multi_agent_scanner(client=None):
         "Minimum Best Stock Score", [75, 80, 85, 90], index=0, key="ma_best_min_score"
     )
     best_cols = [
-        "Symbol", "Best Stock Side", "Final Signal", "Best Stock Score",
+        "Symbol", "Best Stock Side", "Final Signal", "Action Signal", "Breakout Signal", "Best Stock Score",
         "Best Stock Grade", "Entry Price", "Stop Loss", "Last Price",
         "Signal Time (IST)", "5M", "15M", "1H", "Depth Signal",
-        "Best Stock Reason", "Smart Money Side", "Smart Money Score", "Continuation Status",
+        "Best Stock Reason",
     ]
     best = result[
         (result["Best Stock Filter"] == "PASS")
@@ -1817,23 +1701,6 @@ def show_ai_multi_agent_scanner(client=None):
             f"No stock passed {min_best_score}/100 with aligned 5M, 15M and 1H signals. "
             "The analyst will not force a BUY/SELL recommendation."
         )
-
-    # Big-player proxy report: inferred from candles, never represented as actual institutional orders.
-    st.subheader("🏦 BIG PLAYER INTELLIGENCE — OHLCV PROXY")
-    st.caption("Accumulation, liquidity sweeps, OB/FVG and structure are estimates from Yahoo candles. Actual institutional order flow is not directly observable here.")
-    sm_filter = st.selectbox("Smart Money filter", ["ALL", "BULLISH SMART-MONEY PROXY", "BEARISH SMART-MONEY PROXY", "MIXED / WAIT"], key="ma_sm_filter")
-    sm_view = result if sm_filter == "ALL" else result[result["Smart Money Side"] == sm_filter]
-    sm_cols = ["Symbol", "Final Signal", "Base Signal", "Continuation Status", "Smart Money Side", "Smart Money Score", "Accumulation / Distribution", "SM Liquidity Event", "Market Structure", "Bullish OB Zone", "Bearish OB Zone", "FVG Zone", "SM Explanation"]
-    st.dataframe(sm_view[sm_cols].sort_values("Smart Money Score", ascending=False), hide_index=True, **_stretch())
-
-    st.subheader("🧪 HISTORICAL 15M BREAKOUT PROXY — BACKTEST")
-    bt_cols = ["Symbol", "BT Trades", "BT Wins", "BT Losses", "BT Win Rate %", "BT Profit Factor", "BT Net R", "BT Method"]
-    bt_view = result[result["BT Trades"] > 0].copy()
-    if not bt_view.empty:
-        st.dataframe(bt_view[bt_cols].sort_values(["BT Net R", "BT Win Rate %"], ascending=False).head(50), hide_index=True, **_stretch())
-    else:
-        st.info("No qualifying historical 15M breakout trades in available Yahoo candle history.")
-    st.caption("This is a separate 15M breakout proxy, not a historical replay of all 18 agents. It excludes brokerage, taxes, slippage and gaps; use it for research, then validate out-of-sample and paper-trade before live use.")
 
     # Data coverage is shown separately from the final signal count.
     coverage_cols = st.columns(5)
@@ -1859,6 +1726,7 @@ def show_ai_multi_agent_scanner(client=None):
             [
                 "ALL", "WATCH", "CONFIRMED BREAKOUT", "WAIT", "NO DATA",
                 "BUY LIQUIDITY", "SELL LIQUIDITY", "SWEEP UP", "SWEEP DOWN",
+                "BREAKOUT", "BREAKDOWN", "ACTION BUY", "ACTION SELL",
             ],
             key="ma_early_filter",
         )
@@ -1878,10 +1746,16 @@ def show_ai_multi_agent_scanner(client=None):
         view = view[view["15M Upside Sweep"] == "YES"]
     elif early_filter == "SWEEP DOWN":
         view = view[view["15M Downside Sweep"] == "YES"]
+    elif early_filter in ("BREAKOUT", "BREAKDOWN"):
+        view = view[view["Breakout Signal"] == early_filter]
+    elif early_filter == "ACTION BUY":
+        view = view[view["Action Signal"] == "BUY"]
+    elif early_filter == "ACTION SELL":
+        view = view[view["Action Signal"] == "SELL"]
 
     view = view.sort_values(["20M Pre-Move Score", "Confirmation Strength %"], ascending=[False, False])
     summary_cols = [
-        "Symbol", "Final Signal", "Base Signal", "Direction Movement", "Continuation Status", "Continuation Reason", "Signal Time (IST)",
+        "Symbol", "Final Signal", "Action Signal", "Breakout Signal", "Breakout Level", "Breakdown Level", "Breakout Reason", "Direction Movement", "Signal Time (IST)",
         "5M Candle Close (IST)", "15M Candle Close (IST)", "1H Candle Close (IST)",
         "Entry Price", "Stop Loss", "15M ATR",
         "Confirmation Strength %", "Consensus Score",
@@ -1889,8 +1763,6 @@ def show_ai_multi_agent_scanner(client=None):
         "5M Buy-side Liquidity", "5M Sell-side Liquidity", "5M Upside Sweep", "5M Downside Sweep",
         "15M Buy-side Liquidity", "15M Sell-side Liquidity", "15M Upside Sweep", "15M Downside Sweep",
         "1H Buy-side Liquidity", "1H Sell-side Liquidity", "1H Upside Sweep", "1H Downside Sweep",
-        "Smart Money Side", "Smart Money Score", "Accumulation / Distribution", "SM Liquidity Event", "Market Structure", "Bullish OB Zone", "Bearish OB Zone", "FVG Zone", "Confirmed Reversal",
-        "BT Trades", "BT Wins", "BT Losses", "BT Win Rate %", "BT Profit Factor", "BT Net R",
         "18th Agent", "Best Stock Score", "Best Stock Side", "Best Stock Grade",
         "Best Stock Filter", "Best Stock Reason",
         "20M Status", "20M Direction", "20M Pre-Move Score", "20M Range High", "20M Range Low",
@@ -1953,7 +1825,7 @@ def show_ai_multi_agent_scanner(client=None):
             "The first 17 agents are deterministic OHLCV rule engines on 5M, 15M and 1H candles. "
             "The 18th Best Stock Analyst ranks actionable signals using timeframe alignment, "
             "agent agreement, volume, structure and optional FYERS depth. It is a transparent "
-            "screening score, not a probability or an independent AI language model. Smart Money Intelligence is an OHLCV proxy, not actual institutional order visibility. The 15M breakout backtest is a separate simplified proxy, not a replay of the full live model. News is a separate keyword-based "
+            "screening score, not a probability or an independent AI language model. News is a separate keyword-based "
             "headline context check, not a standalone trade signal. Chart Pattern uses OHLCV, "
             "not chart screenshots. Signals are screening outputs, not guaranteed entries."
         )
