@@ -392,10 +392,11 @@ def _agent_result(direction="WAIT", score=0, reason="No clear setup"):
     return {"direction": direction, "score": int(score), "reason": reason}
 
 
-def _liquidity_levels_and_sweeps(df, lookback=20):
-    """Detect meaningful prior swing liquidity and reject unconfirmed wick pokes."""
+def _liquidity_levels_and_sweeps(df, lookback=30):
+    """Detect swing/equal-high and swing/equal-low liquidity, then confirm sweeps."""
     empty = {
         "Buy-side Liquidity": None, "Sell-side Liquidity": None,
+        "Equal High Liquidity": "NO", "Equal Low Liquidity": "NO",
         "Upside Sweep": "NO", "Downside Sweep": "NO",
         "Liquidity Sweep Detail": "NO DATA",
     }
@@ -403,68 +404,104 @@ def _liquidity_levels_and_sweeps(df, lookback=20):
         return empty
     d = df.tail(lookback + 1).reset_index(drop=True)
     prior, last = d.iloc[:-1], d.iloc[-1]
-    buy_liq = _safe_num(prior["High"].max(), np.nan)
-    sell_liq = _safe_num(prior["Low"].min(), np.nan)
+    highs = prior["High"].astype(float).to_numpy()
+    lows = prior["Low"].astype(float).to_numpy()
+    close_prev = float(prior["Close"].iloc[-1])
+    close_now = _safe_num(last["Close"])
+    # Use confirmed local pivots (one candle on each side), excluding the live/latest bar.
+    swing_highs, swing_lows = [], []
+    for i in range(1, len(prior)-1):
+        if highs[i] >= highs[i-1] and highs[i] > highs[i+1]:
+            swing_highs.append(highs[i])
+        if lows[i] <= lows[i-1] and lows[i] < lows[i+1]:
+            swing_lows.append(lows[i])
+    ref_highs = swing_highs or list(highs[-min(lookback, len(highs)):])
+    ref_lows = swing_lows or list(lows[-min(lookback, len(lows)):])
+    buy_liq, sell_liq = max(ref_highs), min(ref_lows)
+    # Equal levels: two or more confirmed pivots clustered within 0.15%.
+    eq_tol = max(abs(close_prev) * 0.0015, 1e-9)
+    equal_high = any(abs(a-b) <= eq_tol for i,a in enumerate(swing_highs) for b in swing_highs[i+1:])
+    equal_low = any(abs(a-b) <= eq_tol for i,a in enumerate(swing_lows) for b in swing_lows[i+1:])
     high, low = _safe_num(last["High"]), _safe_num(last["Low"])
-    opn, close = _safe_num(last["Open"]), _safe_num(last["Close"])
-    span = max(high - low, 1e-9)
-    upper_wick = high - max(opn, close)
-    lower_wick = min(opn, close) - low
+    opn = _safe_num(last["Open"])
+    span = max(high-low, 1e-9)
+    upper_wick, lower_wick = high-max(opn, close_now), min(opn, close_now)-low
     vol_avg = _safe_num(prior["Volume"].tail(20).mean(), 0.0)
     rvol = _safe_num(last["Volume"] / vol_avg, 0.0) if vol_avg > 0 else 0.0
-    # A sweep must pierce a prior extreme, close back inside, reject with a wick,
-    # and show at least modest participation. A mere high/low touch is not enough.
-    upside = bool(np.isfinite(buy_liq) and high > buy_liq and close < buy_liq
-                  and upper_wick / span >= 0.30 and close < opn and rvol >= 1.05)
-    downside = bool(np.isfinite(sell_liq) and low < sell_liq and close > sell_liq
-                    and lower_wick / span >= 0.30 and close > opn and rvol >= 1.05)
+    upside = bool(high > buy_liq and close_now < buy_liq and upper_wick/span >= .30
+                  and close_now < opn and rvol >= 1.05)
+    downside = bool(low < sell_liq and close_now > sell_liq and lower_wick/span >= .30
+                    and close_now > opn and rvol >= 1.05)
     if upside and downside:
-        detail = "BOTH-SIDE WICK — WAIT FOR NEXT-CANDLE CONFIRMATION"
+        detail = "BOTH-SIDE SWEEP — WAIT FOR NEXT CANDLE"
     elif upside:
-        detail = "SWEEP UP: BUY-SIDE LIQUIDITY TAKEN; BEARISH REJECTION CONFIRMED"
+        detail = "SWEEP UP: BUY-SIDE LIQUIDITY TAKEN; BEARISH REJECTION"
     elif downside:
-        detail = "SWEEP DOWN: SELL-SIDE LIQUIDITY TAKEN; BULLISH REJECTION CONFIRMED"
+        detail = "SWEEP DOWN: SELL-SIDE LIQUIDITY TAKEN; BULLISH REJECTION"
     else:
         detail = "NO CONFIRMED SWEEP"
     return {
-        "Buy-side Liquidity": round(buy_liq, 2) if np.isfinite(buy_liq) else None,
-        "Sell-side Liquidity": round(sell_liq, 2) if np.isfinite(sell_liq) else None,
-        "Upside Sweep": "YES" if upside else "NO",
-        "Downside Sweep": "YES" if downside else "NO",
+        "Buy-side Liquidity": round(buy_liq, 2), "Sell-side Liquidity": round(sell_liq, 2),
+        "Equal High Liquidity": "YES" if equal_high else "NO",
+        "Equal Low Liquidity": "YES" if equal_low else "NO",
+        "Upside Sweep": "YES" if upside else "NO", "Downside Sweep": "YES" if downside else "NO",
         "Liquidity Sweep Detail": detail,
     }
 
 
 def _breakout_breakdown_signal(df, lookback=20):
-    """Completed-candle breakout/breakdown confirmation; no intrabar predictions."""
+    """Require a completed candle close beyond the previous range with participation."""
     empty = {"Breakout Signal": "WAIT", "Breakout Level": None,
              "Breakdown Level": None, "Breakout Reason": "Insufficient completed candles"}
     if df is None or not isinstance(df, pd.DataFrame) or len(df) < lookback + 21:
         return empty
     d = df.tail(lookback + 21).reset_index(drop=True)
-    base = d.iloc[-(lookback + 1):-1]
-    last = d.iloc[-1]
-    resistance = _safe_num(base["High"].max(), np.nan)
-    support = _safe_num(base["Low"].min(), np.nan)
-    o, h, l, c = (_safe_num(last[k]) for k in ("Open", "High", "Low", "Close"))
-    span = max(h - l, 1e-9)
-    body_ratio = abs(c - o) / span
-    close_loc = (c - l) / span
-    avg_vol = _safe_num(base["Volume"].tail(20).mean(), 0.0)
-    rvol = _safe_num(last["Volume"] / avg_vol, 0.0) if avg_vol > 0 else 0.0
-    # Require close beyond level (not wick-only), directional body, strong close location,
-    # and RVOL. This reduces false breakouts from low-volume spikes.
-    if c > resistance and c > o and body_ratio >= 0.55 and close_loc >= 0.75 and rvol >= 1.5:
-        signal, reason = "BREAKOUT", f"Close above {resistance:.2f}; body {body_ratio:.0%}; RVOL {rvol:.2f}x"
-    elif c < support and c < o and body_ratio >= 0.55 and close_loc <= 0.25 and rvol >= 1.5:
-        signal, reason = "BREAKDOWN", f"Close below {support:.2f}; body {body_ratio:.0%}; RVOL {rvol:.2f}x"
+    base, last = d.iloc[-(lookback+1):-1], d.iloc[-1]
+    resistance, support = _safe_num(base["High"].max(), np.nan), _safe_num(base["Low"].min(), np.nan)
+    o,h,l,c = (_safe_num(last[k]) for k in ("Open","High","Low","Close"))
+    span=max(h-l,1e-9); body=abs(c-o)/span; close_loc=(c-l)/span
+    avg_vol=_safe_num(base["Volume"].tail(20).mean(),0.0)
+    rvol=_safe_num(last["Volume"]/avg_vol,0.0) if avg_vol>0 else 0.0
+    if c>resistance and c>o and body>=.55 and close_loc>=.75 and rvol>=1.5:
+        sig, reason="BREAKOUT",f"Completed close above swing resistance {resistance:.2f}; body {body:.0%}; RVOL {rvol:.2f}x"
+    elif c<support and c<o and body>=.55 and close_loc<=.25 and rvol>=1.5:
+        sig, reason="BREAKDOWN",f"Completed close below swing support {support:.2f}; body {body:.0%}; RVOL {rvol:.2f}x"
     else:
-        signal, reason = "WAIT", f"No confirmed close/volume break; RVOL {rvol:.2f}x"
-    return {"Breakout Signal": signal,
-            "Breakout Level": round(resistance, 2) if np.isfinite(resistance) else None,
-            "Breakdown Level": round(support, 2) if np.isfinite(support) else None,
-            "Breakout Reason": reason}
+        sig, reason="WAIT",f"No confirmed range break; body {body:.0%}; RVOL {rvol:.2f}x"
+    return {"Breakout Signal":sig,"Breakout Level":round(resistance,2),
+            "Breakdown Level":round(support,2),"Breakout Reason":reason}
 
+
+def _multi_tf_breakout(frames):
+    """A single timeframe trigger is provisional; require 2/3 aligned TFs for confirmation."""
+    checks={tf:_breakout_breakdown_signal(frames.get(tf,pd.DataFrame())) for tf in TIMEFRAMES}
+    ups=sum(v["Breakout Signal"]=="BREAKOUT" for v in checks.values())
+    dns=sum(v["Breakout Signal"]=="BREAKDOWN" for v in checks.values())
+    if ups>=2 and dns==0: signal="BREAKOUT CONFIRMED"
+    elif dns>=2 and ups==0: signal="BREAKDOWN CONFIRMED"
+    elif ups or dns: signal="PROVISIONAL — WAIT"
+    else: signal="WAIT"
+    return {"Multi-TF Breakout":signal,
+            "5M Breakout":checks["5M"]["Breakout Signal"],
+            "15M Breakout":checks["15M"]["Breakout Signal"],
+            "1H Breakout":checks["1H"]["Breakout Signal"]}
+
+
+def _breakout_retest_confirmation(df, level, direction, tolerance_pct=0.003):
+    """Detect a recent retest and hold/rejection of the breakout level."""
+    if df is None or len(df)<3 or level is None or not np.isfinite(_safe_num(level,np.nan)):
+        return "WAIT — NO RETEST DATA"
+    recent=df.tail(3)
+    tol=abs(float(level))*tolerance_pct
+    if direction=="UP":
+        touched=bool((recent["Low"].astype(float)<=float(level)+tol).any())
+        held=float(recent["Close"].iloc[-1])>float(level)
+        return "RETEST HELD" if touched and held else "WAIT — RETEST NOT CONFIRMED"
+    if direction=="DOWN":
+        touched=bool((recent["High"].astype(float)>=float(level)-tol).any())
+        held=float(recent["Close"].iloc[-1])<float(level)
+        return "RETEST REJECTED" if touched and held else "WAIT — RETEST NOT CONFIRMED"
+    return "WAIT — NO BREAKOUT"
 
 def _cached_candles_are_fresh(frame, minutes, now=None):
     """Avoid a Yahoo request when SQLite already contains the latest completed bar."""
@@ -964,11 +1001,21 @@ def _make_result_row(symbol, yahoo_symbol, payload):
     # Keep simple unprefixed fields for the main report, using 15M as the reference.
     row.update(_liquidity_levels_and_sweeps(frame_15m))
     row.update(_breakout_breakdown_signal(frame_15m))
+    row.update(_multi_tf_breakout(frames))
+    main_break = row.get("Breakout Signal", "WAIT")
+    if main_break == "BREAKOUT":
+        row["Breakout Retest"] = _breakout_retest_confirmation(frame_15m, row.get("Breakout Level"), "UP")
+    elif main_break == "BREAKDOWN":
+        row["Breakout Retest"] = _breakout_retest_confirmation(frame_15m, row.get("Breakdown Level"), "DOWN")
+    else:
+        row["Breakout Retest"] = "WAIT — NO 15M BREAK"
     # Explicit event label is separate from the trend consensus. A sweep is a
     # liquidity event, not an automatic BUY/SELL entry; breakout needs confirmation.
     sweep_detail = str(row.get("Liquidity Sweep Detail", ""))
-    if row.get("Breakout Signal") in ("BREAKOUT", "BREAKDOWN"):
-        row["Action Signal"] = row["Breakout Signal"]
+    if row.get("Multi-TF Breakout") == "BREAKOUT CONFIRMED":
+        row["Action Signal"] = "BREAKOUT"
+    elif row.get("Multi-TF Breakout") == "BREAKDOWN CONFIRMED":
+        row["Action Signal"] = "BREAKDOWN"
     elif row.get("Upside Sweep") == "YES":
         row["Action Signal"] = "SWEEP UP"
     elif row.get("Downside Sweep") == "YES":
@@ -1596,7 +1643,88 @@ def show_ai_multi_agent_scanner(client=None):
             buffer = io.BytesIO()
             with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
                 result.to_excel(writer, index=False, sheet_name="AI Scanner")
-            xlsx_bytes = buffer.getvalue()
+                # A separate first sheet makes the downloaded workbook open as a dashboard.
+                counts = result.get("Action Signal", pd.Series(dtype=str)).fillna("WAIT").value_counts()
+                dash_rows = [
+                    ["AI MULTI-AGENT SCANNER DASHBOARD", ""],
+                    ["Generated (IST)", stamp.strftime("%Y-%m-%d %H:%M:%S IST")],
+                    ["Total Stocks Scanned", int(len(result))],
+                    ["BUY", int(counts.get("BUY", 0))],
+                    ["SELL", int(counts.get("SELL", 0))],
+                    ["SWEEP UP", int(counts.get("SWEEP UP", 0))],
+                    ["SWEEP DOWN", int(counts.get("SWEEP DOWN", 0))],
+                    ["BREAKOUT", int(counts.get("BREAKOUT", 0))],
+                    ["BREAKDOWN", int(counts.get("BREAKDOWN", 0))],
+                    ["WAIT", int(counts.get("WAIT", 0))],
+                    ["", ""],
+                    ["TOP QUALIFIED STOCKS", ""],
+                ]
+                dashboard = pd.DataFrame(dash_rows, columns=["Metric", "Value"])
+                dashboard.to_excel(writer, index=False, header=False, sheet_name="Dashboard", startrow=0)
+                top_cols = [c for c in ["Symbol", "Action Signal", "Final Signal", "Best Stock Score", "Confirmation Strength %", "Last Price", "Breakout Signal", "Multi-TF Breakout", "Breakout Retest"] if c in result.columns]
+                top = result.copy()
+                if "Best Stock Filter" in top.columns:
+                    top = top[top["Best Stock Filter"] == "PASS"]
+                if "Best Stock Score" in top.columns:
+                    top = top.sort_values("Best Stock Score", ascending=False)
+                top[top_cols].head(15).to_excel(writer, index=False, sheet_name="Dashboard", startrow=len(dash_rows)+1)
+                from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+                from openpyxl.formatting.rule import CellIsRule
+                wb = writer.book
+                ws = wb["Dashboard"]
+                ws.freeze_panes = "A3"
+                ws.column_dimensions["A"].width = 30
+                ws.column_dimensions["B"].width = 34
+                for col in range(3, max(ws.max_column, 2)+1):
+                    ws.column_dimensions[chr(64+col)].width = 22
+                ws.merge_cells("A1:B1")
+                ws["A1"].font = Font(bold=True, size=16, color="FFFFFF")
+                ws["A1"].fill = PatternFill("solid", fgColor="17365D")
+                ws["A1"].alignment = Alignment(horizontal="center")
+                ws[2][0].font = Font(bold=True, color="17365D")
+                ws[3][0].font = Font(bold=True, color="17365D")
+                # Style the dashboard metric labels and the top-stocks header.
+                for r in range(3, 11):
+                    ws.cell(r,1).font = Font(bold=True)
+                header_row = len(dash_rows)+2
+                for cell in ws[header_row]:
+                    cell.font = Font(bold=True, color="FFFFFF")
+                    cell.fill = PatternFill("solid", fgColor="305496")
+                for row_cells in ws.iter_rows(min_row=header_row+1):
+                    for cell in row_cells:
+                        cell.alignment = Alignment(vertical="center")
+                from openpyxl.chart import BarChart, Reference
+                chart = BarChart()
+                chart.type = "bar"
+                chart.style = 10
+                chart.title = "Signal Counts"
+                chart.y_axis.title = "Signal"
+                chart.x_axis.title = "Stocks"
+                chart.height, chart.width = 7, 12
+                chart.add_data(Reference(ws, min_col=2, min_row=4, max_row=10), titles_from_data=False)
+                chart.set_categories(Reference(ws, min_col=1, min_row=4, max_row=10))
+                ws.add_chart(chart, "D3")
+                # Main scanner report: filters, freeze panes, readable widths and colored signals.
+                report = wb["AI Scanner"]
+                report.freeze_panes = "A2"
+                report.auto_filter.ref = report.dimensions
+                for cell in report[1]:
+                    cell.font = Font(bold=True, color="FFFFFF")
+                    cell.fill = PatternFill("solid", fgColor="17365D")
+                    cell.alignment = Alignment(wrap_text=True, vertical="center")
+                report.row_dimensions[1].height = 32
+                for col_cells in report.columns:
+                    letter = col_cells[0].column_letter
+                    header = str(col_cells[0].value or "")
+                    report.column_dimensions[letter].width = min(max(len(header)+2, 13), 28)
+                headers = {str(c.value): c.column for c in report[1]}
+                for key in ("Action Signal", "Final Signal", "Breakout Signal", "Multi-TF Breakout"):
+                    if key in headers:
+                        col_letter = report.cell(1, headers[key]).column_letter
+                        report.conditional_formatting.add(f"{col_letter}2:{col_letter}{report.max_row}",
+                            CellIsRule(operator="equal", formula=['"BUY"'], fill=PatternFill("solid", fgColor="C6EFCE")))
+                # Open the workbook on the Dashboard sheet by default.
+                wb._sheets = [wb["Dashboard"], wb["AI Scanner"]]
         except Exception as exc:
             xlsx_error = str(exc)
 
@@ -1635,6 +1763,7 @@ def show_ai_multi_agent_scanner(client=None):
     liquidity_defaults = {
         "Buy-side Liquidity": None, "Sell-side Liquidity": None,
         "Upside Sweep": "NO DATA", "Downside Sweep": "NO DATA",
+        "Equal High Liquidity": "NO DATA", "Equal Low Liquidity": "NO DATA",
         "Liquidity Sweep Detail": "Run a fresh scan for liquidity levels",
     }
     for tf in TIMEFRAMES:
@@ -1648,7 +1777,9 @@ def show_ai_multi_agent_scanner(client=None):
     new_signal_defaults = {
         "Breakout Signal": "WAIT", "Breakout Level": None,
         "Breakdown Level": None, "Breakout Reason": "Run a fresh scan",
-        "Action Signal": "WAIT",
+        "Action Signal": "WAIT", "Multi-TF Breakout": "WAIT",
+        "5M Breakout": "WAIT", "15M Breakout": "WAIT", "1H Breakout": "WAIT",
+        "Breakout Retest": "WAIT — NO RETEST DATA",
     }
     for col_name, default_value in new_signal_defaults.items():
         if col_name not in result.columns:
@@ -1755,7 +1886,7 @@ def show_ai_multi_agent_scanner(client=None):
 
     view = view.sort_values(["20M Pre-Move Score", "Confirmation Strength %"], ascending=[False, False])
     summary_cols = [
-        "Symbol", "Final Signal", "Action Signal", "Breakout Signal", "Breakout Level", "Breakdown Level", "Breakout Reason", "Direction Movement", "Signal Time (IST)",
+        "Symbol", "Final Signal", "Action Signal", "Breakout Signal", "Multi-TF Breakout", "5M Breakout", "15M Breakout", "1H Breakout", "Breakout Retest", "Breakout Level", "Breakdown Level", "Breakout Reason", "Equal High Liquidity", "Equal Low Liquidity", "Direction Movement", "Signal Time (IST)",
         "5M Candle Close (IST)", "15M Candle Close (IST)", "1H Candle Close (IST)",
         "Entry Price", "Stop Loss", "15M ATR",
         "Confirmation Strength %", "Consensus Score",
