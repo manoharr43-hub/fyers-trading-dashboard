@@ -14,4 +14,4 @@ python-dotenv>=1.0.0
 xgboost>=2.1.0
 yfinance>=0.2.40
 streamlit-paste-button
-scikit-learn
+scikit-learn>=1.4.0
