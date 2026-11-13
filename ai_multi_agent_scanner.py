@@ -13,6 +13,7 @@ Yahoo Finance batch edition — revised.
 requirements.txt:
     yfinance>=0.2.50
     openpyxl>=3.1.0
+    scikit-learn>=1.4.0  # optional at import; required to train the Real AI Brain
 """
 
 import io
@@ -1137,6 +1138,15 @@ def _make_result_row(symbol, yahoo_symbol, payload):
         "1H Candles": analyses["1H"]["candles"], "Last Price": analyses["15M"]["close"],
         "15M RSI": analyses["15M"]["rsi"], "Errors": " | ".join(payload.get("errors", [])),
     }
+    # Causal 5M features are shared by the ML training and inference paths.
+    ml_features = _real_ai_feature_frame(frame_5m)
+    if not ml_features.empty:
+        for feature_name in AI_FEATURE_COLUMNS:
+            value = ml_features[feature_name].iloc[-1]
+            row[feature_name] = float(value) if pd.notna(value) else None
+    else:
+        for feature_name in AI_FEATURE_COLUMNS:
+            row[feature_name] = None
     row.update(_early_20m_analysis(payload.get("early_1m", pd.DataFrame())))
     row.update(_prebig_5m_analysis(frame_5m))
     for tf in TIMEFRAMES:
@@ -1756,15 +1766,212 @@ def _scan_job_start_worker(job_id):
         return True
 
 
+
+
+# ============================================================
+# REAL AI BRAIN — supervised ML layer (additive; keeps 17 agents)
+# The 17 agents remain transparent technical feature generators.
+# This model learns 3-bar forward direction from saved completed 5M candles.
+# It is NOT an LLM and does not guarantee future performance.
+# ============================================================
+AI_FEATURE_COLUMNS = [
+    "AI Ret 1", "AI Ret 3", "AI Ret 6", "AI Momentum 10",
+    "AI Range %", "AI Body %", "AI Close Location", "AI RVOL 20",
+    "AI EMA Gap %", "AI RSI", "AI Volume Change", "AI ATR %",
+    "AI Compression", "AI VWAP Gap %",
+]
+AI_LABELS = {0: "DOWN", 1: "SIDEWAYS", 2: "UP"}
+
+
+def _real_ai_feature_frame(frame):
+    """Causal features only: each row uses that candle and earlier candles."""
+    cols = ["Open", "High", "Low", "Close", "Volume"]
+    if frame is None or frame.empty or not set(cols).issubset(frame.columns):
+        return pd.DataFrame(columns=AI_FEATURE_COLUMNS)
+    d = frame.copy()
+    for col in cols:
+        d[col] = pd.to_numeric(d[col], errors="coerce")
+    o, h, l, c, v = (d[x] for x in cols)
+    prev = c.shift(1)
+    tr = pd.concat([(h-l), (h-prev).abs(), (l-prev).abs()], axis=1).max(axis=1)
+    atr = tr.rolling(14, min_periods=7).mean()
+    avg_vol = v.shift(1).rolling(20, min_periods=8).mean()
+    ema9 = c.ewm(span=9, adjust=False).mean()
+    ema21 = c.ewm(span=21, adjust=False).mean()
+    typical = (h + l + c) / 3
+    cum_pv = (typical * v).groupby(
+        d["Time"].dt.date if "Time" in d.columns else pd.Series(0, index=d.index)
+    ).cumsum()
+    cum_v = v.groupby(
+        d["Time"].dt.date if "Time" in d.columns else pd.Series(0, index=d.index)
+    ).cumsum().replace(0, np.nan)
+    session_vwap = cum_pv / cum_v
+    candle_range = (h-l).replace(0, np.nan)
+    close_loc = ((c-l) / candle_range).clip(0, 1)
+    vol_ratio = v / avg_vol.replace(0, np.nan)
+    range_pct = (h-l) / c.replace(0, np.nan) * 100
+    rolling_range = (h.rolling(10, min_periods=5).max() -
+                     l.rolling(10, min_periods=5).min()) / c.replace(0, np.nan) * 100
+    prior_range = (h.rolling(30, min_periods=15).max() -
+                   l.rolling(30, min_periods=15).min()) / c.replace(0, np.nan) * 100
+    out = pd.DataFrame(index=d.index)
+    out["AI Ret 1"] = c.pct_change(1) * 100
+    out["AI Ret 3"] = c.pct_change(3) * 100
+    out["AI Ret 6"] = c.pct_change(6) * 100
+    out["AI Momentum 10"] = c.pct_change(10) * 100
+    out["AI Range %"] = range_pct
+    out["AI Body %"] = (c-o) / c.replace(0, np.nan) * 100
+    out["AI Close Location"] = close_loc
+    out["AI RVOL 20"] = vol_ratio.clip(0, 10)
+    out["AI EMA Gap %"] = (ema9-ema21) / c.replace(0, np.nan) * 100
+    out["AI RSI"] = _rsi(c) / 100.0
+    out["AI Volume Change"] = v.pct_change().replace([np.inf, -np.inf], np.nan).clip(-5, 5)
+    out["AI ATR %"] = atr / c.replace(0, np.nan) * 100
+    out["AI Compression"] = rolling_range / prior_range.replace(0, np.nan)
+    out["AI VWAP Gap %"] = (c-session_vwap) / c.replace(0, np.nan) * 100
+    return out.replace([np.inf, -np.inf], np.nan)
+
+
+def _real_ai_training_data():
+    """Build time-labelled examples from SQLite 5M candles; future bars are labels only."""
+    samples = []
+    try:
+        with _memory_connect() as conn:
+            symbols = [r[0] for r in conn.execute(
+                "SELECT DISTINCT symbol FROM candles WHERE timeframe='5M'"
+            ).fetchall()]
+            for symbol in symbols:
+                rows = conn.execute(
+                    """SELECT candle_time,open,high,low,close,volume FROM candles
+                       WHERE symbol=? AND timeframe='5M' ORDER BY candle_time""",
+                    (symbol,),
+                ).fetchall()
+                if len(rows) < 45:
+                    continue
+                d = pd.DataFrame(rows, columns=["Time","Open","High","Low","Close","Volume"])
+                d["Time"] = pd.to_datetime(d["Time"], errors="coerce", utc=True)
+                feat = _real_ai_feature_frame(d)
+                future_return = d["Close"].shift(-3) / d["Close"] - 1
+                label = pd.Series(np.where(future_return > 0.0025, 2,
+                                  np.where(future_return < -0.0025, 0, 1)), index=d.index)
+                valid = feat.notna().all(axis=1) & future_return.notna()
+                part = feat.loc[valid].copy()
+                part["__label"] = label.loc[valid].astype(int)
+                part["__time"] = d.loc[valid, "Time"].values
+                part["__target_time"] = d["Time"].shift(-3).loc[valid].values
+                samples.append(part)
+    except Exception:
+        return pd.DataFrame()
+    if not samples:
+        return pd.DataFrame()
+    data = pd.concat(samples, ignore_index=True)
+    return data.sort_values("__time").reset_index(drop=True)
+
+
+def _train_real_ai_brain(force=False):
+    """Train a time-ordered RandomForest model; optional sklearn dependency."""
+    try:
+        from sklearn.ensemble import RandomForestClassifier
+        from sklearn.metrics import accuracy_score, balanced_accuracy_score
+    except Exception as exc:
+        return None, f"scikit-learn unavailable: {exc}"
+    data = _real_ai_training_data()
+    if len(data) < 500:
+        return None, f"Training data insufficient: {len(data)} labelled samples; need at least 500."
+    X = data[AI_FEATURE_COLUMNS].astype(float)
+    y = data["__label"].astype(int)
+    split = int(len(data) * 0.80)
+    if split < 300 or len(data)-split < 100:
+        return None, "Need at least 300 training rows and 100 later test rows."
+    cutoff_time = pd.to_datetime(data.iloc[split]["__time"], utc=True)
+    # Purge training samples whose 3-candle label horizon crosses into test time.
+    train_mask = pd.to_datetime(data["__target_time"], utc=True) < cutoff_time
+    test_mask = pd.to_datetime(data["__time"], utc=True) >= cutoff_time
+    X_train, X_test = X.loc[train_mask], X.loc[test_mask]
+    y_train, y_test = y.loc[train_mask], y.loc[test_mask]
+    if len(X_train) < 300 or len(X_test) < 100:
+        return None, "After purging the 3-candle boundary, need 300 train and 100 test rows."
+    if y_train.nunique() < 3 or y_test.nunique() < 2:
+        return None, "Historical labels do not contain enough direction classes."
+    model = RandomForestClassifier(
+        n_estimators=220, max_depth=8, min_samples_leaf=5,
+        class_weight="balanced_subsample", random_state=42, n_jobs=-1,
+    )
+    model.fit(X_train, y_train)
+    predicted = model.predict(X_test)
+    metrics = {
+        "samples": int(len(data)), "train_samples": int(len(X_train)),
+        "test_samples": int(len(X_test)),
+        "accuracy": float(accuracy_score(y_test, predicted)),
+        "balanced_accuracy": float(balanced_accuracy_score(y_test, predicted)),
+        "trained_at": datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST"),
+    }
+    return {"model": model, "metrics": metrics}, None
+
+
+def _apply_real_ai_brain(result):
+    """Attach model probabilities without overwriting the 17-agent final signal."""
+    result = result.copy()
+    for col, default in (
+        ("AI Direction", "NOT TRAINED"), ("AI Up Probability %", None),
+        ("AI Down Probability %", None), ("AI Sideways Probability %", None),
+        ("AI Brain Signal", "MODEL NOT TRAINED"), ("AI Model Status", "NOT TRAINED"),
+    ):
+        if col not in result.columns:
+            result[col] = default
+    bundle = st.session_state.get("ma_real_ai_model")
+    if not bundle:
+        return result
+    model = bundle["model"]
+    for idx, row in result.iterrows():
+        try:
+            x = pd.DataFrame([[float(row.get(c)) for c in AI_FEATURE_COLUMNS]],
+                             columns=AI_FEATURE_COLUMNS)
+            if x.isna().any(axis=None):
+                continue
+            probs = model.predict_proba(x)[0]
+            classes = list(model.classes_)
+            p = {int(k): float(v) for k, v in zip(classes, probs)}
+            down, sideways, up = p.get(0, 0.0), p.get(1, 0.0), p.get(2, 0.0)
+            values = {"DOWN": down, "SIDEWAYS": sideways, "UP": up}
+            direction = max(values, key=values.get)
+            confidence = values[direction]
+            result.at[idx, "AI Direction"] = direction
+            result.at[idx, "AI Down Probability %"] = round(down*100, 1)
+            result.at[idx, "AI Sideways Probability %"] = round(sideways*100, 1)
+            result.at[idx, "AI Up Probability %"] = round(up*100, 1)
+            result.at[idx, "AI Model Status"] = "TRAINED"
+            technical = str(row.get("Final Signal", "WAIT")).upper()
+            metrics = bundle["metrics"]
+            reliable = metrics.get("balanced_accuracy", 0) >= 0.40
+            if not reliable:
+                brain_signal = "WATCH — VALIDATION WEAK"
+            elif confidence < 0.55:
+                brain_signal = "WATCH — LOW MODEL CONFIDENCE"
+            elif direction == "UP" and technical in ("BUY", "PRE-BIG BUY"):
+                brain_signal = "AI BUY"
+            elif direction == "DOWN" and technical in ("SELL", "PRE-BIG SELL"):
+                brain_signal = "AI SELL"
+            elif direction in ("UP", "DOWN"):
+                brain_signal = "WATCH — TECHNICAL CONFLICT"
+            else:
+                brain_signal = "WATCH — SIDEWAYS"
+            result.at[idx, "AI Brain Signal"] = brain_signal
+        except Exception:
+            continue
+    return result
+
+
+
 def show_ai_multi_agent_scanner(client=None):
     """Streamlit page. client is retained for app.py compatibility."""
-    st.title("🤖 AI Multi-Agent Scanner V18 — Yahoo Batch")
-    st.caption("17 OHLCV agents × 5M / 15M / 1H + 18th Best Stock Analyst + optional 1M / News")
+    st.title("🤖 AI Multi-Agent Scanner V17 — 17 Agents + Real AI Brain Hybrid")
+    st.caption("17 OHLCV agents × 5M / 15M / 1H + supervised ML AI Brain + optional 1M / News")
     st.info("scanner.py supplies NSE/F&O symbols only (unchanged). Yahoo Finance supplies candles. FYERS is used only for 5-level Market Depth on the technical shortlist.")
     st.caption("Smart Memory: SQLite candles are loaded first; after the initial warm-up, the scanner refreshes a short 2-day overlap and merges it with saved candles. For speed, the extra 1M/20M scan is optional.")
     st.warning(
         "Yahoo intraday data may be delayed, missing or rate-limited. "
-        "Confirmation Strength is a heuristic consensus score, not a probability or win rate."
+        "17-Agent Confirmation Strength is a heuristic score, not a probability. ML probabilities are shown separately and only after historical validation."
     )
     if yf is None:
         st.error("Missing dependency: add yfinance>=0.2.50 to requirements.txt and redeploy.")
@@ -1782,7 +1989,7 @@ def show_ai_multi_agent_scanner(client=None):
     with c2:
         batch_size = st.selectbox("Batch size", [10, 25, 50, 75, 100], index=1, key="ma_batch_size_v18", help="Local PC: 25 is the safer default for NSE. Completed batches are checkpointed and can resume.")
     with c3:
-        st.metric("Analysis", "18 Agents + Ranking")
+        st.metric("Analysis", "17 Agents + ML Brain")
 
     try:
         if universe == "Both (NSE + F&O)":
@@ -2198,8 +2405,90 @@ def show_ai_multi_agent_scanner(client=None):
         f"• batches {info.get('batches', '')} • {info.get('completed_at', '')}"
     )
 
+    # Real AI Brain training uses saved, completed 5M candles and chronological holdout.
+    st.subheader("🧠 REAL AI BRAIN — Hybrid ML")
+    ai_col1, ai_col2 = st.columns(2)
+    with ai_col1:
+        train_ai_now = st.button("🧠 TRAIN / REFRESH REAL AI BRAIN", key="ma_train_real_ai")
+    with ai_col2:
+        ai_bundle = st.session_state.get("ma_real_ai_model")
+        if ai_bundle:
+            st.metric("AI Balanced Accuracy (time holdout)", f"{ai_bundle['metrics']['balanced_accuracy']*100:.1f}%")
+        else:
+            st.metric("AI Model", "NOT TRAINED")
+    if train_ai_now or "ma_real_ai_model" not in st.session_state:
+        with st.spinner("Training ML Brain from saved completed 5M candles..."):
+            trained_bundle, train_error = _train_real_ai_brain(force=True)
+        if trained_bundle:
+            st.session_state["ma_real_ai_model"] = trained_bundle
+            st.session_state["ma_real_ai_train_error"] = None
+            st.success(
+                f"AI Brain trained: {trained_bundle['metrics']['samples']:,} samples • "
+                f"test balanced accuracy {trained_bundle['metrics']['balanced_accuracy']*100:.1f}% "
+                f"• trained {trained_bundle['metrics']['trained_at']}"
+            )
+        else:
+            st.session_state["ma_real_ai_model"] = None
+            st.session_state["ma_real_ai_train_error"] = train_error
+    ai_bundle = st.session_state.get("ma_real_ai_model")
+    if ai_bundle:
+        st.caption(
+            f"Chronological 80/20 validation • {ai_bundle['metrics']['train_samples']:,} train / "
+            f"{ai_bundle['metrics']['test_samples']:,} test • accuracy "
+            f"{ai_bundle['metrics']['accuracy']*100:.1f}% • balanced accuracy "
+            f"{ai_bundle['metrics']['balanced_accuracy']*100:.1f}%. "
+            "Targets: next 3 completed 5M candles; ±0.25% deadband. RF vote fractions are uncalibrated model estimates, not true odds or a guaranteed win rate."
+        )
+        result = _apply_real_ai_brain(result)
+        st.session_state["multi_agent_results"] = result
+        # Refresh both downloads so the newly generated AI Brain fields are included.
+        st.session_state["multi_agent_csv"] = result.to_csv(index=False).encode("utf-8-sig")
+        try:
+            from openpyxl import load_workbook
+            existing_xlsx = st.session_state.get("multi_agent_xlsx")
+            if existing_xlsx:
+                wb_ai = load_workbook(io.BytesIO(existing_xlsx))
+                if "AI Scanner" in wb_ai.sheetnames:
+                    ws_ai = wb_ai["AI Scanner"]
+                    header_map = {str(cell.value): cell.column for cell in ws_ai[1]}
+                    ai_export_cols = [
+                        "AI Direction", "AI Up Probability %", "AI Down Probability %",
+                        "AI Sideways Probability %", "AI Brain Signal", "AI Model Status",
+                    ]
+                    for col_name in ai_export_cols:
+                        if col_name not in header_map:
+                            new_col = ws_ai.max_column + 1
+                            ws_ai.cell(1, new_col, col_name)
+                            header_map[col_name] = new_col
+                    symbol_col = header_map.get("Symbol", 1)
+                    row_lookup = {
+                        str(ws_ai.cell(r, symbol_col).value): r
+                        for r in range(2, ws_ai.max_row + 1)
+                    }
+                    for _, ai_row in result.iterrows():
+                        target_row = row_lookup.get(str(ai_row.get("Symbol", "")))
+                        if not target_row:
+                            continue
+                        for col_name in ai_export_cols:
+                            ws_ai.cell(target_row, header_map[col_name],
+                                       None if pd.isna(ai_row.get(col_name)) else ai_row.get(col_name))
+                    out_buffer = io.BytesIO()
+                    wb_ai.save(out_buffer)
+                    st.session_state["multi_agent_xlsx"] = out_buffer.getvalue()
+        except Exception as ai_export_exc:
+            st.session_state["multi_agent_xlsx_error"] = f"AI export update: {ai_export_exc}"
+        ai_cols = ["Symbol", "AI Direction", "AI Up Probability %", "AI Down Probability %",
+                   "AI Sideways Probability %", "AI Brain Signal", "Final Signal"]
+        st.dataframe(result[ai_cols].head(30), hide_index=True, **_stretch())
+    else:
+        st.warning(
+            "Real AI Brain is not active: " +
+            str(st.session_state.get("ma_real_ai_train_error") or "training data not available") +
+            " Collect more completed 5M candle history and press TRAIN / REFRESH."
+        )
+
     # 18th Agent report: rank only qualified, actionable stocks.
-    st.subheader("🏆 BEST PERFORMANCE STOCKS — 18th Agent")
+    st.subheader("🏆 BEST PERFORMANCE STOCKS — 18th Ranking Analyst")
     min_best_score = st.selectbox(
         "Minimum Best Stock Score", [75, 80, 85, 90], index=0, key="ma_best_min_score"
     )
@@ -2286,6 +2575,8 @@ def show_ai_multi_agent_scanner(client=None):
         "5M Buy-side Liquidity", "5M Sell-side Liquidity", "5M Upside Sweep", "5M Downside Sweep",
         "15M Buy-side Liquidity", "15M Sell-side Liquidity", "15M Upside Sweep", "15M Downside Sweep",
         "1H Buy-side Liquidity", "1H Sell-side Liquidity", "1H Upside Sweep", "1H Downside Sweep",
+        "AI Direction", "AI Up Probability %", "AI Down Probability %",
+        "AI Sideways Probability %", "AI Brain Signal", "AI Model Status",
         "18th Agent", "Best Stock Score", "Best Stock Side", "Best Stock Grade",
         "Best Stock Filter", "Best Stock Reason",
         "20M Status", "20M Direction", "20M Pre-Move Score", "20M Range High", "20M Range Low",
@@ -2329,7 +2620,7 @@ def show_ai_multi_agent_scanner(client=None):
         )
     else:
         st.info("No BUY / SELL / PRE-BIG shortlist rows yet, or Market Depth has not been requested.")
-    st.caption("CSV/Excel include all 51 timeframe-agent outputs plus the 18th Best Stock Analyst report and each agent reason. 5M PRE-BIG fields are calculated in the core scan; 20M early-movement fields need the optional 1M scan.")
+    st.caption("CSV/Excel include all 51 timeframe-agent outputs, the Real AI Brain fields and the 18th Best Stock Analyst report and each agent reason. 5M PRE-BIG fields are calculated in the core scan; 20M early-movement fields need the optional 1M scan.")
     st.caption("Signal Time = latest completed 15M candle close (IST). Entry = 15M close. Stop Loss = 1.5 × 15M ATR; shown only for BUY/SELL and PRE-BIG signals.")
 
     file_stamp = info.get("file_stamp", datetime.now(IST).strftime("%Y%m%d_%H%M%S"))
@@ -2359,9 +2650,12 @@ def show_ai_multi_agent_scanner(client=None):
                 hide_index=True, **_stretch(),
             )
 
-    with st.expander("18 Agents — logic and limitations"):
+    with st.expander("17 Agents + Real AI Brain — logic and limitations"):
         st.write(
             "The first 17 agents are deterministic OHLCV rule engines on 5M, 15M and 1H candles. "
+            "The Real AI Brain is a separate supervised RandomForest model trained from saved 5M candles; "
+            "it predicts the next 3-candle direction using a purged chronological holdout. "
+            "Its class vote fractions are uncalibrated model estimates, not calibrated probabilities. "
             "The 18th Best Stock Analyst ranks actionable signals using timeframe alignment, "
             "agent agreement, volume, structure and optional FYERS depth. It is a transparent "
             "screening score, not a probability or an independent AI language model. News is a separate keyword-based "
