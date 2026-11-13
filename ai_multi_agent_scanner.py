@@ -505,6 +505,89 @@ def _liquidity_levels_and_sweeps(df, lookback=30):
     }
 
 
+def _liquidity_volume_trend_intelligence(frame_15m, trend_5m, trend_15m, trend_1h,
+                                         sweep_data, breakout_data, multi_breakout):
+    """Combine a completed 15M liquidity sweep, relative volume and 5M/15M/1H trend.
+
+    Sweep direction is interpreted as a reversal clue: upside/buy-side sweep ->
+    bearish rejection (SELL bias); downside/sell-side sweep -> bullish rejection (BUY bias).
+    A sweep alone is never treated as an entry signal.
+    """
+    out = {
+        "LVT Event": "NO DATA", "LVT RVOL": None, "LVT Volume Status": "NO DATA",
+        "LVT Trend": "NO DATA", "LVT Trend Alignment": "0/3",
+        "LVT Direction": "WAIT", "LVT Score": 0, "LVT Status": "WAIT",
+        "LVT Reason": "Insufficient 15M candle data",
+    }
+    if frame_15m is None or not isinstance(frame_15m, pd.DataFrame) or len(frame_15m) < 22:
+        return out
+    d = frame_15m.tail(22).copy()
+    last = d.iloc[-1]
+    prior_vol = pd.to_numeric(d["Volume"].iloc[:-1], errors="coerce").tail(20).mean()
+    last_vol = _safe_num(last.get("Volume"), 0.0)
+    rvol = last_vol / prior_vol if pd.notna(prior_vol) and prior_vol > 0 else 0.0
+    if rvol >= 3.0:
+        volume_status = "EXTREME VOLUME"
+    elif rvol >= 2.0:
+        volume_status = "BIG VOLUME"
+    elif rvol >= 1.5:
+        volume_status = "HIGH VOLUME"
+    else:
+        volume_status = "NORMAL VOLUME"
+
+    directions = [str(x or "WAIT").upper() for x in (trend_5m, trend_15m, trend_1h)]
+    event = "NO SWEEP"
+    direction = "WAIT"
+    expected = "WAIT"
+    if str(sweep_data.get("Downside Sweep", "NO")).upper() == "YES":
+        event, direction, expected = "SELL-SIDE LIQUIDITY SWEPT", "BUY", "BUY"
+    elif str(sweep_data.get("Upside Sweep", "NO")).upper() == "YES":
+        event, direction, expected = "BUY-SIDE LIQUIDITY SWEPT", "SELL", "SELL"
+
+    aligned = sum(1 for x in directions if x == expected) if expected != "WAIT" else 0
+    opposing = sum(1 for x in directions if x in ("BUY", "SELL") and x != expected) if expected != "WAIT" else 0
+    trend_label = ("STRONG UP" if directions == ["BUY", "BUY", "BUY"] else
+                   "STRONG DOWN" if directions == ["SELL", "SELL", "SELL"] else
+                   "MIXED / CONFLICT" if len(set(directions)) > 1 else directions[0])
+    breakout_ok = (
+        (expected == "BUY" and (breakout_data.get("Breakout Signal") == "BREAKOUT" or
+                                  multi_breakout == "BREAKOUT CONFIRMED")) or
+        (expected == "SELL" and (breakout_data.get("Breakout Signal") == "BREAKDOWN" or
+                                   multi_breakout == "BREAKDOWN CONFIRMED"))
+    )
+    volume_points = 25 if rvol >= 3 else 20 if rvol >= 2 else 12 if rvol >= 1.5 else 0
+    trend_points = {3: 35, 2: 25, 1: 12, 0: 0}.get(aligned, 0)
+    sweep_points = 25 if expected != "WAIT" else 0
+    breakout_points = 15 if breakout_ok else 0
+    score = min(100, volume_points + trend_points + sweep_points + breakout_points)
+
+    if expected == "WAIT":
+        status = "BIG VOLUME WATCH" if rvol >= 2 else "WAIT"
+        reason = "High volume without a confirmed liquidity sweep; direction not assumed"
+    elif breakout_ok and rvol >= 2 and aligned >= 2 and opposing == 0:
+        status = "CONFIRMED"
+        reason = "Liquidity sweep + big volume + aligned trend + completed breakout"
+    elif rvol >= 2 and aligned >= 2 and opposing == 0:
+        status = "STRONG WATCH"
+        reason = "Liquidity sweep + big volume + trend alignment; wait for breakout"
+    elif rvol >= 1.5 or aligned >= 2:
+        status = "WATCH"
+        reason = "Sweep detected; volume/trend confirmation is incomplete"
+    else:
+        status = "WAIT"
+        reason = "Sweep detected but big-volume and trend confirmation are missing"
+    if opposing:
+        status = "CONFLICT"
+        reason += f"; {opposing} timeframe(s) oppose the sweep direction"
+    out.update({
+        "LVT Event": event, "LVT RVOL": round(rvol, 2),
+        "LVT Volume Status": volume_status, "LVT Trend": trend_label,
+        "LVT Trend Alignment": f"{aligned}/3", "LVT Direction": direction,
+        "LVT Score": int(score), "LVT Status": status, "LVT Reason": reason,
+    })
+    return out
+
+
 def _breakout_breakdown_signal(df, lookback=20):
     """Require a completed candle close beyond the previous range with participation."""
     empty = {"Breakout Signal": "WAIT", "Breakout Level": None,
@@ -1058,6 +1141,11 @@ def _make_result_row(symbol, yahoo_symbol, payload):
     row.update(_liquidity_levels_and_sweeps(frame_15m))
     row.update(_breakout_breakdown_signal(frame_15m))
     row.update(_multi_tf_breakout(frames))
+    row.update(_liquidity_volume_trend_intelligence(
+        frame_15m, analyses["5M"]["direction"], analyses["15M"]["direction"],
+        analyses["1H"]["direction"], _liquidity_levels_and_sweeps(frame_15m),
+        _breakout_breakdown_signal(frame_15m), row.get("Multi-TF Breakout", "WAIT")
+    ))
     main_break = row.get("Breakout Signal", "WAIT")
     if main_break == "BREAKOUT":
         row["Breakout Retest"] = _breakout_retest_confirmation(frame_15m, row.get("Breakout Level"), "UP")
@@ -2010,6 +2098,8 @@ def show_ai_multi_agent_scanner(client=None):
                             CellIsRule(operator="equal", formula=['"BUY"'], fill=PatternFill("solid", fgColor="C6EFCE")))
                 # Open the workbook on the Dashboard sheet by default.
                 wb._sheets = [wb["Dashboard"], wb["AI Scanner"]]
+            # Persist the completed workbook bytes for Streamlit's Excel download button.
+            xlsx_bytes = buffer.getvalue()
         except Exception as exc:
             xlsx_error = str(exc)
 
@@ -2073,6 +2163,15 @@ def show_ai_multi_agent_scanner(client=None):
         "Breakout Retest": "WAIT — NO RETEST DATA",
     }
     for col_name, default_value in new_signal_defaults.items():
+        if col_name not in result.columns:
+            result[col_name] = default_value
+    lvt_defaults = {
+        "LVT Event": "NO DATA", "LVT RVOL": None, "LVT Volume Status": "NO DATA",
+        "LVT Trend": "NO DATA", "LVT Trend Alignment": "0/3",
+        "LVT Direction": "WAIT", "LVT Score": 0, "LVT Status": "WAIT",
+        "LVT Reason": "Run a fresh scan to calculate Liquidity + Volume + Trend Intelligence",
+    }
+    for col_name, default_value in lvt_defaults.items():
         if col_name not in result.columns:
             result[col_name] = default_value
     if "Depth Signal" not in result.columns:
@@ -2149,6 +2248,7 @@ def show_ai_multi_agent_scanner(client=None):
                 "ALL", "WATCH", "CONFIRMED BREAKOUT", "WAIT", "NO DATA",
                 "BUY LIQUIDITY", "SELL LIQUIDITY", "SWEEP UP", "SWEEP DOWN",
                 "BREAKOUT", "BREAKDOWN", "ACTION BUY", "ACTION SELL",
+                "LVT WATCH", "LVT STRONG WATCH", "LVT CONFIRMED", "LVT CONFLICT",
             ],
             key="ma_early_filter",
         )
@@ -2174,6 +2274,9 @@ def show_ai_multi_agent_scanner(client=None):
         view = view[view["Action Signal"] == "BUY"]
     elif early_filter == "ACTION SELL":
         view = view[view["Action Signal"] == "SELL"]
+    elif early_filter.startswith("LVT "):
+        lvt_status = early_filter.replace("LVT ", "")
+        view = view[view["LVT Status"] == lvt_status]
 
     view = view.sort_values(["20M Pre-Move Score", "Confirmation Strength %"], ascending=[False, False])
     summary_cols = [
@@ -2182,6 +2285,8 @@ def show_ai_multi_agent_scanner(client=None):
         "Entry Price", "Stop Loss", "15M ATR",
         "Confirmation Strength %", "Consensus Score",
         "Buy-side Liquidity", "Sell-side Liquidity", "Upside Sweep", "Downside Sweep", "Liquidity Sweep Detail",
+        "LVT Event", "LVT RVOL", "LVT Volume Status", "LVT Trend", "LVT Trend Alignment",
+        "LVT Direction", "LVT Score", "LVT Status", "LVT Reason",
         "5M Buy-side Liquidity", "5M Sell-side Liquidity", "5M Upside Sweep", "5M Downside Sweep",
         "15M Buy-side Liquidity", "15M Sell-side Liquidity", "15M Upside Sweep", "15M Downside Sweep",
         "1H Buy-side Liquidity", "1H Sell-side Liquidity", "1H Upside Sweep", "1H Downside Sweep",
@@ -2196,6 +2301,18 @@ def show_ai_multi_agent_scanner(client=None):
         "Depth Imbalance %", "Depth Time (IST)", "Errors",
     ]
     st.dataframe(view[summary_cols], hide_index=True, **_stretch())
+
+    st.subheader("💧 Liquidity + Big Volume + Present Trend Intelligence")
+    lvt_view = result[result["LVT Status"].isin(["CONFIRMED", "STRONG WATCH", "WATCH", "CONFLICT", "BIG VOLUME WATCH"])].copy()
+    if not lvt_view.empty:
+        lvt_view = lvt_view.sort_values(["LVT Score", "LVT RVOL"], ascending=[False, False])
+        lvt_cols = ["Symbol", "LVT Event", "LVT RVOL", "LVT Volume Status", "LVT Trend",
+                    "LVT Trend Alignment", "LVT Direction", "LVT Score", "LVT Status", "LVT Reason",
+                    "5M", "15M", "1H", "Breakout Signal", "Multi-TF Breakout", "Last Price"]
+        st.dataframe(lvt_view[lvt_cols], hide_index=True, **_stretch())
+    else:
+        st.info("No liquidity + big-volume + trend setup detected in the latest scan.")
+    st.caption("Sweep direction is a reversal clue, not an automatic trade. CONFIRMED requires a completed breakout aligned with big volume and timeframe trend. Yahoo candle volume is not exchange order-flow data.")
 
     st.subheader("📚 FYERS Live Market Depth — Shortlist Only")
     depth_view = st.session_state.get("multi_agent_depth")
@@ -2212,7 +2329,7 @@ def show_ai_multi_agent_scanner(client=None):
         )
     else:
         st.info("No BUY / SELL / PRE-BIG shortlist rows yet, or Market Depth has not been requested.")
-    st.caption("CSV/Excel include all 51 timeframe-agent outputs plus the 18th Best Stock Analyst report and each agent reason. 20M early-movement fields are populated when the optional 1M scan is enabled.")
+    st.caption("CSV/Excel include all timeframe-agent outputs, the 18th Best Stock Analyst, Liquidity + Big Volume + Trend Intelligence, and each agent reason. 20M fields populate when optional 1M scan is enabled.")
     st.caption("Signal Time = latest completed 15M candle close (IST). Entry = 15M close. Stop Loss = 1.5 × 15M ATR; shown only for BUY/SELL and PRE-BIG signals.")
 
     file_stamp = info.get("file_stamp", datetime.now(IST).strftime("%Y%m%d_%H%M%S"))
