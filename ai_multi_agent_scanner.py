@@ -16,14 +16,11 @@ requirements.txt:
 """
 
 import io
-import json
 import math
-import pickle
 import re
 import sqlite3
 import threading
 import time
-import uuid
 from pathlib import Path
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -59,8 +56,6 @@ SIGNAL_PRIORITY = {
     "WAIT": 2, "NO DATA": 3,
 }
 _YF_LOCK = threading.Lock()
-_SCAN_WORKERS = {}
-_SCAN_WORKERS_LOCK = threading.Lock()
 FYERS_DEPTH_CACHE_TTL = 20       # seconds; prevents repeated depth calls on Streamlit reruns
 FYERS_DEPTH_CALL_GAP = 1.05      # conservative one-call-per-second pacing
 FYERS_DEPTH_DEFAULT_LIMIT = 20  # configurable shortlist cap per scan
@@ -82,19 +77,6 @@ def _memory_connect():
         id INTEGER PRIMARY KEY AUTOINCREMENT, scanned_at TEXT NOT NULL,
         symbol TEXT NOT NULL, final_signal TEXT, direction_movement TEXT,
         last_price REAL, yahoo_signal_time TEXT)""")
-    # Durable scan checkpoints: completed symbol rows survive browser refresh,
-    # minimized tabs, Streamlit reruns and local app restarts.
-    conn.execute("""CREATE TABLE IF NOT EXISTS scan_jobs (
-        job_id TEXT PRIMARY KEY, status TEXT NOT NULL, config_json TEXT NOT NULL,
-        total_symbols INTEGER NOT NULL DEFAULT 0,
-        completed_symbols INTEGER NOT NULL DEFAULT 0,
-        created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
-        error TEXT)""")
-    conn.execute("""CREATE TABLE IF NOT EXISTS scan_job_rows (
-        job_id TEXT NOT NULL, symbol TEXT NOT NULL, ticker TEXT NOT NULL,
-        payload BLOB NOT NULL, saved_at TEXT NOT NULL,
-        PRIMARY KEY(job_id, symbol))""")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_scan_jobs_status ON scan_jobs(status, updated_at)")
     return conn
 
 def _save_candle_memory(batch, per_tf):
@@ -123,12 +105,6 @@ def _save_candle_memory(batch, per_tf):
             ON CONFLICT(symbol,timeframe,candle_time) DO UPDATE SET
             open=excluded.open, high=excluded.high, low=excluded.low,
             close=excluded.close, volume=excluded.volume, saved_at=excluded.saved_at""", records)
-        # Bound local DB growth: retain 8 days of optional 1M bars and 65 days
-        # of 5M/15M/1H bars (more than the longest configured Yahoo lookback).
-        cutoff_1m = (pd.Timestamp.now(tz=IST) - pd.Timedelta(days=8)).isoformat()
-        cutoff_core = (pd.Timestamp.now(tz=IST) - pd.Timedelta(days=65)).isoformat()
-        conn.execute("DELETE FROM candles WHERE timeframe='1M' AND candle_time < ?", (cutoff_1m,))
-        conn.execute("DELETE FROM candles WHERE timeframe!='1M' AND candle_time < ?", (cutoff_core,))
     return len(records)
 
 def _load_candle_memory(symbol, timeframe):
@@ -150,44 +126,6 @@ def _load_candle_memory(symbol, timeframe):
         return frame.sort_values("Time").drop_duplicates("Time", keep="last").reset_index(drop=True)
     except Exception:
         return pd.DataFrame(columns=["Time", "Open", "High", "Low", "Close", "Volume"])
-
-def _load_candle_memory_batch(symbols, timeframe):
-    """Load one timeframe for a batch using one SQLite query/connection."""
-    empty_cols = ["Time", "Open", "High", "Low", "Close", "Volume"]
-    symbols = [str(s) for s in symbols]
-    if not symbols:
-        return {}
-    try:
-        placeholders = ",".join("?" for _ in symbols)
-        with _memory_connect() as conn:
-            rows = conn.execute(
-                f"""SELECT symbol, candle_time, open, high, low, close, volume
-                    FROM candles
-                    WHERE timeframe=? AND symbol IN ({placeholders})
-                    ORDER BY symbol, candle_time""",
-                [str(timeframe)] + symbols,
-            ).fetchall()
-        grouped = {s: [] for s in symbols}
-        for row in rows:
-            grouped.setdefault(row[0], []).append(row[1:])
-        output = {}
-        for symbol in symbols:
-            data = grouped.get(symbol, [])
-            if not data:
-                output[symbol] = pd.DataFrame(columns=empty_cols)
-                continue
-            frame = pd.DataFrame(data, columns=empty_cols)
-            frame["Time"] = pd.to_datetime(frame["Time"], errors="coerce", utc=True).dt.tz_convert(IST)
-            for col in ("Open", "High", "Low", "Close", "Volume"):
-                frame[col] = pd.to_numeric(frame[col], errors="coerce")
-            frame = frame.dropna(subset=empty_cols)
-            output[symbol] = (
-                frame.sort_values("Time").drop_duplicates("Time", keep="last").reset_index(drop=True)
-            )
-        return output
-    except Exception:
-        return {s: pd.DataFrame(columns=empty_cols) for s in symbols}
-
 
 def _merge_candle_frames(cached, fresh):
     """Merge stored and fresh Yahoo candles; fresh overlapping bars take precedence."""
@@ -386,8 +324,8 @@ def _download_yahoo_batch_cached(tickers_tuple, interval, period):
     with _YF_LOCK:
         data = yf.download(
             tickers=list(tickers_tuple), period=period, interval=interval,
-            auto_adjust=False, actions=False, progress=False, threads=8,
-            group_by="ticker", timeout=20,
+            auto_adjust=False, actions=False, progress=False, threads=False,
+            group_by="ticker", timeout=15,
         )
     if data is None or data.empty:
         raise RuntimeError(f"Yahoo returned no data for {interval}.")
@@ -448,199 +386,41 @@ def _agent_result(direction="WAIT", score=0, reason="No clear setup"):
     return {"direction": direction, "score": int(score), "reason": reason}
 
 
-def _liquidity_levels_and_sweeps(df, lookback=30):
-    """Detect swing/equal-high and swing/equal-low liquidity, then confirm sweeps."""
+def _liquidity_levels_and_sweeps(df, lookback=20):
+    """Estimate buy-side/sell-side liquidity and confirmed wick sweeps from OHLCV."""
     empty = {
         "Buy-side Liquidity": None, "Sell-side Liquidity": None,
-        "Equal High Liquidity": "NO", "Equal Low Liquidity": "NO",
         "Upside Sweep": "NO", "Downside Sweep": "NO",
         "Liquidity Sweep Detail": "NO DATA",
     }
-    if df is None or not isinstance(df, pd.DataFrame) or len(df) < max(lookback + 1, 25):
+    if df is None or not isinstance(df, pd.DataFrame) or len(df) < max(lookback + 1, 10):
         return empty
     d = df.tail(lookback + 1).reset_index(drop=True)
-    prior, last = d.iloc[:-1], d.iloc[-1]
-    highs = prior["High"].astype(float).to_numpy()
-    lows = prior["Low"].astype(float).to_numpy()
-    close_prev = float(prior["Close"].iloc[-1])
-    close_now = _safe_num(last["Close"])
-    # Use confirmed local pivots (one candle on each side), excluding the live/latest bar.
-    swing_highs, swing_lows = [], []
-    for i in range(1, len(prior)-1):
-        if highs[i] >= highs[i-1] and highs[i] > highs[i+1]:
-            swing_highs.append(highs[i])
-        if lows[i] <= lows[i-1] and lows[i] < lows[i+1]:
-            swing_lows.append(lows[i])
-    ref_highs = swing_highs or list(highs[-min(lookback, len(highs)):])
-    ref_lows = swing_lows or list(lows[-min(lookback, len(lows)):])
-    buy_liq, sell_liq = max(ref_highs), min(ref_lows)
-    # Equal levels: two or more confirmed pivots clustered within 0.15%.
-    eq_tol = max(abs(close_prev) * 0.0015, 1e-9)
-    equal_high = any(abs(a-b) <= eq_tol for i,a in enumerate(swing_highs) for b in swing_highs[i+1:])
-    equal_low = any(abs(a-b) <= eq_tol for i,a in enumerate(swing_lows) for b in swing_lows[i+1:])
-    high, low = _safe_num(last["High"]), _safe_num(last["Low"])
-    opn = _safe_num(last["Open"])
-    span = max(high-low, 1e-9)
-    upper_wick, lower_wick = high-max(opn, close_now), min(opn, close_now)-low
-    vol_avg = _safe_num(prior["Volume"].tail(20).mean(), 0.0)
-    rvol = _safe_num(last["Volume"] / vol_avg, 0.0) if vol_avg > 0 else 0.0
-    upside = bool(high > buy_liq and close_now < buy_liq and upper_wick/span >= .30
-                  and close_now < opn and rvol >= 1.05)
-    downside = bool(low < sell_liq and close_now > sell_liq and lower_wick/span >= .30
-                    and close_now > opn and rvol >= 1.05)
+    prior = d.iloc[:-1]
+    last = d.iloc[-1]
+    buy_liq = _safe_num(prior["High"].max(), np.nan)   # buy stops commonly rest above highs
+    sell_liq = _safe_num(prior["Low"].min(), np.nan)   # sell stops commonly rest below lows
+    high = _safe_num(last["High"], np.nan)
+    low = _safe_num(last["Low"], np.nan)
+    close = _safe_num(last["Close"], np.nan)
+    upside = bool(np.isfinite(buy_liq) and high > buy_liq and close < buy_liq)
+    downside = bool(np.isfinite(sell_liq) and low < sell_liq and close > sell_liq)
     if upside and downside:
-        detail = "BOTH-SIDE SWEEP — WAIT FOR NEXT CANDLE"
+        detail = "BOTH-SIDE SWEEP"
     elif upside:
-        detail = "SWEEP UP: BUY-SIDE LIQUIDITY TAKEN; BEARISH REJECTION"
+        detail = "UPSIDE SWEEP — BUY-SIDE LIQUIDITY TAKEN; CLOSE BACK BELOW"
     elif downside:
-        detail = "SWEEP DOWN: SELL-SIDE LIQUIDITY TAKEN; BULLISH REJECTION"
+        detail = "DOWNSIDE SWEEP — SELL-SIDE LIQUIDITY TAKEN; CLOSE BACK ABOVE"
     else:
         detail = "NO CONFIRMED SWEEP"
     return {
-        "Buy-side Liquidity": round(buy_liq, 2), "Sell-side Liquidity": round(sell_liq, 2),
-        "Equal High Liquidity": "YES" if equal_high else "NO",
-        "Equal Low Liquidity": "YES" if equal_low else "NO",
-        "Upside Sweep": "YES" if upside else "NO", "Downside Sweep": "YES" if downside else "NO",
+        "Buy-side Liquidity": round(buy_liq, 2) if np.isfinite(buy_liq) else None,
+        "Sell-side Liquidity": round(sell_liq, 2) if np.isfinite(sell_liq) else None,
+        "Upside Sweep": "YES" if upside else "NO",
+        "Downside Sweep": "YES" if downside else "NO",
         "Liquidity Sweep Detail": detail,
     }
 
-
-def _liquidity_volume_trend_intelligence(frame_15m, trend_5m, trend_15m, trend_1h,
-                                         sweep_data, breakout_data, multi_breakout):
-    """Combine a completed 15M liquidity sweep, relative volume and 5M/15M/1H trend.
-
-    Sweep direction is interpreted as a reversal clue: upside/buy-side sweep ->
-    bearish rejection (SELL bias); downside/sell-side sweep -> bullish rejection (BUY bias).
-    A sweep alone is never treated as an entry signal.
-    """
-    out = {
-        "LVT Event": "NO DATA", "LVT RVOL": None, "LVT Volume Status": "NO DATA",
-        "LVT Trend": "NO DATA", "LVT Trend Alignment": "0/3",
-        "LVT Direction": "WAIT", "LVT Score": 0, "LVT Status": "WAIT",
-        "LVT Reason": "Insufficient 15M candle data",
-    }
-    if frame_15m is None or not isinstance(frame_15m, pd.DataFrame) or len(frame_15m) < 22:
-        return out
-    d = frame_15m.tail(22).copy()
-    last = d.iloc[-1]
-    prior_vol = pd.to_numeric(d["Volume"].iloc[:-1], errors="coerce").tail(20).mean()
-    last_vol = _safe_num(last.get("Volume"), 0.0)
-    rvol = last_vol / prior_vol if pd.notna(prior_vol) and prior_vol > 0 else 0.0
-    if rvol >= 3.0:
-        volume_status = "EXTREME VOLUME"
-    elif rvol >= 2.0:
-        volume_status = "BIG VOLUME"
-    elif rvol >= 1.5:
-        volume_status = "HIGH VOLUME"
-    else:
-        volume_status = "NORMAL VOLUME"
-
-    directions = [str(x or "WAIT").upper() for x in (trend_5m, trend_15m, trend_1h)]
-    event = "NO SWEEP"
-    direction = "WAIT"
-    expected = "WAIT"
-    if str(sweep_data.get("Downside Sweep", "NO")).upper() == "YES":
-        event, direction, expected = "SELL-SIDE LIQUIDITY SWEPT", "BUY", "BUY"
-    elif str(sweep_data.get("Upside Sweep", "NO")).upper() == "YES":
-        event, direction, expected = "BUY-SIDE LIQUIDITY SWEPT", "SELL", "SELL"
-
-    aligned = sum(1 for x in directions if x == expected) if expected != "WAIT" else 0
-    opposing = sum(1 for x in directions if x in ("BUY", "SELL") and x != expected) if expected != "WAIT" else 0
-    trend_label = ("STRONG UP" if directions == ["BUY", "BUY", "BUY"] else
-                   "STRONG DOWN" if directions == ["SELL", "SELL", "SELL"] else
-                   "MIXED / CONFLICT" if len(set(directions)) > 1 else directions[0])
-    breakout_ok = (
-        (expected == "BUY" and (breakout_data.get("Breakout Signal") == "BREAKOUT" or
-                                  multi_breakout == "BREAKOUT CONFIRMED")) or
-        (expected == "SELL" and (breakout_data.get("Breakout Signal") == "BREAKDOWN" or
-                                   multi_breakout == "BREAKDOWN CONFIRMED"))
-    )
-    volume_points = 25 if rvol >= 3 else 20 if rvol >= 2 else 12 if rvol >= 1.5 else 0
-    trend_points = {3: 35, 2: 25, 1: 12, 0: 0}.get(aligned, 0)
-    sweep_points = 25 if expected != "WAIT" else 0
-    breakout_points = 15 if breakout_ok else 0
-    score = min(100, volume_points + trend_points + sweep_points + breakout_points)
-
-    if expected == "WAIT":
-        status = "BIG VOLUME WATCH" if rvol >= 2 else "WAIT"
-        reason = "High volume without a confirmed liquidity sweep; direction not assumed"
-    elif breakout_ok and rvol >= 2 and aligned >= 2 and opposing == 0:
-        status = "CONFIRMED"
-        reason = "Liquidity sweep + big volume + aligned trend + completed breakout"
-    elif rvol >= 2 and aligned >= 2 and opposing == 0:
-        status = "STRONG WATCH"
-        reason = "Liquidity sweep + big volume + trend alignment; wait for breakout"
-    elif rvol >= 1.5 or aligned >= 2:
-        status = "WATCH"
-        reason = "Sweep detected; volume/trend confirmation is incomplete"
-    else:
-        status = "WAIT"
-        reason = "Sweep detected but big-volume and trend confirmation are missing"
-    if opposing:
-        status = "CONFLICT"
-        reason += f"; {opposing} timeframe(s) oppose the sweep direction"
-    out.update({
-        "LVT Event": event, "LVT RVOL": round(rvol, 2),
-        "LVT Volume Status": volume_status, "LVT Trend": trend_label,
-        "LVT Trend Alignment": f"{aligned}/3", "LVT Direction": direction,
-        "LVT Score": int(score), "LVT Status": status, "LVT Reason": reason,
-    })
-    return out
-
-
-def _breakout_breakdown_signal(df, lookback=20):
-    """Require a completed candle close beyond the previous range with participation."""
-    empty = {"Breakout Signal": "WAIT", "Breakout Level": None,
-             "Breakdown Level": None, "Breakout Reason": "Insufficient completed candles"}
-    if df is None or not isinstance(df, pd.DataFrame) or len(df) < lookback + 21:
-        return empty
-    d = df.tail(lookback + 21).reset_index(drop=True)
-    base, last = d.iloc[-(lookback+1):-1], d.iloc[-1]
-    resistance, support = _safe_num(base["High"].max(), np.nan), _safe_num(base["Low"].min(), np.nan)
-    o,h,l,c = (_safe_num(last[k]) for k in ("Open","High","Low","Close"))
-    span=max(h-l,1e-9); body=abs(c-o)/span; close_loc=(c-l)/span
-    avg_vol=_safe_num(base["Volume"].tail(20).mean(),0.0)
-    rvol=_safe_num(last["Volume"]/avg_vol,0.0) if avg_vol>0 else 0.0
-    if c>resistance and c>o and body>=.55 and close_loc>=.75 and rvol>=1.5:
-        sig, reason="BREAKOUT",f"Completed close above swing resistance {resistance:.2f}; body {body:.0%}; RVOL {rvol:.2f}x"
-    elif c<support and c<o and body>=.55 and close_loc<=.25 and rvol>=1.5:
-        sig, reason="BREAKDOWN",f"Completed close below swing support {support:.2f}; body {body:.0%}; RVOL {rvol:.2f}x"
-    else:
-        sig, reason="WAIT",f"No confirmed range break; body {body:.0%}; RVOL {rvol:.2f}x"
-    return {"Breakout Signal":sig,"Breakout Level":round(resistance,2),
-            "Breakdown Level":round(support,2),"Breakout Reason":reason}
-
-
-def _multi_tf_breakout(frames):
-    """A single timeframe trigger is provisional; require 2/3 aligned TFs for confirmation."""
-    checks={tf:_breakout_breakdown_signal(frames.get(tf,pd.DataFrame())) for tf in TIMEFRAMES}
-    ups=sum(v["Breakout Signal"]=="BREAKOUT" for v in checks.values())
-    dns=sum(v["Breakout Signal"]=="BREAKDOWN" for v in checks.values())
-    if ups>=2 and dns==0: signal="BREAKOUT CONFIRMED"
-    elif dns>=2 and ups==0: signal="BREAKDOWN CONFIRMED"
-    elif ups or dns: signal="PROVISIONAL — WAIT"
-    else: signal="WAIT"
-    return {"Multi-TF Breakout":signal,
-            "5M Breakout":checks["5M"]["Breakout Signal"],
-            "15M Breakout":checks["15M"]["Breakout Signal"],
-            "1H Breakout":checks["1H"]["Breakout Signal"]}
-
-
-def _breakout_retest_confirmation(df, level, direction, tolerance_pct=0.003):
-    """Detect a recent retest and hold/rejection of the breakout level."""
-    if df is None or len(df)<3 or level is None or not np.isfinite(_safe_num(level,np.nan)):
-        return "WAIT — NO RETEST DATA"
-    recent=df.tail(3)
-    tol=abs(float(level))*tolerance_pct
-    if direction=="UP":
-        touched=bool((recent["Low"].astype(float)<=float(level)+tol).any())
-        held=float(recent["Close"].iloc[-1])>float(level)
-        return "RETEST HELD" if touched and held else "WAIT — RETEST NOT CONFIRMED"
-    if direction=="DOWN":
-        touched=bool((recent["High"].astype(float)>=float(level)-tol).any())
-        held=float(recent["Close"].iloc[-1])<float(level)
-        return "RETEST REJECTED" if touched and held else "WAIT — RETEST NOT CONFIRMED"
-    return "WAIT — NO BREAKOUT"
 
 def _cached_candles_are_fresh(frame, minutes, now=None):
     """Avoid a Yahoo request when SQLite already contains the latest completed bar."""
@@ -935,6 +715,100 @@ def _news_agent(yahoo_symbol):
             "reason": f"Keyword headline context{age_text}: " + " | ".join(titles[:3])}
 
 
+
+def _pre_big_move_analysis_5m(df):
+    """Detect 10-15 completed 5M candles consolidating with rising volume.
+
+    The 12-candle base excludes the latest completed candle, so a breakout
+    can be tested against a fixed range without look-ahead contamination.
+    Scores are setup-strength heuristics, not probabilities.
+    """
+    empty = {
+        "PBM Status": "NO DATA", "PBM Direction": "WAIT", "PBM Score": 0,
+        "PBM Candles": 0, "PBM Range High": None, "PBM Range Low": None,
+        "PBM Range %": None, "PBM Volume Build %": None, "PBM RVOL": None,
+        "PBM Last Price": None, "PBM Breakout Level": None,
+        "PBM Breakdown Level": None, "PBM Reason": "Need at least 25 completed 5M candles",
+    }
+    if not isinstance(df, pd.DataFrame) or len(df) < 25:
+        return empty
+    d = df.sort_values("Time").drop_duplicates("Time", keep="last").tail(25).reset_index(drop=True)
+    base = d.iloc[-13:-1]  # 12 candles; latest candle is kept separate for trigger check
+    prior = d.iloc[-25:-13]  # preceding 12 candles for compression comparison
+    trigger = d.iloc[-1]
+    high = _safe_num(base["High"].max())
+    low = _safe_num(base["Low"].min())
+    last = _safe_num(trigger["Close"])
+    if low <= 0 or high <= low or last <= 0:
+        return empty
+
+    base_width = high - low
+    prior_width = _safe_num(prior["High"].max() - prior["Low"].min())
+    range_pct = base_width / last * 100.0
+    compressed = prior_width > 0 and base_width <= prior_width * 0.70
+
+    base_vol = base["Volume"].astype(float).clip(lower=0)
+    recent_vol = _safe_num(base_vol.tail(3).mean())
+    earlier_vol = _safe_num(base_vol.iloc[:9].mean())
+    vol_build = recent_vol / max(earlier_vol, 1.0)
+    avg_base_vol = _safe_num(base_vol.mean())
+    last_vol = max(_safe_num(trigger["Volume"]), 0.0)
+    rvol = last_vol / max(avg_base_vol, 1.0)
+    volume_rising = vol_build >= 1.30
+
+    base_close = _safe_num(base["Close"].iloc[-1])
+    location = (base_close - low) / max(base_width, 1e-9)
+    # Use VWAP/EMA context as directional evidence, not as a standalone signal.
+    closes = d["Close"].astype(float)
+    ema9 = _safe_num(closes.ewm(span=9, adjust=False).mean().iloc[-2])
+    ema21 = _safe_num(closes.ewm(span=21, adjust=False).mean().iloc[-2])
+    vwap = _vwap_last_session(d.iloc[:-1])
+    vwap_value = _safe_num(vwap) if pd.notna(vwap) else None
+    higher_lows = _safe_num(base["Low"].tail(4).iloc[-1]) > _safe_num(base["Low"].head(4).min())
+    lower_highs = _safe_num(base["High"].tail(4).iloc[-1]) < _safe_num(base["High"].head(4).max())
+
+    bull_points = int(location >= 0.60) + int(ema9 >= ema21) + int(vwap_value is not None and base_close >= vwap_value) + int(higher_lows)
+    bear_points = int(location <= 0.40) + int(ema9 <= ema21) + int(vwap_value is not None and base_close <= vwap_value) + int(lower_highs)
+    setup_ready = compressed and volume_rising
+
+    trig_open = _safe_num(trigger["Open"])
+    trig_high = _safe_num(trigger["High"])
+    trig_low = _safe_num(trigger["Low"])
+    trig_close = _safe_num(trigger["Close"])
+    trig_range = max(trig_high - trig_low, 1e-9)
+    body_ratio = abs(trig_close - trig_open) / trig_range
+    close_loc = (trig_close - trig_low) / trig_range
+    breakout = trig_close > high and trig_close > trig_open and body_ratio >= 0.55 and close_loc >= 0.70 and rvol >= 1.50
+    breakdown = trig_close < low and trig_close < trig_open and body_ratio >= 0.55 and close_loc <= 0.30 and rvol >= 1.50
+
+    if breakout:
+        status, direction, reason = "BULLISH BREAKOUT CONFIRMED", "BULLISH", "Completed 5M candle closed above 12-candle range with strong body and RVOL"
+        score = min(100, 70 + int(min(rvol, 3.0) * 10) + bull_points * 3)
+    elif breakdown:
+        status, direction, reason = "BEARISH BREAKDOWN CONFIRMED", "BEARISH", "Completed 5M candle closed below 12-candle range with strong body and RVOL"
+        score = min(100, 70 + int(min(rvol, 3.0) * 10) + bear_points * 3)
+    elif setup_ready and bull_points >= 3 and bull_points > bear_points:
+        status, direction, reason = "BULLISH WATCH", "BULLISH", "12-candle compression + rising volume; bullish bias, breakout not confirmed"
+        score = min(85, 45 + int(min(vol_build, 2.5) * 10) + bull_points * 5)
+    elif setup_ready and bear_points >= 3 and bear_points > bull_points:
+        status, direction, reason = "BEARISH WATCH", "BEARISH", "12-candle compression + rising volume; bearish bias, breakdown not confirmed"
+        score = min(85, 45 + int(min(vol_build, 2.5) * 10) + bear_points * 5)
+    elif compressed and volume_rising:
+        status, direction, reason = "WAIT / DIRECTION UNCLEAR", "WAIT", "Compression and volume buildup found, but directional evidence is mixed"
+        score = min(65, 35 + int(min(vol_build, 2.5) * 10))
+    else:
+        status, direction, reason = "NO SETUP", "WAIT", "12-candle compression or 30% volume buildup condition not met"
+        score = 0
+
+    return {
+        "PBM Status": status, "PBM Direction": direction, "PBM Score": int(score),
+        "PBM Candles": 12, "PBM Range High": round(high, 2), "PBM Range Low": round(low, 2),
+        "PBM Range %": round(range_pct, 3), "PBM Volume Build %": round((vol_build - 1) * 100, 1),
+        "PBM RVOL": round(rvol, 2), "PBM Last Price": round(last, 2),
+        "PBM Breakout Level": round(high, 2), "PBM Breakdown Level": round(low, 2),
+        "PBM Reason": reason,
+    }
+
 def _analyse_timeframe(df):
     agents = _run_17_agents(df)
     score = int(sum(x["score"] for x in agents.values()))
@@ -943,9 +817,9 @@ def _analyse_timeframe(df):
     valid = sum(x["direction"] != "NO DATA" for x in agents.values())
     if valid < 8:
         direction = "NO DATA"
-    elif score >= 7 and buy_votes >= 4 and buy_votes >= sell_votes + 3:
+    elif score >= 5 and buy_votes >= 3:
         direction = "BUY"
-    elif score <= -7 and sell_votes >= 4 and sell_votes >= buy_votes + 3:
+    elif score <= -5 and sell_votes >= 3:
         direction = "SELL"
     else:
         direction = "WAIT"
@@ -1133,41 +1007,13 @@ def _make_result_row(symbol, yahoo_symbol, payload):
         "15M RSI": analyses["15M"]["rsi"], "Errors": " | ".join(payload.get("errors", [])),
     }
     row.update(_early_20m_analysis(payload.get("early_1m", pd.DataFrame())))
+    row.update(_pre_big_move_analysis_5m(frame_5m))
     for tf in TIMEFRAMES:
         liquidity = _liquidity_levels_and_sweeps(frames.get(tf, pd.DataFrame()))
         for key, value in liquidity.items():
             row[f"{tf} {key}"] = value
     # Keep simple unprefixed fields for the main report, using 15M as the reference.
     row.update(_liquidity_levels_and_sweeps(frame_15m))
-    row.update(_breakout_breakdown_signal(frame_15m))
-    row.update(_multi_tf_breakout(frames))
-    row.update(_liquidity_volume_trend_intelligence(
-        frame_15m, analyses["5M"]["direction"], analyses["15M"]["direction"],
-        analyses["1H"]["direction"], _liquidity_levels_and_sweeps(frame_15m),
-        _breakout_breakdown_signal(frame_15m), row.get("Multi-TF Breakout", "WAIT")
-    ))
-    main_break = row.get("Breakout Signal", "WAIT")
-    if main_break == "BREAKOUT":
-        row["Breakout Retest"] = _breakout_retest_confirmation(frame_15m, row.get("Breakout Level"), "UP")
-    elif main_break == "BREAKDOWN":
-        row["Breakout Retest"] = _breakout_retest_confirmation(frame_15m, row.get("Breakdown Level"), "DOWN")
-    else:
-        row["Breakout Retest"] = "WAIT — NO 15M BREAK"
-    # Explicit event label is separate from the trend consensus. A sweep is a
-    # liquidity event, not an automatic BUY/SELL entry; breakout needs confirmation.
-    sweep_detail = str(row.get("Liquidity Sweep Detail", ""))
-    if row.get("Multi-TF Breakout") == "BREAKOUT CONFIRMED":
-        row["Action Signal"] = "BREAKOUT"
-    elif row.get("Multi-TF Breakout") == "BREAKDOWN CONFIRMED":
-        row["Action Signal"] = "BREAKDOWN"
-    elif row.get("Upside Sweep") == "YES":
-        row["Action Signal"] = "SWEEP UP"
-    elif row.get("Downside Sweep") == "YES":
-        row["Action Signal"] = "SWEEP DOWN"
-    elif final_signal in ("BUY", "SELL"):
-        row["Action Signal"] = final_signal
-    else:
-        row["Action Signal"] = "WAIT"
     for tf in TIMEFRAMES:
         for name in AGENT_NAMES:
             item = analyses[tf]["agents"][name]
@@ -1224,10 +1070,7 @@ def _scan_batch(batch, period, include_early=True):
     # If SQLite already has data for every ticker, fetch only a short overlap window.
     # First scan remains a full-history warm-up. The overlap refreshes late/adjusted bars.
     for label, (interval, minutes) in TIMEFRAMES.items():
-        cached = _load_candle_memory_batch(
-            [original_by_ticker[t] for t in tickers], label
-        )
-        cached = {ticker: cached.get(original_by_ticker[ticker], pd.DataFrame()) for ticker in tickers}
+        cached = {ticker: _load_candle_memory(original_by_ticker[ticker], label) for ticker in tickers}
         stale_tickers = [t for t in tickers if not _cached_candles_are_fresh(cached[t], minutes)]
         # Only request symbols whose saved candle set is stale or missing. This is
         # faster than downloading a 2-day overlap for every stock on every scan.
@@ -1246,13 +1089,7 @@ def _scan_batch(batch, period, include_early=True):
     # Optional 1-minute feed. It is the most expensive extra request set, so
     # the fast core scan can finish without downloading 1M candles for every stock.
     if include_early:
-        early_cached_by_symbol = _load_candle_memory_batch(
-            [original_by_ticker[t] for t in tickers], "1M"
-        )
-        early_cached = {
-            ticker: early_cached_by_symbol.get(original_by_ticker[ticker], pd.DataFrame())
-            for ticker in tickers
-        }
+        early_cached = {ticker: _load_candle_memory(original_by_ticker[ticker], "1M") for ticker in tickers}
         early_stale = [t for t in tickers if not _cached_candles_are_fresh(early_cached[t], 1)]
         if early_stale:
             early_period = "2d" if all(not early_cached[t].empty for t in early_stale) else "7d"
@@ -1540,24 +1377,15 @@ def _best_stock_analyst(row):
 
 
 def _direction_movement(row):
-    """Summarise 5M/15M/1H direction, including PRE-BIG votes.
-
-    FYERS depth is a displayed order-book snapshot, not executed trade flow;
-    it annotates alignment/conflict but never changes the technical direction.
-    """
-    directions = [str(row.get(tf, "NO DATA") or "NO DATA").upper()
-                  for tf in ("5M", "15M", "1H")]
-    buy_votes = sum(x in ("BUY", "PRE-BIG BUY") for x in directions)
-    sell_votes = sum(x in ("SELL", "PRE-BIG SELL") for x in directions)
-    direct_buy = sum(x == "BUY" for x in directions)
-    direct_sell = sum(x == "SELL" for x in directions)
-    pre_buy = sum(x == "PRE-BIG BUY" for x in directions)
-    pre_sell = sum(x == "PRE-BIG SELL" for x in directions)
+    """Summarise 5M/15M/1H price direction; flag opposing FYERS book pressure."""
+    directions = [str(row.get(tf, "NO DATA")).upper() for tf in ("5M", "15M", "1H")]
+    buy_votes = sum(x == "BUY" for x in directions)
+    sell_votes = sum(x == "SELL" for x in directions)
 
     if buy_votes >= 2 and sell_votes == 0:
-        movement = "PRE-BIG UP" if pre_buy >= 2 and direct_buy == 0 else "UP"
+        movement = "UP"
     elif sell_votes >= 2 and buy_votes == 0:
-        movement = "PRE-BIG DOWN" if pre_sell >= 2 and direct_sell == 0 else "DOWN"
+        movement = "DOWN"
     elif buy_votes == 0 and sell_votes == 0 and all(x == "WAIT" for x in directions):
         movement = "SIDEWAYS"
     elif directions.count("NO DATA") >= 2:
@@ -1565,201 +1393,24 @@ def _direction_movement(row):
     else:
         movement = "MIXED"
 
+    # FYERS depth is a displayed order-book snapshot, not executed trade flow.
     depth = str(row.get("Depth Signal", "") or "").upper()
-    is_up = movement in ("UP", "PRE-BIG UP")
-    is_down = movement in ("DOWN", "PRE-BIG DOWN")
-    if is_up and depth == "SELL-SIDE DOMINANT":
-        return f"CONFLICT ({movement} / FYERS SELL)"
-    if is_down and depth == "BUY-SIDE DOMINANT":
-        return f"CONFLICT ({movement} / FYERS BUY)"
-    if is_up and depth == "BUY-SIDE DOMINANT":
-        return f"{movement} (DEPTH ALIGNED)"
-    if is_down and depth == "SELL-SIDE DOMINANT":
-        return f"{movement} (DEPTH ALIGNED)"
+    if movement == "UP" and depth == "SELL-SIDE DOMINANT":
+        return "CONFLICT (UP / FYERS SELL)"
+    if movement == "DOWN" and depth == "BUY-SIDE DOMINANT":
+        return "CONFLICT (DOWN / FYERS BUY)"
+    if movement == "UP" and depth == "BUY-SIDE DOMINANT":
+        return "UP (DEPTH ALIGNED)"
+    if movement == "DOWN" and depth == "SELL-SIDE DOMINANT":
+        return "DOWN (DEPTH ALIGNED)"
     return movement
-
-
-
-def _scan_job_create(config):
-    """Create a durable scan job and return its unique ID."""
-    job_id = uuid.uuid4().hex
-    now_text = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S %Z")
-    config_text = json.dumps(config, ensure_ascii=False)
-    with _memory_connect() as conn:
-        conn.execute(
-            """INSERT INTO scan_jobs
-               (job_id,status,config_json,total_symbols,completed_symbols,created_at,updated_at,error)
-               VALUES (?,?,?,?,?,?,?,?)""",
-            (job_id, "RUNNING", config_text, len(config.get("symbols", [])), 0,
-             now_text, now_text, None),
-        )
-    return job_id
-
-
-def _scan_job_get(job_id):
-    if not job_id:
-        return None
-    try:
-        with _memory_connect() as conn:
-            row = conn.execute(
-                """SELECT job_id,status,config_json,total_symbols,completed_symbols,
-                          created_at,updated_at,error
-                   FROM scan_jobs WHERE job_id=?""", (str(job_id),)
-            ).fetchone()
-        if not row:
-            return None
-        return {
-            "job_id": row[0], "status": row[1], "config": json.loads(row[2]),
-            "total": int(row[3]), "completed": int(row[4]),
-            "created_at": row[5], "updated_at": row[6], "error": row[7],
-        }
-    except Exception:
-        return None
-
-
-def _scan_job_latest_active():
-    try:
-        with _memory_connect() as conn:
-            row = conn.execute(
-                """SELECT job_id FROM scan_jobs
-                   WHERE status IN ('RUNNING','PAUSED','DONE')
-                   ORDER BY created_at DESC LIMIT 1"""
-            ).fetchone()
-        return row[0] if row else None
-    except Exception:
-        return None
-
-
-def _scan_job_load_rows(job_id):
-    """Restore completed technical rows in original scan-universe order."""
-    job = _scan_job_get(job_id)
-    if not job:
-        return []
-    config_symbols = job["config"].get("symbols", [])
-    try:
-        with _memory_connect() as conn:
-            rows = conn.execute(
-                "SELECT symbol,payload FROM scan_job_rows WHERE job_id=?",
-                (str(job_id),),
-            ).fetchall()
-        payload_by_symbol = {
-            symbol: pickle.loads(payload) for symbol, payload in rows
-        }
-        return [
-            payload_by_symbol[item[0]]
-            for item in config_symbols
-            if item[0] in payload_by_symbol
-        ]
-    except Exception:
-        return []
-
-
-def _scan_job_worker(job_id):
-    """Background scanner. Each finished batch is committed before moving on."""
-    job = _scan_job_get(job_id)
-    if not job:
-        return
-    config = job["config"]
-    symbols = [(str(x[0]), str(x[1])) for x in config.get("symbols", [])]
-    batch_size = max(10, min(int(config.get("batch_size", 25)), 100))
-    period = str(config.get("period", "30d"))
-    include_early = bool(config.get("include_early", False))
-    now_text = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S %Z")
-
-    try:
-        with _memory_connect() as conn:
-            done_rows = conn.execute(
-                "SELECT symbol FROM scan_job_rows WHERE job_id=?", (job_id,)
-            ).fetchall()
-        completed_symbols = {x[0] for x in done_rows}
-        pending = [x for x in symbols if x[0] not in completed_symbols]
-
-        for start in range(0, len(pending), batch_size):
-            batch = pending[start:start + batch_size]
-            try:
-                batch_rows = _scan_batch(batch, period, include_early=include_early)
-            except Exception as exc:
-                batch_rows = [
-                    _no_data_row(symbol, ticker, f"Batch failed: {str(exc)[:180]}")
-                    for symbol, ticker in batch
-                ]
-
-            saved_at = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S %Z")
-            payload_rows = [
-                (job_id, str(row.get("Symbol", symbol)), str(row.get("Yahoo Symbol", ticker)),
-                 sqlite3.Binary(pickle.dumps(row, protocol=pickle.HIGHEST_PROTOCOL)), saved_at)
-                for (symbol, ticker), row in zip(batch, batch_rows)
-            ]
-            # Commit a whole batch atomically: after a crash, only an unfinished
-            # batch is repeated. Completed symbols are never downloaded again.
-            with _memory_connect() as conn:
-                conn.executemany(
-                    """INSERT INTO scan_job_rows(job_id,symbol,ticker,payload,saved_at)
-                       VALUES (?,?,?,?,?)
-                       ON CONFLICT(job_id,symbol) DO UPDATE SET
-                         ticker=excluded.ticker,payload=excluded.payload,saved_at=excluded.saved_at""",
-                    payload_rows,
-                )
-                total_done = conn.execute(
-                    "SELECT COUNT(*) FROM scan_job_rows WHERE job_id=?", (job_id,)
-                ).fetchone()[0]
-                conn.execute(
-                    """UPDATE scan_jobs SET status='RUNNING',completed_symbols=?,
-                       updated_at=?,error=NULL WHERE job_id=?""",
-                    (int(total_done), saved_at, job_id),
-                )
-
-        finished_at = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S %Z")
-        with _memory_connect() as conn:
-            total_done = conn.execute(
-                "SELECT COUNT(*) FROM scan_job_rows WHERE job_id=?", (job_id,)
-            ).fetchone()[0]
-            conn.execute(
-                """UPDATE scan_jobs SET status='DONE',completed_symbols=?,
-                   updated_at=?,error=NULL WHERE job_id=?""",
-                (int(total_done), finished_at, job_id),
-            )
-    except Exception as exc:
-        paused_at = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S %Z")
-        try:
-            with _memory_connect() as conn:
-                conn.execute(
-                    """UPDATE scan_jobs SET status='PAUSED',updated_at=?,error=?
-                       WHERE job_id=?""",
-                    (paused_at, str(exc)[:1000], job_id),
-                )
-        except Exception:
-            pass
-    finally:
-        with _SCAN_WORKERS_LOCK:
-            _SCAN_WORKERS.pop(job_id, None)
-
-
-def _scan_job_start_worker(job_id):
-    """Start or resume one job; a live worker is never duplicated."""
-    if not job_id:
-        return False
-    with _SCAN_WORKERS_LOCK:
-        current = _SCAN_WORKERS.get(job_id)
-        if current is not None and current.is_alive():
-            return True
-        job = _scan_job_get(job_id)
-        if not job or job["status"] not in ("RUNNING", "PAUSED"):
-            return False
-        worker = threading.Thread(
-            target=_scan_job_worker, args=(job_id,),
-            name=f"nse-scan-{job_id[:8]}", daemon=True,
-        )
-        _SCAN_WORKERS[job_id] = worker
-        worker.start()
-        return True
 
 
 def show_ai_multi_agent_scanner(client=None):
     """Streamlit page. client is retained for app.py compatibility."""
     st.title("🤖 AI Multi-Agent Scanner V18 — Yahoo Batch")
-    st.caption("17 OHLCV agents × 5M / 15M / 1H + 18th Best Stock Analyst + optional 1M / News")
-    st.info("scanner.py supplies NSE/F&O symbols only (unchanged). Yahoo Finance supplies candles. FYERS is used only for 5-level Market Depth on the technical shortlist.")
+    st.caption("17 OHLCV agents × 5M / 15M / 1H + 5M PRE-BIG compression/volume detector + 18th Best Stock Analyst + optional 1M / News")
+    st.info("Default universe: F&O Stocks (typically 213 symbols, depending on scanner.py). scanner.py supplies symbols only; Yahoo Finance supplies candles; FYERS is used only for 5-level Market Depth on the technical shortlist.")
     st.caption("Smart Memory: SQLite candles are loaded first; after the initial warm-up, the scanner refreshes a short 2-day overlap and merges it with saved candles. For speed, the extra 1M/20M scan is optional.")
     st.warning(
         "Yahoo intraday data may be delayed, missing or rate-limited. "
@@ -1777,9 +1428,9 @@ def show_ai_multi_agent_scanner(client=None):
 
     c1, c2, c3 = st.columns(3)
     with c1:
-        universe = st.selectbox("Universe", ["Both (NSE + F&O)", "F&O Stocks", "NSE Equity"], key="ma_universe")
+        universe = st.selectbox("Universe", ["Both (NSE + F&O)", "F&O Stocks", "NSE Equity"], index=1, key="ma_universe")
     with c2:
-        batch_size = st.selectbox("Batch size", [10, 25, 50, 75, 100], index=1, key="ma_batch_size_v18", help="Local PC: 25 is the safer default for NSE. Completed batches are checkpointed and can resume.")
+        batch_size = st.selectbox("Batch size", [25, 50, 75, 100, 125], index=4, key="ma_batch_size_v18")
     with c3:
         st.metric("Analysis", "18 Agents + Ranking")
 
@@ -1847,120 +1498,66 @@ def show_ai_multi_agent_scanner(client=None):
         @st.fragment(run_every=f"{int(auto_interval)}m" if auto_scan else None)
         def _auto_scan_clock():
             if auto_scan and _is_market_hours():
-                now_epoch = time.time()
-                last_trigger = float(st.session_state.get("ma_auto_scan_last_trigger", 0.0))
-                interval_seconds = int(auto_interval) * 60
-                # The fragment also runs during a full app rerun. Initialise its
-                # clock first, then trigger only after the selected interval; this
-                # prevents st.rerun(scope='app') from creating a rerun loop.
-                if last_trigger <= 0:
-                    st.session_state["ma_auto_scan_last_trigger"] = now_epoch
-                elif now_epoch - last_trigger >= interval_seconds:
-                    st.session_state["ma_auto_scan_last_trigger"] = now_epoch
-                    st.session_state["ma_auto_scan_due"] = True
-                    st.rerun(scope="app")
+                st.session_state["ma_auto_scan_due"] = True
+                st.rerun(scope="app")
         _auto_scan_clock()
     elif auto_scan:
         st.warning("ఈ Streamlit version‌లో scheduled fragment లేదు. Auto Scan కోసం Streamlit 1.37+ అవసరం.")
 
     run_scan_now = st.button("🚀 RUN FULL BATCH SCAN", type="primary", key="run_multi_agent", **_stretch())
     auto_due = bool(st.session_state.pop("ma_auto_scan_due", False))
-    start_scan_requested = run_scan_now or (auto_due and auto_scan and _is_market_hours())
-    resume_scan_now = st.button("▶️ RESUME / CONTINUE SCAN", key="ma_resume_scan", **_stretch())
-
-    # Reconnect to the latest unfinished scan after a rerun, refresh or browser reopen.
-    job_id = st.session_state.get("ma_scan_job_id")
-    job = _scan_job_get(job_id) if job_id else None
-    if not job or job["status"] in ("FINALIZED", "CANCELLED"):
-        active_job_id = _scan_job_latest_active()
-        if active_job_id:
-            job_id = active_job_id
-            st.session_state["ma_scan_job_id"] = job_id
-            job = _scan_job_get(job_id)
-
-    if start_scan_requested:
-        if job and job["status"] in ("RUNNING", "PAUSED"):
-            st.warning("ఒక scan ఇప్పటికే pending/running లో ఉంది. దాన్ని Resume చేయండి; duplicate scan ప్రారంభించలేదు.")
-        else:
-            config = {
-                "universe": universe,
-                "source_symbols": len(symbols),
-                "symbols": [[original, ticker] for original, ticker in unique_items],
-                "batch_size": int(batch_size),
-                "period": period,
-                "include_early": bool(early_scan_enabled),
-                "news_enabled": bool(news_enabled),
-                "news_limit": int(news_limit),
-                "depth_limit": int(depth_limit),
-            }
-            job_id = _scan_job_create(config)
-            st.session_state["ma_scan_job_id"] = job_id
-            st.session_state.pop("ma_scan_finalized_job", None)
-            job = _scan_job_get(job_id)
-            _scan_job_start_worker(job_id)
-
-    if resume_scan_now and job_id:
-        _scan_job_start_worker(job_id)
-        job = _scan_job_get(job_id)
-
-    # The worker continues independently of browser rendering. This lightweight
-    # fragment only polls SQLite; a minimized browser may throttle display refresh,
-    # but does not stop the local Python worker.
-    if job_id and job and job["status"] in ("RUNNING", "PAUSED"):
-        if job["status"] == "RUNNING":
-            _scan_job_start_worker(job_id)
-        if hasattr(st, "fragment"):
-            @st.fragment(run_every="1s")
-            def _scan_job_monitor():
-                current = _scan_job_get(job_id)
-                if not current:
-                    st.warning("Scan job record not found.")
-                    return
-                total = max(current["total"], 1)
-                done = min(current["completed"], total)
-                st.progress(done / total, text=f"Background scan: {done:,}/{current['total']:,} stocks")
-                st.caption(
-                    f"Status: {current['status']} • Job: {job_id[:8]} • "
-                    "F&O priority order preserved; finished batches saved to SQLite."
-                )
-                if current["status"] == "PAUSED":
-                    st.error(f"Scan paused: {current.get('error') or 'Unknown worker error'}. Press RESUME / CONTINUE SCAN.")
-                elif current["status"] == "DONE":
-                    st.success("Technical scan completed. Preparing the existing reports…")
-                    st.rerun(scope="app")
-            _scan_job_monitor()
-        else:
-            st.info("Background scan is running. Install/upgrade Streamlit to enable live progress refresh.")
-        job = _scan_job_get(job_id)
-
-    job_done = bool(job and job["status"] == "DONE")
-    already_finalized = st.session_state.get("ma_scan_finalized_job") == job_id
-    run_scan_now = job_done and not already_finalized
-
-    if job and job["status"] == "PAUSED":
-        st.warning("Scan paused safely. Completed batches are saved; press RESUME / CONTINUE SCAN to continue.")
-    elif job and job["status"] == "RUNNING":
-        st.info("NSE/F&O scan is running in the background. You can minimize the browser; the local Python worker continues.")
-    elif job and job["status"] == "DONE" and already_finalized:
-        st.success("Latest scan is already processed. Existing report and Excel downloads are available below.")
-
-    if run_scan_now:
-        saved_job = _scan_job_get(job_id)
-        universe = saved_job["config"].get("universe", universe)
-        unique_items = [(str(x[0]), str(x[1])) for x in saved_job["config"].get("symbols", [])]
-        symbols = [x[0] for x in unique_items]
-        batch_size = int(saved_job["config"].get("batch_size", batch_size))
-        period = str(saved_job["config"].get("period", period))
-        early_scan_enabled = bool(saved_job["config"].get("include_early", early_scan_enabled))
-        news_enabled = bool(saved_job["config"].get("news_enabled", news_enabled))
-        news_limit = int(saved_job["config"].get("news_limit", news_limit))
-        depth_limit = int(saved_job["config"].get("depth_limit", depth_limit))
-        all_rows = _scan_job_load_rows(job_id)
-        batches = [
-            saved_job["config"]["symbols"][i:i + int(saved_job["config"]["batch_size"])]
-            for i in range(0, len(saved_job["config"]["symbols"]), int(saved_job["config"]["batch_size"]))
+    if run_scan_now or (auto_due and auto_scan and _is_market_hours()):
+        batches = [unique_items[i:i + batch_size] for i in range(0, len(unique_items), batch_size)]
+        progress, status = st.progress(0.0), st.empty()
+        live_best_report = st.empty()
+        all_rows = []
+        live_best_cols = [
+            "Symbol", "Best Stock Side", "Final Signal", "Best Stock Score",
+            "Best Stock Grade", "Entry Price", "Stop Loss", "Signal Time (IST)",
+            "5M", "15M", "1H", "Best Stock Reason",
         ]
-        status = st.empty()
+        for idx, batch in enumerate(batches, 1):
+            status.write(
+                f"Priority scan batch {idx}/{len(batches)} — {len(batch)} symbols "
+                f"(F&O first when Both is selected; 5M + 15M + 1H; "
+                f"1M extra scan {'ON' if early_scan_enabled else 'OFF'})"
+            )
+            try:
+                batch_rows = _scan_batch(batch, period, include_early=early_scan_enabled)
+                all_rows.extend(batch_rows)
+            except Exception as exc:
+                batch_rows = [_no_data_row(s, t, f"Batch failed: {exc}") for s, t in batch]
+                all_rows.extend(batch_rows)
+
+            # Live provisional report refreshes after every completed batch.
+            # FYERS depth is added later, so this in-scan ranking is provisional.
+            partial = pd.DataFrame(all_rows)
+            if not partial.empty:
+                partial["Depth Signal"] = None
+                partial_analyst = partial.apply(_best_stock_analyst, axis=1, result_type="expand")
+                partial = pd.concat([partial, partial_analyst], axis=1)
+                live_top = partial[
+                    (partial["Best Stock Filter"] == "PASS")
+                    & (partial["Best Stock Score"] >= 75)
+                ].sort_values(
+                    ["Best Stock Score", "Confirmation Strength %"],
+                    ascending=[False, False],
+                ).head(10)
+                live_best_report.empty()
+                live_best_report.write(
+                    f"🏆 Live Best Stocks — provisional ranking after batch {idx}/{len(batches)} "
+                    "(FYERS depth confirmation pending)"
+                )
+                if not live_top.empty:
+                    live_best_report.dataframe(
+                        live_top[live_best_cols], hide_index=True, **_stretch()
+                    )
+                else:
+                    live_best_report.info(
+                        "No stock has passed the live 75/100 quality filter yet."
+                    )
+            progress.progress(idx / max(len(batches), 1))
+
         result = _sort_results(pd.DataFrame(all_rows))
         if news_enabled:
             candidates = result[result["Final Signal"].isin(
@@ -1998,8 +1595,8 @@ def show_ai_multi_agent_scanner(client=None):
                     "Buy Qty (5L)", "Sell Qty (5L)", "Depth Imbalance %", "Depth Time (IST)", "Depth Message"]] = None
         st.session_state["multi_agent_depth"] = depth_table
 
-        # Direction Movement includes BUY/SELL and PRE-BIG direction votes.
-        # FYERS displayed depth only annotates alignment/conflict; it is not flow.
+        # Direction Movement is placed beside Final Signal. It uses 5M/15M/1H
+        # candle direction and flags disagreement with FYERS displayed depth.
         result["Direction Movement"] = result.apply(_direction_movement, axis=1)
         # 18th Agent runs after technical consensus and optional FYERS depth are available.
         analyst = result.apply(_best_stock_analyst, axis=1, result_type="expand")
@@ -2016,89 +1613,6 @@ def show_ai_multi_agent_scanner(client=None):
             buffer = io.BytesIO()
             with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
                 result.to_excel(writer, index=False, sheet_name="AI Scanner")
-                # A separate first sheet makes the downloaded workbook open as a dashboard.
-                counts = result.get("Action Signal", pd.Series(dtype=str)).fillna("WAIT").value_counts()
-                dash_rows = [
-                    ["AI MULTI-AGENT SCANNER DASHBOARD", ""],
-                    ["Generated (IST)", stamp.strftime("%Y-%m-%d %H:%M:%S IST")],
-                    ["Total Stocks Scanned", int(len(result))],
-                    ["BUY", int(counts.get("BUY", 0))],
-                    ["SELL", int(counts.get("SELL", 0))],
-                    ["SWEEP UP", int(counts.get("SWEEP UP", 0))],
-                    ["SWEEP DOWN", int(counts.get("SWEEP DOWN", 0))],
-                    ["BREAKOUT", int(counts.get("BREAKOUT", 0))],
-                    ["BREAKDOWN", int(counts.get("BREAKDOWN", 0))],
-                    ["WAIT", int(counts.get("WAIT", 0))],
-                    ["", ""],
-                    ["TOP QUALIFIED STOCKS", ""],
-                ]
-                dashboard = pd.DataFrame(dash_rows, columns=["Metric", "Value"])
-                dashboard.to_excel(writer, index=False, header=False, sheet_name="Dashboard", startrow=0)
-                top_cols = [c for c in ["Symbol", "Action Signal", "Final Signal", "Best Stock Score", "Confirmation Strength %", "Last Price", "Breakout Signal", "Multi-TF Breakout", "Breakout Retest"] if c in result.columns]
-                top = result.copy()
-                if "Best Stock Filter" in top.columns:
-                    top = top[top["Best Stock Filter"] == "PASS"]
-                if "Best Stock Score" in top.columns:
-                    top = top.sort_values("Best Stock Score", ascending=False)
-                top[top_cols].head(15).to_excel(writer, index=False, sheet_name="Dashboard", startrow=len(dash_rows)+1)
-                from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
-                from openpyxl.formatting.rule import CellIsRule
-                wb = writer.book
-                ws = wb["Dashboard"]
-                ws.freeze_panes = "A3"
-                ws.column_dimensions["A"].width = 30
-                ws.column_dimensions["B"].width = 34
-                for col in range(3, max(ws.max_column, 2)+1):
-                    ws.column_dimensions[chr(64+col)].width = 22
-                ws.merge_cells("A1:B1")
-                ws["A1"].font = Font(bold=True, size=16, color="FFFFFF")
-                ws["A1"].fill = PatternFill("solid", fgColor="17365D")
-                ws["A1"].alignment = Alignment(horizontal="center")
-                ws[2][0].font = Font(bold=True, color="17365D")
-                ws[3][0].font = Font(bold=True, color="17365D")
-                # Style the dashboard metric labels and the top-stocks header.
-                for r in range(3, 11):
-                    ws.cell(r,1).font = Font(bold=True)
-                header_row = len(dash_rows)+2
-                for cell in ws[header_row]:
-                    cell.font = Font(bold=True, color="FFFFFF")
-                    cell.fill = PatternFill("solid", fgColor="305496")
-                for row_cells in ws.iter_rows(min_row=header_row+1):
-                    for cell in row_cells:
-                        cell.alignment = Alignment(vertical="center")
-                from openpyxl.chart import BarChart, Reference
-                chart = BarChart()
-                chart.type = "bar"
-                chart.style = 10
-                chart.title = "Signal Counts"
-                chart.y_axis.title = "Signal"
-                chart.x_axis.title = "Stocks"
-                chart.height, chart.width = 7, 12
-                chart.add_data(Reference(ws, min_col=2, min_row=4, max_row=10), titles_from_data=False)
-                chart.set_categories(Reference(ws, min_col=1, min_row=4, max_row=10))
-                ws.add_chart(chart, "D3")
-                # Main scanner report: filters, freeze panes, readable widths and colored signals.
-                report = wb["AI Scanner"]
-                report.freeze_panes = "A2"
-                report.auto_filter.ref = report.dimensions
-                for cell in report[1]:
-                    cell.font = Font(bold=True, color="FFFFFF")
-                    cell.fill = PatternFill("solid", fgColor="17365D")
-                    cell.alignment = Alignment(wrap_text=True, vertical="center")
-                report.row_dimensions[1].height = 32
-                for col_cells in report.columns:
-                    letter = col_cells[0].column_letter
-                    header = str(col_cells[0].value or "")
-                    report.column_dimensions[letter].width = min(max(len(header)+2, 13), 28)
-                headers = {str(c.value): c.column for c in report[1]}
-                for key in ("Action Signal", "Final Signal", "Breakout Signal", "Multi-TF Breakout"):
-                    if key in headers:
-                        col_letter = report.cell(1, headers[key]).column_letter
-                        report.conditional_formatting.add(f"{col_letter}2:{col_letter}{report.max_row}",
-                            CellIsRule(operator="equal", formula=['"BUY"'], fill=PatternFill("solid", fgColor="C6EFCE")))
-                # Open the workbook on the Dashboard sheet by default.
-                wb._sheets = [wb["Dashboard"], wb["AI Scanner"]]
-            # Persist the completed workbook bytes for Streamlit's Excel download button.
             xlsx_bytes = buffer.getvalue()
         except Exception as exc:
             xlsx_error = str(exc)
@@ -2117,12 +1631,6 @@ def show_ai_multi_agent_scanner(client=None):
             f"Scan completed: {len(result)} Yahoo rows; FYERS depth requested for "
             f"{len(depth_candidates)} shortlisted stocks (limit {depth_limit})."
         )
-        st.session_state["ma_scan_finalized_job"] = job_id
-        with _memory_connect() as conn:
-            conn.execute(
-                "UPDATE scan_jobs SET status='FINALIZED',updated_at=? WHERE job_id=?",
-                (datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S %Z"), job_id),
-            )
 
     result = st.session_state.get("multi_agent_results")
     if not isinstance(result, pd.DataFrame) or result.empty:
@@ -2141,10 +1649,19 @@ def show_ai_multi_agent_scanner(client=None):
     for col_name, default_value in early_defaults.items():
         if col_name not in result.columns:
             result[col_name] = default_value
+    pbm_defaults = {
+        "PBM Status": "NO DATA", "PBM Direction": "WAIT", "PBM Score": 0,
+        "PBM Candles": 0, "PBM Range High": None, "PBM Range Low": None,
+        "PBM Range %": None, "PBM Volume Build %": None, "PBM RVOL": None,
+        "PBM Last Price": None, "PBM Breakout Level": None,
+        "PBM Breakdown Level": None, "PBM Reason": "Run a fresh scan for 5M pre-big-move detection",
+    }
+    for col_name, default_value in pbm_defaults.items():
+        if col_name not in result.columns:
+            result[col_name] = default_value
     liquidity_defaults = {
         "Buy-side Liquidity": None, "Sell-side Liquidity": None,
         "Upside Sweep": "NO DATA", "Downside Sweep": "NO DATA",
-        "Equal High Liquidity": "NO DATA", "Equal Low Liquidity": "NO DATA",
         "Liquidity Sweep Detail": "Run a fresh scan for liquidity levels",
     }
     for tf in TIMEFRAMES:
@@ -2155,25 +1672,6 @@ def show_ai_multi_agent_scanner(client=None):
     for key, default in liquidity_defaults.items():
         if key not in result.columns:
             result[key] = default
-    new_signal_defaults = {
-        "Breakout Signal": "WAIT", "Breakout Level": None,
-        "Breakdown Level": None, "Breakout Reason": "Run a fresh scan",
-        "Action Signal": "WAIT", "Multi-TF Breakout": "WAIT",
-        "5M Breakout": "WAIT", "15M Breakout": "WAIT", "1H Breakout": "WAIT",
-        "Breakout Retest": "WAIT — NO RETEST DATA",
-    }
-    for col_name, default_value in new_signal_defaults.items():
-        if col_name not in result.columns:
-            result[col_name] = default_value
-    lvt_defaults = {
-        "LVT Event": "NO DATA", "LVT RVOL": None, "LVT Volume Status": "NO DATA",
-        "LVT Trend": "NO DATA", "LVT Trend Alignment": "0/3",
-        "LVT Direction": "WAIT", "LVT Score": 0, "LVT Status": "WAIT",
-        "LVT Reason": "Run a fresh scan to calculate Liquidity + Volume + Trend Intelligence",
-    }
-    for col_name, default_value in lvt_defaults.items():
-        if col_name not in result.columns:
-            result[col_name] = default_value
     if "Depth Signal" not in result.columns:
         result["Depth Signal"] = None
     if "Confirmation Strength %" not in result.columns:
@@ -2189,7 +1687,7 @@ def show_ai_multi_agent_scanner(client=None):
     mem_cols[0].metric("SQLite Candles", f"{candle_count:,}")
     mem_cols[1].metric("Saved Scan Rows", f"{scan_count:,}")
     mem_cols[2].metric("Memory Symbols", f"{memory_symbols:,}")
-    st.caption(f"Local SQLite candle database: {MEMORY_DB_PATH.name} • Host persistence depends on the deployment disk • Auto Scan: {'ON' if st.session_state.get('ma_auto_scan', False) else 'OFF'} (weekdays 09:15–15:30 IST)")
+    st.caption(f"Permanent candle database: {MEMORY_DB_PATH.name} • Auto Scan: {'ON' if st.session_state.get('ma_auto_scan', False) else 'OFF'} (weekdays 09:15–15:30 IST)")
     st.caption(
         f"Last scan: {info.get('universe', '')} • scanner.py symbols {info.get('source_symbols', '')} "
         f"• unique Yahoo tickers {info.get('unique_tickers', len(result))} "
@@ -2202,7 +1700,7 @@ def show_ai_multi_agent_scanner(client=None):
         "Minimum Best Stock Score", [75, 80, 85, 90], index=0, key="ma_best_min_score"
     )
     best_cols = [
-        "Symbol", "Best Stock Side", "Final Signal", "Action Signal", "Breakout Signal", "Best Stock Score",
+        "Symbol", "Best Stock Side", "Final Signal", "Best Stock Score",
         "Best Stock Grade", "Entry Price", "Stop Loss", "Last Price",
         "Signal Time (IST)", "5M", "15M", "1H", "Depth Signal",
         "Best Stock Reason",
@@ -2247,8 +1745,6 @@ def show_ai_multi_agent_scanner(client=None):
             [
                 "ALL", "WATCH", "CONFIRMED BREAKOUT", "WAIT", "NO DATA",
                 "BUY LIQUIDITY", "SELL LIQUIDITY", "SWEEP UP", "SWEEP DOWN",
-                "BREAKOUT", "BREAKDOWN", "ACTION BUY", "ACTION SELL",
-                "LVT WATCH", "LVT STRONG WATCH", "LVT CONFIRMED", "LVT CONFLICT",
             ],
             key="ma_early_filter",
         )
@@ -2268,25 +1764,14 @@ def show_ai_multi_agent_scanner(client=None):
         view = view[view["15M Upside Sweep"] == "YES"]
     elif early_filter == "SWEEP DOWN":
         view = view[view["15M Downside Sweep"] == "YES"]
-    elif early_filter in ("BREAKOUT", "BREAKDOWN"):
-        view = view[view["Breakout Signal"] == early_filter]
-    elif early_filter == "ACTION BUY":
-        view = view[view["Action Signal"] == "BUY"]
-    elif early_filter == "ACTION SELL":
-        view = view[view["Action Signal"] == "SELL"]
-    elif early_filter.startswith("LVT "):
-        lvt_status = early_filter.replace("LVT ", "")
-        view = view[view["LVT Status"] == lvt_status]
 
     view = view.sort_values(["20M Pre-Move Score", "Confirmation Strength %"], ascending=[False, False])
     summary_cols = [
-        "Symbol", "Final Signal", "Action Signal", "Breakout Signal", "Multi-TF Breakout", "5M Breakout", "15M Breakout", "1H Breakout", "Breakout Retest", "Breakout Level", "Breakdown Level", "Breakout Reason", "Equal High Liquidity", "Equal Low Liquidity", "Direction Movement", "Signal Time (IST)",
+        "Symbol", "Final Signal", "Direction Movement", "Signal Time (IST)",
         "5M Candle Close (IST)", "15M Candle Close (IST)", "1H Candle Close (IST)",
         "Entry Price", "Stop Loss", "15M ATR",
         "Confirmation Strength %", "Consensus Score",
         "Buy-side Liquidity", "Sell-side Liquidity", "Upside Sweep", "Downside Sweep", "Liquidity Sweep Detail",
-        "LVT Event", "LVT RVOL", "LVT Volume Status", "LVT Trend", "LVT Trend Alignment",
-        "LVT Direction", "LVT Score", "LVT Status", "LVT Reason",
         "5M Buy-side Liquidity", "5M Sell-side Liquidity", "5M Upside Sweep", "5M Downside Sweep",
         "15M Buy-side Liquidity", "15M Sell-side Liquidity", "15M Upside Sweep", "15M Downside Sweep",
         "1H Buy-side Liquidity", "1H Sell-side Liquidity", "1H Upside Sweep", "1H Downside Sweep",
@@ -2294,25 +1779,32 @@ def show_ai_multi_agent_scanner(client=None):
         "Best Stock Filter", "Best Stock Reason",
         "20M Status", "20M Direction", "20M Pre-Move Score", "20M Range High", "20M Range Low",
         "20M Range %", "20M RVOL", "20M Pressure %", "20M Last Close", "20M Reason",
+        "PBM Status", "PBM Direction", "PBM Score", "PBM Candles", "PBM Range High", "PBM Range Low",
+        "PBM Range %", "PBM Volume Build %", "PBM RVOL", "PBM Last Price", "PBM Breakout Level",
+        "PBM Breakdown Level", "PBM Reason",
         "5M", "15M", "1H", "5M Score", "15M Score", "1H Score",
         "5M Candles", "15M Candles", "1H Candles", "Last Price", "15M RSI",
         "News Agent", "News Score", "News Reason", "Depth Status", "Depth Signal",
         "Best Bid", "Best Ask", "Spread", "Buy Qty (5L)", "Sell Qty (5L)",
         "Depth Imbalance %", "Depth Time (IST)", "Errors",
     ]
-    st.dataframe(view[summary_cols], hide_index=True, **_stretch())
-
-    st.subheader("💧 Liquidity + Big Volume + Present Trend Intelligence")
-    lvt_view = result[result["LVT Status"].isin(["CONFIRMED", "STRONG WATCH", "WATCH", "CONFLICT", "BIG VOLUME WATCH"])].copy()
-    if not lvt_view.empty:
-        lvt_view = lvt_view.sort_values(["LVT Score", "LVT RVOL"], ascending=[False, False])
-        lvt_cols = ["Symbol", "LVT Event", "LVT RVOL", "LVT Volume Status", "LVT Trend",
-                    "LVT Trend Alignment", "LVT Direction", "LVT Score", "LVT Status", "LVT Reason",
-                    "5M", "15M", "1H", "Breakout Signal", "Multi-TF Breakout", "Last Price"]
-        st.dataframe(lvt_view[lvt_cols], hide_index=True, **_stretch())
+    st.subheader("🚀 PRE-BIG MOVE — 10–15 Candle Compression + Volume Build-up")
+    pbm_view = result[result["PBM Status"].isin([
+        "BULLISH WATCH", "BEARISH WATCH", "WAIT / DIRECTION UNCLEAR",
+        "BULLISH BREAKOUT CONFIRMED", "BEARISH BREAKDOWN CONFIRMED",
+    ])].copy()
+    if not pbm_view.empty:
+        pbm_view = pbm_view.sort_values(["PBM Score", "PBM RVOL"], ascending=[False, False])
+        pbm_cols = ["Symbol", "PBM Status", "PBM Direction", "PBM Score", "PBM Candles",
+                    "PBM Range High", "PBM Range Low", "PBM Range %", "PBM Volume Build %",
+                    "PBM RVOL", "PBM Last Price", "PBM Breakout Level",
+                    "PBM Breakdown Level", "5M", "15M", "1H", "PBM Reason"]
+        st.dataframe(pbm_view[pbm_cols], hide_index=True, **_stretch())
     else:
-        st.info("No liquidity + big-volume + trend setup detected in the latest scan.")
-    st.caption("Sweep direction is a reversal clue, not an automatic trade. CONFIRMED requires a completed breakout aligned with big volume and timeframe trend. Yahoo candle volume is not exchange order-flow data.")
+        st.info("No PRE-BIG compression + rising-volume setups found in this scan. This is normal; do not loosen filters just to force signals.")
+    st.caption("WATCH = setup only, not an entry signal. CONFIRMED = latest completed 5M candle closed beyond the fixed 12-candle range with body and RVOL confirmation. Scores are heuristic, not probabilities.")
+
+    st.dataframe(view[summary_cols], hide_index=True, **_stretch())
 
     st.subheader("📚 FYERS Live Market Depth — Shortlist Only")
     depth_view = st.session_state.get("multi_agent_depth")
@@ -2329,7 +1821,7 @@ def show_ai_multi_agent_scanner(client=None):
         )
     else:
         st.info("No BUY / SELL / PRE-BIG shortlist rows yet, or Market Depth has not been requested.")
-    st.caption("CSV/Excel include all timeframe-agent outputs, the 18th Best Stock Analyst, Liquidity + Big Volume + Trend Intelligence, and each agent reason. 20M fields populate when optional 1M scan is enabled.")
+    st.caption("CSV/Excel include all 51 timeframe-agent outputs plus the 18th Best Stock Analyst report and each agent reason. 20M early-movement fields are populated when the optional 1M scan is enabled.")
     st.caption("Signal Time = latest completed 15M candle close (IST). Entry = 15M close. Stop Loss = 1.5 × 15M ATR; shown only for BUY/SELL and PRE-BIG signals.")
 
     file_stamp = info.get("file_stamp", datetime.now(IST).strftime("%Y%m%d_%H%M%S"))
