@@ -2099,6 +2099,8 @@ def show_ai_multi_agent_scanner(client=None):
                             CellIsRule(operator="equal", formula=['"BUY"'], fill=PatternFill("solid", fgColor="C6EFCE")))
                 # Open the workbook on the Dashboard sheet by default.
                 wb._sheets = [wb["Dashboard"], wb["AI Scanner"]]
+            # Capture the completed workbook bytes for Streamlit download.
+            xlsx_bytes = buffer.getvalue()
         except Exception as exc:
             xlsx_error = str(exc)
 
