@@ -16,11 +16,14 @@ requirements.txt:
 """
 
 import io
+import json
 import math
+import pickle
 import re
 import sqlite3
 import threading
 import time
+import uuid
 from pathlib import Path
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -56,6 +59,8 @@ SIGNAL_PRIORITY = {
     "WAIT": 2, "NO DATA": 3,
 }
 _YF_LOCK = threading.Lock()
+_SCAN_WORKERS = {}
+_SCAN_WORKERS_LOCK = threading.Lock()
 FYERS_DEPTH_CACHE_TTL = 20       # seconds; prevents repeated depth calls on Streamlit reruns
 FYERS_DEPTH_CALL_GAP = 1.05      # conservative one-call-per-second pacing
 FYERS_DEPTH_DEFAULT_LIMIT = 20  # configurable shortlist cap per scan
@@ -77,6 +82,19 @@ def _memory_connect():
         id INTEGER PRIMARY KEY AUTOINCREMENT, scanned_at TEXT NOT NULL,
         symbol TEXT NOT NULL, final_signal TEXT, direction_movement TEXT,
         last_price REAL, yahoo_signal_time TEXT)""")
+    # Durable scan checkpoints: completed symbol rows survive browser refresh,
+    # minimized tabs, Streamlit reruns and local app restarts.
+    conn.execute("""CREATE TABLE IF NOT EXISTS scan_jobs (
+        job_id TEXT PRIMARY KEY, status TEXT NOT NULL, config_json TEXT NOT NULL,
+        total_symbols INTEGER NOT NULL DEFAULT 0,
+        completed_symbols INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+        error TEXT)""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS scan_job_rows (
+        job_id TEXT NOT NULL, symbol TEXT NOT NULL, ticker TEXT NOT NULL,
+        payload BLOB NOT NULL, saved_at TEXT NOT NULL,
+        PRIMARY KEY(job_id, symbol))""")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_scan_jobs_status ON scan_jobs(status, updated_at)")
     return conn
 
 def _save_candle_memory(batch, per_tf):
@@ -132,6 +150,44 @@ def _load_candle_memory(symbol, timeframe):
         return frame.sort_values("Time").drop_duplicates("Time", keep="last").reset_index(drop=True)
     except Exception:
         return pd.DataFrame(columns=["Time", "Open", "High", "Low", "Close", "Volume"])
+
+def _load_candle_memory_batch(symbols, timeframe):
+    """Load one timeframe for a batch using one SQLite query/connection."""
+    empty_cols = ["Time", "Open", "High", "Low", "Close", "Volume"]
+    symbols = [str(s) for s in symbols]
+    if not symbols:
+        return {}
+    try:
+        placeholders = ",".join("?" for _ in symbols)
+        with _memory_connect() as conn:
+            rows = conn.execute(
+                f"""SELECT symbol, candle_time, open, high, low, close, volume
+                    FROM candles
+                    WHERE timeframe=? AND symbol IN ({placeholders})
+                    ORDER BY symbol, candle_time""",
+                [str(timeframe)] + symbols,
+            ).fetchall()
+        grouped = {s: [] for s in symbols}
+        for row in rows:
+            grouped.setdefault(row[0], []).append(row[1:])
+        output = {}
+        for symbol in symbols:
+            data = grouped.get(symbol, [])
+            if not data:
+                output[symbol] = pd.DataFrame(columns=empty_cols)
+                continue
+            frame = pd.DataFrame(data, columns=empty_cols)
+            frame["Time"] = pd.to_datetime(frame["Time"], errors="coerce", utc=True).dt.tz_convert(IST)
+            for col in ("Open", "High", "Low", "Close", "Volume"):
+                frame[col] = pd.to_numeric(frame[col], errors="coerce")
+            frame = frame.dropna(subset=empty_cols)
+            output[symbol] = (
+                frame.sort_values("Time").drop_duplicates("Time", keep="last").reset_index(drop=True)
+            )
+        return output
+    except Exception:
+        return {s: pd.DataFrame(columns=empty_cols) for s in symbols}
+
 
 def _merge_candle_frames(cached, fresh):
     """Merge stored and fresh Yahoo candles; fresh overlapping bars take precedence."""
@@ -330,8 +386,8 @@ def _download_yahoo_batch_cached(tickers_tuple, interval, period):
     with _YF_LOCK:
         data = yf.download(
             tickers=list(tickers_tuple), period=period, interval=interval,
-            auto_adjust=False, actions=False, progress=False, threads=False,
-            group_by="ticker", timeout=15,
+            auto_adjust=False, actions=False, progress=False, threads=8,
+            group_by="ticker", timeout=20,
         )
     if data is None or data.empty:
         raise RuntimeError(f"Yahoo returned no data for {interval}.")
@@ -1080,7 +1136,10 @@ def _scan_batch(batch, period, include_early=True):
     # If SQLite already has data for every ticker, fetch only a short overlap window.
     # First scan remains a full-history warm-up. The overlap refreshes late/adjusted bars.
     for label, (interval, minutes) in TIMEFRAMES.items():
-        cached = {ticker: _load_candle_memory(original_by_ticker[ticker], label) for ticker in tickers}
+        cached = _load_candle_memory_batch(
+            [original_by_ticker[t] for t in tickers], label
+        )
+        cached = {ticker: cached.get(original_by_ticker[ticker], pd.DataFrame()) for ticker in tickers}
         stale_tickers = [t for t in tickers if not _cached_candles_are_fresh(cached[t], minutes)]
         # Only request symbols whose saved candle set is stale or missing. This is
         # faster than downloading a 2-day overlap for every stock on every scan.
@@ -1099,7 +1158,13 @@ def _scan_batch(batch, period, include_early=True):
     # Optional 1-minute feed. It is the most expensive extra request set, so
     # the fast core scan can finish without downloading 1M candles for every stock.
     if include_early:
-        early_cached = {ticker: _load_candle_memory(original_by_ticker[ticker], "1M") for ticker in tickers}
+        early_cached_by_symbol = _load_candle_memory_batch(
+            [original_by_ticker[t] for t in tickers], "1M"
+        )
+        early_cached = {
+            ticker: early_cached_by_symbol.get(original_by_ticker[ticker], pd.DataFrame())
+            for ticker in tickers
+        }
         early_stale = [t for t in tickers if not _cached_candles_are_fresh(early_cached[t], 1)]
         if early_stale:
             early_period = "2d" if all(not early_cached[t].empty for t in early_stale) else "7d"
@@ -1426,6 +1491,182 @@ def _direction_movement(row):
     return movement
 
 
+
+def _scan_job_create(config):
+    """Create a durable scan job and return its unique ID."""
+    job_id = uuid.uuid4().hex
+    now_text = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S %Z")
+    config_text = json.dumps(config, ensure_ascii=False)
+    with _memory_connect() as conn:
+        conn.execute(
+            """INSERT INTO scan_jobs
+               (job_id,status,config_json,total_symbols,completed_symbols,created_at,updated_at,error)
+               VALUES (?,?,?,?,?,?,?,?)""",
+            (job_id, "RUNNING", config_text, len(config.get("symbols", [])), 0,
+             now_text, now_text, None),
+        )
+    return job_id
+
+
+def _scan_job_get(job_id):
+    if not job_id:
+        return None
+    try:
+        with _memory_connect() as conn:
+            row = conn.execute(
+                """SELECT job_id,status,config_json,total_symbols,completed_symbols,
+                          created_at,updated_at,error
+                   FROM scan_jobs WHERE job_id=?""", (str(job_id),)
+            ).fetchone()
+        if not row:
+            return None
+        return {
+            "job_id": row[0], "status": row[1], "config": json.loads(row[2]),
+            "total": int(row[3]), "completed": int(row[4]),
+            "created_at": row[5], "updated_at": row[6], "error": row[7],
+        }
+    except Exception:
+        return None
+
+
+def _scan_job_latest_active():
+    try:
+        with _memory_connect() as conn:
+            row = conn.execute(
+                """SELECT job_id FROM scan_jobs
+                   WHERE status IN ('RUNNING','PAUSED','DONE')
+                   ORDER BY created_at DESC LIMIT 1"""
+            ).fetchone()
+        return row[0] if row else None
+    except Exception:
+        return None
+
+
+def _scan_job_load_rows(job_id):
+    """Restore completed technical rows in original scan-universe order."""
+    job = _scan_job_get(job_id)
+    if not job:
+        return []
+    config_symbols = job["config"].get("symbols", [])
+    try:
+        with _memory_connect() as conn:
+            rows = conn.execute(
+                "SELECT symbol,payload FROM scan_job_rows WHERE job_id=?",
+                (str(job_id),),
+            ).fetchall()
+        payload_by_symbol = {
+            symbol: pickle.loads(payload) for symbol, payload in rows
+        }
+        return [
+            payload_by_symbol[item[0]]
+            for item in config_symbols
+            if item[0] in payload_by_symbol
+        ]
+    except Exception:
+        return []
+
+
+def _scan_job_worker(job_id):
+    """Background scanner. Each finished batch is committed before moving on."""
+    job = _scan_job_get(job_id)
+    if not job:
+        return
+    config = job["config"]
+    symbols = [(str(x[0]), str(x[1])) for x in config.get("symbols", [])]
+    batch_size = max(10, min(int(config.get("batch_size", 25)), 100))
+    period = str(config.get("period", "30d"))
+    include_early = bool(config.get("include_early", False))
+    now_text = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S %Z")
+
+    try:
+        with _memory_connect() as conn:
+            done_rows = conn.execute(
+                "SELECT symbol FROM scan_job_rows WHERE job_id=?", (job_id,)
+            ).fetchall()
+        completed_symbols = {x[0] for x in done_rows}
+        pending = [x for x in symbols if x[0] not in completed_symbols]
+
+        for start in range(0, len(pending), batch_size):
+            batch = pending[start:start + batch_size]
+            try:
+                batch_rows = _scan_batch(batch, period, include_early=include_early)
+            except Exception as exc:
+                batch_rows = [
+                    _no_data_row(symbol, ticker, f"Batch failed: {str(exc)[:180]}")
+                    for symbol, ticker in batch
+                ]
+
+            saved_at = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S %Z")
+            payload_rows = [
+                (job_id, str(row.get("Symbol", symbol)), str(row.get("Yahoo Symbol", ticker)),
+                 sqlite3.Binary(pickle.dumps(row, protocol=pickle.HIGHEST_PROTOCOL)), saved_at)
+                for (symbol, ticker), row in zip(batch, batch_rows)
+            ]
+            # Commit a whole batch atomically: after a crash, only an unfinished
+            # batch is repeated. Completed symbols are never downloaded again.
+            with _memory_connect() as conn:
+                conn.executemany(
+                    """INSERT INTO scan_job_rows(job_id,symbol,ticker,payload,saved_at)
+                       VALUES (?,?,?,?,?)
+                       ON CONFLICT(job_id,symbol) DO UPDATE SET
+                         ticker=excluded.ticker,payload=excluded.payload,saved_at=excluded.saved_at""",
+                    payload_rows,
+                )
+                total_done = conn.execute(
+                    "SELECT COUNT(*) FROM scan_job_rows WHERE job_id=?", (job_id,)
+                ).fetchone()[0]
+                conn.execute(
+                    """UPDATE scan_jobs SET status='RUNNING',completed_symbols=?,
+                       updated_at=?,error=NULL WHERE job_id=?""",
+                    (int(total_done), saved_at, job_id),
+                )
+
+        finished_at = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S %Z")
+        with _memory_connect() as conn:
+            total_done = conn.execute(
+                "SELECT COUNT(*) FROM scan_job_rows WHERE job_id=?", (job_id,)
+            ).fetchone()[0]
+            conn.execute(
+                """UPDATE scan_jobs SET status='DONE',completed_symbols=?,
+                   updated_at=?,error=NULL WHERE job_id=?""",
+                (int(total_done), finished_at, job_id),
+            )
+    except Exception as exc:
+        paused_at = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S %Z")
+        try:
+            with _memory_connect() as conn:
+                conn.execute(
+                    """UPDATE scan_jobs SET status='PAUSED',updated_at=?,error=?
+                       WHERE job_id=?""",
+                    (paused_at, str(exc)[:1000], job_id),
+                )
+        except Exception:
+            pass
+    finally:
+        with _SCAN_WORKERS_LOCK:
+            _SCAN_WORKERS.pop(job_id, None)
+
+
+def _scan_job_start_worker(job_id):
+    """Start or resume one job; a live worker is never duplicated."""
+    if not job_id:
+        return False
+    with _SCAN_WORKERS_LOCK:
+        current = _SCAN_WORKERS.get(job_id)
+        if current is not None and current.is_alive():
+            return True
+        job = _scan_job_get(job_id)
+        if not job or job["status"] not in ("RUNNING", "PAUSED"):
+            return False
+        worker = threading.Thread(
+            target=_scan_job_worker, args=(job_id,),
+            name=f"nse-scan-{job_id[:8]}", daemon=True,
+        )
+        _SCAN_WORKERS[job_id] = worker
+        worker.start()
+        return True
+
+
 def show_ai_multi_agent_scanner(client=None):
     """Streamlit page. client is retained for app.py compatibility."""
     st.title("🤖 AI Multi-Agent Scanner V18 — Yahoo Batch")
@@ -1450,7 +1691,7 @@ def show_ai_multi_agent_scanner(client=None):
     with c1:
         universe = st.selectbox("Universe", ["Both (NSE + F&O)", "F&O Stocks", "NSE Equity"], key="ma_universe")
     with c2:
-        batch_size = st.selectbox("Batch size", [25, 50, 75, 100, 125], index=4, key="ma_batch_size_v18")
+        batch_size = st.selectbox("Batch size", [10, 25, 50, 75, 100], index=1, key="ma_batch_size_v18", help="Local PC: 25 is the safer default for NSE. Completed batches are checkpointed and can resume.")
     with c3:
         st.metric("Analysis", "18 Agents + Ranking")
 
@@ -1536,58 +1777,102 @@ def show_ai_multi_agent_scanner(client=None):
 
     run_scan_now = st.button("🚀 RUN FULL BATCH SCAN", type="primary", key="run_multi_agent", **_stretch())
     auto_due = bool(st.session_state.pop("ma_auto_scan_due", False))
-    if run_scan_now or (auto_due and auto_scan and _is_market_hours()):
-        batches = [unique_items[i:i + batch_size] for i in range(0, len(unique_items), batch_size)]
-        progress, status = st.progress(0.0), st.empty()
-        live_best_report = st.empty()
-        all_rows = []
-        live_best_cols = [
-            "Symbol", "Best Stock Side", "Final Signal", "Action Signal", "Breakout Signal", "Best Stock Score",
-            "Best Stock Grade", "Entry Price", "Stop Loss", "Signal Time (IST)",
-            "5M", "15M", "1H", "Best Stock Reason",
-        ]
-        for idx, batch in enumerate(batches, 1):
-            status.write(
-                f"Priority scan batch {idx}/{len(batches)} — {len(batch)} symbols "
-                f"(F&O first when Both is selected; 5M + 15M + 1H; "
-                f"1M extra scan {'ON' if early_scan_enabled else 'OFF'})"
-            )
-            try:
-                batch_rows = _scan_batch(batch, period, include_early=early_scan_enabled)
-                all_rows.extend(batch_rows)
-            except Exception as exc:
-                batch_rows = [_no_data_row(s, t, f"Batch failed: {exc}") for s, t in batch]
-                all_rows.extend(batch_rows)
+    start_scan_requested = run_scan_now or (auto_due and auto_scan and _is_market_hours())
+    resume_scan_now = st.button("▶️ RESUME / CONTINUE SCAN", key="ma_resume_scan", **_stretch())
 
-            # Live provisional report refreshes after every completed batch.
-            # FYERS depth is added later, so this in-scan ranking is provisional.
-            partial = pd.DataFrame(all_rows)
-            if not partial.empty:
-                partial["Depth Signal"] = None
-                partial_analyst = partial.apply(_best_stock_analyst, axis=1, result_type="expand")
-                partial = pd.concat([partial, partial_analyst], axis=1)
-                live_top = partial[
-                    (partial["Best Stock Filter"] == "PASS")
-                    & (partial["Best Stock Score"] >= 75)
-                ].sort_values(
-                    ["Best Stock Score", "Confirmation Strength %"],
-                    ascending=[False, False],
-                ).head(10)
-                live_best_report.empty()
-                live_best_report.write(
-                    f"🏆 Live Best Stocks — provisional ranking after batch {idx}/{len(batches)} "
-                    "(FYERS depth confirmation pending)"
+    # Reconnect to the latest unfinished scan after a rerun, refresh or browser reopen.
+    job_id = st.session_state.get("ma_scan_job_id")
+    job = _scan_job_get(job_id) if job_id else None
+    if not job or job["status"] in ("FINALIZED", "CANCELLED"):
+        active_job_id = _scan_job_latest_active()
+        if active_job_id:
+            job_id = active_job_id
+            st.session_state["ma_scan_job_id"] = job_id
+            job = _scan_job_get(job_id)
+
+    if start_scan_requested:
+        if job and job["status"] in ("RUNNING", "PAUSED"):
+            st.warning("ఒక scan ఇప్పటికే pending/running లో ఉంది. దాన్ని Resume చేయండి; duplicate scan ప్రారంభించలేదు.")
+        else:
+            config = {
+                "universe": universe,
+                "source_symbols": len(symbols),
+                "symbols": [[original, ticker] for original, ticker in unique_items],
+                "batch_size": int(batch_size),
+                "period": period,
+                "include_early": bool(early_scan_enabled),
+                "news_enabled": bool(news_enabled),
+                "news_limit": int(news_limit),
+                "depth_limit": int(depth_limit),
+            }
+            job_id = _scan_job_create(config)
+            st.session_state["ma_scan_job_id"] = job_id
+            st.session_state.pop("ma_scan_finalized_job", None)
+            job = _scan_job_get(job_id)
+            _scan_job_start_worker(job_id)
+
+    if resume_scan_now and job_id:
+        _scan_job_start_worker(job_id)
+        job = _scan_job_get(job_id)
+
+    # The worker continues independently of browser rendering. This lightweight
+    # fragment only polls SQLite; a minimized browser may throttle display refresh,
+    # but does not stop the local Python worker.
+    if job_id and job and job["status"] in ("RUNNING", "PAUSED"):
+        if job["status"] == "RUNNING":
+            _scan_job_start_worker(job_id)
+        if hasattr(st, "fragment"):
+            @st.fragment(run_every="1s")
+            def _scan_job_monitor():
+                current = _scan_job_get(job_id)
+                if not current:
+                    st.warning("Scan job record not found.")
+                    return
+                total = max(current["total"], 1)
+                done = min(current["completed"], total)
+                st.progress(done / total, text=f"Background scan: {done:,}/{current['total']:,} stocks")
+                st.caption(
+                    f"Status: {current['status']} • Job: {job_id[:8]} • "
+                    "F&O priority order preserved; finished batches saved to SQLite."
                 )
-                if not live_top.empty:
-                    live_best_report.dataframe(
-                        live_top[live_best_cols], hide_index=True, **_stretch()
-                    )
-                else:
-                    live_best_report.info(
-                        "No stock has passed the live 75/100 quality filter yet."
-                    )
-            progress.progress(idx / max(len(batches), 1))
+                if current["status"] == "PAUSED":
+                    st.error(f"Scan paused: {current.get('error') or 'Unknown worker error'}. Press RESUME / CONTINUE SCAN.")
+                elif current["status"] == "DONE":
+                    st.success("Technical scan completed. Preparing the existing reports…")
+                    st.rerun(scope="app")
+            _scan_job_monitor()
+        else:
+            st.info("Background scan is running. Install/upgrade Streamlit to enable live progress refresh.")
+        job = _scan_job_get(job_id)
 
+    job_done = bool(job and job["status"] == "DONE")
+    already_finalized = st.session_state.get("ma_scan_finalized_job") == job_id
+    run_scan_now = job_done and not already_finalized
+
+    if job and job["status"] == "PAUSED":
+        st.warning("Scan paused safely. Completed batches are saved; press RESUME / CONTINUE SCAN to continue.")
+    elif job and job["status"] == "RUNNING":
+        st.info("NSE/F&O scan is running in the background. You can minimize the browser; the local Python worker continues.")
+    elif job and job["status"] == "DONE" and already_finalized:
+        st.success("Latest scan is already processed. Existing report and Excel downloads are available below.")
+
+    if run_scan_now:
+        saved_job = _scan_job_get(job_id)
+        universe = saved_job["config"].get("universe", universe)
+        unique_items = [(str(x[0]), str(x[1])) for x in saved_job["config"].get("symbols", [])]
+        symbols = [x[0] for x in unique_items]
+        batch_size = int(saved_job["config"].get("batch_size", batch_size))
+        period = str(saved_job["config"].get("period", period))
+        early_scan_enabled = bool(saved_job["config"].get("include_early", early_scan_enabled))
+        news_enabled = bool(saved_job["config"].get("news_enabled", news_enabled))
+        news_limit = int(saved_job["config"].get("news_limit", news_limit))
+        depth_limit = int(saved_job["config"].get("depth_limit", depth_limit))
+        all_rows = _scan_job_load_rows(job_id)
+        batches = [
+            saved_job["config"]["symbols"][i:i + int(saved_job["config"]["batch_size"])]
+            for i in range(0, len(saved_job["config"]["symbols"]), int(saved_job["config"]["batch_size"]))
+        ]
+        status = st.empty()
         result = _sort_results(pd.DataFrame(all_rows))
         if news_enabled:
             candidates = result[result["Final Signal"].isin(
@@ -1742,6 +2027,12 @@ def show_ai_multi_agent_scanner(client=None):
             f"Scan completed: {len(result)} Yahoo rows; FYERS depth requested for "
             f"{len(depth_candidates)} shortlisted stocks (limit {depth_limit})."
         )
+        st.session_state["ma_scan_finalized_job"] = job_id
+        with _memory_connect() as conn:
+            conn.execute(
+                "UPDATE scan_jobs SET status='FINALIZED',updated_at=? WHERE job_id=?",
+                (datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S %Z"), job_id),
+            )
 
     result = st.session_state.get("multi_agent_results")
     if not isinstance(result, pd.DataFrame) or result.empty:
