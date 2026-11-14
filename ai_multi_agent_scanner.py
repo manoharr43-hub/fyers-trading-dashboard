@@ -109,6 +109,8 @@ def _memory_connect():
                         PRIMARY KEY(job_id, symbol))""")
                     conn.execute("CREATE INDEX IF NOT EXISTS idx_scan_jobs_status ON scan_jobs(status, updated_at)")
                     conn.execute("CREATE INDEX IF NOT EXISTS idx_scan_history_time ON scan_history(scanned_at)")
+                    # One-time cleanup of legacy partial 15:15 1H bars saved by older versions.
+                    conn.execute("DELETE FROM candles WHERE timeframe='1H' AND substr(candle_time,12,5)='15:15'")
                     conn.commit()
                     _MEMORY_INITIALIZED = True
         yield conn
@@ -567,41 +569,37 @@ def _multi_tf_breakout(frames):
             "1H Breakout":checks["1H"]["Breakout Signal"]}
 
 
-def _breakout_retest_confirmation(df, level, direction, tolerance_pct=0.003):
-    """Require a close beyond level, then a later candle retesting and holding it."""
-    if df is None or not isinstance(df, pd.DataFrame) or len(df) < 3 or level is None:
+def _breakout_retest_confirmation(df, direction, lookback=20, scan=6, tol=0.003):
+    """Find a recent breakout against its own prior rolling range, then a later retest."""
+    required = {"Time", "High", "Low", "Close"}
+    if df is None or not isinstance(df, pd.DataFrame) or not required.issubset(df.columns):
         return "WAIT — NO RETEST DATA"
-    level = _safe_num(level, np.nan)
-    if not np.isfinite(level) or level <= 0:
+    d = df.sort_values("Time").drop_duplicates("Time", keep="last").reset_index(drop=True)
+    n = len(d)
+    if n < lookback + scan + 2:
         return "WAIT — NO RETEST DATA"
-    d = df.sort_values("Time").drop_duplicates("Time", keep="last").tail(8).reset_index(drop=True)
-    if len(d) < 3:
-        return "WAIT — NO RETEST DATA"
-    tol = abs(level) * float(tolerance_pct)
-    prior = d.iloc[:-1]  # the latest candle must be after the breakout candle
-    if direction == "UP":
-        breakout_positions = np.flatnonzero(prior["Close"].astype(float).to_numpy() > level)
-        if not len(breakout_positions):
-            return "WAIT — NO PRIOR UPSIDE BREAKOUT"
-        breakout_idx = int(breakout_positions[-1])
-        after = d.iloc[breakout_idx + 1:]
-        if after.empty:
-            return "WAIT — RETEST NOT YET OCCURRED"
-        touched = (after["Low"].astype(float) <= level + tol) & (after["High"].astype(float) >= level - tol)
-        held = float(d["Close"].iloc[-1]) > level
-        return "RETEST HELD" if bool(touched.any()) and held else "WAIT — RETEST NOT CONFIRMED"
-    if direction == "DOWN":
-        breakout_positions = np.flatnonzero(prior["Close"].astype(float).to_numpy() < level)
-        if not len(breakout_positions):
-            return "WAIT — NO PRIOR DOWNSIDE BREAKDOWN"
-        breakout_idx = int(breakout_positions[-1])
-        after = d.iloc[breakout_idx + 1:]
-        if after.empty:
-            return "WAIT — RETEST NOT YET OCCURRED"
-        touched = (after["High"].astype(float) >= level - tol) & (after["Low"].astype(float) <= level + tol)
-        held = float(d["Close"].iloc[-1]) < level
-        return "RETEST REJECTED" if bool(touched.any()) and held else "WAIT — RETEST NOT CONFIRMED"
-    return "WAIT — NO BREAKOUT"
+    hi = pd.to_numeric(d["High"], errors="coerce")
+    lo = pd.to_numeric(d["Low"], errors="coerce")
+    cl = pd.to_numeric(d["Close"], errors="coerce")
+    for k in range(n - 2, max(lookback - 1, n - scan - 2) - 1, -1):
+        up_level = float(hi.iloc[k-lookback:k].max())
+        down_level = float(lo.iloc[k-lookback:k].min())
+        after = d.iloc[k+1:]
+        candle = d.iloc[k]
+        span = max(float(candle["High"])-float(candle["Low"]), 1e-9)
+        body_ratio = abs(float(candle["Close"])-float(candle["Open"])) / span
+        prior_vol = pd.to_numeric(d["Volume"].iloc[k-lookback:k], errors="coerce").mean() if "Volume" in d.columns else 0.0
+        breakout_rvol = float(candle["Volume"])/prior_vol if prior_vol and prior_vol > 0 else 0.0
+        strong_break = body_ratio >= 0.55 and breakout_rvol >= 1.5
+        if direction == "UP" and cl.iloc[k] > up_level and strong_break:
+            touched = (pd.to_numeric(after["Low"], errors="coerce") <= up_level * (1 + tol)).any()
+            held = bool(cl.iloc[-1] > up_level)
+            return "RETEST HELD" if touched and held else "WAIT — RETEST NOT CONFIRMED"
+        if direction == "DOWN" and cl.iloc[k] < down_level and strong_break:
+            touched = (pd.to_numeric(after["High"], errors="coerce") >= down_level * (1 - tol)).any()
+            held = bool(cl.iloc[-1] < down_level)
+            return "RETEST REJECTED" if touched and held else "WAIT — RETEST NOT CONFIRMED"
+    return "WAIT — NO RECENT BREAKOUT"
 
 
 def _last_session_close(now=None, minutes=None):
@@ -631,6 +629,13 @@ def _cached_candles_are_fresh(frame, minutes, now=None):
         close_time = (last.normalize() + SESSION_CLOSE
                       if minutes == 60 and last.hour == 15 and last.minute == 15
                       else last + pd.Timedelta(minutes=minutes))
+        # Before the first completed 1H candle today, avoid repeated fetches only
+        # if cache already reaches the previous expected trading session close.
+        if minutes == 60 and pd.Timestamp("09:15").time() <= now.time() < pd.Timestamp("10:15").time():
+            previous_close = _last_session_close(
+                now.normalize() + pd.Timedelta(hours=9), minutes=60
+            )
+            return close_time >= previous_close - pd.Timedelta(minutes=1)
         if not _is_market_hours(now.to_pydatetime()):
             # At/after close and on weekends, cached data must reach the most
             # recent expected session close, not merely have today's date.
@@ -807,7 +812,7 @@ def _run_17_agents(df, timeframe=None):
     # beyond the candidate window structure; then price must return to that zone.
     for pos in range(len(ob_window) - 1, -1, -1):
         candidate = ob_window.iloc[pos]
-        later = d.iloc[-(len(ob_window)-pos):] if pos < len(ob_window)-1 else d.iloc[0:0]
+        later = d.iloc[-(len(ob_window)-pos):]
         if later.empty:
             continue
         if candidate["Close"] < candidate["Open"] and later["Close"].max() > candidate["High"]:
@@ -815,7 +820,7 @@ def _run_17_agents(df, timeframe=None):
             break
     for pos in range(len(ob_window) - 1, -1, -1):
         candidate = ob_window.iloc[pos]
-        later = d.iloc[-(len(ob_window)-pos):] if pos < len(ob_window)-1 else d.iloc[0:0]
+        later = d.iloc[-(len(ob_window)-pos):]
         if later.empty:
             continue
         if candidate["Close"] > candidate["Open"] and later["Close"].min() < candidate["Low"]:
@@ -966,6 +971,15 @@ def _prebig_5m_analysis(df):
     if df is None or not isinstance(df, pd.DataFrame) or len(df) < 25:
         return empty
     full = df.sort_values("Time").drop_duplicates("Time", keep="last").reset_index(drop=True)
+    latest_day = pd.Timestamp(full["Time"].iloc[-1]).date()
+    same_session = full[pd.to_datetime(full["Time"]).dt.date == latest_day]
+    if len(same_session) < 25:
+        warm = empty.copy()
+        warm["PRE-BIG Status"] = "WAIT — SESSION WARM-UP"
+        warm["PRE-BIG Reason"] = f"Session warm-up: {len(same_session)}/25 same-session 5M candles"
+        warm["PRE-BIG Candles"] = len(same_session)
+        return warm
+    full = same_session.reset_index(drop=True)
     session_vwap = _vwap_last_session(full)
     d = full.tail(25).reset_index(drop=True)
     prior = d.iloc[-25:-13]       # 12 candles before the compression window
@@ -1057,6 +1071,14 @@ def _directional_pre_move_engine(df):
         return empty
     try:
         full = df.sort_values("Time").drop_duplicates("Time", keep="last").reset_index(drop=True)
+        latest_day = pd.Timestamp(full["Time"].iloc[-1]).date()
+        same_session = full[pd.to_datetime(full["Time"]).dt.date == latest_day]
+        if len(same_session) < 26:
+            warm = empty.copy()
+            warm["Directional Pre-Move"] = "WAIT — SESSION WARM-UP"
+            warm["Pre-Move Reason"] = f"Session warm-up: {len(same_session)}/26 same-session 5M candles"
+            return warm
+        full = same_session.reset_index(drop=True)
         session_vwap = _vwap_last_session(full)
         d = full.tail(26).reset_index(drop=True)
         prior, recent, last = d.iloc[-25:-13], d.iloc[-13:-1], d.iloc[-1]
@@ -1147,7 +1169,15 @@ def _early_20m_analysis(df):
     }
     if df is None or not isinstance(df, pd.DataFrame) or len(df) < 21:
         return empty
-    d = df.sort_values("Time").drop_duplicates("Time", keep="last").tail(21).reset_index(drop=True)
+    ordered = df.sort_values("Time").drop_duplicates("Time", keep="last").reset_index(drop=True)
+    latest_day = pd.Timestamp(ordered["Time"].iloc[-1]).date()
+    same_session = ordered[pd.to_datetime(ordered["Time"]).dt.date == latest_day]
+    if len(same_session) < 21:
+        warm = empty.copy()
+        warm["20M Status"] = "WAIT — SESSION WARM-UP"
+        warm["20M Reason"] = f"Session warm-up: {len(same_session)}/21 same-session 1M candles"
+        return warm
+    d = same_session.tail(21).reset_index(drop=True)
     # The latest completed candle is the test candle; range boundaries use the previous 20.
     base = d.iloc[-21:-1]
     last = d.iloc[-1]
@@ -1169,10 +1199,11 @@ def _early_20m_analysis(df):
     pressure = (close_location - 0.5) * 200.0
     breakout_up = close > high
     breakout_down = close < low
-    # Compare 20-minute width to the preceding 20 completed candles when available.
+    # Compare only within this session; never let yesterday's range leak into
+    # today's 20M compression test.
     prior_compression = False
-    if len(df) >= 41:
-        prior = df.sort_values("Time").drop_duplicates("Time", keep="last").iloc[-41:-21]
+    if len(same_session) >= 41:
+        prior = same_session.iloc[-41:-21]
         prior_width = _safe_num(prior["High"].max() - prior["Low"].min())
         current_width = high - low
         prior_compression = prior_width > 0 and current_width <= prior_width * 0.75
@@ -1284,14 +1315,15 @@ def _data_quality_gate(frames, min_candles=30):
                     stamp = stamp.tz_localize(IST) if stamp.tzinfo is None else stamp.tz_convert(IST)
                     now_local = pd.Timestamp.now(tz=IST)
                     age_min = max(0.0, (now_local - stamp).total_seconds() / 60.0)
-                    allowed = {"5M": 25, "15M": 45, "1H": 100}.get(tf, max(30, minutes * 2))
+                    since_close = age_min - float(minutes)
+                    allowed = {"5M": 20, "15M": 30, "1H": 80}.get(tf, minutes + 20)
                     elapsed_from_open = (now_local - (now_local.normalize() + SESSION_OPEN)).total_seconds() / 60.0
                     before_first_bar = (
                         stamp.date() < now_local.date()
-                        and 0 <= elapsed_from_open <= (minutes + 3)
+                        and 0 <= elapsed_from_open <= (minutes + 15)
                     )
-                    if age_min > allowed and not before_first_bar:
-                        issues.append(f"Latest candle is stale ({age_min:.0f} min old)")
+                    if since_close > allowed and not before_first_bar:
+                        issues.append(f"Latest candle is stale ({since_close:.0f} min since close)")
                 except Exception:
                     issues.append("Could not validate latest candle time")
         report[tf] = {
@@ -1310,7 +1342,7 @@ def _data_quality_gate(frames, min_candles=30):
 
 
 def _market_regime_analysis(df):
-    """Describe 15M market regime; informational only, never forces a trade."""
+    """Describe 15M market regime using multi-day ADX with overnight gaps neutralized."""
     empty = {
         "regime": "UNKNOWN", "strength": 0,
         "reason": "Need at least 30 valid 15M candles",
@@ -1319,24 +1351,45 @@ def _market_regime_analysis(df):
     if df is None or not isinstance(df, pd.DataFrame) or len(df) < 30:
         return empty
     try:
-        d = df.sort_values("Time").drop_duplicates("Time", keep="last").copy()
-        h = pd.to_numeric(d["High"], errors="coerce")
-        l = pd.to_numeric(d["Low"], errors="coerce")
-        c = pd.to_numeric(d["Close"], errors="coerce")
-        if c.isna().any() or c.iloc[-1] <= 0:
+        ordered = df.sort_values("Time").drop_duplicates("Time", keep="last").copy()
+        ordered["Time"] = pd.to_datetime(ordered["Time"], errors="coerce")
+        ordered = ordered.dropna(subset=["Time"]).tail(120).reset_index(drop=True)
+        if len(ordered) < 30 or not {"Open", "High", "Low", "Close"}.issubset(ordered.columns):
             return empty
 
-        up_move = h.diff()
-        down_move = -l.diff()
+        # Multi-day history supplies Wilder ADX warm-up. Keep only a short
+        # first-hour guard so the regime is not hidden for most of the session.
+        latest_day = ordered["Time"].iloc[-1].date()
+        latest_session_count = int((ordered["Time"].dt.date == latest_day).sum())
+        if latest_session_count < 4:
+            warm = empty.copy()
+            warm["regime"] = "SESSION WARM-UP"
+            warm["reason"] = f"Need 4 same-session 15M candles; have {latest_session_count}"
+            return warm
+
+        o = pd.to_numeric(ordered["Open"], errors="coerce")
+        h = pd.to_numeric(ordered["High"], errors="coerce")
+        l = pd.to_numeric(ordered["Low"], errors="coerce")
+        c = pd.to_numeric(ordered["Close"], errors="coerce")
+        if any(x.isna().any() for x in (o, h, l, c)) or c.iloc[-1] <= 0:
+            return empty
+
+        day = ordered["Time"].dt.date
+        first = day.ne(day.shift(1))
+        up_move = h.diff().where(~first, 0.0)
+        down_move = (-l.diff()).where(~first, 0.0)
         plus_dm = up_move.where((up_move > down_move) & (up_move > 0), 0.0)
         minus_dm = down_move.where((down_move > up_move) & (down_move > 0), 0.0)
-        prev_close = c.shift(1)
+        prev_close = c.shift(1).where(~first, o)
         tr = pd.concat([(h-l), (h-prev_close).abs(), (l-prev_close).abs()], axis=1).max(axis=1)
         atr = tr.ewm(alpha=1/14, adjust=False, min_periods=14).mean()
         plus_di = 100 * plus_dm.ewm(alpha=1/14, adjust=False, min_periods=14).mean() / atr.replace(0, np.nan)
         minus_di = 100 * minus_dm.ewm(alpha=1/14, adjust=False, min_periods=14).mean() / atr.replace(0, np.nan)
         dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
-        adx = _safe_num(dx.ewm(alpha=1/14, adjust=False, min_periods=14).mean().iloc[-1], 0.0)
+        adx_value = dx.ewm(alpha=1/14, adjust=False, min_periods=14).mean().iloc[-1]
+        if pd.isna(adx_value):
+            return {**empty, "regime": "INDICATOR WARM-UP", "reason": "ADX needs more valid multi-day 15M history"}
+        adx = _safe_num(adx_value, 0.0)
         atr_pct = _safe_num((atr.iloc[-1] / c.iloc[-1]) * 100, 0.0)
 
         mid = c.rolling(20, min_periods=20).mean()
@@ -1503,8 +1556,8 @@ def _make_result_row(symbol, yahoo_symbol, payload):
     row.update(_breakout_breakdown_signal(frame_15m))
     row.update(_multi_tf_breakout(frames))
     main_break = row.get("Breakout Signal", "WAIT")
-    up_retest = _breakout_retest_confirmation(frame_15m, row.get("Breakout Level"), "UP")
-    down_retest = _breakout_retest_confirmation(frame_15m, row.get("Breakdown Level"), "DOWN")
+    up_retest = _breakout_retest_confirmation(frame_15m, "UP")
+    down_retest = _breakout_retest_confirmation(frame_15m, "DOWN")
     if up_retest == "RETEST HELD":
         row["Breakout Retest"] = up_retest
     elif down_retest == "RETEST REJECTED":
@@ -1587,6 +1640,19 @@ def _cache_gap_fetch_period(frame, full_period="60d"):
         last = last.tz_localize(IST) if last.tzinfo is None else last.tz_convert(IST)
         now = pd.Timestamp.now(tz=IST)
         gap_days = max(0, (now.date() - last.date()).days)
+        stamps = pd.to_datetime(frame["Time"], errors="coerce").dropna().sort_values().drop_duplicates()
+        # Illiquid stocks may legitimately have multi-hour intraday gaps. Check
+        # only for wholly missing recent weekdays; holidays merely cause a small
+        # harmless 5-day overlap refresh.
+        days = sorted({stamp.date() for stamp in stamps})
+        if days:
+            present_days = set(days)
+            recent_weekdays = [
+                day for day in pd.bdate_range(days[0], days[-1]).date
+                if (now.date() - day).days <= 5
+            ]
+            if any(day not in present_days for day in recent_weekdays):
+                return "5d"
         if gap_days <= 1:
             return "2d"
         if gap_days <= 4:
@@ -1598,7 +1664,7 @@ def _cache_gap_fetch_period(frame, full_period="60d"):
 
 def _scan_batch(batch, period, include_early=True):
     tickers = [ticker for _, ticker in batch]
-    per_tf, problems = {}, {ticker: [] for ticker in tickers}
+    per_tf, fresh_per_tf, problems = {}, {}, {ticker: [] for ticker in tickers}
     original_by_ticker = {ticker: original for original, ticker in batch}
 
     # If SQLite already has data for every ticker, fetch only a short overlap window.
@@ -1611,19 +1677,24 @@ def _scan_batch(batch, period, include_early=True):
         stale_tickers = [t for t in tickers if not _cached_candles_are_fresh(cached[t], minutes)]
         # Only request symbols whose saved candle set is stale or missing. This is
         # faster than downloading a 2-day overlap for every stock on every scan.
+        fresh_frames, errors = {}, {}
         if stale_tickers:
-            fetch_periods = {_cache_gap_fetch_period(cached[t], period) for t in stale_tickers}
-            # Batch symbols sharing the largest required overlap to avoid losing gaps.
-            fetch_period = max(fetch_periods, key=lambda x: {"2d": 2, "5d": 5}.get(x, 999))
-            fresh_frames, errors = _fetch_interval(stale_tickers, interval, minutes, fetch_period)
-        else:
-            fresh_frames, errors = {}, {}
+            # Do not let one old/missing cache force every symbol to download 30/60 days.
+            period_groups = {}
+            for ticker in stale_tickers:
+                required_period = _cache_gap_fetch_period(cached[ticker], period)
+                period_groups.setdefault(required_period, []).append(ticker)
+            for required_period, group_tickers in period_groups.items():
+                group_frames, group_errors = _fetch_interval(group_tickers, interval, minutes, required_period)
+                fresh_frames.update(group_frames)
+                errors.update(group_errors)
         frames = {}
         for ticker in tickers:
             frames[ticker] = _merge_candle_frames(cached[ticker], fresh_frames.get(ticker))
             if frames[ticker].empty:
                 problems[ticker].append(f"{label}: {errors.get(ticker, 'No cached or fresh data')}")
         per_tf[label] = frames
+        fresh_per_tf[label] = fresh_frames
 
     # Optional 1-minute feed. It is the most expensive extra request set, so
     # the fast core scan can finish without downloading 1M candles for every stock.
@@ -1636,25 +1707,31 @@ def _scan_batch(batch, period, include_early=True):
             for ticker in tickers
         }
         early_stale = [t for t in tickers if not _cached_candles_are_fresh(early_cached[t], 1)]
+        early_fresh, early_errors = {}, {}
         if early_stale:
-            early_periods = {_cache_gap_fetch_period(early_cached[t], "7d") for t in early_stale}
-            early_period = max(early_periods, key=lambda x: {"2d": 2, "5d": 5}.get(x, 999))
-            early_fresh, early_errors = _fetch_interval(early_stale, "1m", 1, early_period)
-        else:
-            early_fresh, early_errors = {}, {}
+            early_period_groups = {}
+            for ticker in early_stale:
+                required_period = _cache_gap_fetch_period(early_cached[ticker], "7d")
+                early_period_groups.setdefault(required_period, []).append(ticker)
+            for required_period, group_tickers in early_period_groups.items():
+                group_frames, group_errors = _fetch_interval(group_tickers, "1m", 1, required_period)
+                early_fresh.update(group_frames)
+                early_errors.update(group_errors)
         early_frames = {
             ticker: _merge_candle_frames(early_cached[ticker], early_fresh.get(ticker))
             for ticker in tickers
         }
         per_tf["1M"] = early_frames
+        fresh_per_tf["1M"] = early_fresh
         for ticker in tickers:
             if early_frames[ticker].empty:
                 problems[ticker].append(f"1M: {early_errors.get(ticker, 'No 1M data')}")
     else:
         per_tf["1M"] = {ticker: pd.DataFrame() for ticker in tickers}
+        fresh_per_tf["1M"] = {}
 
     try:
-        _save_candle_memory(batch, per_tf)
+        _save_candle_memory(batch, fresh_per_tf)
     except Exception:
         pass
 
@@ -1963,8 +2040,26 @@ def _direction_movement(row):
 
 
 
+def _prune_scan_jobs(keep=3):
+    """Keep active jobs, latest DONE result, and a small finalized/cancelled history."""
+    keep = max(1, int(keep))
+    with _memory_connect() as conn:
+        old_ids = [row[0] for row in conn.execute(
+            """SELECT job_id FROM scan_jobs WHERE status IN ('FINALIZED','CANCELLED')
+               ORDER BY created_at DESC LIMIT -1 OFFSET ?""", (keep,)
+        ).fetchall()]
+        old_done = [row[0] for row in conn.execute(
+            """SELECT job_id FROM scan_jobs WHERE status='DONE'
+               ORDER BY created_at DESC LIMIT -1 OFFSET 1"""
+        ).fetchall()]
+        for old_id in set(old_ids + old_done):
+            conn.execute("DELETE FROM scan_job_rows WHERE job_id=?", (old_id,))
+            conn.execute("DELETE FROM scan_jobs WHERE job_id=?", (old_id,))
+
+
 def _scan_job_create(config):
     """Create a durable scan job and return its unique ID."""
+    _prune_scan_jobs(keep=3)
     job_id = uuid.uuid4().hex
     now_text = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S %Z")
     config_text = json.dumps(config, ensure_ascii=False)
@@ -2056,27 +2151,52 @@ def _scan_job_worker(job_id):
         pending = [x for x in symbols if x[0] not in completed_symbols]
 
         for start in range(0, len(pending), batch_size):
+            current_job = _scan_job_get(job_id)
+            if not current_job or current_job["status"] == "CANCELLED":
+                return
             batch = pending[start:start + batch_size]
+            batch_exception = False
             try:
                 batch_rows = _scan_batch(batch, period, include_early=include_early)
-                # A fully empty batch is usually a transient Yahoo throttling/network
-                # failure. Retry once before committing permanent NO DATA checkpoints.
-                if batch_rows and all(str(r.get("Final Signal", "")) == "NO DATA" for r in batch_rows):
+                bad_indices = [i for i, row in enumerate(batch_rows)
+                    if int(row.get("5M Candles", 0) or 0) == 0
+                    and int(row.get("15M Candles", 0) or 0) == 0
+                    and int(row.get("1H Candles", 0) or 0) == 0]
+                if bad_indices:
                     time.sleep(1.0)
-                    retry_rows = _scan_batch(batch, period, include_early=include_early)
-                    if sum(str(r.get("Final Signal", "")) != "NO DATA" for r in retry_rows) > 0:
-                        batch_rows = retry_rows
+                    retry_rows = _scan_batch([batch[i] for i in bad_indices], period, include_early=include_early)
+                    for i, retry_row in zip(bad_indices, retry_rows):
+                        batch_rows[i] = retry_row
+                unresolved_indices = [i for i, row in enumerate(batch_rows)
+                    if int(row.get("5M Candles", 0) or 0) == 0
+                    and int(row.get("15M Candles", 0) or 0) == 0
+                    and int(row.get("1H Candles", 0) or 0) == 0]
             except Exception as exc:
+                batch_exception = True
                 batch_rows = [
                     _no_data_row(symbol, ticker, f"Batch failed: {str(exc)[:180]}")
                     for symbol, ticker in batch
                 ]
+                unresolved_indices = list(range(len(batch)))
+
+            # If a user discarded the scan while Yahoo was downloading, do not
+            # persist the in-flight batch or change CANCELLED back to RUNNING.
+            current_job = _scan_job_get(job_id)
+            if not current_job or current_job["status"] == "CANCELLED":
+                return
+
+            # Persist partial misses as NO DATA and continue. Pause only when the
+            # entire normal-sized batch failed, which is more consistent with throttling.
+            if not batch_exception and (len(unresolved_indices) < len(batch) or len(batch) < 5):
+                unresolved_indices = []
 
             saved_at = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S %Z")
+            unresolved_set = set(unresolved_indices)
             payload_rows = [
                 (job_id, str(row.get("Symbol", symbol)), str(row.get("Yahoo Symbol", ticker)),
                  sqlite3.Binary(pickle.dumps(row, protocol=pickle.HIGHEST_PROTOCOL)), saved_at)
-                for (symbol, ticker), row in zip(batch, batch_rows)
+                for i, ((symbol, ticker), row) in enumerate(zip(batch, batch_rows))
+                if i not in unresolved_set
             ]
             # Commit a whole batch atomically: after a crash, only an unfinished
             # batch is repeated. Completed symbols are never downloaded again.
@@ -2093,9 +2213,17 @@ def _scan_job_worker(job_id):
                 ).fetchone()[0]
                 conn.execute(
                     """UPDATE scan_jobs SET status='RUNNING',completed_symbols=?,
-                       updated_at=?,error=NULL WHERE job_id=?""",
+                       updated_at=?,error=NULL WHERE job_id=? AND status!='CANCELLED'""",
                     (int(total_done), saved_at, job_id),
                 )
+            if unresolved_indices:
+                paused_at = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S %Z")
+                with _memory_connect() as conn:
+                    conn.execute(
+                        "UPDATE scan_jobs SET status='PAUSED',updated_at=?,error=? WHERE job_id=? AND status!='CANCELLED'",
+                        (paused_at, f"Yahoo returned zero core candles for {len(unresolved_indices)} symbols after retry; press RESUME", job_id),
+                    )
+                return
 
         finished_at = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S %Z")
         with _memory_connect() as conn:
@@ -2104,7 +2232,7 @@ def _scan_job_worker(job_id):
             ).fetchone()[0]
             conn.execute(
                 """UPDATE scan_jobs SET status='DONE',completed_symbols=?,
-                   updated_at=?,error=NULL WHERE job_id=?""",
+                   updated_at=?,error=NULL WHERE job_id=? AND status!='CANCELLED'""",
                 (int(total_done), finished_at, job_id),
             )
     except Exception as exc:
@@ -2113,7 +2241,7 @@ def _scan_job_worker(job_id):
             with _memory_connect() as conn:
                 conn.execute(
                     """UPDATE scan_jobs SET status='PAUSED',updated_at=?,error=?
-                       WHERE job_id=?""",
+                       WHERE job_id=? AND status!='CANCELLED'""",
                     (paused_at, str(exc)[:1000], job_id),
                 )
         except Exception:
@@ -2234,7 +2362,7 @@ def _real_ai_training_data():
                 future_time = d["Time"].groupby(session_key).shift(-3)
                 future_return = future_close / d["Close"] - 1
                 atr_pct = feat["AI ATR %"] / 100.0
-                deadband = np.maximum(0.0025, atr_pct * 0.50)
+                deadband = np.maximum(0.0010, 0.80 * atr_pct * math.sqrt(3.0))
                 label = pd.Series(np.where(future_return > deadband, 2,
                                   np.where(future_return < -deadband, 0, 1)), index=d.index)
                 valid = feat.notna().all(axis=1) & future_return.notna() & future_time.notna()
@@ -2472,7 +2600,42 @@ def show_ai_multi_agent_scanner(client=None):
     run_scan_now = st.button("🚀 RUN FULL BATCH SCAN", type="primary", key="run_multi_agent", **_stretch())
     auto_due = bool(st.session_state.pop("ma_auto_scan_due", False))
     start_scan_requested = run_scan_now or (auto_due and auto_scan and _is_market_hours())
-    resume_scan_now = st.button("▶️ RESUME / CONTINUE SCAN", key="ma_resume_scan", **_stretch())
+    resume_col, cancel_col = st.columns(2)
+    with resume_col:
+        resume_scan_now = st.button("▶️ RESUME / CONTINUE SCAN", key="ma_resume_scan", **_stretch())
+    with cancel_col:
+        cancel_scan_now = st.button("🛑 CANCEL / DISCARD SCAN", key="ma_cancel_scan", **_stretch())
+
+    # A cancel is durable in SQLite. Existing candle memory is intentionally preserved.
+    job_id = st.session_state.get("ma_scan_job_id")
+    if cancel_scan_now:
+        if job_id:
+            with _memory_connect() as conn:
+                conn.execute(
+                    "UPDATE scan_jobs SET status='CANCELLED',updated_at=?,error=? WHERE job_id=? AND status IN ('RUNNING','PAUSED','DONE','FINALIZED')",
+                    (datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S %Z"), "Discarded by user", job_id),
+                )
+        st.session_state.pop("ma_scan_job_id", None)
+        st.session_state.pop("ma_scan_finalized_job", None)
+        st.session_state.pop("multi_agent_results", None)
+        st.rerun()
+
+    # Restore the newest finalized scan after a browser refresh. Move it to DONE
+    # so the existing report-building path reloads the saved rows from SQLite.
+    job_id = st.session_state.get("ma_scan_job_id")
+    job = _scan_job_get(job_id) if job_id else None
+    if ("multi_agent_results" not in st.session_state and not start_scan_requested and not resume_scan_now
+            and not (job and job["status"] in ("RUNNING", "PAUSED", "DONE"))):
+        with _memory_connect() as conn:
+            finalized = conn.execute(
+                "SELECT job_id FROM scan_jobs WHERE status='FINALIZED' ORDER BY created_at DESC LIMIT 1"
+            ).fetchone()
+            if finalized:
+                conn.execute("UPDATE scan_jobs SET status='DONE' WHERE job_id=?", (finalized[0],))
+        if finalized:
+            st.session_state["ma_scan_job_id"] = finalized[0]
+            st.session_state.pop("ma_scan_finalized_job", None)
+            st.rerun()
 
     # Reconnect to the latest unfinished scan after a rerun, refresh or browser reopen.
     job_id = st.session_state.get("ma_scan_job_id")
@@ -2836,7 +2999,7 @@ def show_ai_multi_agent_scanner(client=None):
     pre_watch = result[
         result["Directional Pre-Move"].isin(["UP PRE-MOVE WATCH", "DOWN PRE-MOVE WATCH"])
         & result["Pre-Move Direction"].isin(["UP", "DOWN"])
-        & (result["Pre-Move 15M Alignment"] == "ALIGNED")
+        & (result["Pre-Move 15M Alignment"] != "NOT ALIGNED")
     ].copy()
     pre_watch_cols = [
         "Symbol", "Directional Pre-Move", "Pre-Move Direction",
@@ -2895,12 +3058,16 @@ def show_ai_multi_agent_scanner(client=None):
             f"{ai_bundle['metrics']['test_samples']:,} test • accuracy "
             f"{ai_bundle['metrics']['accuracy']*100:.1f}% • balanced accuracy "
             f"{ai_bundle['metrics']['balanced_accuracy']*100:.1f}%. "
-            "Targets: next 3 completed 5M candles within the same session; deadband is max(0.25%, 0.5× ATR%). RF vote fractions are uncalibrated model estimates, not true odds or a guaranteed win rate."
+            "Targets: next 3 completed 5M candles within the same session; deadband is max(0.10%, 0.8× ATR% × √3). RF vote fractions are uncalibrated model estimates, not true odds or a guaranteed win rate."
         )
-        result = _apply_real_ai_brain(result)
-        st.session_state["multi_agent_results"] = result
-        # Refresh both downloads so the newly generated AI Brain fields are included.
-        st.session_state["multi_agent_csv"] = result.to_csv(index=False).encode("utf-8-sig")
+        ai_apply_sig = (st.session_state.get("ma_scan_job_id"), ai_bundle.get("metrics", {}).get("trained_at"), len(result))
+        if st.session_state.get("ma_ai_apply_sig") != ai_apply_sig:
+            result = _apply_real_ai_brain(result)
+            st.session_state["multi_agent_results"] = result
+            st.session_state["multi_agent_csv"] = result.to_csv(index=False).encode("utf-8-sig")
+            st.session_state["ma_ai_apply_sig"] = ai_apply_sig
+        else:
+            result = st.session_state.get("multi_agent_results", result)
         try:
             from openpyxl import load_workbook
             existing_xlsx = st.session_state.get("multi_agent_xlsx")
@@ -2946,9 +3113,14 @@ def show_ai_multi_agent_scanner(client=None):
         st.dataframe(result[ai_cols].head(30), hide_index=True, **_stretch())
     else:
         # Ensure the report schema is stable even before 500 labelled samples exist.
-        result = _apply_real_ai_brain(result)
-        st.session_state["multi_agent_results"] = result
-        st.session_state["multi_agent_csv"] = result.to_csv(index=False).encode("utf-8-sig")
+        ai_apply_sig = (st.session_state.get("ma_scan_job_id"), "none", len(result))
+        if st.session_state.get("ma_ai_apply_sig") != ai_apply_sig:
+            result = _apply_real_ai_brain(result)
+            st.session_state["multi_agent_results"] = result
+            st.session_state["multi_agent_csv"] = result.to_csv(index=False).encode("utf-8-sig")
+            st.session_state["ma_ai_apply_sig"] = ai_apply_sig
+        else:
+            result = st.session_state.get("multi_agent_results", result)
         st.warning(
             "Real AI Brain is not active: " +
             str(st.session_state.get("ma_real_ai_train_error") or "training data not available") +
