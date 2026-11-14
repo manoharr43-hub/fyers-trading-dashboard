@@ -5,7 +5,9 @@ Yahoo Finance batch edition — revised.
 - scanner.py only supplies the NSE / F&O symbol universe; this module combines both loaders without modifying scanner.py.
 - Yahoo Finance supplies all OHLCV candles and technical-analysis data.
 - FYERS is used ONLY for 5-level Market Depth on shortlisted BUY/SELL/PRE-BIG stocks.
+- Data Quality Gate + 15M Market Regime context before the 17-agent decision.
 - 17 OHLCV rule-based agents on completed 5M, 15M and 1H candles.
+- Directional UP/DOWN early pre-move watch using completed 5M candles + 15M alignment.
 - Separate 20-candle 1M compression / volume buildup / breakout detector.
 - Optional Yahoo headline context for the strongest technical shortlist.
 - Compatible entry point: show_ai_multi_agent_scanner(client=None)
@@ -962,6 +964,99 @@ def _prebig_5m_analysis(df):
     }
 
 
+
+def _directional_pre_move_engine(df):
+    """Early UP/DOWN watch from completed 5M candles; not a guaranteed signal."""
+    empty = {
+        "Directional Pre-Move": "NO DATA", "Pre-Move Direction": "WAIT",
+        "UP Pre-Move Score": 0, "DOWN Pre-Move Score": 0,
+        "Pre-Move Volume Build %": None, "Pre-Move Compression": "UNKNOWN",
+        "Pre-Move 15M Alignment": "UNKNOWN",
+        "Pre-Move Reason": "Need at least 26 completed 5M candles",
+    }
+    required = {"Time", "Open", "High", "Low", "Close", "Volume"}
+    if df is None or not isinstance(df, pd.DataFrame) or len(df) < 26 or not required.issubset(df.columns):
+        return empty
+    try:
+        d = df.sort_values("Time").drop_duplicates("Time", keep="last").tail(26).reset_index(drop=True)
+        prior, recent, last = d.iloc[-25:-13], d.iloc[-13:-1], d.iloc[-1]
+        old_width = _safe_num(prior["High"].max() - prior["Low"].min(), 0.0)
+        recent_high = _safe_num(recent["High"].max(), 0.0)
+        recent_low = _safe_num(recent["Low"].min(), 0.0)
+        recent_width = recent_high - recent_low
+        close = _safe_num(last["Close"], 0.0)
+        if old_width <= 0 or recent_width <= 0 or close <= 0:
+            return empty
+
+        compression = recent_width <= old_width * 0.80
+        early_volume = _safe_num(recent["Volume"].iloc[:9].mean(), 0.0)
+        recent_volume = _safe_num(recent["Volume"].iloc[-3:].mean(), 0.0)
+        volume_build = recent_volume / early_volume if early_volume > 0 else 0.0
+        lows = recent["Low"].astype(float).to_numpy()
+        highs = recent["High"].astype(float).to_numpy()
+        higher_lows = float(lows[-3:].mean()) > float(lows[:3].mean())
+        lower_highs = float(highs[-3:].mean()) < float(highs[:3].mean())
+        location = max(0.0, min(1.0, (close - recent_low) / recent_width))
+        try:
+            vwap = _safe_num(_vwap_last_session(d), np.nan)
+        except Exception:
+            vwap = np.nan
+        above_vwap = np.isfinite(vwap) and close > vwap
+        below_vwap = np.isfinite(vwap) and close < vwap
+
+        up_score = 0
+        down_score = 0
+        if compression:
+            up_score += 20
+            down_score += 20
+        if volume_build >= 1.30:
+            up_score += 20
+            down_score += 20
+        elif volume_build >= 1.15:
+            up_score += 12
+            down_score += 12
+        if higher_lows:
+            up_score += 20
+        if lower_highs:
+            down_score += 20
+        if location >= 0.65:
+            up_score += 20
+        elif location <= 0.35:
+            down_score += 20
+        if above_vwap:
+            up_score += 15
+        if below_vwap:
+            down_score += 15
+        up_score, down_score = min(100, up_score), min(100, down_score)
+
+        if close > recent_high or close < recent_low:
+            status = "MOVE ALREADY STARTED"
+            direction = "UP" if close > recent_high else "DOWN"
+            reason = "Latest completed 5M close is outside the setup range; not an early watch"
+        elif compression and volume_build >= 1.15 and up_score >= 65 and up_score >= down_score + 15:
+            status, direction = "UP PRE-MOVE WATCH", "UP"
+            reason = "Compression + volume buildup + bullish structure/location"
+        elif compression and volume_build >= 1.15 and down_score >= 65 and down_score >= up_score + 15:
+            status, direction = "DOWN PRE-MOVE WATCH", "DOWN"
+            reason = "Compression + volume buildup + bearish structure/location"
+        else:
+            status, direction = "WAIT", "WAIT"
+            reason = "Directional evidence is not sufficiently separated"
+
+        return {
+            "Directional Pre-Move": status, "Pre-Move Direction": direction,
+            "UP Pre-Move Score": int(up_score), "DOWN Pre-Move Score": int(down_score),
+            "Pre-Move Volume Build %": round((volume_build - 1) * 100, 1),
+            "Pre-Move Compression": "YES" if compression else "NO",
+            "Pre-Move 15M Alignment": "CHECKING",
+            "Pre-Move Reason": reason,
+        }
+    except Exception as exc:
+        result = empty.copy()
+        result["Pre-Move Reason"] = "Pre-move calculation error: " + str(exc)[:140]
+        return result
+
+
 def _early_20m_analysis(df):
     """20 completed 1-minute candles: compression, volume buildup, pressure and breakout."""
     empty = {
@@ -1056,10 +1151,151 @@ def _last_candle_close_time(frame, minutes):
         return None
 
 
+
+def _data_quality_gate(frames, min_candles=30):
+    """Validate core OHLCV frames before trusting a signal."""
+    report = {}
+    failures = []
+    required = {"Time", "Open", "High", "Low", "Close", "Volume"}
+    for tf, (_, minutes) in TIMEFRAMES.items():
+        df = frames.get(tf, pd.DataFrame())
+        issues = []
+        if not isinstance(df, pd.DataFrame) or df.empty:
+            issues.append("No candles")
+            count = 0
+            last_time = None
+        else:
+            count = len(df)
+            missing = sorted(required - set(df.columns))
+            if missing:
+                issues.append("Missing columns: " + ", ".join(missing))
+            if not missing:
+                x = df.copy()
+                for col in ("Open", "High", "Low", "Close", "Volume"):
+                    x[col] = pd.to_numeric(x[col], errors="coerce")
+                invalid = (
+                    x[list(required - {"Time"})].isna().any(axis=1)
+                    | (x[["Open", "High", "Low", "Close"]] <= 0).any(axis=1)
+                    | (x["Volume"] < 0)
+                    | (x["High"] < x[["Open", "Close", "Low"]].max(axis=1))
+                    | (x["Low"] > x[["Open", "Close", "High"]].min(axis=1))
+                )
+                if bool(invalid.any()):
+                    issues.append(f"{int(invalid.sum())} invalid OHLCV rows")
+                if "Time" in x.columns:
+                    stamps = pd.to_datetime(x["Time"], errors="coerce")
+                    if stamps.isna().any():
+                        issues.append("Invalid candle timestamps")
+                    if stamps.duplicated().any():
+                        issues.append("Duplicate candle timestamps")
+                    last_time = stamps.iloc[-1]
+                else:
+                    last_time = None
+            else:
+                last_time = None
+            if count < min_candles:
+                issues.append(f"Only {count} candles; need {min_candles}")
+
+            # Staleness is checked only during NSE cash-market hours. Outside
+            # market hours the last completed candle is expected to be older.
+            if last_time is not None and not pd.isna(last_time) and _is_market_hours():
+                try:
+                    stamp = pd.Timestamp(last_time)
+                    stamp = stamp.tz_localize(IST) if stamp.tzinfo is None else stamp.tz_convert(IST)
+                    age_min = max(0.0, (pd.Timestamp.now(tz=IST) - stamp).total_seconds() / 60.0)
+                    allowed = {"5M": 25, "15M": 45, "1H": 100}.get(tf, max(30, minutes * 2))
+                    if age_min > allowed:
+                        issues.append(f"Latest candle is stale ({age_min:.0f} min old)")
+                except Exception:
+                    issues.append("Could not validate latest candle time")
+        report[tf] = {
+            "count": count,
+            "status": "PASS" if not issues else "FAIL",
+            "reason": "; ".join(issues) if issues else "OHLCV checks passed",
+        }
+        if issues:
+            failures.append(f"{tf}: " + "; ".join(issues))
+
+    return {
+        "status": "PASS" if not failures else "FAIL",
+        "reason": " | ".join(failures) if failures else "All 5M/15M/1H frames passed",
+        "frames": report,
+    }
+
+
+def _market_regime_analysis(df):
+    """Describe 15M market regime; informational only, never forces a trade."""
+    empty = {
+        "regime": "UNKNOWN", "strength": 0,
+        "reason": "Need at least 30 valid 15M candles",
+        "adx": None, "atr_pct": None, "bb_width_pct": None,
+    }
+    if df is None or not isinstance(df, pd.DataFrame) or len(df) < 30:
+        return empty
+    try:
+        d = df.sort_values("Time").drop_duplicates("Time", keep="last").copy()
+        h = pd.to_numeric(d["High"], errors="coerce")
+        l = pd.to_numeric(d["Low"], errors="coerce")
+        c = pd.to_numeric(d["Close"], errors="coerce")
+        if c.isna().any() or c.iloc[-1] <= 0:
+            return empty
+
+        up_move = h.diff()
+        down_move = -l.diff()
+        plus_dm = up_move.where((up_move > down_move) & (up_move > 0), 0.0)
+        minus_dm = down_move.where((down_move > up_move) & (down_move > 0), 0.0)
+        prev_close = c.shift(1)
+        tr = pd.concat([(h-l), (h-prev_close).abs(), (l-prev_close).abs()], axis=1).max(axis=1)
+        atr = tr.ewm(alpha=1/14, adjust=False, min_periods=14).mean()
+        plus_di = 100 * plus_dm.ewm(alpha=1/14, adjust=False, min_periods=14).mean() / atr.replace(0, np.nan)
+        minus_di = 100 * minus_dm.ewm(alpha=1/14, adjust=False, min_periods=14).mean() / atr.replace(0, np.nan)
+        dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
+        adx = _safe_num(dx.ewm(alpha=1/14, adjust=False, min_periods=14).mean().iloc[-1], 0.0)
+        atr_pct = _safe_num((atr.iloc[-1] / c.iloc[-1]) * 100, 0.0)
+
+        mid = c.rolling(20, min_periods=20).mean()
+        std = c.rolling(20, min_periods=20).std(ddof=0)
+        upper, lower = mid + 2*std, mid - 2*std
+        bb_width = _safe_num(((upper.iloc[-1] - lower.iloc[-1]) / mid.iloc[-1]) * 100, 0.0) if pd.notna(mid.iloc[-1]) and mid.iloc[-1] else 0.0
+        ema20 = c.ewm(span=20, adjust=False).mean().iloc[-1]
+        ema50 = c.ewm(span=50, adjust=False).mean().iloc[-1]
+
+        if atr_pct >= 2.5 or bb_width >= 8.0:
+            regime = "HIGH VOLATILITY"
+            strength = min(100, int(round(max(atr_pct / 2.5, bb_width / 8.0) * 50)))
+            reason = f"Elevated ATR% ({atr_pct:.2f}) / Bollinger width ({bb_width:.2f})"
+        elif adx >= 22 and c.iloc[-1] > ema20 > ema50 and plus_di.iloc[-1] > minus_di.iloc[-1]:
+            regime, strength = "TRENDING UP", min(100, int(adx * 2))
+            reason = f"ADX {adx:.1f}; price and EMAs aligned upward"
+        elif adx >= 22 and c.iloc[-1] < ema20 < ema50 and minus_di.iloc[-1] > plus_di.iloc[-1]:
+            regime, strength = "TRENDING DOWN", min(100, int(adx * 2))
+            reason = f"ADX {adx:.1f}; price and EMAs aligned downward"
+        elif adx < 18 and bb_width < 5.0:
+            regime, strength = "SIDEWAYS / COMPRESSION", max(0, min(100, int((18-adx)*4)))
+            reason = f"Low ADX {adx:.1f}; narrow Bollinger width {bb_width:.2f}"
+        else:
+            regime, strength = "TRANSITION", min(100, int(adx * 2))
+            reason = f"Mixed trend/volatility readings; ADX {adx:.1f}"
+
+        return {
+            "regime": regime, "strength": int(strength), "reason": reason,
+            "adx": round(adx, 2), "atr_pct": round(atr_pct, 3),
+            "bb_width_pct": round(bb_width, 3),
+        }
+    except Exception as exc:
+        result = empty.copy()
+        result["reason"] = "Regime calculation error: " + str(exc)[:140]
+        return result
+
+
 def _make_result_row(symbol, yahoo_symbol, payload):
     frames = payload.get("frames", {})
+    quality = _data_quality_gate(frames)
+    regime = _market_regime_analysis(frames.get("15M", pd.DataFrame()))
     analyses = {tf: _analyse_timeframe(frames.get(tf, pd.DataFrame())) for tf in TIMEFRAMES}
-    valid = all(analyses[tf]["direction"] != "NO DATA" for tf in TIMEFRAMES)
+    valid = quality["status"] == "PASS" and all(
+        analyses[tf]["direction"] != "NO DATA" for tf in TIMEFRAMES
+    )
 
     weighted = 0.0
     if not valid:
@@ -1137,6 +1373,14 @@ def _make_result_row(symbol, yahoo_symbol, payload):
         "5M Candles": analyses["5M"]["candles"], "15M Candles": analyses["15M"]["candles"],
         "1H Candles": analyses["1H"]["candles"], "Last Price": analyses["15M"]["close"],
         "15M RSI": analyses["15M"]["rsi"], "Errors": " | ".join(payload.get("errors", [])),
+        "Data Quality": quality["status"],
+        "Data Quality Reason": quality["reason"],
+        "Market Regime": regime["regime"],
+        "Regime Strength": regime["strength"],
+        "Regime ADX": regime["adx"],
+        "Regime ATR %": regime["atr_pct"],
+        "Regime BB Width %": regime["bb_width_pct"],
+        "Regime Reason": regime["reason"],
     }
     # Causal 5M features are shared by the ML training and inference paths.
     ml_features = _real_ai_feature_frame(frame_5m)
@@ -1149,6 +1393,21 @@ def _make_result_row(symbol, yahoo_symbol, payload):
             row[feature_name] = None
     row.update(_early_20m_analysis(payload.get("early_1m", pd.DataFrame())))
     row.update(_prebig_5m_analysis(frame_5m))
+    row.update(_directional_pre_move_engine(frame_5m))
+    pre_direction = row.get("Pre-Move Direction", "WAIT")
+    direction_15m = analyses["15M"]["direction"]
+    if pre_direction == "UP":
+        row["Pre-Move 15M Alignment"] = (
+            "ALIGNED" if direction_15m == "BUY"
+            else "NOT ALIGNED" if direction_15m == "SELL" else "WAIT"
+        )
+    elif pre_direction == "DOWN":
+        row["Pre-Move 15M Alignment"] = (
+            "ALIGNED" if direction_15m == "SELL"
+            else "NOT ALIGNED" if direction_15m == "BUY" else "WAIT"
+        )
+    else:
+        row["Pre-Move 15M Alignment"] = "NOT APPLICABLE"
     for tf in TIMEFRAMES:
         liquidity = _liquidity_levels_and_sweeps(frames.get(tf, pd.DataFrame()))
         for key, value in liquidity.items():
@@ -2349,6 +2608,33 @@ def show_ai_multi_agent_scanner(client=None):
     for col_name, default_value in early_defaults.items():
         if col_name not in result.columns:
             result[col_name] = default_value
+    directional_pre_move_defaults = {
+        "Directional Pre-Move": "NOT CALCULATED",
+        "Pre-Move Direction": "WAIT",
+        "UP Pre-Move Score": 0,
+        "DOWN Pre-Move Score": 0,
+        "Pre-Move Volume Build %": None,
+        "Pre-Move Compression": "UNKNOWN",
+        "Pre-Move 15M Alignment": "UNKNOWN",
+        "Pre-Move Reason": "Run a fresh scan to calculate directional pre-move",
+    }
+    for col_name, default_value in directional_pre_move_defaults.items():
+        if col_name not in result.columns:
+            result[col_name] = default_value
+    quality_regime_defaults = {
+        "Data Quality": "NOT CALCULATED",
+        "Data Quality Reason": "Run a fresh scan",
+        "Market Regime": "UNKNOWN",
+        "Regime Strength": 0,
+        "Regime ADX": None,
+        "Regime ATR %": None,
+        "Regime BB Width %": None,
+        "Regime Reason": "Run a fresh scan",
+    }
+    for col_name, default_value in quality_regime_defaults.items():
+        if col_name not in result.columns:
+            result[col_name] = default_value
+
     prebig_defaults = {
         "PRE-BIG Status": "NO DATA", "PRE-BIG Direction": "WAIT", "PRE-BIG Score": 0,
         "PRE-BIG Candles": 0, "PRE-BIG Range High": None, "PRE-BIG Range Low": None,
@@ -2404,6 +2690,33 @@ def show_ai_multi_agent_scanner(client=None):
         f"• unique Yahoo tickers {info.get('unique_tickers', len(result))} "
         f"• batches {info.get('batches', '')} • {info.get('completed_at', '')}"
     )
+
+    st.subheader("⚡ EARLY DIRECTIONAL PRE-MOVE — UP / DOWN")
+    pre_watch = result[result["Pre-Move Direction"].isin(["UP", "DOWN"])].copy()
+    pre_watch_cols = [
+        "Symbol", "Directional Pre-Move", "Pre-Move Direction",
+        "UP Pre-Move Score", "DOWN Pre-Move Score",
+        "Pre-Move Volume Build %", "Pre-Move Compression",
+        "Pre-Move 15M Alignment", "Market Regime", "Signal Time (IST)",
+        "Last Price", "Pre-Move Reason",
+    ]
+    if not pre_watch.empty:
+        pre_watch = pre_watch.sort_values(
+            ["Pre-Move 15M Alignment", "UP Pre-Move Score", "DOWN Pre-Move Score"],
+            ascending=[True, False, False],
+        )
+        st.dataframe(pre_watch[pre_watch_cols], hide_index=True, **_stretch())
+    else:
+        st.caption("No directional pre-move watch currently meets the setup threshold.")
+
+    with st.expander("Data Quality + Market Regime checks"):
+        st.write(
+            "Data Quality checks the 5M/15M/1H OHLCV frames, minimum candle count, "
+            "invalid prices/volume, duplicate timestamps and intraday staleness. "
+            "Market Regime is descriptive context only; it does not force BUY/SELL."
+        )
+        quality_cols = ["Symbol", "Data Quality", "Data Quality Reason", "Market Regime", "Regime Strength", "Regime ADX", "Regime ATR %", "Regime BB Width %"]
+        st.dataframe(result[quality_cols].head(100), hide_index=True, **_stretch())
 
     # Real AI Brain training uses saved, completed 5M candles and chronological holdout.
     st.subheader("🧠 REAL AI BRAIN — Hybrid ML")
