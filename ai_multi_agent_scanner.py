@@ -20,6 +20,7 @@ requirements.txt:
 
 import io
 import json
+import copy
 import math
 import pickle
 import re
@@ -29,6 +30,7 @@ from contextlib import contextmanager
 import time
 import uuid
 from pathlib import Path
+from collections import OrderedDict
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -68,6 +70,36 @@ _SCAN_WORKERS_LOCK = threading.Lock()
 FYERS_DEPTH_CACHE_TTL = 20       # seconds; prevents repeated depth calls on Streamlit reruns
 FYERS_DEPTH_CALL_GAP = 1.05      # conservative one-call-per-second pacing
 FYERS_DEPTH_DEFAULT_LIMIT = 20  # configurable shortlist cap per scan
+
+
+# Thread-safe TTL cache for background Yahoo workers. Streamlit's cache_data
+# is intentionally not used from worker threads.
+_TTL_CACHE = OrderedDict()
+_TTL_CACHE_LOCK = threading.Lock()
+_TTL_CACHE_MAX_ITEMS = 32
+
+
+def _ttl_cache_get(key, ttl_seconds):
+    now = time.time()
+    with _TTL_CACHE_LOCK:
+        item = _TTL_CACHE.get(key)
+        if item is None:
+            return None
+        saved_at, value = item
+        if now - saved_at >= ttl_seconds:
+            _TTL_CACHE.pop(key, None)
+            return None
+        _TTL_CACHE.move_to_end(key)
+        return copy.deepcopy(value)
+
+
+def _ttl_cache_set(key, value):
+    with _TTL_CACHE_LOCK:
+        _TTL_CACHE[key] = (time.time(), copy.deepcopy(value))
+        _TTL_CACHE.move_to_end(key)
+        while len(_TTL_CACHE) > _TTL_CACHE_MAX_ITEMS:
+            _TTL_CACHE.popitem(last=False)
+
 
 
 
@@ -405,8 +437,11 @@ def _closed_candles(df, minutes):
     return out.reset_index(drop=True)
 
 
-@st.cache_data(ttl=180, show_spinner=False, max_entries=16)
 def _download_yahoo_batch_cached(tickers_tuple, interval, period):
+    key = ("yahoo_batch", tuple(tickers_tuple), str(interval), str(period))
+    cached = _ttl_cache_get(key, 180)
+    if cached is not None:
+        return cached
     if yf is None:
         raise RuntimeError("yfinance is not installed. Add yfinance>=0.2.50.")
     with _YF_LOCK:
@@ -417,7 +452,8 @@ def _download_yahoo_batch_cached(tickers_tuple, interval, period):
         )
     if data is None or data.empty:
         raise RuntimeError(f"Yahoo returned no data for {interval}.")
-    return data
+    _ttl_cache_set(key, data)
+    return data.copy(deep=True)
 
 
 def _extract_one_ticker(batch_df, ticker):
@@ -663,6 +699,22 @@ def _run_17_agents(df, timeframe=None):
     ema9, ema21, ema50 = (c.ewm(span=p, adjust=False).mean() for p in (9, 21, 50))
     rsi = _rsi(c)
     avg_vol = _safe_num(v.shift(1).rolling(20, min_periods=10).mean().iloc[-1])
+    if str(timeframe).upper() == "1H" and "Time" in d.columns:
+        try:
+            times = pd.to_datetime(d["Time"], errors="coerce")
+            latest = times.iloc[-1]
+            same_slot = (
+                (times.dt.hour == latest.hour) &
+                (times.dt.minute == latest.minute) &
+                (times.dt.date < latest.date())
+            )
+            slot_volumes = pd.to_numeric(v[same_slot], errors="coerce").dropna().tail(10)
+            # Require several historical same-slot observations; otherwise use the
+            # ordinary rolling baseline rather than a noisy one-day comparison.
+            if len(slot_volumes) >= 3:
+                avg_vol = _safe_num(slot_volumes.mean(), avg_vol)
+        except Exception:
+            pass
     rvol = _safe_num(v.iloc[-1] / avg_vol) if avg_vol > 0 else 0.0
     result = {}
 
@@ -700,7 +752,16 @@ def _run_17_agents(df, timeframe=None):
         result["Volume Expansion"] = _agent_result("WAIT", 0, f"RVOL {rvol:.2f}x; no directional expansion")
 
     vwap = _vwap_last_session(d)
-    if pd.notna(vwap) and last > vwap * 1.001:
+    session_bar_count = len(d)
+    if str(timeframe).upper() == "1H" and "Time" in d.columns:
+        try:
+            latest_date = pd.to_datetime(d["Time"].iloc[-1]).date()
+            session_bar_count = int((pd.to_datetime(d["Time"]).dt.date == latest_date).sum())
+        except Exception:
+            session_bar_count = 0
+    if str(timeframe).upper() == "1H" and session_bar_count < 2:
+        result["VWAP"] = _agent_result("WAIT", 0, "1H session VWAP warm-up; need at least 2 completed bars")
+    elif pd.notna(vwap) and last > vwap * 1.001:
         result["VWAP"] = _agent_result("BUY", 1, f"Above session VWAP ({vwap:.2f})")
     elif pd.notna(vwap) and last < vwap * .999:
         result["VWAP"] = _agent_result("SELL", -1, f"Below session VWAP ({vwap:.2f})")
@@ -870,18 +931,33 @@ def _run_17_agents(df, timeframe=None):
 
 
 # News is contextual headline keyword scoring, not an AI model or standalone signal.
-_POSITIVE = [r"profits?", r"growth", r"upgrades?", r"upgraded", r"order wins?", r"approval",
-             r"record (?:profit|revenue|orders?|highs?)", r"buybacks?", r"dividends?", r"partnerships?", r"strong results",
-             r"beats? estimates"]
-_NEGATIVE = [r"loss(?:es)?", r"downgrades?", r"downgraded", r"fraud", r"default(?:s|ed)?",
-             r"(?:regulatory|investigation) probe", r"bans?", r"banned", r"penalty", r"penalties", r"resignation",
-             r"weak results", r"misses? estimates", r"debt (?:default|restructuring|crisis)"]
+_POSITIVE = [
+    r"profit(?:s)? (?:rise|rose|jump|surge|increase|up)",
+    r"revenue (?:rise|rose|jump|surge|increase|up)",
+    r"growth (?:accelerates?|improves?|strengthens?)",
+    r"(?:analyst|brokerage) upgrades?",
+    r"upgraded to (?:buy|overweight|outperform)",
+    r"order wins?", r"regulatory approval", r"record (?:profit|revenue|orders?|highs?)",
+    r"share buyback", r"dividend (?:increase|hike|announced)", r"strong results",
+    r"beats? (?:market|street|analyst) estimates",
+]
+_NEGATIVE = [
+    r"net loss(?:es)?", r"profit(?:s)? (?:fall|fell|decline|drop|down)",
+    r"revenue (?:fall|fell|decline|drop|down)", r"downgrad(?:e|ed|es)",
+    r"fraud", r"default(?:s|ed)?", r"(?:regulatory|investigation) probe",
+    r"ban(?:s|ned)?", r"penalt(?:y|ies)", r"resignation", r"weak results",
+    r"misses? (?:market|street|analyst) estimates",
+    r"debt (?:default|restructuring|crisis)",
+]
 _POS_RE = [re.compile(r"\b" + p + r"\b") for p in _POSITIVE]
 _NEG_RE = [re.compile(r"\b" + p + r"\b") for p in _NEGATIVE]
 
 
-@st.cache_data(ttl=300, show_spinner=False)
 def _fetch_yahoo_news_cached(yahoo_symbol):
+    key = ("yahoo_news", str(yahoo_symbol).upper())
+    cached = _ttl_cache_get(key, 300)
+    if cached is not None:
+        return cached
     if yf is None:
         return []
     try:
@@ -906,6 +982,7 @@ def _fetch_yahoo_news_cached(yahoo_symbol):
                 published = pd.NaT
             if title:
                 cleaned.append({"title": str(title), "publisher": str(publisher), "published": published})
+        _ttl_cache_set(key, cleaned)
         return cleaned
     except Exception:
         return []
@@ -973,14 +1050,14 @@ def _prebig_5m_analysis(df):
     full = df.sort_values("Time").drop_duplicates("Time", keep="last").reset_index(drop=True)
     latest_day = pd.Timestamp(full["Time"].iloc[-1]).date()
     same_session = full[pd.to_datetime(full["Time"]).dt.date == latest_day]
-    if len(same_session) < 25:
+    if len(full) < 25:
         warm = empty.copy()
-        warm["PRE-BIG Status"] = "WAIT — SESSION WARM-UP"
-        warm["PRE-BIG Reason"] = f"Session warm-up: {len(same_session)}/25 same-session 5M candles"
-        warm["PRE-BIG Candles"] = len(same_session)
+        warm["PRE-BIG Status"] = "WAIT — HISTORY WARM-UP"
+        warm["PRE-BIG Reason"] = f"Need 25 completed 5M candles across recent sessions; have {len(full)}"
+        warm["PRE-BIG Candles"] = len(full)
         return warm
-    full = same_session.reset_index(drop=True)
-    session_vwap = _vwap_last_session(full)
+    # Range/volume windows may include the previous session; VWAP remains current-session only.
+    session_vwap = _vwap_last_session(same_session)
     d = full.tail(25).reset_index(drop=True)
     prior = d.iloc[-25:-13]       # 12 candles before the compression window
     base = d.iloc[-13:-1]         # latest 12 completed candles; latest candle is trigger test
@@ -1073,13 +1150,13 @@ def _directional_pre_move_engine(df):
         full = df.sort_values("Time").drop_duplicates("Time", keep="last").reset_index(drop=True)
         latest_day = pd.Timestamp(full["Time"].iloc[-1]).date()
         same_session = full[pd.to_datetime(full["Time"]).dt.date == latest_day]
-        if len(same_session) < 26:
+        if len(full) < 26:
             warm = empty.copy()
-            warm["Directional Pre-Move"] = "WAIT — SESSION WARM-UP"
-            warm["Pre-Move Reason"] = f"Session warm-up: {len(same_session)}/26 same-session 5M candles"
+            warm["Directional Pre-Move"] = "WAIT — HISTORY WARM-UP"
+            warm["Pre-Move Reason"] = f"Need 26 completed 5M candles across recent sessions; have {len(full)}"
             return warm
-        full = same_session.reset_index(drop=True)
-        session_vwap = _vwap_last_session(full)
+        # Use prior-session candles for setup windows, but never carry VWAP overnight.
+        session_vwap = _vwap_last_session(same_session)
         d = full.tail(26).reset_index(drop=True)
         prior, recent, last = d.iloc[-25:-13], d.iloc[-13:-1], d.iloc[-1]
         old_width = _safe_num(prior["High"].max() - prior["Low"].min(), 0.0)
@@ -1197,8 +1274,18 @@ def _early_20m_analysis(df):
     candle_span = max(_safe_num(last["High"] - last["Low"]), 1e-9)
     close_location = max(0.0, min(1.0, (close - _safe_num(last["Low"])) / candle_span))
     pressure = (close_location - 0.5) * 200.0
-    breakout_up = close > high
-    breakout_down = close < low
+    last_open = _safe_num(last["Open"])
+    last_high = _safe_num(last["High"])
+    last_low = _safe_num(last["Low"])
+    body_ratio = abs(close - last_open) / candle_span
+    breakout_up = (
+        close > high and close > last_open and body_ratio >= 0.55
+        and close_location >= 0.75 and rvol >= 1.50
+    )
+    breakout_down = (
+        close < low and close < last_open and body_ratio >= 0.55
+        and close_location <= 0.25 and rvol >= 1.50
+    )
     # Compare only within this session; never let yesterday's range leak into
     # today's 20M compression test.
     prior_compression = False
@@ -1221,12 +1308,16 @@ def _early_20m_analysis(df):
     score = min(100, score)
     if breakout_up:
         status, direction = "CONFIRMED BREAKOUT", "UP"
-        reason = "Latest completed 1M close broke above previous 20-candle high"
+        reason = "Completed 1M close broke above 20-candle high with body >=55%, close near high and RVOL >=1.5"
         score = max(score, 80)
     elif breakout_down:
         status, direction = "CONFIRMED BREAKOUT", "DOWN"
-        reason = "Latest completed 1M close broke below previous 20-candle low"
+        reason = "Completed 1M close broke below 20-candle low with body >=55%, close near low and RVOL >=1.5"
         score = max(score, 80)
+    elif close > high or close < low:
+        status = "BREAKOUT WATCH — VOLUME/BODY NOT CONFIRMED"
+        direction = "UP" if close > high else "DOWN"
+        reason = f"Range crossed, but confirmation failed (body {body_ratio:.2f}, RVOL {rvol:.2f}); wait for stronger completed candle"
     elif prior_compression and buildup >= 1.05 and pressure >= 15 and near_high:
         status, direction = "WATCH", "UP"
         reason = "20M range compression + volume buildup + buying pressure near range high"
@@ -1409,7 +1500,7 @@ def _market_regime_analysis(df):
         elif adx >= 22 and c.iloc[-1] < ema20 < ema50 and minus_di.iloc[-1] > plus_di.iloc[-1]:
             regime, strength = "TRENDING DOWN", min(100, int(adx * 2))
             reason = f"ADX {adx:.1f}; price and EMAs aligned downward"
-        elif adx < 18 and bb_width < 5.0:
+        elif adx < 18 and bb_width < 2.5:
             regime, strength = "SIDEWAYS / COMPRESSION", max(0, min(100, int((18-adx)*4)))
             reason = f"Low ADX {adx:.1f}; narrow Bollinger width {bb_width:.2f}"
         else:
@@ -1483,7 +1574,8 @@ def _make_result_row(symbol, yahoo_symbol, payload):
                 [(high - low), (high - previous_close).abs(), (low - previous_close).abs()],
                 axis=1,
             ).max(axis=1)
-            atr_value = true_range.rolling(14, min_periods=7).mean().iloc[-1]
+            # Wilder smoothing matches the regime/ADX ATR implementation.
+            atr_value = true_range.ewm(alpha=1/14, adjust=False, min_periods=14).mean().iloc[-1]
             if pd.notna(atr_value) and float(atr_value) > 0:
                 atr_15m = float(atr_value)
         except Exception:
@@ -1896,6 +1988,14 @@ def _fetch_fyers_depth_shortlist(client, shortlist, limit=FYERS_DEPTH_DEFAULT_LI
 
 def _sort_results(result):
     result = result.copy()
+    if result.empty:
+        return result
+    if "Final Signal" not in result.columns:
+        result["Final Signal"] = "NO DATA"
+    if "Confirmation Strength %" not in result.columns:
+        result["Confirmation Strength %"] = 0
+    if "Symbol" not in result.columns:
+        result["Symbol"] = ""
     result["_priority"] = result["Final Signal"].map(SIGNAL_PRIORITY).fillna(9)
     return result.sort_values(
         ["_priority", "Confirmation Strength %", "Symbol"],
@@ -1923,11 +2023,15 @@ def _best_stock_analyst(row):
             "Best Stock Filter": "REJECT",
         }
 
-    # Hard reject missing or opposing timeframe confirmation.
-    tfs = [str(row.get(tf, "NO DATA")).upper() for tf in ("5M", "15M", "1H")]
-    aligned = sum(x == expected for x in tfs)
-    opposing = sum(x in ("SELL", "PRE-BIG SELL") if expected == "BUY"
-                   else x in ("BUY", "PRE-BIG BUY") for x in tfs)
+    # Direct trend has priority; if it is WAIT, use that timeframe's Pre-Big agent.
+    tfs = []
+    for tf in ("5M", "15M", "1H"):
+        direct = str(row.get(tf, "NO DATA") or "NO DATA").upper()
+        pre = str(row.get(f"{tf} Pre-Big_Movement", "WAIT") or "WAIT").upper()
+        tfs.append(direct if direct in ("BUY", "SELL") else pre)
+    aligned = sum(x in (expected, f"PRE-BIG {expected}") for x in tfs)
+    opposing = sum(x in (("SELL", "PRE-BIG SELL") if expected == "BUY"
+                         else ("BUY", "PRE-BIG BUY")) for x in tfs)
     if aligned < 2 or opposing:
         return {
             "18th Agent": "REJECT / CONFLICT", "Best Stock Score": 0,
@@ -2000,13 +2104,18 @@ def _best_stock_analyst(row):
 
 
 def _direction_movement(row):
-    """Summarise 5M/15M/1H direction, including PRE-BIG votes.
+    """Summarise direct trend and per-timeframe Pre-Big Movement agent votes."""
+    directions = []
+    for tf in ("5M", "15M", "1H"):
+        direct = str(row.get(tf, "NO DATA") or "NO DATA").upper()
+        pre = str(row.get(f"{tf} Pre-Big_Movement", "WAIT") or "WAIT").upper()
+        if direct in ("BUY", "SELL"):
+            directions.append(direct)
+        elif pre in ("PRE-BIG BUY", "PRE-BIG SELL"):
+            directions.append(pre)
+        else:
+            directions.append(direct)
 
-    FYERS depth is a displayed order-book snapshot, not executed trade flow;
-    it annotates alignment/conflict but never changes the technical direction.
-    """
-    directions = [str(row.get(tf, "NO DATA") or "NO DATA").upper()
-                  for tf in ("5M", "15M", "1H")]
     buy_votes = sum(x in ("BUY", "PRE-BIG BUY") for x in directions)
     sell_votes = sum(x in ("SELL", "PRE-BIG SELL") for x in directions)
     direct_buy = sum(x == "BUY" for x in directions)
@@ -2018,8 +2127,8 @@ def _direction_movement(row):
         movement = "PRE-BIG UP" if pre_buy >= 2 and direct_buy == 0 else "UP"
     elif sell_votes >= 2 and buy_votes == 0:
         movement = "PRE-BIG DOWN" if pre_sell >= 2 and direct_sell == 0 else "DOWN"
-    elif buy_votes == 0 and sell_votes == 0 and all(x == "WAIT" for x in directions):
-        movement = "SIDEWAYS"
+    elif buy_votes == 0 and sell_votes == 0 and all(x in ("WAIT", "NO DATA") for x in directions):
+        movement = "SIDEWAYS" if all(x == "WAIT" for x in directions) else "NO DATA"
     elif directions.count("NO DATA") >= 2:
         movement = "NO DATA"
     else:
@@ -2037,9 +2146,6 @@ def _direction_movement(row):
     if is_down and depth == "SELL-SIDE DOMINANT":
         return f"{movement} (DEPTH ALIGNED)"
     return movement
-
-
-
 def _prune_scan_jobs(keep=3):
     """Keep active jobs, latest DONE result, and a small finalized/cancelled history."""
     keep = max(1, int(keep))
@@ -2262,6 +2368,11 @@ def _scan_job_start_worker(job_id):
         job = _scan_job_get(job_id)
         if not job or job["status"] not in ("RUNNING", "PAUSED"):
             return False
+        with _memory_connect() as conn:
+            conn.execute(
+                "UPDATE scan_jobs SET status='RUNNING',updated_at=?,error=NULL WHERE job_id=? AND status IN ('RUNNING','PAUSED')",
+                (datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S %Z"), job_id),
+            )
         worker = threading.Thread(
             target=_scan_job_worker, args=(job_id,),
             name=f"nse-scan-{job_id[:8]}", daemon=True,
@@ -2434,8 +2545,8 @@ def _apply_real_ai_brain(result):
         "AI Brain Signal": "MODEL NOT TRAINED", "AI Model Status": "NOT TRAINED",
     }
     for col, default in defaults.items():
-        if col not in result.columns:
-            result[col] = default
+        # Clear old predictions before applying the currently loaded model.
+        result[col] = default
     bundle = st.session_state.get("ma_real_ai_model")
     if not bundle or not all(c in result.columns for c in AI_FEATURE_COLUMNS):
         return result
@@ -2487,6 +2598,117 @@ def _apply_real_ai_brain(result):
         result["AI Prediction Error"] = str(exc)[:160]
     return result
 
+
+
+
+def _build_excel(result, stamp):
+    """Build the complete dashboard + scanner workbook from the current result DataFrame."""
+    try:
+        from openpyxl.styles import Font, PatternFill, Alignment
+        from openpyxl.formatting.rule import CellIsRule
+        from openpyxl.chart import BarChart, Reference
+
+        buffer = io.BytesIO()
+        with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+            result.to_excel(writer, index=False, sheet_name="AI Scanner")
+            counts = result.get("Action Signal", pd.Series(dtype=str)).fillna("WAIT").value_counts()
+            dash_rows = [
+                ["AI MULTI-AGENT SCANNER DASHBOARD", ""],
+                ["Generated (IST)", stamp.strftime("%Y-%m-%d %H:%M:%S IST")],
+                ["Total Stocks Scanned", int(len(result))],
+                ["BUY", int(counts.get("BUY", 0))],
+                ["SELL", int(counts.get("SELL", 0))],
+                ["SWEEP UP", int(counts.get("SWEEP UP", 0))],
+                ["SWEEP DOWN", int(counts.get("SWEEP DOWN", 0))],
+                ["BREAKOUT", int(counts.get("BREAKOUT", 0))],
+                ["BREAKDOWN", int(counts.get("BREAKDOWN", 0))],
+                ["WAIT", int(counts.get("WAIT", 0))],
+                ["", ""],
+                ["TOP QUALIFIED STOCKS", ""],
+            ]
+            pd.DataFrame(dash_rows, columns=["Metric", "Value"]).to_excel(
+                writer, index=False, header=False, sheet_name="Dashboard", startrow=0
+            )
+            top_cols = [c for c in [
+                "Symbol", "Action Signal", "Final Signal", "Best Stock Score",
+                "Confirmation Strength %", "Last Price", "Breakout Signal",
+                "Multi-TF Breakout", "Breakout Retest", "AI Direction",
+                "AI Up Probability %", "AI Down Probability %", "AI Brain Signal",
+            ] if c in result.columns]
+            top = result.copy()
+            if "Best Stock Filter" in top.columns:
+                top = top[top["Best Stock Filter"] == "PASS"]
+            if "Best Stock Score" in top.columns:
+                top = top.sort_values("Best Stock Score", ascending=False)
+            top[top_cols].head(15).to_excel(
+                writer, index=False, sheet_name="Dashboard", startrow=len(dash_rows)+1
+            )
+
+            wb = writer.book
+            ws = wb["Dashboard"]
+            ws.freeze_panes = "A3"
+            ws.column_dimensions["A"].width = 30
+            ws.column_dimensions["B"].width = 34
+            for col in range(3, max(ws.max_column, 2) + 1):
+                ws.column_dimensions[ws.cell(1, col).column_letter].width = 22
+            ws.merge_cells("A1:B1")
+            ws["A1"].font = Font(bold=True, size=16, color="FFFFFF")
+            ws["A1"].fill = PatternFill("solid", fgColor="17365D")
+            ws["A1"].alignment = Alignment(horizontal="center")
+            ws[2][0].font = Font(bold=True, color="17365D")
+            ws[3][0].font = Font(bold=True, color="17365D")
+            for r in range(3, 11):
+                ws.cell(r, 1).font = Font(bold=True)
+            header_row = len(dash_rows) + 2
+            for cell in ws[header_row]:
+                cell.font = Font(bold=True, color="FFFFFF")
+                cell.fill = PatternFill("solid", fgColor="305496")
+            for row_cells in ws.iter_rows(min_row=header_row + 1):
+                for cell in row_cells:
+                    cell.alignment = Alignment(vertical="center")
+
+            chart = BarChart()
+            chart.type = "bar"
+            chart.style = 10
+            chart.title = "Signal Counts"
+            chart.y_axis.title = "Signal"
+            chart.x_axis.title = "Stocks"
+            chart.height, chart.width = 7, 12
+            chart.add_data(Reference(ws, min_col=2, min_row=4, max_row=10), titles_from_data=False)
+            chart.set_categories(Reference(ws, min_col=1, min_row=4, max_row=10))
+            ws.add_chart(chart, "D3")
+
+            report = wb["AI Scanner"]
+            report.freeze_panes = "A2"
+            last_col = report.cell(1, report.max_column).column_letter
+            report.auto_filter.ref = f"A1:{last_col}{max(report.max_row, 1)}"
+            for cell in report[1]:
+                cell.font = Font(bold=True, color="FFFFFF")
+                cell.fill = PatternFill("solid", fgColor="17365D")
+                cell.alignment = Alignment(wrap_text=True, vertical="center")
+            report.row_dimensions[1].height = 32
+            for col_cells in report.columns:
+                letter = col_cells[0].column_letter
+                header = str(col_cells[0].value or "")
+                report.column_dimensions[letter].width = min(max(len(header) + 2, 13), 28)
+            headers = {str(c.value): c.column for c in report[1]}
+            for key in ("Action Signal", "Final Signal", "Breakout Signal", "Multi-TF Breakout"):
+                if key in headers:
+                    col_letter = report.cell(1, headers[key]).column_letter
+                    report.conditional_formatting.add(
+                        f"{col_letter}2:{col_letter}{report.max_row}",
+                        CellIsRule(operator="equal", formula=['"BUY"'],
+                                   fill=PatternFill("solid", fgColor="C6EFCE")),
+                    )
+                    report.conditional_formatting.add(
+                        f"{col_letter}2:{col_letter}{report.max_row}",
+                        CellIsRule(operator="equal", formula=['"SELL"'],
+                                   fill=PatternFill("solid", fgColor="F4CCCC")),
+                    )
+            wb._sheets = [wb["Dashboard"], wb["AI Scanner"]]
+        return buffer.getvalue(), ""
+    except Exception as exc:
+        return None, str(exc)
 
 
 def show_ai_multi_agent_scanner(client=None):
@@ -2609,6 +2831,8 @@ def show_ai_multi_agent_scanner(client=None):
     # A cancel is durable in SQLite. Existing candle memory is intentionally preserved.
     job_id = st.session_state.get("ma_scan_job_id")
     if cancel_scan_now:
+        st.session_state["ma_discarded"] = True
+        st.session_state.pop("ma_restored_from_db", None)
         if job_id:
             with _memory_connect() as conn:
                 conn.execute(
@@ -2625,15 +2849,19 @@ def show_ai_multi_agent_scanner(client=None):
     job_id = st.session_state.get("ma_scan_job_id")
     job = _scan_job_get(job_id) if job_id else None
     if ("multi_agent_results" not in st.session_state and not start_scan_requested and not resume_scan_now
+            and not st.session_state.get("ma_discarded", False)
             and not (job and job["status"] in ("RUNNING", "PAUSED", "DONE"))):
         with _memory_connect() as conn:
-            finalized = conn.execute(
-                "SELECT job_id FROM scan_jobs WHERE status='FINALIZED' ORDER BY created_at DESC LIMIT 1"
+            latest_job = conn.execute(
+                "SELECT job_id,status FROM scan_jobs ORDER BY created_at DESC LIMIT 1"
             ).fetchone()
+            # sqlite3.Row is not configured in _memory_connect(); fetchone() is a tuple.
+            finalized = latest_job if latest_job and latest_job[1] == "FINALIZED" else None
             if finalized:
                 conn.execute("UPDATE scan_jobs SET status='DONE' WHERE job_id=?", (finalized[0],))
         if finalized:
             st.session_state["ma_scan_job_id"] = finalized[0]
+            st.session_state["ma_restored_from_db"] = True
             st.session_state.pop("ma_scan_finalized_job", None)
             st.rerun()
 
@@ -2651,6 +2879,10 @@ def show_ai_multi_agent_scanner(client=None):
         if job and job["status"] in ("RUNNING", "PAUSED"):
             st.warning("ఒక scan ఇప్పటికే pending/running లో ఉంది. దాన్ని Resume చేయండి; duplicate scan ప్రారంభించలేదు.")
         else:
+            st.session_state["ma_discarded"] = False
+            st.session_state.pop("ma_restored_from_db", None)
+            st.session_state.pop("ma_ai_export_signature", None)
+            st.session_state.pop("ma_ai_apply_sig", None)
             config = {
                 "universe": universe,
                 "source_symbols": len(symbols),
@@ -2731,40 +2963,72 @@ def show_ai_multi_agent_scanner(client=None):
         ]
         status = st.empty()
         result = _sort_results(pd.DataFrame(all_rows))
-        if news_enabled:
-            candidates = result[result["Final Signal"].isin(
-                ["BUY", "SELL", "PRE-BIG BUY", "PRE-BIG SELL"]
-            )].head(news_limit)
-            news_map = {}
-            if len(candidates):
-                news_bar = st.progress(0.0)
-                for n, (_, item) in enumerate(candidates.iterrows(), 1):
-                    status.write(f"News context {n}/{len(candidates)}: {item['Symbol']}")
-                    news_map[item["Symbol"]] = _news_agent(item["Yahoo Symbol"])
-                    news_bar.progress(n / len(candidates))
-            default = {"direction": "NOT CHECKED", "score": 0, "reason": "Not in technical shortlist / news limit"}
-            result["News Agent"] = result["Symbol"].map(lambda s: news_map.get(s, default)["direction"])
-            result["News Score"] = result["Symbol"].map(lambda s: news_map.get(s, default)["score"])
-            result["News Reason"] = result["Symbol"].map(lambda s: news_map.get(s, default)["reason"])
-        else:
-            result["News Agent"], result["News Score"], result["News Reason"] = "DISABLED", 0, "News disabled"
+        if result.empty:
+            st.error("No completed stock rows were saved for this scan job. Check Yahoo data and press RESUME or start a fresh scan.")
+            return
+        restored_from_db = bool(st.session_state.pop("ma_restored_from_db", False))
 
-        # FYERS is called ONLY for the technical BUY/SELL/PRE-BIG shortlist.
-        depth_candidates = result[result["Final Signal"].isin(
-            ["BUY", "SELL", "PRE-BIG BUY", "PRE-BIG SELL"]
-        )].head(depth_limit)
-        depth_table = _fetch_fyers_depth_shortlist(client, depth_candidates, depth_limit)
-        if not depth_table.empty:
-            depth_columns = [c for c in depth_table.columns if c != "Symbol"]
-            result = result.merge(depth_table[["Symbol"] + depth_columns], on="Symbol", how="left")
-        else:
-            for col in ["FYERS Symbol", "Depth Status", "Depth Signal", "Best Bid", "Best Ask", "Spread",
-                        "Buy Qty (5L)", "Sell Qty (5L)", "Depth Imbalance %", "Depth Time (IST)", "Depth Message"]:
+        # A browser refresh restores technical rows from SQLite. Do not repeat
+        # optional external calls (Yahoo news / FYERS depth) during that restore.
+        if restored_from_db:
+            default = {
+                "direction": "NOT FETCHED ON RESTORE",
+                "score": 0,
+                "reason": "Restored from SQLite; external news call intentionally skipped",
+            }
+            result["News Agent"] = "NOT FETCHED ON RESTORE" if news_enabled else "DISABLED"
+            result["News Score"] = 0
+            result["News Reason"] = default["reason"] if news_enabled else "News disabled"
+
+            depth_candidates = result[result["Final Signal"].isin(
+                ["BUY", "SELL", "PRE-BIG BUY", "PRE-BIG SELL"]
+            )].head(depth_limit)
+            depth_columns = [
+                "FYERS Symbol", "Depth Status", "Depth Signal", "Best Bid", "Best Ask",
+                "Spread", "Buy Qty (5L)", "Sell Qty (5L)", "Depth Imbalance %",
+                "Depth Time (IST)", "Depth Message",
+            ]
+            for col in depth_columns:
                 result[col] = None
-        # Rows outside the technical shortlist must never receive FYERS depth data.
-        result.loc[~result["Final Signal"].isin(["BUY", "SELL", "PRE-BIG BUY", "PRE-BIG SELL"]),
-                   ["FYERS Symbol", "Depth Status", "Depth Signal", "Best Bid", "Best Ask", "Spread",
-                    "Buy Qty (5L)", "Sell Qty (5L)", "Depth Imbalance %", "Depth Time (IST)", "Depth Message"]] = None
+            result["Depth Status"] = "NOT FETCHED ON RESTORE"
+            result["Depth Message"] = "Restored from SQLite; FYERS depth call intentionally skipped"
+            depth_table = pd.DataFrame(columns=["Symbol"] + depth_columns)
+        else:
+            if news_enabled:
+                candidates = result[result["Final Signal"].isin(
+                    ["BUY", "SELL", "PRE-BIG BUY", "PRE-BIG SELL"]
+                )].head(news_limit)
+                news_map = {}
+                if len(candidates):
+                    news_bar = st.progress(0.0)
+                    for n, (_, item) in enumerate(candidates.iterrows(), 1):
+                        status.write(f"News context {n}/{len(candidates)}: {item['Symbol']}")
+                        news_map[item["Symbol"]] = _news_agent(item["Yahoo Symbol"])
+                        news_bar.progress(n / len(candidates))
+                default = {"direction": "NOT CHECKED", "score": 0, "reason": "Not in technical shortlist / news limit"}
+                result["News Agent"] = result["Symbol"].map(lambda s: news_map.get(s, default)["direction"])
+                result["News Score"] = result["Symbol"].map(lambda s: news_map.get(s, default)["score"])
+                result["News Reason"] = result["Symbol"].map(lambda s: news_map.get(s, default)["reason"])
+            else:
+                result["News Agent"], result["News Score"], result["News Reason"] = "DISABLED", 0, "News disabled"
+
+            # FYERS is called ONLY for the technical BUY/SELL/PRE-BIG shortlist.
+            depth_candidates = result[result["Final Signal"].isin(
+                ["BUY", "SELL", "PRE-BIG BUY", "PRE-BIG SELL"]
+            )].head(depth_limit)
+            depth_table = _fetch_fyers_depth_shortlist(client, depth_candidates, depth_limit)
+            if not depth_table.empty:
+                depth_columns = [c for c in depth_table.columns if c != "Symbol"]
+                result = result.merge(depth_table[["Symbol"] + depth_columns], on="Symbol", how="left")
+            else:
+                for col in ["FYERS Symbol", "Depth Status", "Depth Signal", "Best Bid", "Best Ask", "Spread",
+                            "Buy Qty (5L)", "Sell Qty (5L)", "Depth Imbalance %", "Depth Time (IST)", "Depth Message"]:
+                    result[col] = None
+            # Rows outside the technical shortlist must never receive FYERS depth data.
+            result.loc[~result["Final Signal"].isin(["BUY", "SELL", "PRE-BIG BUY", "PRE-BIG SELL"]),
+                       ["FYERS Symbol", "Depth Status", "Depth Signal", "Best Bid", "Best Ask", "Spread",
+                        "Buy Qty (5L)", "Sell Qty (5L)", "Depth Imbalance %", "Depth Time (IST)", "Depth Message"]] = None
+
         st.session_state["multi_agent_depth"] = depth_table
 
         # Direction Movement includes BUY/SELL and PRE-BIG direction votes.
@@ -2776,103 +3040,12 @@ def show_ai_multi_agent_scanner(client=None):
 
         stamp = datetime.now(IST)
         try:
-            _save_scan_history(result, stamp.strftime("%Y-%m-%d %H:%M:%S %Z"))
+            if not restored_from_db:
+                _save_scan_history(result, stamp.strftime("%Y-%m-%d %H:%M:%S %Z"))
         except Exception as memory_exc:
             st.warning(f"SQLite scan history save issue: {memory_exc}")
         csv_bytes = result.to_csv(index=False).encode("utf-8-sig")
-        xlsx_bytes, xlsx_error = None, ""
-        try:
-            buffer = io.BytesIO()
-            with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-                result.to_excel(writer, index=False, sheet_name="AI Scanner")
-                # A separate first sheet makes the downloaded workbook open as a dashboard.
-                counts = result.get("Action Signal", pd.Series(dtype=str)).fillna("WAIT").value_counts()
-                dash_rows = [
-                    ["AI MULTI-AGENT SCANNER DASHBOARD", ""],
-                    ["Generated (IST)", stamp.strftime("%Y-%m-%d %H:%M:%S IST")],
-                    ["Total Stocks Scanned", int(len(result))],
-                    ["BUY", int(counts.get("BUY", 0))],
-                    ["SELL", int(counts.get("SELL", 0))],
-                    ["SWEEP UP", int(counts.get("SWEEP UP", 0))],
-                    ["SWEEP DOWN", int(counts.get("SWEEP DOWN", 0))],
-                    ["BREAKOUT", int(counts.get("BREAKOUT", 0))],
-                    ["BREAKDOWN", int(counts.get("BREAKDOWN", 0))],
-                    ["WAIT", int(counts.get("WAIT", 0))],
-                    ["", ""],
-                    ["TOP QUALIFIED STOCKS", ""],
-                ]
-                dashboard = pd.DataFrame(dash_rows, columns=["Metric", "Value"])
-                dashboard.to_excel(writer, index=False, header=False, sheet_name="Dashboard", startrow=0)
-                top_cols = [c for c in ["Symbol", "Action Signal", "Final Signal", "Best Stock Score", "Confirmation Strength %", "Last Price", "Breakout Signal", "Multi-TF Breakout", "Breakout Retest"] if c in result.columns]
-                top = result.copy()
-                if "Best Stock Filter" in top.columns:
-                    top = top[top["Best Stock Filter"] == "PASS"]
-                if "Best Stock Score" in top.columns:
-                    top = top.sort_values("Best Stock Score", ascending=False)
-                top[top_cols].head(15).to_excel(writer, index=False, sheet_name="Dashboard", startrow=len(dash_rows)+1)
-                from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
-                from openpyxl.formatting.rule import CellIsRule
-                wb = writer.book
-                ws = wb["Dashboard"]
-                ws.freeze_panes = "A3"
-                ws.column_dimensions["A"].width = 30
-                ws.column_dimensions["B"].width = 34
-                for col in range(3, max(ws.max_column, 2)+1):
-                    ws.column_dimensions[chr(64+col)].width = 22
-                ws.merge_cells("A1:B1")
-                ws["A1"].font = Font(bold=True, size=16, color="FFFFFF")
-                ws["A1"].fill = PatternFill("solid", fgColor="17365D")
-                ws["A1"].alignment = Alignment(horizontal="center")
-                ws[2][0].font = Font(bold=True, color="17365D")
-                ws[3][0].font = Font(bold=True, color="17365D")
-                # Style the dashboard metric labels and the top-stocks header.
-                for r in range(3, 11):
-                    ws.cell(r,1).font = Font(bold=True)
-                header_row = len(dash_rows)+2
-                for cell in ws[header_row]:
-                    cell.font = Font(bold=True, color="FFFFFF")
-                    cell.fill = PatternFill("solid", fgColor="305496")
-                for row_cells in ws.iter_rows(min_row=header_row+1):
-                    for cell in row_cells:
-                        cell.alignment = Alignment(vertical="center")
-                from openpyxl.chart import BarChart, Reference
-                chart = BarChart()
-                chart.type = "bar"
-                chart.style = 10
-                chart.title = "Signal Counts"
-                chart.y_axis.title = "Signal"
-                chart.x_axis.title = "Stocks"
-                chart.height, chart.width = 7, 12
-                chart.add_data(Reference(ws, min_col=2, min_row=4, max_row=10), titles_from_data=False)
-                chart.set_categories(Reference(ws, min_col=1, min_row=4, max_row=10))
-                ws.add_chart(chart, "D3")
-                # Main scanner report: filters, freeze panes, readable widths and colored signals.
-                report = wb["AI Scanner"]
-                report.freeze_panes = "A2"
-                report.auto_filter.ref = report.dimensions
-                for cell in report[1]:
-                    cell.font = Font(bold=True, color="FFFFFF")
-                    cell.fill = PatternFill("solid", fgColor="17365D")
-                    cell.alignment = Alignment(wrap_text=True, vertical="center")
-                report.row_dimensions[1].height = 32
-                for col_cells in report.columns:
-                    letter = col_cells[0].column_letter
-                    header = str(col_cells[0].value or "")
-                    report.column_dimensions[letter].width = min(max(len(header)+2, 13), 28)
-                headers = {str(c.value): c.column for c in report[1]}
-                for key in ("Action Signal", "Final Signal", "Breakout Signal", "Multi-TF Breakout"):
-                    if key in headers:
-                        col_letter = report.cell(1, headers[key]).column_letter
-                        report.conditional_formatting.add(f"{col_letter}2:{col_letter}{report.max_row}",
-                            CellIsRule(operator="equal", formula=['"BUY"'], fill=PatternFill("solid", fgColor="C6EFCE")))
-                        report.conditional_formatting.add(f"{col_letter}2:{col_letter}{report.max_row}",
-                            CellIsRule(operator="equal", formula=['"SELL"'], fill=PatternFill("solid", fgColor="F4CCCC")))
-                # Open the workbook on the Dashboard sheet by default.
-                wb._sheets = [wb["Dashboard"], wb["AI Scanner"]]
-            # Capture the completed workbook bytes for Streamlit download.
-            xlsx_bytes = buffer.getvalue()
-        except Exception as exc:
-            xlsx_error = str(exc)
+        xlsx_bytes, xlsx_error = _build_excel(result, stamp)
 
         st.session_state["multi_agent_results"] = result
         st.session_state["multi_agent_csv"] = csv_bytes
@@ -2884,10 +3057,15 @@ def show_ai_multi_agent_scanner(client=None):
             "completed_at": stamp.strftime("%Y-%m-%d %H:%M:%S IST"),
             "file_stamp": stamp.strftime("%Y%m%d_%H%M%S"),
         }
-        status.success(
-            f"Scan completed: {len(result)} Yahoo rows; FYERS depth requested for "
-            f"{len(depth_candidates)} shortlisted stocks (limit {depth_limit})."
-        )
+        if restored_from_db:
+            status.success(
+                f"Restored {len(result)} Yahoo rows from SQLite. News and FYERS depth were not re-fetched."
+            )
+        else:
+            status.success(
+                f"Scan completed: {len(result)} Yahoo rows; FYERS depth requested for "
+                f"{len(depth_candidates)} shortlisted stocks (limit {depth_limit})."
+            )
         st.session_state["ma_scan_finalized_job"] = job_id
         with _memory_connect() as conn:
             conn.execute(
@@ -3068,46 +3246,17 @@ def show_ai_multi_agent_scanner(client=None):
             st.session_state["ma_ai_apply_sig"] = ai_apply_sig
         else:
             result = st.session_state.get("multi_agent_results", result)
-        try:
-            from openpyxl import load_workbook
-            existing_xlsx = st.session_state.get("multi_agent_xlsx")
-            ai_export_signature = (
-                st.session_state.get("ma_scan_job_id"),
-                ai_bundle.get("metrics", {}).get("trained_at"),
-                len(result),
-            )
-            if existing_xlsx and st.session_state.get("ma_ai_export_signature") != ai_export_signature:
-                wb_ai = load_workbook(io.BytesIO(existing_xlsx))
-                if "AI Scanner" in wb_ai.sheetnames:
-                    ws_ai = wb_ai["AI Scanner"]
-                    header_map = {str(cell.value): cell.column for cell in ws_ai[1]}
-                    ai_export_cols = [
-                        "AI Direction", "AI Up Probability %", "AI Down Probability %",
-                        "AI Sideways Probability %", "AI Brain Signal", "AI Model Status",
-                    ]
-                    for col_name in ai_export_cols:
-                        if col_name not in header_map:
-                            new_col = ws_ai.max_column + 1
-                            ws_ai.cell(1, new_col, col_name)
-                            header_map[col_name] = new_col
-                    symbol_col = header_map.get("Symbol", 1)
-                    row_lookup = {
-                        str(ws_ai.cell(r, symbol_col).value): r
-                        for r in range(2, ws_ai.max_row + 1)
-                    }
-                    for _, ai_row in result.iterrows():
-                        target_row = row_lookup.get(str(ai_row.get("Symbol", "")))
-                        if not target_row:
-                            continue
-                        for col_name in ai_export_cols:
-                            ws_ai.cell(target_row, header_map[col_name],
-                                       None if pd.isna(ai_row.get(col_name)) else ai_row.get(col_name))
-                    out_buffer = io.BytesIO()
-                    wb_ai.save(out_buffer)
-                    st.session_state["multi_agent_xlsx"] = out_buffer.getvalue()
-                    st.session_state["ma_ai_export_signature"] = ai_export_signature
-        except Exception as ai_export_exc:
-            st.session_state["multi_agent_xlsx_error"] = f"AI export update: {ai_export_exc}"
+        ai_export_signature = (
+            st.session_state.get("ma_scan_job_id"),
+            ai_bundle.get("metrics", {}).get("trained_at"),
+            len(result),
+        )
+        if st.session_state.get("ma_ai_export_signature") != ai_export_signature:
+            stamp = datetime.now(IST)
+            xlsx_bytes, xlsx_error = _build_excel(result, stamp)
+            st.session_state["multi_agent_xlsx"] = xlsx_bytes
+            st.session_state["multi_agent_xlsx_error"] = xlsx_error
+            st.session_state["ma_ai_export_signature"] = ai_export_signature
         ai_cols = ["Symbol", "AI Direction", "AI Up Probability %", "AI Down Probability %",
                    "AI Sideways Probability %", "AI Brain Signal", "Final Signal"]
         st.dataframe(result[ai_cols].head(30), hide_index=True, **_stretch())
@@ -3121,6 +3270,15 @@ def show_ai_multi_agent_scanner(client=None):
             st.session_state["ma_ai_apply_sig"] = ai_apply_sig
         else:
             result = st.session_state.get("multi_agent_results", result)
+        ai_export_signature = (
+            st.session_state.get("ma_scan_job_id"), "none", len(result)
+        )
+        if st.session_state.get("ma_ai_export_signature") != ai_export_signature:
+            stamp = datetime.now(IST)
+            xlsx_bytes, xlsx_error = _build_excel(result, stamp)
+            st.session_state["multi_agent_xlsx"] = xlsx_bytes
+            st.session_state["multi_agent_xlsx_error"] = xlsx_error
+            st.session_state["ma_ai_export_signature"] = ai_export_signature
         st.warning(
             "Real AI Brain is not active: " +
             str(st.session_state.get("ma_real_ai_train_error") or "training data not available") +
