@@ -1,6 +1,6 @@
 """
 AI Multi-Agent Scanner for NSE AI PRO V17
-Yahoo Finance batch edition — revised.
+Yahoo Finance batch edition — revised (audit round 4).
 
 - scanner.py only supplies the NSE / F&O symbol universe; this module combines both loaders without modifying scanner.py.
 - Yahoo Finance supplies all OHLCV candles and technical-analysis data.
@@ -101,8 +101,6 @@ def _ttl_cache_set(key, value):
             _TTL_CACHE.popitem(last=False)
 
 
-
-
 # SQLite candle memory: persists completed Yahoo candles between Streamlit reruns.
 # On hosted ephemeral filesystems, use a persistent mounted disk for survival across redeploys.
 MEMORY_DB_PATH = Path(__file__).with_name("ai_multi_agent_candle_memory.sqlite3")
@@ -188,6 +186,7 @@ def _save_candle_memory(batch, per_tf):
         conn.execute("DELETE FROM candles WHERE timeframe!='1M' AND candle_time < ?", (cutoff_core,))
     return len(records)
 
+
 def _load_candle_memory(symbol, timeframe):
     """Load previously saved candles for one source symbol/timeframe."""
     try:
@@ -207,6 +206,7 @@ def _load_candle_memory(symbol, timeframe):
         return frame.sort_values("Time").drop_duplicates("Time", keep="last").reset_index(drop=True)
     except Exception:
         return pd.DataFrame(columns=["Time", "Open", "High", "Low", "Close", "Volume"])
+
 
 def _load_candle_memory_batch(symbols, timeframe):
     """Load one timeframe for a batch using one SQLite query/connection."""
@@ -256,6 +256,7 @@ def _merge_candle_frames(cached, fresh):
     return (merged.dropna(subset=["Time"]).sort_values("Time")
             .drop_duplicates("Time", keep="last").reset_index(drop=True))
 
+
 def _save_scan_history(result, scanned_at):
     if result is None or result.empty:
         return 0
@@ -272,6 +273,7 @@ def _save_scan_history(result, scanned_at):
                      ((pd.Timestamp.now(tz=IST) - pd.Timedelta(days=180)).strftime("%Y-%m-%d %H:%M:%S"),))
     return len(rows)
 
+
 def _memory_stats():
     try:
         with _memory_connect() as conn:
@@ -282,9 +284,11 @@ def _memory_stats():
     except Exception:
         return 0, 0, 0
 
+
 def _is_market_hours(now=None):
     now = now or datetime.now(IST)
     return now.weekday() < 5 and (now.hour, now.minute) >= (9, 15) and (now.hour, now.minute) < (15, 30)
+
 
 def _stretch():
     try:
@@ -456,6 +460,15 @@ def _download_yahoo_batch_cached(tickers_tuple, interval, period):
     return data.copy(deep=True)
 
 
+def _yahoo_is_healthy():
+    """True when Yahoo answers for a liquid reference ticker (distinguishes dead symbols from an outage)."""
+    try:
+        _download_yahoo_batch_cached(("RELIANCE.NS",), "5m", "5d")
+        return True
+    except Exception:
+        return False
+
+
 def _extract_one_ticker(batch_df, ticker):
     if batch_df is None or batch_df.empty:
         return pd.DataFrame()
@@ -538,8 +551,8 @@ def _liquidity_levels_and_sweeps(df, lookback=30):
     buy_liq, sell_liq = max(ref_highs), min(ref_lows)
     # Equal levels: two or more confirmed pivots clustered within 0.15%.
     eq_tol = max(abs(close_prev) * 0.0015, 1e-9)
-    equal_high = any(abs(a-b) <= eq_tol for i,a in enumerate(swing_highs) for b in swing_highs[i+1:])
-    equal_low = any(abs(a-b) <= eq_tol for i,a in enumerate(swing_lows) for b in swing_lows[i+1:])
+    equal_high = any(abs(a-b) <= eq_tol for i, a in enumerate(swing_highs) for b in swing_highs[i+1:])
+    equal_low = any(abs(a-b) <= eq_tol for i, a in enumerate(swing_lows) for b in swing_lows[i+1:])
     high, low = _safe_num(last["High"]), _safe_num(last["Low"])
     opn = _safe_num(last["Open"])
     span = max(high-low, 1e-9)
@@ -576,33 +589,39 @@ def _breakout_breakdown_signal(df, lookback=20):
     d = df.tail(lookback + 21).reset_index(drop=True)
     base, last = d.iloc[-(lookback+1):-1], d.iloc[-1]
     resistance, support = _safe_num(base["High"].max(), np.nan), _safe_num(base["Low"].min(), np.nan)
-    o,h,l,c = (_safe_num(last[k]) for k in ("Open","High","Low","Close"))
-    span=max(h-l,1e-9); body=abs(c-o)/span; close_loc=(c-l)/span
-    avg_vol=_safe_num(base["Volume"].tail(20).mean(),0.0)
-    rvol=_safe_num(last["Volume"]/avg_vol,0.0) if avg_vol>0 else 0.0
-    if c>resistance and c>o and body>=.55 and close_loc>=.75 and rvol>=1.5:
-        sig, reason="BREAKOUT",f"Completed close above swing resistance {resistance:.2f}; body {body:.0%}; RVOL {rvol:.2f}x"
-    elif c<support and c<o and body>=.55 and close_loc<=.25 and rvol>=1.5:
-        sig, reason="BREAKDOWN",f"Completed close below swing support {support:.2f}; body {body:.0%}; RVOL {rvol:.2f}x"
+    o, h, l, c = (_safe_num(last[k]) for k in ("Open", "High", "Low", "Close"))
+    span = max(h-l, 1e-9)
+    body = abs(c-o)/span
+    close_loc = (c-l)/span
+    avg_vol = _safe_num(base["Volume"].tail(20).mean(), 0.0)
+    rvol = _safe_num(last["Volume"]/avg_vol, 0.0) if avg_vol > 0 else 0.0
+    if c > resistance and c > o and body >= .55 and close_loc >= .75 and rvol >= 1.5:
+        sig, reason = "BREAKOUT", f"Completed close above swing resistance {resistance:.2f}; body {body:.0%}; RVOL {rvol:.2f}x"
+    elif c < support and c < o and body >= .55 and close_loc <= .25 and rvol >= 1.5:
+        sig, reason = "BREAKDOWN", f"Completed close below swing support {support:.2f}; body {body:.0%}; RVOL {rvol:.2f}x"
     else:
-        sig, reason="WAIT",f"No confirmed range break; body {body:.0%}; RVOL {rvol:.2f}x"
-    return {"Breakout Signal":sig,"Breakout Level":round(resistance,2),
-            "Breakdown Level":round(support,2),"Breakout Reason":reason}
+        sig, reason = "WAIT", f"No confirmed range break; body {body:.0%}; RVOL {rvol:.2f}x"
+    return {"Breakout Signal": sig, "Breakout Level": round(resistance, 2),
+            "Breakdown Level": round(support, 2), "Breakout Reason": reason}
 
 
 def _multi_tf_breakout(frames):
     """A single timeframe trigger is provisional; require 2/3 aligned TFs for confirmation."""
-    checks={tf:_breakout_breakdown_signal(frames.get(tf,pd.DataFrame())) for tf in TIMEFRAMES}
-    ups=sum(v["Breakout Signal"]=="BREAKOUT" for v in checks.values())
-    dns=sum(v["Breakout Signal"]=="BREAKDOWN" for v in checks.values())
-    if ups>=2 and dns==0: signal="BREAKOUT CONFIRMED"
-    elif dns>=2 and ups==0: signal="BREAKDOWN CONFIRMED"
-    elif ups or dns: signal="PROVISIONAL — WAIT"
-    else: signal="WAIT"
-    return {"Multi-TF Breakout":signal,
-            "5M Breakout":checks["5M"]["Breakout Signal"],
-            "15M Breakout":checks["15M"]["Breakout Signal"],
-            "1H Breakout":checks["1H"]["Breakout Signal"]}
+    checks = {tf: _breakout_breakdown_signal(frames.get(tf, pd.DataFrame())) for tf in TIMEFRAMES}
+    ups = sum(v["Breakout Signal"] == "BREAKOUT" for v in checks.values())
+    dns = sum(v["Breakout Signal"] == "BREAKDOWN" for v in checks.values())
+    if ups >= 2 and dns == 0:
+        signal = "BREAKOUT CONFIRMED"
+    elif dns >= 2 and ups == 0:
+        signal = "BREAKDOWN CONFIRMED"
+    elif ups or dns:
+        signal = "PROVISIONAL — WAIT"
+    else:
+        signal = "WAIT"
+    return {"Multi-TF Breakout": signal,
+            "5M Breakout": checks["5M"]["Breakout Signal"],
+            "15M Breakout": checks["15M"]["Breakout Signal"],
+            "1H Breakout": checks["1H"]["Breakout Signal"]}
 
 
 def _breakout_retest_confirmation(df, direction, lookback=20, scan=6, tol=0.003):
@@ -680,7 +699,6 @@ def _cached_candles_are_fresh(frame, minutes, now=None):
         return -1.0 <= age < float(minutes)
     except Exception:
         return False
-
 
 
 def _run_17_agents(df, timeframe=None):
@@ -931,9 +949,11 @@ def _run_17_agents(df, timeframe=None):
 
 
 # News is contextual headline keyword scoring, not an AI model or standalone signal.
+# Verb forms are listed explicitly (jumps/jumped/surges...) because the patterns are
+# wrapped in \b...\b; a bare "jump" would not match "jumps".
 _POSITIVE = [
-    r"profit(?:s)? (?:rise|rose|jump|surge|increase|up)",
-    r"revenue (?:rise|rose|jump|surge|increase|up)",
+    r"profits? (?:rises?|rose|jumps?|jumped|surges?|surged|increases?|increased|up)",
+    r"revenue (?:rises?|rose|jumps?|jumped|surges?|surged|increases?|increased|up)",
     r"growth (?:accelerates?|improves?|strengthens?)",
     r"(?:analyst|brokerage) upgrades?",
     r"upgraded to (?:buy|overweight|outperform)",
@@ -942,8 +962,10 @@ _POSITIVE = [
     r"beats? (?:market|street|analyst) estimates",
 ]
 _NEGATIVE = [
-    r"net loss(?:es)?", r"profit(?:s)? (?:fall|fell|decline|drop|down)",
-    r"revenue (?:fall|fell|decline|drop|down)", r"downgrad(?:e|ed|es)",
+    r"net loss(?:es)?",
+    r"profits? (?:falls?|fell|declines?|declined|drops?|dropped|down)",
+    r"revenue (?:falls?|fell|declines?|declined|drops?|dropped|down)",
+    r"downgrad(?:e|ed|es)",
     r"fraud", r"default(?:s|ed)?", r"(?:regulatory|investigation) probe",
     r"ban(?:s|ned)?", r"penalt(?:y|ies)", r"resignation", r"weak results",
     r"misses? (?:market|street|analyst) estimates",
@@ -1050,13 +1072,15 @@ def _prebig_5m_analysis(df):
     full = df.sort_values("Time").drop_duplicates("Time", keep="last").reset_index(drop=True)
     latest_day = pd.Timestamp(full["Time"].iloc[-1]).date()
     same_session = full[pd.to_datetime(full["Time"]).dt.date == latest_day]
-    if len(full) < 25:
+    # The 12-candle base + the trigger candle must all be from today, so an
+    # overnight gap candle cannot masquerade as a breakout from yesterday's range.
+    if len(same_session) < 13:
         warm = empty.copy()
-        warm["PRE-BIG Status"] = "WAIT — HISTORY WARM-UP"
-        warm["PRE-BIG Reason"] = f"Need 25 completed 5M candles across recent sessions; have {len(full)}"
-        warm["PRE-BIG Candles"] = len(full)
+        warm["PRE-BIG Status"] = "WAIT — SESSION WARM-UP"
+        warm["PRE-BIG Reason"] = f"Need 13 same-session 5M candles; have {len(same_session)}"
+        warm["PRE-BIG Candles"] = len(same_session)
         return warm
-    # Range/volume windows may include the previous session; VWAP remains current-session only.
+    # The "prior" comparison window may use late candles from the previous session; VWAP is current-session only.
     session_vwap = _vwap_last_session(same_session)
     d = full.tail(25).reset_index(drop=True)
     prior = d.iloc[-25:-13]       # 12 candles before the compression window
@@ -1080,7 +1104,6 @@ def _prebig_5m_analysis(df):
     avg20 = _safe_num(d.iloc[:-1]["Volume"].tail(20).mean(), 0.0)
     last_vol = _safe_num(last["Volume"], 0.0)
     rvol = last_vol / avg20 if avg20 > 0 else 0.0
-    midpoint = (hi + lo) / 2.0
     base_close = _safe_num(base["Close"].iloc[-1], close)
     try:
         vwap = _safe_num(session_vwap, np.nan)
@@ -1133,7 +1156,6 @@ def _prebig_5m_analysis(df):
     }
 
 
-
 def _directional_pre_move_engine(df):
     """Early UP/DOWN watch from completed 5M candles; not a guaranteed signal."""
     empty = {
@@ -1150,12 +1172,13 @@ def _directional_pre_move_engine(df):
         full = df.sort_values("Time").drop_duplicates("Time", keep="last").reset_index(drop=True)
         latest_day = pd.Timestamp(full["Time"].iloc[-1]).date()
         same_session = full[pd.to_datetime(full["Time"]).dt.date == latest_day]
-        if len(full) < 26:
+        # Base window (12) + trigger candle must be same-session; avoids gap-candle false setups.
+        if len(same_session) < 13:
             warm = empty.copy()
-            warm["Directional Pre-Move"] = "WAIT — HISTORY WARM-UP"
-            warm["Pre-Move Reason"] = f"Need 26 completed 5M candles across recent sessions; have {len(full)}"
+            warm["Directional Pre-Move"] = "WAIT — SESSION WARM-UP"
+            warm["Pre-Move Reason"] = f"Need 13 same-session 5M candles; have {len(same_session)}"
             return warm
-        # Use prior-session candles for setup windows, but never carry VWAP overnight.
+        # Prior comparison window may use previous-session candles; VWAP never carries overnight.
         session_vwap = _vwap_last_session(same_session)
         d = full.tail(26).reset_index(drop=True)
         prior, recent, last = d.iloc[-25:-13], d.iloc[-13:-1], d.iloc[-1]
@@ -1268,15 +1291,12 @@ def _early_20m_analysis(df):
     recent5 = d.iloc[-6:-1]
     prev_avg = _safe_num(previous["Volume"].mean())
     recent_avg = _safe_num(recent5["Volume"].mean())
-    last_vol = _safe_num(last["Volume"])
-    rvol = last_vol / max(_safe_num(base["Volume"].mean()), 1.0)
+    rvol = _safe_num(last["Volume"]) / max(_safe_num(base["Volume"].mean()), 1.0)
     buildup = recent_avg / max(prev_avg, 1.0)
     candle_span = max(_safe_num(last["High"] - last["Low"]), 1e-9)
     close_location = max(0.0, min(1.0, (close - _safe_num(last["Low"])) / candle_span))
     pressure = (close_location - 0.5) * 200.0
     last_open = _safe_num(last["Open"])
-    last_high = _safe_num(last["High"])
-    last_low = _safe_num(last["Low"])
     body_ratio = abs(close - last_open) / candle_span
     breakout_up = (
         close > high and close > last_open and body_ratio >= 0.55
@@ -1351,7 +1371,6 @@ def _last_candle_close_time(frame, minutes):
         return close_stamp.strftime("%Y-%m-%d %H:%M:%S IST")
     except Exception:
         return None
-
 
 
 def _data_quality_gate(frames, min_candles=30):
@@ -1662,7 +1681,6 @@ def _make_result_row(symbol, yahoo_symbol, payload):
         row["Breakout Retest"] = "WAIT — NO RECENT BREAKOUT RETEST"
     # Explicit event label is separate from the trend consensus. A sweep is a
     # liquidity event, not an automatic BUY/SELL entry; breakout needs confirmation.
-    sweep_detail = str(row.get("Liquidity Sweep Detail", ""))
     if row.get("Multi-TF Breakout") == "BREAKOUT CONFIRMED":
         row["Action Signal"] = "BREAKOUT"
     elif row.get("Multi-TF Breakout") == "BREAKDOWN CONFIRMED":
@@ -1840,7 +1858,6 @@ def _scan_batch(batch, period, include_early=True):
     return rows
 
 
-
 def _to_fyers_equity_symbol(symbol):
     """Convert scanner universe symbols to FYERS NSE cash-market symbols."""
     raw = str(symbol or "").strip().upper()
@@ -1893,8 +1910,10 @@ def _normalise_depth_row(symbol, fyers_symbol, response, fetched_at=None):
 
     bids = book.get("bids") or book.get("buy") or []
     asks = book.get("ask") or book.get("asks") or book.get("sell") or []
+
     def level_price(level):
         return _safe_num(level.get("price"), np.nan) if isinstance(level, dict) else np.nan
+
     def level_qty(level):
         if not isinstance(level, dict):
             return 0.0
@@ -1985,6 +2004,7 @@ def _fetch_fyers_depth_shortlist(client, shortlist, limit=FYERS_DEPTH_DEFAULT_LI
 
     st.session_state["ma_fyers_depth_cache"] = cache
     return pd.DataFrame(rows, columns=columns)
+
 
 def _sort_results(result):
     result = result.copy()
@@ -2146,6 +2166,8 @@ def _direction_movement(row):
     if is_down and depth == "SELL-SIDE DOMINANT":
         return f"{movement} (DEPTH ALIGNED)"
     return movement
+
+
 def _prune_scan_jobs(keep=3):
     """Keep active jobs, latest DONE result, and a small finalized/cancelled history."""
     keep = max(1, int(keep))
@@ -2265,18 +2287,18 @@ def _scan_job_worker(job_id):
             try:
                 batch_rows = _scan_batch(batch, period, include_early=include_early)
                 bad_indices = [i for i, row in enumerate(batch_rows)
-                    if int(row.get("5M Candles", 0) or 0) == 0
-                    and int(row.get("15M Candles", 0) or 0) == 0
-                    and int(row.get("1H Candles", 0) or 0) == 0]
+                               if int(row.get("5M Candles", 0) or 0) == 0
+                               and int(row.get("15M Candles", 0) or 0) == 0
+                               and int(row.get("1H Candles", 0) or 0) == 0]
                 if bad_indices:
                     time.sleep(1.0)
                     retry_rows = _scan_batch([batch[i] for i in bad_indices], period, include_early=include_early)
                     for i, retry_row in zip(bad_indices, retry_rows):
                         batch_rows[i] = retry_row
                 unresolved_indices = [i for i, row in enumerate(batch_rows)
-                    if int(row.get("5M Candles", 0) or 0) == 0
-                    and int(row.get("15M Candles", 0) or 0) == 0
-                    and int(row.get("1H Candles", 0) or 0) == 0]
+                                      if int(row.get("5M Candles", 0) or 0) == 0
+                                      and int(row.get("15M Candles", 0) or 0) == 0
+                                      and int(row.get("1H Candles", 0) or 0) == 0]
             except Exception as exc:
                 batch_exception = True
                 batch_rows = [
@@ -2290,6 +2312,13 @@ def _scan_job_worker(job_id):
             current_job = _scan_job_get(job_id)
             if not current_job or current_job["status"] == "CANCELLED":
                 return
+
+            # A whole batch with zero candles is either a Yahoo outage/throttle or
+            # simply dead/delisted tickers. If a liquid reference ticker still
+            # downloads, Yahoo is healthy, so save the batch as NO DATA and continue
+            # instead of pausing forever on the same batch.
+            if unresolved_indices and not batch_exception and _yahoo_is_healthy():
+                unresolved_indices = []
 
             # Persist partial misses as NO DATA and continue. Pause only when the
             # entire normal-sized batch failed, which is more consistent with throttling.
@@ -2327,7 +2356,7 @@ def _scan_job_worker(job_id):
                 with _memory_connect() as conn:
                     conn.execute(
                         "UPDATE scan_jobs SET status='PAUSED',updated_at=?,error=? WHERE job_id=? AND status!='CANCELLED'",
-                        (paused_at, f"Yahoo returned zero core candles for {len(unresolved_indices)} symbols after retry; press RESUME", job_id),
+                        (paused_at, f"Yahoo returned zero core candles for {len(unresolved_indices)} symbols after retry (Yahoo appears unavailable); press RESUME", job_id),
                     )
                 return
 
@@ -2380,8 +2409,6 @@ def _scan_job_start_worker(job_id):
         _SCAN_WORKERS[job_id] = worker
         worker.start()
         return True
-
-
 
 
 # ============================================================
@@ -2464,7 +2491,7 @@ def _real_ai_training_data():
                 ).fetchall()
                 if len(rows) < 45:
                     continue
-                d = pd.DataFrame(rows, columns=["Time","Open","High","Low","Close","Volume"])
+                d = pd.DataFrame(rows, columns=["Time", "Open", "High", "Low", "Close", "Volume"])
                 d["Time"] = pd.to_datetime(d["Time"], errors="coerce", utc=True)
                 feat = _real_ai_feature_frame(d)
                 # Forward horizon stays inside one NSE session; no overnight label leakage.
@@ -2475,7 +2502,7 @@ def _real_ai_training_data():
                 atr_pct = feat["AI ATR %"] / 100.0
                 deadband = np.maximum(0.0010, 0.80 * atr_pct * math.sqrt(3.0))
                 label = pd.Series(np.where(future_return > deadband, 2,
-                                  np.where(future_return < -deadband, 0, 1)), index=d.index)
+                                           np.where(future_return < -deadband, 0, 1)), index=d.index)
                 valid = feat.notna().all(axis=1) & future_return.notna() & future_time.notna()
                 part = feat.loc[valid].copy()
                 part["__label"] = label.loc[valid].astype(int)
@@ -2539,6 +2566,9 @@ def _train_real_ai_brain(force=False):
 def _apply_real_ai_brain(result):
     """Attach model estimates in one batch; never overwrite the 17-agent signal."""
     result = result.copy()
+    # Clear any error text left by a previous failed prediction run.
+    if "AI Prediction Error" in result.columns:
+        result = result.drop(columns=["AI Prediction Error"])
     defaults = {
         "AI Direction": "NOT TRAINED", "AI Up Probability %": None,
         "AI Down Probability %": None, "AI Sideways Probability %": None,
@@ -2597,8 +2627,6 @@ def _apply_real_ai_brain(result):
         result["AI Brain Signal"] = "WATCH — AI PREDICTION ERROR"
         result["AI Prediction Error"] = str(exc)[:160]
     return result
-
-
 
 
 def _build_excel(result, stamp):
@@ -2676,7 +2704,8 @@ def _build_excel(result, stamp):
             chart.height, chart.width = 7, 12
             chart.add_data(Reference(ws, min_col=2, min_row=4, max_row=10), titles_from_data=False)
             chart.set_categories(Reference(ws, min_col=1, min_row=4, max_row=10))
-            ws.add_chart(chart, "D3")
+            # Anchored to the right of the top-stocks table (columns A-M) so it never covers it.
+            ws.add_chart(chart, "O2")
 
             report = wb["AI Scanner"]
             report.freeze_panes = "A2"
@@ -2942,8 +2971,6 @@ def show_ai_multi_agent_scanner(client=None):
         st.warning("Scan paused safely. Completed batches are saved; press RESUME / CONTINUE SCAN to continue.")
     elif job and job["status"] == "RUNNING":
         st.info("NSE/F&O scan is running in the background. You can minimize the browser; the local Python worker continues.")
-    elif job and job["status"] == "DONE" and already_finalized:
-        st.success("Latest scan is already processed. Existing report and Excel downloads are available below.")
 
     if run_scan_now:
         saved_job = _scan_job_get(job_id)
@@ -2971,14 +2998,12 @@ def show_ai_multi_agent_scanner(client=None):
         # A browser refresh restores technical rows from SQLite. Do not repeat
         # optional external calls (Yahoo news / FYERS depth) during that restore.
         if restored_from_db:
-            default = {
-                "direction": "NOT FETCHED ON RESTORE",
-                "score": 0,
-                "reason": "Restored from SQLite; external news call intentionally skipped",
-            }
             result["News Agent"] = "NOT FETCHED ON RESTORE" if news_enabled else "DISABLED"
             result["News Score"] = 0
-            result["News Reason"] = default["reason"] if news_enabled else "News disabled"
+            result["News Reason"] = (
+                "Restored from SQLite; external news call intentionally skipped"
+                if news_enabled else "News disabled"
+            )
 
             depth_candidates = result[result["Final Signal"].isin(
                 ["BUY", "SELL", "PRE-BIG BUY", "PRE-BIG SELL"]
@@ -3045,12 +3070,15 @@ def show_ai_multi_agent_scanner(client=None):
         except Exception as memory_exc:
             st.warning(f"SQLite scan history save issue: {memory_exc}")
         csv_bytes = result.to_csv(index=False).encode("utf-8-sig")
-        xlsx_bytes, xlsx_error = _build_excel(result, stamp)
 
         st.session_state["multi_agent_results"] = result
         st.session_state["multi_agent_csv"] = csv_bytes
-        st.session_state["multi_agent_xlsx"] = xlsx_bytes
-        st.session_state["multi_agent_xlsx_error"] = xlsx_error
+        # The Excel workbook is built once, in the AI block below, after the AI
+        # columns are applied. Clearing the signatures forces that single build.
+        st.session_state["multi_agent_xlsx"] = None
+        st.session_state["multi_agent_xlsx_error"] = ""
+        st.session_state.pop("ma_ai_export_signature", None)
+        st.session_state.pop("ma_ai_apply_sig", None)
         st.session_state["multi_agent_scan_info"] = {
             "universe": universe, "source_symbols": len(symbols),
             "unique_tickers": len(unique_items), "batches": len(batches),
