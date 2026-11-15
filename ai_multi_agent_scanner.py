@@ -1,6 +1,6 @@
 """
-AI Multi-Agent Scanner for NSE AI PRO V17
-Yahoo Finance batch edition — revised (audit round 4).
+AI Multi-Agent Scanner for NSE AI PRO V18 — ADVANCED BIG MOVEMENT
+Yahoo Finance batch edition — advanced movement + false-breakout audit.
 
 - scanner.py only supplies the NSE / F&O symbol universe; this module combines both loaders without modifying scanner.py.
 - Yahoo Finance supplies all OHLCV candles and technical-analysis data.
@@ -9,6 +9,9 @@ Yahoo Finance batch edition — revised (audit round 4).
 - 17 OHLCV rule-based agents on completed 5M, 15M and 1H candles.
 - Directional UP/DOWN early pre-move watch using completed 5M candles + 15M alignment.
 - Separate 20-candle 1M compression / volume buildup / breakout detector.
+- Advanced Big Movement module: compression, directional pressure, breakout failure risk, retest and continuation context.
+- 5M PRE-BIG requires at least 13 completed candles in the current NSE session (12-bar base + completed trigger candle).
+- AI model vote fractions are labelled MODEL ESTIMATES, never probabilities without calibrated out-of-sample trade backtesting.
 - Optional Yahoo headline context for the strongest technical shortlist.
 - Compatible entry point: show_ai_multi_agent_scanner(client=None)
 
@@ -46,6 +49,14 @@ except Exception:
 IST = ZoneInfo("Asia/Kolkata")
 SESSION_OPEN = pd.Timedelta(hours=9, minutes=15)
 SESSION_CLOSE = pd.Timedelta(hours=15, minutes=30)
+# NSE 2026 equity holidays. Update this set when NSE publishes each new calendar.
+# Source: NSE India - Market Timings & Holidays (2026 Equities calendar).
+NSE_HOLIDAYS = {
+    "2026-01-15", "2026-01-26", "2026-03-03", "2026-03-26",
+    "2026-03-31", "2026-04-03", "2026-04-14", "2026-05-01",
+    "2026-05-28", "2026-06-26", "2026-09-14", "2026-10-02",
+    "2026-10-20", "2026-11-10", "2026-11-24", "2026-12-25",
+}
 
 INDEX_NAMES = {
     "NIFTY", "NIFTY50", "BANKNIFTY", "NIFTYBANK", "FINNIFTY",
@@ -90,12 +101,15 @@ def _ttl_cache_get(key, ttl_seconds):
             _TTL_CACHE.pop(key, None)
             return None
         _TTL_CACHE.move_to_end(key)
-        return copy.deepcopy(value)
+        return value.copy(deep=True) if isinstance(value, pd.DataFrame) else copy.deepcopy(value)
 
 
 def _ttl_cache_set(key, value):
     with _TTL_CACHE_LOCK:
-        _TTL_CACHE[key] = (time.time(), copy.deepcopy(value))
+        # DataFrame cache entries are not mutated by consumers; each read returns
+        # an isolated deep copy. Avoid an extra full-frame copy while inserting.
+        stored = value.copy(deep=False) if isinstance(value, pd.DataFrame) else copy.deepcopy(value)
+        _TTL_CACHE[key] = (time.time(), stored)
         _TTL_CACHE.move_to_end(key)
         while len(_TTL_CACHE) > _TTL_CACHE_MAX_ITEMS:
             _TTL_CACHE.popitem(last=False)
@@ -286,9 +300,15 @@ def _memory_stats():
 
 
 def _is_market_hours(now=None):
+    """NSE regular-session clock, excluding weekends and configured holidays."""
     now = now or datetime.now(IST)
-    return now.weekday() < 5 and (now.hour, now.minute) >= (9, 15) and (now.hour, now.minute) < (15, 30)
-
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=IST)
+    else:
+        now = now.astimezone(IST)
+    if now.weekday() >= 5 or now.strftime("%Y-%m-%d") in NSE_HOLIDAYS:
+        return False
+    return (now.hour, now.minute) >= (9, 15) and (now.hour, now.minute) < (15, 30)
 
 def _stretch():
     try:
@@ -461,13 +481,19 @@ def _download_yahoo_batch_cached(tickers_tuple, interval, period):
 
 
 def _yahoo_is_healthy():
-    """True when Yahoo answers for a liquid reference ticker (distinguishes dead symbols from an outage)."""
+    """Probe Yahoo directly; deliberately bypass the normal 180-second batch cache."""
+    if yf is None:
+        return False
     try:
-        _download_yahoo_batch_cached(("RELIANCE.NS",), "5m", "5d")
-        return True
+        with _YF_LOCK:
+            data = yf.download(
+                "RELIANCE.NS", period="5d", interval="5m",
+                auto_adjust=False, actions=False, progress=False,
+                threads=False, timeout=10,
+            )
+        return isinstance(data, pd.DataFrame) and not data.empty
     except Exception:
         return False
-
 
 def _extract_one_ticker(batch_df, ticker):
     if batch_df is None or batch_df.empty:
@@ -584,9 +610,15 @@ def _breakout_breakdown_signal(df, lookback=20):
     """Require a completed candle close beyond the previous range with participation."""
     empty = {"Breakout Signal": "WAIT", "Breakout Level": None,
              "Breakdown Level": None, "Breakout Reason": "Insufficient completed candles"}
-    if df is None or not isinstance(df, pd.DataFrame) or len(df) < lookback + 21:
+    required = {"Open", "High", "Low", "Close", "Volume"}
+    if (df is None or not isinstance(df, pd.DataFrame)
+            or not required.issubset(df.columns)
+            or not isinstance(lookback, int) or lookback < 2
+            or len(df) < lookback + 1):
         return empty
-    d = df.tail(lookback + 21).reset_index(drop=True)
+    # Exactly `lookback` completed candles form the reference range and the
+    # latest completed candle is the trigger: lookback + 1 bars in total.
+    d = df.tail(lookback + 1).reset_index(drop=True)
     base, last = d.iloc[-(lookback+1):-1], d.iloc[-1]
     resistance, support = _safe_num(base["High"].max(), np.nan), _safe_num(base["Low"].min(), np.nan)
     o, h, l, c = (_safe_num(last[k]) for k in ("Open", "High", "Low", "Close"))
@@ -625,36 +657,67 @@ def _multi_tf_breakout(frames):
 
 
 def _breakout_retest_confirmation(df, direction, lookback=20, scan=6, tol=0.003):
-    """Find a recent breakout against its own prior rolling range, then a later retest."""
-    required = {"Time", "High", "Low", "Close"}
-    if df is None or not isinstance(df, pd.DataFrame) or not required.issubset(df.columns):
+    """Confirm a retest only when price tests the level zone and closes on its valid side."""
+    required = {"Time", "Open", "High", "Low", "Close", "Volume"}
+    if (df is None or not isinstance(df, pd.DataFrame)
+            or not required.issubset(df.columns)
+            or not isinstance(lookback, int) or lookback < 2
+            or not isinstance(scan, int) or scan < 1
+            or not np.isfinite(tol) or tol < 0):
         return "WAIT — NO RETEST DATA"
-    d = df.sort_values("Time").drop_duplicates("Time", keep="last").reset_index(drop=True)
-    n = len(d)
-    if n < lookback + scan + 2:
-        return "WAIT — NO RETEST DATA"
-    hi = pd.to_numeric(d["High"], errors="coerce")
-    lo = pd.to_numeric(d["Low"], errors="coerce")
-    cl = pd.to_numeric(d["Close"], errors="coerce")
-    for k in range(n - 2, max(lookback - 1, n - scan - 2) - 1, -1):
-        up_level = float(hi.iloc[k-lookback:k].max())
-        down_level = float(lo.iloc[k-lookback:k].min())
-        after = d.iloc[k+1:]
-        candle = d.iloc[k]
-        span = max(float(candle["High"])-float(candle["Low"]), 1e-9)
-        body_ratio = abs(float(candle["Close"])-float(candle["Open"])) / span
-        prior_vol = pd.to_numeric(d["Volume"].iloc[k-lookback:k], errors="coerce").mean() if "Volume" in d.columns else 0.0
-        breakout_rvol = float(candle["Volume"])/prior_vol if prior_vol and prior_vol > 0 else 0.0
-        strong_break = body_ratio >= 0.55 and breakout_rvol >= 1.5
-        if direction == "UP" and cl.iloc[k] > up_level and strong_break:
-            touched = (pd.to_numeric(after["Low"], errors="coerce") <= up_level * (1 + tol)).any()
-            held = bool(cl.iloc[-1] > up_level)
-            return "RETEST HELD" if touched and held else "WAIT — RETEST NOT CONFIRMED"
-        if direction == "DOWN" and cl.iloc[k] < down_level and strong_break:
-            touched = (pd.to_numeric(after["High"], errors="coerce") >= down_level * (1 - tol)).any()
-            held = bool(cl.iloc[-1] < down_level)
-            return "RETEST REJECTED" if touched and held else "WAIT — RETEST NOT CONFIRMED"
-    return "WAIT — NO RECENT BREAKOUT"
+    if direction not in ("UP", "DOWN"):
+        return "WAIT — INVALID DIRECTION"
+    try:
+        d = df.sort_values("Time").drop_duplicates("Time", keep="last").reset_index(drop=True)
+        n = len(d)
+        if n < lookback + 2:
+            return "WAIT — NO RETEST DATA"
+        for col in ("Open", "High", "Low", "Close", "Volume"):
+            d[col] = pd.to_numeric(d[col], errors="coerce")
+        d = d.dropna(subset=["Open", "High", "Low", "Close", "Volume"]).reset_index(drop=True)
+        n = len(d)
+        if n < lookback + 2:
+            return "WAIT — NO RETEST DATA"
+
+        first_k = max(lookback, n - scan - 2)
+        for k in range(n - 2, first_k - 1, -1):
+            prior = d.iloc[k-lookback:k]
+            candle = d.iloc[k]
+            after = d.iloc[k+1:]
+            if after.empty:
+                continue
+            up_level = float(prior["High"].max())
+            down_level = float(prior["Low"].min())
+            span = max(float(candle["High"])-float(candle["Low"]), 1e-9)
+            body_ratio = abs(float(candle["Close"])-float(candle["Open"])) / span
+            prior_vol = float(prior["Volume"].mean())
+            breakout_rvol = float(candle["Volume"])/prior_vol if prior_vol > 0 else 0.0
+            strong_break = body_ratio >= 0.55 and breakout_rvol >= 1.5
+
+            if direction == "UP" and float(candle["Close"]) > up_level and strong_break:
+                # The retest low must stay within the tolerance band around
+                # resistance; a deep loss of the level is not a successful retest.
+                touched = (
+                    (after["Low"] <= up_level * (1 + tol))
+                    & (after["Low"] >= up_level * (1 - tol))
+                    & (after["Close"] > up_level)
+                ).any()
+                held = float(d["Close"].iloc[-1]) > up_level
+                return "RETEST HELD" if touched and held else "WAIT — RETEST NOT CONFIRMED"
+
+            if direction == "DOWN" and float(candle["Close"]) < down_level and strong_break:
+                # The retest high must stay within the tolerance band around
+                # support; a strong reclaim above support invalidates rejection.
+                touched = (
+                    (after["High"] >= down_level * (1 - tol))
+                    & (after["High"] <= down_level * (1 + tol))
+                    & (after["Close"] < down_level)
+                ).any()
+                held = float(d["Close"].iloc[-1]) < down_level
+                return "RETEST REJECTED" if touched and held else "WAIT — RETEST NOT CONFIRMED"
+        return "WAIT — NO RECENT BREAKOUT"
+    except Exception:
+        return "WAIT — RETEST DATA ERROR"
 
 
 def _last_session_close(now=None, minutes=None):
@@ -666,14 +729,14 @@ def _last_session_close(now=None, minutes=None):
         day -= pd.Timedelta(days=now.weekday() - 4)
     elif now.time() < pd.Timestamp("09:15").time():
         day -= pd.Timedelta(days=1)
-    while day.weekday() >= 5:
+    while day.weekday() >= 5 or day.strftime("%Y-%m-%d") in NSE_HOLIDAYS:
         day -= pd.Timedelta(days=1)
     expected_close = pd.Timedelta(hours=15, minutes=15) if minutes == 60 else SESSION_CLOSE
     return day + expected_close
 
 
 def _cached_candles_are_fresh(frame, minutes, now=None):
-    """Avoid Yahoo calls only when SQLite contains the latest expected completed bar."""
+    """Use cached bars until the next interval could have completed; tolerate Yahoo delay."""
     if frame is None or frame.empty or "Time" not in frame.columns:
         return False
     now = pd.Timestamp(now if now is not None else pd.Timestamp.now(tz=IST))
@@ -684,22 +747,20 @@ def _cached_candles_are_fresh(frame, minutes, now=None):
         close_time = (last.normalize() + SESSION_CLOSE
                       if minutes == 60 and last.hour == 15 and last.minute == 15
                       else last + pd.Timedelta(minutes=minutes))
-        # Before the first completed 1H candle today, avoid repeated fetches only
-        # if cache already reaches the previous expected trading session close.
+        # During the opening interval, no new completed candle exists yet.
+        open_time = now.normalize() + pd.Timedelta(hours=9, minutes=15)
+        if open_time <= now < open_time + pd.Timedelta(minutes=minutes):
+            previous_close = _last_session_close(now.normalize() + pd.Timedelta(hours=9), minutes=minutes)
+            return close_time >= previous_close - pd.Timedelta(minutes=1)
         if minutes == 60 and pd.Timestamp("09:15").time() <= now.time() < pd.Timestamp("10:15").time():
-            previous_close = _last_session_close(
-                now.normalize() + pd.Timedelta(hours=9), minutes=60
-            )
+            previous_close = _last_session_close(now.normalize() + pd.Timedelta(hours=9), minutes=60)
             return close_time >= previous_close - pd.Timedelta(minutes=1)
         if not _is_market_hours(now.to_pydatetime()):
-            # At/after close and on weekends, cached data must reach the most
-            # recent expected session close, not merely have today's date.
             return close_time >= (_last_session_close(now, minutes=minutes) - pd.Timedelta(minutes=1))
         age = (now - close_time).total_seconds() / 60.0
-        return -1.0 <= age < float(minutes)
+        return -1.0 <= age < float(minutes) + 2.0
     except Exception:
         return False
-
 
 def _run_17_agents(df, timeframe=None):
     """17 deterministic OHLCV rule engines; scores are not probabilities."""
@@ -952,24 +1013,26 @@ def _run_17_agents(df, timeframe=None):
 # Verb forms are listed explicitly (jumps/jumped/surges...) because the patterns are
 # wrapped in \b...\b; a bare "jump" would not match "jumps".
 _POSITIVE = [
-    r"profits? (?:rises?|rose|jumps?|jumped|surges?|surged|increases?|increased|up)",
-    r"revenue (?:rises?|rose|jumps?|jumped|surges?|surged|increases?|increased|up)",
-    r"growth (?:accelerates?|improves?|strengthens?)",
-    r"(?:analyst|brokerage) upgrades?",
+    r"profits? (?:rises?|rose|jumps?|jumped|surges?|surged|increases?|increased|up|grow(?:s|ing)?)",
+    r"revenue (?:rises?|rose|jumps?|jumped|surges?|surged|increases?|increased|up|grow(?:s|ing)?)",
+    r"growth (?:accelerates?|improves?|strengthens?|surges?)",
+    r"(?:analyst|brokerage) (?:upgrades?|raises? rating)",
     r"upgraded to (?:buy|overweight|outperform)",
     r"order wins?", r"regulatory approval", r"record (?:profit|revenue|orders?|highs?)",
     r"share buyback", r"dividend (?:increase|hike|announced)", r"strong results",
-    r"beats? (?:market|street|analyst) estimates",
+    r"beats? (?:market|street|analyst|estimates?|expectations?)",
+    r"debt reduced", r"margin expansion", r"capacity expansion", r"positive outlook",
 ]
 _NEGATIVE = [
     r"net loss(?:es)?",
-    r"profits? (?:falls?|fell|declines?|declined|drops?|dropped|down)",
-    r"revenue (?:falls?|fell|declines?|declined|drops?|dropped|down)",
+    r"profits? (?:falls?|fell|declines?|declined|drops?|dropped|down|slumps?)",
+    r"revenue (?:falls?|fell|declines?|declined|drops?|dropped|down|slumps?)",
     r"downgrad(?:e|ed|es)",
     r"fraud", r"default(?:s|ed)?", r"(?:regulatory|investigation) probe",
     r"ban(?:s|ned)?", r"penalt(?:y|ies)", r"resignation", r"weak results",
-    r"misses? (?:market|street|analyst) estimates",
-    r"debt (?:default|restructuring|crisis)",
+    r"misses? (?:market|street|analyst|estimates?|expectations?)",
+    r"debt (?:default|restructuring|crisis)", r"guidance cut", r"margin contraction",
+    r"promoter pledge", r"insolvency", r"accounting irregularit(?:y|ies)",
 ]
 _POS_RE = [re.compile(r"\b" + p + r"\b") for p in _POSITIVE]
 _NEG_RE = [re.compile(r"\b" + p + r"\b") for p in _NEGATIVE]
@@ -1017,8 +1080,16 @@ def _news_agent(yahoo_symbol):
     now = pd.Timestamp.now(tz="UTC")
     total, ages, titles = 0, [], []
     for item in items:
-        headline = item["title"].lower()
-        score = sum(bool(p.search(headline)) for p in _POS_RE) - sum(bool(p.search(headline)) for p in _NEG_RE)
+        # Normalize Yahoo headline punctuation/HTML before phrase matching. Keep
+        # phrase boundaries so e.g. "upgrade" does not match "downgrade".
+        headline = str(item.get("title", "")).lower()
+        headline = re.sub(r"<[^>]+>", " ", headline)
+        headline = re.sub(r"&(?:amp|nbsp|quot);", " ", headline)
+        headline = re.sub(r"[^a-z0-9%+.-]+", " ", headline)
+        headline = re.sub(r"\s+", " ", headline).strip()
+        positive_hits = sum(bool(p.search(headline)) for p in _POS_RE)
+        negative_hits = sum(bool(p.search(headline)) for p in _NEG_RE)
+        score = positive_hits - negative_hits
         published = item.get("published")
         age = None
         if published is not None and not pd.isna(published):
@@ -1058,57 +1129,67 @@ def _analyse_timeframe(df, timeframe=None):
 
 
 def _prebig_5m_analysis(df):
-    """Find 5M compression + rising volume before a move; never label a watch as confirmed."""
+    """5M same-session compression + volume watch; requires 13 completed candles today."""
     empty = {
         "PRE-BIG Status": "NO DATA", "PRE-BIG Direction": "WAIT",
         "PRE-BIG Score": 0, "PRE-BIG Candles": 0,
         "PRE-BIG Range High": None, "PRE-BIG Range Low": None,
         "PRE-BIG Range Width %": None, "PRE-BIG Volume Build %": None,
         "PRE-BIG RVOL": None, "PRE-BIG Trigger": None,
-        "PRE-BIG Reason": "Need at least 25 completed 5M candles",
+        "PRE-BIG Reason": "Need at least 13 completed 5M candles today",
     }
-    if df is None or not isinstance(df, pd.DataFrame) or len(df) < 25:
+    required = {"Time", "Open", "High", "Low", "Close", "Volume"}
+    if df is None or not isinstance(df, pd.DataFrame) or not required.issubset(df.columns):
         return empty
     full = df.sort_values("Time").drop_duplicates("Time", keep="last").reset_index(drop=True)
+    if full.empty:
+        return empty
     latest_day = pd.Timestamp(full["Time"].iloc[-1]).date()
-    same_session = full[pd.to_datetime(full["Time"]).dt.date == latest_day]
-    # The 12-candle base + the trigger candle must all be from today, so an
-    # overnight gap candle cannot masquerade as a breakout from yesterday's range.
-    if len(same_session) < 13:
+    same_session = full[pd.to_datetime(full["Time"]).dt.date == latest_day].reset_index(drop=True)
+    candle_count = len(same_session)
+    if candle_count < 13:
         warm = empty.copy()
         warm["PRE-BIG Status"] = "WAIT — SESSION WARM-UP"
-        warm["PRE-BIG Reason"] = f"Need 13 same-session 5M candles; have {len(same_session)}"
-        warm["PRE-BIG Candles"] = len(same_session)
+        warm["PRE-BIG Reason"] = f"Need 13 same-session 5M candles; have {candle_count}"
+        warm["PRE-BIG Candles"] = candle_count
         return warm
-    # The "prior" comparison window may use late candles from the previous session; VWAP is current-session only.
+
     session_vwap = _vwap_last_session(same_session)
-    d = full.tail(25).reset_index(drop=True)
-    prior = d.iloc[-25:-13]       # 12 candles before the compression window
-    base = d.iloc[-13:-1]         # latest 12 completed candles; latest candle is trigger test
-    last = d.iloc[-1]
-    if len(prior) < 12 or len(base) < 12:
-        return empty
+    base = same_session.iloc[-13:-1].copy()  # 12 same-day base candles
+    last = same_session.iloc[-1]
     hi = _safe_num(base["High"].max(), np.nan)
     lo = _safe_num(base["Low"].min(), np.nan)
-    prev_width = _safe_num(prior["High"].max() - prior["Low"].min(), 0.0)
     width = hi - lo
     close = _safe_num(last["Close"], np.nan)
     if not np.isfinite(hi) or not np.isfinite(lo) or width <= 0 or close <= 0:
         return empty
     width_pct = width / close * 100.0
-    compression = prev_width > 0 and width <= prev_width * 0.70
-    # Compare last 3 candles in the 12-candle base with the earlier 9 candles.
+
+    # Compare only with today's earlier candles. Before 25 same-session bars,
+    # use a volatility-aware absolute compression cap instead of yesterday's range.
+    if candle_count >= 25:
+        prior = same_session.iloc[-25:-13]
+        prior_width = _safe_num(prior["High"].max() - prior["Low"].min(), 0.0)
+        compression = prior_width > 0 and width <= prior_width * 0.70
+        compression_reason = "same-session relative contraction"
+    else:
+        h = same_session["High"].astype(float)
+        l = same_session["Low"].astype(float)
+        c = same_session["Close"].astype(float)
+        prev_c = c.shift(1)
+        tr = pd.concat([(h-l), (h-prev_c).abs(), (l-prev_c).abs()], axis=1).max(axis=1)
+        atr5 = _safe_num(tr.tail(14).mean(), 0.0)
+        compression = width_pct <= 0.8 or (atr5 > 0 and width <= 2.5 * atr5)
+        compression_reason = f"absolute early-session cap (width {width_pct:.2f}%, ATR5 {atr5:.3f})"
+
     vol_early = _safe_num(base["Volume"].iloc[:9].mean(), 0.0)
     vol_recent = _safe_num(base["Volume"].iloc[-3:].mean(), 0.0)
     volume_build = vol_recent / vol_early if vol_early > 0 else 0.0
-    avg20 = _safe_num(d.iloc[:-1]["Volume"].tail(20).mean(), 0.0)
+    avg20 = _safe_num(same_session.iloc[:-1]["Volume"].tail(20).mean(), 0.0)
     last_vol = _safe_num(last["Volume"], 0.0)
     rvol = last_vol / avg20 if avg20 > 0 else 0.0
     base_close = _safe_num(base["Close"].iloc[-1], close)
-    try:
-        vwap = _safe_num(session_vwap, np.nan)
-    except Exception:
-        vwap = np.nan
+    vwap = _safe_num(session_vwap, np.nan)
     recent_lows = base["Low"].astype(float).tail(4).to_numpy()
     recent_highs = base["High"].astype(float).tail(4).to_numpy()
     higher_lows = len(recent_lows) >= 3 and recent_lows[-1] >= recent_lows[0]
@@ -1117,37 +1198,38 @@ def _prebig_5m_analysis(df):
     lower_zone = base_close <= lo + width * 0.35
     vwap_bull = np.isfinite(vwap) and base_close >= vwap
     vwap_bear = np.isfinite(vwap) and base_close <= vwap
-    # Latest completed candle can independently confirm a range break.
     o, h, l, c = (_safe_num(last[k]) for k in ("Open", "High", "Low", "Close"))
     span = max(h-l, 1e-9)
     body = abs(c-o) / span
     close_loc = (c-l) / span
     breakout_up = c > hi and c > o and body >= 0.55 and close_loc >= 0.75 and rvol >= 1.5
     breakout_dn = c < lo and c < o and body >= 0.55 and close_loc <= 0.25 and rvol >= 1.5
-    score = 0
-    score += 30 if compression else 0
+    score = 30 if compression else 0
     score += 25 if volume_build >= 1.30 else 15 if volume_build >= 1.15 else 0
     score += 20 if rvol >= 1.50 else 10 if rvol >= 1.20 else 0
     bull_points = int(upper_zone) + int(higher_lows) + int(vwap_bull)
     bear_points = int(lower_zone) + int(lower_highs) + int(vwap_bear)
     score += 25 if max(bull_points, bear_points) >= 2 else 10 if max(bull_points, bear_points) == 1 else 0
-    if breakout_up:
-        status, direction, reason = "BULLISH BREAKOUT CONFIRMED", "UP", "Completed 5M close above compressed range with strong body and RVOL"
-        trigger = round(hi, 2)
-        score = max(score, 85)
-    elif breakout_dn:
-        status, direction, reason = "BEARISH BREAKDOWN CONFIRMED", "DOWN", "Completed 5M close below compressed range with strong body and RVOL"
-        trigger = round(lo, 2)
-        score = max(score, 85)
+
+    # Do not call an already-escaped price a PRE-BIG watch.
+    if c > hi or c < lo:
+        if breakout_up:
+            status, direction, reason, trigger = "BULLISH BREAKOUT CONFIRMED", "UP", "Completed 5M close above compressed range with strong body and RVOL", round(hi, 2)
+            score = max(score, 85)
+        elif breakout_dn:
+            status, direction, reason, trigger = "BEARISH BREAKDOWN CONFIRMED", "DOWN", "Completed 5M close below compressed range with strong body and RVOL", round(lo, 2)
+            score = max(score, 85)
+        else:
+            status, direction, reason, trigger = "MOVE ALREADY STARTED — NO PRE-BIG WATCH", "WAIT", "Latest completed close is outside the base range but lacks breakout confirmation", None
     elif compression and volume_build >= 1.30 and rvol >= 1.20 and bull_points >= 2:
-        status, direction, reason, trigger = "PRE-BIG BULLISH WATCH", "UP", "12-candle compression + rising volume + bullish location/structure; breakout not yet confirmed", round(hi, 2)
+        status, direction, reason, trigger = "PRE-BIG BULLISH WATCH", "UP", f"12-bar same-session compression + rising volume + bullish alignment; {compression_reason}", round(hi, 2)
     elif compression and volume_build >= 1.30 and rvol >= 1.20 and bear_points >= 2:
-        status, direction, reason, trigger = "PRE-BIG BEARISH WATCH", "DOWN", "12-candle compression + rising volume + bearish location/structure; breakdown not yet confirmed", round(lo, 2)
+        status, direction, reason, trigger = "PRE-BIG BEARISH WATCH", "DOWN", f"12-bar same-session compression + rising volume + bearish alignment; {compression_reason}", round(lo, 2)
     else:
-        status, direction, reason, trigger = "WAIT", "WAIT", "Compression, volume and directional conditions are not aligned", None
+        status, direction, reason, trigger = "WAIT", "WAIT", f"Compression, volume and directional conditions are not aligned; {compression_reason}", None
     return {
         "PRE-BIG Status": status, "PRE-BIG Direction": direction,
-        "PRE-BIG Score": int(min(100, score)), "PRE-BIG Candles": 12,
+        "PRE-BIG Score": int(min(100, score)), "PRE-BIG Candles": candle_count,
         "PRE-BIG Range High": round(hi, 2), "PRE-BIG Range Low": round(lo, 2),
         "PRE-BIG Range Width %": round(width_pct, 3),
         "PRE-BIG Volume Build %": round((volume_build-1)*100, 1),
@@ -1155,6 +1237,123 @@ def _prebig_5m_analysis(df):
         "PRE-BIG Reason": reason,
     }
 
+def _advanced_big_movement_analysis(frame_5m, frame_15m=None, frame_1h=None):
+    """Rule-based big-move context; screening score is not probability."""
+    empty = {
+        "Advanced Big Move": "WAIT", "Big Move Direction": "WAIT",
+        "Big Move Score": 0, "False Breakout Risk": "UNKNOWN",
+        "Breakout Retest Status": "NOT TESTED", "Momentum Continuation": "UNKNOWN",
+        "Big Move Range High": None, "Big Move Range Low": None,
+        "Big Move RVOL": None, "Big Move Reason": "Insufficient completed 5M candles",
+    }
+    required = {"Time", "Open", "High", "Low", "Close", "Volume"}
+    if frame_5m is None or not isinstance(frame_5m, pd.DataFrame) or not required.issubset(frame_5m.columns):
+        return empty
+    try:
+        d = frame_5m.sort_values("Time").drop_duplicates("Time", keep="last").reset_index(drop=True)
+        if d.empty:
+            return empty
+        today = pd.Timestamp(d["Time"].iloc[-1]).date()
+        session = d[pd.to_datetime(d["Time"]).dt.date == today].reset_index(drop=True)
+        if len(session) < 13:
+            out = empty.copy()
+            out["Advanced Big Move"] = "WAIT — SESSION WARM-UP"
+            out["Big Move Reason"] = f"Need 13 completed 5M candles today; have {len(session)}"
+            return out
+        base = session.iloc[-13:-1]
+        last = session.iloc[-1]
+        hi, lo = float(base["High"].astype(float).max()), float(base["Low"].astype(float).min())
+        close, opn = float(last["Close"]), float(last["Open"])
+        high, low = float(last["High"]), float(last["Low"])
+        if close <= 0 or hi <= lo:
+            return empty
+        vol_early = float(base["Volume"].astype(float).iloc[:9].mean())
+        vol_recent = float(base["Volume"].astype(float).iloc[-3:].mean())
+        rvol_base = float(last["Volume"]) / max(float(session["Volume"].iloc[:-1].tail(20).mean()), 1e-9)
+        volume_build = vol_recent / max(vol_early, 1e-9)
+        width_pct = (hi-lo) / close * 100.0
+        if len(session) >= 25:
+            prior = session.iloc[-25:-13]
+            prior_width = float(prior["High"].max()-prior["Low"].min()) if len(prior) else 0.0
+            compressed = prior_width > 0 and (hi-lo) <= prior_width * 0.75
+            compression_reason = "same-session relative contraction"
+        else:
+            h_s, l_s, c_s = session["High"].astype(float), session["Low"].astype(float), session["Close"].astype(float)
+            prev_c = c_s.shift(1)
+            tr = pd.concat([(h_s-l_s), (h_s-prev_c).abs(), (l_s-prev_c).abs()], axis=1).max(axis=1)
+            atr5 = _safe_num(tr.tail(14).mean(), 0.0)
+            compressed = width_pct <= 0.8 or (atr5 > 0 and (hi-lo) <= 2.5*atr5)
+            compression_reason = f"absolute early-session cap (width {width_pct:.2f}%, ATR5 {atr5:.3f})"
+        span = max(high-low, 1e-9)
+        body_ratio = abs(close-opn)/span
+        close_location = (close-low)/span
+        broke_up, broke_down = close > hi, close < lo
+        prev = session.iloc[-2] if len(session) >= 2 else None
+        pre = session.iloc[-14:-2] if len(session) >= 14 else None
+        if prev is not None and pre is not None:
+            pre_hi, pre_lo = float(pre["High"].max()), float(pre["Low"].min())
+            failed_up = float(prev["High"]) > pre_hi and close <= pre_hi
+            failed_down = float(prev["Low"]) < pre_lo and close >= pre_lo
+        else:
+            failed_up = failed_down = False
+        weak_up = broke_up and (body_ratio < 0.45 or close_location < 0.65 or rvol_base < 1.25)
+        weak_down = broke_down and (body_ratio < 0.45 or close_location > 0.35 or rvol_base < 1.25)
+        false_risk = "HIGH" if (failed_up or failed_down or weak_up or weak_down) else (
+            "LOW" if broke_up or broke_down else "MEDIUM" if compressed and rvol_base >= 1.2 else "UNKNOWN")
+        ema9 = float(session["Close"].astype(float).ewm(span=9, adjust=False).mean().iloc[-1])
+        ema20 = float(session["Close"].astype(float).ewm(span=20, adjust=False).mean().iloc[-1])
+        up_align = down_align = 0
+        for tf_frame in (frame_15m, frame_1h):
+            if tf_frame is None or not isinstance(tf_frame, pd.DataFrame) or len(tf_frame) < 20 or "Close" not in tf_frame:
+                continue
+            c_tf = tf_frame["Close"].astype(float)
+            e9 = float(c_tf.ewm(span=9, adjust=False).mean().iloc[-1])
+            e20 = float(c_tf.ewm(span=20, adjust=False).mean().iloc[-1])
+            up_align += int(float(c_tf.iloc[-1]) > e9 > e20)
+            down_align += int(float(c_tf.iloc[-1]) < e9 < e20)
+        up_setup = int(compressed) + int(volume_build >= 1.20) + int(rvol_base >= 1.20) + int(ema9 > ema20) + up_align
+        down_setup = int(compressed) + int(volume_build >= 1.20) + int(rvol_base >= 1.20) + int(ema9 < ema20) + down_align
+        retest = "NOT TESTED"
+        if broke_up and not weak_up:
+            status, direction, reason = "BREAKOUT CONFIRMED", "UP", "Completed 5M close above base range with candle/volume confirmation"
+            retest = "AWAITING RETEST"
+        elif broke_down and not weak_down:
+            status, direction, reason = "BREAKDOWN CONFIRMED", "DOWN", "Completed 5M close below base range with candle/volume confirmation"
+            retest = "AWAITING RETEST"
+        elif failed_up:
+            status, direction, reason, retest = "FALSE BREAKOUT RISK", "DOWN", "Price pierced range high but latest completed candle closed back inside", "FAILED UPSIDE BREAK"
+        elif failed_down:
+            status, direction, reason, retest = "FALSE BREAKOUT RISK", "UP", "Price pierced range low but latest completed candle closed back inside", "FAILED DOWNSIDE BREAK"
+        elif weak_up or weak_down:
+            status = "FALSE BREAKOUT RISK"
+            direction = "WAIT"
+            reason = "Price closed outside range but breakout candle/volume confirmation is weak"
+            retest = "AWAITING RETEST"
+        elif compressed and max(up_setup, down_setup) >= 4:
+            direction = "UP" if up_setup > down_setup else "DOWN" if down_setup > up_setup else "WAIT"
+            status = "PRE-BIG WATCH" if direction != "WAIT" else "WAIT"
+            reason = "Compression + volume activity + EMA/multi-timeframe alignment; breakout not yet confirmed"
+        else:
+            status, direction, reason = "WAIT", "WAIT", "No strong compression/volume/trend confluence"
+        score = min(100, int(max(up_setup, down_setup) / 6 * 100))
+        if status in ("BREAKOUT CONFIRMED", "BREAKDOWN CONFIRMED"):
+            score = max(score, 80)
+        if false_risk == "HIGH":
+            score = min(score, 55)
+        continuation = "BULLISH" if direction == "UP" and ema9 > ema20 and up_align >= 1 else (
+            "BEARISH" if direction == "DOWN" and ema9 < ema20 and down_align >= 1 else "NOT CONFIRMED")
+        return {
+            "Advanced Big Move": status, "Big Move Direction": direction,
+            "Big Move Score": score, "False Breakout Risk": false_risk,
+            "Breakout Retest Status": retest, "Momentum Continuation": continuation,
+            "Big Move Range High": round(hi, 2), "Big Move Range Low": round(lo, 2),
+            "Big Move RVOL": round(rvol_base, 2),
+            "Big Move Reason": f"{reason}; volume build {volume_build:.2f}x; range {width_pct:.2f}%; {compression_reason}",
+        }
+    except Exception as exc:
+        out = empty.copy()
+        out["Big Move Reason"] = f"Advanced analysis error: {str(exc)[:160]}"
+        return out
 
 def _directional_pre_move_engine(df):
     """Early UP/DOWN watch from completed 5M candles; not a guaranteed signal."""
@@ -1163,10 +1362,10 @@ def _directional_pre_move_engine(df):
         "UP Pre-Move Score": 0, "DOWN Pre-Move Score": 0,
         "Pre-Move Volume Build %": None, "Pre-Move Compression": "UNKNOWN",
         "Pre-Move 15M Alignment": "UNKNOWN",
-        "Pre-Move Reason": "Need at least 26 completed 5M candles",
+        "Pre-Move Reason": "Need at least 13 completed 5M candles today",
     }
     required = {"Time", "Open", "High", "Low", "Close", "Volume"}
-    if df is None or not isinstance(df, pd.DataFrame) or len(df) < 26 or not required.issubset(df.columns):
+    if df is None or not isinstance(df, pd.DataFrame) or len(df) < 13 or not required.issubset(df.columns):
         return empty
     try:
         full = df.sort_values("Time").drop_duplicates("Time", keep="last").reset_index(drop=True)
@@ -1178,19 +1377,25 @@ def _directional_pre_move_engine(df):
             warm["Directional Pre-Move"] = "WAIT — SESSION WARM-UP"
             warm["Pre-Move Reason"] = f"Need 13 same-session 5M candles; have {len(same_session)}"
             return warm
-        # Prior comparison window may use previous-session candles; VWAP never carries overnight.
         session_vwap = _vwap_last_session(same_session)
-        d = full.tail(26).reset_index(drop=True)
-        prior, recent, last = d.iloc[-25:-13], d.iloc[-13:-1], d.iloc[-1]
-        old_width = _safe_num(prior["High"].max() - prior["Low"].min(), 0.0)
+        recent, last = same_session.iloc[-13:-1], same_session.iloc[-1]
+        prior = same_session.iloc[-25:-13] if len(same_session) >= 25 else same_session.iloc[0:0]
+        old_width = _safe_num(prior["High"].max() - prior["Low"].min(), 0.0) if len(prior) else 0.0
         recent_high = _safe_num(recent["High"].max(), 0.0)
         recent_low = _safe_num(recent["Low"].min(), 0.0)
         recent_width = recent_high - recent_low
         close = _safe_num(last["Close"], 0.0)
-        if old_width <= 0 or recent_width <= 0 or close <= 0:
+        if recent_width <= 0 or close <= 0:
             return empty
 
-        compression = recent_width <= old_width * 0.80
+        if len(prior) == 12 and old_width > 0:
+            compression = recent_width <= old_width * 0.80
+        else:
+            hs, ls, cs = same_session["High"].astype(float), same_session["Low"].astype(float), same_session["Close"].astype(float)
+            prev_cs = cs.shift(1)
+            tr = pd.concat([(hs-ls), (hs-prev_cs).abs(), (ls-prev_cs).abs()], axis=1).max(axis=1)
+            atr5 = _safe_num(tr.tail(14).mean(), 0.0)
+            compression = (recent_width / close * 100.0) <= 0.8 or (atr5 > 0 and recent_width <= 2.5 * atr5)
         early_volume = _safe_num(recent["Volume"].iloc[:9].mean(), 0.0)
         recent_volume = _safe_num(recent["Volume"].iloc[-3:].mean(), 0.0)
         volume_build = recent_volume / early_volume if early_volume > 0 else 0.0
@@ -1426,13 +1631,13 @@ def _data_quality_gate(frames, min_candles=30):
                     now_local = pd.Timestamp.now(tz=IST)
                     age_min = max(0.0, (now_local - stamp).total_seconds() / 60.0)
                     since_close = age_min - float(minutes)
-                    allowed = {"5M": 20, "15M": 30, "1H": 80}.get(tf, minutes + 20)
+                    allowed = {"5M": 20, "15M": 30, "1H": 90}.get(tf, minutes + 30)
                     elapsed_from_open = (now_local - (now_local.normalize() + SESSION_OPEN)).total_seconds() / 60.0
                     before_first_bar = (
                         stamp.date() < now_local.date()
                         and 0 <= elapsed_from_open <= (minutes + 15)
                     )
-                    if since_close > allowed and not before_first_bar:
+                    if since_close > (allowed + 0.5) and not before_first_bar:
                         issues.append(f"Latest candle is stale ({since_close:.0f} min since close)")
                 except Exception:
                     issues.append("Could not validate latest candle time")
@@ -1643,6 +1848,7 @@ def _make_result_row(symbol, yahoo_symbol, payload):
             row[feature_name] = None
     row.update(_early_20m_analysis(payload.get("early_1m", pd.DataFrame())))
     row.update(_prebig_5m_analysis(frame_5m))
+    row.update(_advanced_big_movement_analysis(frame_5m, frame_15m, frame_1h))
     row.update(_directional_pre_move_engine(frame_5m))
     pre_direction = row.get("Pre-Move Direction", "WAIT")
     direction_15m = analyses["15M"]["direction"]
@@ -2261,7 +2467,7 @@ def _scan_job_load_rows(job_id):
 
 
 def _scan_job_worker(job_id):
-    """Background scanner. Each finished batch is committed before moving on."""
+    """Background scanner with one retry; never convert a batch exception into dead tickers."""
     job = _scan_job_get(job_id)
     if not job:
         return
@@ -2272,9 +2478,7 @@ def _scan_job_worker(job_id):
     include_early = bool(config.get("include_early", False))
     try:
         with _memory_connect() as conn:
-            done_rows = conn.execute(
-                "SELECT symbol FROM scan_job_rows WHERE job_id=?", (job_id,)
-            ).fetchall()
+            done_rows = conn.execute("SELECT symbol FROM scan_job_rows WHERE job_id=?", (job_id,)).fetchall()
         completed_symbols = {x[0] for x in done_rows}
         pending = [x for x in symbols if x[0] not in completed_symbols]
 
@@ -2283,48 +2487,51 @@ def _scan_job_worker(job_id):
             if not current_job or current_job["status"] == "CANCELLED":
                 return
             batch = pending[start:start + batch_size]
-            batch_exception = False
-            try:
-                batch_rows = _scan_batch(batch, period, include_early=include_early)
-                bad_indices = [i for i, row in enumerate(batch_rows)
-                               if int(row.get("5M Candles", 0) or 0) == 0
-                               and int(row.get("15M Candles", 0) or 0) == 0
-                               and int(row.get("1H Candles", 0) or 0) == 0]
-                if bad_indices:
+            batch_rows = None
+            batch_error = None
+            # First attempt plus one complete retry on exception or zero-candle rows.
+            for attempt in range(2):
+                try:
+                    rows = _scan_batch(batch, period, include_early=include_early)
+                    if not isinstance(rows, list) or len(rows) != len(batch):
+                        raise RuntimeError(f"Yahoo batch returned {len(rows) if isinstance(rows, list) else 'invalid'} rows for {len(batch)} symbols")
+                    batch_rows = rows
+                    bad = [i for i, row in enumerate(batch_rows)
+                           if int(row.get("5M Candles", 0) or 0) == 0
+                           and int(row.get("15M Candles", 0) or 0) == 0
+                           and int(row.get("1H Candles", 0) or 0) == 0]
+                    if not bad or attempt == 1:
+                        break
                     time.sleep(1.0)
-                    retry_rows = _scan_batch([batch[i] for i in bad_indices], period, include_early=include_early)
-                    for i, retry_row in zip(bad_indices, retry_rows):
+                    retry_rows = _scan_batch([batch[i] for i in bad], period, include_early=include_early)
+                    if not isinstance(retry_rows, list) or len(retry_rows) != len(bad):
+                        raise RuntimeError("Yahoo retry returned an incomplete batch")
+                    for i, retry_row in zip(bad, retry_rows):
                         batch_rows[i] = retry_row
+                    break
+                except Exception as exc:
+                    batch_error = exc
+                    if attempt == 0:
+                        time.sleep(1.0)
+                        continue
+            if batch_rows is None:
+                # Keep all symbols unresolved; a true exception is not a delisted ticker.
+                batch_rows = [_no_data_row(sym, ticker, f"Yahoo download failed: {str(batch_error)[:180]}")
+                              for sym, ticker in batch]
+                unresolved_indices = list(range(len(batch)))
+            else:
                 unresolved_indices = [i for i, row in enumerate(batch_rows)
                                       if int(row.get("5M Candles", 0) or 0) == 0
                                       and int(row.get("15M Candles", 0) or 0) == 0
                                       and int(row.get("1H Candles", 0) or 0) == 0]
-            except Exception as exc:
-                batch_exception = True
-                batch_rows = [
-                    _no_data_row(symbol, ticker, f"Batch failed: {str(exc)[:180]}")
-                    for symbol, ticker in batch
-                ]
-                unresolved_indices = list(range(len(batch)))
+                # If any unresolved rows remain, probe Yahoo directly, bypassing TTL cache.
+                # Healthy Yahoo => these are per-symbol misses; unhealthy Yahoo => pause and retry later.
+                if unresolved_indices and _yahoo_is_healthy():
+                    unresolved_indices = []
 
-            # If a user discarded the scan while Yahoo was downloading, do not
-            # persist the in-flight batch or change CANCELLED back to RUNNING.
             current_job = _scan_job_get(job_id)
             if not current_job or current_job["status"] == "CANCELLED":
                 return
-
-            # A whole batch with zero candles is either a Yahoo outage/throttle or
-            # simply dead/delisted tickers. If a liquid reference ticker still
-            # downloads, Yahoo is healthy, so save the batch as NO DATA and continue
-            # instead of pausing forever on the same batch.
-            if unresolved_indices and not batch_exception and _yahoo_is_healthy():
-                unresolved_indices = []
-
-            # Persist partial misses as NO DATA and continue. Pause only when the
-            # entire normal-sized batch failed, which is more consistent with throttling.
-            if not batch_exception and (len(unresolved_indices) < len(batch) or len(batch) < 5):
-                unresolved_indices = []
-
             saved_at = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S %Z")
             unresolved_set = set(unresolved_indices)
             payload_rows = [
@@ -2333,22 +2540,17 @@ def _scan_job_worker(job_id):
                 for i, ((symbol, ticker), row) in enumerate(zip(batch, batch_rows))
                 if i not in unresolved_set
             ]
-            # Commit a whole batch atomically: after a crash, only an unfinished
-            # batch is repeated. Completed symbols are never downloaded again.
             with _memory_connect() as conn:
                 conn.executemany(
                     """INSERT INTO scan_job_rows(job_id,symbol,ticker,payload,saved_at)
-                       VALUES (?,?,?,?,?)
-                       ON CONFLICT(job_id,symbol) DO UPDATE SET
-                         ticker=excluded.ticker,payload=excluded.payload,saved_at=excluded.saved_at""",
+                       VALUES (?,?,?,?,?) ON CONFLICT(job_id,symbol) DO UPDATE SET
+                       ticker=excluded.ticker,payload=excluded.payload,saved_at=excluded.saved_at""",
                     payload_rows,
                 )
-                total_done = conn.execute(
-                    "SELECT COUNT(*) FROM scan_job_rows WHERE job_id=?", (job_id,)
-                ).fetchone()[0]
+                total_done = conn.execute("SELECT COUNT(*) FROM scan_job_rows WHERE job_id=?", (job_id,)).fetchone()[0]
                 conn.execute(
-                    """UPDATE scan_jobs SET status='RUNNING',completed_symbols=?,
-                       updated_at=?,error=NULL WHERE job_id=? AND status!='CANCELLED'""",
+                    """UPDATE scan_jobs SET status='RUNNING',completed_symbols=?,updated_at=?,error=NULL
+                       WHERE job_id=? AND status!='CANCELLED'""",
                     (int(total_done), saved_at, job_id),
                 )
             if unresolved_indices:
@@ -2356,35 +2558,69 @@ def _scan_job_worker(job_id):
                 with _memory_connect() as conn:
                     conn.execute(
                         "UPDATE scan_jobs SET status='PAUSED',updated_at=?,error=? WHERE job_id=? AND status!='CANCELLED'",
-                        (paused_at, f"Yahoo returned zero core candles for {len(unresolved_indices)} symbols after retry (Yahoo appears unavailable); press RESUME", job_id),
+                        (paused_at, f"Yahoo download unresolved for {len(unresolved_indices)} symbols after retry; no permanent NO DATA rows saved. Press RESUME.", job_id),
                     )
                 return
 
+        # Re-fetch zero-candle rows: a single-symbol health probe may pass even
+        # when the preceding multi-symbol Yahoo batch was throttled.
+        try:
+            with _memory_connect() as conn:
+                saved = conn.execute(
+                    "SELECT symbol,ticker,payload FROM scan_job_rows WHERE job_id=?",
+                    (job_id,),
+                ).fetchall()
+            retry_items = []
+            for sym, tick, blob in saved:
+                try:
+                    r = pickle.loads(blob)
+                except Exception:
+                    # One malformed row must not abort retries for other symbols.
+                    continue
+                if isinstance(r, dict) and all(
+                    int(r.get(k, 0) or 0) == 0
+                    for k in ("5M Candles", "15M Candles", "1H Candles")
+                ):
+                    retry_items.append((sym, tick))
+            if retry_items and _yahoo_is_healthy():
+                for i in range(0, len(retry_items), batch_size):
+                    sub = retry_items[i:i + batch_size]
+                    time.sleep(1.0)
+                    new_rows = _scan_batch(sub, period, include_early=include_early)
+                    if not isinstance(new_rows, list) or len(new_rows) != len(sub):
+                        continue
+                    ts = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S %Z")
+                    with _memory_connect() as conn:
+                        conn.executemany(
+                            """INSERT INTO scan_job_rows(job_id,symbol,ticker,payload,saved_at) VALUES (?,?,?,?,?)
+                               ON CONFLICT(job_id,symbol) DO UPDATE SET ticker=excluded.ticker,
+                               payload=excluded.payload,saved_at=excluded.saved_at""",
+                            [(job_id, str(sym), str(tick),
+                              sqlite3.Binary(pickle.dumps(row, protocol=pickle.HIGHEST_PROTOCOL)), ts)
+                             for (sym, tick), row in zip(sub, new_rows)],
+                        )
+        except Exception:
+            pass
+
         finished_at = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S %Z")
         with _memory_connect() as conn:
-            total_done = conn.execute(
-                "SELECT COUNT(*) FROM scan_job_rows WHERE job_id=?", (job_id,)
-            ).fetchone()[0]
+            total_done = conn.execute("SELECT COUNT(*) FROM scan_job_rows WHERE job_id=?", (job_id,)).fetchone()[0]
             conn.execute(
-                """UPDATE scan_jobs SET status='DONE',completed_symbols=?,
-                   updated_at=?,error=NULL WHERE job_id=? AND status!='CANCELLED'""",
+                """UPDATE scan_jobs SET status='DONE',completed_symbols=?,updated_at=?,error=NULL
+                   WHERE job_id=? AND status!='CANCELLED'""",
                 (int(total_done), finished_at, job_id),
             )
     except Exception as exc:
         paused_at = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S %Z")
         try:
             with _memory_connect() as conn:
-                conn.execute(
-                    """UPDATE scan_jobs SET status='PAUSED',updated_at=?,error=?
-                       WHERE job_id=? AND status!='CANCELLED'""",
-                    (paused_at, str(exc)[:1000], job_id),
-                )
+                conn.execute("UPDATE scan_jobs SET status='PAUSED',updated_at=?,error=? WHERE job_id=? AND status!='CANCELLED'",
+                             (paused_at, str(exc)[:1000], job_id))
         except Exception:
             pass
     finally:
         with _SCAN_WORKERS_LOCK:
             _SCAN_WORKERS.pop(job_id, None)
-
 
 def _scan_job_start_worker(job_id):
     """Start or resume one job; a live worker is never duplicated."""
@@ -2435,19 +2671,17 @@ def _real_ai_feature_frame(frame):
     for col in cols:
         d[col] = pd.to_numeric(d[col], errors="coerce")
     o, h, l, c, v = (d[x] for x in cols)
-    prev = c.shift(1)
+    session_key = (pd.to_datetime(d["Time"], errors="coerce", utc=True).dt.tz_convert(IST).dt.date
+                   if "Time" in d.columns else pd.Series(0, index=d.index))
+    prev = c.groupby(session_key).shift(1)  # first bar each session uses High-Low, not overnight gap
     tr = pd.concat([(h-l), (h-prev).abs(), (l-prev).abs()], axis=1).max(axis=1)
     atr = tr.rolling(14, min_periods=7).mean()
     avg_vol = v.shift(1).rolling(20, min_periods=8).mean()
     ema9 = c.ewm(span=9, adjust=False).mean()
     ema21 = c.ewm(span=21, adjust=False).mean()
     typical = (h + l + c) / 3
-    cum_pv = (typical * v).groupby(
-        d["Time"].dt.date if "Time" in d.columns else pd.Series(0, index=d.index)
-    ).cumsum()
-    cum_v = v.groupby(
-        d["Time"].dt.date if "Time" in d.columns else pd.Series(0, index=d.index)
-    ).cumsum().replace(0, np.nan)
+    cum_pv = (typical * v).groupby(session_key).cumsum()
+    cum_v = v.groupby(session_key).cumsum().replace(0, np.nan)
     session_vwap = cum_pv / cum_v
     candle_range = (h-l).replace(0, np.nan)
     close_loc = ((c-l) / candle_range).clip(0, 1)
@@ -2517,10 +2751,34 @@ def _real_ai_training_data():
     return data.sort_values("__time").reset_index(drop=True)
 
 
+def _load_persisted_ai_brain():
+    """Load the most recently trained local model bundle, if present."""
+    try:
+        model_path = Path(__file__).with_name("ai_multi_agent_brain.pkl")
+        if model_path.exists():
+            with model_path.open("rb") as fh:
+                bundle = pickle.load(fh)
+            if (isinstance(bundle, dict) and "model" in bundle and "metrics" in bundle
+                    and bundle.get("features") == list(AI_FEATURE_COLUMNS)):
+                return bundle
+    except Exception:
+        return None
+    return None
+
+
 def _train_real_ai_brain(force=False):
     """Train a time-ordered RandomForest model; optional sklearn dependency."""
     if not force and st.session_state.get("ma_real_ai_model"):
-        return st.session_state["ma_real_ai_model"], None
+        current_bundle = st.session_state["ma_real_ai_model"]
+        if (isinstance(current_bundle, dict)
+                and current_bundle.get("features") == list(AI_FEATURE_COLUMNS)):
+            return current_bundle, None
+        st.session_state["ma_real_ai_model"] = None
+    if not force:
+        persisted = _load_persisted_ai_brain()
+        if persisted:
+            st.session_state["ma_real_ai_model"] = persisted
+            return persisted, None
     try:
         from sklearn.ensemble import RandomForestClassifier
         from sklearn.metrics import accuracy_score, balanced_accuracy_score
@@ -2553,14 +2811,55 @@ def _train_real_ai_brain(force=False):
     )
     model.fit(X_train, y_train)
     predicted = model.predict(X_test)
+    # Three expanding-window, chronological validation folds. Each fold purges
+    # examples whose 3-bar target horizon overlaps the validation start.
+    wf_scores = []
+    time_values = pd.to_datetime(data["__time"], utc=True)
+    target_values = pd.to_datetime(data["__target_time"], utc=True)
+    n_rows = len(data)
+    for train_fraction, test_end_fraction in ((0.50, 0.65), (0.65, 0.80), (0.80, 0.95)):
+        start_i = int(n_rows * train_fraction)
+        end_i = int(n_rows * test_end_fraction)
+        if end_i <= start_i + 50:
+            continue
+        fold_start = time_values.iloc[start_i]
+        fold_end = time_values.iloc[end_i]
+        fold_train = (time_values < fold_start) & (target_values < fold_start)
+        fold_test = (time_values >= fold_start) & (time_values < fold_end)
+        if int(fold_train.sum()) < 300 or int(fold_test.sum()) < 100:
+            continue
+        if y.loc[fold_train].nunique() < 3 or y.loc[fold_test].nunique() < 2:
+            continue
+        fold_model = RandomForestClassifier(
+            n_estimators=120, max_depth=8, min_samples_leaf=5,
+            class_weight="balanced_subsample", random_state=42, n_jobs=2,
+        )
+        fold_model.fit(X.loc[fold_train], y.loc[fold_train])
+        fold_pred = fold_model.predict(X.loc[fold_test])
+        wf_scores.append(float(balanced_accuracy_score(y.loc[fold_test], fold_pred)))
     metrics = {
         "samples": int(len(data)), "train_samples": int(len(X_train)),
         "test_samples": int(len(X_test)),
         "accuracy": float(accuracy_score(y_test, predicted)),
         "balanced_accuracy": float(balanced_accuracy_score(y_test, predicted)),
+        "walk_forward_balanced_accuracy": float(np.mean(wf_scores)) if wf_scores else None,
+        "walk_forward_folds": len(wf_scores),
         "trained_at": datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST"),
     }
-    return {"model": model, "metrics": metrics}, None
+    bundle = {
+        "model": model,
+        "metrics": metrics,
+        "features": list(AI_FEATURE_COLUMNS),
+    }
+    try:
+        model_path = Path(__file__).with_name("ai_multi_agent_brain.pkl")
+        temp_path = model_path.with_suffix(".pkl.tmp")
+        with temp_path.open("wb") as fh:
+            pickle.dump(bundle, fh, protocol=pickle.HIGHEST_PROTOCOL)
+        temp_path.replace(model_path)
+    except Exception as exc:
+        metrics["persistence_warning"] = str(exc)[:180]
+    return bundle, None
 
 
 def _apply_real_ai_brain(result):
@@ -2570,15 +2869,17 @@ def _apply_real_ai_brain(result):
     if "AI Prediction Error" in result.columns:
         result = result.drop(columns=["AI Prediction Error"])
     defaults = {
-        "AI Direction": "NOT TRAINED", "AI Up Probability %": None,
-        "AI Down Probability %": None, "AI Sideways Probability %": None,
+        "AI Direction": "NOT TRAINED", "AI Up Model Estimate %": None,
+        "AI Down Model Estimate %": None, "AI Sideways Model Estimate %": None,
         "AI Brain Signal": "MODEL NOT TRAINED", "AI Model Status": "NOT TRAINED",
     }
     for col, default in defaults.items():
         # Clear old predictions before applying the currently loaded model.
         result[col] = default
     bundle = st.session_state.get("ma_real_ai_model")
-    if not bundle or not all(c in result.columns for c in AI_FEATURE_COLUMNS):
+    if (not isinstance(bundle, dict)
+            or bundle.get("features") != list(AI_FEATURE_COLUMNS)
+            or not all(c in result.columns for c in AI_FEATURE_COLUMNS)):
         return result
     try:
         x = result[AI_FEATURE_COLUMNS].apply(pd.to_numeric, errors="coerce")
@@ -2598,14 +2899,15 @@ def _apply_real_ai_brain(result):
         confidence = probs.max(axis=1)
         row_indices = np.flatnonzero(valid)
         result.loc[result.index[row_indices], "AI Direction"] = labels
-        result.loc[result.index[row_indices], "AI Down Probability %"] = np.round(down * 100, 1)
-        result.loc[result.index[row_indices], "AI Sideways Probability %"] = np.round(sideways * 100, 1)
-        result.loc[result.index[row_indices], "AI Up Probability %"] = np.round(up * 100, 1)
+        result.loc[result.index[row_indices], "AI Down Model Estimate %"] = np.round(down * 100, 1)
+        result.loc[result.index[row_indices], "AI Sideways Model Estimate %"] = np.round(sideways * 100, 1)
+        result.loc[result.index[row_indices], "AI Up Model Estimate %"] = np.round(up * 100, 1)
         result.loc[result.index[row_indices], "AI Model Status"] = "TRAINED"
 
         technical = result["Final Signal"].fillna("WAIT").astype(str).str.upper().to_numpy()
-        balanced = _safe_num(bundle.get("metrics", {}).get("balanced_accuracy"), 0.0)
-        reliable = balanced >= 0.45
+        metrics = bundle.get("metrics", {})
+        balanced = _safe_num(metrics.get("walk_forward_balanced_accuracy", metrics.get("balanced_accuracy")), 0.0)
+        reliable = balanced >= 0.55 and int(metrics.get("walk_forward_folds", 0) or 0) >= 3
         brain = np.full(len(result), "MODEL NOT TRAINED", dtype=object)
         brain[valid] = "WATCH — VALIDATION WEAK" if not reliable else "WATCH — LOW MODEL CONFIDENCE"
         if reliable:
@@ -2641,7 +2943,7 @@ def _build_excel(result, stamp):
             result.to_excel(writer, index=False, sheet_name="AI Scanner")
             counts = result.get("Action Signal", pd.Series(dtype=str)).fillna("WAIT").value_counts()
             dash_rows = [
-                ["AI MULTI-AGENT SCANNER DASHBOARD", ""],
+                ["NSE AI PRO V18 — ADVANCED BIG MOVEMENT DASHBOARD", ""],
                 ["Generated (IST)", stamp.strftime("%Y-%m-%d %H:%M:%S IST")],
                 ["Total Stocks Scanned", int(len(result))],
                 ["BUY", int(counts.get("BUY", 0))],
@@ -2661,7 +2963,7 @@ def _build_excel(result, stamp):
                 "Symbol", "Action Signal", "Final Signal", "Best Stock Score",
                 "Confirmation Strength %", "Last Price", "Breakout Signal",
                 "Multi-TF Breakout", "Breakout Retest", "AI Direction",
-                "AI Up Probability %", "AI Down Probability %", "AI Brain Signal",
+                "AI Up Model Estimate %", "AI Down Model Estimate %", "AI Brain Signal",
             ] if c in result.columns]
             top = result.copy()
             if "Best Stock Filter" in top.columns:
@@ -2699,8 +3001,10 @@ def _build_excel(result, stamp):
             chart.type = "bar"
             chart.style = 10
             chart.title = "Signal Counts"
-            chart.y_axis.title = "Signal"
-            chart.x_axis.title = "Stocks"
+            chart.x_axis.title = "Signal"
+            chart.y_axis.title = "Stocks"
+            chart.x_axis.delete = False
+            chart.y_axis.delete = False
             chart.height, chart.width = 7, 12
             chart.add_data(Reference(ws, min_col=2, min_row=4, max_row=10), titles_from_data=False)
             chart.set_categories(Reference(ws, min_col=1, min_row=4, max_row=10))
@@ -2742,13 +3046,13 @@ def _build_excel(result, stamp):
 
 def show_ai_multi_agent_scanner(client=None):
     """Streamlit page. client is retained for app.py compatibility."""
-    st.title("🤖 AI Multi-Agent Scanner V17 — 17 Agents + Real AI Brain Hybrid")
+    st.title("🚀 NSE AI PRO V18 — Advanced Big Movement Scanner")
     st.caption("17 OHLCV agents × 5M / 15M / 1H + supervised ML AI Brain + optional 1M / News")
     st.info("scanner.py supplies NSE/F&O symbols only (unchanged). Yahoo Finance supplies candles. FYERS is used only for 5-level Market Depth on the technical shortlist.")
     st.caption("Smart Memory: SQLite candles are loaded first; after the initial warm-up, the scanner refreshes a short 2-day overlap and merges it with saved candles. For speed, the extra 1M/20M scan is optional.")
     st.warning(
         "Yahoo intraday data may be delayed, missing or rate-limited. "
-        "17-Agent Confirmation Strength is a heuristic score, not a probability. ML probabilities are shown separately and only after historical validation."
+        "17-Agent Confirmation Strength is a heuristic score, not a probability. ML vote fractions are uncalibrated model estimates, not true probabilities or guaranteed win rates."
     )
     if yf is None:
         st.error("Missing dependency: add yfinance>=0.2.50 to requirements.txt and redeploy.")
@@ -2802,7 +3106,7 @@ def show_ai_multi_agent_scanner(client=None):
 
     a, b, c = st.columns(3)
     with a:
-        period = st.selectbox("Yahoo history", ["59d", "30d"], index=1, key="ma_period_v18")
+        period = st.selectbox("Yahoo history", ["59d", "30d"], index=0, key="ma_period_v18")
     with b:
         news_enabled = st.checkbox("News Intelligence (shortlist only — slower)", value=False, key="ma_news_enabled")
     with c:
@@ -2991,7 +3295,16 @@ def show_ai_multi_agent_scanner(client=None):
         status = st.empty()
         result = _sort_results(pd.DataFrame(all_rows))
         if result.empty:
-            st.error("No completed stock rows were saved for this scan job. Check Yahoo data and press RESUME or start a fresh scan.")
+            st.error("No completed stock rows were saved for this scan job. The job has been paused for a safe retry; check Yahoo data and press RESUME.")
+            try:
+                with _memory_connect() as conn:
+                    conn.execute(
+                        "UPDATE scan_jobs SET status='PAUSED',updated_at=?,error=? WHERE job_id=? AND status='DONE'",
+                        (datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S %Z"), "Restore returned zero rows; paused instead of repeating a DONE restore.", job_id),
+                    )
+            except Exception:
+                pass
+            st.session_state.pop("ma_restored_from_db", None)
             return
         restored_from_db = bool(st.session_state.pop("ma_restored_from_db", False))
 
@@ -3232,6 +3545,12 @@ def show_ai_multi_agent_scanner(client=None):
         quality_cols = ["Symbol", "Data Quality", "Data Quality Reason", "Market Regime", "Regime Strength", "Regime ADX", "Regime ATR %", "Regime BB Width %"]
         st.dataframe(result[quality_cols].head(100), hide_index=True, **_stretch())
 
+    # Restore the previously trained model once per Streamlit session.
+    if not st.session_state.get("ma_real_ai_model"):
+        _persisted = _load_persisted_ai_brain()
+        if _persisted:
+            st.session_state["ma_real_ai_model"] = _persisted
+
     # Real AI Brain training uses saved, completed 5M candles and chronological holdout.
     st.subheader("🧠 REAL AI BRAIN — Hybrid ML")
     ai_col1, ai_col2 = st.columns(2)
@@ -3240,7 +3559,8 @@ def show_ai_multi_agent_scanner(client=None):
     with ai_col2:
         ai_bundle = st.session_state.get("ma_real_ai_model")
         if ai_bundle:
-            st.metric("AI Balanced Accuracy (time holdout)", f"{ai_bundle['metrics']['balanced_accuracy']*100:.1f}%")
+            wf_score = ai_bundle["metrics"].get("walk_forward_balanced_accuracy")
+            st.metric("AI Walk-Forward Balanced Accuracy", f"{wf_score*100:.1f}%" if wf_score is not None else "NOT AVAILABLE")
         else:
             st.metric("AI Model", "NOT TRAINED")
     if train_ai_now:
@@ -3251,20 +3571,24 @@ def show_ai_multi_agent_scanner(client=None):
             st.session_state["ma_real_ai_train_error"] = None
             st.success(
                 f"AI Brain trained: {trained_bundle['metrics']['samples']:,} samples • "
-                f"test balanced accuracy {trained_bundle['metrics']['balanced_accuracy']*100:.1f}% "
-                f"• trained {trained_bundle['metrics']['trained_at']}"
+                f"walk-forward balanced accuracy "
+                f"{trained_bundle['metrics']['walk_forward_balanced_accuracy']*100:.1f}% "
+                f"({trained_bundle['metrics']['walk_forward_folds']} folds) • trained {trained_bundle['metrics']['trained_at']}"
+                if trained_bundle['metrics']['walk_forward_balanced_accuracy'] is not None else
+                f"walk-forward validation unavailable; holdout balanced accuracy {trained_bundle['metrics']['balanced_accuracy']*100:.1f}% • trained {trained_bundle['metrics']['trained_at']}"
             )
         else:
             st.session_state["ma_real_ai_model"] = None
             st.session_state["ma_real_ai_train_error"] = train_error
     ai_bundle = st.session_state.get("ma_real_ai_model")
     if ai_bundle:
+        wf_value = ai_bundle["metrics"].get("walk_forward_balanced_accuracy")
+        wf_text = f"walk-forward balanced accuracy {wf_value*100:.1f}%" if wf_value is not None else "walk-forward balanced accuracy NOT AVAILABLE"
         st.caption(
-            f"Chronological 80/20 validation • {ai_bundle['metrics']['train_samples']:,} train / "
-            f"{ai_bundle['metrics']['test_samples']:,} test • accuracy "
-            f"{ai_bundle['metrics']['accuracy']*100:.1f}% • balanced accuracy "
-            f"{ai_bundle['metrics']['balanced_accuracy']*100:.1f}%. "
-            "Targets: next 3 completed 5M candles within the same session; deadband is max(0.10%, 0.8× ATR% × √3). RF vote fractions are uncalibrated model estimates, not true odds or a guaranteed win rate."
+            f"Chronological 80/20 holdout + {ai_bundle['metrics'].get('walk_forward_folds', 0)} expanding walk-forward folds • "
+            f"{ai_bundle['metrics']['train_samples']:,} train / {ai_bundle['metrics']['test_samples']:,} holdout • "
+            f"holdout balanced accuracy {ai_bundle['metrics']['balanced_accuracy']*100:.1f}% • {wf_text}. "
+            "Targets: next 3 completed 5M candles within the same session; deadband is max(0.10%, 0.8× ATR% × √3). RF vote fractions are uncalibrated model estimates, not probabilities, true odds or a guaranteed win rate."
         )
         ai_apply_sig = (st.session_state.get("ma_scan_job_id"), ai_bundle.get("metrics", {}).get("trained_at"), len(result))
         if st.session_state.get("ma_ai_apply_sig") != ai_apply_sig:
@@ -3285,8 +3609,8 @@ def show_ai_multi_agent_scanner(client=None):
             st.session_state["multi_agent_xlsx"] = xlsx_bytes
             st.session_state["multi_agent_xlsx_error"] = xlsx_error
             st.session_state["ma_ai_export_signature"] = ai_export_signature
-        ai_cols = ["Symbol", "AI Direction", "AI Up Probability %", "AI Down Probability %",
-                   "AI Sideways Probability %", "AI Brain Signal", "Final Signal"]
+        ai_cols = ["Symbol", "AI Direction", "AI Up Model Estimate %", "AI Down Model Estimate %",
+                   "AI Sideways Model Estimate %", "AI Brain Signal", "Final Signal"]
         st.dataframe(result[ai_cols].head(30), hide_index=True, **_stretch())
     else:
         # Ensure the report schema is stable even before 500 labelled samples exist.
@@ -3312,6 +3636,23 @@ def show_ai_multi_agent_scanner(client=None):
             str(st.session_state.get("ma_real_ai_train_error") or "training data not available") +
             " Collect more completed 5M candle history and press TRAIN / REFRESH."
         )
+
+    st.subheader("🚀 V18 ADVANCED BIG MOVEMENT — FALSE BREAKOUT + CONTINUATION")
+    advanced_cols = [c for c in [
+        "Symbol", "Last Price", "Advanced Big Move", "Big Move Direction", "Big Move Score",
+        "False Breakout Risk", "Breakout Retest Status", "Momentum Continuation",
+        "Big Move Range High", "Big Move Range Low", "Big Move RVOL", "Big Move Reason",
+    ] if c in result.columns]
+    advanced_view = result[result.get("Advanced Big Move", pd.Series(index=result.index, dtype=str)).isin([
+        "PRE-BIG WATCH", "BREAKOUT CONFIRMED", "BREAKDOWN CONFIRMED", "FALSE BREAKOUT RISK",
+        "WAIT — SESSION WARM-UP",
+    ])].copy()
+    if not advanced_view.empty:
+        advanced_view = advanced_view.sort_values("Big Move Score", ascending=False)
+        st.dataframe(advanced_view[advanced_cols], hide_index=True, height=420, **_stretch())
+    else:
+        st.info("No advanced big-movement setup currently meets the screening conditions.")
+    st.caption("Big Move Score is a rule-based screening score, not a probability or guaranteed return. Retest and continuation require subsequent completed candles; validate using historical trade backtesting.")
 
     # 18th Agent report: rank only qualified, actionable stocks.
     st.subheader("🏆 BEST PERFORMANCE STOCKS — 18th Ranking Analyst")
@@ -3401,8 +3742,11 @@ def show_ai_multi_agent_scanner(client=None):
         "5M Buy-side Liquidity", "5M Sell-side Liquidity", "5M Upside Sweep", "5M Downside Sweep",
         "15M Buy-side Liquidity", "15M Sell-side Liquidity", "15M Upside Sweep", "15M Downside Sweep",
         "1H Buy-side Liquidity", "1H Sell-side Liquidity", "1H Upside Sweep", "1H Downside Sweep",
-        "AI Direction", "AI Up Probability %", "AI Down Probability %",
-        "AI Sideways Probability %", "AI Brain Signal", "AI Model Status",
+        "AI Direction", "AI Up Model Estimate %", "AI Down Model Estimate %",
+        "AI Sideways Model Estimate %", "AI Brain Signal", "AI Model Status",
+        "Advanced Big Move", "Big Move Direction", "Big Move Score", "False Breakout Risk",
+        "Breakout Retest Status", "Momentum Continuation", "Big Move Range High",
+        "Big Move Range Low", "Big Move RVOL", "Big Move Reason",
         "18th Agent", "Best Stock Score", "Best Stock Side", "Best Stock Grade",
         "Best Stock Filter", "Best Stock Reason",
         "20M Status", "20M Direction", "20M Pre-Move Score", "20M Range High", "20M Range Low",
@@ -3414,7 +3758,7 @@ def show_ai_multi_agent_scanner(client=None):
         "Depth Imbalance %", "Depth Time (IST)", "Errors",
     ]
     st.subheader("🚀 EARLY BIG MOVE CATCHER — 5M Compression + Volume Build-up")
-    st.caption(f"{int(result.get('Symbol', pd.Series(dtype=str)).nunique()):,} unique scanned symbols: 12 completed 5M candles in a tight range, rising volume and directional bias; breakout is confirmed only after a completed candle closes beyond the range with strong body and RVOL.")
+    st.caption(f"{int(result.get('Symbol', pd.Series(dtype=str)).nunique()):,} unique scanned symbols: 13 completed 5M candles today (12-bar base + 1 completed trigger candle), rising volume and directional bias; breakout is confirmed only after a completed candle closes beyond the range with strong body and RVOL.")
     prebig_view = result[result["PRE-BIG Status"].isin([
         "PRE-BIG BULLISH WATCH", "PRE-BIG BEARISH WATCH",
         "BULLISH BREAKOUT CONFIRMED", "BEARISH BREAKDOWN CONFIRMED",
