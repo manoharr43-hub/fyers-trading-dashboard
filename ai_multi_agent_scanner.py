@@ -25,6 +25,7 @@ import io
 import json
 import copy
 import math
+import os
 import pickle
 import re
 import sqlite3
@@ -39,6 +40,7 @@ from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
+import requests
 import streamlit as st
 
 try:
@@ -1918,7 +1920,7 @@ def _no_data_row(symbol, ticker, message):
     })
 
 
-def _fetch_interval(tickers, interval, minutes, period, retries=1):
+def _fetch_interval(tickers, interval, minutes, period, retries=0):
     frames = {t: pd.DataFrame() for t in tickers}
     errors, pending = {}, list(tickers)
     for attempt in range(retries + 1):
@@ -2562,46 +2564,7 @@ def _scan_job_worker(job_id):
                     )
                 return
 
-        # Re-fetch zero-candle rows: a single-symbol health probe may pass even
-        # when the preceding multi-symbol Yahoo batch was throttled.
-        try:
-            with _memory_connect() as conn:
-                saved = conn.execute(
-                    "SELECT symbol,ticker,payload FROM scan_job_rows WHERE job_id=?",
-                    (job_id,),
-                ).fetchall()
-            retry_items = []
-            for sym, tick, blob in saved:
-                try:
-                    r = pickle.loads(blob)
-                except Exception:
-                    # One malformed row must not abort retries for other symbols.
-                    continue
-                if isinstance(r, dict) and all(
-                    int(r.get(k, 0) or 0) == 0
-                    for k in ("5M Candles", "15M Candles", "1H Candles")
-                ):
-                    retry_items.append((sym, tick))
-            if retry_items and _yahoo_is_healthy():
-                for i in range(0, len(retry_items), batch_size):
-                    sub = retry_items[i:i + batch_size]
-                    time.sleep(1.0)
-                    new_rows = _scan_batch(sub, period, include_early=include_early)
-                    if not isinstance(new_rows, list) or len(new_rows) != len(sub):
-                        continue
-                    ts = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S %Z")
-                    with _memory_connect() as conn:
-                        conn.executemany(
-                            """INSERT INTO scan_job_rows(job_id,symbol,ticker,payload,saved_at) VALUES (?,?,?,?,?)
-                               ON CONFLICT(job_id,symbol) DO UPDATE SET ticker=excluded.ticker,
-                               payload=excluded.payload,saved_at=excluded.saved_at""",
-                            [(job_id, str(sym), str(tick),
-                              sqlite3.Binary(pickle.dumps(row, protocol=pickle.HIGHEST_PROTOCOL)), ts)
-                             for (sym, tick), row in zip(sub, new_rows)],
-                        )
-        except Exception:
-            pass
-
+        # Third-pass zero-candle refetch skipped to avoid repeated Yahoo requests.
         finished_at = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S %Z")
         with _memory_connect() as conn:
             total_done = conn.execute("SELECT COUNT(*) FROM scan_job_rows WHERE job_id=?", (job_id,)).fetchone()[0]
@@ -3044,6 +3007,100 @@ def _build_excel(result, stamp):
         return None, str(exc)
 
 
+
+def _prescan_supabase_config():
+    """Read Supabase credentials from Streamlit secrets or environment."""
+    url = str(os.getenv("SUPABASE_URL", "") or "").strip().rstrip("/")
+    key = str(os.getenv("SUPABASE_SERVICE_ROLE_KEY", "") or "").strip()
+    if not url or not key:
+        try:
+            url = url or str(st.secrets.get("SUPABASE_URL", "")).strip().rstrip("/")
+            key = key or str(st.secrets.get("SUPABASE_SERVICE_ROLE_KEY", "")).strip()
+        except Exception:
+            pass
+    if not url or not key:
+        raise RuntimeError("Supabase credentials missing. Configure SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY in Streamlit Secrets.")
+    headers = {"apikey": key, "Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+    return url, key, headers
+
+
+def _load_latest_prescan_to_local_job(universe, batch_size=50, period="59d", depth_limit=10):
+    """Download a completed cloud pre-scan and hydrate existing SQLite job rows.
+
+    The normal V18 report-finalization path then adds its existing AI/18th-agent/UI
+    logic. No technical-agent formulas are changed here.
+    """
+    url, _key, headers = _prescan_supabase_config()
+    # Restore the same persistent candle cache used by the scheduled worker.
+    # A missing cache is non-fatal: the saved report can still be loaded.
+    try:
+        storage_bucket = str(os.getenv("SUPABASE_STORAGE_BUCKET", "ai-scanner-memory"))
+        cache_url = f"{url}/storage/v1/object/{storage_bucket}/ai_multi_agent_candle_memory.sqlite3"
+        cache_resp = requests.get(cache_url, headers=headers, timeout=90)
+        if cache_resp.ok and cache_resp.content:
+            MEMORY_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+            MEMORY_DB_PATH.write_bytes(cache_resp.content)
+            globals()["_MEMORY_INITIALIZED"] = False
+    except Exception:
+        pass
+    runs_url = f"{url}/rest/v1/prescan_runs"
+    run_resp = requests.get(
+        runs_url, headers=headers,
+        params={"select": "id,status,universe,scheduled_type,started_at,completed_at,total_symbols,completed_symbols,symbols",
+                "status": "eq.DONE", "universe": f"eq.{universe}",
+                "order": "completed_at.desc", "limit": "1"}, timeout=30,
+    )
+    run_resp.raise_for_status()
+    runs = run_resp.json()
+    if not runs:
+        raise RuntimeError(f"No completed background report found for universe: {universe}")
+    run = runs[0]
+    symbols = run.get("symbols") or []
+    if not symbols:
+        raise RuntimeError("The latest background report has no saved symbol list.")
+    rows = []
+    offset, page_size = 0, 1000
+    while True:
+        resp = requests.get(
+            f"{url}/rest/v1/prescan_rows", headers={**headers, "Range-Unit": "items", "Range": f"{offset}-{offset + page_size - 1}"},
+            params={"select": "symbol,ticker,payload", "scan_id": f"eq.{run['id']}", "order": "symbol.asc", "limit": str(page_size)},
+            timeout=60,
+        )
+        resp.raise_for_status()
+        page = resp.json()
+        rows.extend(page)
+        if len(page) < page_size:
+            break
+        offset += page_size
+    payload_by_symbol = {str(item.get("symbol")): item.get("payload") for item in rows if isinstance(item.get("payload"), dict)}
+    ordered_rows = [payload_by_symbol[str(item[0])] for item in symbols if str(item[0]) in payload_by_symbol]
+    if not ordered_rows:
+        raise RuntimeError("The background report exists, but no stock result rows could be loaded.")
+    config = {
+        "universe": universe, "source_symbols": len(symbols), "symbols": symbols,
+        "batch_size": int(batch_size), "period": str(period), "include_early": False,
+        "news_enabled": False, "news_limit": 50, "depth_limit": int(depth_limit),
+        "prescan_run_id": run["id"], "prescan_completed_at": run.get("completed_at"),
+    }
+    job_id = _scan_job_create(config)
+    saved_at = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S %Z")
+    insert_rows = []
+    for payload in ordered_rows:
+        sym = str(payload.get("Symbol", ""))
+        ticker = str(payload.get("Yahoo Symbol", ""))
+        if sym and ticker:
+            insert_rows.append((job_id, sym, ticker, sqlite3.Binary(pickle.dumps(payload, protocol=pickle.HIGHEST_PROTOCOL)), saved_at))
+    with _memory_connect() as conn:
+        conn.executemany(
+            "INSERT OR REPLACE INTO scan_job_rows(job_id,symbol,ticker,payload,saved_at) VALUES (?,?,?,?,?)",
+            insert_rows,
+        )
+        conn.execute(
+            "UPDATE scan_jobs SET status='DONE',completed_symbols=?,updated_at=?,error=NULL WHERE job_id=?",
+            (len(insert_rows), saved_at, job_id),
+        )
+    return job_id, run, len(insert_rows)
+
 def show_ai_multi_agent_scanner(client=None):
     """Streamlit page. client is retained for app.py compatibility."""
     st.title("🚀 NSE AI PRO V18 — Advanced Big Movement Scanner")
@@ -3129,6 +3186,27 @@ def show_ai_multi_agent_scanner(client=None):
         auto_scan = st.checkbox("⏱️ On-Time Auto Scan (market hours only)", value=False, key="ma_auto_scan")
     with auto_col2:
         auto_interval = st.selectbox("Auto Scan Interval", [5, 10, 15, 30], index=2, key="ma_auto_interval")
+
+    st.markdown("#### ☁️ Background Pre-Scan Memory")
+    st.caption("Background worker saves NSE + F&O reports to Supabase. This button loads the latest completed cloud report into the existing V18 report pipeline.")
+    if st.button("⚡ LOAD LATEST PRE-SCAN REPORT", key="ma_load_prescan", **_stretch()):
+        try:
+            with st.spinner("Loading latest saved NSE/F&O report..."):
+                loaded_job_id, loaded_run, loaded_count = _load_latest_prescan_to_local_job(
+                    universe, batch_size=batch_size, period=period, depth_limit=depth_limit
+                )
+            st.session_state["ma_scan_job_id"] = loaded_job_id
+            st.session_state.pop("ma_scan_finalized_job", None)
+            st.session_state["ma_restored_from_db"] = False
+            st.session_state["ma_discarded"] = False
+            st.success(
+                f"Loaded {loaded_count:,} stocks • {loaded_run.get('scheduled_type', 'BACKGROUND')} • "
+                f"completed {loaded_run.get('completed_at', 'time unavailable')}. Preparing V18 reports..."
+            )
+            st.rerun()
+        except Exception as prescan_exc:
+            st.error(f"Could not load background report: {prescan_exc}")
+            st.info("Check Supabase credentials, SQL tables, and whether the scheduled GitHub Action completed successfully.")
 
     # Streamlit fragments periodically request an app rerun. The scan itself still
     # runs through the same guarded batch path as the manual button.
@@ -3598,17 +3676,6 @@ def show_ai_multi_agent_scanner(client=None):
             st.session_state["ma_ai_apply_sig"] = ai_apply_sig
         else:
             result = st.session_state.get("multi_agent_results", result)
-        ai_export_signature = (
-            st.session_state.get("ma_scan_job_id"),
-            ai_bundle.get("metrics", {}).get("trained_at"),
-            len(result),
-        )
-        if st.session_state.get("ma_ai_export_signature") != ai_export_signature:
-            stamp = datetime.now(IST)
-            xlsx_bytes, xlsx_error = _build_excel(result, stamp)
-            st.session_state["multi_agent_xlsx"] = xlsx_bytes
-            st.session_state["multi_agent_xlsx_error"] = xlsx_error
-            st.session_state["ma_ai_export_signature"] = ai_export_signature
         ai_cols = ["Symbol", "AI Direction", "AI Up Model Estimate %", "AI Down Model Estimate %",
                    "AI Sideways Model Estimate %", "AI Brain Signal", "Final Signal"]
         st.dataframe(result[ai_cols].head(30), hide_index=True, **_stretch())
@@ -3622,15 +3689,6 @@ def show_ai_multi_agent_scanner(client=None):
             st.session_state["ma_ai_apply_sig"] = ai_apply_sig
         else:
             result = st.session_state.get("multi_agent_results", result)
-        ai_export_signature = (
-            st.session_state.get("ma_scan_job_id"), "none", len(result)
-        )
-        if st.session_state.get("ma_ai_export_signature") != ai_export_signature:
-            stamp = datetime.now(IST)
-            xlsx_bytes, xlsx_error = _build_excel(result, stamp)
-            st.session_state["multi_agent_xlsx"] = xlsx_bytes
-            st.session_state["multi_agent_xlsx_error"] = xlsx_error
-            st.session_state["ma_ai_export_signature"] = ai_export_signature
         st.warning(
             "Real AI Brain is not active: " +
             str(st.session_state.get("ma_real_ai_train_error") or "training data not available") +
@@ -3774,7 +3832,8 @@ def show_ai_multi_agent_scanner(client=None):
         st.info("No 5M PRE-BIG setup currently meets the compression + volume + direction rules. This is preferable to forcing a signal.")
 
     summary_cols = [c for c in summary_cols if c in view.columns]
-    st.dataframe(view[summary_cols], hide_index=True, **_stretch())
+    st.caption(f"Showing top 300 of {len(view):,} rows in the main table. Full results remain available in CSV/Excel.")
+    st.dataframe(view[summary_cols].head(300), hide_index=True, **_stretch())
 
     st.subheader("📚 FYERS Live Market Depth — Shortlist Only")
     depth_view = st.session_state.get("multi_agent_depth")
@@ -3801,6 +3860,14 @@ def show_ai_multi_agent_scanner(client=None):
             file_name=f"multi_agent_full_scan_{file_stamp}.csv",
             mime="text/csv", key="ma_csv",
         )
+    if st.button("📊 Prepare Excel (takes time)", key="ma_prep_xlsx"):
+        with st.spinner("Building full Excel workbook..."):
+            xlsx_bytes, xlsx_error = _build_excel(result, datetime.now(IST))
+        st.session_state["multi_agent_xlsx"] = xlsx_bytes
+        st.session_state["multi_agent_xlsx_error"] = xlsx_error
+        if xlsx_bytes:
+            st.success("Excel workbook is ready. Use the Download Full Excel button below.")
+
     if st.session_state.get("multi_agent_xlsx"):
         st.download_button(
             "⬇️ Download Full Excel", st.session_state["multi_agent_xlsx"],
