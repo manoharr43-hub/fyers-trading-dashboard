@@ -6040,6 +6040,8 @@ def _decorate_live_big_movement_rows(
                     "strike": strike,
                     "side": selected_side,
                     "score": current_score,
+                    # Premium at the exact scan when the BIG MOVEMENT threshold crossed.
+                    "signal_price": ce_now if selected_side == "CE" else pe_now,
                 }
                 event = events[event_key]
             live_phase = "BIG MOVEMENT CONFIRMED" if event else "BIG MOVEMENT"
@@ -6058,6 +6060,7 @@ def _decorate_live_big_movement_rows(
                     "symbol": symbol,
                     "strike": strike,
                     "side": pre_side,
+                    "signal_price": ce_now if selected_side == "CE" else pe_now,
                 }
 
         premove_key = f"{symbol}|{strike:.4f}|{pre_side}"
@@ -6069,7 +6072,24 @@ def _decorate_live_big_movement_rows(
             return "—"
 
         r = row.to_dict()
+        # Track the selected option premium from the first PRE-MOVE / BIG-MOVE event.
+        signal_record = event or premove_event
+        signal_price = _pin_num(signal_record.get("signal_price"), 0.0)
+        current_price = ce_now if selected_side == "CE" else pe_now
+        signal_change_pct = (
+            (current_price - signal_price) / signal_price * 100.0
+            if signal_price > 0 and current_price > 0 else 0.0
+        )
+        signal_ts = signal_record.get("ts") if signal_record else None
+        signal_age_min = (
+            max(0.0, (now - signal_ts).total_seconds() / 60.0)
+            if isinstance(signal_ts, datetime) else None
+        )
         r.update({
+            "Signal Price": round(signal_price, 2) if signal_price > 0 else None,
+            "Current Price": round(current_price, 2) if current_price > 0 else None,
+            "Change Since Signal %": round(signal_change_pct, 2),
+            "Signal Age (min)": round(signal_age_min, 1) if signal_age_min is not None else None,
             "Baseline Time": _fmt_ts(baseline_ts),
             "Pre-Move Time": _fmt_ts(premove_event.get("ts")),
             "Live Phase": live_phase,
@@ -6285,7 +6305,8 @@ def _render_big_movement_scan(
     show_cols = [
         "Instrument", "Strike", "Option", "Direction", "Status",
         "Live Phase", "Pre-Move Side", "Baseline Time", "Pre-Move Time",
-        "Movement Time",
+        "Movement Time", "Signal Price", "Current Price",
+        "Change Since Signal %", "Signal Age (min)",
         "Score", "CE Score", "PE Score", "CE Score Δ", "PE Score Δ",
         "Movement Bias", "CE Price", "PE Price", "CE Price Δ%", "PE Price Δ%",
         "CE Rising", "PE Rising", "Price Delta", "Price Change %",
@@ -6586,6 +6607,38 @@ def _show_top_blasting_alerts(state, cfg, fresh_data=False):
     st.caption("Volume Increase % compares cumulative volume between snapshots; it is NOT RVOL. Gamma is not a predicted premium blast. Thresholds are screening heuristics.")
 
 
+def _render_big_movement_live_fragment(
+    fyers: Any,
+    scan_type: str,
+    interval_seconds: int,
+    auto_scan: bool = True,
+) -> None:
+    """Render the additive Big Movement scanner with isolated timed refresh.
+
+    Streamlit 1.56 supports fragments with run_every. The fragment refreshes
+    only this scanner section; it does not block the main app with time.sleep().
+    """
+    interval = max(10, min(120, int(interval_seconds or 20)))
+
+    if auto_scan and hasattr(st, "fragment"):
+        @st.fragment(run_every=interval)
+        def _live_big_movement_section():
+            if st.session_state.get(BIG_TRACKER_ACTIVE_KEY, False):
+                current_type = st.session_state.get(BIG_TRACKER_TYPE_KEY, scan_type)
+                _render_big_movement_scan(fyers, current_type, strike_count=40)
+            else:
+                st.info("Live Big Movement Tracker stopped.")
+
+        _live_big_movement_section()
+    else:
+        if auto_scan and not hasattr(st, "fragment"):
+            st.warning(
+                "ఈ Streamlit version లో fragment auto-refresh లేదు. "
+                "Manual REFRESH NOW ఉపయోగించండి; Streamlit 1.56+ అవసరం."
+            )
+        _render_big_movement_scan(fyers, scan_type, strike_count=40)
+
+
 def _render_multi_blast_watchlist(fyers=None, big_tab=False):
     if big_tab:
         st.markdown("### 🚨 TOP BLASTING STRIKES — INDEX + F&O CE/PE")
@@ -6674,12 +6727,14 @@ def run_dashboard(fyers: Any = None) -> None:
     if movement_search_cfg.get("total_fno_clicked"):
         _render_total_fno_movement_search(fyers, strike_count=40)
 
-    # ADDITIVE BIG-MOVEMENT REPORTS — old scanner/report logic remains untouched.
+    # ADDITIVE BIG-MOVEMENT LIVE DASHBOARD — isolated timed fragment.
+    # Old option-chain tabs, Greeks, GEX/DEX, pressure and scanner logic are untouched.
     if movement_search_cfg.get("big_tracker_active"):
-        _render_big_movement_scan(
+        _render_big_movement_live_fragment(
             fyers,
             movement_search_cfg.get("big_tracker_type", "INDEX"),
-            strike_count=40,
+            movement_search_cfg.get("live_tracker_interval", 20),
+            auto_scan=movement_search_cfg.get("live_tracker_auto", True),
         )
 
     cfg["fetch_clicked"] = bool(cfg.get("fetch_clicked") or run_clicked or refresh_clicked)
@@ -6715,13 +6770,8 @@ def run_dashboard(fyers: Any = None) -> None:
     state = st.session_state.get("oc_state")
     if state is None:
         st.info("👈 Choose an instrument and click **Fetch Live Data**.")
-        # Keep the independent Movement Tracker running even before the
-        # main option-chain dashboard has been fetched.
-        if (st.session_state.get(BIG_TRACKER_ACTIVE_KEY, False)
-                and movement_search_cfg.get("live_tracker_auto", True)):
-            interval = int(movement_search_cfg.get("live_tracker_interval", 20))
-            time.sleep(max(10, interval))
-            st.rerun()
+        # The independent Big Movement fragment above keeps refreshing even
+        # before the main option-chain dashboard has been fetched.
         return
 
     df: pd.DataFrame = state["df"]
@@ -7251,14 +7301,6 @@ def run_dashboard(fyers: Any = None) -> None:
         f"**NSE Options + FYERS Price Action + Buy/Sell Pressure** | Last: {meta.get('fetched_at', datetime.now()).strftime('%H:%M:%S')} | "
         "Educational tool — not financial advice."
     )
-
-    if (
-        st.session_state.get(BIG_TRACKER_ACTIVE_KEY, False)
-        and movement_search_cfg.get("live_tracker_auto", True)
-    ):
-        interval = int(movement_search_cfg.get("live_tracker_interval", 20))
-        time.sleep(max(10, interval))
-        st.rerun()
 
     if cfg["auto_refresh"]:
         time.sleep(cfg["refresh_secs"])
