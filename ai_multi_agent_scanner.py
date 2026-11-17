@@ -874,15 +874,19 @@ def _agent_result(direction="WAIT", score=0, reason="No clear setup"):
     return {"direction": direction, "score": int(score), "reason": reason}
 
 
-def _liquidity_levels_and_sweeps(df, lookback=30):
-    """Detect swing/equal-high and swing/equal-low liquidity, then confirm sweeps."""
+def _liquidity_levels_and_sweeps(df, lookback=30, timeframe_minutes=15):
+    """Detect liquidity levels and confirmed sweeps with their candle-close times in IST."""
     empty = {
         "Buy-side Liquidity": None, "Sell-side Liquidity": None,
+        "Buy-side Liquidity Time (IST)": None, "Sell-side Liquidity Time (IST)": None,
         "Equal High Liquidity": "NO", "Equal Low Liquidity": "NO",
         "Upside Sweep": "NO", "Downside Sweep": "NO",
+        "Upside Sweep Time (IST)": None, "Downside Sweep Time (IST)": None,
         "Liquidity Sweep Detail": "NO DATA",
     }
-    if df is None or not isinstance(df, pd.DataFrame) or len(df) < max(lookback + 1, 25):
+    required = {"Time", "Open", "High", "Low", "Close", "Volume"}
+    if (df is None or not isinstance(df, pd.DataFrame) or not required.issubset(df.columns)
+            or len(df) < max(lookback + 1, 25)):
         return empty
     d = df.tail(lookback + 1).reset_index(drop=True)
     prior, last = d.iloc[:-1], d.iloc[-1]
@@ -890,20 +894,25 @@ def _liquidity_levels_and_sweeps(df, lookback=30):
     lows = prior["Low"].astype(float).to_numpy()
     close_prev = float(prior["Close"].iloc[-1])
     close_now = _safe_num(last["Close"])
-    # Use confirmed local pivots (one candle on each side), excluding the live/latest bar.
     swing_highs, swing_lows = [], []
     for i in range(1, len(prior)-1):
         if highs[i] >= highs[i-1] and highs[i] > highs[i+1]:
-            swing_highs.append(highs[i])
+            swing_highs.append((i, highs[i]))
         if lows[i] <= lows[i-1] and lows[i] < lows[i+1]:
-            swing_lows.append(lows[i])
-    ref_highs = swing_highs or list(highs[-min(lookback, len(highs)):])
-    ref_lows = swing_lows or list(lows[-min(lookback, len(lows)):])
-    buy_liq, sell_liq = max(ref_highs), min(ref_lows)
-    # Equal levels: two or more confirmed pivots clustered within 0.15%.
+            swing_lows.append((i, lows[i]))
+    if swing_highs:
+        buy_idx, buy_liq = max(swing_highs, key=lambda item: item[1])
+    else:
+        buy_idx = int(np.argmax(highs))
+        buy_liq = float(highs[buy_idx])
+    if swing_lows:
+        sell_idx, sell_liq = min(swing_lows, key=lambda item: item[1])
+    else:
+        sell_idx = int(np.argmin(lows))
+        sell_liq = float(lows[sell_idx])
     eq_tol = max(abs(close_prev) * 0.0015, 1e-9)
-    equal_high = any(abs(a-b) <= eq_tol for i, a in enumerate(swing_highs) for b in swing_highs[i+1:])
-    equal_low = any(abs(a-b) <= eq_tol for i, a in enumerate(swing_lows) for b in swing_lows[i+1:])
+    equal_high = any(abs(a[1]-b[1]) <= eq_tol for i, a in enumerate(swing_highs) for b in swing_highs[i+1:])
+    equal_low = any(abs(a[1]-b[1]) <= eq_tol for i, a in enumerate(swing_lows) for b in swing_lows[i+1:])
     high, low = _safe_num(last["High"]), _safe_num(last["Low"])
     opn = _safe_num(last["Open"])
     span = max(high-low, 1e-9)
@@ -914,6 +923,22 @@ def _liquidity_levels_and_sweeps(df, lookback=30):
                   and close_now < opn and rvol >= 1.05)
     downside = bool(low < sell_liq and close_now > sell_liq and lower_wick/span >= .30
                     and close_now > opn and rvol >= 1.05)
+
+    def _close_time(value):
+        try:
+            ts = pd.Timestamp(value)
+            ts = ts.tz_localize(IST) if ts.tzinfo is None else ts.tz_convert(IST)
+            if timeframe_minutes == 60 and ts.hour == 15 and ts.minute == 15:
+                ts = ts.normalize() + SESSION_CLOSE
+            else:
+                ts += pd.Timedelta(minutes=int(timeframe_minutes))
+            return ts.strftime("%Y-%m-%d %H:%M:%S IST")
+        except Exception:
+            return None
+
+    buy_time = _close_time(prior["Time"].iloc[buy_idx])
+    sell_time = _close_time(prior["Time"].iloc[sell_idx])
+    trigger_time = _close_time(last["Time"])
     if upside and downside:
         detail = "BOTH-SIDE SWEEP — WAIT FOR NEXT CANDLE"
     elif upside:
@@ -924,9 +949,12 @@ def _liquidity_levels_and_sweeps(df, lookback=30):
         detail = "NO CONFIRMED SWEEP"
     return {
         "Buy-side Liquidity": round(buy_liq, 2), "Sell-side Liquidity": round(sell_liq, 2),
+        "Buy-side Liquidity Time (IST)": buy_time, "Sell-side Liquidity Time (IST)": sell_time,
         "Equal High Liquidity": "YES" if equal_high else "NO",
         "Equal Low Liquidity": "YES" if equal_low else "NO",
         "Upside Sweep": "YES" if upside else "NO", "Downside Sweep": "YES" if downside else "NO",
+        "Upside Sweep Time (IST)": trigger_time if upside else None,
+        "Downside Sweep Time (IST)": trigger_time if downside else None,
         "Liquidity Sweep Detail": detail,
     }
 
@@ -2190,11 +2218,11 @@ def _make_result_row(symbol, yahoo_symbol, payload):
     else:
         row["Pre-Move 15M Alignment"] = "NOT APPLICABLE"
     for tf in TIMEFRAMES:
-        liquidity = _liquidity_levels_and_sweeps(frames.get(tf, pd.DataFrame()))
+        liquidity = _liquidity_levels_and_sweeps(frames.get(tf, pd.DataFrame()), timeframe_minutes=TIMEFRAMES[tf][1])
         for key, value in liquidity.items():
             row[f"{tf} {key}"] = value
     # Keep simple unprefixed fields for the main report, using 15M as the reference.
-    row.update(_liquidity_levels_and_sweeps(frame_15m))
+    row.update(_liquidity_levels_and_sweeps(frame_15m, timeframe_minutes=15))
     row.update(_breakout_breakdown_signal(frame_15m))
     row.update(_multi_tf_breakout(frames))
     main_break = row.get("Breakout Signal", "WAIT")
@@ -3247,7 +3275,9 @@ def _build_excel(result, stamp):
             )
             top_cols = [c for c in [
                 "Symbol", "Action Signal", "Final Signal", "Best Stock Score",
-                "Confirmation Strength %", "Last Price", "Breakout Signal",
+                "Confirmation Strength %", "Last Price", "Buy-side Liquidity", "Buy-side Liquidity Time (IST)",
+                "Sell-side Liquidity", "Sell-side Liquidity Time (IST)", "Upside Sweep", "Upside Sweep Time (IST)",
+                "Downside Sweep", "Downside Sweep Time (IST)", "Breakout Signal",
                 "Multi-TF Breakout", "Breakout Retest", "AI Direction",
                 "AI Up Model Estimate %", "AI Down Model Estimate %", "AI Brain Signal",
             ] if c in result.columns]
@@ -3872,7 +3902,9 @@ def show_ai_multi_agent_scanner(client=None):
             result[col_name] = default_value
     liquidity_defaults = {
         "Buy-side Liquidity": None, "Sell-side Liquidity": None,
+        "Buy-side Liquidity Time (IST)": None, "Sell-side Liquidity Time (IST)": None,
         "Upside Sweep": "NO DATA", "Downside Sweep": "NO DATA",
+        "Upside Sweep Time (IST)": None, "Downside Sweep Time (IST)": None,
         "Equal High Liquidity": "NO DATA", "Equal Low Liquidity": "NO DATA",
         "Liquidity Sweep Detail": "Run a fresh scan for liquidity levels",
     }
@@ -4027,6 +4059,30 @@ def show_ai_multi_agent_scanner(client=None):
     except Exception as event_exc:
         st.warning(f"Live signal event save issue: {event_exc}")
 
+    # Liquidity & sweep event-time panel (15M reference; timestamps are completed-candle close times).
+    st.subheader("💧 BUY / SELL LIQUIDITY + SWEEP SIGNAL TIME (IST)")
+    liquidity_time_cols = [
+        "Symbol", "Last Price", "Buy-side Liquidity", "Buy-side Liquidity Time (IST)",
+        "Sell-side Liquidity", "Sell-side Liquidity Time (IST)",
+        "Upside Sweep", "Upside Sweep Time (IST)",
+        "Downside Sweep", "Downside Sweep Time (IST)", "Liquidity Sweep Detail",
+        "15M Buy-side Liquidity", "15M Buy-side Liquidity Time (IST)",
+        "15M Sell-side Liquidity", "15M Sell-side Liquidity Time (IST)",
+        "15M Upside Sweep", "15M Upside Sweep Time (IST)",
+        "15M Downside Sweep", "15M Downside Sweep Time (IST)",
+    ]
+    liquidity_time_cols = [c for c in liquidity_time_cols if c in result.columns]
+    liquidity_event_mask = (
+        result.get("15M Upside Sweep", pd.Series("NO", index=result.index)).eq("YES")
+        | result.get("15M Downside Sweep", pd.Series("NO", index=result.index)).eq("YES")
+    )
+    liquidity_panel = result.loc[liquidity_event_mask, liquidity_time_cols].copy()
+    if not liquidity_panel.empty:
+        st.dataframe(liquidity_panel, hide_index=True, height=300, **_stretch())
+    else:
+        st.info("ప్రస్తుతం 15M completed candleలో confirmed Sweep Up / Sweep Down signal లేదు. Liquidity levels మరియు వాటి formation times క్రింది main reportలో ఉంటాయి.")
+    st.caption("Liquidity Time = ఆ liquidity level ఏర్పడిన pivot candle close time. Sweep Time = sweep confirm అయిన completed candle close time. అన్ని timestamps IST.")
+
     st.subheader("🚀 V18 ADVANCED BIG MOVEMENT — FALSE BREAKOUT + CONTINUATION")
     advanced_cols = [c for c in [
         "Symbol", "Last Price", "Advanced Big Move", "Big Move Direction", "Big Move Score",
@@ -4128,10 +4184,10 @@ def show_ai_multi_agent_scanner(client=None):
         "5M Candle Close (IST)", "15M Candle Close (IST)", "1H Candle Close (IST)",
         "Entry Price", "Stop Loss", "15M ATR",
         "Confirmation Strength %", "Consensus Score",
-        "Buy-side Liquidity", "Sell-side Liquidity", "Upside Sweep", "Downside Sweep", "Liquidity Sweep Detail",
-        "5M Buy-side Liquidity", "5M Sell-side Liquidity", "5M Upside Sweep", "5M Downside Sweep",
-        "15M Buy-side Liquidity", "15M Sell-side Liquidity", "15M Upside Sweep", "15M Downside Sweep",
-        "1H Buy-side Liquidity", "1H Sell-side Liquidity", "1H Upside Sweep", "1H Downside Sweep",
+        "Buy-side Liquidity", "Buy-side Liquidity Time (IST)", "Sell-side Liquidity", "Sell-side Liquidity Time (IST)", "Upside Sweep", "Upside Sweep Time (IST)", "Downside Sweep", "Downside Sweep Time (IST)", "Liquidity Sweep Detail",
+        "5M Buy-side Liquidity", "5M Buy-side Liquidity Time (IST)", "5M Sell-side Liquidity", "5M Sell-side Liquidity Time (IST)", "5M Upside Sweep", "5M Upside Sweep Time (IST)", "5M Downside Sweep", "5M Downside Sweep Time (IST)",
+        "15M Buy-side Liquidity", "15M Buy-side Liquidity Time (IST)", "15M Sell-side Liquidity", "15M Sell-side Liquidity Time (IST)", "15M Upside Sweep", "15M Upside Sweep Time (IST)", "15M Downside Sweep", "15M Downside Sweep Time (IST)",
+        "1H Buy-side Liquidity", "1H Buy-side Liquidity Time (IST)", "1H Sell-side Liquidity", "1H Sell-side Liquidity Time (IST)", "1H Upside Sweep", "1H Upside Sweep Time (IST)", "1H Downside Sweep", "1H Downside Sweep Time (IST)",
         "AI Direction", "AI Up Model Estimate %", "AI Down Model Estimate %",
         "AI Sideways Model Estimate %", "AI Brain Signal", "AI Model Status",
         "Advanced Big Move", "Big Move Direction", "Big Move Score", "False Breakout Risk",
