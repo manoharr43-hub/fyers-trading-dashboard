@@ -1,6 +1,6 @@
 """
 AI Multi-Agent Scanner for NSE AI PRO V18 — ADVANCED BIG MOVEMENT
-Yahoo Finance batch edition — advanced movement + false-breakout audit.
+Yahoo Finance batch edition — advanced movement + false-breakout audit + Live Dashboard.
 
 - scanner.py only supplies the NSE / F&O symbol universe; this module combines both loaders without modifying scanner.py.
 - Yahoo Finance supplies all OHLCV candles and technical-analysis data.
@@ -13,6 +13,7 @@ Yahoo Finance batch edition — advanced movement + false-breakout audit.
 - 5M PRE-BIG requires at least 13 completed candles in the current NSE session (12-bar base + completed trigger candle).
 - AI model vote fractions are labelled MODEL ESTIMATES, never probabilities without calibrated out-of-sample trade backtesting.
 - Optional Yahoo headline context for the strongest technical shortlist.
+- Live Dashboard: one-minute display refresh, immutable signal events, and 1/5/10/15/30-minute Yahoo price snapshots.
 - Compatible entry point: show_ai_multi_agent_scanner(client=None)
 
 requirements.txt:
@@ -155,6 +156,36 @@ def _memory_connect():
                         PRIMARY KEY(job_id, symbol))""")
                     conn.execute("CREATE INDEX IF NOT EXISTS idx_scan_jobs_status ON scan_jobs(status, updated_at)")
                     conn.execute("CREATE INDEX IF NOT EXISTS idx_scan_history_time ON scan_history(scanned_at)")
+                    # Durable event ledger for the Live Dashboard. A signal event is
+                    # immutable; later price updates are stored separately as snapshots.
+                    conn.execute("""CREATE TABLE IF NOT EXISTS signal_events (
+                        event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        event_key TEXT NOT NULL UNIQUE,
+                        symbol TEXT NOT NULL,
+                        yahoo_symbol TEXT,
+                        signal_type TEXT NOT NULL,
+                        direction TEXT,
+                        signal_price REAL,
+                        signal_time_ist TEXT NOT NULL,
+                        created_at_ist TEXT NOT NULL,
+                        current_price REAL,
+                        current_price_time_ist TEXT,
+                        data_status TEXT DEFAULT 'WAITING',
+                        status TEXT DEFAULT 'ACTIVE'
+                    )""")
+                    conn.execute("""CREATE TABLE IF NOT EXISTS signal_price_snapshots (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        event_id INTEGER NOT NULL,
+                        elapsed_minutes INTEGER NOT NULL,
+                        price REAL NOT NULL,
+                        price_time_ist TEXT NOT NULL,
+                        change_pct REAL,
+                        FOREIGN KEY(event_id) REFERENCES signal_events(event_id),
+                        UNIQUE(event_id, elapsed_minutes)
+                    )""")
+                    conn.execute("CREATE INDEX IF NOT EXISTS idx_signal_events_created ON signal_events(created_at_ist)")
+                    conn.execute("CREATE INDEX IF NOT EXISTS idx_signal_events_status ON signal_events(status, symbol)")
+                    conn.execute("CREATE INDEX IF NOT EXISTS idx_signal_snapshots_event ON signal_price_snapshots(event_id)")
                     # One-time cleanup of legacy partial 15:15 1H bars saved by older versions.
                     conn.execute("DELETE FROM candles WHERE timeframe='1H' AND substr(candle_time,12,5)='15:15'")
                     conn.commit()
@@ -299,6 +330,298 @@ def _memory_stats():
         return candles, scans, symbols
     except Exception:
         return 0, 0, 0
+
+
+# Live Dashboard configuration. Dashboard refresh is separate from a full market scan.
+LIVE_DASHBOARD_REFRESH_SECONDS = 60
+LIVE_TRACKING_MINUTES = (1, 5, 10, 15, 30)
+LIVE_EVENT_MAX_AGE_MINUTES = 180
+LIVE_YAHOO_BATCH_SIZE = 50
+_LIVE_PRICE_REFRESH_LOCK = threading.Lock()
+_LIVE_PRICE_LAST_REFRESH_MONOTONIC = 0.0
+
+
+def _as_ist_timestamp(value):
+    """Parse timestamps safely and return a timezone-aware IST Timestamp."""
+    try:
+        ts = pd.Timestamp(value)
+        if pd.isna(ts):
+            return None
+        if ts.tzinfo is None:
+            return ts.tz_localize(IST)
+        return ts.tz_convert(IST)
+    except Exception:
+        return None
+
+
+def _capture_signal_events(result):
+    """Persist each newly detected actionable/pre-big/confirmed-breakout event once."""
+    if not isinstance(result, pd.DataFrame) or result.empty:
+        return 0
+    now = datetime.now(IST)
+    now_text = now.isoformat(timespec="seconds")
+    rows = []
+    actionable = {"BUY", "SELL", "PRE-BIG BUY", "PRE-BIG SELL"}
+    for _, row in result.iterrows():
+        symbol = str(row.get("Symbol", "")).strip()
+        if not symbol:
+            continue
+        final_signal = str(row.get("Final Signal", "WAIT") or "WAIT").strip().upper()
+        breakout = str(row.get("Breakout Signal", "WAIT") or "WAIT").strip().upper()
+        advanced = str(row.get("Advanced Big Move", "") or "").strip().upper()
+        signal_type = None
+        direction = None
+        if final_signal in actionable:
+            direction = "UP" if "BUY" in final_signal else "DOWN"
+            if breakout in ("BREAKOUT", "BREAKDOWN"):
+                signal_type = f"{final_signal} / CONFIRMED {breakout}"
+            elif advanced in ("BREAKOUT CONFIRMED", "BREAKDOWN CONFIRMED"):
+                signal_type = f"{final_signal} / {advanced}"
+            else:
+                signal_type = final_signal
+        elif breakout in ("BREAKOUT", "BREAKDOWN"):
+            signal_type = f"CONFIRMED {breakout}"
+            direction = "UP" if breakout == "BREAKOUT" else "DOWN"
+        elif advanced in ("BREAKOUT CONFIRMED", "BREAKDOWN CONFIRMED"):
+            signal_type = advanced
+            direction = "UP" if advanced == "BREAKOUT CONFIRMED" else "DOWN"
+        if not signal_type:
+            continue
+
+        candle_time = _as_ist_timestamp(row.get("Signal Time (IST)"))
+        if candle_time is None:
+            # Do not invent a candle timestamp; skip rows without a valid source time.
+            continue
+        price = _safe_num(row.get("Last Price"), 0.0)
+        if price <= 0:
+            price = _safe_num(row.get("Entry Price"), 0.0)
+        if price <= 0:
+            continue
+        yahoo_symbol = str(row.get("Yahoo Symbol", "") or "").strip()
+        candle_time_text = candle_time.isoformat(timespec="seconds")
+        event_key = f"{symbol}|{signal_type}|{candle_time_text}"
+        rows.append((event_key, symbol, yahoo_symbol, signal_type, direction,
+                     float(price), candle_time_text, now_text, now_text))
+
+    if not rows:
+        return 0
+    with _memory_connect() as conn:
+        before = conn.total_changes
+        conn.executemany("""INSERT OR IGNORE INTO signal_events
+            (event_key,symbol,yahoo_symbol,signal_type,direction,signal_price,
+             signal_time_ist,created_at_ist,current_price_time_ist,data_status,status)
+            VALUES (?,?,?,?,?,?,?,?,?,'WAITING','ACTIVE')""", rows)
+        return conn.total_changes - before
+
+
+def _load_live_signal_events(limit=300):
+    """Load recent event ledger rows and their fixed-interval snapshots."""
+    try:
+        with _memory_connect() as conn:
+            events = pd.read_sql_query("""SELECT event_id,event_key,symbol,yahoo_symbol,
+                signal_type,direction,signal_price,signal_time_ist,created_at_ist,
+                current_price,current_price_time_ist,data_status,status
+                FROM signal_events ORDER BY created_at_ist DESC LIMIT ?""", conn, params=(int(limit),))
+            snapshots = pd.read_sql_query("""SELECT event_id,elapsed_minutes,price,
+                price_time_ist,change_pct FROM signal_price_snapshots
+                ORDER BY event_id,elapsed_minutes""", conn)
+        return events, snapshots
+    except Exception:
+        return pd.DataFrame(), pd.DataFrame()
+
+
+def _refresh_live_signal_prices():
+    """Refresh only symbols with active signal events; never launches a full NSE scan."""
+    global _LIVE_PRICE_LAST_REFRESH_MONOTONIC
+    if yf is None or not _is_market_hours():
+        return {"updated": 0, "error": None, "symbols": 0, "skipped": True}
+    with _LIVE_PRICE_REFRESH_LOCK:
+        monotonic_now = time.monotonic()
+        if monotonic_now - _LIVE_PRICE_LAST_REFRESH_MONOTONIC < 55:
+            return {"updated": 0, "error": None, "symbols": 0, "skipped": True}
+        _LIVE_PRICE_LAST_REFRESH_MONOTONIC = monotonic_now
+    now = datetime.now(IST)
+    cutoff = (now - pd.Timedelta(minutes=LIVE_EVENT_MAX_AGE_MINUTES)).isoformat(timespec="seconds")
+    with _memory_connect() as conn:
+        active = pd.read_sql_query("""SELECT event_id,symbol,yahoo_symbol,signal_price,created_at_ist
+            FROM signal_events WHERE status='ACTIVE' AND created_at_ist>=?
+            ORDER BY created_at_ist DESC""", conn, params=(cutoff,))
+        conn.execute("UPDATE signal_events SET status='EXPIRED' WHERE status='ACTIVE' AND created_at_ist<?", (cutoff,))
+    if active.empty:
+        return {"updated": 0, "error": None, "symbols": 0}
+
+    ticker_map = {}
+    for _, item in active.iterrows():
+        ticker = str(item.get("yahoo_symbol") or "").strip()
+        if not ticker:
+            ticker = _to_yahoo_symbol(str(item.get("symbol", "")))
+        if ticker:
+            ticker_map[ticker] = str(item.get("symbol", ""))
+    tickers = list(ticker_map)
+    if not tickers:
+        return {"updated": 0, "error": "No valid Yahoo symbols in active events.", "symbols": 0}
+
+    updated = 0
+    try:
+        # Yahoo 1-minute history is used only for the event-ledger symbols.
+        # Chunking limits oversized requests; provider throttling can still occur.
+        for start in range(0, len(tickers), LIVE_YAHOO_BATCH_SIZE):
+            batch = tuple(tickers[start:start + LIVE_YAHOO_BATCH_SIZE])
+            with _YF_LOCK:
+                data = yf.download(
+                    tickers=list(batch), period="1d", interval="1m",
+                    auto_adjust=False, actions=False, progress=False,
+                    threads=False, group_by="ticker", timeout=20,
+                )
+            if data is None or data.empty:
+                continue
+            for ticker in batch:
+                frame = _extract_one_ticker(data, ticker)
+                if frame is None or frame.empty or "Close" not in frame.columns:
+                    continue
+                close = pd.to_numeric(frame["Close"], errors="coerce").dropna()
+                if close.empty:
+                    continue
+                index = pd.to_datetime(close.index, errors="coerce")
+                if getattr(index, "tz", None) is None:
+                    index = index.tz_localize(IST)
+                else:
+                    index = index.tz_convert(IST)
+                prices = pd.DataFrame({"time": index, "price": close.to_numpy()}).dropna()
+                prices = prices[prices["price"] > 0].sort_values("time")
+                if prices.empty:
+                    continue
+                latest = prices.iloc[-1]
+                latest_time = pd.Timestamp(latest["time"]).isoformat(timespec="seconds")
+                latest_price = float(latest["price"])
+                ticker_events = active[active["yahoo_symbol"].astype(str) == ticker]
+                if ticker_events.empty:
+                    ticker_events = active[active["symbol"].astype(str) == ticker_map.get(ticker, "")]
+
+                with _memory_connect() as conn:
+                    for _, event in ticker_events.iterrows():
+                        event_id = int(event["event_id"])
+                        signal_price = _safe_num(event.get("signal_price"), 0.0)
+                        conn.execute("""UPDATE signal_events SET current_price=?,
+                            current_price_time_ist=?,data_status='YAHOO 1M' WHERE event_id=?""",
+                            (latest_price, latest_time, event_id))
+                        updated += 1
+                        created = _as_ist_timestamp(event.get("created_at_ist"))
+                        if created is None:
+                            continue
+                        for target in LIVE_TRACKING_MINUTES:
+                            target_time = created + pd.Timedelta(minutes=target)
+                            # Pick the nearest available 1M candle to the target point.
+                            diffs = (prices["time"] - target_time).abs()
+                            nearest_idx = diffs.idxmin()
+                            if pd.isna(nearest_idx) or float(diffs.loc[nearest_idx].total_seconds()) > 180:
+                                continue
+                            snap = prices.loc[nearest_idx]
+                            snap_price = float(snap["price"])
+                            snap_time = pd.Timestamp(snap["time"]).isoformat(timespec="seconds")
+                            change_pct = ((snap_price / signal_price) - 1.0) * 100.0 if signal_price > 0 else None
+                            conn.execute("""INSERT OR IGNORE INTO signal_price_snapshots
+                                (event_id,elapsed_minutes,price,price_time_ist,change_pct)
+                                VALUES (?,?,?,?,?)""",
+                                (event_id, int(target), snap_price, snap_time, change_pct))
+        return {"updated": updated, "error": None, "symbols": len(tickers)}
+    except Exception as exc:
+        return {"updated": updated, "error": str(exc)[:300], "symbols": len(tickers)}
+
+
+def _render_live_dashboard_body():
+    """Render dashboard using SQLite; price refresh is throttled by the fragment clock."""
+    refresh_result = _refresh_live_signal_prices()
+    events, snapshots = _load_live_signal_events()
+    st.subheader("📡 LIVE MARKET DASHBOARD")
+    st.caption("Dashboard refresh: 60 seconds • Signal scan and dashboard refresh are separate • Prices: Yahoo Finance 1M feed")
+    if refresh_result.get("error"):
+        st.warning(f"Yahoo price update issue: {refresh_result['error']}. Last saved prices are retained and labelled by age.")
+
+    if events.empty:
+        cols = st.columns(4)
+        for col, label in zip(cols, ("Active Signals", "Fresh Signals", "Breakout Events", "Tracked Stocks")):
+            col.metric(label, "0")
+        st.info("No signal events saved yet. Run the V18 scanner once; newly detected signals will appear here and remain in SQLite.")
+        st.divider()
+        return
+
+    now = pd.Timestamp.now(tz=IST)
+    events["_created"] = pd.to_datetime(events["created_at_ist"], errors="coerce", utc=True).dt.tz_convert(IST)
+    events["_age_min"] = (now - events["_created"]).dt.total_seconds() / 60.0
+    events["_age_min"] = events["_age_min"].clip(lower=0)
+    events["Signal Age"] = events["_age_min"].map(lambda x: f"{int(x)} min" if pd.notna(x) else "UNKNOWN")
+    events["Price Change %"] = np.where(
+        pd.to_numeric(events["signal_price"], errors="coerce") > 0,
+        (pd.to_numeric(events["current_price"], errors="coerce") /
+         pd.to_numeric(events["signal_price"], errors="coerce") - 1.0) * 100.0,
+        np.nan,
+    )
+    update_times = pd.to_datetime(events["current_price_time_ist"], errors="coerce", utc=True).dt.tz_convert(IST)
+    update_age = (now - update_times).dt.total_seconds() / 60.0
+    events["Price Data Status"] = np.where(
+        update_times.isna(), "NO DATA",
+        np.where(update_age <= 3, "YAHOO UPDATED", np.where(update_age <= 10, "DELAYED", "STALE")),
+    )
+    active = events[events["status"] == "ACTIVE"].copy()
+    fresh = active[active["_age_min"] <= 5].copy()
+    breakout_mask = events["signal_type"].astype(str).str.contains("BREAKOUT|BREAKDOWN", case=False, regex=True)
+    existing_breakouts = events[breakout_mask].copy()
+    cols = st.columns(4)
+    cols[0].metric("Active Signals", f"{len(active):,}")
+    cols[1].metric("Fresh Signals ≤ 5m", f"{len(fresh):,}")
+    cols[2].metric("Breakout / Breakdown Events", f"{len(existing_breakouts):,}")
+    cols[3].metric("Tracked Stocks", f"{events['symbol'].nunique():,}")
+
+    display_cols = ["symbol", "signal_type", "signal_price", "current_price", "Price Change %",
+                    "created_at_ist", "Signal Age", "Price Data Status", "status"]
+    labels = {"symbol": "Stock", "signal_type": "Signal", "signal_price": "Signal Price",
+              "current_price": "Current Price", "created_at_ist": "Detected Time (IST)",
+              "status": "Event Status"}
+    st.markdown("#### 🟢 FRESH SIGNALS")
+    if fresh.empty:
+        st.caption("No signal detected in the last 5 minutes.")
+    else:
+        st.dataframe(fresh[display_cols].rename(columns=labels).head(100), hide_index=True, **_stretch())
+
+    st.markdown("#### ⚡ EXISTING BREAKOUT / BREAKDOWN STOCKS")
+    if existing_breakouts.empty:
+        st.caption("No confirmed breakout / breakdown event has been recorded yet.")
+    else:
+        st.dataframe(existing_breakouts[display_cols].rename(columns=labels).head(150), hide_index=True, **_stretch())
+
+    st.markdown("#### 📈 ALL RECENT SIGNALS + PRICE TRACKING")
+    recent = events.head(150).copy()
+    if snapshots.empty:
+        st.caption("Price snapshots will populate when Yahoo 1M candles become available at the 1/5/10/15/30-minute checkpoints.")
+    else:
+        snap_view = snapshots[snapshots["event_id"].isin(recent["event_id"])].copy()
+        if not snap_view.empty:
+            pivot = snap_view.pivot_table(index="event_id", columns="elapsed_minutes", values="price", aggfunc="last")
+            pivot.columns = [f"Price +{int(c)}m" for c in pivot.columns]
+            recent = recent.merge(pivot, left_on="event_id", right_index=True, how="left")
+    track_cols = ["symbol", "signal_type", "signal_price", "current_price", "Price Change %",
+                  "Signal Age", "Price Data Status"] + [c for c in recent.columns if c.startswith("Price +")]
+    st.dataframe(recent[track_cols].rename(columns=labels), hide_index=True, **_stretch())
+
+    with st.expander("Signal event detail — candle time and snapshot timestamps"):
+        detail_cols = ["symbol", "signal_type", "signal_time_ist", "created_at_ist", "yahoo_symbol", "data_status", "status"]
+        st.dataframe(events[detail_cols].head(100), hide_index=True, **_stretch())
+        st.caption("Signal candle time is the completed 15M candle timestamp from V18. Detected Time is when this scanner run first recorded the event; 1/5/10/15/30-minute tracking is measured from Detected Time.")
+    st.caption(f"Last dashboard refresh: {datetime.now(IST).strftime('%Y-%m-%d %H:%M:%S IST')} • Updated event rows: {refresh_result.get('updated', 0)} • Yahoo symbols requested: {refresh_result.get('symbols', 0)}")
+    st.divider()
+
+
+def _render_live_dashboard():
+    """One-minute Streamlit fragment; falls back to a normal render on older versions."""
+    if hasattr(st, "fragment"):
+        @st.fragment(run_every="60s")
+        def _live_dashboard_fragment():
+            _render_live_dashboard_body()
+        _live_dashboard_fragment()
+    else:
+        st.info("Automatic 60-second dashboard refresh needs Streamlit fragments. Showing the latest saved dashboard data.")
+        _render_live_dashboard_body()
 
 
 def _is_market_hours(now=None):
@@ -3103,8 +3426,9 @@ def _load_latest_prescan_to_local_job(universe, batch_size=50, period="59d", dep
 
 def show_ai_multi_agent_scanner(client=None):
     """Streamlit page. client is retained for app.py compatibility."""
-    st.title("🚀 NSE AI PRO V18 — Advanced Big Movement Scanner")
-    st.caption("17 OHLCV agents × 5M / 15M / 1H + supervised ML AI Brain + optional 1M / News")
+    st.title("🚀 NSE AI PRO V18 — LIVE MARKET DASHBOARD + SCANNER")
+    st.caption("Live Dashboard first • 17 OHLCV agents × 5M / 15M / 1H + supervised ML AI Brain + optional 1M / News")
+    _render_live_dashboard()
     st.info("scanner.py supplies NSE/F&O symbols only (unchanged). Yahoo Finance supplies candles. FYERS is used only for 5-level Market Depth on the technical shortlist.")
     st.caption("Smart Memory: SQLite candles are loaded first; after the initial warm-up, the scanner refreshes a short 2-day overlap and merges it with saved candles. For speed, the extra 1M/20M scan is optional.")
     st.warning(
@@ -3694,6 +4018,14 @@ def show_ai_multi_agent_scanner(client=None):
             str(st.session_state.get("ma_real_ai_train_error") or "training data not available") +
             " Collect more completed 5M candle history and press TRAIN / REFRESH."
         )
+
+    # Idempotent event capture: repeated Streamlit reruns do not create duplicate events.
+    try:
+        new_events = _capture_signal_events(result)
+        if new_events:
+            st.caption(f"Live Dashboard: {new_events} new signal event(s) saved to SQLite.")
+    except Exception as event_exc:
+        st.warning(f"Live signal event save issue: {event_exc}")
 
     st.subheader("🚀 V18 ADVANCED BIG MOVEMENT — FALSE BREAKOUT + CONTINUATION")
     advanced_cols = [c for c in [
