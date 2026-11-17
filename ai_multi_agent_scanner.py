@@ -186,6 +186,20 @@ def _memory_connect():
                     conn.execute("CREATE INDEX IF NOT EXISTS idx_signal_events_created ON signal_events(created_at_ist)")
                     conn.execute("CREATE INDEX IF NOT EXISTS idx_signal_events_status ON signal_events(status, symbol)")
                     conn.execute("CREATE INDEX IF NOT EXISTS idx_signal_snapshots_event ON signal_price_snapshots(event_id)")
+                    # Separate immutable ledger for liquidity levels and confirmed sweeps.
+                    # Kept separate from signal_events so existing Active/Fresh counters do not change.
+                    conn.execute("""CREATE TABLE IF NOT EXISTS liquidity_sweep_events (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        event_key TEXT NOT NULL UNIQUE,
+                        symbol TEXT NOT NULL,
+                        timeframe TEXT NOT NULL,
+                        event_type TEXT NOT NULL,
+                        level REAL,
+                        direction TEXT,
+                        signal_time_ist TEXT NOT NULL,
+                        captured_at_ist TEXT NOT NULL
+                    )""")
+                    conn.execute("CREATE INDEX IF NOT EXISTS idx_liquidity_events_time ON liquidity_sweep_events(signal_time_ist)")
                     # One-time cleanup of legacy partial 15:15 1H bars saved by older versions.
                     conn.execute("DELETE FROM candles WHERE timeframe='1H' AND substr(candle_time,12,5)='15:15'")
                     conn.commit()
@@ -414,6 +428,102 @@ def _capture_signal_events(result):
         return conn.total_changes - before
 
 
+def _capture_liquidity_sweep_events(result):
+    """Persist liquidity pivot times and confirmed sweep candle times without changing signal counters."""
+    if not isinstance(result, pd.DataFrame) or result.empty:
+        return 0
+    now_text = datetime.now(IST).isoformat(timespec="seconds")
+    rows = []
+    frames = [
+        ("5M", "5M Buy-side Liquidity", "5M Buy-side Liquidity Time (IST)",
+         "5M Sell-side Liquidity", "5M Sell-side Liquidity Time (IST)",
+         "5M Upside Sweep", "5M Upside Sweep Time (IST)",
+         "5M Downside Sweep", "5M Downside Sweep Time (IST)"),
+        ("15M", "15M Buy-side Liquidity", "15M Buy-side Liquidity Time (IST)",
+         "15M Sell-side Liquidity", "15M Sell-side Liquidity Time (IST)",
+         "15M Upside Sweep", "15M Upside Sweep Time (IST)",
+         "15M Downside Sweep", "15M Downside Sweep Time (IST)"),
+        ("1H", "1H Buy-side Liquidity", "1H Buy-side Liquidity Time (IST)",
+         "1H Sell-side Liquidity", "1H Sell-side Liquidity Time (IST)",
+         "1H Upside Sweep", "1H Upside Sweep Time (IST)",
+         "1H Downside Sweep", "1H Downside Sweep Time (IST)"),
+    ]
+    for _, row in result.iterrows():
+        symbol = str(row.get("Symbol", "") or "").strip()
+        if not symbol:
+            continue
+        for tf, buy_col, buy_time_col, sell_col, sell_time_col, up_col, up_time_col, down_col, down_time_col in frames:
+            # The unprefixed fields are the scanner's primary 15M view.
+            if tf == "15M":
+                buy_col, buy_time_col = "Buy-side Liquidity", "Buy-side Liquidity Time (IST)"
+                sell_col, sell_time_col = "Sell-side Liquidity", "Sell-side Liquidity Time (IST)"
+                up_col, up_time_col = "Upside Sweep", "Upside Sweep Time (IST)"
+                down_col, down_time_col = "Downside Sweep", "Downside Sweep Time (IST)"
+            for event_type, level_col, time_col, direction in (
+                ("BUY LIQUIDITY", buy_col, buy_time_col, "BUY"),
+                ("SELL LIQUIDITY", sell_col, sell_time_col, "SELL"),
+                ("SWEEP UP", None, up_time_col, "SELL"),
+                ("SWEEP DOWN", None, down_time_col, "BUY"),
+            ):
+                if event_type == "SWEEP UP" and str(row.get(up_col, "NO")).upper() != "YES":
+                    continue
+                if event_type == "SWEEP DOWN" and str(row.get(down_col, "NO")).upper() != "YES":
+                    continue
+                stamp = _as_ist_timestamp(row.get(time_col))
+                if stamp is None:
+                    continue
+                level = _safe_num(row.get(level_col), np.nan) if level_col else np.nan
+                if event_type.endswith("LIQUIDITY") and not np.isfinite(level):
+                    continue
+                stamp_text = stamp.isoformat(timespec="seconds")
+                event_key = f"{symbol}|{tf}|{event_type}|{stamp_text}|{level if np.isfinite(level) else ''}"
+                rows.append((event_key, symbol, tf, event_type,
+                             float(level) if np.isfinite(level) else None,
+                             direction, stamp_text, now_text))
+    if not rows:
+        return 0
+    with _memory_connect() as conn:
+        before = conn.total_changes
+        conn.executemany("""INSERT OR IGNORE INTO liquidity_sweep_events
+            (event_key,symbol,timeframe,event_type,level,direction,signal_time_ist,captured_at_ist)
+            VALUES (?,?,?,?,?,?,?,?)""", rows)
+        return conn.total_changes - before
+
+
+def _load_liquidity_sweep_events(limit=500):
+    try:
+        with _memory_connect() as conn:
+            return pd.read_sql_query("""SELECT symbol,timeframe,event_type,level,direction,
+                signal_time_ist,captured_at_ist FROM liquidity_sweep_events
+                ORDER BY signal_time_ist DESC LIMIT ?""", conn, params=(int(limit),))
+    except Exception:
+        return pd.DataFrame()
+
+
+def _render_live_liquidity_sweep_panel():
+    """Show persisted liquidity/sweep event times on the existing Live Market Dashboard."""
+    st.markdown("#### 💧 BUY / SELL LIQUIDITY + SWEEP SIGNAL TIMES (IST)")
+    liq = _load_liquidity_sweep_events()
+    if liq.empty:
+        st.info("Liquidity/Sweep timestamps ఇంకా save కాలేదు. Scannerను కనీసం ఒకసారి run చేసిన తర్వాత ఇక్కడ కనిపిస్తాయి.")
+        return
+    liq = liq.copy()
+    liq["Signal Time (IST)"] = pd.to_datetime(liq["signal_time_ist"], errors="coerce", utc=True).dt.tz_convert(IST).dt.strftime("%Y-%m-%d %H:%M:%S IST")
+    liq["Liquidity Level"] = liq["level"].map(lambda x: f"{x:.2f}" if pd.notna(x) else "—")
+    liq = liq.rename(columns={"symbol":"Stock", "timeframe":"Timeframe", "event_type":"Signal", "direction":"Direction"})
+    view_cols = ["Stock", "Timeframe", "Signal", "Direction", "Liquidity Level", "Signal Time (IST)"]
+    sweeps = liq[liq["Signal"].isin(["SWEEP UP", "SWEEP DOWN"])]
+    levels = liq[liq["Signal"].isin(["BUY LIQUIDITY", "SELL LIQUIDITY"])]
+    st.markdown("**Confirmed Sweep Signals**")
+    if sweeps.empty:
+        st.caption("ఇప్పటివరకు confirmed Sweep Up / Sweep Down event లేదు.")
+    else:
+        st.dataframe(sweeps[view_cols].head(100), hide_index=True, **_stretch())
+    st.markdown("**BUY / SELL Liquidity Levels**")
+    st.dataframe(levels[view_cols].head(150), hide_index=True, **_stretch())
+    st.caption("Liquidity Time = pivot candle close time • Sweep Time = sweep confirm అయిన completed candle close time • Times are IST.")
+
+
 def _load_live_signal_events(limit=300):
     """Load recent event ledger rows and their fixed-interval snapshots."""
     try:
@@ -537,6 +647,8 @@ def _render_live_dashboard_body():
     st.caption("Dashboard refresh: 60 seconds • Signal scan and dashboard refresh are separate • Prices: Yahoo Finance 1M feed")
     if refresh_result.get("error"):
         st.warning(f"Yahoo price update issue: {refresh_result['error']}. Last saved prices are retained and labelled by age.")
+
+    _render_live_liquidity_sweep_panel()
 
     if events.empty:
         cols = st.columns(4)
@@ -4054,8 +4166,11 @@ def show_ai_multi_agent_scanner(client=None):
     # Idempotent event capture: repeated Streamlit reruns do not create duplicate events.
     try:
         new_events = _capture_signal_events(result)
+        new_liquidity_events = _capture_liquidity_sweep_events(result)
         if new_events:
             st.caption(f"Live Dashboard: {new_events} new signal event(s) saved to SQLite.")
+        if new_liquidity_events:
+            st.caption(f"Live Dashboard: {new_liquidity_events} new liquidity/sweep event(s) saved to SQLite.")
     except Exception as event_exc:
         st.warning(f"Live signal event save issue: {event_exc}")
 
