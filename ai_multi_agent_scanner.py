@@ -474,20 +474,26 @@ def _capture_signal_events(result):
         breakout = str(row.get("Breakout Signal", "WAIT") or "WAIT").strip().upper()
         advanced = str(row.get("Advanced Big Move", "") or "").strip().upper()
         signal_type, direction = None, None
+        if advanced in ("BREAKOUT DETECTED", "BREAKDOWN DETECTED", "RETEST WAITING",
+                        "RETEST HELD — 15M WAIT", "RETEST REJECTED — 15M WAIT",
+                        "FALSE BREAKOUT RISK"):
+            continue
+        if breakout in ("BREAKOUT", "BREAKDOWN") and advanced not in ("BUY CONFIRMED", "SELL CONFIRMED"):
+            continue
         if final_signal in actionable:
             direction = "UP" if "BUY" in final_signal else "DOWN"
             if breakout in ("BREAKOUT", "BREAKDOWN"):
                 signal_type = f"{final_signal} / CONFIRMED {breakout}"
-            elif advanced in ("BREAKOUT CONFIRMED", "BREAKDOWN CONFIRMED"):
-                signal_type = f"{final_signal} / {advanced}"
+            elif advanced in ("BUY CONFIRMED", "SELL CONFIRMED"):
+                signal_type = advanced
             else:
                 signal_type = final_signal
         elif breakout in ("BREAKOUT", "BREAKDOWN"):
             signal_type = f"CONFIRMED {breakout}"
             direction = "UP" if breakout == "BREAKOUT" else "DOWN"
-        elif advanced in ("BREAKOUT CONFIRMED", "BREAKDOWN CONFIRMED"):
+        elif advanced in ("BUY CONFIRMED", "SELL CONFIRMED"):
             signal_type = advanced
-            direction = "UP" if advanced == "BREAKOUT CONFIRMED" else "DOWN"
+            direction = "UP" if advanced == "BUY CONFIRMED" else "DOWN"
         if not signal_type:
             continue
         candle_time = _as_ist_timestamp(row.get("Signal Time (IST)"))
@@ -916,7 +922,9 @@ def _render_live_dashboard_body():
 
     active = events[events["status"] == "ACTIVE"].copy()
     fresh = active[active["_age_min"] <= 5].copy()
-    breakout_mask = events["signal_type"].astype(str).str.contains("BREAKOUT|BREAKDOWN", case=False, regex=True)
+    breakout_mask = events["signal_type"].astype(str).str.contains(
+        "BREAKOUT|BREAKDOWN|BUY CONFIRMED|SELL CONFIRMED", case=False, regex=True
+    )
     existing_breakouts = events[breakout_mask].copy()
     cols = st.columns(4)
     cols[0].metric("Active Signals", f"{len(active):,}")
@@ -1974,6 +1982,7 @@ def _advanced_big_movement_analysis(frame_5m, frame_15m=None, frame_1h=None):
         "Advanced Big Move": "WAIT", "Big Move Direction": "WAIT",
         "Big Move Score": 0, "False Breakout Risk": "UNKNOWN",
         "Breakout Retest Status": "NOT TESTED", "Momentum Continuation": "UNKNOWN",
+        "5M Retest Check": "NO DATA", "15M Trend Check": "NO DATA",
         "Big Move Range High": None, "Big Move Range Low": None,
         "Big Move RVOL": None, "Big Move Reason": "Insufficient completed 5M candles",
     }
@@ -2044,32 +2053,66 @@ def _advanced_big_movement_analysis(frame_5m, frame_15m=None, frame_1h=None):
             down_align += int(float(c_tf.iloc[-1]) < e9 < e20)
         up_setup = int(compressed) + int(volume_build >= 1.20) + int(rvol_base >= 1.20) + int(ema9 > ema20) + up_align
         down_setup = int(compressed) + int(volume_build >= 1.20) + int(rvol_base >= 1.20) + int(ema9 < ema20) + down_align
+        # 5M is the entry timeframe: a breakout is only DETECTED first.
+        # A BUY/SELL confirmation needs a later 5M retest AND 15M EMA trend alignment.
+        retest_up = _breakout_retest_confirmation(session, "UP", lookback=12, scan=6, tol=0.003)
+        retest_down = _breakout_retest_confirmation(session, "DOWN", lookback=12, scan=6, tol=0.003)
+        f15 = frame_15m if isinstance(frame_15m, pd.DataFrame) else pd.DataFrame()
+        up_15m_ok = down_15m_ok = False
+        if not f15.empty and "Close" in f15.columns:
+            c15 = pd.to_numeric(f15["Close"], errors="coerce").dropna()
+            if len(c15) >= 20:
+                e9_15 = float(c15.ewm(span=9, adjust=False).mean().iloc[-1])
+                e20_15 = float(c15.ewm(span=20, adjust=False).mean().iloc[-1])
+                last15 = float(c15.iloc[-1])
+                up_15m_ok = last15 > e9_15 > e20_15
+                down_15m_ok = last15 < e9_15 < e20_15
+
         retest = "NOT TESTED"
-        if broke_up and not weak_up:
-            status, direction, reason = "BREAKOUT CONFIRMED", "UP", "Completed 5M close above base range with candle/volume confirmation"
-            retest = "AWAITING RETEST"
-        elif broke_down and not weak_down:
-            status, direction, reason = "BREAKDOWN CONFIRMED", "DOWN", "Completed 5M close below base range with candle/volume confirmation"
-            retest = "AWAITING RETEST"
-        elif failed_up:
-            status, direction, reason, retest = "FALSE BREAKOUT RISK", "DOWN", "Price pierced range high but latest completed candle closed back inside", "FAILED UPSIDE BREAK"
+        if failed_up:
+            status, direction, reason, retest = "FALSE BREAKOUT RISK", "WAIT", "Price moved above resistance but a later completed 5M candle closed back inside the range", "FAILED UPSIDE BREAK"
         elif failed_down:
-            status, direction, reason, retest = "FALSE BREAKOUT RISK", "UP", "Price pierced range low but latest completed candle closed back inside", "FAILED DOWNSIDE BREAK"
+            status, direction, reason, retest = "FALSE BREAKOUT RISK", "WAIT", "Price moved below support but a later completed 5M candle closed back inside the range", "FAILED DOWNSIDE BREAK"
         elif weak_up or weak_down:
-            status = "FALSE BREAKOUT RISK"
-            direction = "WAIT"
-            reason = "Price closed outside range but breakout candle/volume confirmation is weak"
-            retest = "AWAITING RETEST"
+            status, direction = "FALSE BREAKOUT RISK", "WAIT"
+            reason, retest = "Price closed outside range but breakout candle/volume confirmation is weak", "WEAK BREAKOUT — NO ENTRY"
+        elif broke_up:
+            status, direction = "BREAKOUT DETECTED", "UP"
+            reason, retest = "Completed 5M candle closed above the base range; wait for a 5M retest", "RETEST WAITING"
+        elif broke_down:
+            status, direction = "BREAKDOWN DETECTED", "DOWN"
+            reason, retest = "Completed 5M candle closed below the base range; wait for a 5M retest", "RETEST WAITING"
+        elif retest_up == "RETEST HELD":
+            if up_15m_ok:
+                status, direction = "BUY CONFIRMED", "UP"
+                reason, retest = "5M breakout retest held and 15M EMA trend is bullish", "5M RETEST HELD + 15M UP ALIGNED"
+            else:
+                status, direction = "RETEST HELD — 15M WAIT", "WAIT"
+                reason, retest = "5M retest held, but 15M trend alignment is not bullish yet", "5M RETEST HELD — WAIT 15M"
+        elif retest_down == "RETEST REJECTED":
+            if down_15m_ok:
+                status, direction = "SELL CONFIRMED", "DOWN"
+                reason, retest = "5M breakdown retest rejected and 15M EMA trend is bearish", "5M RETEST REJECTED + 15M DOWN ALIGNED"
+            else:
+                status, direction = "RETEST REJECTED — 15M WAIT", "WAIT"
+                reason, retest = "5M breakdown retest rejected, but 15M trend alignment is not bearish yet", "5M RETEST REJECTED — WAIT 15M"
+        elif retest_up == "WAIT — RETEST NOT CONFIRMED":
+            status, direction, reason, retest = "RETEST WAITING", "UP", "A recent 5M upside breakout exists; waiting for a valid retest hold", "RETEST WAITING"
+        elif retest_down == "WAIT — RETEST NOT CONFIRMED":
+            status, direction, reason, retest = "RETEST WAITING", "DOWN", "A recent 5M downside breakout exists; waiting for a valid retest rejection", "RETEST WAITING"
         elif compressed and max(up_setup, down_setup) >= 4:
             direction = "UP" if up_setup > down_setup else "DOWN" if down_setup > up_setup else "WAIT"
             status = "PRE-BIG WATCH" if direction != "WAIT" else "WAIT"
-            reason = "Compression + volume activity + EMA/multi-timeframe alignment; breakout not yet confirmed"
+            reason = "Compression + volume activity + EMA/multi-timeframe alignment; breakout not yet detected"
         else:
             status, direction, reason = "WAIT", "WAIT", "No strong compression/volume/trend confluence"
+
         score = min(100, int(max(up_setup, down_setup) / 6 * 100))
-        if status in ("BREAKOUT CONFIRMED", "BREAKDOWN CONFIRMED"):
-            score = max(score, 80)
-        if false_risk == "HIGH":
+        if status in ("BUY CONFIRMED", "SELL CONFIRMED"):
+            score = max(score, 85)
+        elif status in ("BREAKOUT DETECTED", "BREAKDOWN DETECTED", "RETEST WAITING"):
+            score = min(score, 65)
+        if false_risk == "HIGH" and status not in ("BUY CONFIRMED", "SELL CONFIRMED"):
             score = min(score, 55)
         continuation = "BULLISH" if direction == "UP" and ema9 > ema20 and up_align >= 1 else (
             "BEARISH" if direction == "DOWN" and ema9 < ema20 and down_align >= 1 else "NOT CONFIRMED")
@@ -2077,6 +2120,8 @@ def _advanced_big_movement_analysis(frame_5m, frame_15m=None, frame_1h=None):
             "Advanced Big Move": status, "Big Move Direction": direction,
             "Big Move Score": score, "False Breakout Risk": false_risk,
             "Breakout Retest Status": retest, "Momentum Continuation": continuation,
+            "5M Retest Check": retest_up if direction == "UP" else retest_down if direction == "DOWN" else "NOT APPLICABLE",
+            "15M Trend Check": "UP ALIGNED" if up_15m_ok else "DOWN ALIGNED" if down_15m_ok else "NOT ALIGNED",
             "Big Move Range High": round(hi, 2), "Big Move Range Low": round(lo, 2),
             "Big Move RVOL": round(rvol_base, 2),
             "Big Move Reason": f"{reason}; volume build {volume_build:.2f}x; range {width_pct:.2f}%; {compression_reason}",
@@ -2621,10 +2666,21 @@ def _make_result_row(symbol, yahoo_symbol, payload):
         row["Breakout Retest"] = "WAIT — NO RECENT BREAKOUT RETEST"
     # Explicit event label is separate from the trend consensus. A sweep is a
     # liquidity event, not an automatic BUY/SELL entry; breakout needs confirmation.
-    if row.get("Multi-TF Breakout") == "BREAKOUT CONFIRMED":
-        row["Action Signal"] = "BREAKOUT"
+    advanced_status = str(row.get("Advanced Big Move", "WAIT")).upper()
+    if advanced_status == "BUY CONFIRMED":
+        row["Action Signal"] = "BUY CONFIRMED"
+    elif advanced_status == "SELL CONFIRMED":
+        row["Action Signal"] = "SELL CONFIRMED"
+    elif advanced_status in ("BREAKOUT DETECTED", "RETEST WAITING", "RETEST HELD — 15M WAIT"):
+        row["Action Signal"] = "BREAKOUT DETECTED — WAIT RETEST / 15M"
+    elif advanced_status in ("BREAKDOWN DETECTED", "RETEST REJECTED — 15M WAIT"):
+        row["Action Signal"] = "BREAKDOWN DETECTED — WAIT RETEST / 15M"
+    elif advanced_status == "FALSE BREAKOUT RISK":
+        row["Action Signal"] = "FALSE BREAKOUT — WAIT"
+    elif row.get("Multi-TF Breakout") == "BREAKOUT CONFIRMED":
+        row["Action Signal"] = "BREAKOUT DETECTED — WAIT RETEST / 15M"
     elif row.get("Multi-TF Breakout") == "BREAKDOWN CONFIRMED":
-        row["Action Signal"] = "BREAKDOWN"
+        row["Action Signal"] = "BREAKDOWN DETECTED — WAIT RETEST / 15M"
     elif row.get("Upside Sweep") == "YES":
         row["Action Signal"] = "SWEEP UP"
     elif row.get("Downside Sweep") == "YES":
@@ -4508,12 +4564,13 @@ def show_ai_multi_agent_scanner(client=None):
     st.subheader("🚀 V18 ADVANCED BIG MOVEMENT — FALSE BREAKOUT + CONTINUATION")
     advanced_cols = [c for c in [
         "Symbol", "Last Price", "Advanced Big Move", "Big Move Direction", "Big Move Score",
-        "False Breakout Risk", "Breakout Retest Status", "Momentum Continuation",
+        "False Breakout Risk", "Breakout Retest Status", "5M Retest Check", "15M Trend Check", "Momentum Continuation",
         "Big Move Range High", "Big Move Range Low", "Big Move RVOL", "Big Move Reason",
     ] if c in result.columns]
     advanced_view = result[result.get("Advanced Big Move", pd.Series(index=result.index, dtype=str)).isin([
-        "PRE-BIG WATCH", "BREAKOUT CONFIRMED", "BREAKDOWN CONFIRMED", "FALSE BREAKOUT RISK",
-        "WAIT — SESSION WARM-UP",
+        "PRE-BIG WATCH", "BREAKOUT DETECTED", "BREAKDOWN DETECTED", "RETEST WAITING",
+        "BUY CONFIRMED", "SELL CONFIRMED", "RETEST HELD — 15M WAIT",
+        "RETEST REJECTED — 15M WAIT", "FALSE BREAKOUT RISK", "WAIT — SESSION WARM-UP",
     ])].copy()
     if not advanced_view.empty:
         advanced_view = advanced_view.sort_values("Big Move Score", ascending=False)
@@ -4613,7 +4670,7 @@ def show_ai_multi_agent_scanner(client=None):
         "AI Direction", "AI Up Model Estimate %", "AI Down Model Estimate %",
         "AI Sideways Model Estimate %", "AI Brain Signal", "AI Model Status",
         "Advanced Big Move", "Big Move Direction", "Big Move Score", "False Breakout Risk",
-        "Breakout Retest Status", "Momentum Continuation", "Big Move Range High",
+        "Breakout Retest Status", "5M Retest Check", "15M Trend Check", "Momentum Continuation", "Big Move Range High",
         "Big Move Range Low", "Big Move RVOL", "Big Move Reason",
         "18th Agent", "Best Stock Score", "Best Stock Side", "Best Stock Grade",
         "Best Stock Filter", "Best Stock Reason",
