@@ -209,9 +209,30 @@ def _memory_connect():
                         level REAL,
                         direction TEXT,
                         signal_time_ist TEXT NOT NULL,
+                        captured_at_ist TEXT NOT NULL,
+                        candle_volume REAL,
+                        average_volume REAL,
+                        rvol REAL
+                    )""")
+                    liq_columns = {r[1] for r in conn.execute("PRAGMA table_info(liquidity_sweep_events)").fetchall()}
+                    for col_name in ("candle_volume", "average_volume", "rvol"):
+                        if col_name not in liq_columns:
+                            conn.execute(f"ALTER TABLE liquidity_sweep_events ADD COLUMN {col_name} REAL")
+                    conn.execute("CREATE INDEX IF NOT EXISTS idx_liquidity_events_time ON liquidity_sweep_events(signal_time_ist)")
+                    conn.execute("""CREATE TABLE IF NOT EXISTS volume_expansion_events (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        event_key TEXT NOT NULL UNIQUE,
+                        symbol TEXT NOT NULL,
+                        timeframe TEXT NOT NULL,
+                        direction TEXT NOT NULL,
+                        candle_volume REAL,
+                        average_volume REAL,
+                        rvol REAL,
+                        last_price REAL,
+                        signal_time_ist TEXT NOT NULL,
                         captured_at_ist TEXT NOT NULL
                     )""")
-                    conn.execute("CREATE INDEX IF NOT EXISTS idx_liquidity_events_time ON liquidity_sweep_events(signal_time_ist)")
+                    conn.execute("CREATE INDEX IF NOT EXISTS idx_volume_events_time ON volume_expansion_events(signal_time_ist)")
                     # One-time cleanup of legacy partial 15:15 1H bars saved by older versions.
                     conn.execute("DELETE FROM candles WHERE timeframe='1H' AND substr(candle_time,12,5)='15:15'")
                     conn.commit()
@@ -418,6 +439,7 @@ def _prune_event_ledgers(signal_days=90, liquidity_days=14):
                         (SELECT event_id FROM signal_events WHERE created_at_ist<?)""", (sig_cut,))
         conn.execute("DELETE FROM signal_events WHERE created_at_ist<?", (sig_cut,))
         conn.execute("DELETE FROM liquidity_sweep_events WHERE captured_at_ist<?", (liq_cut,))
+        conn.execute("DELETE FROM volume_expansion_events WHERE captured_at_ist<?", (liq_cut,))
 
 
 def _drop_recent_duplicate_events(conn, rows, minutes=60):
@@ -548,14 +570,17 @@ def _capture_liquidity_sweep_events(result):
                 event_key = f"{symbol}|{tf}|{event_type}|{stamp_text}|{level if np.isfinite(level) else ''}"
                 rows.append((event_key, symbol, tf, event_type,
                              float(level) if np.isfinite(level) else None,
-                             direction, stamp_text, now_text))
+                             direction, stamp_text, now_text,
+                             _safe_num(row.get(f"{tf} Candle Volume"), 0.0),
+                             _safe_num(row.get(f"{tf} Average Volume 20"), 0.0),
+                             _safe_num(row.get(f"{tf} RVOL"), 0.0)))
     if not rows:
         return 0
     with _memory_connect() as conn:
         before = conn.total_changes
         conn.executemany("""INSERT OR IGNORE INTO liquidity_sweep_events
-            (event_key,symbol,timeframe,event_type,level,direction,signal_time_ist,captured_at_ist)
-            VALUES (?,?,?,?,?,?,?,?)""", rows)
+            (event_key,symbol,timeframe,event_type,level,direction,signal_time_ist,captured_at_ist,candle_volume,average_volume,rvol)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?)""", rows)
         inserted = conn.total_changes - before
         # Promote confirmed 15M sweep events into the same live accuracy ledger.
         sweep_rows = []
@@ -589,10 +614,56 @@ def _capture_liquidity_sweep_events(result):
         return inserted
 
 
+def _capture_volume_expansion_events(result, threshold=2.0):
+    """Persist completed-candle volume expansion events at >=2x prior 20-bar average."""
+    if not isinstance(result, pd.DataFrame) or result.empty:
+        return 0
+    now_text = datetime.now(IST).isoformat(timespec="seconds")
+    rows = []
+    for _, row in result.iterrows():
+        symbol = str(row.get("Symbol", "") or "").strip()
+        if not symbol:
+            continue
+        for tf in TIMEFRAMES:
+            rvol = _safe_num(row.get(f"{tf} RVOL"), 0.0)
+            direction = str(row.get(f"{tf} Candle Direction", "WAIT")).upper()
+            volume = _safe_num(row.get(f"{tf} Candle Volume"), 0.0)
+            average = _safe_num(row.get(f"{tf} Average Volume 20"), 0.0)
+            price = _safe_num(row.get("Last Price"), 0.0)
+            # Use the actual completed candle close time for this timeframe.
+            stamp = _as_ist_timestamp(row.get(f"{tf} Candle Close (IST)"))
+            if stamp is None:
+                stamp = _as_ist_timestamp(row.get("Signal Time (IST)"))
+            if rvol < threshold or direction not in ("BUY", "SELL") or volume <= 0 or average <= 0 or stamp is None:
+                continue
+            stamp_text = stamp.isoformat(timespec="seconds")
+            event_key = f"{symbol}|{tf}|{direction}|{stamp_text}"
+            rows.append((event_key, symbol, tf, direction, volume, average, rvol,
+                         price if price > 0 else None, stamp_text, now_text))
+    if not rows:
+        return 0
+    with _memory_connect() as conn:
+        before = conn.total_changes
+        conn.executemany("""INSERT OR IGNORE INTO volume_expansion_events
+            (event_key,symbol,timeframe,direction,candle_volume,average_volume,rvol,last_price,signal_time_ist,captured_at_ist)
+            VALUES (?,?,?,?,?,?,?,?,?,?)""", rows)
+        return conn.total_changes - before
+
+
+def _load_volume_expansion_events(limit=500):
+    try:
+        with _memory_connect() as conn:
+            return pd.read_sql_query("""SELECT symbol,timeframe,direction,candle_volume,average_volume,rvol,last_price,
+                signal_time_ist,captured_at_ist FROM volume_expansion_events
+                ORDER BY signal_time_ist DESC LIMIT ?""", conn, params=(int(limit),))
+    except Exception:
+        return pd.DataFrame()
+
+
 def _load_liquidity_sweep_events(limit=500):
     try:
         with _memory_connect() as conn:
-            return pd.read_sql_query("""SELECT symbol,timeframe,event_type,level,direction,
+            return pd.read_sql_query("""SELECT symbol,timeframe,event_type,level,direction,candle_volume,average_volume,rvol,
                 signal_time_ist,captured_at_ist FROM liquidity_sweep_events
                 ORDER BY signal_time_ist DESC LIMIT ?""", conn, params=(int(limit),))
     except Exception:
@@ -610,7 +681,8 @@ def _render_live_liquidity_sweep_panel():
     liq["Signal Time (IST)"] = pd.to_datetime(liq["signal_time_ist"], errors="coerce", utc=True).dt.tz_convert(IST).dt.strftime("%Y-%m-%d %H:%M:%S IST")
     liq["Liquidity Level"] = liq["level"].map(lambda x: f"{x:.2f}" if pd.notna(x) else "—")
     liq = liq.rename(columns={"symbol":"Stock", "timeframe":"Timeframe", "event_type":"Signal", "direction":"Direction"})
-    view_cols = ["Stock", "Timeframe", "Signal", "Direction", "Liquidity Level", "Signal Time (IST)"]
+    liq = liq.rename(columns={"candle_volume":"Candle Volume", "average_volume":"Average Volume (20)", "rvol":"RVOL"})
+    view_cols = ["Stock", "Timeframe", "Signal", "Direction", "Liquidity Level", "Candle Volume", "Average Volume (20)", "RVOL", "Signal Time (IST)"]
     sweeps = liq[liq["Signal"].isin(["SWEEP UP", "SWEEP DOWN"])]
     levels = liq[liq["Signal"].isin(["BUY LIQUIDITY", "SELL LIQUIDITY"])]
     st.markdown("**Confirmed Sweep Signals**")
@@ -772,15 +844,34 @@ def _refresh_live_signal_prices():
         return {"updated": updated, "error": str(exc)[:300], "symbols": len(tickers)}
 
 
+def _render_live_volume_expansion_panel():
+    """Display completed 5M/15M/1H candles with volume >= 2x prior 20-bar average."""
+    st.markdown("#### 🔊 LIVE VOLUME INCREASE STOCKS — RVOL ≥ 2.0x")
+    vol = _load_volume_expansion_events()
+    if vol.empty:
+        st.info("2x లేదా అంతకంటే ఎక్కువ Relative Volume ఉన్న completed-candle signals ఇంకా save కాలేదు. Fresh scan run చేయండి.")
+        return
+    vol = vol.copy()
+    vol["Signal Time (IST)"] = pd.to_datetime(vol["signal_time_ist"], errors="coerce", utc=True).dt.tz_convert(IST).dt.strftime("%Y-%m-%d %H:%M:%S IST")
+    vol = vol.rename(columns={"symbol":"Stock", "timeframe":"Timeframe", "direction":"Candle Direction",
+        "candle_volume":"Candle Volume", "average_volume":"Average Volume (20)",
+        "rvol":"RVOL", "last_price":"LTP"})
+    vol["Volume Signal"] = np.where(vol["Candle Direction"].eq("BUY"), "BUY VOLUME WATCH", "SELL VOLUME WATCH")
+    cols = ["Stock", "Timeframe", "LTP", "Candle Direction", "Candle Volume", "Average Volume (20)", "RVOL", "Volume Signal", "Signal Time (IST)"]
+    st.dataframe(vol[cols].head(150), hide_index=True, **_stretch())
+    st.caption("Threshold: current completed candle volume ≥ 2 × average volume of previous 20 completed candles. Direction is candle body only; it is a watch signal, not an automatic trade entry.")
+
+
 def _render_live_dashboard_body():
     """Render dashboard using SQLite; price refresh is throttled by the fragment clock."""
     refresh_result = _refresh_live_signal_prices()
     events, snapshots = _load_live_signal_events()
     st.subheader("📡 LIVE MARKET DASHBOARD")
-    st.caption("Dashboard refresh: 60 seconds • BUY / SELL / SWEEP UP / SWEEP DOWN • 1:1.5 target tracking • Prices: Yahoo Finance 1M feed")
+    st.caption("Dashboard refresh: 60 seconds • BUY / SELL / SWEEP + Volume ≥2x • 1:1.5 target tracking • Prices: Yahoo Finance 1M feed")
     if refresh_result.get("error"):
         st.warning(f"Yahoo price update issue: {refresh_result['error']}. Last saved prices are retained and labelled by age.")
 
+    _render_live_volume_expansion_panel()
     _render_live_liquidity_sweep_panel()
 
     if events.empty:
@@ -1156,6 +1247,8 @@ def _liquidity_levels_and_sweeps(df, lookback=30, timeframe_minutes=15):
         "Upside Sweep": "NO", "Downside Sweep": "NO",
         "Upside Sweep Time (IST)": None, "Downside Sweep Time (IST)": None,
         "Liquidity Sweep Detail": "NO DATA",
+        "Candle Volume": None, "Average Volume 20": None, "RVOL": None,
+        "Volume Signal": "NO DATA", "Candle Direction": "WAIT",
     }
     required = {"Time", "Open", "High", "Low", "Close", "Volume"}
     if (df is None or not isinstance(df, pd.DataFrame) or not required.issubset(df.columns)
@@ -1192,6 +1285,13 @@ def _liquidity_levels_and_sweeps(df, lookback=30, timeframe_minutes=15):
     upper_wick, lower_wick = high-max(opn, close_now), min(opn, close_now)-low
     vol_avg = _safe_num(prior["Volume"].tail(20).mean(), 0.0)
     rvol = _safe_num(last["Volume"] / vol_avg, 0.0) if vol_avg > 0 else 0.0
+    candle_volume = _safe_num(last["Volume"], 0.0)
+    candle_direction = "BUY" if close_now > opn else "SELL" if close_now < opn else "NEUTRAL"
+    volume_signal = (
+        "HIGH VOLUME BUY" if rvol >= 2.0 and candle_direction == "BUY" else
+        "HIGH VOLUME SELL" if rvol >= 2.0 and candle_direction == "SELL" else
+        "BELOW 2X THRESHOLD"
+    )
     upside = bool(high > buy_liq and close_now < buy_liq and upper_wick/span >= .30
                   and close_now < opn and rvol >= 1.05)
     downside = bool(low < sell_liq and close_now > sell_liq and lower_wick/span >= .30
@@ -1229,6 +1329,11 @@ def _liquidity_levels_and_sweeps(df, lookback=30, timeframe_minutes=15):
         "Upside Sweep Time (IST)": trigger_time if upside else None,
         "Downside Sweep Time (IST)": trigger_time if downside else None,
         "Liquidity Sweep Detail": detail,
+        "Candle Volume": round(candle_volume, 2),
+        "Average Volume 20": round(vol_avg, 2) if vol_avg > 0 else None,
+        "RVOL": round(rvol, 2),
+        "Volume Signal": volume_signal,
+        "Candle Direction": candle_direction,
     }
 
 
@@ -4215,6 +4320,8 @@ def show_ai_multi_agent_scanner(client=None):
         "Upside Sweep Time (IST)": None, "Downside Sweep Time (IST)": None,
         "Equal High Liquidity": "NO DATA", "Equal Low Liquidity": "NO DATA",
         "Liquidity Sweep Detail": "Run a fresh scan for liquidity levels",
+        "Candle Volume": None, "Average Volume 20": None, "RVOL": None,
+        "Volume Signal": "NO DATA", "Candle Direction": "WAIT",
     }
     for tf in TIMEFRAMES:
         for key, default in liquidity_defaults.items():
@@ -4363,11 +4470,14 @@ def show_ai_multi_agent_scanner(client=None):
     try:
         new_events = _capture_signal_events(result)
         new_liquidity_events = _capture_liquidity_sweep_events(result)
+        new_volume_events = _capture_volume_expansion_events(result, threshold=2.0)
         _prune_event_ledgers()
         if new_events:
             st.caption(f"Live Dashboard: {new_events} new signal event(s) saved to SQLite.")
         if new_liquidity_events:
             st.caption(f"Live Dashboard: {new_liquidity_events} new liquidity/sweep event(s) saved to SQLite.")
+        if new_volume_events:
+            st.caption(f"Live Dashboard: {new_volume_events} new >=2x volume event(s) saved to SQLite.")
     except Exception as event_exc:
         st.warning(f"Live signal event save issue: {event_exc}")
 
