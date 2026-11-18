@@ -171,8 +171,20 @@ def _memory_connect():
                         current_price REAL,
                         current_price_time_ist TEXT,
                         data_status TEXT DEFAULT 'WAITING',
-                        status TEXT DEFAULT 'ACTIVE'
+                        status TEXT DEFAULT 'ACTIVE',
+                        stop_price REAL,
+                        target_price REAL,
+                        outcome TEXT DEFAULT 'PENDING',
+                        outcome_time_ist TEXT,
+                        risk_reward REAL DEFAULT 1.5
                     )""")
+                    # Safe additive migration: old SQLite databases keep all existing rows.
+                    signal_columns = {r[1] for r in conn.execute("PRAGMA table_info(signal_events)").fetchall()}
+                    for col_name, col_type in (("stop_price", "REAL"), ("target_price", "REAL"),
+                                               ("outcome", "TEXT DEFAULT 'PENDING'"),
+                                               ("outcome_time_ist", "TEXT"), ("risk_reward", "REAL DEFAULT 1.5")):
+                        if col_name not in signal_columns:
+                            conn.execute(f"ALTER TABLE signal_events ADD COLUMN {col_name} {col_type}")
                     conn.execute("""CREATE TABLE IF NOT EXISTS signal_price_snapshots (
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
                         event_id INTEGER NOT NULL,
@@ -358,6 +370,8 @@ _LIVE_PRICE_LAST_REFRESH_MONOTONIC = 0.0
 def _as_ist_timestamp(value):
     """Parse timestamps safely and return a timezone-aware IST Timestamp."""
     try:
+        if isinstance(value, str):
+            value = re.sub(r"\s*IST\s*$", "", value.strip())
         ts = pd.Timestamp(value)
         if pd.isna(ts):
             return None
@@ -368,12 +382,66 @@ def _as_ist_timestamp(value):
         return None
 
 
+SIGNAL_MAX_AGE_MINUTES = 45
+
+
+def _is_fresh_signal_time(stamp, now=None):
+    if stamp is None:
+        return False
+    now = pd.Timestamp(now) if now is not None else pd.Timestamp.now(tz=IST)
+    age = (now - stamp).total_seconds() / 60.0
+    return -2.0 <= age <= SIGNAL_MAX_AGE_MINUTES
+
+
+def _risk_levels_for_event(row, direction, entry):
+    """Return stop/target using the existing scanner stop when valid, else 1.5 x 15M ATR."""
+    stop = _safe_num(row.get("Stop Loss"), np.nan)
+    if not np.isfinite(stop) or stop <= 0 or (direction == "UP" and stop >= entry) or (direction == "DOWN" and stop <= entry):
+        atr = _safe_num(row.get("15M ATR"), np.nan)
+        if not np.isfinite(atr) or atr <= 0:
+            return None, None
+        stop = entry - 1.5 * atr if direction == "UP" else entry + 1.5 * atr
+    risk = abs(entry - stop)
+    if risk <= 0:
+        return None, None
+    target = entry + 1.5 * risk if direction == "UP" else entry - 1.5 * risk
+    return float(stop), float(target)
+
+
+def _prune_event_ledgers(signal_days=90, liquidity_days=14):
+    """Bound local event-ledger growth while retaining recent accuracy history."""
+    now = pd.Timestamp.now(tz=IST)
+    sig_cut = (now - pd.Timedelta(days=signal_days)).isoformat(timespec="seconds")
+    liq_cut = (now - pd.Timedelta(days=liquidity_days)).isoformat(timespec="seconds")
+    with _memory_connect() as conn:
+        conn.execute("""DELETE FROM signal_price_snapshots WHERE event_id IN
+                        (SELECT event_id FROM signal_events WHERE created_at_ist<?)""", (sig_cut,))
+        conn.execute("DELETE FROM signal_events WHERE created_at_ist<?", (sig_cut,))
+        conn.execute("DELETE FROM liquidity_sweep_events WHERE captured_at_ist<?", (liq_cut,))
+
+
+def _drop_recent_duplicate_events(conn, rows, minutes=60):
+    """Drop same-symbol/same-signal-type events already logged recently or repeated in this batch."""
+    cut = (pd.Timestamp.now(tz=IST) - pd.Timedelta(minutes=minutes)).isoformat(timespec="seconds")
+    seen = {(r[0], r[1]) for r in conn.execute(
+        "SELECT symbol, signal_type FROM signal_events WHERE created_at_ist>=?", (cut,)
+    )}
+    kept = []
+    # Newest signal candle first, so the freshest event wins inside a batch.
+    for r in sorted(rows, key=lambda x: x[6], reverse=True):
+        key = (r[1], r[3])
+        if key in seen:
+            continue
+        seen.add(key)
+        kept.append(r)
+    return kept
+
+
 def _capture_signal_events(result):
-    """Persist each newly detected actionable/pre-big/confirmed-breakout event once."""
+    """Persist BUY/SELL/PRE-BIG/confirmed breakout signals with fixed 1:1.5 outcome levels."""
     if not isinstance(result, pd.DataFrame) or result.empty:
         return 0
-    now = datetime.now(IST)
-    now_text = now.isoformat(timespec="seconds")
+    now_text = datetime.now(IST).isoformat(timespec="seconds")
     rows = []
     actionable = {"BUY", "SELL", "PRE-BIG BUY", "PRE-BIG SELL"}
     for _, row in result.iterrows():
@@ -383,8 +451,7 @@ def _capture_signal_events(result):
         final_signal = str(row.get("Final Signal", "WAIT") or "WAIT").strip().upper()
         breakout = str(row.get("Breakout Signal", "WAIT") or "WAIT").strip().upper()
         advanced = str(row.get("Advanced Big Move", "") or "").strip().upper()
-        signal_type = None
-        direction = None
+        signal_type, direction = None, None
         if final_signal in actionable:
             direction = "UP" if "BUY" in final_signal else "DOWN"
             if breakout in ("BREAKOUT", "BREAKDOWN"):
@@ -401,30 +468,32 @@ def _capture_signal_events(result):
             direction = "UP" if advanced == "BREAKOUT CONFIRMED" else "DOWN"
         if not signal_type:
             continue
-
         candle_time = _as_ist_timestamp(row.get("Signal Time (IST)"))
-        if candle_time is None:
-            # Do not invent a candle timestamp; skip rows without a valid source time.
+        if candle_time is None or not _is_fresh_signal_time(candle_time):
             continue
-        price = _safe_num(row.get("Last Price"), 0.0)
+        price = _safe_num(row.get("Entry Price"), 0.0)
         if price <= 0:
-            price = _safe_num(row.get("Entry Price"), 0.0)
+            price = _safe_num(row.get("Last Price"), 0.0)
         if price <= 0:
             continue
+        stop, target = _risk_levels_for_event(row, direction, price)
         yahoo_symbol = str(row.get("Yahoo Symbol", "") or "").strip()
         candle_time_text = candle_time.isoformat(timespec="seconds")
         event_key = f"{symbol}|{signal_type}|{candle_time_text}"
-        rows.append((event_key, symbol, yahoo_symbol, signal_type, direction,
-                     float(price), candle_time_text, now_text, now_text))
-
+        rows.append((event_key, symbol, yahoo_symbol, signal_type, direction, float(price),
+                     candle_time_text, now_text, now_text, stop, target))
     if not rows:
         return 0
     with _memory_connect() as conn:
+        rows = _drop_recent_duplicate_events(conn, rows)
+        if not rows:
+            return 0
         before = conn.total_changes
         conn.executemany("""INSERT OR IGNORE INTO signal_events
             (event_key,symbol,yahoo_symbol,signal_type,direction,signal_price,
-             signal_time_ist,created_at_ist,current_price_time_ist,data_status,status)
-            VALUES (?,?,?,?,?,?,?,?,?,'WAITING','ACTIVE')""", rows)
+             signal_time_ist,created_at_ist,current_price_time_ist,stop_price,target_price,
+             risk_reward,data_status,status,outcome)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,1.5,'WAITING','ACTIVE','PENDING')""", rows)
         return conn.total_changes - before
 
 
@@ -487,7 +556,37 @@ def _capture_liquidity_sweep_events(result):
         conn.executemany("""INSERT OR IGNORE INTO liquidity_sweep_events
             (event_key,symbol,timeframe,event_type,level,direction,signal_time_ist,captured_at_ist)
             VALUES (?,?,?,?,?,?,?,?)""", rows)
-        return conn.total_changes - before
+        inserted = conn.total_changes - before
+        # Promote confirmed 15M sweep events into the same live accuracy ledger.
+        sweep_rows = []
+        for _, row in result.iterrows():
+            symbol = str(row.get("Symbol", "") or "").strip()
+            if not symbol:
+                continue
+            for sweep_name, flag_col, time_col, direction in (
+                ("SWEEP UP", "Upside Sweep", "Upside Sweep Time (IST)", "DOWN"),
+                ("SWEEP DOWN", "Downside Sweep", "Downside Sweep Time (IST)", "UP"),
+            ):
+                if str(row.get(flag_col, "NO")).upper() != "YES":
+                    continue
+                stamp = _as_ist_timestamp(row.get(time_col))
+                entry = _safe_num(row.get("Last Price"), 0.0)
+                if stamp is None or entry <= 0 or not _is_fresh_signal_time(stamp):
+                    continue
+                stop, target = _risk_levels_for_event(row, direction, entry)
+                stamp_text = stamp.isoformat(timespec="seconds")
+                event_key = f"{symbol}|{sweep_name}|{stamp_text}"
+                sweep_rows.append((event_key, symbol, str(row.get("Yahoo Symbol", "") or "").strip(),
+                    sweep_name, direction, entry, stamp_text, now_text, now_text, stop, target))
+        sweep_rows = _drop_recent_duplicate_events(conn, sweep_rows)
+        if sweep_rows:
+            conn.executemany("""INSERT OR IGNORE INTO signal_events
+                (event_key,symbol,yahoo_symbol,signal_type,direction,signal_price,
+                 signal_time_ist,created_at_ist,current_price_time_ist,stop_price,target_price,
+                 risk_reward,data_status,status,outcome)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,1.5,'WAITING','ACTIVE','PENDING')""", sweep_rows)
+            inserted += conn.total_changes - before - inserted
+        return inserted
 
 
 def _load_liquidity_sweep_events(limit=500):
@@ -524,13 +623,14 @@ def _render_live_liquidity_sweep_panel():
     st.caption("Liquidity Time = pivot candle close time • Sweep Time = sweep confirm అయిన completed candle close time • Times are IST.")
 
 
-def _load_live_signal_events(limit=300):
+def _load_live_signal_events(limit=10000):
     """Load recent event ledger rows and their fixed-interval snapshots."""
     try:
         with _memory_connect() as conn:
             events = pd.read_sql_query("""SELECT event_id,event_key,symbol,yahoo_symbol,
                 signal_type,direction,signal_price,signal_time_ist,created_at_ist,
-                current_price,current_price_time_ist,data_status,status
+                current_price,current_price_time_ist,data_status,status,stop_price,target_price,
+                outcome,outcome_time_ist,risk_reward
                 FROM signal_events ORDER BY created_at_ist DESC LIMIT ?""", conn, params=(int(limit),))
             snapshots = pd.read_sql_query("""SELECT event_id,elapsed_minutes,price,
                 price_time_ist,change_pct FROM signal_price_snapshots
@@ -553,7 +653,7 @@ def _refresh_live_signal_prices():
     now = datetime.now(IST)
     cutoff = (now - pd.Timedelta(minutes=LIVE_EVENT_MAX_AGE_MINUTES)).isoformat(timespec="seconds")
     with _memory_connect() as conn:
-        active = pd.read_sql_query("""SELECT event_id,symbol,yahoo_symbol,signal_price,created_at_ist
+        active = pd.read_sql_query("""SELECT event_id,symbol,yahoo_symbol,signal_price,signal_time_ist,created_at_ist,direction,stop_price,target_price
             FROM signal_events WHERE status='ACTIVE' AND created_at_ist>=?
             ORDER BY created_at_ist DESC""", conn, params=(cutoff,))
         conn.execute("UPDATE signal_events SET status='EXPIRED' WHERE status='ACTIVE' AND created_at_ist<?", (cutoff,))
@@ -589,15 +689,17 @@ def _refresh_live_signal_prices():
                 frame = _extract_one_ticker(data, ticker)
                 if frame is None or frame.empty or "Close" not in frame.columns:
                     continue
-                close = pd.to_numeric(frame["Close"], errors="coerce").dropna()
-                if close.empty:
+                close = pd.to_numeric(frame["Close"], errors="coerce")
+                if close.dropna().empty:
                     continue
-                index = pd.to_datetime(close.index, errors="coerce")
+                index = pd.to_datetime(frame.index, errors="coerce")
                 if getattr(index, "tz", None) is None:
                     index = index.tz_localize(IST)
                 else:
                     index = index.tz_convert(IST)
-                prices = pd.DataFrame({"time": index, "price": close.to_numpy()}).dropna()
+                prices = pd.DataFrame({"time": index, "price": close.to_numpy(),
+                    "high": pd.to_numeric(frame["High"], errors="coerce").to_numpy() if "High" in frame else close.to_numpy(),
+                    "low": pd.to_numeric(frame["Low"], errors="coerce").to_numpy() if "Low" in frame else close.to_numpy()}).dropna(subset=["time", "price"])
                 prices = prices[prices["price"] > 0].sort_values("time")
                 if prices.empty:
                     continue
@@ -616,15 +718,46 @@ def _refresh_live_signal_prices():
                             current_price_time_ist=?,data_status='YAHOO 1M' WHERE event_id=?""",
                             (latest_price, latest_time, event_id))
                         updated += 1
+                        # Resolve target/stop from 1M high/low after signal time.
+                        stop_price = _safe_num(event.get("stop_price"), np.nan)
+                        target_price = _safe_num(event.get("target_price"), np.nan)
+                        direction = str(event.get("direction", "")).upper()
                         created = _as_ist_timestamp(event.get("created_at_ist"))
+                        signal_stamp = _as_ist_timestamp(event.get("signal_time_ist"))
+                        if signal_stamp is not None and np.isfinite(stop_price) and np.isfinite(target_price):
+                            anchors = [t for t in (signal_stamp, created) if t is not None]
+                            anchor = max(anchors)
+                            future_bars = prices[prices["time"] >= anchor]
+                            resolved = None
+                            resolved_time = None
+                            for _, bar in future_bars.iterrows():
+                                hi, lo = float(bar["high"]), float(bar["low"])
+                                if direction == "UP":
+                                    hit_stop, hit_target = lo <= stop_price, hi >= target_price
+                                else:
+                                    hit_stop, hit_target = hi >= stop_price, lo <= target_price
+                                if hit_stop or hit_target:
+                                    # If both levels fall inside one 1M candle, count LOSS conservatively.
+                                    resolved = "LOSS" if hit_stop else "WIN"
+                                    resolved_time = pd.Timestamp(bar["time"]).isoformat(timespec="seconds")
+                                    break
+                            if resolved and not future_bars.empty:
+                                first_iso = pd.Timestamp(future_bars["time"].iloc[0]).isoformat(timespec="seconds")
+                                lag_min = ((created - signal_stamp).total_seconds() / 60.0) if created is not None else 0.0
+                                if resolved_time == first_iso and lag_min > 5:
+                                    resolved = "MISSED"  # level may have been breached before detection
+                            if resolved:
+                                conn.execute("UPDATE signal_events SET outcome=?,status=?,outcome_time_ist=? WHERE event_id=? AND outcome='PENDING'",
+                                    (resolved, resolved, resolved_time, event_id))
                         if created is None:
                             continue
                         for target in LIVE_TRACKING_MINUTES:
                             target_time = created + pd.Timedelta(minutes=target)
-                            # Pick the nearest available 1M candle to the target point.
+                            if target_time > pd.Timestamp(latest["time"]):
+                                continue  # checkpoint has not been reached yet
                             diffs = (prices["time"] - target_time).abs()
                             nearest_idx = diffs.idxmin()
-                            if pd.isna(nearest_idx) or float(diffs.loc[nearest_idx].total_seconds()) > 180:
+                            if pd.isna(nearest_idx) or float(diffs.loc[nearest_idx].total_seconds()) > 120:
                                 continue
                             snap = prices.loc[nearest_idx]
                             snap_price = float(snap["price"])
@@ -644,7 +777,7 @@ def _render_live_dashboard_body():
     refresh_result = _refresh_live_signal_prices()
     events, snapshots = _load_live_signal_events()
     st.subheader("📡 LIVE MARKET DASHBOARD")
-    st.caption("Dashboard refresh: 60 seconds • Signal scan and dashboard refresh are separate • Prices: Yahoo Finance 1M feed")
+    st.caption("Dashboard refresh: 60 seconds • BUY / SELL / SWEEP UP / SWEEP DOWN • 1:1.5 target tracking • Prices: Yahoo Finance 1M feed")
     if refresh_result.get("error"):
         st.warning(f"Yahoo price update issue: {refresh_result['error']}. Last saved prices are retained and labelled by age.")
 
@@ -663,18 +796,33 @@ def _render_live_dashboard_body():
     events["_age_min"] = (now - events["_created"]).dt.total_seconds() / 60.0
     events["_age_min"] = events["_age_min"].clip(lower=0)
     events["Signal Age"] = events["_age_min"].map(lambda x: f"{int(x)} min" if pd.notna(x) else "UNKNOWN")
-    events["Price Change %"] = np.where(
+    _raw_chg = np.where(
         pd.to_numeric(events["signal_price"], errors="coerce") > 0,
         (pd.to_numeric(events["current_price"], errors="coerce") /
          pd.to_numeric(events["signal_price"], errors="coerce") - 1.0) * 100.0,
         np.nan,
     )
+    _sign = np.where(events["direction"].astype(str).str.upper() == "DOWN", -1.0, 1.0)
+    events["Price Change %"] = _raw_chg * _sign  # positive = in favour of the signal
     update_times = pd.to_datetime(events["current_price_time_ist"], errors="coerce", utc=True).dt.tz_convert(IST)
     update_age = (now - update_times).dt.total_seconds() / 60.0
     events["Price Data Status"] = np.where(
-        update_times.isna(), "NO DATA",
+        update_times.isna() | pd.to_numeric(events["current_price"], errors="coerce").isna(), "NO DATA",
         np.where(update_age <= 3, "YAHOO UPDATED", np.where(update_age <= 10, "DELAYED", "STALE")),
     )
+    # Historical accuracy uses only resolved WIN/LOSS outcomes; PENDING/EXPIRED are excluded.
+    resolved = events[events["outcome"].isin(["WIN", "LOSS"])].copy()
+    st.markdown("#### 🎯 LIVE SIGNAL ACCURACY — 1:1.5 RISK / REWARD")
+    accuracy_types = ["BUY", "SELL", "SWEEP UP", "SWEEP DOWN"]
+    acc_cols = st.columns(4)
+    for col, label in zip(acc_cols, accuracy_types):
+        subset = resolved[resolved["signal_type"].astype(str).str.upper().str.startswith(label)]
+        count = len(subset)
+        wins = int((subset["outcome"] == "WIN").sum())
+        accuracy = (wins / count * 100.0) if count else 0.0
+        col.metric(label, f"{accuracy:.1f}%" if count else "N/A", f"{wins}/{count} WIN")
+    st.caption("Accuracy = WIN ÷ (WIN + LOSS) × 100. Pending, expired, MISSED (target or stop already reached before detection) or data-missing signals are not counted. Same 1-minute candle touching both Target and Stop Loss is conservatively counted as LOSS.")
+
     active = events[events["status"] == "ACTIVE"].copy()
     fresh = active[active["_age_min"] <= 5].copy()
     breakout_mask = events["signal_type"].astype(str).str.contains("BREAKOUT|BREAKDOWN", case=False, regex=True)
@@ -685,11 +833,23 @@ def _render_live_dashboard_body():
     cols[2].metric("Breakout / Breakdown Events", f"{len(existing_breakouts):,}")
     cols[3].metric("Tracked Stocks", f"{events['symbol'].nunique():,}")
 
-    display_cols = ["symbol", "signal_type", "signal_price", "current_price", "Price Change %",
-                    "created_at_ist", "Signal Age", "Price Data Status", "status"]
-    labels = {"symbol": "Stock", "signal_type": "Signal", "signal_price": "Signal Price",
-              "current_price": "Current Price", "created_at_ist": "Detected Time (IST)",
-              "status": "Event Status"}
+    display_cols = ["symbol", "signal_type", "signal_price", "stop_price", "target_price",
+                    "current_price", "Price Change %", "outcome", "created_at_ist",
+                    "Signal Age", "Price Data Status", "status"]
+    labels = {"symbol": "Stock", "signal_type": "Signal", "signal_price": "Entry",
+              "stop_price": "Stop Loss", "target_price": "Target (1:1.5)",
+              "current_price": "Current Price", "outcome": "Result",
+              "created_at_ist": "Detected Time (IST)", "status": "Event Status"}
+    st.markdown("#### 🔴 LIVE BUY / SELL / SWEEP SIGNALS")
+    live_signal_rows = active[active["signal_type"].astype(str).str.upper().str.contains(
+        r"^(BUY|SELL|SWEEP UP|SWEEP DOWN)", regex=True, na=False
+    )].copy()
+    if live_signal_rows.empty:
+        st.caption("ప్రస్తుతం Active BUY / SELL / SWEEP UP / SWEEP DOWN signals లేవు.")
+    else:
+        st.dataframe(live_signal_rows[display_cols].head(150).rename(columns=labels),
+                     hide_index=True, **_stretch())
+
     st.markdown("#### 🟢 FRESH SIGNALS")
     if fresh.empty:
         st.caption("No signal detected in the last 5 minutes.")
@@ -712,12 +872,13 @@ def _render_live_dashboard_body():
             pivot = snap_view.pivot_table(index="event_id", columns="elapsed_minutes", values="price", aggfunc="last")
             pivot.columns = [f"Price +{int(c)}m" for c in pivot.columns]
             recent = recent.merge(pivot, left_on="event_id", right_index=True, how="left")
-    track_cols = ["symbol", "signal_type", "signal_price", "current_price", "Price Change %",
-                  "Signal Age", "Price Data Status"] + [c for c in recent.columns if c.startswith("Price +")]
+    track_cols = ["symbol", "signal_type", "signal_price", "stop_price", "target_price",
+                  "current_price", "Price Change %", "outcome", "Signal Age", "Price Data Status"] + [c for c in recent.columns if c.startswith("Price +")]
     st.dataframe(recent[track_cols].rename(columns=labels), hide_index=True, **_stretch())
 
     with st.expander("Signal event detail — candle time and snapshot timestamps"):
-        detail_cols = ["symbol", "signal_type", "signal_time_ist", "created_at_ist", "yahoo_symbol", "data_status", "status"]
+        detail_cols = ["symbol", "signal_type", "signal_time_ist", "created_at_ist", "yahoo_symbol",
+                       "stop_price", "target_price", "risk_reward", "outcome", "outcome_time_ist", "data_status", "status"]
         st.dataframe(events[detail_cols].head(100), hide_index=True, **_stretch())
         st.caption("Signal candle time is the completed 15M candle timestamp from V18. Detected Time is when this scanner run first recorded the event; 1/5/10/15/30-minute tracking is measured from Detected Time.")
     st.caption(f"Last dashboard refresh: {datetime.now(IST).strftime('%Y-%m-%d %H:%M:%S IST')} • Updated event rows: {refresh_result.get('updated', 0)} • Yahoo symbols requested: {refresh_result.get('symbols', 0)}")
@@ -2258,7 +2419,10 @@ def _make_result_row(symbol, yahoo_symbol, payload):
             high = frame_15m["High"].astype(float)
             low = frame_15m["Low"].astype(float)
             close = frame_15m["Close"].astype(float)
-            previous_close = close.shift(1)
+            open_ = frame_15m["Open"].astype(float)
+            day = pd.to_datetime(frame_15m["Time"]).dt.date
+            first_bar = day.ne(day.shift(1))
+            previous_close = close.shift(1).where(~first_bar, open_)
             true_range = pd.concat(
                 [(high - low), (high - previous_close).abs(), (low - previous_close).abs()],
                 axis=1,
@@ -3489,6 +3653,44 @@ def _prescan_supabase_config():
     return url, key, headers
 
 
+def _merge_remote_candle_cache(url, headers):
+    """Merge cloud candle rows into the local DB without replacing local ledgers."""
+    bucket = str(os.getenv("SUPABASE_STORAGE_BUCKET", "ai-scanner-memory"))
+    resp = requests.get(
+        f"{url}/storage/v1/object/{bucket}/ai_multi_agent_candle_memory.sqlite3",
+        headers=headers, timeout=90,
+    )
+    if not (resp.ok and resp.content):
+        return 0
+    tmp = MEMORY_DB_PATH.with_suffix(".remote.tmp")
+    tmp.write_bytes(resp.content)
+    merged = 0
+    try:
+        with _memory_connect() as conn:
+            conn.execute("ATTACH DATABASE ? AS remote", (str(tmp),))
+            try:
+                before = conn.total_changes
+                conn.execute("""INSERT OR REPLACE INTO candles
+                    (symbol,timeframe,candle_time,open,high,low,close,volume,saved_at)
+                    SELECT symbol,timeframe,candle_time,open,high,low,close,volume,saved_at
+                    FROM remote.candles""")
+                conn.execute("DELETE FROM candles WHERE timeframe='1H' AND substr(candle_time,12,5)='15:15'")
+                merged = conn.total_changes - before
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                conn.execute("DETACH DATABASE remote")
+    finally:
+        for suffix in ("", "-wal", "-shm"):
+            try:
+                Path(str(tmp) + suffix).unlink()
+            except Exception:
+                pass
+    return merged
+
+
 def _load_latest_prescan_to_local_job(universe, batch_size=50, period="59d", depth_limit=10):
     """Download a completed cloud pre-scan and hydrate existing SQLite job rows.
 
@@ -3499,13 +3701,7 @@ def _load_latest_prescan_to_local_job(universe, batch_size=50, period="59d", dep
     # Restore the same persistent candle cache used by the scheduled worker.
     # A missing cache is non-fatal: the saved report can still be loaded.
     try:
-        storage_bucket = str(os.getenv("SUPABASE_STORAGE_BUCKET", "ai-scanner-memory"))
-        cache_url = f"{url}/storage/v1/object/{storage_bucket}/ai_multi_agent_candle_memory.sqlite3"
-        cache_resp = requests.get(cache_url, headers=headers, timeout=90)
-        if cache_resp.ok and cache_resp.content:
-            MEMORY_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-            MEMORY_DB_PATH.write_bytes(cache_resp.content)
-            globals()["_MEMORY_INITIALIZED"] = False
+        _merge_remote_candle_cache(url, headers)
     except Exception:
         pass
     runs_url = f"{url}/rest/v1/prescan_runs"
@@ -4124,8 +4320,8 @@ def show_ai_multi_agent_scanner(client=None):
                 f"walk-forward validation unavailable; holdout balanced accuracy {trained_bundle['metrics']['balanced_accuracy']*100:.1f}% • trained {trained_bundle['metrics']['trained_at']}"
             )
         else:
-            st.session_state["ma_real_ai_model"] = None
             st.session_state["ma_real_ai_train_error"] = train_error
+            st.error(f"AI retraining failed; the previous model is kept. Reason: {train_error}")
     ai_bundle = st.session_state.get("ma_real_ai_model")
     if ai_bundle:
         wf_value = ai_bundle["metrics"].get("walk_forward_balanced_accuracy")
@@ -4167,6 +4363,7 @@ def show_ai_multi_agent_scanner(client=None):
     try:
         new_events = _capture_signal_events(result)
         new_liquidity_events = _capture_liquidity_sweep_events(result)
+        _prune_event_ledgers()
         if new_events:
             st.caption(f"Live Dashboard: {new_events} new signal event(s) saved to SQLite.")
         if new_liquidity_events:
