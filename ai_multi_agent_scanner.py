@@ -4582,7 +4582,8 @@ def show_ai_multi_agent_scanner(client=None):
         else:
             st.caption("No directional pre-move watch currently meets the setup threshold.")
 
-        with st.expander("Data Quality + Market Regime checks"):
+        with st.container():
+            st.subheader("Data Quality + Market Regime checks")
             st.write(
                 "Data Quality checks the 5M/15M/1H OHLCV frames, minimum candle count, "
                 "invalid prices/volume, duplicate timestamps and intraday staleness. "
