@@ -2337,6 +2337,105 @@ def _early_20m_analysis(df):
     }
 
 
+
+def _early_signal_decision(row):
+    """Additive early-decision layer; never changes the legacy Final/Action Signal."""
+    empty = {
+        "Early Signal": "WAIT", "Early Direction": "WAIT",
+        "Early Evidence Score": 0, "Early Confirmation": "NOT CONFIRMED",
+        "Early Signal Reason": "Insufficient completed-candle evidence",
+        "Early Signal Time (IST)": None, "1M Candle Close (IST)": None,
+    }
+    try:
+        one_dir = str(row.get("20M Direction", "WAIT") or "WAIT").upper()
+        one_status = str(row.get("20M Status", "NO DATA") or "NO DATA").upper()
+        one_score = max(0.0, min(100.0, _safe_num(row.get("20M Pre-Move Score"), 0.0)))
+        five_dir = str(row.get("Pre-Move Direction", "WAIT") or "WAIT").upper()
+        five_status = str(row.get("Directional Pre-Move", "NO DATA") or "NO DATA").upper()
+        five_score = _safe_num(row.get("UP Pre-Move Score" if five_dir == "UP" else "DOWN Pre-Move Score"), 0.0)
+        prebig_dir = str(row.get("PRE-BIG Direction", "WAIT") or "WAIT").upper()
+        prebig_status = str(row.get("PRE-BIG Status", "NO DATA") or "NO DATA").upper()
+        if five_dir not in ("UP", "DOWN") and prebig_dir in ("UP", "DOWN") and "WATCH" in prebig_status:
+            five_dir = prebig_dir
+            five_score = _safe_num(row.get("PRE-BIG Score"), 0.0)
+        d15 = str(row.get("15M", "WAIT") or "WAIT").upper()
+        d1h = str(row.get("1H", "WAIT") or "WAIT").upper()
+        direction_map = {"BUY": "UP", "SELL": "DOWN"}
+        tf15 = direction_map.get(d15, "WAIT")
+        tf1h = direction_map.get(d1h, "WAIT")
+        one_is_candidate = one_dir in ("UP", "DOWN") and any(x in one_status for x in (
+            "WATCH", "BREAKOUT WATCH", "CONFIRMED BREAKOUT"
+        ))
+        five_is_candidate = five_dir in ("UP", "DOWN") and (
+            "PRE-MOVE WATCH" in five_status or "PRE-BIG" in prebig_status and "WATCH" in prebig_status
+        )
+        directions = [d for d, ok in ((one_dir, one_is_candidate), (five_dir, five_is_candidate)) if ok]
+        if not directions:
+            out = empty.copy()
+            if "WARM-UP" in one_status or "WARM-UP" in five_status:
+                out["Early Signal"] = "WAIT — SESSION WARM-UP"
+                out["Early Signal Reason"] = f"1M: {one_status}; 5M: {five_status}"
+            elif "NO DATA" in (one_status, five_status):
+                out["Early Signal"] = "WAIT — EARLY DATA MISSING"
+                out["Early Signal Reason"] = f"1M: {one_status}; 5M: {five_status}"
+            else:
+                out["Early Signal Reason"] = f"No valid early setup. 1M: {one_status}; 5M: {five_status}"
+            return out
+        if len(set(directions)) > 1:
+            return {**empty, "Early Signal": "WAIT — 1M/5M CONFLICT",
+                    "Early Signal Reason": f"1M direction {one_dir} conflicts with 5M direction {five_dir}"}
+        direction = directions[0]
+        if tf15 != direction:
+            return {**empty, "Early Signal": "WAIT — 15M NOT ALIGNED", "Early Direction": direction,
+                    "Early Signal Reason": f"Early direction {direction}; 15M trend is {d15}. Wait for 15M alignment."}
+        if tf1h in ("UP", "DOWN") and tf1h != direction:
+            return {**empty, "Early Signal": "WAIT — 1H CONFLICT", "Early Direction": direction,
+                    "Early Signal Reason": f"Early direction {direction}; 1H trend is opposite ({d1h})."}
+
+        # Evidence score is a weighted screening score, not a win probability.
+        parts, weights = [], []
+        if one_is_candidate:
+            parts.append(one_score); weights.append(0.35)
+        if five_is_candidate:
+            parts.append(max(0.0, min(100.0, five_score))); weights.append(0.35)
+        score15 = min(100.0, abs(_safe_num(row.get("15M Score"), 0.0)) * 2.0)
+        parts.append(score15); weights.append(0.20)
+        if d1h in ("BUY", "SELL"):
+            score1h = min(100.0, abs(_safe_num(row.get("1H Score"), 0.0)) * 2.0)
+            parts.append(score1h); weights.append(0.10)
+        evidence = round(sum(v*w for v, w in zip(parts, weights)) / sum(weights)) if weights else 0
+
+        is_1m_confirmed = "CONFIRMED BREAKOUT" in one_status
+        if is_1m_confirmed and one_is_candidate and five_is_candidate:
+            signal = "BREAKOUT CONFIRMED — RETEST CHECK"
+            confirmation = "1M BREAKOUT + 5M + 15M ALIGNED"
+        elif one_is_candidate and five_is_candidate:
+            signal = "EARLY WATCH — MULTI-TF ALIGNED"
+            confirmation = "1M + 5M + 15M ALIGNED"
+        elif five_is_candidate:
+            signal = "EARLY WATCH — 5M ONLY"
+            confirmation = "5M + 15M ALIGNED; 1M NOT AVAILABLE/READY"
+        else:
+            signal = "EARLY WATCH — 1M ONLY"
+            confirmation = "1M SETUP; WAIT FOR 5M CONFIRMATION"
+        reason = (
+            f"Direction {direction}; 1M={one_status} ({one_score:.0f}), "
+            f"5M={five_status} ({five_score:.0f}), 15M={d15}, 1H={d1h}. "
+            "Early Evidence Score is a screening score, not probability."
+        )
+        return {
+            "Early Signal": signal, "Early Direction": direction,
+            "Early Evidence Score": int(evidence), "Early Confirmation": confirmation,
+            "Early Signal Reason": reason,
+            "Early Signal Time (IST)": (
+                row.get("1M Candle Close (IST)") if one_is_candidate and row.get("1M Candle Close (IST)")
+                else row.get("5M Candle Close (IST)")
+            ),
+        }
+    except Exception as exc:
+        return {**empty, "Early Signal": "WAIT — CALCULATION ERROR",
+                "Early Signal Reason": str(exc)[:160]}
+
 def _last_candle_close_time(frame, minutes):
     """Return the close time of the latest completed candle in IST."""
     if frame is None or frame.empty or "Time" not in frame.columns:
@@ -2626,6 +2725,7 @@ def _make_result_row(symbol, yahoo_symbol, payload):
         for feature_name in AI_FEATURE_COLUMNS:
             row[feature_name] = None
     row.update(_early_20m_analysis(payload.get("early_1m", pd.DataFrame())))
+    row["1M Candle Close (IST)"] = _last_candle_close_time(payload.get("early_1m", pd.DataFrame()), 1)
     row.update(_prebig_5m_analysis(frame_5m))
     row.update(_advanced_big_movement_analysis(frame_5m, frame_15m, frame_1h))
     row.update(_directional_pre_move_engine(frame_5m))
@@ -2643,6 +2743,8 @@ def _make_result_row(symbol, yahoo_symbol, payload):
         )
     else:
         row["Pre-Move 15M Alignment"] = "NOT APPLICABLE"
+    # New early-decision layer is additive; legacy Final Signal and Action Signal stay untouched.
+    row.update(_early_signal_decision(row))
     for tf in TIMEFRAMES:
         liquidity = _liquidity_levels_and_sweeps(frames.get(tf, pd.DataFrame()), timeframe_minutes=TIMEFRAMES[tf][1])
         for key, value in liquidity.items():
@@ -4345,6 +4447,20 @@ def show_ai_multi_agent_scanner(client=None):
     for col_name, default_value in directional_pre_move_defaults.items():
         if col_name not in result.columns:
             result[col_name] = default_value
+    early_decision_defaults = {
+        "Early Signal": "NOT CALCULATED", "Early Direction": "WAIT",
+        "Early Evidence Score": 0, "Early Confirmation": "NOT CONFIRMED",
+        "Early Signal Reason": "Run a fresh scan to calculate the additive early-decision layer",
+        "Early Signal Time (IST)": None,
+    }
+    for col_name, default_value in early_decision_defaults.items():
+        if col_name not in result.columns:
+            result[col_name] = default_value
+    # Recalculate only the new fields for restored/older session rows; legacy columns are preserved.
+    if "Early Signal" in result.columns and (result["Early Signal"] == "NOT CALCULATED").any():
+        new_early = result.apply(_early_signal_decision, axis=1, result_type="expand")
+        for col_name in early_decision_defaults:
+            result[col_name] = new_early[col_name]
     quality_regime_defaults = {
         "Data Quality": "NOT CALCULATED",
         "Data Quality Reason": "Run a fresh scan",
@@ -4407,318 +4523,366 @@ def show_ai_multi_agent_scanner(client=None):
     st.session_state["multi_agent_results"] = result
 
     info = st.session_state.get("multi_agent_scan_info", {})
-    candle_count, scan_count, memory_symbols = _memory_stats()
-    mem_cols = st.columns(3)
-    mem_cols[0].metric("SQLite Candles", f"{candle_count:,}")
-    mem_cols[1].metric("Saved Scan Rows", f"{scan_count:,}")
-    mem_cols[2].metric("Memory Symbols", f"{memory_symbols:,}")
-    st.caption(f"Local SQLite candle database: {MEMORY_DB_PATH.name} • Host persistence depends on the deployment disk • Auto Scan: {'ON' if st.session_state.get('ma_auto_scan', False) else 'OFF'} (weekdays 09:15–15:30 IST)")
-    st.caption(
-        f"Last scan: {info.get('universe', '')} • scanner.py symbols {info.get('source_symbols', '')} "
-        f"• unique Yahoo tickers {info.get('unique_tickers', len(result))} "
-        f"• batches {info.get('batches', '')} • {info.get('completed_at', '')}"
+
+    # SIMPLE MAIN REPORT: compact screen view; the full result DataFrame remains untouched.
+    st.subheader("📊 SIMPLE SCAN REPORT — QUICK VIEW")
+    signal_counts = result.get("Final Signal", pd.Series("WAIT", index=result.index)).fillna("WAIT").value_counts()
+    quick_metrics = st.columns(5)
+    for metric_col, metric_name in zip(quick_metrics, ("BUY", "SELL", "PRE-BIG BUY", "PRE-BIG SELL", "WAIT")):
+        metric_col.metric(metric_name, int(signal_counts.get(metric_name, 0)))
+    quick_filter = st.selectbox(
+        "Quick filter", ["ALL", "BUY", "SELL", "PRE-BIG BUY", "PRE-BIG SELL", "WAIT", "NO DATA"],
+        key="ma_simple_report_filter_v1",
     )
+    quick_view = result.copy()
+    if quick_filter != "ALL":
+        quick_view = quick_view[quick_view["Final Signal"].astype(str) == quick_filter]
+    quick_sort_cols = [c for c in ("Best Stock Score", "Confirmation Strength %") if c in quick_view.columns]
+    if quick_sort_cols:
+        quick_view = quick_view.sort_values(quick_sort_cols, ascending=[False] * len(quick_sort_cols))
+    quick_cols = [c for c in [
+        "Symbol", "Final Signal", "Best Stock Score", "Last Price", "Entry Price",
+        "Stop Loss", "5M", "15M", "1H", "Signal Time (IST)", "Best Stock Reason",
+    ] if c in quick_view.columns]
+    st.caption("BUY/SELL = confirmed technical signal • PRE-BIG = early watch, not confirmed • WAIT = no clear setup. Full analysis is below.")
+    st.dataframe(quick_view[quick_cols].head(300), hide_index=True, **_stretch())
 
-    st.subheader("⚡ EARLY DIRECTIONAL PRE-MOVE — UP / DOWN")
-    pre_watch = result[
-        result["Directional Pre-Move"].isin(["UP PRE-MOVE WATCH", "DOWN PRE-MOVE WATCH"])
-        & result["Pre-Move Direction"].isin(["UP", "DOWN"])
-        & (result["Pre-Move 15M Alignment"] != "NOT ALIGNED")
-    ].copy()
-    pre_watch_cols = [
-        "Symbol", "Directional Pre-Move", "Pre-Move Direction",
-        "UP Pre-Move Score", "DOWN Pre-Move Score",
-        "Pre-Move Volume Build %", "Pre-Move Compression",
-        "Pre-Move 15M Alignment", "Market Regime", "Signal Time (IST)",
-        "Last Price", "Pre-Move Reason",
-    ]
-    if not pre_watch.empty:
-        pre_watch = pre_watch.sort_values(
-            ["Pre-Move 15M Alignment", "UP Pre-Move Score", "DOWN Pre-Move Score"],
-            ascending=[True, False, False],
+    with st.expander("🔎 ADVANCED REPORTS — LIQUIDITY, SWEEPS, AI, BIG MOVE & AGENT DETAILS", expanded=False):
+        candle_count, scan_count, memory_symbols = _memory_stats()
+        mem_cols = st.columns(3)
+        mem_cols[0].metric("SQLite Candles", f"{candle_count:,}")
+        mem_cols[1].metric("Saved Scan Rows", f"{scan_count:,}")
+        mem_cols[2].metric("Memory Symbols", f"{memory_symbols:,}")
+        st.caption(f"Local SQLite candle database: {MEMORY_DB_PATH.name} • Host persistence depends on the deployment disk • Auto Scan: {'ON' if st.session_state.get('ma_auto_scan', False) else 'OFF'} (weekdays 09:15–15:30 IST)")
+        st.caption(
+            f"Last scan: {info.get('universe', '')} • scanner.py symbols {info.get('source_symbols', '')} "
+            f"• unique Yahoo tickers {info.get('unique_tickers', len(result))} "
+            f"• batches {info.get('batches', '')} • {info.get('completed_at', '')}"
         )
-        st.dataframe(pre_watch[pre_watch_cols], hide_index=True, **_stretch())
-    else:
-        st.caption("No directional pre-move watch currently meets the setup threshold.")
 
-    with st.expander("Data Quality + Market Regime checks"):
-        st.write(
-            "Data Quality checks the 5M/15M/1H OHLCV frames, minimum candle count, "
-            "invalid prices/volume, duplicate timestamps and intraday staleness. "
-            "Market Regime is descriptive context only; it does not force BUY/SELL."
-        )
-        quality_cols = ["Symbol", "Data Quality", "Data Quality Reason", "Market Regime", "Regime Strength", "Regime ADX", "Regime ATR %", "Regime BB Width %"]
-        st.dataframe(result[quality_cols].head(100), hide_index=True, **_stretch())
+        st.subheader("⚡ EARLY DIRECTIONAL PRE-MOVE — UP / DOWN")
+        pre_watch = result[
+            result["Directional Pre-Move"].isin(["UP PRE-MOVE WATCH", "DOWN PRE-MOVE WATCH"])
+            & result["Pre-Move Direction"].isin(["UP", "DOWN"])
+            & (result["Pre-Move 15M Alignment"] != "NOT ALIGNED")
+        ].copy()
+        pre_watch_cols = [
+            "Symbol", "Directional Pre-Move", "Pre-Move Direction",
+            "UP Pre-Move Score", "DOWN Pre-Move Score",
+            "Pre-Move Volume Build %", "Pre-Move Compression",
+            "Pre-Move 15M Alignment", "Market Regime", "Signal Time (IST)",
+            "Last Price", "Pre-Move Reason",
+        ]
+        if not pre_watch.empty:
+            pre_watch = pre_watch.sort_values(
+                ["Pre-Move 15M Alignment", "UP Pre-Move Score", "DOWN Pre-Move Score"],
+                ascending=[True, False, False],
+            )
+            st.dataframe(pre_watch[pre_watch_cols], hide_index=True, **_stretch())
+        else:
+            st.caption("No directional pre-move watch currently meets the setup threshold.")
 
-    # Restore the previously trained model once per Streamlit session.
-    if not st.session_state.get("ma_real_ai_model"):
-        _persisted = _load_persisted_ai_brain()
-        if _persisted:
-            st.session_state["ma_real_ai_model"] = _persisted
+        with st.expander("Data Quality + Market Regime checks"):
+            st.write(
+                "Data Quality checks the 5M/15M/1H OHLCV frames, minimum candle count, "
+                "invalid prices/volume, duplicate timestamps and intraday staleness. "
+                "Market Regime is descriptive context only; it does not force BUY/SELL."
+            )
+            quality_cols = ["Symbol", "Data Quality", "Data Quality Reason", "Market Regime", "Regime Strength", "Regime ADX", "Regime ATR %", "Regime BB Width %"]
+            st.dataframe(result[quality_cols].head(100), hide_index=True, **_stretch())
 
-    # Real AI Brain training uses saved, completed 5M candles and chronological holdout.
-    st.subheader("🧠 REAL AI BRAIN — Hybrid ML")
-    ai_col1, ai_col2 = st.columns(2)
-    with ai_col1:
-        train_ai_now = st.button("🧠 TRAIN / REFRESH REAL AI BRAIN", key="ma_train_real_ai")
-    with ai_col2:
+        # Restore the previously trained model once per Streamlit session.
+        if not st.session_state.get("ma_real_ai_model"):
+            _persisted = _load_persisted_ai_brain()
+            if _persisted:
+                st.session_state["ma_real_ai_model"] = _persisted
+
+        # Real AI Brain training uses saved, completed 5M candles and chronological holdout.
+        st.subheader("🧠 REAL AI BRAIN — Hybrid ML")
+        ai_col1, ai_col2 = st.columns(2)
+        with ai_col1:
+            train_ai_now = st.button("🧠 TRAIN / REFRESH REAL AI BRAIN", key="ma_train_real_ai")
+        with ai_col2:
+            ai_bundle = st.session_state.get("ma_real_ai_model")
+            if ai_bundle:
+                wf_score = ai_bundle["metrics"].get("walk_forward_balanced_accuracy")
+                st.metric("AI Walk-Forward Balanced Accuracy", f"{wf_score*100:.1f}%" if wf_score is not None else "NOT AVAILABLE")
+            else:
+                st.metric("AI Model", "NOT TRAINED")
+        if train_ai_now:
+            with st.spinner("Training ML Brain from saved completed 5M candles..."):
+                trained_bundle, train_error = _train_real_ai_brain(force=True)
+            if trained_bundle:
+                st.session_state["ma_real_ai_model"] = trained_bundle
+                st.session_state["ma_real_ai_train_error"] = None
+                st.success(
+                    f"AI Brain trained: {trained_bundle['metrics']['samples']:,} samples • "
+                    f"walk-forward balanced accuracy "
+                    f"{trained_bundle['metrics']['walk_forward_balanced_accuracy']*100:.1f}% "
+                    f"({trained_bundle['metrics']['walk_forward_folds']} folds) • trained {trained_bundle['metrics']['trained_at']}"
+                    if trained_bundle['metrics']['walk_forward_balanced_accuracy'] is not None else
+                    f"walk-forward validation unavailable; holdout balanced accuracy {trained_bundle['metrics']['balanced_accuracy']*100:.1f}% • trained {trained_bundle['metrics']['trained_at']}"
+                )
+            else:
+                st.session_state["ma_real_ai_train_error"] = train_error
+                st.error(f"AI retraining failed; the previous model is kept. Reason: {train_error}")
         ai_bundle = st.session_state.get("ma_real_ai_model")
         if ai_bundle:
-            wf_score = ai_bundle["metrics"].get("walk_forward_balanced_accuracy")
-            st.metric("AI Walk-Forward Balanced Accuracy", f"{wf_score*100:.1f}%" if wf_score is not None else "NOT AVAILABLE")
+            wf_value = ai_bundle["metrics"].get("walk_forward_balanced_accuracy")
+            wf_text = f"walk-forward balanced accuracy {wf_value*100:.1f}%" if wf_value is not None else "walk-forward balanced accuracy NOT AVAILABLE"
+            st.caption(
+                f"Chronological 80/20 holdout + {ai_bundle['metrics'].get('walk_forward_folds', 0)} expanding walk-forward folds • "
+                f"{ai_bundle['metrics']['train_samples']:,} train / {ai_bundle['metrics']['test_samples']:,} holdout • "
+                f"holdout balanced accuracy {ai_bundle['metrics']['balanced_accuracy']*100:.1f}% • {wf_text}. "
+                "Targets: next 3 completed 5M candles within the same session; deadband is max(0.10%, 0.8× ATR% × √3). RF vote fractions are uncalibrated model estimates, not probabilities, true odds or a guaranteed win rate."
+            )
+            ai_apply_sig = (st.session_state.get("ma_scan_job_id"), ai_bundle.get("metrics", {}).get("trained_at"), len(result))
+            if st.session_state.get("ma_ai_apply_sig") != ai_apply_sig:
+                result = _apply_real_ai_brain(result)
+                st.session_state["multi_agent_results"] = result
+                st.session_state["multi_agent_csv"] = result.to_csv(index=False).encode("utf-8-sig")
+                st.session_state["ma_ai_apply_sig"] = ai_apply_sig
+            else:
+                result = st.session_state.get("multi_agent_results", result)
+            ai_cols = ["Symbol", "AI Direction", "AI Up Model Estimate %", "AI Down Model Estimate %",
+                       "AI Sideways Model Estimate %", "AI Brain Signal", "Final Signal"]
+            st.dataframe(result[ai_cols].head(30), hide_index=True, **_stretch())
         else:
-            st.metric("AI Model", "NOT TRAINED")
-    if train_ai_now:
-        with st.spinner("Training ML Brain from saved completed 5M candles..."):
-            trained_bundle, train_error = _train_real_ai_brain(force=True)
-        if trained_bundle:
-            st.session_state["ma_real_ai_model"] = trained_bundle
-            st.session_state["ma_real_ai_train_error"] = None
-            st.success(
-                f"AI Brain trained: {trained_bundle['metrics']['samples']:,} samples • "
-                f"walk-forward balanced accuracy "
-                f"{trained_bundle['metrics']['walk_forward_balanced_accuracy']*100:.1f}% "
-                f"({trained_bundle['metrics']['walk_forward_folds']} folds) • trained {trained_bundle['metrics']['trained_at']}"
-                if trained_bundle['metrics']['walk_forward_balanced_accuracy'] is not None else
-                f"walk-forward validation unavailable; holdout balanced accuracy {trained_bundle['metrics']['balanced_accuracy']*100:.1f}% • trained {trained_bundle['metrics']['trained_at']}"
+            # Ensure the report schema is stable even before 500 labelled samples exist.
+            ai_apply_sig = (st.session_state.get("ma_scan_job_id"), "none", len(result))
+            if st.session_state.get("ma_ai_apply_sig") != ai_apply_sig:
+                result = _apply_real_ai_brain(result)
+                st.session_state["multi_agent_results"] = result
+                st.session_state["multi_agent_csv"] = result.to_csv(index=False).encode("utf-8-sig")
+                st.session_state["ma_ai_apply_sig"] = ai_apply_sig
+            else:
+                result = st.session_state.get("multi_agent_results", result)
+            st.warning(
+                "Real AI Brain is not active: " +
+                str(st.session_state.get("ma_real_ai_train_error") or "training data not available") +
+                " Collect more completed 5M candle history and press TRAIN / REFRESH."
+            )
+
+        # Idempotent event capture: repeated Streamlit reruns do not create duplicate events.
+        try:
+            new_events = _capture_signal_events(result)
+            new_liquidity_events = _capture_liquidity_sweep_events(result)
+            new_volume_events = _capture_volume_expansion_events(result, threshold=2.0)
+            _prune_event_ledgers()
+            if new_events:
+                st.caption(f"Live Dashboard: {new_events} new signal event(s) saved to SQLite.")
+            if new_liquidity_events:
+                st.caption(f"Live Dashboard: {new_liquidity_events} new liquidity/sweep event(s) saved to SQLite.")
+            if new_volume_events:
+                st.caption(f"Live Dashboard: {new_volume_events} new >=2x volume event(s) saved to SQLite.")
+        except Exception as event_exc:
+            st.warning(f"Live signal event save issue: {event_exc}")
+
+        # Additive early signal report; does not alter existing BUY/SELL or Action Signal fields.
+        st.subheader("⚡ EARLY SIGNAL DECISION — BEFORE MOVE + FALSE-SIGNAL FILTER")
+        early_decision_cols = [c for c in [
+            "Symbol", "Last Price", "Early Signal", "Early Direction", "Early Evidence Score",
+            "Early Confirmation", "Early Signal Time (IST)", "20M Status", "20M Direction",
+            "20M Pre-Move Score", "Directional Pre-Move", "Pre-Move Direction",
+            "Pre-Move 15M Alignment", "5M", "15M", "1H", "Market Regime", "Early Signal Reason",
+        ] if c in result.columns]
+        early_decision_view = result[result["Early Signal"].astype(str).str.startswith((
+            "EARLY WATCH", "BREAKOUT CONFIRMED", "WAIT — 1M/5M CONFLICT",
+            "WAIT — 15M NOT ALIGNED", "WAIT — 1H CONFLICT"
+        ))].copy()
+        if not early_decision_view.empty:
+            early_decision_view = early_decision_view.sort_values(
+                ["Early Evidence Score", "20M Pre-Move Score"], ascending=[False, False]
+            )
+            st.dataframe(early_decision_view[early_decision_cols].head(200), hide_index=True, height=360, **_stretch())
+        else:
+            st.info("ప్రస్తుతం 1M/5M ముందస్తు setup + 15M దిశ సరిపోలిన signal లేదు. WAIT అనేది కూడా valid result.")
+        st.caption("Early Evidence Score is a screening score, not a probability. 1M/5M signals are WATCH only until confirmation; breakout needs retest/continuation checks. Legacy Final Signal and Action Signal remain unchanged.")
+
+        # Liquidity & sweep event-time panel (15M reference; timestamps are completed-candle close times).
+        st.subheader("💧 BUY / SELL LIQUIDITY + SWEEP SIGNAL TIME (IST)")
+        liquidity_time_cols = [
+            "Symbol", "Last Price", "Buy-side Liquidity", "Buy-side Liquidity Time (IST)",
+            "Sell-side Liquidity", "Sell-side Liquidity Time (IST)",
+            "Upside Sweep", "Upside Sweep Time (IST)",
+            "Downside Sweep", "Downside Sweep Time (IST)", "Liquidity Sweep Detail",
+            "15M Buy-side Liquidity", "15M Buy-side Liquidity Time (IST)",
+            "15M Sell-side Liquidity", "15M Sell-side Liquidity Time (IST)",
+            "15M Upside Sweep", "15M Upside Sweep Time (IST)",
+            "15M Downside Sweep", "15M Downside Sweep Time (IST)",
+        ]
+        liquidity_time_cols = [c for c in liquidity_time_cols if c in result.columns]
+        liquidity_event_mask = (
+            result.get("15M Upside Sweep", pd.Series("NO", index=result.index)).eq("YES")
+            | result.get("15M Downside Sweep", pd.Series("NO", index=result.index)).eq("YES")
+        )
+        liquidity_panel = result.loc[liquidity_event_mask, liquidity_time_cols].copy()
+        if not liquidity_panel.empty:
+            st.dataframe(liquidity_panel, hide_index=True, height=300, **_stretch())
+        else:
+            st.info("ప్రస్తుతం 15M completed candleలో confirmed Sweep Up / Sweep Down signal లేదు. Liquidity levels మరియు వాటి formation times క్రింది main reportలో ఉంటాయి.")
+        st.caption("Liquidity Time = ఆ liquidity level ఏర్పడిన pivot candle close time. Sweep Time = sweep confirm అయిన completed candle close time. అన్ని timestamps IST.")
+
+        st.subheader("🚀 V18 ADVANCED BIG MOVEMENT — FALSE BREAKOUT + CONTINUATION")
+        advanced_cols = [c for c in [
+            "Symbol", "Last Price", "Advanced Big Move", "Big Move Direction", "Big Move Score",
+            "False Breakout Risk", "Breakout Retest Status", "5M Retest Check", "15M Trend Check", "Momentum Continuation",
+            "Big Move Range High", "Big Move Range Low", "Big Move RVOL", "Big Move Reason",
+        ] if c in result.columns]
+        advanced_view = result[result.get("Advanced Big Move", pd.Series(index=result.index, dtype=str)).isin([
+            "PRE-BIG WATCH", "BREAKOUT DETECTED", "BREAKDOWN DETECTED", "RETEST WAITING",
+            "BUY CONFIRMED", "SELL CONFIRMED", "RETEST HELD — 15M WAIT",
+            "RETEST REJECTED — 15M WAIT", "FALSE BREAKOUT RISK", "WAIT — SESSION WARM-UP",
+        ])].copy()
+        if not advanced_view.empty:
+            advanced_view = advanced_view.sort_values("Big Move Score", ascending=False)
+            st.dataframe(advanced_view[advanced_cols], hide_index=True, height=420, **_stretch())
+        else:
+            st.info("No advanced big-movement setup currently meets the screening conditions.")
+        st.caption("Big Move Score is a rule-based screening score, not a probability or guaranteed return. Retest and continuation require subsequent completed candles; validate using historical trade backtesting.")
+
+        # 18th Agent report: rank only qualified, actionable stocks.
+        st.subheader("🏆 BEST PERFORMANCE STOCKS — 18th Ranking Analyst")
+        min_best_score = st.selectbox(
+            "Minimum Best Stock Score", [75, 80, 85, 90], index=0, key="ma_best_min_score"
+        )
+        best_cols = [
+            "Symbol", "Best Stock Side", "Final Signal", "Action Signal", "Breakout Signal", "Best Stock Score",
+            "Best Stock Grade", "Entry Price", "Stop Loss", "Last Price",
+            "Signal Time (IST)", "5M", "15M", "1H", "Depth Signal",
+            "Best Stock Reason",
+        ]
+        best = result[
+            (result["Best Stock Filter"] == "PASS")
+            & (result["Best Stock Score"] >= int(min_best_score))
+        ].copy()
+        if not best.empty:
+            best = best.sort_values(
+                ["Best Stock Score", "Confirmation Strength %"], ascending=[False, False]
+            ).head(10)
+            st.dataframe(best[best_cols], hide_index=True, **_stretch())
+            st.caption(f"Showing top {len(best)} qualified stocks. Score threshold: {min_best_score}/100.")
+        else:
+            st.info(
+                f"No stock passed {min_best_score}/100 with aligned 5M, 15M and 1H signals. "
+                "The analyst will not force a BUY/SELL recommendation."
+            )
+
+        # Data coverage is shown separately from the final signal count.
+        coverage_cols = st.columns(5)
+        coverage_cols[0].metric("Rows attempted", len(result))
+        for col, tf in zip(coverage_cols[1:4], ("5M", "15M", "1H")):
+            col.metric(f"{tf} valid data", int((result[f"{tf} Candles"] >= 30).sum()))
+        coverage_cols[4].metric("20M data", int((result["20M Status"] != "NO DATA").sum()))
+
+        counts = result["Final Signal"].value_counts()
+        metric_cols = st.columns(6)
+        for col, label in zip(metric_cols, ["BUY", "SELL", "PRE-BIG BUY", "PRE-BIG SELL", "WAIT", "NO DATA"]):
+            col.metric(label, int(counts.get(label, 0)))
+
+        filter_col1, filter_col2 = st.columns(2)
+        with filter_col1:
+            signal_filter = st.selectbox(
+                "Show technical signals", ["ALL", "BUY", "SELL", "PRE-BIG BUY", "PRE-BIG SELL", "WAIT", "NO DATA"],
+                key="ma_filter",
+            )
+        with filter_col2:
+            early_filter = st.selectbox(
+                "20M Early Movement / Liquidity",
+                [
+                    "ALL", "WATCH", "CONFIRMED BREAKOUT", "WAIT", "NO DATA",
+                    "BUY LIQUIDITY", "SELL LIQUIDITY", "SWEEP UP", "SWEEP DOWN",
+                    "BREAKOUT", "BREAKDOWN", "ACTION BUY", "ACTION SELL",
+                ],
+                key="ma_early_filter",
+            )
+        view = result if signal_filter == "ALL" else result[result["Final Signal"] == signal_filter]
+
+        # Liquidity filters use the completed 15M candle as the common reference.
+        # Buy-side liquidity is above prior highs; sell-side liquidity is below prior lows.
+        # Sweep UP means buy-side liquidity was taken and price closed back below.
+        # Sweep DOWN means sell-side liquidity was taken and price closed back above.
+        if early_filter in ("WATCH", "CONFIRMED BREAKOUT", "WAIT", "NO DATA"):
+            view = view[view["20M Status"] == early_filter]
+        elif early_filter == "BUY LIQUIDITY":
+            view = view[view["15M Buy-side Liquidity"].notna()]
+        elif early_filter == "SELL LIQUIDITY":
+            view = view[view["15M Sell-side Liquidity"].notna()]
+        elif early_filter == "SWEEP UP":
+            view = view[view["15M Upside Sweep"] == "YES"]
+        elif early_filter == "SWEEP DOWN":
+            view = view[view["15M Downside Sweep"] == "YES"]
+        elif early_filter in ("BREAKOUT", "BREAKDOWN"):
+            view = view[view["Breakout Signal"] == early_filter]
+        elif early_filter == "ACTION BUY":
+            view = view[view["Action Signal"] == "BUY"]
+        elif early_filter == "ACTION SELL":
+            view = view[view["Action Signal"] == "SELL"]
+
+        view = view.sort_values(["20M Pre-Move Score", "Confirmation Strength %"], ascending=[False, False])
+        summary_cols = [
+            "Symbol", "Final Signal", "Action Signal", "Breakout Signal", "Multi-TF Breakout", "5M Breakout", "15M Breakout", "1H Breakout", "Breakout Retest", "Breakout Level", "Breakdown Level", "Breakout Reason", "Equal High Liquidity", "Equal Low Liquidity", "Direction Movement", "Signal Time (IST)",
+            "5M Candle Close (IST)", "15M Candle Close (IST)", "1H Candle Close (IST)",
+            "Entry Price", "Stop Loss", "15M ATR",
+            "Confirmation Strength %", "Consensus Score",
+            "Buy-side Liquidity", "Buy-side Liquidity Time (IST)", "Sell-side Liquidity", "Sell-side Liquidity Time (IST)", "Upside Sweep", "Upside Sweep Time (IST)", "Downside Sweep", "Downside Sweep Time (IST)", "Liquidity Sweep Detail",
+            "5M Buy-side Liquidity", "5M Buy-side Liquidity Time (IST)", "5M Sell-side Liquidity", "5M Sell-side Liquidity Time (IST)", "5M Upside Sweep", "5M Upside Sweep Time (IST)", "5M Downside Sweep", "5M Downside Sweep Time (IST)",
+            "15M Buy-side Liquidity", "15M Buy-side Liquidity Time (IST)", "15M Sell-side Liquidity", "15M Sell-side Liquidity Time (IST)", "15M Upside Sweep", "15M Upside Sweep Time (IST)", "15M Downside Sweep", "15M Downside Sweep Time (IST)",
+            "1H Buy-side Liquidity", "1H Buy-side Liquidity Time (IST)", "1H Sell-side Liquidity", "1H Sell-side Liquidity Time (IST)", "1H Upside Sweep", "1H Upside Sweep Time (IST)", "1H Downside Sweep", "1H Downside Sweep Time (IST)",
+            "AI Direction", "AI Up Model Estimate %", "AI Down Model Estimate %",
+            "AI Sideways Model Estimate %", "AI Brain Signal", "AI Model Status",
+            "Advanced Big Move", "Big Move Direction", "Big Move Score", "False Breakout Risk",
+            "Breakout Retest Status", "5M Retest Check", "15M Trend Check", "Momentum Continuation", "Big Move Range High",
+            "Big Move Range Low", "Big Move RVOL", "Big Move Reason",
+            "18th Agent", "Best Stock Score", "Best Stock Side", "Best Stock Grade",
+            "Best Stock Filter", "Best Stock Reason",
+            "Early Signal", "Early Direction", "Early Evidence Score", "Early Confirmation",
+            "Early Signal Time (IST)", "1M Candle Close (IST)", "Early Signal Reason",
+            "20M Status", "20M Direction", "20M Pre-Move Score", "20M Range High", "20M Range Low",
+            "20M Range %", "20M RVOL", "20M Pressure %", "20M Last Close", "20M Reason",
+            "5M", "15M", "1H", "5M Score", "15M Score", "1H Score",
+            "5M Candles", "15M Candles", "1H Candles", "Last Price", "15M RSI",
+            "News Agent", "News Score", "News Reason", "Depth Status", "Depth Signal",
+            "Best Bid", "Best Ask", "Spread", "Buy Qty (5L)", "Sell Qty (5L)",
+            "Depth Imbalance %", "Depth Time (IST)", "Errors",
+        ]
+        st.subheader("🚀 EARLY BIG MOVE CATCHER — 5M Compression + Volume Build-up")
+        st.caption(f"{int(result.get('Symbol', pd.Series(dtype=str)).nunique()):,} unique scanned symbols: 13 completed 5M candles today (12-bar base + 1 completed trigger candle), rising volume and directional bias; breakout is confirmed only after a completed candle closes beyond the range with strong body and RVOL.")
+        prebig_view = result[result["PRE-BIG Status"].isin([
+            "PRE-BIG BULLISH WATCH", "PRE-BIG BEARISH WATCH",
+            "BULLISH BREAKOUT CONFIRMED", "BEARISH BREAKDOWN CONFIRMED",
+        ])].copy()
+        if not prebig_view.empty:
+            prebig_view = prebig_view.sort_values(["PRE-BIG Score", "PRE-BIG RVOL"], ascending=[False, False])
+            prebig_cols = ["Symbol", "PRE-BIG Status", "PRE-BIG Direction", "PRE-BIG Score",
+                           "PRE-BIG Candles", "PRE-BIG Range High", "PRE-BIG Range Low",
+                           "PRE-BIG Range Width %", "PRE-BIG Volume Build %", "PRE-BIG RVOL",
+                           "PRE-BIG Trigger", "Last Price", "5M", "15M", "1H", "PRE-BIG Reason"]
+            st.dataframe(prebig_view[prebig_cols], hide_index=True, **_stretch())
+        else:
+            st.info("No 5M PRE-BIG setup currently meets the compression + volume + direction rules. This is preferable to forcing a signal.")
+
+        summary_cols = [c for c in summary_cols if c in view.columns]
+        st.caption(f"Showing top 300 of {len(view):,} rows in the main table. Full results remain available in CSV/Excel.")
+        st.dataframe(view[summary_cols].head(300), hide_index=True, **_stretch())
+
+        st.subheader("📚 FYERS Live Market Depth — Shortlist Only")
+        depth_view = st.session_state.get("multi_agent_depth")
+        if isinstance(depth_view, pd.DataFrame) and not depth_view.empty:
+            st.caption(
+                f"FYERS depth requests: {len(depth_view)} • cache TTL: {FYERS_DEPTH_CACHE_TTL}s • "
+                "one request per symbol, paced at approximately one call/second."
+            )
+            st.dataframe(depth_view, hide_index=True, **_stretch())
+            st.caption(
+                "Buy Qty / Sell Qty = sum of displayed first five bid/ask levels. "
+                "Depth Imbalance = (Buy Qty − Sell Qty) ÷ total × 100. "
+                "This is a displayed-book snapshot, not executed buying/selling or a guaranteed direction."
             )
         else:
-            st.session_state["ma_real_ai_train_error"] = train_error
-            st.error(f"AI retraining failed; the previous model is kept. Reason: {train_error}")
-    ai_bundle = st.session_state.get("ma_real_ai_model")
-    if ai_bundle:
-        wf_value = ai_bundle["metrics"].get("walk_forward_balanced_accuracy")
-        wf_text = f"walk-forward balanced accuracy {wf_value*100:.1f}%" if wf_value is not None else "walk-forward balanced accuracy NOT AVAILABLE"
-        st.caption(
-            f"Chronological 80/20 holdout + {ai_bundle['metrics'].get('walk_forward_folds', 0)} expanding walk-forward folds • "
-            f"{ai_bundle['metrics']['train_samples']:,} train / {ai_bundle['metrics']['test_samples']:,} holdout • "
-            f"holdout balanced accuracy {ai_bundle['metrics']['balanced_accuracy']*100:.1f}% • {wf_text}. "
-            "Targets: next 3 completed 5M candles within the same session; deadband is max(0.10%, 0.8× ATR% × √3). RF vote fractions are uncalibrated model estimates, not probabilities, true odds or a guaranteed win rate."
-        )
-        ai_apply_sig = (st.session_state.get("ma_scan_job_id"), ai_bundle.get("metrics", {}).get("trained_at"), len(result))
-        if st.session_state.get("ma_ai_apply_sig") != ai_apply_sig:
-            result = _apply_real_ai_brain(result)
-            st.session_state["multi_agent_results"] = result
-            st.session_state["multi_agent_csv"] = result.to_csv(index=False).encode("utf-8-sig")
-            st.session_state["ma_ai_apply_sig"] = ai_apply_sig
-        else:
-            result = st.session_state.get("multi_agent_results", result)
-        ai_cols = ["Symbol", "AI Direction", "AI Up Model Estimate %", "AI Down Model Estimate %",
-                   "AI Sideways Model Estimate %", "AI Brain Signal", "Final Signal"]
-        st.dataframe(result[ai_cols].head(30), hide_index=True, **_stretch())
-    else:
-        # Ensure the report schema is stable even before 500 labelled samples exist.
-        ai_apply_sig = (st.session_state.get("ma_scan_job_id"), "none", len(result))
-        if st.session_state.get("ma_ai_apply_sig") != ai_apply_sig:
-            result = _apply_real_ai_brain(result)
-            st.session_state["multi_agent_results"] = result
-            st.session_state["multi_agent_csv"] = result.to_csv(index=False).encode("utf-8-sig")
-            st.session_state["ma_ai_apply_sig"] = ai_apply_sig
-        else:
-            result = st.session_state.get("multi_agent_results", result)
-        st.warning(
-            "Real AI Brain is not active: " +
-            str(st.session_state.get("ma_real_ai_train_error") or "training data not available") +
-            " Collect more completed 5M candle history and press TRAIN / REFRESH."
-        )
-
-    # Idempotent event capture: repeated Streamlit reruns do not create duplicate events.
-    try:
-        new_events = _capture_signal_events(result)
-        new_liquidity_events = _capture_liquidity_sweep_events(result)
-        new_volume_events = _capture_volume_expansion_events(result, threshold=2.0)
-        _prune_event_ledgers()
-        if new_events:
-            st.caption(f"Live Dashboard: {new_events} new signal event(s) saved to SQLite.")
-        if new_liquidity_events:
-            st.caption(f"Live Dashboard: {new_liquidity_events} new liquidity/sweep event(s) saved to SQLite.")
-        if new_volume_events:
-            st.caption(f"Live Dashboard: {new_volume_events} new >=2x volume event(s) saved to SQLite.")
-    except Exception as event_exc:
-        st.warning(f"Live signal event save issue: {event_exc}")
-
-    # Liquidity & sweep event-time panel (15M reference; timestamps are completed-candle close times).
-    st.subheader("💧 BUY / SELL LIQUIDITY + SWEEP SIGNAL TIME (IST)")
-    liquidity_time_cols = [
-        "Symbol", "Last Price", "Buy-side Liquidity", "Buy-side Liquidity Time (IST)",
-        "Sell-side Liquidity", "Sell-side Liquidity Time (IST)",
-        "Upside Sweep", "Upside Sweep Time (IST)",
-        "Downside Sweep", "Downside Sweep Time (IST)", "Liquidity Sweep Detail",
-        "15M Buy-side Liquidity", "15M Buy-side Liquidity Time (IST)",
-        "15M Sell-side Liquidity", "15M Sell-side Liquidity Time (IST)",
-        "15M Upside Sweep", "15M Upside Sweep Time (IST)",
-        "15M Downside Sweep", "15M Downside Sweep Time (IST)",
-    ]
-    liquidity_time_cols = [c for c in liquidity_time_cols if c in result.columns]
-    liquidity_event_mask = (
-        result.get("15M Upside Sweep", pd.Series("NO", index=result.index)).eq("YES")
-        | result.get("15M Downside Sweep", pd.Series("NO", index=result.index)).eq("YES")
-    )
-    liquidity_panel = result.loc[liquidity_event_mask, liquidity_time_cols].copy()
-    if not liquidity_panel.empty:
-        st.dataframe(liquidity_panel, hide_index=True, height=300, **_stretch())
-    else:
-        st.info("ప్రస్తుతం 15M completed candleలో confirmed Sweep Up / Sweep Down signal లేదు. Liquidity levels మరియు వాటి formation times క్రింది main reportలో ఉంటాయి.")
-    st.caption("Liquidity Time = ఆ liquidity level ఏర్పడిన pivot candle close time. Sweep Time = sweep confirm అయిన completed candle close time. అన్ని timestamps IST.")
-
-    st.subheader("🚀 V18 ADVANCED BIG MOVEMENT — FALSE BREAKOUT + CONTINUATION")
-    advanced_cols = [c for c in [
-        "Symbol", "Last Price", "Advanced Big Move", "Big Move Direction", "Big Move Score",
-        "False Breakout Risk", "Breakout Retest Status", "5M Retest Check", "15M Trend Check", "Momentum Continuation",
-        "Big Move Range High", "Big Move Range Low", "Big Move RVOL", "Big Move Reason",
-    ] if c in result.columns]
-    advanced_view = result[result.get("Advanced Big Move", pd.Series(index=result.index, dtype=str)).isin([
-        "PRE-BIG WATCH", "BREAKOUT DETECTED", "BREAKDOWN DETECTED", "RETEST WAITING",
-        "BUY CONFIRMED", "SELL CONFIRMED", "RETEST HELD — 15M WAIT",
-        "RETEST REJECTED — 15M WAIT", "FALSE BREAKOUT RISK", "WAIT — SESSION WARM-UP",
-    ])].copy()
-    if not advanced_view.empty:
-        advanced_view = advanced_view.sort_values("Big Move Score", ascending=False)
-        st.dataframe(advanced_view[advanced_cols], hide_index=True, height=420, **_stretch())
-    else:
-        st.info("No advanced big-movement setup currently meets the screening conditions.")
-    st.caption("Big Move Score is a rule-based screening score, not a probability or guaranteed return. Retest and continuation require subsequent completed candles; validate using historical trade backtesting.")
-
-    # 18th Agent report: rank only qualified, actionable stocks.
-    st.subheader("🏆 BEST PERFORMANCE STOCKS — 18th Ranking Analyst")
-    min_best_score = st.selectbox(
-        "Minimum Best Stock Score", [75, 80, 85, 90], index=0, key="ma_best_min_score"
-    )
-    best_cols = [
-        "Symbol", "Best Stock Side", "Final Signal", "Action Signal", "Breakout Signal", "Best Stock Score",
-        "Best Stock Grade", "Entry Price", "Stop Loss", "Last Price",
-        "Signal Time (IST)", "5M", "15M", "1H", "Depth Signal",
-        "Best Stock Reason",
-    ]
-    best = result[
-        (result["Best Stock Filter"] == "PASS")
-        & (result["Best Stock Score"] >= int(min_best_score))
-    ].copy()
-    if not best.empty:
-        best = best.sort_values(
-            ["Best Stock Score", "Confirmation Strength %"], ascending=[False, False]
-        ).head(10)
-        st.dataframe(best[best_cols], hide_index=True, **_stretch())
-        st.caption(f"Showing top {len(best)} qualified stocks. Score threshold: {min_best_score}/100.")
-    else:
-        st.info(
-            f"No stock passed {min_best_score}/100 with aligned 5M, 15M and 1H signals. "
-            "The analyst will not force a BUY/SELL recommendation."
-        )
-
-    # Data coverage is shown separately from the final signal count.
-    coverage_cols = st.columns(5)
-    coverage_cols[0].metric("Rows attempted", len(result))
-    for col, tf in zip(coverage_cols[1:4], ("5M", "15M", "1H")):
-        col.metric(f"{tf} valid data", int((result[f"{tf} Candles"] >= 30).sum()))
-    coverage_cols[4].metric("20M data", int((result["20M Status"] != "NO DATA").sum()))
-
-    counts = result["Final Signal"].value_counts()
-    metric_cols = st.columns(6)
-    for col, label in zip(metric_cols, ["BUY", "SELL", "PRE-BIG BUY", "PRE-BIG SELL", "WAIT", "NO DATA"]):
-        col.metric(label, int(counts.get(label, 0)))
-
-    filter_col1, filter_col2 = st.columns(2)
-    with filter_col1:
-        signal_filter = st.selectbox(
-            "Show technical signals", ["ALL", "BUY", "SELL", "PRE-BIG BUY", "PRE-BIG SELL", "WAIT", "NO DATA"],
-            key="ma_filter",
-        )
-    with filter_col2:
-        early_filter = st.selectbox(
-            "20M Early Movement / Liquidity",
-            [
-                "ALL", "WATCH", "CONFIRMED BREAKOUT", "WAIT", "NO DATA",
-                "BUY LIQUIDITY", "SELL LIQUIDITY", "SWEEP UP", "SWEEP DOWN",
-                "BREAKOUT", "BREAKDOWN", "ACTION BUY", "ACTION SELL",
-            ],
-            key="ma_early_filter",
-        )
-    view = result if signal_filter == "ALL" else result[result["Final Signal"] == signal_filter]
-
-    # Liquidity filters use the completed 15M candle as the common reference.
-    # Buy-side liquidity is above prior highs; sell-side liquidity is below prior lows.
-    # Sweep UP means buy-side liquidity was taken and price closed back below.
-    # Sweep DOWN means sell-side liquidity was taken and price closed back above.
-    if early_filter in ("WATCH", "CONFIRMED BREAKOUT", "WAIT", "NO DATA"):
-        view = view[view["20M Status"] == early_filter]
-    elif early_filter == "BUY LIQUIDITY":
-        view = view[view["15M Buy-side Liquidity"].notna()]
-    elif early_filter == "SELL LIQUIDITY":
-        view = view[view["15M Sell-side Liquidity"].notna()]
-    elif early_filter == "SWEEP UP":
-        view = view[view["15M Upside Sweep"] == "YES"]
-    elif early_filter == "SWEEP DOWN":
-        view = view[view["15M Downside Sweep"] == "YES"]
-    elif early_filter in ("BREAKOUT", "BREAKDOWN"):
-        view = view[view["Breakout Signal"] == early_filter]
-    elif early_filter == "ACTION BUY":
-        view = view[view["Action Signal"] == "BUY"]
-    elif early_filter == "ACTION SELL":
-        view = view[view["Action Signal"] == "SELL"]
-
-    view = view.sort_values(["20M Pre-Move Score", "Confirmation Strength %"], ascending=[False, False])
-    summary_cols = [
-        "Symbol", "Final Signal", "Action Signal", "Breakout Signal", "Multi-TF Breakout", "5M Breakout", "15M Breakout", "1H Breakout", "Breakout Retest", "Breakout Level", "Breakdown Level", "Breakout Reason", "Equal High Liquidity", "Equal Low Liquidity", "Direction Movement", "Signal Time (IST)",
-        "5M Candle Close (IST)", "15M Candle Close (IST)", "1H Candle Close (IST)",
-        "Entry Price", "Stop Loss", "15M ATR",
-        "Confirmation Strength %", "Consensus Score",
-        "Buy-side Liquidity", "Buy-side Liquidity Time (IST)", "Sell-side Liquidity", "Sell-side Liquidity Time (IST)", "Upside Sweep", "Upside Sweep Time (IST)", "Downside Sweep", "Downside Sweep Time (IST)", "Liquidity Sweep Detail",
-        "5M Buy-side Liquidity", "5M Buy-side Liquidity Time (IST)", "5M Sell-side Liquidity", "5M Sell-side Liquidity Time (IST)", "5M Upside Sweep", "5M Upside Sweep Time (IST)", "5M Downside Sweep", "5M Downside Sweep Time (IST)",
-        "15M Buy-side Liquidity", "15M Buy-side Liquidity Time (IST)", "15M Sell-side Liquidity", "15M Sell-side Liquidity Time (IST)", "15M Upside Sweep", "15M Upside Sweep Time (IST)", "15M Downside Sweep", "15M Downside Sweep Time (IST)",
-        "1H Buy-side Liquidity", "1H Buy-side Liquidity Time (IST)", "1H Sell-side Liquidity", "1H Sell-side Liquidity Time (IST)", "1H Upside Sweep", "1H Upside Sweep Time (IST)", "1H Downside Sweep", "1H Downside Sweep Time (IST)",
-        "AI Direction", "AI Up Model Estimate %", "AI Down Model Estimate %",
-        "AI Sideways Model Estimate %", "AI Brain Signal", "AI Model Status",
-        "Advanced Big Move", "Big Move Direction", "Big Move Score", "False Breakout Risk",
-        "Breakout Retest Status", "5M Retest Check", "15M Trend Check", "Momentum Continuation", "Big Move Range High",
-        "Big Move Range Low", "Big Move RVOL", "Big Move Reason",
-        "18th Agent", "Best Stock Score", "Best Stock Side", "Best Stock Grade",
-        "Best Stock Filter", "Best Stock Reason",
-        "20M Status", "20M Direction", "20M Pre-Move Score", "20M Range High", "20M Range Low",
-        "20M Range %", "20M RVOL", "20M Pressure %", "20M Last Close", "20M Reason",
-        "5M", "15M", "1H", "5M Score", "15M Score", "1H Score",
-        "5M Candles", "15M Candles", "1H Candles", "Last Price", "15M RSI",
-        "News Agent", "News Score", "News Reason", "Depth Status", "Depth Signal",
-        "Best Bid", "Best Ask", "Spread", "Buy Qty (5L)", "Sell Qty (5L)",
-        "Depth Imbalance %", "Depth Time (IST)", "Errors",
-    ]
-    st.subheader("🚀 EARLY BIG MOVE CATCHER — 5M Compression + Volume Build-up")
-    st.caption(f"{int(result.get('Symbol', pd.Series(dtype=str)).nunique()):,} unique scanned symbols: 13 completed 5M candles today (12-bar base + 1 completed trigger candle), rising volume and directional bias; breakout is confirmed only after a completed candle closes beyond the range with strong body and RVOL.")
-    prebig_view = result[result["PRE-BIG Status"].isin([
-        "PRE-BIG BULLISH WATCH", "PRE-BIG BEARISH WATCH",
-        "BULLISH BREAKOUT CONFIRMED", "BEARISH BREAKDOWN CONFIRMED",
-    ])].copy()
-    if not prebig_view.empty:
-        prebig_view = prebig_view.sort_values(["PRE-BIG Score", "PRE-BIG RVOL"], ascending=[False, False])
-        prebig_cols = ["Symbol", "PRE-BIG Status", "PRE-BIG Direction", "PRE-BIG Score",
-                       "PRE-BIG Candles", "PRE-BIG Range High", "PRE-BIG Range Low",
-                       "PRE-BIG Range Width %", "PRE-BIG Volume Build %", "PRE-BIG RVOL",
-                       "PRE-BIG Trigger", "Last Price", "5M", "15M", "1H", "PRE-BIG Reason"]
-        st.dataframe(prebig_view[prebig_cols], hide_index=True, **_stretch())
-    else:
-        st.info("No 5M PRE-BIG setup currently meets the compression + volume + direction rules. This is preferable to forcing a signal.")
-
-    summary_cols = [c for c in summary_cols if c in view.columns]
-    st.caption(f"Showing top 300 of {len(view):,} rows in the main table. Full results remain available in CSV/Excel.")
-    st.dataframe(view[summary_cols].head(300), hide_index=True, **_stretch())
-
-    st.subheader("📚 FYERS Live Market Depth — Shortlist Only")
-    depth_view = st.session_state.get("multi_agent_depth")
-    if isinstance(depth_view, pd.DataFrame) and not depth_view.empty:
-        st.caption(
-            f"FYERS depth requests: {len(depth_view)} • cache TTL: {FYERS_DEPTH_CACHE_TTL}s • "
-            "one request per symbol, paced at approximately one call/second."
-        )
-        st.dataframe(depth_view, hide_index=True, **_stretch())
-        st.caption(
-            "Buy Qty / Sell Qty = sum of displayed first five bid/ask levels. "
-            "Depth Imbalance = (Buy Qty − Sell Qty) ÷ total × 100. "
-            "This is a displayed-book snapshot, not executed buying/selling or a guaranteed direction."
-        )
-    else:
-        st.info("No BUY / SELL / PRE-BIG shortlist rows yet, or Market Depth has not been requested.")
-    st.caption("CSV/Excel include all 51 timeframe-agent outputs, the Real AI Brain fields and the 18th Best Stock Analyst report and each agent reason. 5M PRE-BIG fields are calculated in the core scan; 20M early-movement fields need the optional 1M scan.")
-    st.caption("Signal Time = latest completed 15M candle close (IST). Entry = 15M close. Stop Loss = 1.5 × 15M ATR; shown only for BUY/SELL and PRE-BIG signals.")
+            st.info("No BUY / SELL / PRE-BIG shortlist rows yet, or Market Depth has not been requested.")
+        st.caption("CSV/Excel include all 51 timeframe-agent outputs, the Real AI Brain fields and the 18th Best Stock Analyst report and each agent reason. 5M PRE-BIG fields are calculated in the core scan; 20M early-movement fields need the optional 1M scan.")
+        st.caption("Signal Time = latest completed 15M candle close (IST). Entry = 15M close. Stop Loss = 1.5 × 15M ATR; shown only for BUY/SELL and PRE-BIG signals.")
 
     file_stamp = info.get("file_stamp", datetime.now(IST).strftime("%Y%m%d_%H%M%S"))
     if st.session_state.get("multi_agent_csv"):
