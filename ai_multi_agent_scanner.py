@@ -470,31 +470,13 @@ def _capture_signal_events(result):
         symbol = str(row.get("Symbol", "")).strip()
         if not symbol:
             continue
-        final_signal = str(row.get("Final Signal", "WAIT") or "WAIT").strip().upper()
-        breakout = str(row.get("Breakout Signal", "WAIT") or "WAIT").strip().upper()
-        advanced = str(row.get("Advanced Big Move", "") or "").strip().upper()
+        live_signal = str(row.get("Live Trade Decision", "WAIT") or "WAIT").strip().upper()
         signal_type, direction = None, None
-        if advanced in ("BREAKOUT DETECTED", "BREAKDOWN DETECTED", "RETEST WAITING",
-                        "RETEST HELD — 15M WAIT", "RETEST REJECTED — 15M WAIT",
-                        "FALSE BREAKOUT RISK"):
-            continue
-        if breakout in ("BREAKOUT", "BREAKDOWN") and advanced not in ("BUY CONFIRMED", "SELL CONFIRMED"):
-            continue
-        if final_signal in actionable:
-            direction = "UP" if "BUY" in final_signal else "DOWN"
-            if breakout in ("BREAKOUT", "BREAKDOWN"):
-                signal_type = f"{final_signal} / CONFIRMED {breakout}"
-            elif advanced in ("BUY CONFIRMED", "SELL CONFIRMED"):
-                signal_type = advanced
-            else:
-                signal_type = final_signal
-        elif breakout in ("BREAKOUT", "BREAKDOWN"):
-            signal_type = f"CONFIRMED {breakout}"
-            direction = "UP" if breakout == "BREAKOUT" else "DOWN"
-        elif advanced in ("BUY CONFIRMED", "SELL CONFIRMED"):
-            signal_type = advanced
-            direction = "UP" if advanced == "BUY CONFIRMED" else "DOWN"
-        if not signal_type:
+        if live_signal == "BUY CONFIRMED":
+            signal_type, direction = live_signal, "UP"
+        elif live_signal == "SELL CONFIRMED":
+            signal_type, direction = live_signal, "DOWN"
+        else:
             continue
         candle_time = _as_ist_timestamp(row.get("Signal Time (IST)"))
         if candle_time is None or not _is_fresh_signal_time(candle_time):
@@ -848,6 +830,73 @@ def _refresh_live_signal_prices():
         return {"updated": updated, "error": None, "symbols": len(tickers)}
     except Exception as exc:
         return {"updated": updated, "error": str(exc)[:300], "symbols": len(tickers)}
+
+
+
+def _render_high_volume_stocks_report(result, threshold=2.0, limit=100):
+    """Show stocks whose latest completed 5M/15M/1H candle has unusually high RVOL."""
+    st.subheader("🔊 HIGH VOLUME STOCKS — RVOL ≥ 2.0x")
+    if not isinstance(result, pd.DataFrame) or result.empty:
+        st.info("Scan result ఇంకా లేదు. ముందుగా Fresh Scan run చేయండి.")
+        return
+
+    parts = []
+    for tf in ("5M", "15M", "1H"):
+        rvol_col = f"{tf} RVOL"
+        vol_col = f"{tf} Candle Volume"
+        avg_col = f"{tf} Average Volume 20"
+        if rvol_col not in result.columns:
+            continue
+
+        part = result.copy()
+        part["_RVOL"] = pd.to_numeric(part[rvol_col], errors="coerce")
+        part = part[part["_RVOL"] >= float(threshold)].copy()
+        if part.empty:
+            continue
+
+        part["Timeframe"] = tf
+        part["Candle Volume"] = pd.to_numeric(part.get(vol_col), errors="coerce")
+        part["Average Volume (20)"] = pd.to_numeric(part.get(avg_col), errors="coerce")
+        part["Volume Direction"] = part.get(
+            f"{tf} Candle Direction", pd.Series("WAIT", index=part.index)
+        ).fillna("WAIT")
+        part["Volume Signal"] = np.where(
+            part["Volume Direction"].astype(str).str.upper().eq("BUY"),
+            "BUY VOLUME WATCH",
+            np.where(
+                part["Volume Direction"].astype(str).str.upper().eq("SELL"),
+                "SELL VOLUME WATCH",
+                "HIGH VOLUME — DIRECTION UNCLEAR",
+            ),
+        )
+        part["Volume Signal Time"] = part.get(
+            f"{tf} Liquidity Sweep Detail", pd.Series("", index=part.index)
+        )
+        parts.append(part)
+
+    if not parts:
+        st.info(
+            f"ప్రస్తుత scan‌లో 5M / 15M / 1H completed candle RVOL ≥ {threshold:.1f}x ఉన్న stocks లేవు. "
+            "Volume తక్కువగా ఉన్నా BUY/SELL signal‌ను బలవంతంగా చూపించము."
+        )
+        return
+
+    high = pd.concat(parts, ignore_index=True)
+    high = high.sort_values(["_RVOL", "Best Stock Score"], ascending=[False, False])
+    cols = [
+        "Symbol", "Timeframe", "Last Price", "Candle Volume",
+        "Average Volume (20)", "_RVOL", "Volume Direction", "Volume Signal",
+        "Live Trade Decision", "Live Decision Reason", "5M", "15M", "1H",
+        "Signal Time (IST)",
+    ]
+    cols = [c for c in cols if c in high.columns]
+    high = high.rename(columns={"_RVOL": "RVOL"})
+    st.dataframe(high[cols].head(int(limit)), hide_index=True, **_stretch())
+    st.caption(
+        "RVOL = latest completed candle volume ÷ average volume of previous 20 completed candles. "
+        "Each row is one stock/timeframe pair. High volume alone is not a BUY/SELL entry; "
+        "use Live Trade Decision and its reason for trade confirmation."
+    )
 
 
 def _render_live_volume_expansion_panel():
@@ -2617,6 +2666,65 @@ def _market_regime_analysis(df):
         return result
 
 
+
+def _live_trade_decision(row):
+    """Conservative live gate: separate raw technical bias from an actionable entry."""
+    def wait(reason):
+        return "WAIT", reason
+
+    if str(row.get("Data Quality", "FAIL")).upper() != "PASS":
+        return wait("Data quality gate failed")
+
+    signal_time = _as_ist_timestamp(row.get("Signal Time (IST)"))
+    if signal_time is None or not _is_fresh_signal_time(signal_time):
+        return wait("15M signal is stale; rescan for a fresh completed candle")
+
+    raw = str(row.get("Final Signal", "WAIT") or "WAIT").strip().upper()
+    if raw not in ("BUY", "SELL"):
+        return wait(f"Raw consensus is {raw}; no confirmed direction")
+
+    side = raw
+    tf5 = str(row.get("5M", "WAIT") or "WAIT").upper()
+    tf15 = str(row.get("15M", "WAIT") or "WAIT").upper()
+    tf1h = str(row.get("1H", "WAIT") or "WAIT").upper()
+    regime = str(row.get("Market Regime", "UNKNOWN") or "UNKNOWN").upper()
+
+    if tf15 != side:
+        return wait(f"15M does not confirm {side} (15M={tf15})")
+    if tf1h not in (side, "WAIT", "NO DATA"):
+        return wait(f"1H trend opposes {side} (1H={tf1h})")
+
+    if side == "BUY" and regime == "TRENDING DOWN":
+        return wait("Market regime is TRENDING DOWN; BUY reversal not confirmed")
+    if side == "SELL" and regime == "TRENDING UP":
+        return wait("Market regime is TRENDING UP; SELL reversal not confirmed")
+
+    if regime == "HIGH VOLATILITY" and not (tf5 == side and tf15 == side and tf1h == side):
+        return wait("High volatility: all 5M/15M/1H directions must align")
+
+    if regime == "SIDEWAYS / COMPRESSION":
+        breakout = str(row.get("Breakout Signal", "WAIT") or "WAIT").upper()
+        retest = str(row.get("Breakout Retest", "WAIT") or "WAIT").upper()
+        valid_break = (
+            side == "BUY" and breakout == "BREAKOUT" and retest == "RETEST HELD"
+        ) or (
+            side == "SELL" and breakout == "BREAKDOWN" and retest == "RETEST REJECTED"
+        )
+        if not valid_break:
+            return wait("Sideways market: breakout plus successful retest required")
+
+    # A sweep against the proposed trade warns of a possible liquidity reversal.
+    if side == "BUY" and str(row.get("Upside Sweep", "NO")).upper() == "YES":
+        return wait("Upside liquidity sweep: BUY reversal risk; wait for fresh confirmation")
+    if side == "SELL" and str(row.get("Downside Sweep", "NO")).upper() == "YES":
+        return wait("Downside liquidity sweep: SELL reversal risk; wait for fresh confirmation")
+
+    if tf5 not in (side, "WAIT", "NO DATA"):
+        return wait(f"5M pullback/conflict against {side}; wait for alignment")
+
+    return f"{side} CONFIRMED", "15M confirms; 1H does not oppose; data and reversal checks passed"
+
+
 def _make_result_row(symbol, yahoo_symbol, payload):
     frames = payload.get("frames", {})
     quality = _data_quality_gate(frames)
@@ -2791,6 +2899,11 @@ def _make_result_row(symbol, yahoo_symbol, payload):
         row["Action Signal"] = final_signal
     else:
         row["Action Signal"] = "WAIT"
+
+    live_decision, live_reason = _live_trade_decision(row)
+    row["Live Trade Decision"] = live_decision
+    row["Live Decision Reason"] = live_reason
+
     for tf in TIMEFRAMES:
         for name in AGENT_NAMES:
             item = analyses[tf]["agents"][name]
@@ -3794,13 +3907,13 @@ def _build_excel(result, stamp):
         buffer = io.BytesIO()
         with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
             result.to_excel(writer, index=False, sheet_name="AI Scanner")
-            counts = result.get("Action Signal", pd.Series(dtype=str)).fillna("WAIT").value_counts()
+            counts = result.get("Live Trade Decision", pd.Series(dtype=str)).fillna("WAIT").value_counts()
             dash_rows = [
                 ["NSE AI PRO V18 — ADVANCED BIG MOVEMENT DASHBOARD", ""],
                 ["Generated (IST)", stamp.strftime("%Y-%m-%d %H:%M:%S IST")],
                 ["Total Stocks Scanned", int(len(result))],
-                ["BUY", int(counts.get("BUY", 0))],
-                ["SELL", int(counts.get("SELL", 0))],
+                ["BUY CONFIRMED", int(counts.get("BUY CONFIRMED", 0))],
+                ["SELL CONFIRMED", int(counts.get("SELL CONFIRMED", 0))],
                 ["SWEEP UP", int(counts.get("SWEEP UP", 0))],
                 ["SWEEP DOWN", int(counts.get("SWEEP DOWN", 0))],
                 ["BREAKOUT", int(counts.get("BREAKOUT", 0))],
@@ -3813,7 +3926,7 @@ def _build_excel(result, stamp):
                 writer, index=False, header=False, sheet_name="Dashboard", startrow=0
             )
             top_cols = [c for c in [
-                "Symbol", "Action Signal", "Final Signal", "Best Stock Score",
+                "Symbol", "Live Trade Decision", "Live Decision Reason", "Action Signal", "Final Signal", "Best Stock Score",
                 "Confirmation Strength %", "Last Price", "Buy-side Liquidity", "Buy-side Liquidity Time (IST)",
                 "Sell-side Liquidity", "Sell-side Liquidity Time (IST)", "Upside Sweep", "Upside Sweep Time (IST)",
                 "Downside Sweep", "Downside Sweep Time (IST)", "Breakout Signal",
@@ -4526,25 +4639,27 @@ def show_ai_multi_agent_scanner(client=None):
 
     # SIMPLE MAIN REPORT: compact screen view; the full result DataFrame remains untouched.
     st.subheader("📊 SIMPLE SCAN REPORT — QUICK VIEW")
-    signal_counts = result.get("Final Signal", pd.Series("WAIT", index=result.index)).fillna("WAIT").value_counts()
+    signal_counts = result.get("Live Trade Decision", pd.Series("WAIT", index=result.index)).fillna("WAIT").value_counts()
     quick_metrics = st.columns(5)
-    for metric_col, metric_name in zip(quick_metrics, ("BUY", "SELL", "PRE-BIG BUY", "PRE-BIG SELL", "WAIT")):
+    for metric_col, metric_name in zip(quick_metrics, ("BUY CONFIRMED", "SELL CONFIRMED", "WAIT")):
         metric_col.metric(metric_name, int(signal_counts.get(metric_name, 0)))
     quick_filter = st.selectbox(
-        "Quick filter", ["ALL", "BUY", "SELL", "PRE-BIG BUY", "PRE-BIG SELL", "WAIT", "NO DATA"],
+        "Quick filter", ["ALL", "BUY CONFIRMED", "SELL CONFIRMED", "WAIT"],
         key="ma_simple_report_filter_v1",
     )
     quick_view = result.copy()
     if quick_filter != "ALL":
-        quick_view = quick_view[quick_view["Final Signal"].astype(str) == quick_filter]
+        quick_view = quick_view[quick_view["Live Trade Decision"].astype(str) == quick_filter]
     quick_sort_cols = [c for c in ("Best Stock Score", "Confirmation Strength %") if c in quick_view.columns]
     if quick_sort_cols:
         quick_view = quick_view.sort_values(quick_sort_cols, ascending=[False] * len(quick_sort_cols))
     quick_cols = [c for c in [
-        "Symbol", "Final Signal", "Best Stock Score", "Last Price", "Entry Price",
+        "Symbol", "Live Trade Decision", "Live Decision Reason", "Final Signal", "Best Stock Score", "Last Price", "Entry Price",
         "Stop Loss", "5M", "15M", "1H", "Signal Time (IST)", "Best Stock Reason",
     ] if c in quick_view.columns]
-    st.caption("BUY/SELL = confirmed technical signal • PRE-BIG = early watch, not confirmed • WAIT = no clear setup. Full analysis is below.")
+    _render_high_volume_stocks_report(result, threshold=2.0, limit=100)
+
+    st.caption("Live Trade Decision is the guarded entry status. Final Signal is the raw multi-timeframe technical consensus; it can differ. PRE-BIG remains a watch only.")
     st.dataframe(quick_view[quick_cols].head(300), hide_index=True, **_stretch())
 
     with st.expander("🔎 ADVANCED REPORTS — LIQUIDITY, SWEEPS, AI, BIG MOVE & AGENT DETAILS", expanded=False):
