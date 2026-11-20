@@ -409,9 +409,7 @@ SIGNAL_MAX_AGE_MINUTES = 45
 def _is_fresh_signal_time(stamp, now=None):
     if stamp is None:
         return False
-    now = _as_ist_timestamp(now) if now is not None else pd.Timestamp.now(tz=IST)
-    if now is None:
-        now = pd.Timestamp.now(tz=IST)
+    now = pd.Timestamp(now) if now is not None else pd.Timestamp.now(tz=IST)
     age = (now - stamp).total_seconds() / 60.0
     return -2.0 <= age <= SIGNAL_MAX_AGE_MINUTES
 
@@ -461,7 +459,7 @@ def _drop_recent_duplicate_events(conn, rows, minutes=60):
     return kept
 
 
-def _capture_signal_events(result, reference_time=None):
+def _capture_signal_events(result):
     """Persist BUY/SELL/PRE-BIG/confirmed breakout signals with fixed 1:1.5 outcome levels."""
     if not isinstance(result, pd.DataFrame) or result.empty:
         return 0
@@ -469,8 +467,6 @@ def _capture_signal_events(result, reference_time=None):
     rows = []
     actionable = {"BUY", "SELL", "PRE-BIG BUY", "PRE-BIG SELL"}
     for _, row in result.iterrows():
-        if str(row.get("Data Quality", "PASS")).strip().upper() != "PASS":
-            continue
         symbol = str(row.get("Symbol", "")).strip()
         if not symbol:
             continue
@@ -501,7 +497,7 @@ def _capture_signal_events(result, reference_time=None):
         if not signal_type:
             continue
         candle_time = _as_ist_timestamp(row.get("Signal Time (IST)"))
-        if candle_time is None or not _is_fresh_signal_time(candle_time, now=reference_time):
+        if candle_time is None or not _is_fresh_signal_time(candle_time):
             continue
         price = _safe_num(row.get("Entry Price"), 0.0)
         if price <= 0:
@@ -529,7 +525,7 @@ def _capture_signal_events(result, reference_time=None):
         return conn.total_changes - before
 
 
-def _capture_liquidity_sweep_events(result, reference_time=None):
+def _capture_liquidity_sweep_events(result):
     """Persist liquidity pivot times and confirmed sweep candle times without changing signal counters."""
     if not isinstance(result, pd.DataFrame) or result.empty:
         return 0
@@ -550,8 +546,6 @@ def _capture_liquidity_sweep_events(result, reference_time=None):
          "1H Downside Sweep", "1H Downside Sweep Time (IST)"),
     ]
     for _, row in result.iterrows():
-        if str(row.get("Data Quality", "PASS")).strip().upper() != "PASS":
-            continue
         symbol = str(row.get("Symbol", "") or "").strip()
         if not symbol:
             continue
@@ -597,8 +591,6 @@ def _capture_liquidity_sweep_events(result, reference_time=None):
         # Promote confirmed 15M sweep events into the same live accuracy ledger.
         sweep_rows = []
         for _, row in result.iterrows():
-            if str(row.get("Data Quality", "PASS")).strip().upper() != "PASS":
-                continue
             symbol = str(row.get("Symbol", "") or "").strip()
             if not symbol:
                 continue
@@ -610,7 +602,7 @@ def _capture_liquidity_sweep_events(result, reference_time=None):
                     continue
                 stamp = _as_ist_timestamp(row.get(time_col))
                 entry = _safe_num(row.get("Last Price"), 0.0)
-                if stamp is None or entry <= 0 or not _is_fresh_signal_time(stamp, now=reference_time):
+                if stamp is None or entry <= 0 or not _is_fresh_signal_time(stamp):
                     continue
                 stop, target = _risk_levels_for_event(row, direction, entry)
                 stamp_text = stamp.isoformat(timespec="seconds")
@@ -628,15 +620,13 @@ def _capture_liquidity_sweep_events(result, reference_time=None):
         return inserted
 
 
-def _capture_volume_expansion_events(result, threshold=2.0, reference_time=None):
+def _capture_volume_expansion_events(result, threshold=2.0):
     """Persist completed-candle volume expansion events at >=2x prior 20-bar average."""
     if not isinstance(result, pd.DataFrame) or result.empty:
         return 0
     now_text = datetime.now(IST).isoformat(timespec="seconds")
     rows = []
     for _, row in result.iterrows():
-        if str(row.get("Data Quality", "PASS")).strip().upper() != "PASS":
-            continue
         symbol = str(row.get("Symbol", "") or "").strip()
         if not symbol:
             continue
@@ -813,9 +803,8 @@ def _refresh_live_signal_prices():
                         created = _as_ist_timestamp(event.get("created_at_ist"))
                         signal_stamp = _as_ist_timestamp(event.get("signal_time_ist"))
                         if signal_stamp is not None and np.isfinite(stop_price) and np.isfinite(target_price):
-                            # Evaluate every completed 1M bar after the signal candle,
-                            # including bars before the dashboard captured the event.
-                            anchor = signal_stamp
+                            anchors = [t for t in (signal_stamp, created) if t is not None]
+                            anchor = max(anchors)
                             future_bars = prices[prices["time"] >= anchor]
                             resolved = None
                             resolved_time = None
@@ -830,10 +819,11 @@ def _refresh_live_signal_prices():
                                     resolved = "LOSS" if hit_stop else "WIN"
                                     resolved_time = pd.Timestamp(bar["time"]).isoformat(timespec="seconds")
                                     break
-                            if resolved and created is not None and resolved_time is not None:
-                                resolved_stamp = _as_ist_timestamp(resolved_time)
-                                if resolved_stamp is not None and resolved_stamp <= created:
-                                    resolved = "MISSED"  # target/stop already reached before event capture
+                            if resolved and not future_bars.empty:
+                                first_iso = pd.Timestamp(future_bars["time"].iloc[0]).isoformat(timespec="seconds")
+                                lag_min = ((created - signal_stamp).total_seconds() / 60.0) if created is not None else 0.0
+                                if resolved_time == first_iso and lag_min > 5:
+                                    resolved = "MISSED"  # level may have been breached before detection
                             if resolved:
                                 conn.execute("UPDATE signal_events SET outcome=?,status=?,outcome_time_ist=? WHERE event_id=? AND outcome='PENDING'",
                                     (resolved, resolved, resolved_time, event_id))
@@ -2800,13 +2790,6 @@ def _make_result_row(symbol, yahoo_symbol, payload):
         row["Action Signal"] = final_signal
     else:
         row["Action Signal"] = "WAIT"
-    if str(row.get("Data Quality", "PASS")).strip().upper() != "PASS":
-        row["Advanced Big Move"] = "NO DATA"
-        row["Action Signal"] = "NO DATA"
-        row["Early Signal"] = "WAIT — DATA QUALITY FAIL"
-        row["Early Direction"] = "WAIT"
-        row["Early Confirmation"] = "NOT CONFIRMED"
-        row["Early Signal Reason"] = str(row.get("Data Quality Reason", "Data Quality gate failed"))
     for tf in TIMEFRAMES:
         for name in AGENT_NAMES:
             item = analyses[tf]["agents"][name]
@@ -3282,32 +3265,8 @@ def _direction_movement(row):
     return movement
 
 
-def _expire_stale_scan_jobs(max_age_hours=4):
-    """Release jobs from an earlier day or jobs with no progress for more than four hours."""
-    now = pd.Timestamp.now(tz=IST)
-    cutoff = now - pd.Timedelta(hours=float(max_age_hours))
-    with _memory_connect() as conn:
-        rows = conn.execute(
-            "SELECT job_id,status,updated_at FROM scan_jobs WHERE status IN ('RUNNING','PAUSED','DONE')"
-        ).fetchall()
-        for job_id, status, updated_text in rows:
-            stamp = _as_ist_timestamp(updated_text)
-            stale = stamp is None or stamp.date() != now.date() or stamp < cutoff
-            if not stale:
-                continue
-            if status == "DONE":
-                # Preserve completed rows so the regular restore path can still load them.
-                conn.execute("UPDATE scan_jobs SET status='FINALIZED' WHERE job_id=? AND status='DONE'", (job_id,))
-            else:
-                conn.execute(
-                    "UPDATE scan_jobs SET status='CANCELLED',updated_at=?,error=? WHERE job_id=? AND status IN ('RUNNING','PAUSED')",
-                    (now.strftime("%Y-%m-%d %H:%M:%S %Z"), "Auto-expired: previous trading day or no progress for over 4 hours.", job_id),
-                )
-
-
 def _prune_scan_jobs(keep=3):
-    """Expire stalled jobs, then retain the latest completed result and short history."""
-    _expire_stale_scan_jobs()
+    """Keep active jobs, latest DONE result, and a small finalized/cancelled history."""
     keep = max(1, int(keep))
     with _memory_connect() as conn:
         old_ids = [row[0] for row in conn.execute(
@@ -3363,12 +3322,11 @@ def _scan_job_get(job_id):
 
 def _scan_job_latest_active():
     try:
-        _expire_stale_scan_jobs()
         with _memory_connect() as conn:
             row = conn.execute(
                 """SELECT job_id FROM scan_jobs
                    WHERE status IN ('RUNNING','PAUSED','DONE')
-                   ORDER BY updated_at DESC, created_at DESC LIMIT 1"""
+                   ORDER BY created_at DESC LIMIT 1"""
             ).fetchone()
         return row[0] if row else None
     except Exception:
@@ -3406,7 +3364,7 @@ def _scan_job_worker(job_id):
         return
     config = job["config"]
     symbols = [(str(x[0]), str(x[1])) for x in config.get("symbols", [])]
-    batch_size = max(10, min(int(config.get("batch_size", 50)), 100))
+    batch_size = max(10, min(int(config.get("batch_size", 25)), 100))
     period = str(config.get("period", "30d"))
     include_early = bool(config.get("include_early", False))
     try:
@@ -3486,21 +3444,6 @@ def _scan_job_worker(job_id):
                        WHERE job_id=? AND status!='CANCELLED'""",
                     (int(total_done), saved_at, job_id),
                 )
-            # Capture each healthy batch immediately. This prevents the first
-            # NSE/F&O batches from ageing out while the rest of the universe scans.
-            try:
-                capture_rows = [
-                    row for i, row in enumerate(batch_rows)
-                    if i not in unresolved_set
-                ]
-                if capture_rows:
-                    _capture_all_dashboard_events(
-                        pd.DataFrame(capture_rows),
-                        reference_time=_as_ist_timestamp(saved_at),
-                    )
-            except Exception:
-                # Dashboard ledgers must never stop the core scan worker.
-                pass
             if unresolved_indices:
                 paused_at = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S %Z")
                 with _memory_connect() as conn:
@@ -4123,14 +4066,12 @@ def _today_text():
     return datetime.now(IST).strftime("%Y-%m-%d")
 
 
-def _candle_is_recent(value, max_age_min, now=None):
-    """True only for a completed candle from the reference day and within max_age_min."""
+def _candle_is_recent(value, max_age_min):
+    """True only for a completed candle from TODAY that closed within max_age_min."""
     stamp = _as_ist_timestamp(value)
     if stamp is None:
         return False
-    now = _as_ist_timestamp(now) if now is not None else pd.Timestamp.now(tz=IST)
-    if now is None:
-        now = pd.Timestamp.now(tz=IST)
+    now = pd.Timestamp.now(tz=IST)
     if stamp.date() != now.date():
         return False
     age = (now - stamp).total_seconds() / 60.0
@@ -4318,15 +4259,13 @@ def _extra_formulas(frame_5m, row=None):
 # Old bug: any 15M breakout flag threw away even valid BUY/SELL signals,
 # and pure breakouts could never be saved.
 # ---------------------------------------------------------------------
-def _capture_signal_events(result, reference_time=None):
+def _capture_signal_events(result):
     if not isinstance(result, pd.DataFrame) or result.empty:
         return 0
     now_text = datetime.now(IST).isoformat(timespec="seconds")
     actionable = {"BUY", "SELL", "PRE-BIG BUY", "PRE-BIG SELL"}
     rows = []
     for _, row in result.iterrows():
-        if str(row.get("Data Quality", "PASS")).strip().upper() != "PASS":
-            continue
         symbol = str(row.get("Symbol", "")).strip()
         if not symbol:
             continue
@@ -4358,7 +4297,7 @@ def _capture_signal_events(result, reference_time=None):
         if not signal_type:
             continue
         candle_time = _as_ist_timestamp(row.get("Signal Time (IST)"))
-        if candle_time is None or not _is_fresh_signal_time(candle_time, now=reference_time):
+        if candle_time is None or not _is_fresh_signal_time(candle_time):
             continue
         price = _safe_num(row.get("Entry Price"), 0.0)
         if price <= 0:
@@ -4389,15 +4328,13 @@ def _capture_signal_events(result, reference_time=None):
 # FIXED CAPTURE: BIG VOLUME (replaces _capture_volume_expansion_events)
 # Old bug: no freshness check, so yesterday's / restored candles showed as "live".
 # ---------------------------------------------------------------------
-def _capture_volume_expansion_events(result, threshold=BIG_VOL_RVOL_MIN, reference_time=None):
+def _capture_volume_expansion_events(result, threshold=BIG_VOL_RVOL_MIN):
     if not isinstance(result, pd.DataFrame) or result.empty:
         return 0
     now_text = datetime.now(IST).isoformat(timespec="seconds")
     max_age = {"5M": 30, "15M": 60, "1H": 120}
     rows = []
     for _, row in result.iterrows():
-        if str(row.get("Data Quality", "PASS")).strip().upper() != "PASS":
-            continue
         symbol = str(row.get("Symbol", "") or "").strip()
         if not symbol:
             continue
@@ -4410,7 +4347,7 @@ def _capture_volume_expansion_events(result, threshold=BIG_VOL_RVOL_MIN, referen
             close_text = row.get(f"{tf} Candle Close (IST)")
             stamp = _as_ist_timestamp(close_text)
             if (rvol < threshold or direction not in ("BUY", "SELL") or volume <= 0
-                    or average <= 0 or stamp is None or not _candle_is_recent(close_text, max_age[tf], now=reference_time)):
+                    or average <= 0 or stamp is None or not _candle_is_recent(close_text, max_age[tf])):
                 continue
             stext = stamp.isoformat(timespec="seconds")
             rows.append((f"{symbol}|{tf}|{direction}|{stext}", symbol, tf, direction, volume, average,
@@ -4438,7 +4375,7 @@ _PREBIG_STATUSES = {
 }
 
 
-def _capture_big_move_events(result, reference_time=None):
+def _capture_big_move_events(result):
     """Cache big-movement stocks in SQLite (one row per symbol/source/status/day, updated in place)."""
     if not isinstance(result, pd.DataFrame) or result.empty:
         return 0
@@ -4446,11 +4383,9 @@ def _capture_big_move_events(result, reference_time=None):
     today, now_text = _today_text(), datetime.now(IST).isoformat(timespec="seconds")
     rows = []
     for _, row in result.iterrows():
-        if str(row.get("Data Quality", "PASS")).strip().upper() != "PASS":
-            continue
         symbol = str(row.get("Symbol", "") or "").strip()
         close_text = row.get("5M Candle Close (IST)")
-        if not symbol or not _candle_is_recent(close_text, 30, now=reference_time):
+        if not symbol or not _candle_is_recent(close_text, 30):
             continue
         price = _safe_num(row.get("Last Price"), 0.0)
         cands = []
@@ -4487,7 +4422,7 @@ def _capture_big_move_events(result, reference_time=None):
     return len(clean)
 
 
-def _capture_liquidity_watch(result, reference_time=None):
+def _capture_liquidity_watch(result):
     """Cache stocks that are near buy/sell-side liquidity or have a fresh sweep (today only)."""
     if not isinstance(result, pd.DataFrame) or result.empty:
         return 0
@@ -4495,10 +4430,8 @@ def _capture_liquidity_watch(result, reference_time=None):
     now_text = datetime.now(IST).isoformat(timespec="seconds")
     rows = []
     for _, row in result.iterrows():
-        if str(row.get("Data Quality", "PASS")).strip().upper() != "PASS":
-            continue
         symbol = str(row.get("Symbol", "") or "").strip()
-        if not symbol or not _candle_is_recent(row.get("5M Candle Close (IST)"), 30, now=reference_time):
+        if not symbol or not _candle_is_recent(row.get("5M Candle Close (IST)"), 30):
             continue
         price = _safe_num(row.get("Last Price"), 0.0)
         buy = _safe_num(row.get("15M Buy-side Liquidity"), np.nan)
@@ -4518,7 +4451,7 @@ def _capture_liquidity_watch(result, reference_time=None):
                 (f"{tf} Downside Sweep", f"{tf} Downside Sweep Time (IST)", "SWEEP DOWN", "BUY"),
             ):
                 limit = {"5M": 30, "15M": 60, "1H": 120}[tf]
-                if str(row.get(flag, "NO")).upper() == "YES" and _candle_is_recent(row.get(tcol), limit, now=reference_time):
+                if str(row.get(flag, "NO")).upper() == "YES" and _candle_is_recent(row.get(tcol), limit):
                     cur = _as_ist_timestamp(sweep_time) if sweep_time else None
                     new = _as_ist_timestamp(row.get(tcol))
                     if cur is None or (new is not None and new > cur):
@@ -4542,11 +4475,9 @@ def _capture_liquidity_watch(result, reference_time=None):
     return len(rows)
 
 
-def _capture_all_dashboard_events(result, reference_time=None):
-    """One call for every dashboard ledger; freshness is measured at scan completion."""
+def _capture_all_dashboard_events(result):
+    """One call for every dashboard ledger. Safe to call repeatedly (idempotent)."""
     _ensure_patch_tables()
-    if isinstance(result, pd.DataFrame) and "Data Quality" in result.columns:
-        result = result[result["Data Quality"].astype(str).str.strip().str.upper() == "PASS"].copy()
     counts = {}
     for name, fn in (("signals", _capture_signal_events),
                      ("liquidity_sweeps", _capture_liquidity_sweep_events),
@@ -4554,7 +4485,7 @@ def _capture_all_dashboard_events(result, reference_time=None):
                      ("big_move", _capture_big_move_events),
                      ("liquidity_watch", _capture_liquidity_watch)):
         try:
-            counts[name] = fn(result, reference_time=reference_time)
+            counts[name] = fn(result)
         except Exception as exc:
             counts[name] = f"error: {str(exc)[:80]}"
     try:
@@ -4684,7 +4615,7 @@ def show_ai_multi_agent_scanner(client=None):
     with c1:
         universe = st.selectbox("Universe", ["Both (NSE + F&O)", "F&O Stocks", "NSE Equity"], key="ma_universe")
     with c2:
-        batch_size = st.selectbox("Batch size", [10, 25, 50, 75, 100], index=2, key="ma_batch_size_v18", help="50 is the balanced default for full NSE scans. Use 10/25 if Yahoo rate-limits; use 75/100 only if your connection and Yahoo responses remain stable. Completed batches are checkpointed and can resume.")
+        batch_size = st.selectbox("Batch size", [10, 25, 50, 75, 100], index=1, key="ma_batch_size_v18", help="Local PC: 25 is the safer default for NSE. Completed batches are checkpointed and can resume.")
     with c3:
         st.metric("Analysis", "17 Agents + ML Brain")
 
@@ -4798,8 +4729,6 @@ def show_ai_multi_agent_scanner(client=None):
     with cancel_col:
         cancel_scan_now = st.button("🛑 CANCEL / DISCARD SCAN", key="ma_cancel_scan", **_stretch())
 
-    # Expire yesterday's or stalled jobs before checking the session-bound job ID.
-    _expire_stale_scan_jobs()
     # A cancel is durable in SQLite. Existing candle memory is intentionally preserved.
     job_id = st.session_state.get("ma_scan_job_id")
     if cancel_scan_now:
@@ -5058,22 +4987,6 @@ def show_ai_multi_agent_scanner(client=None):
         st.info("No results yet. Press RUN FULL BATCH SCAN.")
         return
 
-    # Re-apply the hard quality gate to restored/session-cached rows as well.
-    if "Data Quality" in result.columns:
-        failed_quality = result["Data Quality"].astype(str).str.strip().str.upper() != "PASS"
-        if failed_quality.any():
-            for col, value in (
-                ("Advanced Big Move", "NO DATA"),
-                ("Action Signal", "NO DATA"),
-                ("Early Signal", "WAIT — DATA QUALITY FAIL"),
-                ("Early Direction", "WAIT"),
-                ("Early Confirmation", "NOT CONFIRMED"),
-            ):
-                result.loc[failed_quality, col] = value
-            if "Early Signal Reason" in result.columns and "Data Quality Reason" in result.columns:
-                result.loc[failed_quality, "Early Signal Reason"] = result.loc[failed_quality, "Data Quality Reason"].astype(str)
-            st.session_state["multi_agent_results"] = result
-
     if "Direction Movement" not in result.columns:
         result["Direction Movement"] = result.apply(_direction_movement, axis=1)
     # Backward compatibility for results retained in Streamlit session_state from an older version.
@@ -5318,12 +5231,7 @@ def show_ai_multi_agent_scanner(client=None):
 
         # Idempotent event capture: repeated Streamlit reruns do not create duplicate events.
         try:
-            _capture_job = _scan_job_get(st.session_state.get("ma_scan_job_id"))
-            _capture_reference = (
-                _as_ist_timestamp(_capture_job.get("updated_at"))
-                if _capture_job else pd.Timestamp.now(tz=IST)
-            )
-            _cap = _capture_all_dashboard_events(result, reference_time=_capture_reference)
+            _cap = _capture_all_dashboard_events(result)
             _n = lambda k: _cap.get(k) if isinstance(_cap.get(k), int) else 0
             new_events, new_liquidity_events, new_volume_events = _n('signals'), _n('liquidity_sweeps'), _n('big_volume')
             if new_events:
