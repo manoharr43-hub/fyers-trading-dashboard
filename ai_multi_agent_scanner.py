@@ -3804,7 +3804,7 @@ def show_ai_multi_agent_scanner(client=None):
         "ADDON Score Change": None, "ADDON Memory Trend": "NEW / NO HISTORY",
         "ADDON 1H Sideways Minutes": 0, "ADDON 2H Sideways Minutes": 0,
         "ADDON Volume Build": None, "ADDON Volume Build Duration Minutes": 0,
-        "ADDON False Signal Filter": "NOT CONFIRMED", "ADDON Reason": "Run a fresh scan"}:
+        "ADDON False Signal Filter": "NOT CONFIRMED", "ADDON Reason": "Run a fresh scan"}.items():
         if col_name not in result.columns:
             result[col_name] = default
     addon_view = result[result["ADDON Verdict"].astype(str).str.contains("PRE-MOVE WATCH", na=False)].copy()
