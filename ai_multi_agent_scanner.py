@@ -461,72 +461,6 @@ def _drop_recent_duplicate_events(conn, rows, minutes=60):
     return kept
 
 
-def _capture_signal_events(result, reference_time=None):
-    """Persist BUY/SELL/PRE-BIG/confirmed breakout signals with fixed 1:1.5 outcome levels."""
-    if not isinstance(result, pd.DataFrame) or result.empty:
-        return 0
-    now_text = datetime.now(IST).isoformat(timespec="seconds")
-    rows = []
-    actionable = {"BUY", "SELL", "PRE-BIG BUY", "PRE-BIG SELL"}
-    for _, row in result.iterrows():
-        if str(row.get("Data Quality", "PASS")).strip().upper() != "PASS":
-            continue
-        symbol = str(row.get("Symbol", "")).strip()
-        if not symbol:
-            continue
-        final_signal = str(row.get("Final Signal", "WAIT") or "WAIT").strip().upper()
-        breakout = str(row.get("Breakout Signal", "WAIT") or "WAIT").strip().upper()
-        advanced = str(row.get("Advanced Big Move", "") or "").strip().upper()
-        signal_type, direction = None, None
-        if advanced in ("BREAKOUT DETECTED", "BREAKDOWN DETECTED", "RETEST WAITING",
-                        "RETEST HELD — 15M WAIT", "RETEST REJECTED — 15M WAIT",
-                        "FALSE BREAKOUT RISK"):
-            continue
-        if breakout in ("BREAKOUT", "BREAKDOWN") and advanced not in ("BUY CONFIRMED", "SELL CONFIRMED"):
-            continue
-        if final_signal in actionable:
-            direction = "UP" if "BUY" in final_signal else "DOWN"
-            if breakout in ("BREAKOUT", "BREAKDOWN"):
-                signal_type = f"{final_signal} / CONFIRMED {breakout}"
-            elif advanced in ("BUY CONFIRMED", "SELL CONFIRMED"):
-                signal_type = advanced
-            else:
-                signal_type = final_signal
-        elif breakout in ("BREAKOUT", "BREAKDOWN"):
-            signal_type = f"CONFIRMED {breakout}"
-            direction = "UP" if breakout == "BREAKOUT" else "DOWN"
-        elif advanced in ("BUY CONFIRMED", "SELL CONFIRMED"):
-            signal_type = advanced
-            direction = "UP" if advanced == "BUY CONFIRMED" else "DOWN"
-        if not signal_type:
-            continue
-        candle_time = _as_ist_timestamp(row.get("Signal Time (IST)"))
-        if candle_time is None or not _is_fresh_signal_time(candle_time, now=reference_time):
-            continue
-        price = _safe_num(row.get("Entry Price"), 0.0)
-        if price <= 0:
-            price = _safe_num(row.get("Last Price"), 0.0)
-        if price <= 0:
-            continue
-        stop, target = _risk_levels_for_event(row, direction, price)
-        yahoo_symbol = str(row.get("Yahoo Symbol", "") or "").strip()
-        candle_time_text = candle_time.isoformat(timespec="seconds")
-        event_key = f"{symbol}|{signal_type}|{candle_time_text}"
-        rows.append((event_key, symbol, yahoo_symbol, signal_type, direction, float(price),
-                     candle_time_text, now_text, now_text, stop, target))
-    if not rows:
-        return 0
-    with _memory_connect() as conn:
-        rows = _drop_recent_duplicate_events(conn, rows)
-        if not rows:
-            return 0
-        before = conn.total_changes
-        conn.executemany("""INSERT OR IGNORE INTO signal_events
-            (event_key,symbol,yahoo_symbol,signal_type,direction,signal_price,
-             signal_time_ist,created_at_ist,current_price_time_ist,stop_price,target_price,
-             risk_reward,data_status,status,outcome)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,1.5,'WAITING','ACTIVE','PENDING')""", rows)
-        return conn.total_changes - before
 
 
 def _capture_liquidity_sweep_events(result, reference_time=None):
@@ -628,42 +562,6 @@ def _capture_liquidity_sweep_events(result, reference_time=None):
         return inserted
 
 
-def _capture_volume_expansion_events(result, threshold=2.0, reference_time=None):
-    """Persist completed-candle volume expansion events at >=2x prior 20-bar average."""
-    if not isinstance(result, pd.DataFrame) or result.empty:
-        return 0
-    now_text = datetime.now(IST).isoformat(timespec="seconds")
-    rows = []
-    for _, row in result.iterrows():
-        if str(row.get("Data Quality", "PASS")).strip().upper() != "PASS":
-            continue
-        symbol = str(row.get("Symbol", "") or "").strip()
-        if not symbol:
-            continue
-        for tf in TIMEFRAMES:
-            rvol = _safe_num(row.get(f"{tf} RVOL"), 0.0)
-            direction = str(row.get(f"{tf} Candle Direction", "WAIT")).upper()
-            volume = _safe_num(row.get(f"{tf} Candle Volume"), 0.0)
-            average = _safe_num(row.get(f"{tf} Average Volume 20"), 0.0)
-            price = _safe_num(row.get("Last Price"), 0.0)
-            # Use the actual completed candle close time for this timeframe.
-            stamp = _as_ist_timestamp(row.get(f"{tf} Candle Close (IST)"))
-            if stamp is None:
-                stamp = _as_ist_timestamp(row.get("Signal Time (IST)"))
-            if rvol < threshold or direction not in ("BUY", "SELL") or volume <= 0 or average <= 0 or stamp is None:
-                continue
-            stamp_text = stamp.isoformat(timespec="seconds")
-            event_key = f"{symbol}|{tf}|{direction}|{stamp_text}"
-            rows.append((event_key, symbol, tf, direction, volume, average, rvol,
-                         price if price > 0 else None, stamp_text, now_text))
-    if not rows:
-        return 0
-    with _memory_connect() as conn:
-        before = conn.total_changes
-        conn.executemany("""INSERT OR IGNORE INTO volume_expansion_events
-            (event_key,symbol,timeframe,direction,candle_volume,average_volume,rvol,last_price,signal_time_ist,captured_at_ist)
-            VALUES (?,?,?,?,?,?,?,?,?,?)""", rows)
-        return conn.total_changes - before
 
 
 def _load_volume_expansion_events(limit=500):
@@ -1227,9 +1125,13 @@ def _safe_num(value, default=0.0):
 
 
 def _rsi(close, period=14):
+    """Wilder RSI; suppress values until a full warm-up window is available."""
+    if not isinstance(period, int) or period < 2:
+        raise ValueError("RSI period must be an integer >= 2")
+    close = pd.to_numeric(close, errors="coerce")
     delta = close.diff()
-    gain = delta.clip(lower=0).ewm(alpha=1 / period, adjust=False).mean()
-    loss = (-delta.clip(upper=0)).ewm(alpha=1 / period, adjust=False).mean()
+    gain = delta.clip(lower=0).ewm(alpha=1 / period, adjust=False, min_periods=period).mean()
+    loss = (-delta.clip(upper=0)).ewm(alpha=1 / period, adjust=False, min_periods=period).mean()
     rs = gain / loss.replace(0, np.nan)
     value = 100 - (100 / (1 + rs))
     value = value.where(~((loss == 0) & (gain > 0)), 100.0)
@@ -2038,11 +1940,30 @@ def _advanced_big_movement_analysis(frame_5m, frame_15m=None, frame_1h=None):
         broke_up, broke_down = close > hi, close < lo
         prev = session.iloc[-2] if len(session) >= 2 else None
         pre = session.iloc[-14:-2] if len(session) >= 14 else None
-        if prev is not None and pre is not None:
+        if prev is not None and pre is not None and len(pre) >= 8:
             pre_hi, pre_lo = float(pre["High"].max()), float(pre["Low"].min())
-            failed_up = float(prev["High"]) > pre_hi and close <= pre_hi
-            failed_down = float(prev["Low"]) < pre_lo and close >= pre_lo
+            # A wick through a level is not enough to call a failed breakout.
+            # The prior completed candle must CLOSE outside the range, and the
+            # latest completed candle must close back inside by a small ATR/% buffer.
+            prev_close = float(prev["Close"])
+            prev_high, prev_low = float(prev["High"]), float(prev["Low"])
+            prior_closes = session["Close"].astype(float).iloc[:-1]
+            prior_highs = session["High"].astype(float).iloc[:-1]
+            prior_lows = session["Low"].astype(float).iloc[:-1]
+            prev_close_loc = ((prev_close - prev_low) / max(prev_high - prev_low, 1e-9))
+            tr_all = pd.concat([
+                session["High"].astype(float) - session["Low"].astype(float),
+                (session["High"].astype(float) - session["Close"].astype(float).shift(1)).abs(),
+                (session["Low"].astype(float) - session["Close"].astype(float).shift(1)).abs(),
+            ], axis=1).max(axis=1)
+            atr_now = _safe_num(tr_all.tail(14).mean(), 0.0)
+            fail_buffer = max(0.15 * atr_now, close * 0.001)
+            failed_up = (prev_close > pre_hi and prev_close_loc >= 0.60
+                         and close < pre_hi - fail_buffer)
+            failed_down = (prev_close < pre_lo and prev_close_loc <= 0.40
+                           and close > pre_lo + fail_buffer)
         else:
+            pre_hi, pre_lo = hi, lo
             failed_up = failed_down = False
         weak_up = broke_up and (body_ratio < 0.45 or close_location < 0.65 or rvol_base < 1.25)
         weak_down = broke_down and (body_ratio < 0.45 or close_location > 0.35 or rvol_base < 1.25)
@@ -2761,7 +2682,7 @@ def _make_result_row(symbol, yahoo_symbol, payload):
     row.update(_liquidity_levels_and_sweeps(frame_15m, timeframe_minutes=15))
     row.update(_extra_formulas(frame_5m, row))
     # V19 is an independent additive engine. Legacy 17-agent fields remain unchanged.
-    row.update(_v19_live_fields(frame_5m, row))
+    row.update(_v19_live_fields(frame_5m, row, frame_15m))
     row.update(_v19_bigmove_fields(frame_5m, row))
     row.update(_breakout_breakdown_signal(frame_15m))
     row.update(_multi_tf_breakout(frames))
@@ -4727,6 +4648,36 @@ def _v19_supertrend(h, l, c, period=10, mult=3.0):
     return pd.Series(dirn, index=c.index)
 
 
+def _v19_tod_volume_metrics(d):
+    """Return causal same-slot RVOL and cumulative same-time-of-day RVOL.
+
+    For each session/bar slot, the baseline uses only earlier sessions. Before
+    five comparable sessions exist, per-bar RVOL falls back to prior-20 bars.
+    """
+    vol = pd.to_numeric(d["Volume"], errors="coerce").fillna(0.0).clip(lower=0.0)
+    day = d["Time"].dt.date
+    slot = d.groupby(day, sort=False).cumcount()
+    cum = vol.groupby(day, sort=False).cumsum()
+    rvol_tod = pd.Series(np.nan, index=d.index, dtype=float)
+    cum_rvol_tod = pd.Series(np.nan, index=d.index, dtype=float)
+    history = {}
+    cum_history = {}
+    for idx in d.index:
+        key = int(slot.loc[idx])
+        prior = history.get(key, [])[-10:]
+        prior_cum = cum_history.get(key, [])[-10:]
+        if len(prior) >= 5 and np.mean(prior) > 0:
+            rvol_tod.loc[idx] = float(vol.loc[idx]) / float(np.mean(prior))
+        if len(prior_cum) >= 5 and np.mean(prior_cum) > 0:
+            cum_rvol_tod.loc[idx] = float(cum.loc[idx]) / float(np.mean(prior_cum))
+        # Add this bar only after calculating its own reference, preventing look-ahead.
+        history.setdefault(key, []).append(float(vol.loc[idx]))
+        cum_history.setdefault(key, []).append(float(cum.loc[idx]))
+    fallback = vol / vol.shift(1).rolling(20, min_periods=10).mean().replace(0, np.nan)
+    rvol_tod = rvol_tod.where(rvol_tod.notna(), fallback)
+    return rvol_tod, cum_rvol_tod
+
+
 def _v19_feature_frame(df):
     """Causal features + long/short edge scores for every 5M bar (no look-ahead)."""
     req = ["Time", "Open", "High", "Low", "Close", "Volume"]
@@ -4764,7 +4715,8 @@ def _v19_feature_frame(df):
     vwap_dn = vwap < vwap.shift(3)
 
     base_vol = v.shift(1).rolling(20, min_periods=10).mean()
-    rvol = v / base_vol.replace(0, np.nan)
+    rvol_rolling = v / base_vol.replace(0, np.nan)
+    rvol, cum_rvol_tod = _v19_tod_volume_metrics(d)
 
     macd = c.ewm(span=12, adjust=False).mean() - c.ewm(span=26, adjust=False).mean()
     hist = macd - macd.ewm(span=9, adjust=False).mean()
@@ -4809,17 +4761,57 @@ def _v19_feature_frame(df):
     short_ok = sane & trig_s & (st_dir == -1) & (ext >= -V19_MAX_EXTENSION_ATR) & (rvol >= 1.3) & (S >= V19_MIN_SCORE)
 
     d["atr"], d["adx"], d["rvol"], d["ext"] = atr, adx, rvol, ext
+    d["rvol_rolling"], d["cum_rvol_tod"] = rvol_rolling, cum_rvol_tod
     d["long_score"], d["short_score"] = L.astype(float), S.astype(float)
     d["long"], d["short"] = long_ok.fillna(False), short_ok.fillna(False)
     d["day"] = day
     return d
 
 
-def _v19_live_fields(frame_5m, row=None):
+def _v19_context_at(frame_15m, signal_close_time):
+    """15M EMA/ADX/liquidity context available at a 5M signal close (no look-ahead)."""
+    empty = {"trend": "UNKNOWN", "adx": np.nan, "resistance": np.nan, "support": np.nan}
+    req = {"Time", "High", "Low", "Close"}
+    if not isinstance(frame_15m, pd.DataFrame) or frame_15m.empty or not req.issubset(frame_15m.columns):
+        return empty
+    try:
+        d = frame_15m[["Time", "High", "Low", "Close"]].copy()
+        d["Time"] = _v19_ist_times(d["Time"])
+        for col in ("High", "Low", "Close"):
+            d[col] = pd.to_numeric(d[col], errors="coerce")
+        d = d.dropna().sort_values("Time").drop_duplicates("Time", keep="last").reset_index(drop=True)
+        # Yahoo timestamps are candle starts; only use a 15M candle after its close.
+        d = d[(d["Time"] + pd.Timedelta(minutes=15)) <= pd.Timestamp(signal_close_time)]
+        if len(d) < 20:
+            return empty
+        c, h, l = d["Close"], d["High"], d["Low"]
+        e9, e21 = c.ewm(span=9, adjust=False).mean(), c.ewm(span=21, adjust=False).mean()
+        pc = c.shift(1)
+        tr = pd.concat([h-l, (h-pc).abs(), (l-pc).abs()], axis=1).max(axis=1)
+        atr = tr.ewm(alpha=1/14, adjust=False, min_periods=14).mean()
+        up, dn = h.diff(), -l.diff()
+        pdm = up.where((up > dn) & (up > 0), 0.0)
+        mdm = dn.where((dn > up) & (dn > 0), 0.0)
+        pdi = 100 * pdm.ewm(alpha=1/14, adjust=False, min_periods=14).mean() / atr.replace(0, np.nan)
+        mdi = 100 * mdm.ewm(alpha=1/14, adjust=False, min_periods=14).mean() / atr.replace(0, np.nan)
+        dx = 100 * (pdi-mdi).abs() / (pdi+mdi).replace(0, np.nan)
+        adx = dx.ewm(alpha=1/14, adjust=False, min_periods=14).mean()
+        trend = "UP" if c.iloc[-1] > e9.iloc[-1] > e21.iloc[-1] else (
+            "DOWN" if c.iloc[-1] < e9.iloc[-1] < e21.iloc[-1] else "MIXED")
+        return {"trend": trend, "adx": float(adx.iloc[-1]) if pd.notna(adx.iloc[-1]) else np.nan,
+                "resistance": float(h.shift(1).rolling(20, min_periods=10).max().iloc[-1]) if len(h) >= 11 else np.nan,
+                "support": float(l.shift(1).rolling(20, min_periods=10).min().iloc[-1]) if len(l) >= 11 else np.nan}
+    except Exception:
+        return empty
+
+
+def _v19_live_fields(frame_5m, row=None, frame_15m=None):
     """Live V19 verdict for the latest completed 5M candle."""
     row = row or {}
     out = {"V19 Verdict": "NO DATA", "V19 Side": "WAIT", "V19 Score": 0, "V19 Entry": None,
-           "V19 Stop": None, "V19 Target": None, "V19 Reason": "Need 60 completed 5M candles"}
+           "V19 Stop": None, "V19 Target": None, "V19 RVOL (TOD)": None,
+           "V19 Cum RVOL (TOD)": None, "V19 RVOL Method": "NO DATA",
+           "V19 Reason": "Need 60 completed 5M candles"}
     try:
         f = _v19_feature_frame(frame_5m)
         if f.empty:
@@ -4827,6 +4819,9 @@ def _v19_live_fields(frame_5m, row=None):
         x = f.iloc[-1]
         is_l, is_s = bool(x["long"]), bool(x["short"])
         out["V19 Score"] = int(max(x["long_score"], x["short_score"]))
+        out["V19 RVOL (TOD)"] = round(float(x["rvol"]), 2) if pd.notna(x["rvol"]) else None
+        out["V19 Cum RVOL (TOD)"] = round(float(x["cum_rvol_tod"]), 2) if pd.notna(x["cum_rvol_tod"]) else None
+        out["V19 RVOL Method"] = "SAME TIME-OF-DAY" if pd.notna(x["cum_rvol_tod"]) else "ROLLING FALLBACK (<5 COMPARABLE SESSIONS)"
         if not (is_l or is_s) or (is_l and is_s):
             out.update({"V19 Verdict": "SKIP", "V19 Reason":
                         f"Gate not met (L {x['long_score']:.0f} / S {x['short_score']:.0f}, "
@@ -4845,8 +4840,17 @@ def _v19_live_fields(frame_5m, row=None):
             reasons.append("15M opposite")
         if "SIDEWAYS" in regime:
             reasons.append("sideways regime")
-        # Room to run: next opposing liquidity level must be >= 1R away
+        # Additional causal 15M context: only a completed 15M candle is eligible.
+        signal_close = pd.Timestamp(x["Time"]) + pd.Timedelta(minutes=5)
+        ctx = _v19_context_at(frame_15m, signal_close)
+        if ctx["trend"] not in ("UNKNOWN", "MIXED") and ((side == 1 and ctx["trend"] == "DOWN") or (side == -1 and ctx["trend"] == "UP")):
+            reasons.append("15M EMA trend opposite")
+        if np.isfinite(ctx["adx"]) and ctx["adx"] < 18:
+            reasons.append("15M ADX below 18 / weak trend")
+        # Room to run: next opposing liquidity level must be >= 1R away.
         liq = _safe_num(row.get("15M Buy-side Liquidity" if side == 1 else "15M Sell-side Liquidity"), np.nan)
+        if not np.isfinite(liq):
+            liq = _safe_num(ctx["resistance"] if side == 1 else ctx["support"], np.nan)
         if np.isfinite(liq) and (liq - price) * side > 0 and (liq - price) * side < risk:
             reasons.append("no room to liquidity")
         out.update({"V19 Entry": round(price, 2), "V19 Stop": round(stop, 2), "V19 Target": round(target, 2)})
@@ -4865,7 +4869,7 @@ def _v19_live_fields(frame_5m, row=None):
 # ---------------------------------------------------------------------
 # BACKTEST: next-bar-open entry, ATR stop, 1:1.5 target, costs included
 # ---------------------------------------------------------------------
-def _v19_backtest_frame(df, symbol):
+def _v19_backtest_frame(df, symbol, frame_15m=None):
     f = _v19_feature_frame(df)
     if f.empty:
         return []
@@ -4873,11 +4877,21 @@ def _v19_backtest_frame(df, symbol):
     atr, days = f["atr"].to_numpy(float), f["day"].to_numpy()
     longs, shorts = f["long"].to_numpy(bool), f["short"].to_numpy(bool)
     lscore, sscore = f["long_score"].to_numpy(float), f["short_score"].to_numpy(float)
-    times = f["Time"].to_numpy()
+    # Keep timezone-aware Timestamp objects; numpy conversion strips the zone and
+    # would silently disable the historical 15M as-of veto.
+    times = f["Time"].tolist()
     n, trades, i = len(f), [], 60
     while i < n - 2:
         side = 1 if (longs[i] and not shorts[i]) else -1 if (shorts[i] and not longs[i]) else 0
         if side == 0:
+            i += 1
+            continue
+        signal_close = pd.Timestamp(times[i]) + pd.Timedelta(minutes=5)
+        ctx = _v19_context_at(frame_15m, signal_close)
+        if ctx["trend"] not in ("UNKNOWN", "MIXED") and ((side == 1 and ctx["trend"] == "DOWN") or (side == -1 and ctx["trend"] == "UP")):
+            i += 1
+            continue
+        if np.isfinite(ctx["adx"]) and ctx["adx"] < 18:
             i += 1
             continue
         e = i + 1
@@ -4885,6 +4899,13 @@ def _v19_backtest_frame(df, symbol):
             i += 1
             continue
         entry, risk = o[e], V19_ATR_STOP * atr[i]
+        if not np.isfinite(entry) or entry <= 0 or not np.isfinite(risk) or risk <= 0:
+            i += 1
+            continue
+        opposing_liq = ctx["resistance"] if side == 1 else ctx["support"]
+        if np.isfinite(opposing_liq) and (opposing_liq - entry) * side > 0 and (opposing_liq - entry) * side < risk:
+            i += 1
+            continue
         stop, target = entry - side * risk, entry + side * risk * V19_RR
         outcome, exit_j = "TIMEOUT", e
         for j in range(e, min(n, e + V19_MAX_HOLD_BARS)):
@@ -4918,8 +4939,13 @@ def _v19_summarise(t):
         return {}
     wins, losses = int((t["Outcome"] == "WIN").sum()), int((t["Outcome"] == "LOSS").sum())
     gross_win, gross_loss = t.loc[t["R"] > 0, "R"].sum(), -t.loc[t["R"] < 0, "R"].sum()
-    return {"Trades": len(t), "Wins": wins, "Losses": losses, "Timeouts": int((t["Outcome"] == "TIMEOUT").sum()),
-            "Win Rate %": round(wins / (wins + losses) * 100, 1) if wins + losses else 0.0,
+    timeouts = int((t["Outcome"] == "TIMEOUT").sum())
+    decisive = wins + losses
+    positive_r = int((t["R"] > 0).sum())
+    return {"Trades": len(t), "Wins": wins, "Losses": losses, "Timeouts": timeouts,
+            "Win Rate %": round(wins / decisive * 100, 1) if decisive else 0.0,
+            "Decisive Trades": decisive,
+            "Positive Net R % (all trades)": round(positive_r / len(t) * 100, 1) if len(t) else 0.0,
             "Avg R (net of costs)": round(float(t["R"].mean()), 3),
             "Profit Factor": round(float(gross_win / gross_loss), 2) if gross_loss > 0 else None,
             "Break-even Win Rate %": round(100 / (1 + V19_RR), 1)}
@@ -4932,7 +4958,9 @@ def _v19_run_backtest(max_symbols=80):
                GROUP BY symbol ORDER BY COUNT(*) DESC LIMIT ?""", (int(max_symbols),)).fetchall()]
     trades = []
     for s in syms:
-        trades.extend(_v19_backtest_frame(_load_candle_memory(s, "5M"), s))
+        frame_5m = _load_candle_memory(s, "5M")
+        frame_15m = _load_candle_memory(s, "15M")
+        trades.extend(_v19_backtest_frame(frame_5m, s, frame_15m))
     if not trades:
         return pd.DataFrame(), len(syms)
     return pd.DataFrame(trades).sort_values("Time").reset_index(drop=True), len(syms)
@@ -4959,8 +4987,7 @@ def _render_v19_backtest_panel():
     s_all = _v19_summarise(trades)
     for col, key in zip(cols, ("Trades", "Win Rate %", "Avg R (net of costs)", "Profit Factor")):
         col.metric(key, s_all.get(key, "—"))
-    st.caption(f"Break-even win rate at 1:{V19_RR} is {s_all['Break-even Win Rate %']}% (before costs). "
-               "Edge exists only if Avg R is positive.")
+    st.caption(f"Decisive Win Rate excludes TIMEOUTs; Positive Net R % includes every trade. Break-even win rate at 1:{V19_RR} is {s_all['Break-even Win Rate %']}% before costs. Edge exists only if Avg R is positive.")
     split = pd.DataFrame({"First 70% (in-sample)": _v19_summarise(trades.iloc[:cut]),
                           "Last 30% (out-of-sample)": _v19_summarise(trades.iloc[cut:])})
     st.dataframe(split, **_stretch())
@@ -5077,18 +5104,26 @@ def _v19_bigmove_fields(frame_5m, row=None):
 
         # ---- stage ----
         rv = cum_rvol if np.isfinite(cum_rvol) else 0.0
-        if direction == "WAIT":
-            stage = "WAIT"
-        elif range_atr >= 1.8:
+        # A coiled setup is a WATCH, not an entry. Allow a softer directional
+        # bias (3/6 votes with a one-vote lead) so compression is not hidden as WAIT.
+        setup_direction = direction
+        if setup_direction == "WAIT":
+            if nu >= 3 and nu >= nd + 1:
+                setup_direction = "UP"
+            elif nd >= 3 and nd >= nu + 1:
+                setup_direction = "DOWN"
+        if range_atr >= 1.8 and setup_direction != "WAIT":
             stage = "EXHAUSTED — DO NOT CHASE"
-        elif range_atr >= 1.0 and rv >= 2.0:
+        elif setup_direction != "WAIT" and range_atr >= 1.0 and rv >= 2.0:
             stage = "RUNNING"
-        elif rv >= 2.0 and range_atr >= 0.4:
+        elif setup_direction != "WAIT" and rv >= 2.0 and range_atr >= 0.4:
             stage = "IGNITION"
-        elif comp_pts >= 15 and rv < 2.0:
+        elif comp_pts >= 15 and rv < 2.0 and setup_direction != "WAIT":
             stage = "SETUP — COILED"
         else:
             stage = "WAIT"
+        if direction == "WAIT" and stage == "SETUP — COILED":
+            direction = setup_direction
         if stage in ("WAIT", "NO DATA"):
             score = min(score, 54)
 
@@ -5184,7 +5219,10 @@ def _v19_capture_live_signals(result, reference_time=None):
     for _, r in result.iterrows():
         if str(r.get("Data Quality", "PASS")).strip().upper() != "PASS":
             continue
-        if str(r.get("V19 Verdict", "")).upper() != "TAKE":
+        verdict = str(r.get("V19 Verdict", "")).upper()
+        if V19_STRICT_GATE and verdict != "TAKE":
+            continue
+        if not V19_STRICT_GATE and verdict not in ("TAKE", "SKIP"):
             continue
         symbol = str(r.get("Symbol", "")).strip()
         candle_time = r.get("5M Candle Close (IST)")
@@ -6065,7 +6103,8 @@ def show_ai_multi_agent_scanner(client=None):
             "Symbol", "Final Signal", "Action Signal", "Breakout Signal", "Multi-TF Breakout", "5M Breakout", "15M Breakout", "1H Breakout", "Breakout Retest", "Breakout Level", "Breakdown Level", "Breakout Reason", "Equal High Liquidity", "Equal Low Liquidity", "Direction Movement", "Signal Time (IST)",
             "5M Candle Close (IST)", "15M Candle Close (IST)", "1H Candle Close (IST)",
             "Entry Price", "Stop Loss", "15M ATR",
-            "V19 Verdict", "V19 Side", "V19 Score", "V19 Entry", "V19 Stop", "V19 Target", "V19 Reason",
+            "V19 Verdict", "V19 Side", "V19 Score", "V19 Entry", "V19 Stop", "V19 Target",
+            "V19 RVOL (TOD)", "V19 Cum RVOL (TOD)", "V19 RVOL Method", "V19 Reason",
             "BM Stage", "BM Direction", "BM Score", "BM Cum RVOL", "BM Move %", "BM Range/ATR",
             "BM Compression", "BM Trigger", "BM Invalidation", "BM Reason",
             "Confirmation Strength %", "Consensus Score",
