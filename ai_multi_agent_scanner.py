@@ -23,6 +23,7 @@ requirements.txt:
 """
 
 import io
+import html
 import json
 import copy
 import math
@@ -1014,6 +1015,67 @@ def _is_market_hours(now=None):
     if now.weekday() >= 5 or now.strftime("%Y-%m-%d") in NSE_HOLIDAYS:
         return False
     return (now.hour, now.minute) >= (9, 15) and (now.hour, now.minute) < (15, 30)
+
+def _show_blink_score_table(df, score_col="Best Stock Score", threshold=80, height=None):
+    """Render an existing report table with blinking rows at/above threshold.
+
+    Uses HTML because st.dataframe's canvas renderer does not reliably support
+    CSS keyframe animations. Input DataFrame is not modified.
+    """
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        st.info("No rows to display.")
+        return
+    if score_col not in df.columns:
+        st.dataframe(df, hide_index=True, **_stretch())
+        return
+
+    def _fmt(value):
+        try:
+            if pd.isna(value):
+                return ""
+        except (TypeError, ValueError):
+            pass
+        if isinstance(value, (float, np.floating)):
+            return f"{value:,.2f}" if abs(value) < 10000 else f"{value:,.0f}"
+        return str(value)
+
+    headers = "".join(f"<th>{html.escape(str(c))}</th>" for c in df.columns)
+    body_rows = []
+    for _, row in df.iterrows():
+        try:
+            score = float(pd.to_numeric(row.get(score_col), errors="coerce"))
+        except (TypeError, ValueError):
+            score = float("nan")
+        css_class = ""
+        if np.isfinite(score) and score >= 90:
+            css_class = "score-90"
+        elif np.isfinite(score) and score >= float(threshold):
+            css_class = "score-80"
+        cells = []
+        for col in df.columns:
+            value = _fmt(row[col])
+            if col == score_col and css_class:
+                value = f'<span class="score-pill">{html.escape(value)}</span>'
+            else:
+                value = html.escape(value)
+            cells.append(f"<td>{value}</td>")
+        body_rows.append(f'<tr class="{css_class}">' + "".join(cells) + "</tr>")
+
+    max_height = f"max-height:{int(height)}px;" if height else "max-height:680px;"
+    table_html = f"""<style>
+    @keyframes scannerScoreBlink {{ 0%,100% {{opacity:1;}} 50% {{opacity:.48;}} }}
+    .scanner-score-wrap {{ width:100%; overflow:auto; {max_height} border:1px solid rgba(128,128,128,.28); border-radius:8px; }}
+    .scanner-score-table {{ border-collapse:collapse; width:100%; min-width:900px; font-size:12px; }}
+    .scanner-score-table th {{ position:sticky; top:0; z-index:1; background:#263746; color:white; text-align:left; padding:8px; white-space:nowrap; }}
+    .scanner-score-table td {{ padding:7px 8px; border-bottom:1px solid rgba(128,128,128,.2); white-space:nowrap; }}
+    .scanner-score-table tr.score-80 {{ background:rgba(0,170,95,.12); animation:scannerScoreBlink 1.7s ease-in-out infinite; }}
+    .scanner-score-table tr.score-90 {{ background:rgba(0,190,105,.23); font-weight:700; animation:scannerScoreBlink .95s ease-in-out infinite; }}
+    .score-pill {{ display:inline-block; border-radius:5px; padding:2px 6px; background:rgba(0,170,95,.22); font-weight:700; }}
+    </style>
+    <div class="scanner-score-wrap"><table class="scanner-score-table"><thead><tr>{headers}</tr></thead>
+    <tbody>{''.join(body_rows)}</tbody></table></div>"""
+    st.markdown(table_html, unsafe_allow_html=True)
+
 
 def _stretch():
     try:
@@ -5197,7 +5259,7 @@ def show_ai_multi_agent_scanner(client=None):
         "Stop Loss", "5M", "15M", "1H", "Signal Time (IST)", "Best Stock Reason",
     ] if c in quick_view.columns]
     st.caption("BUY/SELL = confirmed technical signal • PRE-BIG = early watch, not confirmed • WAIT = no clear setup. Full analysis is below.")
-    st.dataframe(quick_view[quick_cols].head(300), hide_index=True, **_stretch())
+    _show_blink_score_table(quick_view[quick_cols].head(300), score_col="Best Stock Score", threshold=80)
 
     with st.expander("🔎 ADVANCED REPORTS — LIQUIDITY, SWEEPS, AI, BIG MOVE & AGENT DETAILS", expanded=False):
         candle_count, scan_count, memory_symbols = _memory_stats()
@@ -5417,7 +5479,7 @@ def show_ai_multi_agent_scanner(client=None):
             best = best.sort_values(
                 ["Best Stock Score", "Confirmation Strength %"], ascending=[False, False]
             ).head(10)
-            st.dataframe(best[best_cols], hide_index=True, **_stretch())
+            _show_blink_score_table(best[best_cols], score_col="Best Stock Score", threshold=80)
             st.caption(f"Showing top {len(best)} qualified stocks. Score threshold: {min_best_score}/100.")
         else:
             st.info(
@@ -5515,13 +5577,13 @@ def show_ai_multi_agent_scanner(client=None):
                            "PRE-BIG Candles", "PRE-BIG Range High", "PRE-BIG Range Low",
                            "PRE-BIG Range Width %", "PRE-BIG Volume Build %", "PRE-BIG RVOL",
                            "PRE-BIG Trigger", "Last Price", "5M", "15M", "1H", "PRE-BIG Reason"]
-            st.dataframe(prebig_view[prebig_cols], hide_index=True, **_stretch())
+            _show_blink_score_table(prebig_view[prebig_cols], score_col="PRE-BIG Score", threshold=80)
         else:
             st.info("No 5M PRE-BIG setup currently meets the compression + volume + direction rules. This is preferable to forcing a signal.")
 
         summary_cols = [c for c in summary_cols if c in view.columns]
         st.caption(f"Showing top 300 of {len(view):,} rows in the main table. Full results remain available in CSV/Excel.")
-        st.dataframe(view[summary_cols].head(300), hide_index=True, **_stretch())
+        _show_blink_score_table(view[summary_cols].head(300), score_col="Best Stock Score", threshold=80)
 
         st.subheader("📚 FYERS Live Market Depth — Shortlist Only")
         depth_view = st.session_state.get("multi_agent_depth")
