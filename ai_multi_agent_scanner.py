@@ -23,6 +23,7 @@ requirements.txt:
 """
 
 import io
+import html
 import json
 import copy
 import math
@@ -1014,6 +1015,53 @@ def _is_market_hours(now=None):
     if now.weekday() >= 5 or now.strftime("%Y-%m-%d") in NSE_HOLIDAYS:
         return False
     return (now.hour, now.minute) >= (9, 15) and (now.hour, now.minute) < (15, 30)
+
+def _show_blink_score_table(df, score_col="Best Stock Score", threshold=80, height=None):
+    """Fast native Streamlit table with direction and high-score row colours.
+
+    BUY/UP rows are green, SELL/DOWN rows are red. Scores at/above the
+    threshold receive stronger colour. Native st.dataframe is used to avoid
+    the slow large-HTML-table rendering problem. CSS blinking is not reliably
+    supported by Streamlit's dataframe grid renderer.
+    """
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        st.info("No rows to display.")
+        return
+
+    display_df = df.copy()
+    direction_cols = [c for c in ("Final Signal", "Action Signal", "Best Stock Side",
+                                  "PRE-BIG Direction", "Pre-Move Direction",
+                                  "Big Move Direction", "Direction") if c in display_df.columns]
+
+    def _style_rows(row):
+        score = pd.to_numeric(pd.Series([row.get(score_col)]), errors="coerce").iloc[0] if score_col in row.index else float("nan")
+        direction_text = " ".join(str(row.get(c, "")) for c in direction_cols).upper()
+        high_score = pd.notna(score) and float(score) >= float(threshold)
+
+        is_sell = any(token in direction_text for token in ("SELL", "DOWN", "BEAR"))
+        is_buy = any(token in direction_text for token in ("BUY", "UP", "BULL"))
+
+        if is_sell and high_score:
+            style = "background-color: #991b1b; color: #ffffff; font-weight: 700;"
+        elif is_sell:
+            style = "background-color: #fee2e2; color: #7f1d1d;"
+        elif is_buy and high_score:
+            style = "background-color: #166534; color: #ffffff; font-weight: 700;"
+        elif is_buy:
+            style = "background-color: #dcfce7; color: #14532d;"
+        elif high_score:
+            style = "background-color: #fef3c7; color: #78350f; font-weight: 700;"
+        else:
+            return [""] * len(row)
+
+        styles = [style] * len(row)
+        if score_col in row.index and high_score:
+            styles[list(row.index).index(score_col)] += " text-align: center; font-weight: 800;"
+        return styles
+
+    styled_df = display_df.style.apply(_style_rows, axis=1)
+    st.dataframe(styled_df, hide_index=True, height=height, **_stretch())
+
 
 def _stretch():
     try:
@@ -5197,7 +5245,7 @@ def show_ai_multi_agent_scanner(client=None):
         "Stop Loss", "5M", "15M", "1H", "Signal Time (IST)", "Best Stock Reason",
     ] if c in quick_view.columns]
     st.caption("BUY/SELL = confirmed technical signal • PRE-BIG = early watch, not confirmed • WAIT = no clear setup. Full analysis is below.")
-    st.dataframe(quick_view[quick_cols].head(300), hide_index=True, **_stretch())
+    _show_blink_score_table(quick_view[quick_cols].head(300), score_col="Best Stock Score", threshold=80)
 
     with st.expander("🔎 ADVANCED REPORTS — LIQUIDITY, SWEEPS, AI, BIG MOVE & AGENT DETAILS", expanded=False):
         candle_count, scan_count, memory_symbols = _memory_stats()
@@ -5417,7 +5465,7 @@ def show_ai_multi_agent_scanner(client=None):
             best = best.sort_values(
                 ["Best Stock Score", "Confirmation Strength %"], ascending=[False, False]
             ).head(10)
-            st.dataframe(best[best_cols], hide_index=True, **_stretch())
+            _show_blink_score_table(best[best_cols], score_col="Best Stock Score", threshold=80)
             st.caption(f"Showing top {len(best)} qualified stocks. Score threshold: {min_best_score}/100.")
         else:
             st.info(
@@ -5515,13 +5563,13 @@ def show_ai_multi_agent_scanner(client=None):
                            "PRE-BIG Candles", "PRE-BIG Range High", "PRE-BIG Range Low",
                            "PRE-BIG Range Width %", "PRE-BIG Volume Build %", "PRE-BIG RVOL",
                            "PRE-BIG Trigger", "Last Price", "5M", "15M", "1H", "PRE-BIG Reason"]
-            st.dataframe(prebig_view[prebig_cols], hide_index=True, **_stretch())
+            _show_blink_score_table(prebig_view[prebig_cols], score_col="PRE-BIG Score", threshold=80)
         else:
             st.info("No 5M PRE-BIG setup currently meets the compression + volume + direction rules. This is preferable to forcing a signal.")
 
         summary_cols = [c for c in summary_cols if c in view.columns]
         st.caption(f"Showing top 300 of {len(view):,} rows in the main table. Full results remain available in CSV/Excel.")
-        st.dataframe(view[summary_cols].head(300), hide_index=True, **_stretch())
+        _show_blink_score_table(view[summary_cols].head(300), score_col="Best Stock Score", threshold=80)
 
         st.subheader("📚 FYERS Live Market Depth — Shortlist Only")
         depth_view = st.session_state.get("multi_agent_depth")
