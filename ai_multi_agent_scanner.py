@@ -23,6 +23,7 @@ requirements.txt:
 """
 
 import io
+import hashlib
 import json
 import copy
 import math
@@ -2683,6 +2684,7 @@ def _make_result_row(symbol, yahoo_symbol, payload):
     row.update(_extra_formulas(frame_5m, row))
     # V19 is an independent additive engine. Legacy 17-agent fields remain unchanged.
     row.update(_v19_live_fields(frame_5m, row, frame_15m))
+    row.update(_v20_live_fields(frame_5m, row))
     row.update(_v19_bigmove_fields(frame_5m, row))
     row.update(_breakout_breakdown_signal(frame_15m))
     row.update(_multi_tf_breakout(frames))
@@ -4768,6 +4770,42 @@ def _v19_feature_frame(df):
     return d
 
 
+_V19_FRAME_CACHE = OrderedDict()
+_V19_FRAME_CACHE_LOCK = threading.Lock()
+_V19_FRAME_CACHE_MAX = 128
+
+
+def _v19_feature_frame_cached(df):
+    """Bounded cache for repeated live V19/V20 calculations on identical OHLCV."""
+    req = ["Time", "Open", "High", "Low", "Close", "Volume"]
+    try:
+        if not isinstance(df, pd.DataFrame) or not set(req).issubset(df.columns):
+            return _v19_feature_frame(df)
+        base = df[req]
+        digest = hashlib.blake2b(
+            pd.util.hash_pandas_object(base, index=True).to_numpy().tobytes(),
+            digest_size=16,
+        ).digest()
+        key = (len(base), digest)
+    except Exception:
+        return _v19_feature_frame(df)
+
+    with _V19_FRAME_CACHE_LOCK:
+        hit = _V19_FRAME_CACHE.get(key)
+        if hit is not None:
+            _V19_FRAME_CACHE.move_to_end(key)
+            return hit.copy(deep=False)
+
+    # Do expensive work outside the lock; duplicate concurrent misses are harmless.
+    calculated = _v19_feature_frame(df)
+    with _V19_FRAME_CACHE_LOCK:
+        _V19_FRAME_CACHE[key] = calculated
+        _V19_FRAME_CACHE.move_to_end(key)
+        while len(_V19_FRAME_CACHE) > _V19_FRAME_CACHE_MAX:
+            _V19_FRAME_CACHE.popitem(last=False)
+    return calculated.copy(deep=False)
+
+
 def _v19_context_at(frame_15m, signal_close_time):
     """15M EMA/ADX/liquidity context available at a 5M signal close (no look-ahead)."""
     empty = {"trend": "UNKNOWN", "adx": np.nan, "resistance": np.nan, "support": np.nan}
@@ -4813,7 +4851,7 @@ def _v19_live_fields(frame_5m, row=None, frame_15m=None):
            "V19 Cum RVOL (TOD)": None, "V19 RVOL Method": "NO DATA",
            "V19 Reason": "Need 60 completed 5M candles"}
     try:
-        f = _v19_feature_frame(frame_5m)
+        f = _v19_feature_frame_cached(frame_5m)
         if f.empty:
             return out
         x = f.iloc[-1]
@@ -4869,8 +4907,10 @@ def _v19_live_fields(frame_5m, row=None, frame_15m=None):
 # ---------------------------------------------------------------------
 # BACKTEST: next-bar-open entry, ATR stop, 1:1.5 target, costs included
 # ---------------------------------------------------------------------
-def _v19_backtest_frame(df, symbol, frame_15m=None):
-    f = _v19_feature_frame(df)
+def _v19_backtest_frame(df, symbol, frame_15m=None, use_v20=False):
+    f = _v19_feature_frame_cached(df)
+    if use_v20 and not f.empty:
+        f = _v20_add_features(f)
     if f.empty:
         return []
     o, h, l, c = (f[k].to_numpy(float) for k in ("Open", "High", "Low", "Close"))
@@ -4886,6 +4926,24 @@ def _v19_backtest_frame(df, symbol, frame_15m=None):
         if side == 0:
             i += 1
             continue
+        if use_v20:
+            # Apply V20 indicators at the signal bar; profile uses only bars up to i.
+            gate_col = "v20_long" if side == 1 else "v20_short"
+            if not bool(f[gate_col].iloc[i]):
+                i += 1
+                continue
+            sess_to_signal = f.iloc[:i + 1]
+            sess_to_signal = sess_to_signal[sess_to_signal["day"] == days[i]]
+            prof = _v20_volume_profile(sess_to_signal)
+            if prof:
+                _, vah, val = prof
+                signal_price = float(c[i])
+                if side == 1 and 0 <= (vah - signal_price) / signal_price * 100 <= V20_EDGE_PCT:
+                    i += 1
+                    continue
+                if side == -1 and 0 <= (signal_price - val) / signal_price * 100 <= V20_EDGE_PCT:
+                    i += 1
+                    continue
         signal_close = pd.Timestamp(times[i]) + pd.Timedelta(minutes=5)
         ctx = _v19_context_at(frame_15m, signal_close)
         if ctx["trend"] not in ("UNKNOWN", "MIXED") and ((side == 1 and ctx["trend"] == "DOWN") or (side == -1 and ctx["trend"] == "UP")):
@@ -5025,7 +5083,7 @@ def _v19_bigmove_fields(frame_5m, row=None):
     out = dict(_BM_DEFAULTS)
     row = row or {}
     try:
-        f = _v19_feature_frame(frame_5m)
+        f = _v19_feature_frame_cached(frame_5m)
         if f.empty:
             return out
         day = f["day"]
@@ -5222,6 +5280,8 @@ def _v19_capture_live_signals(result, reference_time=None):
         verdict = str(r.get("V19 Verdict", "")).upper()
         if V19_STRICT_GATE and verdict != "TAKE":
             continue
+        if V20_ENABLED and V20_LIVE_LEDGER_GATE and str(r.get("V20 Gate", "N/A")).strip().upper() != "PASS":
+            continue
         if not V19_STRICT_GATE and verdict not in ("TAKE", "SKIP"):
             continue
         symbol = str(r.get("Symbol", "")).strip()
@@ -5274,6 +5334,235 @@ def _render_v19_live_panel():
         "last_seen_ist": "Last Seen (IST)",
     })
     st.dataframe(live, hide_index=True, **_stretch())
+
+
+V20_ENABLED = True
+V20_MIN_ER = 0.30            # efficiency ratio: >=0.30 = directional, <0.30 = noisy
+V20_MAX_CHOP = 61.8          # choppiness index above this = ranging market
+V20_MAX_VWAP_Z = 2.0         # do not chase beyond 2 sigma from session VWAP
+V20_MIN_DELTA = 0.05         # min |delta-volume ratio| in trade direction
+V20_NARROW_CPR_PCT = 0.25    # narrow CPR (% of pivot) = higher chance of trend day
+V20_PROFILE_BINS = 24
+V20_EDGE_PCT = 0.15          # veto if entry is within 0.15% of VAH (long) / VAL (short)
+
+_V20_DEFAULTS = {
+    "V20 Gate": "N/A", "V20 Quality": 0, "V20 Efficiency Ratio": None,
+    "V20 Choppiness": None, "V20 VWAP Z": None, "V20 Delta Ratio": None,
+    "V20 CPR Width %": None, "V20 CPR State": "NO DATA", "V20 POC": None,
+    "V20 VAH": None, "V20 VAL": None, "V20 Reason": "Need V19 TAKE signal",
+}
+
+
+def _v20_add_features(f):
+    """Add V20 columns to a V19 feature frame (needs Time/OHLCV/day columns)."""
+    if f is None or not isinstance(f, pd.DataFrame) or f.empty:
+        return f
+    d = f.copy()
+    o, h, l, c, v = (d[k].astype(float) for k in ("Open", "High", "Low", "Close", "Volume"))
+    typ = (h + l + c) / 3
+    day = d["day"]
+    cv = v.groupby(day).cumsum().replace(0, np.nan)
+    vw = (typ * v).groupby(day).cumsum() / cv
+    var = ((typ ** 2 * v).groupby(day).cumsum() / cv - vw ** 2).clip(lower=0)
+    sd = np.sqrt(var)
+    bars = d.groupby("day").cumcount()
+    d["v20_vwap_z"] = ((c - vw) / sd.replace(0, np.nan)).where(bars >= 6)
+
+    net = (c - c.shift(10)).abs()
+    path = c.diff().abs().rolling(10).sum()
+    d["v20_er"] = net / path.replace(0, np.nan)
+
+    pc = c.shift(1)
+    tr = pd.concat([(h - l), (h - pc).abs(), (l - pc).abs()], axis=1).max(axis=1)
+    rng14 = (h.rolling(14).max() - l.rolling(14).min()).replace(0, np.nan)
+    d["v20_chop"] = 100 * np.log10(tr.rolling(14).sum() / rng14) / np.log10(14)
+
+    clv = ((c - l) - (h - c)) / (h - l).replace(0, np.nan)
+    delta = (clv * v).fillna(0.0)
+    d["v20_delta"] = delta.rolling(6).sum() / v.rolling(6).sum().replace(0, np.nan)
+
+    daily = d.groupby("day").agg(H=("High", "max"), L=("Low", "min"), C=("Close", "last")).shift(1)
+    piv = (daily["H"] + daily["L"] + daily["C"]) / 3
+    bc = (daily["H"] + daily["L"]) / 2
+    tc = 2 * piv - bc
+    top, bot = np.maximum(tc, bc), np.minimum(tc, bc)
+    d["v20_cpr_top"] = d["day"].map(top)
+    d["v20_cpr_bot"] = d["day"].map(bot)
+    d["v20_cpr_w"] = d["day"].map((top - bot) / piv * 100)
+
+    z, er, ch, dr = d["v20_vwap_z"], d["v20_er"], d["v20_chop"], d["v20_delta"]
+    trend_ok = (er >= V20_MIN_ER) & (ch <= V20_MAX_CHOP)
+    long_g = (trend_ok & (z.isna() | (z <= V20_MAX_VWAP_Z)) & (dr >= V20_MIN_DELTA)
+              & (d["v20_cpr_bot"].isna() | (c >= d["v20_cpr_bot"])))
+    short_g = (trend_ok & (z.isna() | (z >= -V20_MAX_VWAP_Z)) & (dr <= -V20_MIN_DELTA)
+               & (d["v20_cpr_top"].isna() | (c <= d["v20_cpr_top"])))
+    d["v20_long"], d["v20_short"] = long_g.fillna(False), short_g.fillna(False)
+    q = (0.30 * (er / 0.6).clip(0, 1) + 0.20 * ((V20_MAX_CHOP - ch) / 20).clip(0, 1)
+         + 0.30 * (dr.abs() / 0.3).clip(0, 1)
+         + 0.20 * (d["v20_cpr_w"] <= V20_NARROW_CPR_PCT).astype(float))
+    d["v20_quality"] = (q.fillna(0) * 100).round(0)
+    return d
+
+
+def _v20_volume_profile(sess, bins=V20_PROFILE_BINS):
+    """Session volume profile -> (POC, VAH, VAL) or None."""
+    try:
+        if sess is None or len(sess) < 12:
+            return None
+        lo, hi = float(sess["Low"].min()), float(sess["High"].max())
+        if hi <= lo:
+            return None
+        edges = np.linspace(lo, hi, bins + 1)
+        typ = ((sess["High"] + sess["Low"] + sess["Close"]) / 3).to_numpy(float)
+        idx = np.clip(np.searchsorted(edges, typ, side="right") - 1, 0, bins - 1)
+        vol = np.zeros(bins)
+        np.add.at(vol, idx, sess["Volume"].to_numpy(float))
+        total = vol.sum()
+        if total <= 0:
+            return None
+        poc = int(vol.argmax())
+        lo_i = hi_i = poc
+        acc = vol[poc]
+        while acc < 0.70 * total and (lo_i > 0 or hi_i < bins - 1):
+            up = vol[hi_i + 1] if hi_i < bins - 1 else -1.0
+            dn = vol[lo_i - 1] if lo_i > 0 else -1.0
+            if up >= dn:
+                hi_i += 1
+                acc += vol[hi_i]
+            else:
+                lo_i -= 1
+                acc += vol[lo_i]
+        return float((edges[poc] + edges[poc + 1]) / 2), float(edges[hi_i + 1]), float(edges[lo_i])
+    except Exception:
+        return None
+
+
+def _v20_live_fields(frame_5m, row=None):
+    """Live V20 verdict. Gate is evaluated only when V19 says TAKE."""
+    out = dict(_V20_DEFAULTS)
+    row = row or {}
+    try:
+        f = _v19_feature_frame_cached(frame_5m)
+        if f.empty:
+            out["V20 Reason"] = "Need 60 completed 5M candles"
+            return out
+        f = _v20_add_features(f)
+        x = f.iloc[-1]
+        n = lambda k, r=2: round(float(x[k]), r) if pd.notna(x[k]) else None
+        out.update({
+            "V20 Quality": int(x["v20_quality"]), "V20 Efficiency Ratio": n("v20_er"),
+            "V20 Choppiness": n("v20_chop", 1), "V20 VWAP Z": n("v20_vwap_z"),
+            "V20 Delta Ratio": n("v20_delta", 3), "V20 CPR Width %": n("v20_cpr_w", 3),
+        })
+        price = float(x["Close"])
+        if pd.notna(x["v20_cpr_top"]):
+            out["V20 CPR State"] = ("NARROW CPR — TREND DAY BIAS"
+                                    if x["v20_cpr_w"] <= V20_NARROW_CPR_PCT else "NORMAL CPR")
+            out["V20 CPR State"] += (" | ABOVE CPR" if price > x["v20_cpr_top"]
+                                     else " | BELOW CPR" if price < x["v20_cpr_bot"] else " | INSIDE CPR")
+        sess = f[f["day"] == x["day"]]
+        prof = _v20_volume_profile(sess)
+        if prof:
+            out["V20 POC"], out["V20 VAH"], out["V20 VAL"] = (round(p, 2) for p in prof)
+
+        side = str(row.get("V19 Side", "WAIT")).upper()
+        if str(row.get("V19 Verdict", "")).upper() != "TAKE" or side not in ("BUY", "SELL"):
+            return out
+        passed = bool(x["v20_long"] if side == "BUY" else x["v20_short"])
+        fails = []
+        if not passed:
+            if not (pd.notna(x["v20_er"]) and x["v20_er"] >= V20_MIN_ER):
+                fails.append(f"noisy trend (ER {x['v20_er']:.2f} < {V20_MIN_ER})" if pd.notna(x["v20_er"]) else "ER warm-up")
+            if not (pd.notna(x["v20_chop"]) and x["v20_chop"] <= V20_MAX_CHOP):
+                fails.append("choppy market")
+            zz = x["v20_vwap_z"]
+            if pd.notna(zz) and ((side == "BUY" and zz > V20_MAX_VWAP_Z) or (side == "SELL" and zz < -V20_MAX_VWAP_Z)):
+                fails.append(f"over-extended ({zz:.1f} sigma from VWAP)")
+            dd = x["v20_delta"]
+            if not (pd.notna(dd) and ((side == "BUY" and dd >= V20_MIN_DELTA) or (side == "SELL" and dd <= -V20_MIN_DELTA))):
+                fails.append("delta-volume does not support direction")
+            if pd.notna(x["v20_cpr_bot"]) and ((side == "BUY" and price < x["v20_cpr_bot"]) or (side == "SELL" and price > x["v20_cpr_top"])):
+                fails.append("price on wrong side of CPR")
+        if prof:
+            _, vah, val = prof
+            if side == "BUY" and 0 <= (vah - price) / price * 100 <= V20_EDGE_PCT:
+                fails.append("entry directly under value-area high (supply)")
+            if side == "SELL" and 0 <= (price - val) / price * 100 <= V20_EDGE_PCT:
+                fails.append("entry directly above value-area low (demand)")
+        out["V20 Gate"] = "PASS" if not fails and passed else "FAIL"
+        out["V20 Reason"] = ("All V20 filters aligned: trend quality, no chop, not extended, delta/CPR support."
+                             if out["V20 Gate"] == "PASS" else "Vetoed: " + "; ".join(fails or ["gate not met"]))
+        return out
+    except Exception as exc:
+        out["V20 Reason"] = "V20 error: " + str(exc)[:100]
+        return out
+
+
+
+# V20 is advisory by default. Enable only after the OOS A/B test supports it.
+V20_LIVE_LEDGER_GATE = False
+
+
+def _v19_run_backtest(max_symbols=80, use_v20=False):
+    with _memory_connect() as conn:
+        syms = [r[0] for r in conn.execute(
+            """SELECT symbol FROM candles WHERE timeframe='5M'
+               GROUP BY symbol ORDER BY COUNT(*) DESC LIMIT ?""", (int(max_symbols),)).fetchall()]
+    trades = []
+    for symbol in syms:
+        trades.extend(_v19_backtest_frame(
+            _load_candle_memory(symbol, "5M"), symbol,
+            _load_candle_memory(symbol, "15M"), use_v20=use_v20,
+        ))
+    if not trades:
+        return pd.DataFrame(), len(syms)
+    return pd.DataFrame(trades).sort_values("Time").reset_index(drop=True), len(syms)
+
+
+def _render_v20_ab_panel():
+    st.subheader("⚖️ V20 A/B TEST — V19 only vs V19 + V20")
+    st.caption("V20 stays advisory until the last 30% out-of-sample Avg R improves and has about 30+ trades.")
+    n_sym = st.selectbox("V20 A/B symbols", [20, 50, 80, 150], index=2, key="v20_ab_symbols")
+    if st.button("▶ RUN V19 vs V19+V20 A/B", key="v20_ab_run"):
+        with st.spinner("Running both backtests on saved completed 5M candles..."):
+            a, _ = _v19_run_backtest(n_sym, use_v20=False)
+            b, _ = _v19_run_backtest(n_sym, use_v20=True)
+        st.session_state["v20_ab"] = (a, b)
+    saved = st.session_state.get("v20_ab")
+    if not saved:
+        return
+    a, b = saved
+    if a.empty or b.empty:
+        st.info("Not enough comparable trades. Scan more market sessions to build SQLite 5M history.")
+        return
+    rows = []
+    for name, trades in (("V19 only", a), ("V19 + V20", b)):
+        cut = int(len(trades) * 0.70)
+        full = _v19_summarise(trades)
+        oos = _v19_summarise(trades.iloc[cut:])
+        rows.append({
+            "Model": name, "Trades": full.get("Trades"),
+            "Win Rate %": full.get("Win Rate %"),
+            "Avg R": full.get("Avg R (net of costs)"),
+            "Profit Factor": full.get("Profit Factor"),
+            "OOS Trades": oos.get("Trades"),
+            "OOS Win Rate %": oos.get("Win Rate %"),
+            "OOS Avg R": oos.get("Avg R (net of costs)"),
+        })
+    comparison = pd.DataFrame(rows)
+    st.dataframe(comparison, hide_index=True, **_stretch())
+    try:
+        base = comparison.loc[comparison["Model"] == "V19 only"].iloc[0]
+        filtered = comparison.loc[comparison["Model"] == "V19 + V20"].iloc[0]
+        supported = (pd.notna(base["OOS Avg R"]) and pd.notna(filtered["OOS Avg R"])
+                     and filtered["OOS Avg R"] > base["OOS Avg R"]
+                     and int(filtered["OOS Trades"] or 0) >= 30)
+        if supported:
+            st.success("A/B evidence supports testing V20 as a live gate. Enable V20_LIVE_LEDGER_GATE manually only after review.")
+        else:
+            st.warning("Evidence is not sufficient to activate V20 as a live gate. Keep V20 advisory and collect more data / tune thresholds.")
+    except Exception:
+        st.info("Review OOS Avg R and OOS trade count before enabling the V20 live gate.")
 
 
 def show_ai_multi_agent_scanner(client=None):
@@ -5675,10 +5964,14 @@ def show_ai_multi_agent_scanner(client=None):
         st.info("No results yet. Press RUN FULL BATCH SCAN.")
         return
 
-    # V19 is additive: separate strict TAKE ledger, Big Move Catcher and opt-in backtest.
+    # V19/V20 are additive; V20 remains advisory until A/B evidence supports activation.
+    for _k, _v in _V20_DEFAULTS.items():
+        if _k not in result.columns:
+            result[_k] = _v
     _render_v19_live_panel()
     _render_v19_bigmove_panel(result)
     _render_v19_backtest_panel()
+    _render_v20_ab_panel()
 
     # Re-apply the hard quality gate to restored/session-cached rows as well.
     if "Data Quality" in result.columns:
@@ -6105,6 +6398,7 @@ def show_ai_multi_agent_scanner(client=None):
             "Entry Price", "Stop Loss", "15M ATR",
             "V19 Verdict", "V19 Side", "V19 Score", "V19 Entry", "V19 Stop", "V19 Target",
             "V19 RVOL (TOD)", "V19 Cum RVOL (TOD)", "V19 RVOL Method", "V19 Reason",
+            "V20 Gate", "V20 Quality", "V20 Efficiency Ratio", "V20 Choppiness", "V20 VWAP Z", "V20 Delta Ratio", "V20 CPR Width %", "V20 CPR State", "V20 POC", "V20 VAH", "V20 VAL", "V20 Reason",
             "BM Stage", "BM Direction", "BM Score", "BM Cum RVOL", "BM Move %", "BM Range/ATR",
             "BM Compression", "BM Trigger", "BM Invalidation", "BM Reason",
             "Confirmation Strength %", "Consensus Score",
