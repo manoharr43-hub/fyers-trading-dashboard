@@ -1161,6 +1161,9 @@ def _liquidity_levels_and_sweeps(df, lookback=30, timeframe_minutes=15):
     empty = {
         "Buy-side Liquidity": None, "Sell-side Liquidity": None,
         "Buy-side Liquidity Time (IST)": None, "Sell-side Liquidity Time (IST)": None,
+        "Buy-side Liquidity Signal": "NO DATA", "Sell-side Liquidity Signal": "NO DATA",
+        "Buy-side Liquidity Distance %": None, "Sell-side Liquidity Distance %": None,
+        "Buy-side Liquidity Status": "NO DATA", "Sell-side Liquidity Status": "NO DATA",
         "Equal High Liquidity": "NO", "Equal Low Liquidity": "NO",
         "Upside Sweep": "NO", "Downside Sweep": "NO",
         "Upside Sweep Time (IST)": None, "Downside Sweep Time (IST)": None,
@@ -1230,6 +1233,20 @@ def _liquidity_levels_and_sweeps(df, lookback=30, timeframe_minutes=15):
     buy_time = _close_time(prior["Time"].iloc[buy_idx])
     sell_time = _close_time(prior["Time"].iloc[sell_idx])
     trigger_time = _close_time(last["Time"])
+    buy_dist = (buy_liq - close_now) / max(abs(close_now), 1e-9) * 100.0
+    sell_dist = (close_now - sell_liq) / max(abs(close_now), 1e-9) * 100.0
+    # Track the two liquidity pools independently from sweep events.
+    # A level is not a trade signal until price interaction is confirmed.
+    buy_status = ("TAKEN / ACCEPTED ABOVE" if close_now > buy_liq else
+                  "NEAR BUY-SIDE LIQUIDITY" if 0 <= buy_dist <= 0.25 else "RESTING ABOVE PRICE")
+    sell_status = ("TAKEN / ACCEPTED BELOW" if close_now < sell_liq else
+                   "NEAR SELL-SIDE LIQUIDITY" if 0 <= sell_dist <= 0.25 else "RESTING BELOW PRICE")
+    buy_signal = ("BUY-SIDE SWEPT — CHECK REJECTION" if upside else
+                  "BUY-SIDE BREAKOUT — ACCEPTED" if close_now > buy_liq else
+                  "BUY-SIDE LIQUIDITY NEAR" if 0 <= buy_dist <= 0.25 else "WAIT — ABOVE PRICE")
+    sell_signal = ("SELL-SIDE SWEPT — CHECK RECLAIM" if downside else
+                   "SELL-SIDE BREAKDOWN — ACCEPTED" if close_now < sell_liq else
+                   "SELL-SIDE LIQUIDITY NEAR" if 0 <= sell_dist <= 0.25 else "WAIT — BELOW PRICE")
     if upside and downside:
         detail = "BOTH-SIDE SWEEP — WAIT FOR NEXT CANDLE"
     elif upside:
@@ -1241,6 +1258,9 @@ def _liquidity_levels_and_sweeps(df, lookback=30, timeframe_minutes=15):
     return {
         "Buy-side Liquidity": round(buy_liq, 2), "Sell-side Liquidity": round(sell_liq, 2),
         "Buy-side Liquidity Time (IST)": buy_time, "Sell-side Liquidity Time (IST)": sell_time,
+        "Buy-side Liquidity Signal": buy_signal, "Sell-side Liquidity Signal": sell_signal,
+        "Buy-side Liquidity Distance %": round(buy_dist, 3), "Sell-side Liquidity Distance %": round(sell_dist, 3),
+        "Buy-side Liquidity Status": buy_status, "Sell-side Liquidity Status": sell_status,
         "Equal High Liquidity": "YES" if equal_high else "NO",
         "Equal Low Liquidity": "YES" if equal_low else "NO",
         "Upside Sweep": "YES" if upside else "NO", "Downside Sweep": "YES" if downside else "NO",
@@ -2683,6 +2703,10 @@ def _make_result_row(symbol, yahoo_symbol, payload):
     row.update(_extra_formulas(frame_5m, row))
     # V19 is an independent additive engine. Legacy 17-agent fields remain unchanged.
     row.update(_v19_live_fields(frame_5m, row, frame_15m))
+    if V20_ENABLED:
+        row.update(_v20_live_fields(frame_5m, row))
+    else:
+        row.update(dict(_V20_DEFAULTS, **{"V20 Gate": "DISABLED", "V20 Reason": "V20_ENABLED=False"}))
     row.update(_v19_bigmove_fields(frame_5m, row))
     row.update(_breakout_breakdown_signal(frame_15m))
     row.update(_multi_tf_breakout(frames))
@@ -3794,8 +3818,9 @@ def _build_excel(result, stamp):
             )
             top_cols = [c for c in [
                 "Symbol", "Action Signal", "Final Signal", "Best Stock Score",
-                "Confirmation Strength %", "Last Price", "Buy-side Liquidity", "Buy-side Liquidity Time (IST)",
-                "Sell-side Liquidity", "Sell-side Liquidity Time (IST)", "Upside Sweep", "Upside Sweep Time (IST)",
+                "Confirmation Strength %", "Last Price", "V20 Gate", "V20 Quality",
+                "Buy-side Liquidity", "Buy-side Liquidity Time (IST)", "Buy-side Liquidity Signal", "Buy-side Liquidity Status",
+                "Sell-side Liquidity", "Sell-side Liquidity Time (IST)", "Sell-side Liquidity Signal", "Sell-side Liquidity Status", "Upside Sweep", "Upside Sweep Time (IST)",
                 "Downside Sweep", "Downside Sweep Time (IST)", "Breakout Signal",
                 "Multi-TF Breakout", "Breakout Retest", "AI Direction",
                 "AI Up Model Estimate %", "AI Down Model Estimate %", "AI Brain Signal",
@@ -4869,13 +4894,19 @@ def _v19_live_fields(frame_5m, row=None, frame_15m=None):
 # ---------------------------------------------------------------------
 # BACKTEST: next-bar-open entry, ATR stop, 1:1.5 target, costs included
 # ---------------------------------------------------------------------
-def _v19_backtest_frame(df, symbol, frame_15m=None):
+def _v19_backtest_frame(df, symbol, frame_15m=None, use_v20=False):
     f = _v19_feature_frame(df)
+    if use_v20 and not f.empty:
+        f = _v20_add_features(f)
     if f.empty:
         return []
     o, h, l, c = (f[k].to_numpy(float) for k in ("Open", "High", "Low", "Close"))
     atr, days = f["atr"].to_numpy(float), f["day"].to_numpy()
     longs, shorts = f["long"].to_numpy(bool), f["short"].to_numpy(bool)
+    if use_v20:
+        # Same causal ER/Choppiness/VWAP/delta/CPR directional core as live V20.
+        longs = longs & f["v20_long"].to_numpy(bool)
+        shorts = shorts & f["v20_short"].to_numpy(bool)
     lscore, sscore = f["long_score"].to_numpy(float), f["short_score"].to_numpy(float)
     # Keep timezone-aware Timestamp objects; numpy conversion strips the zone and
     # would silently disable the historical 15M as-of veto.
@@ -4951,7 +4982,7 @@ def _v19_summarise(t):
             "Break-even Win Rate %": round(100 / (1 + V19_RR), 1)}
 
 
-def _v19_run_backtest(max_symbols=80):
+def _v19_run_backtest(max_symbols=80, use_v20=False):
     with _memory_connect() as conn:
         syms = [r[0] for r in conn.execute(
             """SELECT symbol FROM candles WHERE timeframe='5M'
@@ -4960,7 +4991,7 @@ def _v19_run_backtest(max_symbols=80):
     for s in syms:
         frame_5m = _load_candle_memory(s, "5M")
         frame_15m = _load_candle_memory(s, "15M")
-        trades.extend(_v19_backtest_frame(frame_5m, s, frame_15m))
+        trades.extend(_v19_backtest_frame(frame_5m, s, frame_15m, use_v20=use_v20))
     if not trades:
         return pd.DataFrame(), len(syms)
     return pd.DataFrame(trades).sort_values("Time").reset_index(drop=True), len(syms)
@@ -5276,11 +5307,265 @@ def _render_v19_live_panel():
     st.dataframe(live, hide_index=True, **_stretch())
 
 
+# =====================================================================
+# V20 ACCURACY LAYER — paste ABOVE `def show_ai_multi_agent_scanner(...)`
+# (after the V19 block). Additive: 17 agents / V18 / V19 logic unchanged.
+#
+# New formulas (all causal, no look-ahead):
+#   1. Kaufman Efficiency Ratio (10)   -> trend quality vs noise
+#   2. Choppiness Index (14)           -> blocks range-bound chop
+#   3. Session VWAP +/- sigma z-score  -> blocks chasing over-extended moves
+#   4. Estimated delta-volume ratio    -> buying/selling pressure inside candles
+#   5. CPR (previous-day central pivot range) + width -> trend-day context
+#   6. Session Volume Profile POC / VAH / VAL -> blocks entries into value-area edge
+# The same gate is used by LIVE scanning and BACKTEST, so measured win rate
+# is the win rate of the live rule.
+# =====================================================================
+
+V20_ENABLED = True
+V20_MIN_ER = 0.30            # efficiency ratio: >=0.30 = directional, <0.30 = noisy
+V20_MAX_CHOP = 61.8          # choppiness index above this = ranging market
+V20_MAX_VWAP_Z = 2.0         # do not chase beyond 2 sigma from session VWAP
+V20_MIN_DELTA = 0.05         # min |delta-volume ratio| in trade direction
+V20_NARROW_CPR_PCT = 0.25    # narrow CPR (% of pivot) = higher chance of trend day
+V20_PROFILE_BINS = 24
+V20_EDGE_PCT = 0.15          # veto if entry is within 0.15% of VAH (long) / VAL (short)
+
+_V20_DEFAULTS = {
+    "V20 Gate": "N/A", "V20 Quality": 0, "V20 Efficiency Ratio": None,
+    "V20 Choppiness": None, "V20 VWAP Z": None, "V20 Delta Ratio": None,
+    "V20 CPR Width %": None, "V20 CPR State": "NO DATA", "V20 POC": None,
+    "V20 VAH": None, "V20 VAL": None, "V20 Reason": "Need V19 TAKE signal",
+}
+
+
+def _v20_add_features(f):
+    """Add V20 columns to a V19 feature frame (needs Time/OHLCV/day columns)."""
+    if f is None or not isinstance(f, pd.DataFrame) or f.empty:
+        return f
+    d = f.copy()
+    o, h, l, c, v = (d[k].astype(float) for k in ("Open", "High", "Low", "Close", "Volume"))
+    typ = (h + l + c) / 3
+    day = d["day"]
+    cv = v.groupby(day).cumsum().replace(0, np.nan)
+    vw = (typ * v).groupby(day).cumsum() / cv
+    var = ((typ ** 2 * v).groupby(day).cumsum() / cv - vw ** 2).clip(lower=0)
+    sd = np.sqrt(var)
+    bars = d.groupby("day").cumcount()
+    d["v20_vwap_z"] = ((c - vw) / sd.replace(0, np.nan)).where(bars >= 6)
+
+    net = (c - c.shift(10)).abs()
+    path = c.diff().abs().rolling(10).sum()
+    d["v20_er"] = net / path.replace(0, np.nan)
+
+    pc = c.shift(1)
+    tr = pd.concat([(h - l), (h - pc).abs(), (l - pc).abs()], axis=1).max(axis=1)
+    rng14 = (h.rolling(14).max() - l.rolling(14).min()).replace(0, np.nan)
+    d["v20_chop"] = 100 * np.log10(tr.rolling(14).sum() / rng14) / np.log10(14)
+
+    clv = ((c - l) - (h - c)) / (h - l).replace(0, np.nan)
+    delta = (clv * v).fillna(0.0)
+    d["v20_delta"] = delta.rolling(6).sum() / v.rolling(6).sum().replace(0, np.nan)
+
+    daily = d.groupby("day").agg(H=("High", "max"), L=("Low", "min"), C=("Close", "last")).shift(1)
+    piv = (daily["H"] + daily["L"] + daily["C"]) / 3
+    bc = (daily["H"] + daily["L"]) / 2
+    tc = 2 * piv - bc
+    top, bot = np.maximum(tc, bc), np.minimum(tc, bc)
+    d["v20_cpr_top"] = d["day"].map(top)
+    d["v20_cpr_bot"] = d["day"].map(bot)
+    d["v20_cpr_w"] = d["day"].map((top - bot) / piv * 100)
+
+    z, er, ch, dr = d["v20_vwap_z"], d["v20_er"], d["v20_chop"], d["v20_delta"]
+    trend_ok = (er >= V20_MIN_ER) & (ch <= V20_MAX_CHOP)
+    long_g = (trend_ok & (z.isna() | (z <= V20_MAX_VWAP_Z)) & (dr >= V20_MIN_DELTA)
+              & (d["v20_cpr_bot"].isna() | (c >= d["v20_cpr_bot"])))
+    short_g = (trend_ok & (z.isna() | (z >= -V20_MAX_VWAP_Z)) & (dr <= -V20_MIN_DELTA)
+               & (d["v20_cpr_top"].isna() | (c <= d["v20_cpr_top"])))
+    d["v20_long"], d["v20_short"] = long_g.fillna(False), short_g.fillna(False)
+    q = (0.30 * (er / 0.6).clip(0, 1) + 0.20 * ((V20_MAX_CHOP - ch) / 20).clip(0, 1)
+         + 0.30 * (dr.abs() / 0.3).clip(0, 1)
+         + 0.20 * (d["v20_cpr_w"] <= V20_NARROW_CPR_PCT).astype(float))
+    d["v20_quality"] = (q.fillna(0) * 100).round(0)
+    return d
+
+
+def _v20_volume_profile(sess, bins=V20_PROFILE_BINS):
+    """Session volume profile -> (POC, VAH, VAL) or None."""
+    try:
+        if sess is None or len(sess) < 12:
+            return None
+        lo, hi = float(sess["Low"].min()), float(sess["High"].max())
+        if hi <= lo:
+            return None
+        edges = np.linspace(lo, hi, bins + 1)
+        typ = ((sess["High"] + sess["Low"] + sess["Close"]) / 3).to_numpy(float)
+        idx = np.clip(np.searchsorted(edges, typ, side="right") - 1, 0, bins - 1)
+        vol = np.zeros(bins)
+        np.add.at(vol, idx, sess["Volume"].to_numpy(float))
+        total = vol.sum()
+        if total <= 0:
+            return None
+        poc = int(vol.argmax())
+        lo_i = hi_i = poc
+        acc = vol[poc]
+        while acc < 0.70 * total and (lo_i > 0 or hi_i < bins - 1):
+            up = vol[hi_i + 1] if hi_i < bins - 1 else -1.0
+            dn = vol[lo_i - 1] if lo_i > 0 else -1.0
+            if up >= dn:
+                hi_i += 1
+                acc += vol[hi_i]
+            else:
+                lo_i -= 1
+                acc += vol[lo_i]
+        return float((edges[poc] + edges[poc + 1]) / 2), float(edges[hi_i + 1]), float(edges[lo_i])
+    except Exception:
+        return None
+
+
+def _v20_live_fields(frame_5m, row=None):
+    """Live V20 verdict. Gate is evaluated only when V19 says TAKE."""
+    out = dict(_V20_DEFAULTS)
+    row = row or {}
+    try:
+        f = _v19_feature_frame(frame_5m)
+        if f.empty:
+            out["V20 Reason"] = "Need 60 completed 5M candles"
+            return out
+        f = _v20_add_features(f)
+        x = f.iloc[-1]
+        n = lambda k, r=2: round(float(x[k]), r) if pd.notna(x[k]) else None
+        out.update({
+            "V20 Quality": int(x["v20_quality"]), "V20 Efficiency Ratio": n("v20_er"),
+            "V20 Choppiness": n("v20_chop", 1), "V20 VWAP Z": n("v20_vwap_z"),
+            "V20 Delta Ratio": n("v20_delta", 3), "V20 CPR Width %": n("v20_cpr_w", 3),
+        })
+        price = float(x["Close"])
+        if pd.notna(x["v20_cpr_top"]):
+            out["V20 CPR State"] = ("NARROW CPR — TREND DAY BIAS"
+                                    if x["v20_cpr_w"] <= V20_NARROW_CPR_PCT else "NORMAL CPR")
+            out["V20 CPR State"] += (" | ABOVE CPR" if price > x["v20_cpr_top"]
+                                     else " | BELOW CPR" if price < x["v20_cpr_bot"] else " | INSIDE CPR")
+        sess = f[f["day"] == x["day"]]
+        prof = _v20_volume_profile(sess)
+        if prof:
+            out["V20 POC"], out["V20 VAH"], out["V20 VAL"] = (round(p, 2) for p in prof)
+
+        side = str(row.get("V19 Side", "WAIT")).upper()
+        if str(row.get("V19 Verdict", "")).upper() != "TAKE" or side not in ("BUY", "SELL"):
+            return out
+        passed = bool(x["v20_long"] if side == "BUY" else x["v20_short"])
+        fails = []
+        if not passed:
+            if not (pd.notna(x["v20_er"]) and x["v20_er"] >= V20_MIN_ER):
+                fails.append(f"noisy trend (ER {x['v20_er']:.2f} < {V20_MIN_ER})" if pd.notna(x["v20_er"]) else "ER warm-up")
+            if not (pd.notna(x["v20_chop"]) and x["v20_chop"] <= V20_MAX_CHOP):
+                fails.append("choppy market")
+            zz = x["v20_vwap_z"]
+            if pd.notna(zz) and ((side == "BUY" and zz > V20_MAX_VWAP_Z) or (side == "SELL" and zz < -V20_MAX_VWAP_Z)):
+                fails.append(f"over-extended ({zz:.1f} sigma from VWAP)")
+            dd = x["v20_delta"]
+            if not (pd.notna(dd) and ((side == "BUY" and dd >= V20_MIN_DELTA) or (side == "SELL" and dd <= -V20_MIN_DELTA))):
+                fails.append("delta-volume does not support direction")
+            if pd.notna(x["v20_cpr_bot"]) and ((side == "BUY" and price < x["v20_cpr_bot"]) or (side == "SELL" and price > x["v20_cpr_top"])):
+                fails.append("price on wrong side of CPR")
+        if prof:
+            _, vah, val = prof
+            if side == "BUY" and 0 <= (vah - price) / price * 100 <= V20_EDGE_PCT:
+                fails.append("entry directly under value-area high (supply)")
+            if side == "SELL" and 0 <= (price - val) / price * 100 <= V20_EDGE_PCT:
+                fails.append("entry directly above value-area low (demand)")
+        out["V20 Gate"] = "PASS" if not fails and passed else "FAIL"
+        out["V20 Reason"] = ("All V20 filters aligned: trend quality, no chop, not extended, delta/CPR support."
+                             if out["V20 Gate"] == "PASS" else "Vetoed: " + "; ".join(fails or ["gate not met"]))
+        return out
+    except Exception as exc:
+        out["V20 Reason"] = "V20 error: " + str(exc)[:100]
+        return out
+
+
+# ---------------------------------------------------------------------
+# A/B BACKTEST: V19 alone vs V19 + V20 (replaces _v19_run_backtest)
+# ---------------------------------------------------------------------
+def _v19_run_backtest(max_symbols=80, use_v20=False):
+    with _memory_connect() as conn:
+        syms = [r[0] for r in conn.execute(
+            """SELECT symbol FROM candles WHERE timeframe='5M'
+               GROUP BY symbol ORDER BY COUNT(*) DESC LIMIT ?""", (int(max_symbols),)).fetchall()]
+    trades = []
+    for s in syms:
+        trades.extend(_v19_backtest_frame(_load_candle_memory(s, "5M"), s,
+                                          _load_candle_memory(s, "15M"), use_v20=use_v20))
+    if not trades:
+        return pd.DataFrame(), len(syms)
+    return pd.DataFrame(trades).sort_values("Time").reset_index(drop=True), len(syms)
+
+
+def _render_v20_ab_panel():
+    """Call right after _render_v19_backtest_panel()."""
+    st.subheader("⚖️ V20 A/B TEST — does the new filter really improve accuracy?")
+    n_sym = st.selectbox("Symbols", [20, 50, 80, 150], index=2, key="v20_ab_symbols")
+    if st.button("▶ RUN A/B (V19 vs V19+V20)", key="v20_ab_run"):
+        with st.spinner("Running both backtests..."):
+            a, _ = _v19_run_backtest(n_sym, use_v20=False)
+            b, _ = _v19_run_backtest(n_sym, use_v20=True)
+        st.session_state["v20_ab"] = (a, b)
+    saved = st.session_state.get("v20_ab")
+    if not saved:
+        return
+    a, b = saved
+    if a.empty or b.empty:
+        st.info("Not enough trades. Scan more days to build 5M history.")
+        return
+    rows = {}
+    for name, t in (("V19 only", a), ("V19 + V20", b)):
+        cut = int(len(t) * 0.70)
+        full, oos = _v19_summarise(t), _v19_summarise(t.iloc[cut:])
+        rows[name] = {"Trades": full.get("Trades"), "Win Rate %": full.get("Win Rate %"),
+                      "Avg R": full.get("Avg R (net of costs)"), "Profit Factor": full.get("Profit Factor"),
+                      "OOS Trades": oos.get("Trades"), "OOS Win Rate %": oos.get("Win Rate %"),
+                      "OOS Avg R": oos.get("Avg R (net of costs)")}
+    st.dataframe(pd.DataFrame(rows), **_stretch())
+    st.caption("Keep V20 ON only if the OOS (last 30%) Avg R is higher than V19 alone AND OOS trades >= ~30. "
+               "Fewer trades with higher Avg R is the expected, healthy result. Past results do not guarantee future results.")
+
+
+
+def _render_v20_signal_overlay(result):
+    """Show all V18 BUY/SELL/PRE-BIG candidates; V20 is a separate PASS/FAIL column."""
+    if not isinstance(result, pd.DataFrame) or result.empty:
+        return
+    st.subheader("🧭 V18 SIGNALS + V20 ACCURACY CHECK — ALL CANDIDATES")
+    st.caption("V18 signals are preserved. V20 PASS/FAIL is an additional filter; PRE-BIG and V18 BUY/SELL are never hidden by V20.")
+    sig = result.copy()
+    final = sig.get("Final Signal", pd.Series("", index=sig.index)).astype(str).str.upper()
+    action = sig.get("Action Signal", pd.Series("", index=sig.index)).astype(str).str.upper()
+    bm = sig.get("Advanced Big Move", pd.Series("", index=sig.index)).astype(str).str.upper()
+    mask = final.isin(["BUY", "SELL", "PRE-BIG BUY", "PRE-BIG SELL"]) | action.isin(["BUY", "SELL"]) | bm.str.contains("PRE-BIG", na=False)
+    view = sig.loc[mask].copy()
+    cols = ["Symbol", "Last Price", "Final Signal", "Action Signal", "Advanced Big Move", "Big Move Direction",
+            "V19 Verdict", "V19 Side", "V19 Score", "V20 Gate", "V20 Quality", "V20 Efficiency Ratio",
+            "V20 Choppiness", "V20 VWAP Z", "V20 Delta Ratio", "V20 CPR State", "V20 Reason",
+            "Buy-side Liquidity Signal", "Buy-side Liquidity Status", "Buy-side Liquidity Distance %",
+            "Sell-side Liquidity Signal", "Sell-side Liquidity Status", "Sell-side Liquidity Distance %",
+            "Buy-side Liquidity", "Sell-side Liquidity", "Upside Sweep", "Downside Sweep"]
+    cols = [c for c in cols if c in view.columns]
+    if view.empty:
+        st.info("ప్రస్తుతం V18 BUY/SELL/PRE-BIG candidate లేదు. Existing scanner signals అలాగే ఉంటాయి.")
+    else:
+        sort_cols = [c for c in ("Best Stock Score", "Confirmation Strength %") if c in view.columns]
+        if sort_cols:
+            view = view.sort_values(sort_cols, ascending=False)
+        st.dataframe(view[cols].head(300), hide_index=True, height=420, **_stretch())
+    st.caption("V20 Gate = N/A means there was no V19 TAKE signal to evaluate; it does NOT mean PASS. Delta is candle-derived estimate, not exchange order-flow delta.")
+
+
 def show_ai_multi_agent_scanner(client=None):
     """Streamlit page. client is retained for app.py compatibility."""
     st.title("🚀 NSE AI PRO V18 — LIVE MARKET DASHBOARD + SCANNER")
     st.caption("Live Dashboard first • 17 OHLCV agents × 5M / 15M / 1H + supervised ML AI Brain + optional 1M / News")
     _render_live_dashboard()
+    _render_live_liquidity_sweep_panel()
     st.info("scanner.py supplies NSE/F&O symbols only (unchanged). Yahoo Finance supplies candles. FYERS is used only for 5-level Market Depth on the technical shortlist.")
     st.caption("Smart Memory: SQLite candles are loaded first; after the initial warm-up, the scanner refreshes a short 2-day overlap and merges it with saved candles. For speed, the extra 1M/20M scan is optional.")
     st.warning(
@@ -5679,6 +5964,8 @@ def show_ai_multi_agent_scanner(client=None):
     _render_v19_live_panel()
     _render_v19_bigmove_panel(result)
     _render_v19_backtest_panel()
+    _render_v20_ab_panel()
+    _render_v20_signal_overlay(result)
 
     # Re-apply the hard quality gate to restored/session-cached rows as well.
     if "Data Quality" in result.columns:
@@ -5982,7 +6269,9 @@ def show_ai_multi_agent_scanner(client=None):
         st.subheader("💧 BUY / SELL LIQUIDITY + SWEEP SIGNAL TIME (IST)")
         liquidity_time_cols = [
             "Symbol", "Last Price", "Buy-side Liquidity", "Buy-side Liquidity Time (IST)",
+            "Buy-side Liquidity Signal", "Buy-side Liquidity Status", "Buy-side Liquidity Distance %",
             "Sell-side Liquidity", "Sell-side Liquidity Time (IST)",
+            "Sell-side Liquidity Signal", "Sell-side Liquidity Status", "Sell-side Liquidity Distance %",
             "Upside Sweep", "Upside Sweep Time (IST)",
             "Downside Sweep", "Downside Sweep Time (IST)", "Liquidity Sweep Detail",
             "15M Buy-side Liquidity", "15M Buy-side Liquidity Time (IST)",
@@ -6105,10 +6394,14 @@ def show_ai_multi_agent_scanner(client=None):
             "Entry Price", "Stop Loss", "15M ATR",
             "V19 Verdict", "V19 Side", "V19 Score", "V19 Entry", "V19 Stop", "V19 Target",
             "V19 RVOL (TOD)", "V19 Cum RVOL (TOD)", "V19 RVOL Method", "V19 Reason",
+            "V20 Gate", "V20 Quality", "V20 Efficiency Ratio", "V20 Choppiness", "V20 VWAP Z",
+            "V20 Delta Ratio", "V20 CPR Width %", "V20 CPR State", "V20 POC", "V20 VAH", "V20 VAL", "V20 Reason",
             "BM Stage", "BM Direction", "BM Score", "BM Cum RVOL", "BM Move %", "BM Range/ATR",
             "BM Compression", "BM Trigger", "BM Invalidation", "BM Reason",
             "Confirmation Strength %", "Consensus Score",
-            "Buy-side Liquidity", "Buy-side Liquidity Time (IST)", "Sell-side Liquidity", "Sell-side Liquidity Time (IST)", "Upside Sweep", "Upside Sweep Time (IST)", "Downside Sweep", "Downside Sweep Time (IST)", "Liquidity Sweep Detail",
+            "Buy-side Liquidity", "Buy-side Liquidity Time (IST)", "Sell-side Liquidity", "Sell-side Liquidity Time (IST)",
+            "Buy-side Liquidity Signal", "Buy-side Liquidity Status", "Buy-side Liquidity Distance %",
+            "Sell-side Liquidity Signal", "Sell-side Liquidity Status", "Sell-side Liquidity Distance %", "Upside Sweep", "Upside Sweep Time (IST)", "Downside Sweep", "Downside Sweep Time (IST)", "Liquidity Sweep Detail",
             "5M Buy-side Liquidity", "5M Buy-side Liquidity Time (IST)", "5M Sell-side Liquidity", "5M Sell-side Liquidity Time (IST)", "5M Upside Sweep", "5M Upside Sweep Time (IST)", "5M Downside Sweep", "5M Downside Sweep Time (IST)",
             "15M Buy-side Liquidity", "15M Buy-side Liquidity Time (IST)", "15M Sell-side Liquidity", "15M Sell-side Liquidity Time (IST)", "15M Upside Sweep", "15M Upside Sweep Time (IST)", "15M Downside Sweep", "15M Downside Sweep Time (IST)",
             "1H Buy-side Liquidity", "1H Buy-side Liquidity Time (IST)", "1H Sell-side Liquidity", "1H Sell-side Liquidity Time (IST)", "1H Upside Sweep", "1H Upside Sweep Time (IST)", "1H Downside Sweep", "1H Downside Sweep Time (IST)",
