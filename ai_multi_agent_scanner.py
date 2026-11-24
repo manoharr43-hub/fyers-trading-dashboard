@@ -23,7 +23,6 @@ requirements.txt:
 """
 
 import io
-import hashlib
 import json
 import copy
 import math
@@ -2684,7 +2683,8 @@ def _make_result_row(symbol, yahoo_symbol, payload):
     row.update(_extra_formulas(frame_5m, row))
     # V19 is an independent additive engine. Legacy 17-agent fields remain unchanged.
     row.update(_v19_live_fields(frame_5m, row, frame_15m))
-    row.update(_v20_live_fields(frame_5m, row))
+    # V20 is additive and runs only for V19 TAKE rows; it never alters legacy signals.
+    row.update(_v20_live_fields(frame_5m, row) if V20_ENABLED else dict(_V20_DEFAULTS))
     row.update(_v19_bigmove_fields(frame_5m, row))
     row.update(_breakout_breakdown_signal(frame_15m))
     row.update(_multi_tf_breakout(frames))
@@ -4770,42 +4770,6 @@ def _v19_feature_frame(df):
     return d
 
 
-_V19_FRAME_CACHE = OrderedDict()
-_V19_FRAME_CACHE_LOCK = threading.Lock()
-_V19_FRAME_CACHE_MAX = 128
-
-
-def _v19_feature_frame_cached(df):
-    """Bounded cache for repeated live V19/V20 calculations on identical OHLCV."""
-    req = ["Time", "Open", "High", "Low", "Close", "Volume"]
-    try:
-        if not isinstance(df, pd.DataFrame) or not set(req).issubset(df.columns):
-            return _v19_feature_frame(df)
-        base = df[req]
-        digest = hashlib.blake2b(
-            pd.util.hash_pandas_object(base, index=True).to_numpy().tobytes(),
-            digest_size=16,
-        ).digest()
-        key = (len(base), digest)
-    except Exception:
-        return _v19_feature_frame(df)
-
-    with _V19_FRAME_CACHE_LOCK:
-        hit = _V19_FRAME_CACHE.get(key)
-        if hit is not None:
-            _V19_FRAME_CACHE.move_to_end(key)
-            return hit.copy(deep=False)
-
-    # Do expensive work outside the lock; duplicate concurrent misses are harmless.
-    calculated = _v19_feature_frame(df)
-    with _V19_FRAME_CACHE_LOCK:
-        _V19_FRAME_CACHE[key] = calculated
-        _V19_FRAME_CACHE.move_to_end(key)
-        while len(_V19_FRAME_CACHE) > _V19_FRAME_CACHE_MAX:
-            _V19_FRAME_CACHE.popitem(last=False)
-    return calculated.copy(deep=False)
-
-
 def _v19_context_at(frame_15m, signal_close_time):
     """15M EMA/ADX/liquidity context available at a 5M signal close (no look-ahead)."""
     empty = {"trend": "UNKNOWN", "adx": np.nan, "resistance": np.nan, "support": np.nan}
@@ -4851,7 +4815,7 @@ def _v19_live_fields(frame_5m, row=None, frame_15m=None):
            "V19 Cum RVOL (TOD)": None, "V19 RVOL Method": "NO DATA",
            "V19 Reason": "Need 60 completed 5M candles"}
     try:
-        f = _v19_feature_frame_cached(frame_5m)
+        f = _v19_feature_frame(frame_5m)
         if f.empty:
             return out
         x = f.iloc[-1]
@@ -4907,10 +4871,8 @@ def _v19_live_fields(frame_5m, row=None, frame_15m=None):
 # ---------------------------------------------------------------------
 # BACKTEST: next-bar-open entry, ATR stop, 1:1.5 target, costs included
 # ---------------------------------------------------------------------
-def _v19_backtest_frame(df, symbol, frame_15m=None, use_v20=False):
-    f = _v19_feature_frame_cached(df)
-    if use_v20 and not f.empty:
-        f = _v20_add_features(f)
+def _v19_backtest_frame(df, symbol, frame_15m=None):
+    f = _v19_feature_frame(df)
     if f.empty:
         return []
     o, h, l, c = (f[k].to_numpy(float) for k in ("Open", "High", "Low", "Close"))
@@ -4926,24 +4888,6 @@ def _v19_backtest_frame(df, symbol, frame_15m=None, use_v20=False):
         if side == 0:
             i += 1
             continue
-        if use_v20:
-            # Apply V20 indicators at the signal bar; profile uses only bars up to i.
-            gate_col = "v20_long" if side == 1 else "v20_short"
-            if not bool(f[gate_col].iloc[i]):
-                i += 1
-                continue
-            sess_to_signal = f.iloc[:i + 1]
-            sess_to_signal = sess_to_signal[sess_to_signal["day"] == days[i]]
-            prof = _v20_volume_profile(sess_to_signal)
-            if prof:
-                _, vah, val = prof
-                signal_price = float(c[i])
-                if side == 1 and 0 <= (vah - signal_price) / signal_price * 100 <= V20_EDGE_PCT:
-                    i += 1
-                    continue
-                if side == -1 and 0 <= (signal_price - val) / signal_price * 100 <= V20_EDGE_PCT:
-                    i += 1
-                    continue
         signal_close = pd.Timestamp(times[i]) + pd.Timedelta(minutes=5)
         ctx = _v19_context_at(frame_15m, signal_close)
         if ctx["trend"] not in ("UNKNOWN", "MIXED") and ((side == 1 and ctx["trend"] == "DOWN") or (side == -1 and ctx["trend"] == "UP")):
@@ -5083,7 +5027,7 @@ def _v19_bigmove_fields(frame_5m, row=None):
     out = dict(_BM_DEFAULTS)
     row = row or {}
     try:
-        f = _v19_feature_frame_cached(frame_5m)
+        f = _v19_feature_frame(frame_5m)
         if f.empty:
             return out
         day = f["day"]
@@ -5280,8 +5224,6 @@ def _v19_capture_live_signals(result, reference_time=None):
         verdict = str(r.get("V19 Verdict", "")).upper()
         if V19_STRICT_GATE and verdict != "TAKE":
             continue
-        if V20_ENABLED and V20_LIVE_LEDGER_GATE and str(r.get("V20 Gate", "N/A")).strip().upper() != "PASS":
-            continue
         if not V19_STRICT_GATE and verdict not in ("TAKE", "SKIP"):
             continue
         symbol = str(r.get("Symbol", "")).strip()
@@ -5335,6 +5277,21 @@ def _render_v19_live_panel():
     })
     st.dataframe(live, hide_index=True, **_stretch())
 
+
+# =====================================================================
+# V20 ACCURACY LAYER — paste ABOVE `def show_ai_multi_agent_scanner(...)`
+# (after the V19 block). Additive: 17 agents / V18 / V19 logic unchanged.
+#
+# New formulas (all causal, no look-ahead):
+#   1. Kaufman Efficiency Ratio (10)   -> trend quality vs noise
+#   2. Choppiness Index (14)           -> blocks range-bound chop
+#   3. Session VWAP +/- sigma z-score  -> blocks chasing over-extended moves
+#   4. Estimated delta-volume ratio    -> buying/selling pressure inside candles
+#   5. CPR (previous-day central pivot range) + width -> trend-day context
+#   6. Session Volume Profile POC / VAH / VAL -> blocks entries into value-area edge
+# The same gate is used by LIVE scanning and BACKTEST, so measured win rate
+# is the win rate of the live rule.
+# =====================================================================
 
 V20_ENABLED = True
 V20_MIN_ER = 0.30            # efficiency ratio: >=0.30 = directional, <0.30 = noisy
@@ -5441,8 +5398,11 @@ def _v20_live_fields(frame_5m, row=None):
     """Live V20 verdict. Gate is evaluated only when V19 says TAKE."""
     out = dict(_V20_DEFAULTS)
     row = row or {}
+    side = str(row.get("V19 Side", "WAIT")).upper()
+    if str(row.get("V19 Verdict", "")).upper() != "TAKE" or side not in ("BUY", "SELL"):
+        return out
     try:
-        f = _v19_feature_frame_cached(frame_5m)
+        f = _v19_feature_frame(frame_5m)
         if f.empty:
             out["V20 Reason"] = "Need 60 completed 5M candles"
             return out
@@ -5465,9 +5425,6 @@ def _v20_live_fields(frame_5m, row=None):
         if prof:
             out["V20 POC"], out["V20 VAH"], out["V20 VAL"] = (round(p, 2) for p in prof)
 
-        side = str(row.get("V19 Side", "WAIT")).upper()
-        if str(row.get("V19 Verdict", "")).upper() != "TAKE" or side not in ("BUY", "SELL"):
-            return out
         passed = bool(x["v20_long"] if side == "BUY" else x["v20_short"])
         fails = []
         if not passed:
@@ -5499,8 +5456,93 @@ def _v20_live_fields(frame_5m, row=None):
 
 
 
-# V20 is advisory by default. Enable only after the OOS A/B test supports it.
-V20_LIVE_LEDGER_GATE = False
+
+# ---------------------------------------------------------------------
+# V20 A/B BACKTEST — compatible with this V18/V19 implementation.
+# V20 features and volume profile are evaluated as-of each signal candle.
+# ---------------------------------------------------------------------
+def _v19_backtest_frame(df, symbol, frame_15m=None, use_v20=False):
+    f = _v19_feature_frame(df)
+    if f.empty:
+        return []
+    if use_v20:
+        f = _v20_add_features(f)
+    o, h, l, c = (f[k].to_numpy(float) for k in ("Open", "High", "Low", "Close"))
+    atr, days = f["atr"].to_numpy(float), f["day"].to_numpy()
+    longs, shorts = f["long"].to_numpy(bool), f["short"].to_numpy(bool)
+    lscore, sscore = f["long_score"].to_numpy(float), f["short_score"].to_numpy(float)
+    v20_l = f["v20_long"].to_numpy(bool) if use_v20 else None
+    v20_s = f["v20_short"].to_numpy(bool) if use_v20 else None
+    times = f["Time"].tolist()
+    n, trades, i = len(f), [], 60
+    while i < n - 2:
+        side = 1 if (longs[i] and not shorts[i]) else -1 if (shorts[i] and not longs[i]) else 0
+        if side == 0:
+            i += 1
+            continue
+        if use_v20:
+            if not (v20_l[i] if side == 1 else v20_s[i]):
+                i += 1
+                continue
+            # Use only bars available at signal time; never use the future session profile.
+            sess = f.iloc[:i + 1]
+            sess = sess[sess["day"] == days[i]]
+            prof = _v20_volume_profile(sess)
+            if prof:
+                _, vah, val = prof
+                px = c[i]
+                if side == 1 and 0 <= (vah - px) / px * 100 <= V20_EDGE_PCT:
+                    i += 1
+                    continue
+                if side == -1 and 0 <= (px - val) / px * 100 <= V20_EDGE_PCT:
+                    i += 1
+                    continue
+        signal_close = pd.Timestamp(times[i]) + pd.Timedelta(minutes=5)
+        ctx = _v19_context_at(frame_15m, signal_close)
+        if ctx["trend"] not in ("UNKNOWN", "MIXED") and ((side == 1 and ctx["trend"] == "DOWN") or (side == -1 and ctx["trend"] == "UP")):
+            i += 1
+            continue
+        if np.isfinite(ctx["adx"]) and ctx["adx"] < 18:
+            i += 1
+            continue
+        e = i + 1
+        if days[e] != days[i] or not np.isfinite(atr[i]) or atr[i] <= 0:
+            i += 1
+            continue
+        entry, risk = o[e], V19_ATR_STOP * atr[i]
+        if not np.isfinite(entry) or entry <= 0 or not np.isfinite(risk) or risk <= 0:
+            i += 1
+            continue
+        opposing_liq = ctx["resistance"] if side == 1 else ctx["support"]
+        if np.isfinite(opposing_liq) and (opposing_liq - entry) * side > 0 and (opposing_liq - entry) * side < risk:
+            i += 1
+            continue
+        stop, target = entry - side * risk, entry + side * risk * V19_RR
+        outcome, exit_j = "TIMEOUT", e
+        for j in range(e, min(n, e + V19_MAX_HOLD_BARS)):
+            if days[j] != days[i]:
+                break
+            hit_stop = (l[j] <= stop) if side == 1 else (h[j] >= stop)
+            hit_tgt = (h[j] >= target) if side == 1 else (l[j] <= target)
+            exit_j = j
+            if hit_stop:
+                outcome = "LOSS"
+                break
+            if hit_tgt:
+                outcome = "WIN"
+                break
+        if outcome == "WIN":
+            r = V19_RR
+        elif outcome == "LOSS":
+            r = -1.0
+        else:
+            r = side * (c[exit_j] - entry) / risk
+        r -= (entry * V19_COST_PCT) / risk
+        trades.append({"Symbol": symbol, "Time": pd.Timestamp(times[i]), "Side": "BUY" if side == 1 else "SELL",
+                       "Score": float(lscore[i] if side == 1 else sscore[i]),
+                       "Outcome": outcome, "R": round(float(r), 3)})
+        i = max(i + V19_COOLDOWN_BARS, exit_j + 1)
+    return trades
 
 
 def _v19_run_backtest(max_symbols=80, use_v20=False):
@@ -5512,7 +5554,7 @@ def _v19_run_backtest(max_symbols=80, use_v20=False):
     for symbol in syms:
         trades.extend(_v19_backtest_frame(
             _load_candle_memory(symbol, "5M"), symbol,
-            _load_candle_memory(symbol, "15M"), use_v20=use_v20,
+            _load_candle_memory(symbol, "15M"), use_v20=use_v20
         ))
     if not trades:
         return pd.DataFrame(), len(syms)
@@ -5520,11 +5562,10 @@ def _v19_run_backtest(max_symbols=80, use_v20=False):
 
 
 def _render_v20_ab_panel():
-    st.subheader("⚖️ V20 A/B TEST — V19 only vs V19 + V20")
-    st.caption("V20 stays advisory until the last 30% out-of-sample Avg R improves and has about 30+ trades.")
+    st.subheader("⚖️ V20 A/B TEST — V19 vs V19 + V20")
     n_sym = st.selectbox("V20 A/B symbols", [20, 50, 80, 150], index=2, key="v20_ab_symbols")
-    if st.button("▶ RUN V19 vs V19+V20 A/B", key="v20_ab_run"):
-        with st.spinner("Running both backtests on saved completed 5M candles..."):
+    if st.button("▶ RUN A/B (V19 vs V19+V20)", key="v20_ab_run"):
+        with st.spinner("Running V19 and V20 backtests from saved SQLite candles..."):
             a, _ = _v19_run_backtest(n_sym, use_v20=False)
             b, _ = _v19_run_backtest(n_sym, use_v20=True)
         st.session_state["v20_ab"] = (a, b)
@@ -5533,36 +5574,36 @@ def _render_v20_ab_panel():
         return
     a, b = saved
     if a.empty or b.empty:
-        st.info("Not enough comparable trades. Scan more market sessions to build SQLite 5M history.")
+        st.info("Not enough trades. Scan more sessions to build 5M history.")
         return
-    rows = []
+    rows = {}
     for name, trades in (("V19 only", a), ("V19 + V20", b)):
         cut = int(len(trades) * 0.70)
-        full = _v19_summarise(trades)
-        oos = _v19_summarise(trades.iloc[cut:])
-        rows.append({
-            "Model": name, "Trades": full.get("Trades"),
-            "Win Rate %": full.get("Win Rate %"),
-            "Avg R": full.get("Avg R (net of costs)"),
-            "Profit Factor": full.get("Profit Factor"),
-            "OOS Trades": oos.get("Trades"),
-            "OOS Win Rate %": oos.get("Win Rate %"),
-            "OOS Avg R": oos.get("Avg R (net of costs)"),
-        })
-    comparison = pd.DataFrame(rows)
-    st.dataframe(comparison, hide_index=True, **_stretch())
-    try:
-        base = comparison.loc[comparison["Model"] == "V19 only"].iloc[0]
-        filtered = comparison.loc[comparison["Model"] == "V19 + V20"].iloc[0]
-        supported = (pd.notna(base["OOS Avg R"]) and pd.notna(filtered["OOS Avg R"])
-                     and filtered["OOS Avg R"] > base["OOS Avg R"]
-                     and int(filtered["OOS Trades"] or 0) >= 30)
-        if supported:
-            st.success("A/B evidence supports testing V20 as a live gate. Enable V20_LIVE_LEDGER_GATE manually only after review.")
-        else:
-            st.warning("Evidence is not sufficient to activate V20 as a live gate. Keep V20 advisory and collect more data / tune thresholds.")
-    except Exception:
-        st.info("Review OOS Avg R and OOS trade count before enabling the V20 live gate.")
+        full, oos = _v19_summarise(trades), _v19_summarise(trades.iloc[cut:])
+        rows[name] = {"Trades": full.get("Trades"), "Win Rate %": full.get("Win Rate %"),
+                      "Avg R": full.get("Avg R (net of costs)"), "Profit Factor": full.get("Profit Factor"),
+                      "OOS Trades": oos.get("Trades"), "OOS Win Rate %": oos.get("Win Rate %"),
+                      "OOS Avg R": oos.get("Avg R (net of costs)")}
+    st.dataframe(pd.DataFrame(rows), **_stretch())
+    st.caption("Keep V20 only if OOS Avg R improves and the OOS sample is meaningful (about 30+ trades). Past results do not guarantee future performance.")
+
+
+def _render_v20_live_panel(result):
+    st.subheader("🧪 V20 ACCURACY LAYER — V19 TAKE candidates only")
+    if result is None or result.empty or "V20 Gate" not in result.columns:
+        st.info("V20 fields are not available in this result set yet.")
+        return
+    cols = ["Symbol", "V19 Side", "V19 Score", "V20 Gate", "V20 Quality",
+            "V20 Efficiency Ratio", "V20 Choppiness", "V20 VWAP Z", "V20 Delta Ratio",
+            "V20 CPR State", "V20 POC", "V20 VAH", "V20 VAL", "V20 Reason"]
+    cols = [c for c in cols if c in result.columns]
+    candidates = result[result["V19 Verdict"].astype(str).str.upper().eq("TAKE")].copy()
+    if candidates.empty:
+        st.info("ఈ scanలో V19 TAKE candidate లేదు; అందువల్ల V20 gate evaluate చేయలేదు.")
+        return
+    st.dataframe(candidates[cols].sort_values(["V20 Gate", "V19 Score"], ascending=[True, False]),
+                 hide_index=True, **_stretch())
+    st.caption("V20 PASS/FAIL is an additional quality label. It does not hide or rewrite V18 BUY/SELL, PRE-BIG, liquidity or sweep events.")
 
 
 def show_ai_multi_agent_scanner(client=None):
@@ -5571,7 +5612,7 @@ def show_ai_multi_agent_scanner(client=None):
     st.caption("Live Dashboard first • 17 OHLCV agents × 5M / 15M / 1H + supervised ML AI Brain + optional 1M / News")
     _render_live_dashboard()
     st.info("scanner.py supplies NSE/F&O symbols only (unchanged). Yahoo Finance supplies candles. FYERS is used only for 5-level Market Depth on the technical shortlist.")
-    st.caption("Smart Memory: SQLite candles are loaded first; after the initial warm-up, the scanner refreshes a short 2-day overlap and merges it with saved candles. For speed, the extra 1M/20M scan is optional.")
+    st.caption("F&O SPEED PROFILE: 75-symbol Yahoo batches • 30d warm-up • SQLite incremental refresh • 1M/news optional OFF • FYERS depth limited to top 5. All F&O symbols still receive the complete 17-agent + V19 analysis; V20 runs only on V19 TAKE candidates.")
     st.warning(
         "Yahoo intraday data may be delayed, missing or rate-limited. "
         "17-Agent Confirmation Strength is a heuristic score, not a probability. ML vote fractions are uncalibrated model estimates, not true probabilities or guaranteed win rates."
@@ -5588,11 +5629,11 @@ def show_ai_multi_agent_scanner(client=None):
 
     c1, c2, c3 = st.columns(3)
     with c1:
-        universe = st.selectbox("Universe", ["Both (NSE + F&O)", "F&O Stocks", "NSE Equity"], key="ma_universe")
+        universe = st.selectbox("Universe", ["Both (NSE + F&O)", "F&O Stocks", "NSE Equity"], index=1, key="ma_universe")
     with c2:
-        batch_size = st.selectbox("Batch size", [10, 25, 50, 75, 100], index=2, key="ma_batch_size_v18", help="50 is the balanced default for full NSE scans. Use 10/25 if Yahoo rate-limits; use 75/100 only if your connection and Yahoo responses remain stable. Completed batches are checkpointed and can resume.")
+        batch_size = st.selectbox("Batch size", [10, 25, 50, 75, 100], index=3, key="ma_batch_size_v18", help="75 is the F&O speed profile: fewer Yahoo batch requests while retaining checkpoint/retry safety. If Yahoo rate-limits, reduce to 50.")
     with c3:
-        st.metric("Analysis", "17 Agents + ML Brain")
+        st.metric("Analysis", "17 Agents + V19/V20 + ML")
 
     try:
         if universe == "Both (NSE + F&O)":
@@ -5628,7 +5669,7 @@ def show_ai_multi_agent_scanner(client=None):
 
     a, b, c = st.columns(3)
     with a:
-        period = st.selectbox("Yahoo history", ["59d", "30d"], index=0, key="ma_period_v18")
+        period = st.selectbox("Yahoo history", ["59d", "30d"], index=1, key="ma_period_v18", help="30d is sufficient for the live 5M/15M/1H engines and V20 warm-up; SQLite retains previously saved history for backtests.")
     with b:
         news_enabled = st.checkbox("News Intelligence (shortlist only — slower)", value=False, key="ma_news_enabled")
     with c:
@@ -5641,7 +5682,7 @@ def show_ai_multi_agent_scanner(client=None):
     )
 
     depth_limit = st.selectbox(
-        "FYERS Market Depth shortlist limit", [5, 10, 20, 30, 50], index=1,
+        "FYERS Market Depth shortlist limit", [5, 10, 20, 30, 50], index=0,
         help="FYERS Market Depth is requested only for the strongest BUY/SELL/PRE-BIG rows. Calls are paced and cached.",
         key="ma_depth_limit",
     )
@@ -5964,13 +6005,11 @@ def show_ai_multi_agent_scanner(client=None):
         st.info("No results yet. Press RUN FULL BATCH SCAN.")
         return
 
-    # V19/V20 are additive; V20 remains advisory until A/B evidence supports activation.
-    for _k, _v in _V20_DEFAULTS.items():
-        if _k not in result.columns:
-            result[_k] = _v
+    # V19 is additive: separate strict TAKE ledger, Big Move Catcher and opt-in backtest.
     _render_v19_live_panel()
     _render_v19_bigmove_panel(result)
     _render_v19_backtest_panel()
+    _render_v20_live_panel(result)
     _render_v20_ab_panel()
 
     # Re-apply the hard quality gate to restored/session-cached rows as well.
@@ -6398,7 +6437,8 @@ def show_ai_multi_agent_scanner(client=None):
             "Entry Price", "Stop Loss", "15M ATR",
             "V19 Verdict", "V19 Side", "V19 Score", "V19 Entry", "V19 Stop", "V19 Target",
             "V19 RVOL (TOD)", "V19 Cum RVOL (TOD)", "V19 RVOL Method", "V19 Reason",
-            "V20 Gate", "V20 Quality", "V20 Efficiency Ratio", "V20 Choppiness", "V20 VWAP Z", "V20 Delta Ratio", "V20 CPR Width %", "V20 CPR State", "V20 POC", "V20 VAH", "V20 VAL", "V20 Reason",
+            "V20 Gate", "V20 Quality", "V20 Efficiency Ratio", "V20 Choppiness", "V20 VWAP Z",
+            "V20 Delta Ratio", "V20 CPR Width %", "V20 CPR State", "V20 POC", "V20 VAH", "V20 VAL", "V20 Reason",
             "BM Stage", "BM Direction", "BM Score", "BM Cum RVOL", "BM Move %", "BM Range/ATR",
             "BM Compression", "BM Trigger", "BM Invalidation", "BM Reason",
             "Confirmation Strength %", "Consensus Score",
