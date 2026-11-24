@@ -434,6 +434,7 @@ def _risk_levels_for_event(row, direction, entry):
 
 def _prune_event_ledgers(signal_days=90, liquidity_days=14):
     """Bound local event-ledger growth while retaining recent accuracy history."""
+    _ensure_patch_tables()
     now = pd.Timestamp.now(tz=IST)
     sig_cut = (now - pd.Timedelta(days=signal_days)).isoformat(timespec="seconds")
     liq_cut = (now - pd.Timedelta(days=liquidity_days)).isoformat(timespec="seconds")
@@ -443,6 +444,7 @@ def _prune_event_ledgers(signal_days=90, liquidity_days=14):
         conn.execute("DELETE FROM signal_events WHERE created_at_ist<?", (sig_cut,))
         conn.execute("DELETE FROM liquidity_sweep_events WHERE captured_at_ist<?", (liq_cut,))
         conn.execute("DELETE FROM volume_expansion_events WHERE captured_at_ist<?", (liq_cut,))
+        conn.execute("DELETE FROM v19_signal_events WHERE last_seen_ist<?", (liq_cut,))
 
 
 def _drop_recent_duplicate_events(conn, rows, minutes=60):
@@ -3776,7 +3778,16 @@ def _build_excel(result, stamp):
         buffer = io.BytesIO()
         with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
             result.to_excel(writer, index=False, sheet_name="AI Scanner")
-            counts = result.get("Action Signal", pd.Series(dtype=str)).fillna("WAIT").value_counts()
+            action_series = (
+                result.get("Action Signal", pd.Series(index=result.index, dtype=str))
+                .fillna("WAIT")
+                .astype(str)
+                .str.strip()
+                .str.upper()
+            )
+            counts = action_series.value_counts()
+            n_break = int(action_series.str.startswith("BREAKOUT").sum())
+            n_down = int(action_series.str.startswith("BREAKDOWN").sum())
             dash_rows = [
                 ["NSE AI PRO V18 — ADVANCED BIG MOVEMENT DASHBOARD", ""],
                 ["Generated (IST)", stamp.strftime("%Y-%m-%d %H:%M:%S IST")],
@@ -3785,8 +3796,8 @@ def _build_excel(result, stamp):
                 ["SELL", int(counts.get("SELL", 0))],
                 ["SWEEP UP", int(counts.get("SWEEP UP", 0))],
                 ["SWEEP DOWN", int(counts.get("SWEEP DOWN", 0))],
-                ["BREAKOUT", int(counts.get("BREAKOUT", 0))],
-                ["BREAKDOWN", int(counts.get("BREAKDOWN", 0))],
+                ["BREAKOUT", n_break],
+                ["BREAKDOWN", n_down],
                 ["WAIT", int(counts.get("WAIT", 0))],
                 ["", ""],
                 ["TOP QUALIFIED STOCKS", ""],
@@ -4656,26 +4667,41 @@ def _v19_tod_volume_metrics(d):
     For each session/bar slot, the baseline uses only earlier sessions. Before
     five comparable sessions exist, per-bar RVOL falls back to prior-20 bars.
     """
-    vol = pd.to_numeric(d["Volume"], errors="coerce").fillna(0.0).clip(lower=0.0)
+    vol = (
+        pd.to_numeric(d["Volume"], errors="coerce")
+        .fillna(0.0)
+        .clip(lower=0.0)
+    )
     day = d["Time"].dt.date
     slot = d.groupby(day, sort=False).cumcount()
     cum = vol.groupby(day, sort=False).cumsum()
-    rvol_tod = pd.Series(np.nan, index=d.index, dtype=float)
-    cum_rvol_tod = pd.Series(np.nan, index=d.index, dtype=float)
-    history = {}
-    cum_history = {}
-    for idx in d.index:
-        key = int(slot.loc[idx])
-        prior = history.get(key, [])[-10:]
-        prior_cum = cum_history.get(key, [])[-10:]
-        if len(prior) >= 5 and np.mean(prior) > 0:
-            rvol_tod.loc[idx] = float(vol.loc[idx]) / float(np.mean(prior))
-        if len(prior_cum) >= 5 and np.mean(prior_cum) > 0:
-            cum_rvol_tod.loc[idx] = float(cum.loc[idx]) / float(np.mean(prior_cum))
-        # Add this bar only after calculating its own reference, preventing look-ahead.
-        history.setdefault(key, []).append(float(vol.loc[idx]))
-        cum_history.setdefault(key, []).append(float(cum.loc[idx]))
-    fallback = vol / vol.shift(1).rolling(20, min_periods=10).mean().replace(0, np.nan)
+
+    work = pd.DataFrame(
+        {
+            "_slot": slot.to_numpy(),
+            "_volume": vol.to_numpy(),
+            "_cum_volume": cum.to_numpy(),
+        },
+        index=d.index,
+    )
+    by_slot = work.groupby("_slot", sort=False)
+
+    # shift(1) excludes the current session, preventing look-ahead.
+    prior_volume_avg = by_slot["_volume"].transform(
+        lambda values: values.shift(1).rolling(10, min_periods=5).mean()
+    )
+    prior_cum_avg = by_slot["_cum_volume"].transform(
+        lambda values: values.shift(1).rolling(10, min_periods=5).mean()
+    )
+
+    rvol_tod = vol / prior_volume_avg.replace(0, np.nan)
+    cum_rvol_tod = cum / prior_cum_avg.replace(0, np.nan)
+
+    # Preserve the existing fallback when fewer than five prior sessions exist.
+    fallback = (
+        vol
+        / vol.shift(1).rolling(20, min_periods=10).mean().replace(0, np.nan)
+    )
     rvol_tod = rvol_tod.where(rvol_tod.notna(), fallback)
     return rvol_tod, cum_rvol_tod
 
@@ -4735,7 +4761,15 @@ def _v19_feature_frame(df):
     sd = c.rolling(20).std(ddof=0)
     kc_mid = ema21
     in_squeeze = ((mid + 2 * sd) < (kc_mid + 1.5 * atr)) & ((mid - 2 * sd) > (kc_mid - 1.5 * atr))
-    recent_squeeze = in_squeeze.shift(1).rolling(8, min_periods=1).max().fillna(0).astype(bool) & ~in_squeeze
+    recent_squeeze = (
+        in_squeeze.astype(float)
+        .shift(1)
+        .rolling(8, min_periods=1)
+        .max()
+        .fillna(0)
+        .astype(bool)
+        & ~in_squeeze.fillna(False)
+    )
 
     st_dir = _v19_supertrend(h, l, c, 10, 3.0)
     ext = (c - vwap) / atr.replace(0, np.nan)          # distance from VWAP in ATRs
@@ -6089,6 +6123,37 @@ def show_ai_multi_agent_scanner(client=None):
         result = pd.concat([result, analyst], axis=1)
     st.session_state["multi_agent_results"] = result
 
+    # Prepare AI predictions before rendering the Quick Report.
+    if not st.session_state.get("ma_real_ai_model"):
+        _persisted_ai_bundle = _load_persisted_ai_brain()
+        if _persisted_ai_bundle:
+            st.session_state["ma_real_ai_model"] = _persisted_ai_bundle
+
+    _quick_ai_bundle = st.session_state.get("ma_real_ai_model")
+    _quick_ai_trained_at = (
+        _quick_ai_bundle.get("metrics", {}).get("trained_at")
+        if isinstance(_quick_ai_bundle, dict)
+        else "none"
+    )
+    _quick_ai_apply_sig = (
+        st.session_state.get("ma_scan_job_id"),
+        _quick_ai_trained_at,
+        len(result),
+    )
+    if (
+        st.session_state.get("ma_ai_apply_sig") != _quick_ai_apply_sig
+        or "AI Brain Signal" not in result.columns
+        or "AI Direction" not in result.columns
+    ):
+        result = _apply_real_ai_brain(result)
+        st.session_state["multi_agent_results"] = result
+        st.session_state["multi_agent_csv"] = (
+            result.to_csv(index=False).encode("utf-8-sig")
+        )
+        st.session_state["ma_ai_apply_sig"] = _quick_ai_apply_sig
+    else:
+        result = st.session_state.get("multi_agent_results", result)
+
     info = st.session_state.get("multi_agent_scan_info", {})
 
     # SIMPLE MAIN REPORT: compact screen view; the full result DataFrame remains untouched.
@@ -6110,6 +6175,7 @@ def show_ai_multi_agent_scanner(client=None):
     quick_cols = [c for c in [
         "Symbol", "Final Signal", "Best Stock Score", "Last Price", "Entry Price",
         "Stop Loss", "5M", "15M", "1H", "Signal Time (IST)", "Best Stock Reason",
+        "AI Direction", "AI Brain Signal",
     ] if c in quick_view.columns]
     st.caption("BUY/SELL = confirmed technical signal • PRE-BIG = early watch, not confirmed • WAIT = no clear setup. Full analysis is below.")
     st.dataframe(quick_view[quick_cols].head(300), hide_index=True, **_stretch())
