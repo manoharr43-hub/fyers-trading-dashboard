@@ -6,7 +6,7 @@ Yahoo Finance batch edition — advanced movement + false-breakout audit + Live 
 - Yahoo Finance supplies all OHLCV candles and technical-analysis data.
 - FYERS is used ONLY for 5-level Market Depth on shortlisted BUY/SELL/PRE-BIG stocks.
 - Data Quality Gate + 15M Market Regime context before the 17-agent decision.
-- 17 OHLCV rule-based agents on completed 5M, 15M and 1H candles.
+- 17 OHLCV rule-based agents on completed 5M, 15M and 1H candles; live BUY/SELL requires 5M+15M agreement and no opposite 1H trend.
 - Directional UP/DOWN early pre-move watch using completed 5M candles + 15M alignment.
 - Separate 20-candle 1M compression / volume buildup / breakout detector.
 - Advanced Big Movement module: compression, directional pressure, breakout failure risk, retest and continuation context.
@@ -863,7 +863,7 @@ def _refresh_live_signal_prices():
 
 def _render_live_volume_expansion_panel():
     """Display completed 5M/15M/1H candles with volume >= 2x prior 20-bar average."""
-    st.markdown("#### 🔊 LIVE VOLUME INCREASE STOCKS — RVOL ≥ 2.0x")
+    st.markdown("#### 🔊 LIVE HIGH VOLUME STOCKS — RVOL ≥ 1.5x")
     vol = _load_volume_expansion_events()
     if vol.empty:
         st.info("2x లేదా అంతకంటే ఎక్కువ Relative Volume ఉన్న completed-candle signals ఇంకా save కాలేదు. Fresh scan run చేయండి.")
@@ -876,7 +876,7 @@ def _render_live_volume_expansion_panel():
     vol["Volume Signal"] = np.where(vol["Candle Direction"].eq("BUY"), "BUY VOLUME WATCH", "SELL VOLUME WATCH")
     cols = ["Stock", "Timeframe", "LTP", "Candle Direction", "Candle Volume", "Average Volume (20)", "RVOL", "Volume Signal", "Signal Time (IST)"]
     st.dataframe(vol[cols].head(150), hide_index=True, **_stretch())
-    st.caption("Threshold: current completed candle volume ≥ 2 × average volume of previous 20 completed candles. Direction is candle body only; it is a watch signal, not an automatic trade entry.")
+    st.caption("Threshold: completed candle volume ≥ 1.5 × average of the previous 20 completed candles. RVOL 1.5–1.99x = rising-volume watch; 2–2.99x = strong; ≥3x = extreme. Candle-body direction is a watch only, not proof of executed buying/selling.")
 
 
 def _render_live_dashboard_body():
@@ -884,7 +884,7 @@ def _render_live_dashboard_body():
     refresh_result = _refresh_live_signal_prices()
     events, snapshots = _load_live_signal_events()
     st.subheader("📡 LIVE MARKET DASHBOARD")
-    st.caption("Dashboard refresh: 60 seconds • BUY / SELL / SWEEP + Volume ≥2x • 1:1.5 target tracking • Prices: Yahoo Finance 1M feed")
+    st.caption("Dashboard refresh: 60 seconds • BUY / SELL / SWEEP + Volume ≥1.5x • 1:1.5 target tracking • Prices: Yahoo Finance 1M feed")
     if refresh_result.get("error"):
         st.warning(f"Yahoo price update issue: {refresh_result['error']}. Last saved prices are retained and labelled by age.")
 
@@ -1352,9 +1352,9 @@ def _liquidity_levels_and_sweeps(df, lookback=30, timeframe_minutes=15):
     candle_volume = _safe_num(last["Volume"], 0.0)
     candle_direction = "BUY" if close_now > opn else "SELL" if close_now < opn else "NEUTRAL"
     volume_signal = (
-        "HIGH VOLUME BUY" if rvol >= 2.0 and candle_direction == "BUY" else
-        "HIGH VOLUME SELL" if rvol >= 2.0 and candle_direction == "SELL" else
-        "BELOW 2X THRESHOLD"
+        "HIGH VOLUME BUY" if rvol >= BIG_VOL_RVOL_MIN and candle_direction == "BUY" else
+        "HIGH VOLUME SELL" if rvol >= BIG_VOL_RVOL_MIN and candle_direction == "SELL" else
+        f"BELOW {BIG_VOL_RVOL_MIN:.1f}X THRESHOLD"
     )
     upside = bool(high > buy_liq and close_now < buy_liq and upper_wick/span >= .30
                   and close_now < opn and rvol >= 1.05)
@@ -2693,11 +2693,15 @@ def _make_result_row(symbol, yahoo_symbol, payload):
         pre_buy = sum(analyses[tf]["agents"]["Pre-Big Movement"]["direction"] == "PRE-BIG BUY" for tf in weights)
         pre_sell = sum(analyses[tf]["agents"]["Pre-Big Movement"]["direction"] == "PRE-BIG SELL" for tf in weights)
 
-        if buy_tf >= 2 and sell_tf == 0 and weighted >= 5:
+        # High-selectivity live entry gate:
+        # 5M is the trigger, 15M must confirm, and 1H must not oppose.
+        # This intentionally produces fewer signals rather than forcing trades.
+        d5, d15, d1h = directions
+        if d5 == "BUY" and d15 == "BUY" and d1h != "SELL" and weighted >= 5:
             final_signal = "BUY"
-        elif sell_tf >= 2 and buy_tf == 0 and weighted <= -5:
+        elif d5 == "SELL" and d15 == "SELL" and d1h != "BUY" and weighted <= -5:
             final_signal = "SELL"
-        # PRE-BIG is also blocked by any opposite timeframe trend.
+        # PRE-BIG remains an early watch, never a confirmed entry.
         elif pre_buy >= 2 and sell_tf == 0 and weighted > 0:
             final_signal = "PRE-BIG BUY"
         elif pre_sell >= 2 and buy_tf == 0 and weighted < 0:
@@ -4137,7 +4141,7 @@ def _load_latest_prescan_to_local_job(universe, batch_size=50, period="59d", dep
 # Then apply the 4 small edits listed in the chat reply.
 # =====================================================================
 
-BIG_VOL_RVOL_MIN = 2.0        # big-volume threshold (x prior 20-bar average)
+BIG_VOL_RVOL_MIN = 1.5        # high-volume watch threshold (x prior 20 completed candles)
 LIQ_NEAR_PCT = 0.5            # "near liquidity" = within 0.5% of the level
 BIG_MOVE_MIN_SCORE = 50       # minimum screening score to cache a big-move stock
 
@@ -4479,6 +4483,7 @@ def _capture_volume_expansion_events(result, threshold=BIG_VOL_RVOL_MIN, referen
 _BIG_MOVE_STATUSES = {
     "PRE-BIG WATCH", "BREAKOUT DETECTED", "BREAKDOWN DETECTED", "RETEST WAITING",
     "BUY CONFIRMED", "SELL CONFIRMED", "RETEST HELD — 15M WAIT", "RETEST REJECTED — 15M WAIT",
+    "BREAKOUT WATCH", "BREAKDOWN WATCH", "PRE-BIG BULLISH WATCH", "PRE-BIG BEARISH WATCH",
 }
 _PREBIG_STATUSES = {
     "PRE-BIG BULLISH WATCH", "PRE-BIG BEARISH WATCH",
@@ -4516,6 +4521,32 @@ def _capture_big_move_events(result, reference_time=None):
         if v2_dir in ("UP", "DOWN") and _safe_num(row.get("Big Move V2 Score"), 0) >= 70:
             cands.append((f"BIG MOVE V2 {v2_dir}", v2_dir, _safe_num(row.get("Big Move V2 Score")),
                           "V2 FORMULA", None, None, row.get("Big Volume RVOL"), row.get("Big Move V2 Reason")))
+
+        # Preserve early watch states even when they are not yet confirmed entries.
+        # These are deliberately labelled WATCH, not BUY/SELL execution signals.
+        early_status = str(row.get("20M Status", "") or "").strip().upper()
+        early_dir = str(row.get("20M Direction", "WAIT") or "WAIT").strip().upper()
+        early_score = _safe_num(row.get("20M Pre-Move Score"), 0)
+        if early_status in ("WATCH", "BREAKOUT WATCH — VOLUME/BODY NOT CONFIRMED",
+                            "CONFIRMED BREAKOUT") and early_dir in ("UP", "DOWN"):
+            watch_name = ("BIG BUY WATCH" if early_dir == "UP" else "BIG SELL WATCH")
+            if early_status == "BREAKOUT WATCH — VOLUME/BODY NOT CONFIRMED":
+                watch_name = "BREAKOUT WATCH" if early_dir == "UP" else "BREAKDOWN WATCH"
+            elif early_status == "CONFIRMED BREAKOUT":
+                watch_name = "BREAKOUT CONFIRMED" if early_dir == "UP" else "BREAKDOWN CONFIRMED"
+            cands.append((watch_name, early_dir, early_score, "20M PRE-MOVE",
+                          row.get("20M Range High"), row.get("20M Range Low"),
+                          row.get("20M RVOL"), row.get("20M Reason")))
+
+        multi_break = str(row.get("Multi-TF Breakout", "") or "").upper()
+        breakout_signal = str(row.get("Breakout Signal", "") or "").upper()
+        if multi_break == "PROVISIONAL — WAIT" and breakout_signal in ("BREAKOUT", "BREAKDOWN"):
+            bdir = "UP" if breakout_signal == "BREAKOUT" else "DOWN"
+            cands.append(("BREAKOUT WATCH" if bdir == "UP" else "BREAKDOWN WATCH",
+                          bdir, max(50, _safe_num(row.get("Big Move Score"), 0)),
+                          "15M BREAKOUT", row.get("Breakout Level"), row.get("Breakdown Level"),
+                          row.get("15M RVOL"), row.get("Breakout Reason")))
+
         for status, direction, score, source, hi, lo, rvol, reason in cands:
             rows.append((f"{symbol}|{source}|{status}|{today}", symbol, status, direction, float(score),
                          price if price > 0 else None, _safe_num(hi, np.nan), _safe_num(lo, np.nan),
@@ -4572,10 +4603,16 @@ def _capture_liquidity_watch(result, reference_time=None):
                     if cur is None or (new is not None and new > cur):
                         state, bias, sweep_tf, sweep_time = st_name, st_bias, tf, str(row.get(tcol))
         if state is None:
-            if np.isfinite(buy_d) and 0 <= buy_d <= LIQ_NEAR_PCT:
-                state, bias = "NEAR BUY-SIDE LIQUIDITY", "SELL-REJECT / BUY-BREAK WATCH"
-            elif np.isfinite(sell_d) and 0 <= sell_d <= LIQ_NEAR_PCT:
-                state, bias = "NEAR SELL-SIDE LIQUIDITY", "BUY-REJECT / SELL-BREAK WATCH"
+            buy_near = np.isfinite(buy_d) and abs(buy_d) <= LIQ_NEAR_PCT
+            sell_near = np.isfinite(sell_d) and abs(sell_d) <= LIQ_NEAR_PCT
+            if buy_near and sell_near:
+                state, bias = "NEAR BOTH LIQUIDITY LEVELS", "WAIT FOR SWEEP + CANDLE CONFIRMATION"
+            elif buy_near:
+                state, bias = "NEAR BUY-SIDE LIQUIDITY", "BUY-SIDE ABOVE: BREAKOUT OR REJECTION WATCH"
+            elif sell_near:
+                state, bias = "NEAR SELL-SIDE LIQUIDITY", "SELL-SIDE BELOW: BREAKDOWN OR REJECTION WATCH"
+            elif np.isfinite(buy) or np.isfinite(sell):
+                state, bias = "LIQUIDITY LEVELS WATCH", "WAIT — LEVELS NOT YET NEAR PRICE"
             else:
                 continue
         fin = lambda x: float(x) if np.isfinite(x) else None
@@ -4663,8 +4700,8 @@ def _render_live_stock_boards():
                 "Score / RVOL": r.get("rvol"), "Details": "Liquidity pivot / confirmed sweep"
             })
 
-    vol = _load_today_table("""SELECT symbol,timeframe,direction,rvol,last_price,
-        signal_time_ist FROM volume_expansion_events
+    vol = _load_today_table("""SELECT symbol,timeframe,direction,candle_volume,average_volume,
+        rvol,last_price,signal_time_ist FROM volume_expansion_events
         WHERE substr(signal_time_ist,1,10)=? ORDER BY signal_time_ist DESC LIMIT 3000""", (today,))
     if not vol.empty:
         for _, r in vol.iterrows():
@@ -4673,7 +4710,8 @@ def _render_live_stock_boards():
                 "Time (IST)": r.get("signal_time_ist"), "Stock": r.get("symbol"),
                 "Signal": "BIG VOLUME " + side, "Direction / Bias": side,
                 "Timeframe": r.get("timeframe"), "LTP / Level": r.get("last_price"),
-                "Score / RVOL": r.get("rvol"), "Details": "Completed candle volume expansion"
+                "Score / RVOL": r.get("rvol"),
+                "Details": f"Volume { _safe_num(r.get('candle_volume')):,.0f} vs 20-bar avg { _safe_num(r.get('average_volume')):,.0f}"
             })
 
     big = _load_today_table("""SELECT symbol,status,direction,score,price,rvol,source,
@@ -4689,6 +4727,31 @@ def _render_live_stock_boards():
                 "Details": str(r.get("reason") or "")[:240]
             })
 
+    # Near-liquidity states are stored separately from confirmed sweeps.
+    # Include them here too; otherwise the cache is populated but invisible.
+    watch = _load_today_table("""SELECT symbol,price,buy_level,buy_dist_pct,sell_level,
+        sell_dist_pct,state,bias,sweep_tf,sweep_time_ist,rvol,updated_at_ist
+        FROM liquidity_watch WHERE substr(updated_at_ist,1,10)=?
+        ORDER BY updated_at_ist DESC LIMIT 3000""", (today,))
+    if not watch.empty:
+        for _, r in watch.iterrows():
+            level = r.get("buy_level") if "BUY" in str(r.get("state", "")).upper() else r.get("sell_level")
+            frames.append({
+                "Time (IST)": r.get("sweep_time_ist") or r.get("updated_at_ist"),
+                "Stock": r.get("symbol"),
+                "Signal": str(r.get("state") or "LIQUIDITY WATCH"),
+                "Direction / Bias": r.get("bias"),
+                "Timeframe": r.get("sweep_tf") or "15M LEVEL",
+                "LTP / Level": level if pd.notna(level) else r.get("price"),
+                "Score / RVOL": r.get("rvol"),
+                "Details": (
+                    f"BUY-side { _safe_num(r.get('buy_level'), 0):.2f} "
+                    f"({ _safe_num(r.get('buy_dist_pct'), 0):.2f}%) | "
+                    f"SELL-side { _safe_num(r.get('sell_level'), 0):.2f} "
+                    f"({ _safe_num(r.get('sell_dist_pct'), 0):.2f}%)"
+                )
+            })
+
     st.subheader("📡 ONE-BOX LIVE SIGNAL FEED — ALL STOCK EVENTS")
     st.caption(
         "Scanner run చేసినప్పుడు capture అయిన BIG MOVEMENT, BIG VOLUME, BUY/SELL LIQUIDITY, "
@@ -4696,24 +4759,126 @@ def _render_live_stock_boards():
     )
 
     if not frames:
-        st.info("ఈ రోజు ఇంకా signal events save కాలేదు. Scanner run చేసి completed scan batch వచ్చిన తర్వాత ఈ Boxలో కనిపిస్తాయి.")
-        return
+        st.info("ఈ రోజు ఇంకా signal / liquidity events save కాలేదు. Scanner full scan పూర్తయ్యాక ఇక్కడ కనిపిస్తాయి.")
+        feed = pd.DataFrame(columns=["Time (IST)", "Stock", "Signal", "Direction / Bias", "Timeframe",
+                                    "LTP / Level", "Score / RVOL", "Details"])
+    else:
+        feed = pd.DataFrame(frames)
+        parsed = pd.to_datetime(feed["Time (IST)"], errors="coerce", utc=True)
+        feed["_sort_time"] = parsed
+        feed["Time (IST)"] = parsed.dt.tz_convert(IST).dt.strftime("%H:%M:%S")
+        feed["LTP / Level"] = pd.to_numeric(feed["LTP / Level"], errors="coerce").round(2)
+        feed["Score / RVOL"] = pd.to_numeric(feed["Score / RVOL"], errors="coerce").round(2)
+        feed = feed.sort_values("_sort_time", ascending=False).drop(columns=["_sort_time"])
+        feed = feed[["Time (IST)", "Stock", "Signal", "Direction / Bias", "Timeframe",
+                     "LTP / Level", "Score / RVOL", "Details"]]
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Total Events Today", len(feed))
+        c2.metric("Big Movement", int(feed["Signal"].astype(str).str.contains("BIG MOVEMENT", case=False).sum()))
+        c3.metric("Liquidity / Sweeps", int(feed["Signal"].astype(str).str.contains("LIQUIDITY|SWEEP", case=False, regex=True).sum()))
+        c4.metric("Buy / Sell Signals", int(feed["Signal"].astype(str).str.contains(r"BUY|SELL", case=False, regex=True).sum()))
+        st.dataframe(feed.head(1000), hide_index=True, height=520, use_container_width=True)
 
-    feed = pd.DataFrame(frames)
-    parsed = pd.to_datetime(feed["Time (IST)"], errors="coerce", utc=True)
-    feed["_sort_time"] = parsed
-    feed["Time (IST)"] = parsed.dt.tz_convert(IST).dt.strftime("%H:%M:%S")
-    feed["LTP / Level"] = pd.to_numeric(feed["LTP / Level"], errors="coerce").round(2)
-    feed["Score / RVOL"] = pd.to_numeric(feed["Score / RVOL"], errors="coerce").round(2)
-    feed = feed.sort_values("_sort_time", ascending=False).drop(columns=["_sort_time"])
-    feed = feed[["Time (IST)", "Stock", "Signal", "Direction / Bias", "Timeframe",
-                 "LTP / Level", "Score / RVOL", "Details"]]
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Total Events Today", len(feed))
-    c2.metric("Big Movement", int(feed["Signal"].astype(str).str.contains("BIG MOVEMENT", case=False).sum()))
-    c3.metric("Liquidity / Sweeps", int(feed["Signal"].astype(str).str.contains("LIQUIDITY|SWEEP", case=False, regex=True).sum()))
-    c4.metric("Buy / Sell Signals", int(feed["Signal"].astype(str).str.fullmatch(r".*(BUY|SELL).*", case=False).sum()))
-    st.dataframe(feed.head(1000), hide_index=True, height=520, use_container_width=True)
+    # Dedicated, easy-to-read high-volume stock board (today's fresh completed candles).
+    st.markdown("#### 🔊 HIGH VOLUME STOCKS — BUY VOLUME / SELL VOLUME")
+    volume_board = _load_today_table(
+        """SELECT symbol,timeframe,direction,candle_volume,average_volume,rvol,last_price,
+                  signal_time_ist
+           FROM volume_expansion_events
+           WHERE substr(signal_time_ist,1,10)=?
+           ORDER BY signal_time_ist DESC LIMIT 5000""",
+        (today,),
+    )
+    if volume_board.empty:
+        st.info("High-volume stocks కనిపించడానికి కనీసం ఒక fresh full scan అవసరం.")
+    else:
+        volume_board = volume_board.copy()
+        volume_board["RVOL"] = pd.to_numeric(volume_board["rvol"], errors="coerce")
+        volume_board["Candle Volume"] = pd.to_numeric(volume_board["candle_volume"], errors="coerce")
+        volume_board["20-Candle Avg Volume"] = pd.to_numeric(volume_board["average_volume"], errors="coerce")
+        volume_board["LTP"] = pd.to_numeric(volume_board["last_price"], errors="coerce")
+        volume_board["Signal Time (IST)"] = _hhmmss(volume_board["signal_time_ist"])
+        volume_board["Volume Strength"] = np.select(
+            [volume_board["RVOL"] >= 3.0, volume_board["RVOL"] >= 2.0],
+            ["EXTREME ≥3x", "STRONG ≥2x"], default="RISING ≥1.5x"
+        )
+        volume_board = volume_board.sort_values(["RVOL", "signal_time_ist"], ascending=[False, False])
+        volume_cols = ["symbol", "timeframe", "direction", "LTP", "Candle Volume",
+                       "20-Candle Avg Volume", "RVOL", "Volume Strength", "Signal Time (IST)"]
+        buy_vol = volume_board[volume_board["direction"].astype(str).str.upper().eq("BUY")]
+        sell_vol = volume_board[volume_board["direction"].astype(str).str.upper().eq("SELL")]
+        vm1, vm2, vm3 = st.columns(3)
+        vm1.metric("High-volume stocks", int(volume_board["symbol"].nunique()))
+        vm2.metric("BUY-volume rows", len(buy_vol))
+        vm3.metric("SELL-volume rows", len(sell_vol))
+        vb1, vb2 = st.columns(2)
+        with vb1:
+            st.markdown("**🟢 BUY-side candle volume**")
+            if buy_vol.empty:
+                st.caption("No fresh BUY-volume rows.")
+            else:
+                st.dataframe(buy_vol[volume_cols].head(100), hide_index=True, use_container_width=True)
+        with vb2:
+            st.markdown("**🔴 SELL-side candle volume**")
+            if sell_vol.empty:
+                st.caption("No fresh SELL-volume rows.")
+            else:
+                st.dataframe(sell_vol[volume_cols].head(100), hide_index=True, use_container_width=True)
+        st.caption("RVOL = current completed candle volume ÷ previous 20 completed candles' average volume. This is abnormal activity, not confirmed net buying/selling.")
+
+    # Dedicated early-movement / breakout board: keep WATCH separate from confirmed entries.
+    st.markdown("#### 🚀 BIG BUY / BIG SELL WATCH + BREAKOUT WATCH")
+    big_watch = _load_today_table(
+        """SELECT symbol,status,direction,score,price,range_high,range_low,rvol,source,
+                  first_seen_ist,last_seen_ist,reason
+           FROM big_move_events WHERE substr(first_seen_ist,1,10)=?
+           ORDER BY score DESC,last_seen_ist DESC LIMIT 2000""",
+        (today,),
+    )
+    if big_watch.empty:
+        st.info("ఇంకా తాజా BIG BUY/SELL WATCH లేదా BREAKOUT WATCH events లేవు. Scan పూర్తయ్యాక మళ్లీ చూడండి.")
+    else:
+        big_watch = big_watch.copy()
+        big_watch["Signal Time (IST)"] = _hhmmss(big_watch["first_seen_ist"])
+        big_watch["Last Seen (IST)"] = _hhmmss(big_watch["last_seen_ist"])
+        big_watch = big_watch.rename(columns={
+            "symbol": "Stock", "status": "Watch / Breakout Status",
+            "direction": "Direction", "score": "Score", "price": "LTP",
+            "range_high": "Range High", "range_low": "Range Low",
+            "rvol": "RVOL", "source": "Source", "reason": "Reason",
+        })
+        big_cols = ["Stock", "Watch / Breakout Status", "Direction", "Score", "LTP",
+                    "Range High", "Range Low", "RVOL", "Source", "Signal Time (IST)",
+                    "Last Seen (IST)", "Reason"]
+        st.dataframe(big_watch[big_cols].head(300), hide_index=True, use_container_width=True)
+        st.caption("WATCH = early setup only; BREAKOUT CONFIRMED / BUY CONFIRMED / SELL CONFIRMED remain separate states. Score is a screening score, not a probability.")
+
+    # Standalone liquidity board: show both nearby levels and confirmed sweep bias.
+    st.markdown("#### 💧 LIVE BUY-SIDE / SELL-SIDE LIQUIDITY WATCH")
+    liquidity_board = _load_today_table(
+        """SELECT symbol,price,buy_level,buy_dist_pct,sell_level,sell_dist_pct,
+                  state,bias,sweep_tf,sweep_time_ist,rvol,updated_at_ist
+           FROM liquidity_watch WHERE substr(updated_at_ist,1,10)=?
+           ORDER BY updated_at_ist DESC LIMIT 1000""",
+        (today,),
+    )
+    if liquidity_board.empty:
+        st.info("ఇంకా తాజా scan నుంచి BUY-side / SELL-side liquidity levels రాలేదు. Scanner full scan పూర్తయ్యాక మళ్లీ చూడండి.")
+    else:
+        liquidity_board = liquidity_board.copy()
+        liquidity_board["BUY Liquidity"] = pd.to_numeric(liquidity_board["buy_level"], errors="coerce")
+        liquidity_board["BUY Dist %"] = pd.to_numeric(liquidity_board["buy_dist_pct"], errors="coerce")
+        liquidity_board["SELL Liquidity"] = pd.to_numeric(liquidity_board["sell_level"], errors="coerce")
+        liquidity_board["SELL Dist %"] = pd.to_numeric(liquidity_board["sell_dist_pct"], errors="coerce")
+        liquidity_board["LTP"] = pd.to_numeric(liquidity_board["price"], errors="coerce")
+        liquidity_board["RVOL"] = pd.to_numeric(liquidity_board["rvol"], errors="coerce")
+        liquidity_board["Updated (IST)"] = _hhmmss(liquidity_board["updated_at_ist"])
+        liquidity_board = liquidity_board.sort_values(["RVOL", "updated_at_ist"], ascending=[False, False])
+        liq_cols = ["symbol", "LTP", "BUY Liquidity", "BUY Dist %", "SELL Liquidity",
+                    "SELL Dist %", "state", "bias", "sweep_tf", "RVOL", "Updated (IST)"]
+        st.dataframe(liquidity_board[liq_cols].head(200), hide_index=True, use_container_width=True)
+        st.caption("BUY-side liquidity = prior swing highs; SELL-side liquidity = prior swing lows. Level watch మాత్రమే trade signal కాదు. Sweep తర్వాత rejection candle + volume + timeframe confirmation వచ్చినప్పుడే BUY/SELL confirmationగా చూడాలి.")
+
     st.download_button(
         "Download today's complete signal feed (CSV)",
         feed.to_csv(index=False).encode("utf-8"),
@@ -5462,7 +5627,7 @@ def show_ai_multi_agent_scanner(client=None):
             if new_liquidity_events:
                 st.caption(f"Live Dashboard: {new_liquidity_events} new liquidity/sweep event(s) saved to SQLite.")
             if new_volume_events:
-                st.caption(f"Live Dashboard: {new_volume_events} new >=2x volume event(s) saved to SQLite.")
+                st.caption(f"Live Dashboard: {new_volume_events} new high-volume event(s) saved to SQLite.")
         except Exception as event_exc:
             st.warning(f"Live signal event save issue: {event_exc}")
 
