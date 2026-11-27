@@ -459,6 +459,8 @@ def _prune_event_ledgers(signal_days=90, liquidity_days=14):
         conn.execute("DELETE FROM signal_events WHERE created_at_ist<?", (sig_cut,))
         conn.execute("DELETE FROM liquidity_sweep_events WHERE captured_at_ist<?", (liq_cut,))
         conn.execute("DELETE FROM volume_expansion_events WHERE captured_at_ist<?", (liq_cut,))
+        conn.execute("DELETE FROM pine_15m_liquidity_events WHERE captured_at_ist<?", (liq_cut,))
+        conn.execute("DELETE FROM liquidity_touch_events WHERE captured_at_ist<?", (liq_cut,))
 
 
 def _drop_recent_duplicate_events(conn, rows, minutes=60):
@@ -582,8 +584,10 @@ def _capture_liquidity_sweep_events(result, reference_time=None):
             for event_type, level_col, time_col, direction in (
                 ("BUY LIQUIDITY", buy_col, buy_time_col, "BUY"),
                 ("SELL LIQUIDITY", sell_col, sell_time_col, "SELL"),
-                ("SWEEP UP", None, up_time_col, "SELL"),
-                ("SWEEP DOWN", None, down_time_col, "BUY"),
+                # SWEEP UP takes the buy-side liquidity above price.
+                ("SWEEP UP", buy_col, up_time_col, "SELL"),
+                # SWEEP DOWN takes the sell-side liquidity below price.
+                ("SWEEP DOWN", sell_col, down_time_col, "BUY"),
             ):
                 if event_type == "SWEEP UP" and str(row.get(up_col, "NO")).upper() != "YES":
                     continue
@@ -641,8 +645,7 @@ def _capture_liquidity_sweep_events(result, reference_time=None):
                  signal_time_ist,created_at_ist,current_price_time_ist,stop_price,target_price,
                  risk_reward,data_status,status,outcome)
                 VALUES (?,?,?,?,?,?,?,?,?,?,?,1.5,'WAITING','ACTIVE','PENDING')""", sweep_rows)
-            inserted += conn.total_changes - before - inserted
-        return inserted
+        return conn.total_changes - before
 
 
 def _capture_volume_expansion_events(result, threshold=2.0, reference_time=None):
@@ -2960,6 +2963,8 @@ def _make_result_row(symbol, yahoo_symbol, payload):
         "Symbol": symbol, "Yahoo Symbol": yahoo_symbol, "Final Signal": final_signal,
         "Signal Time (IST)": signal_time,
         "5M Candle Close (IST)": candle_close_5m,
+        "5M Candle High": _safe_num(frame_5m["High"].iloc[-1], np.nan) if isinstance(frame_5m, pd.DataFrame) and not frame_5m.empty else None,
+        "5M Candle Low": _safe_num(frame_5m["Low"].iloc[-1], np.nan) if isinstance(frame_5m, pd.DataFrame) and not frame_5m.empty else None,
         "15M Candle Close (IST)": candle_close_15m,
         "1H Candle Close (IST)": candle_close_1h,
         "Entry Price": round(entry_price, 2) if entry_price is not None else None,
@@ -4375,6 +4380,20 @@ def _ensure_patch_tables():
                 symbol TEXT PRIMARY KEY, price REAL, buy_level REAL, buy_dist_pct REAL,
                 sell_level REAL, sell_dist_pct REAL, state TEXT, bias TEXT,
                 sweep_tf TEXT, sweep_time_ist TEXT, rvol REAL, updated_at_ist TEXT NOT NULL)""")
+            conn.execute("""CREATE TABLE IF NOT EXISTS liquidity_touch_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_key TEXT NOT NULL UNIQUE,
+                symbol TEXT NOT NULL,
+                side TEXT NOT NULL,
+                timeframe TEXT NOT NULL,
+                level REAL NOT NULL,
+                touch_price REAL NOT NULL,
+                candle_high REAL,
+                candle_low REAL,
+                rvol REAL,
+                signal_time_ist TEXT NOT NULL,
+                captured_at_ist TEXT NOT NULL)""")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_liquidity_touch_time ON liquidity_touch_events(signal_time_ist)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_big_move_seen ON big_move_events(last_seen_ist)")
         _PATCH_TABLES_READY = True
 
@@ -4808,11 +4827,11 @@ def _capture_liquidity_watch(result, reference_time=None):
                 if str(row.get(flag, "NO")).upper() == "YES" and _candle_is_recent(row.get(tcol), limit, now=reference_time):
                     cur = _as_ist_timestamp(sweep_time) if sweep_time else None
                     new = _as_ist_timestamp(row.get(tcol))
-                    if cur is None or (new is not None and new > cur):
-                        state, bias, sweep_tf, sweep_time = st_name, st_bias, tf, str(row.get(tcol))
+                    if new is not None and (cur is None or new > cur):
+                        state, bias, sweep_tf, sweep_time = st_name, st_bias, tf, new.isoformat(timespec="seconds")
         if state is None:
-            buy_near = np.isfinite(buy_d) and abs(buy_d) <= LIQ_NEAR_PCT
-            sell_near = np.isfinite(sell_d) and abs(sell_d) <= LIQ_NEAR_PCT
+            buy_near = np.isfinite(buy_d) and 0 <= buy_d <= LIQ_NEAR_PCT
+            sell_near = np.isfinite(sell_d) and 0 <= sell_d <= LIQ_NEAR_PCT
             if buy_near and sell_near:
                 state, bias = "NEAR BOTH LIQUIDITY LEVELS", "WAIT FOR SWEEP + CANDLE CONFIRMATION"
             elif buy_near:
@@ -4835,6 +4854,61 @@ def _capture_liquidity_watch(result, reference_time=None):
     return len(rows)
 
 
+def _capture_liquidity_touch_events(result, reference_time=None):
+    """Record when the latest completed 5M candle range touches a 15M liquidity level.
+
+    The event time is the completed 5M candle close timestamp, not an intrabar tick time.
+    Buy-side liquidity is above price (touch when candle high reaches the level);
+    sell-side liquidity is below price (touch when candle low reaches the level).
+    """
+    if not isinstance(result, pd.DataFrame) or result.empty:
+        return 0
+    _ensure_patch_tables()
+    now_text = datetime.now(IST).isoformat(timespec="seconds")
+    rows = []
+    for _, row in result.iterrows():
+        if str(row.get("Data Quality", "PASS")).strip().upper() != "PASS":
+            continue
+        symbol = str(row.get("Symbol", "") or "").strip()
+        if not symbol:
+            continue
+        stamp = _as_ist_timestamp(row.get("5M Candle Close (IST)"))
+        if stamp is None or not _candle_is_recent(stamp, 10, now=reference_time):
+            continue
+        high = _safe_num(row.get("5M Candle High"), np.nan)
+        low = _safe_num(row.get("5M Candle Low"), np.nan)
+        close = _safe_num(row.get("Last Price"), 0.0)
+        rvol = _safe_num(row.get("5M RVOL"), 0.0)
+        if not (np.isfinite(high) and np.isfinite(low) and high >= low and close > 0):
+            continue
+        candidates = (
+            ("BUY-SIDE", _safe_num(row.get("15M Buy-side Liquidity"), np.nan),
+             high, "BUY-SIDE LIQUIDITY TOUCH"),
+            ("SELL-SIDE", _safe_num(row.get("15M Sell-side Liquidity"), np.nan),
+             low, "SELL-SIDE LIQUIDITY TOUCH"),
+        )
+        for side, level, extreme, label in candidates:
+            if not np.isfinite(level) or level <= 0:
+                continue
+            # Avoid treating a level far on the wrong side of the current market as a touch.
+            touched = low <= level <= high
+            if not touched:
+                continue
+            event_time = stamp.isoformat(timespec="seconds")
+            event_key = f"{symbol}|{side}|15M|{event_time}|{level:.8f}"
+            rows.append((event_key, symbol, side, "5M", float(level), float(extreme),
+                         float(high), float(low), float(rvol), event_time, now_text))
+    if not rows:
+        return 0
+    with _memory_connect() as conn:
+        before = conn.total_changes
+        conn.executemany("""INSERT OR IGNORE INTO liquidity_touch_events
+            (event_key,symbol,side,timeframe,level,touch_price,candle_high,candle_low,rvol,
+             signal_time_ist,captured_at_ist)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?)""", rows)
+        return conn.total_changes - before
+
+
 def _capture_all_dashboard_events(result, reference_time=None):
     """One call for every dashboard ledger; freshness is measured at scan completion."""
     _ensure_patch_tables()
@@ -4846,7 +4920,8 @@ def _capture_all_dashboard_events(result, reference_time=None):
                      ("pine_15m_liquidity", _capture_pine_15m_liquidity_events),
                      ("big_volume", _capture_volume_expansion_events),
                      ("big_move", _capture_big_move_events),
-                     ("liquidity_watch", _capture_liquidity_watch)):
+                     ("liquidity_watch", _capture_liquidity_watch),
+                     ("liquidity_touch", _capture_liquidity_touch_events)):
         try:
             counts[name] = fn(result, reference_time=reference_time)
         except Exception as exc:
@@ -4899,14 +4974,40 @@ def _render_live_stock_boards():
 
     liq = _load_today_table("""SELECT symbol,timeframe,event_type,level,direction,rvol,
         signal_time_ist FROM liquidity_sweep_events
-        WHERE substr(signal_time_ist,1,10)=? ORDER BY signal_time_ist DESC LIMIT 5000""", (today,))
+        WHERE substr(signal_time_ist,1,10)=? AND (
+            event_type IN ('SWEEP UP','SWEEP DOWN') OR id IN (
+                SELECT MAX(id) FROM liquidity_sweep_events
+                WHERE event_type IN ('BUY LIQUIDITY','SELL LIQUIDITY')
+                  AND substr(signal_time_ist,1,10)=?
+                GROUP BY symbol,timeframe,event_type))
+        ORDER BY signal_time_ist DESC LIMIT 5000""", (today, today))
     if not liq.empty:
         for _, r in liq.iterrows():
             frames.append({
                 "Time (IST)": r.get("signal_time_ist"), "Stock": r.get("symbol"),
-                "Signal": r.get("event_type"), "Direction / Bias": r.get("direction"),
+                "Signal": {"BUY LIQUIDITY": "BUY-SIDE LIQUIDITY", "SELL LIQUIDITY": "SELL-SIDE LIQUIDITY"}.get(
+                    str(r.get("event_type")), r.get("event_type")),
+                "Direction / Bias": {"BUY LIQUIDITY": "LEVEL ABOVE PRICE", "SELL LIQUIDITY": "LEVEL BELOW PRICE"}.get(
+                    str(r.get("event_type")), r.get("direction")),
                 "Timeframe": r.get("timeframe"), "LTP / Level": r.get("level"),
                 "Score / RVOL": r.get("rvol"), "Details": "Liquidity pivot / confirmed sweep"
+            })
+
+    touches = _load_today_table("""SELECT symbol,side,timeframe,level,touch_price,candle_high,
+        candle_low,rvol,signal_time_ist FROM liquidity_touch_events
+        WHERE substr(signal_time_ist,1,10)=? ORDER BY signal_time_ist DESC LIMIT 3000""", (today,))
+    if not touches.empty:
+        for _, r in touches.iterrows():
+            side = str(r.get("side") or "").upper()
+            frames.append({
+                "Time (IST)": r.get("signal_time_ist"), "Stock": r.get("symbol"),
+                "Signal": f"{side} LIQUIDITY TOUCH",
+                "Direction / Bias": "LEVEL TOUCHED — WAIT FOR BREAKOUT / REJECTION",
+                "Timeframe": r.get("timeframe"),
+                "LTP / Level": r.get("level"),
+                "Score / RVOL": r.get("rvol"),
+                "Details": f"Touch price { _safe_num(r.get('touch_price')):.2f} | 5M range "
+                           f"{_safe_num(r.get('candle_low')):.2f}–{_safe_num(r.get('candle_high')):.2f}"
             })
 
     vol = _load_today_table("""SELECT symbol,timeframe,direction,candle_volume,average_volume,
@@ -4944,7 +5045,8 @@ def _render_live_stock_boards():
         ORDER BY updated_at_ist DESC LIMIT 3000""", (today,))
     if not watch.empty:
         for _, r in watch.iterrows():
-            level = r.get("buy_level") if "BUY" in str(r.get("state", "")).upper() else r.get("sell_level")
+            _st = str(r.get("state", "")).upper()
+            level = r.get("buy_level") if ("BUY" in _st or _st == "SWEEP UP") else r.get("sell_level")
             frames.append({
                 "Time (IST)": r.get("sweep_time_ist") or r.get("updated_at_ist"),
                 "Stock": r.get("symbol"),
@@ -4973,7 +5075,8 @@ def _render_live_stock_boards():
                                     "LTP / Level", "Score / RVOL", "Details"])
     else:
         feed = pd.DataFrame(frames)
-        parsed = pd.to_datetime(feed["Time (IST)"], errors="coerce", utc=True)
+        _iso = lambda v: (lambda t: t.isoformat() if t is not None else None)(_as_ist_timestamp(v))
+        parsed = pd.to_datetime(feed["Time (IST)"].map(_iso), errors="coerce", utc=True)
         feed["_sort_time"] = parsed
         feed["Time (IST)"] = parsed.dt.tz_convert(IST).dt.strftime("%H:%M:%S")
         feed["LTP / Level"] = pd.to_numeric(feed["LTP / Level"], errors="coerce").round(2)
@@ -4985,8 +5088,38 @@ def _render_live_stock_boards():
         c1.metric("Total Events Today", len(feed))
         c2.metric("Big Movement", int(feed["Signal"].astype(str).str.contains("BIG MOVEMENT", case=False).sum()))
         c3.metric("Liquidity / Sweeps", int(feed["Signal"].astype(str).str.contains("LIQUIDITY|SWEEP", case=False, regex=True).sum()))
-        c4.metric("Buy / Sell Signals", int(feed["Signal"].astype(str).str.contains(r"BUY|SELL", case=False, regex=True).sum()))
+        c4.metric("Buy / Sell Signals", int(feed["Signal"].astype(str).str.upper().str.contains(
+            r"^(?:BUY|SELL|PRE-BIG BUY|PRE-BIG SELL)(?![- ]*(?:SIDE|LIQUIDITY))", regex=True).sum()))
         st.dataframe(feed.head(1000), hide_index=True, height=520, use_container_width=True)
+
+    # Dedicated alert board: stocks whose latest completed 5M candle touched a 15M liquidity level.
+    st.markdown("#### 🎯 LIVE BUY / SELL LIQUIDITY LEVEL TOUCH ALERTS")
+    touch_board = _load_today_table(
+        """SELECT symbol,side,timeframe,level,touch_price,rvol,signal_time_ist
+           FROM liquidity_touch_events
+           WHERE substr(signal_time_ist,1,10)=?
+           ORDER BY signal_time_ist DESC LIMIT 1000""",
+        (today,),
+    )
+    if touch_board.empty:
+        st.info("ఇంకా completed 5M candleలో 15M BUY-side / SELL-side liquidity level touch కాలేదు. Fresh scan తర్వాత కనిపిస్తుంది.")
+    else:
+        touch_board = touch_board.copy()
+        touch_board["Touch Time (IST)"] = _hhmmss(touch_board["signal_time_ist"])
+        touch_board["Liquidity Level"] = pd.to_numeric(touch_board["level"], errors="coerce").round(2)
+        touch_board["Touch Price"] = pd.to_numeric(touch_board["touch_price"], errors="coerce").round(2)
+        touch_board["RVOL"] = pd.to_numeric(touch_board["rvol"], errors="coerce").round(2)
+        touch_board = touch_board.rename(columns={
+            "symbol": "Stock", "side": "Liquidity Side", "timeframe": "Touch TF"
+        })
+        touch_cols = ["Touch Time (IST)", "Stock", "Liquidity Side", "Touch TF",
+                      "Liquidity Level", "Touch Price", "RVOL"]
+        tm1, tm2, tm3 = st.columns(3)
+        tm1.metric("Stocks touched", int(touch_board["Stock"].nunique()))
+        tm2.metric("BUY-side touches", int(touch_board["Liquidity Side"].eq("BUY-SIDE").sum()))
+        tm3.metric("SELL-side touches", int(touch_board["Liquidity Side"].eq("SELL-SIDE").sum()))
+        st.dataframe(touch_board[touch_cols].head(200), hide_index=True, use_container_width=True)
+    st.caption("Touch time = completed 5M candle close time (IST). It identifies a level touched within that candle; it is not an exact tick timestamp or a BUY/SELL entry confirmation.")
 
     # Dedicated, easy-to-read high-volume stock board (today's fresh completed candles).
     st.markdown("#### 🔊 HIGH VOLUME STOCKS — BUY VOLUME / SELL VOLUME")
