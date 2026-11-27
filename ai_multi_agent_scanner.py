@@ -4912,6 +4912,178 @@ def _primary_direction_confirmation(row):
     return "WAIT"
 
 
+
+# =====================================================================
+# ADDITIVE LIVE LIQUIDITY MONITOR — 1M detection / 5-minute polling
+# Does not modify the legacy 5M/15M/1H agent, Final Signal, or report logic.
+# =====================================================================
+LIVE_LIQUIDITY_POLL_SECONDS = 300
+LIVE_LIQUIDITY_NEAR_PCT = 1.0
+LIVE_LIQUIDITY_DEFAULT_MAX_SYMBOLS = 250
+
+
+def _ensure_live_liquidity_1m_table():
+    with _memory_connect() as conn:
+        conn.execute("""CREATE TABLE IF NOT EXISTS live_liquidity_1m_events (
+            event_key TEXT PRIMARY KEY, symbol TEXT NOT NULL, yahoo_symbol TEXT,
+            event_type TEXT NOT NULL, bias TEXT, price REAL, liquidity_level REAL,
+            rvol REAL, candle_time_ist TEXT, detected_at_ist TEXT,
+            reason TEXT, status TEXT DEFAULT 'ACTIVE')""")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_live_liq_1m_time ON live_liquidity_1m_events(detected_at_ist)")
+
+
+def _live_liquidity_1m_candidates(result, max_symbols=LIVE_LIQUIDITY_DEFAULT_MAX_SYMBOLS):
+    """Prioritise nearest pre-existing 15M liquidity levels; no legacy fields are changed."""
+    if not isinstance(result, pd.DataFrame) or result.empty:
+        return []
+    d = result.copy()
+    if 'Data Quality' in d.columns:
+        d = d[d['Data Quality'].astype(str).str.upper().eq('PASS')]
+    if 'Yahoo Symbol' not in d.columns or 'Symbol' not in d.columns:
+        return []
+    candidates = []
+    for _, row in d.iterrows():
+        ticker = str(row.get('Yahoo Symbol') or '').strip()
+        symbol = str(row.get('Symbol') or '').strip()
+        price = _safe_num(row.get('Last Price'), 0.0)
+        if not ticker or not symbol or price <= 0:
+            continue
+        distances = []
+        for col, level_col in (('Liq Buy Dist %', '15M Buy-side Liquidity'),
+                               ('Liq Sell Dist %', '15M Sell-side Liquidity')):
+            dist = _safe_num(row.get(col), np.nan)
+            level = _safe_num(row.get(level_col), np.nan)
+            if not np.isfinite(dist) and np.isfinite(level):
+                dist = abs(level - price) / price * 100.0
+            if np.isfinite(dist):
+                distances.append(abs(float(dist)))
+        if not distances:
+            # Compatibility with older result schemas that contain only base fields.
+            for level_col in ('Buy-side Liquidity', 'Sell-side Liquidity'):
+                level = _safe_num(row.get(level_col), np.nan)
+                if np.isfinite(level):
+                    distances.append(abs(level - price) / price * 100.0)
+        nearest = min(distances) if distances else 999.0
+        if nearest <= LIVE_LIQUIDITY_NEAR_PCT:
+            candidates.append((nearest, symbol, ticker))
+    candidates.sort(key=lambda x: x[0])
+    # Keep the monitor's API footprint bounded. Raise the UI limit if required.
+    return [(symbol, ticker) for _, symbol, ticker in candidates[:int(max_symbols)]]
+
+
+def _run_live_liquidity_1m_once(result, max_symbols=LIVE_LIQUIDITY_DEFAULT_MAX_SYMBOLS):
+    """Fetch completed 1M candles for the closest liquidity candidates and persist events."""
+    _ensure_live_liquidity_1m_table()
+    candidates = _live_liquidity_1m_candidates(result, max_symbols=max_symbols)
+    if not candidates:
+        return pd.DataFrame(), 0, 'No PASS-quality stocks are within 1.0% of saved 15M liquidity levels.'
+    now = pd.Timestamp.now(tz=IST)
+    all_rows, errors = [], 0
+    # Batch size 50 uses the existing Yahoo TTL cache/lock and avoids per-symbol requests.
+    for start in range(0, len(candidates), 50):
+        batch = candidates[start:start + 50]
+        tickers = [ticker for _, ticker in batch]
+        frames, fetch_errors = _fetch_interval(tickers, '1m', 1, '7d', retries=0)
+        errors += len(fetch_errors)
+        symbol_by_ticker = {ticker: symbol for symbol, ticker in batch}
+        for ticker in tickers:
+            frame = frames.get(ticker, pd.DataFrame())
+            if frame is None or frame.empty or len(frame) < 31:
+                continue
+            # _fetch_interval already strips incomplete/current 1M candles.
+            sweep = _liquidity_levels_and_sweeps(frame, lookback=30, timeframe_minutes=1)
+            last = frame.iloc[-1]
+            price = _safe_num(last.get('Close'), 0.0)
+            if price <= 0:
+                continue
+            buy_level = _safe_num(sweep.get('Buy-side Liquidity'), np.nan)
+            sell_level = _safe_num(sweep.get('Sell-side Liquidity'), np.nan)
+            rvol = _safe_num(sweep.get('RVOL'), 0.0)
+            candle_time = _as_ist_timestamp(last.get('Time'))
+            candle_text = candle_time.strftime('%Y-%m-%d %H:%M:%S IST') if candle_time is not None else None
+            events = []
+            if sweep.get('Upside Sweep') == 'YES':
+                events.append(('1M SELL-SIDE BIAS — BUY-SIDE SWEEP', 'SELL', buy_level,
+                               'Price swept above buy-side liquidity and closed back below with bearish rejection.'))
+            if sweep.get('Downside Sweep') == 'YES':
+                events.append(('1M BUY-SIDE BIAS — SELL-SIDE SWEEP', 'BUY', sell_level,
+                               'Price swept below sell-side liquidity and closed back above with bullish rejection.'))
+            if not events:
+                # Watch state only; never promote a near-level touch to a confirmed sweep.
+                buy_dist = abs(buy_level - price) / price * 100 if np.isfinite(buy_level) else np.inf
+                sell_dist = abs(price - sell_level) / price * 100 if np.isfinite(sell_level) else np.inf
+                if buy_dist <= LIVE_LIQUIDITY_NEAR_PCT:
+                    events.append(('1M NEAR BUY-SIDE LIQUIDITY — WATCH', 'WATCH SELL / BREAKOUT', buy_level,
+                                   f'Within {buy_dist:.2f}% of buy-side liquidity; wait for completed-candle sweep/rejection.'))
+                if sell_dist <= LIVE_LIQUIDITY_NEAR_PCT:
+                    events.append(('1M NEAR SELL-SIDE LIQUIDITY — WATCH', 'WATCH BUY / BREAKDOWN', sell_level,
+                                   f'Within {sell_dist:.2f}% of sell-side liquidity; wait for completed-candle sweep/rejection.'))
+            for event_type, bias, level, reason in events:
+                if not candle_text:
+                    continue
+                key = f"{symbol}|{event_type}|{candle_text}"
+                all_rows.append((key, symbol_by_ticker[ticker], ticker, event_type, bias,
+                                 price, float(level) if np.isfinite(level) else None,
+                                 rvol, candle_text, now.strftime('%Y-%m-%d %H:%M:%S IST'), reason, 'ACTIVE'))
+    if all_rows:
+        with _memory_connect() as conn:
+            conn.executemany("""INSERT INTO live_liquidity_1m_events
+                (event_key,symbol,yahoo_symbol,event_type,bias,price,liquidity_level,rvol,
+                 candle_time_ist,detected_at_ist,reason,status)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(event_key) DO UPDATE SET price=excluded.price,
+                 liquidity_level=excluded.liquidity_level,rvol=excluded.rvol,
+                 detected_at_ist=excluded.detected_at_ist,reason=excluded.reason""", all_rows)
+            conn.execute("DELETE FROM live_liquidity_1m_events WHERE substr(detected_at_ist,1,10)<>?",
+                         (now.strftime('%Y-%m-%d'),))
+    view = _load_today_table("""SELECT symbol,event_type,bias,price,liquidity_level,rvol,
+        candle_time_ist,detected_at_ist,reason FROM live_liquidity_1m_events
+        WHERE substr(detected_at_ist,1,10)=?
+        ORDER BY candle_time_ist DESC, detected_at_ist DESC LIMIT 500""",
+        (now.strftime('%Y-%m-%d'),))
+    status = f'Monitored {len(candidates)} near-liquidity stocks; {errors} ticker fetch errors.'
+    return view, len(all_rows), status
+
+
+def _render_live_liquidity_1m_monitor(result):
+    """Independent 5-minute poller; active only while this scanner page is open."""
+    st.subheader('⚡ LIVE LIQUIDITY DETECTION — 1M / 5-MINUTE MONITOR')
+    st.caption('Completed 1-minute candles only. NEAR = WATCH; SWEEP = liquidity taken + rejection. A sweep is not an automatic trade entry.')
+    max_symbols = st.selectbox('1M Monitor shortlist size', [50, 100, 250, 500], index=2,
+                               key='ma_live_liq_1m_max_symbols')
+    if not _is_market_hours():
+        st.info('NSE market hours వెలుపల 1M live monitor pauseలో ఉంటుంది. Saved events మాత్రం కనిపిస్తాయి.')
+    if hasattr(st, 'fragment'):
+        @st.fragment(run_every='300s')
+        def _live_liq_fragment():
+            if _is_market_hours():
+                try:
+                    view, new_count, status = _run_live_liquidity_1m_once(result, max_symbols=max_symbols)
+                    st.caption(f'{status} • Poll interval: 5 minutes • {datetime.now(IST).strftime("%H:%M:%S IST")}')
+                except Exception as exc:
+                    st.warning(f'Live 1M liquidity monitor error: {str(exc)[:220]}')
+                    view = _load_today_table("""SELECT symbol,event_type,bias,price,liquidity_level,rvol,
+                        candle_time_ist,detected_at_ist,reason FROM live_liquidity_1m_events
+                        WHERE substr(detected_at_ist,1,10)=? ORDER BY candle_time_ist DESC LIMIT 500""",
+                        (_today_text(),))
+            else:
+                view = _load_today_table("""SELECT symbol,event_type,bias,price,liquidity_level,rvol,
+                    candle_time_ist,detected_at_ist,reason FROM live_liquidity_1m_events
+                    WHERE substr(detected_at_ist,1,10)=? ORDER BY candle_time_ist DESC LIMIT 500""",
+                    (_today_text(),))
+            if view.empty:
+                st.info('ఇంకా 1M liquidity watch / sweep events లేవు. 1.0% proximity shortlist మరియు valid completed candles అవసరం.')
+            else:
+                st.dataframe(view, hide_index=True, use_container_width=True)
+        _live_liq_fragment()
+    else:
+        st.warning('5-minute automatic monitoring కోసం Streamlit fragments support అవసరం. Manual scan:')
+        if st.button('RUN 1M LIQUIDITY CHECK', key='ma_live_liq_1m_manual'):
+            view, _, status = _run_live_liquidity_1m_once(result, max_symbols=max_symbols)
+            st.caption(status)
+            if not view.empty:
+                st.dataframe(view, hide_index=True, use_container_width=True)
+
 def show_ai_multi_agent_scanner(client=None):
     """Streamlit page. client is retained for app.py compatibility."""
     st.title("🚀 NSE AI PRO V18 — LIVE MARKET DASHBOARD + SCANNER")
@@ -5461,6 +5633,10 @@ def show_ai_multi_agent_scanner(client=None):
     result["Scan Time (IST)"] = _scan_stamp
     # Keep the enriched result available to the existing report/export pipeline.
     st.session_state["multi_agent_results"] = result
+
+    # Additive 1M live liquidity layer; legacy scanner results remain unchanged.
+    _render_live_liquidity_1m_monitor(result)
+
     try:
         st.session_state["multi_agent_csv"] = result.to_csv(index=False).encode("utf-8-sig")
     except Exception:
