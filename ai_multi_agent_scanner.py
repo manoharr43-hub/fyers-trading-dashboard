@@ -4,7 +4,7 @@ Yahoo Finance batch edition — advanced movement + false-breakout audit + Live 
 
 - scanner.py only supplies the NSE / F&O symbol universe; this module combines both loaders without modifying scanner.py.
 - Yahoo Finance supplies all OHLCV candles and technical-analysis data.
-- FYERS is used ONLY for 5-level Market Depth on shortlisted BUY/SELL/PRE-BIG stocks.
+- Yahoo Finance is the only market-data provider; no external broker depth/API depth dependency.
 - Data Quality Gate + 15M Market Regime context before the 17-agent decision.
 - 17 OHLCV rule-based agents on completed 5M, 15M and 1H candles; live BUY/SELL requires 5M+15M agreement and no opposite 1H trend.
 - Directional UP/DOWN early pre-move watch using completed 5M candles + 15M alignment.
@@ -83,9 +83,6 @@ SIGNAL_PRIORITY = {
 _YF_LOCK = threading.Lock()
 _SCAN_WORKERS = {}
 _SCAN_WORKERS_LOCK = threading.Lock()
-FYERS_DEPTH_CACHE_TTL = 20       # seconds; prevents repeated depth calls on Streamlit reruns
-FYERS_DEPTH_CALL_GAP = 1.05      # conservative one-call-per-second pacing
-FYERS_DEPTH_DEFAULT_LIMIT = 20  # configurable shortlist cap per scan
 
 
 # Thread-safe TTL cache for background Yahoo workers. Streamlit's cache_data
@@ -2882,6 +2879,75 @@ def _market_regime_analysis(df):
         return result
 
 
+def _amd_stage_analysis(frame_5m, frame_15m=None):
+    """Conservative OHLCV-only AMD sequence detector (heuristic, not institutional-flow proof).
+
+    Accumulation: a compressed 12-bar base with contracting volume.
+    Manipulation: a completed candle sweeps a base edge and closes back inside.
+    Distribution: after a detected sweep, a completed candle closes outside the
+    base in the opposite direction with expanding relative volume.
+    """
+    empty = {
+        "AMD Stage": "NO AMD SETUP", "AMD Signal": "WAIT",
+        "AMD Base High": None, "AMD Base Low": None,
+        "AMD RVOL": None,
+        "AMD Reason": "Need 15 completed 5M candles for base + sweep evaluation",
+    }
+    if not isinstance(frame_5m, pd.DataFrame) or len(frame_5m) < 15:
+        return empty
+    try:
+        f = frame_5m.sort_values("Time").drop_duplicates("Time", keep="last").tail(30).copy()
+        for col in ("Open", "High", "Low", "Close", "Volume"):
+            f[col] = pd.to_numeric(f[col], errors="coerce")
+        f = f.dropna(subset=["Open", "High", "Low", "Close", "Volume"])
+        if len(f) < 15:
+            return empty
+        base = f.iloc[-15:-3]
+        recent = f.iloc[-3:]
+        if len(base) < 12:
+            return empty
+        base_high = float(base["High"].max())
+        base_low = float(base["Low"].min())
+        last = recent.iloc[-1]
+        close = float(last["Close"])
+        high = float(last["High"])
+        low = float(last["Low"])
+        base_mid = (base_high + base_low) / 2.0
+        width_pct = ((base_high - base_low) / base_mid * 100.0) if base_mid > 0 else 999.0
+        base_vol = float(base["Volume"].tail(10).mean())
+        prior_vol = float(base["Volume"].head(10).mean())
+        vol_contract = base_vol <= prior_vol * 1.10 if prior_vol > 0 else False
+        rvol = float(last["Volume"] / max(float(f["Volume"].iloc[-21:-1].mean()) if len(f) >= 21 else base_vol, 1.0))
+        accumulation = width_pct <= 2.8 and vol_contract
+        sweep_up = high > base_high and close < base_high and close >= base_low
+        sweep_down = low < base_low and close > base_low and close <= base_high
+        # A distribution leg is accepted only after a prior completed manipulation
+        # candle was observed in the last two bars; no future candle is consulted.
+        prior = recent.iloc[:-1]
+        prior_sweep_up = any(float(x.High) > base_high and float(x.Close) < base_high for x in prior.itertuples())
+        prior_sweep_down = any(float(x.Low) < base_low and float(x.Close) > base_low for x in prior.itertuples())
+        if prior_sweep_down and close > base_high and rvol >= 1.30:
+            stage, signal, reason = "DISTRIBUTION UP", "BUY WATCH", "Sell-side liquidity sweep followed by high-volume close above base"
+        elif prior_sweep_up and close < base_low and rvol >= 1.30:
+            stage, signal, reason = "DISTRIBUTION DOWN", "Buy-side liquidity sweep followed by high-volume close below base"
+        elif sweep_down:
+            stage, signal, reason = "MANIPULATION DOWN-SWEEP", "Sell-side liquidity swept; candle closed back inside base — bullish reversal watch only"
+        elif sweep_up:
+            stage, signal, reason = "MANIPULATION UP-SWEEP", "Buy-side liquidity swept; candle closed back inside base — bearish reversal watch only"
+        elif accumulation:
+            stage, signal, reason = "ACCUMULATION WATCH", "Compressed base with contracting/contained volume; direction not confirmed"
+        else:
+            stage, signal, reason = "NO AMD SETUP", "No completed accumulation → sweep → distribution sequence"
+        return {
+            "AMD Stage": stage, "AMD Signal": signal,
+            "AMD Base High": round(base_high, 2), "AMD Base Low": round(base_low, 2),
+            "AMD RVOL": round(rvol, 2),
+            "AMD Reason": f"{reason}; base width {width_pct:.2f}%",
+        }
+    except Exception as exc:
+        return {**empty, "AMD Reason": f"AMD calculation error: {str(exc)[:120]}"}
+
+
 def _make_result_row(symbol, yahoo_symbol, payload):
     frames = payload.get("frames", {})
     quality = _data_quality_gate(frames)
@@ -2999,6 +3065,7 @@ def _make_result_row(symbol, yahoo_symbol, payload):
     row["1M Candle Close (IST)"] = _last_candle_close_time(payload.get("early_1m", pd.DataFrame()), 1)
     row.update(_prebig_5m_analysis(frame_5m))
     row.update(_advanced_big_movement_analysis(frame_5m, frame_15m, frame_1h))
+    row.update(_amd_stage_analysis(frame_5m, frame_15m))
     row.update(_directional_pre_move_engine(frame_5m))
     pre_direction = row.get("Pre-Move Direction", "WAIT")
     direction_15m = analyses["15M"]["direction"]
@@ -3014,6 +3081,20 @@ def _make_result_row(symbol, yahoo_symbol, payload):
         )
     else:
         row["Pre-Move 15M Alignment"] = "NOT APPLICABLE"
+    # A 1.5R target is displayed only when the source row has a valid entry/stop pair.
+    entry_for_target = _safe_num(row.get("Entry Price"), np.nan)
+    stop_for_target = _safe_num(row.get("Stop Loss"), np.nan)
+    side_for_target = str(row.get("Final Signal", "")).upper()
+    if np.isfinite(entry_for_target) and np.isfinite(stop_for_target) and entry_for_target > 0 and stop_for_target > 0:
+        risk_for_target = abs(entry_for_target - stop_for_target)
+        if risk_for_target > 0 and side_for_target in ("BUY", "PRE-BIG BUY") and stop_for_target < entry_for_target:
+            row["Target Price"] = round(entry_for_target + 1.5 * risk_for_target, 2)
+        elif risk_for_target > 0 and side_for_target in ("SELL", "PRE-BIG SELL") and stop_for_target > entry_for_target:
+            row["Target Price"] = round(entry_for_target - 1.5 * risk_for_target, 2)
+        else:
+            row["Target Price"] = None
+    else:
+        row["Target Price"] = None
     # New early-decision layer is additive; legacy Final Signal and Action Signal stay untouched.
     row.update(_early_signal_decision(row))
     for tf in TIMEFRAMES:
@@ -3237,154 +3318,6 @@ def _scan_batch(batch, period, include_early=True):
     return rows
 
 
-def _to_fyers_equity_symbol(symbol):
-    """Convert scanner universe symbols to FYERS NSE cash-market symbols."""
-    raw = str(symbol or "").strip().upper()
-    if raw.startswith("NSE:"):
-        body = raw[4:]
-    elif raw.startswith("BSE:"):
-        return ""  # This scanner is configured for NSE equity/F&O universe.
-    else:
-        body = raw
-    body = body.replace(".NS", "").replace(".BO", "")
-    for suffix in ("-EQ", "-BE", "-INDEX", "_EQ"):
-        if body.endswith(suffix):
-            body = body[:-len(suffix)]
-    if not body or body in INDEX_NAMES:
-        return ""
-    return f"NSE:{body}-EQ"
-
-
-def _depth_levels(payload):
-    """Return the FYERS symbol depth object across common SDK response wrappers."""
-    if not isinstance(payload, dict):
-        return None
-    data = payload.get("d", payload.get("data", payload))
-    if isinstance(data, dict):
-        # FYERS normally keys d by the requested symbol.
-        for value in data.values():
-            if isinstance(value, dict) and any(k in value for k in ("bids", "ask", "asks")):
-                return value
-        if any(k in data for k in ("bids", "ask", "asks")):
-            return data
-    return None
-
-
-def _normalise_depth_row(symbol, fyers_symbol, response, fetched_at=None):
-    """Convert FYERS 5-level depth into transparent quantities and imbalance."""
-    stamp = fetched_at or datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST")
-    if not isinstance(response, dict) or str(response.get("s", "")).lower() not in ("ok", "success"):
-        message = response.get("message", "FYERS depth response not successful") if isinstance(response, dict) else "Invalid FYERS response"
-        return {"Symbol": symbol, "FYERS Symbol": fyers_symbol, "Depth Status": "DEPTH UNAVAILABLE",
-                "Depth Signal": "N/A", "Best Bid": None, "Best Ask": None, "Spread": None,
-                "Buy Qty (5L)": None, "Sell Qty (5L)": None, "Depth Imbalance %": None,
-                "Depth Time (IST)": stamp, "Depth Message": str(message)[:180]}
-
-    book = _depth_levels(response)
-    if not book:
-        return {"Symbol": symbol, "FYERS Symbol": fyers_symbol, "Depth Status": "DEPTH UNAVAILABLE",
-                "Depth Signal": "N/A", "Best Bid": None, "Best Ask": None, "Spread": None,
-                "Buy Qty (5L)": None, "Sell Qty (5L)": None, "Depth Imbalance %": None,
-                "Depth Time (IST)": stamp, "Depth Message": "No bids/asks in FYERS response"}
-
-    bids = book.get("bids") or book.get("buy") or []
-    asks = book.get("ask") or book.get("asks") or book.get("sell") or []
-
-    def level_price(level):
-        return _safe_num(level.get("price"), np.nan) if isinstance(level, dict) else np.nan
-
-    def level_qty(level):
-        if not isinstance(level, dict):
-            return 0.0
-        return _safe_num(level.get("volume", level.get("qty", level.get("quantity", 0))))
-
-    bids = list(bids)[:5] if isinstance(bids, (list, tuple)) else []
-    asks = list(asks)[:5] if isinstance(asks, (list, tuple)) else []
-    buy_qty = sum(level_qty(x) for x in bids)
-    sell_qty = sum(level_qty(x) for x in asks)
-    bid_prices = [level_price(x) for x in bids]
-    ask_prices = [level_price(x) for x in asks]
-    bid_prices = [x for x in bid_prices if np.isfinite(x) and x > 0]
-    ask_prices = [x for x in ask_prices if np.isfinite(x) and x > 0]
-    best_bid = max(bid_prices) if bid_prices else np.nan
-    best_ask = min(ask_prices) if ask_prices else np.nan
-    spread = best_ask - best_bid if np.isfinite(best_bid) and np.isfinite(best_ask) else np.nan
-    total = buy_qty + sell_qty
-    imbalance = ((buy_qty - sell_qty) / total * 100.0) if total > 0 else np.nan
-    if not bids or not asks or total <= 0:
-        depth_signal = "INSUFFICIENT DEPTH"
-        status = "PARTIAL DEPTH"
-    elif imbalance >= 15:
-        depth_signal, status = "BUY-SIDE DOMINANT", "OK"
-    elif imbalance <= -15:
-        depth_signal, status = "SELL-SIDE DOMINANT", "OK"
-    else:
-        depth_signal, status = "BALANCED", "OK"
-
-    return {
-        "Symbol": symbol, "FYERS Symbol": fyers_symbol, "Depth Status": status,
-        "Depth Signal": depth_signal,
-        "Best Bid": round(best_bid, 2) if np.isfinite(best_bid) else None,
-        "Best Ask": round(best_ask, 2) if np.isfinite(best_ask) else None,
-        "Spread": round(spread, 2) if np.isfinite(spread) else None,
-        "Buy Qty (5L)": int(buy_qty), "Sell Qty (5L)": int(sell_qty),
-        "Depth Imbalance %": round(imbalance, 2) if np.isfinite(imbalance) else None,
-        "Depth Time (IST)": stamp, "Depth Message": "5-level bid/ask quantities; snapshot only",
-    }
-
-
-def _fetch_fyers_depth_shortlist(client, shortlist, limit=FYERS_DEPTH_DEFAULT_LIMIT):
-    """Fetch FYERS depth only for technical BUY/SELL/PRE-BIG shortlist rows.
-
-    Cache is stored in Streamlit session_state. Calls are paced conservatively;
-    missing client/API errors are reported as unavailable, never fabricated.
-    """
-    columns = ["Symbol", "FYERS Symbol", "Depth Status", "Depth Signal", "Best Bid", "Best Ask",
-               "Spread", "Buy Qty (5L)", "Sell Qty (5L)", "Depth Imbalance %", "Depth Time (IST)", "Depth Message"]
-    if shortlist is None or shortlist.empty:
-        return pd.DataFrame(columns=columns)
-
-    cache = st.session_state.setdefault("ma_fyers_depth_cache", {})
-    now = time.time()
-    rows = []
-    selected = shortlist.head(int(limit))
-    if client is None or not callable(getattr(client, "depth", None)):
-        for _, item in selected.iterrows():
-            sym = str(item["Symbol"])
-            fy_sym = _to_fyers_equity_symbol(sym)
-            rows.append(_normalise_depth_row(sym, fy_sym, {"s": "error", "message": "FYERS client/depth() not supplied by app.py"}))
-        return pd.DataFrame(rows, columns=columns)
-
-    last_call = float(st.session_state.get("ma_fyers_depth_last_call", 0.0))
-    for _, item in selected.iterrows():
-        symbol = str(item["Symbol"])
-        fyers_symbol = _to_fyers_equity_symbol(symbol)
-        if not fyers_symbol:
-            rows.append(_normalise_depth_row(symbol, "", {"s": "error", "message": "Unsupported/non-NSE symbol"}))
-            continue
-        cached = cache.get(fyers_symbol)
-        if cached and now - cached.get("ts", 0) < FYERS_DEPTH_CACHE_TTL:
-            rows.append(cached["row"])
-            continue
-
-        wait_for = FYERS_DEPTH_CALL_GAP - (time.time() - last_call)
-        if wait_for > 0:
-            time.sleep(wait_for)
-        try:
-            # FYERS API v3 market-depth endpoint; no history/quotes/orders are called here.
-            response = client.depth(data={"symbol": fyers_symbol, "ohlcv_flag": "1"})
-            row = _normalise_depth_row(symbol, fyers_symbol, response)
-        except Exception as exc:
-            row = _normalise_depth_row(symbol, fyers_symbol, {"s": "error", "message": str(exc)[:180]})
-        last_call = time.time()
-        st.session_state["ma_fyers_depth_last_call"] = last_call
-        cache[fyers_symbol] = {"ts": last_call, "row": row}
-        rows.append(row)
-
-    st.session_state["ma_fyers_depth_cache"] = cache
-    return pd.DataFrame(rows, columns=columns)
-
-
 def _sort_results(result):
     result = result.copy()
     if result.empty:
@@ -3407,7 +3340,7 @@ def _best_stock_analyst(row):
 
     The score is a transparent screening score (0-100), not a probability.
     It rewards multi-timeframe alignment, agent consensus, volume/structure,
-    and optional FYERS depth confirmation.
+    and OHLCV volume/structure confirmation.
     """
     signal = str(row.get("Final Signal", "NO DATA")).upper()
     if signal in ("BUY", "PRE-BIG BUY"):
@@ -3476,13 +3409,9 @@ def _best_stock_analyst(row):
                 structure_votes += 1
     score_structure = min(10.0, structure_votes / 6.0 * 10.0)
 
-    depth = str(row.get("Depth Signal", "") or "").upper()
-    if depth == ("BUY-SIDE DOMINANT" if expected == "BUY" else "SELL-SIDE DOMINANT"):
-        score_depth, depth_note = 10, "FYERS depth aligned"
-    elif depth in ("BUY-SIDE DOMINANT", "SELL-SIDE DOMINANT"):
-        score_depth, depth_note = 0, "FYERS depth opposing"
-    else:
-        score_depth, depth_note = 5, "FYERS depth unavailable/neutral"
+    # No order-book feed is connected. Keep this component neutral; never
+    # infer displayed bid/ask pressure from Yahoo OHLCV candles.
+    score_depth, depth_note = 5, "Order-book depth not available (Yahoo OHLCV only)"
 
     total = int(round(score_consensus + score_alignment + score_agents
                       + score_volume + score_structure + score_depth))
@@ -3533,17 +3462,6 @@ def _direction_movement(row):
     else:
         movement = "MIXED"
 
-    depth = str(row.get("Depth Signal", "") or "").upper()
-    is_up = movement in ("UP", "PRE-BIG UP")
-    is_down = movement in ("DOWN", "PRE-BIG DOWN")
-    if is_up and depth == "SELL-SIDE DOMINANT":
-        return f"CONFLICT ({movement} / FYERS SELL)"
-    if is_down and depth == "BUY-SIDE DOMINANT":
-        return f"CONFLICT ({movement} / FYERS BUY)"
-    if is_up and depth == "BUY-SIDE DOMINANT":
-        return f"{movement} (DEPTH ALIGNED)"
-    if is_down and depth == "SELL-SIDE DOMINANT":
-        return f"{movement} (DEPTH ALIGNED)"
     return movement
 
 
@@ -4275,7 +4193,7 @@ def _merge_remote_candle_cache(url, headers):
     return merged
 
 
-def _load_latest_prescan_to_local_job(universe, batch_size=50, period="59d", depth_limit=10):
+def _load_latest_prescan_to_local_job(universe, batch_size=50, period="59d"):
     """Download a completed cloud pre-scan and hydrate existing SQLite job rows.
 
     The normal V18 report-finalization path then adds its existing AI/18th-agent/UI
@@ -4324,7 +4242,7 @@ def _load_latest_prescan_to_local_job(universe, batch_size=50, period="59d", dep
     config = {
         "universe": universe, "source_symbols": len(symbols), "symbols": symbols,
         "batch_size": int(batch_size), "period": str(period), "include_early": False,
-        "news_enabled": False, "news_limit": 50, "depth_limit": int(depth_limit),
+        "news_enabled": False, "news_limit": 50,
         "prescan_run_id": run["id"], "prescan_completed_at": run.get("completed_at"),
     }
     job_id = _scan_job_create(config)
@@ -5259,7 +5177,7 @@ def show_ai_multi_agent_scanner(client=None):
     st.title("🚀 NSE AI PRO V18 — LIVE MARKET DASHBOARD + SCANNER")
     st.caption("Live Dashboard first • 17 OHLCV agents • Primary: 5M + 15M confirmation • 1H context • supervised ML AI Brain + optional 1M / News")
     _render_live_dashboard()
-    st.info("scanner.py supplies NSE/F&O symbols only (unchanged). Yahoo Finance supplies candles. FYERS is used only for 5-level Market Depth on the technical shortlist.")
+    st.info("scanner.py supplies NSE/F&O symbols only (unchanged). Yahoo Finance supplies candles. Yahoo Finance supplies all OHLCV candles; no external broker depth connection or Market Depth API is used.")
     st.caption("Smart Memory: SQLite candles are loaded first; after the initial warm-up, the scanner refreshes a short 2-day overlap and merges it with saved candles. For speed, the extra 1M/20M scan is optional.")
     st.warning(
         "Yahoo intraday data may be delayed, missing or rate-limited. "
@@ -5349,11 +5267,6 @@ def show_ai_multi_agent_scanner(client=None):
         help="OFF = faster core scan on 5M/15M/1H. ON = also downloads Yahoo 1-minute candles for every stock.",
     )
 
-    depth_limit = st.selectbox(
-        "FYERS Market Depth shortlist limit", [5, 10, 20, 30, 50], index=1,
-        help="FYERS Market Depth is requested only for the strongest BUY/SELL/PRE-BIG rows. Calls are paced and cached.",
-        key="ma_depth_limit",
-    )
 
     auto_col1, auto_col2 = st.columns(2)
     with auto_col1:
@@ -5367,7 +5280,7 @@ def show_ai_multi_agent_scanner(client=None):
         try:
             with st.spinner("Loading latest saved NSE/F&O report..."):
                 loaded_job_id, loaded_run, loaded_count = _load_latest_prescan_to_local_job(
-                    universe, batch_size=batch_size, period=period, depth_limit=depth_limit
+                    universe, batch_size=batch_size, period=period
                 )
             st.session_state["ma_scan_job_id"] = loaded_job_id
             st.session_state.pop("ma_scan_finalized_job", None)
@@ -5479,7 +5392,6 @@ def show_ai_multi_agent_scanner(client=None):
                 "include_early": bool(early_scan_enabled),
                 "news_enabled": bool(news_enabled),
                 "news_limit": int(news_limit),
-                "depth_limit": int(depth_limit),
             }
             job_id = _scan_job_create(config)
             st.session_state["ma_scan_job_id"] = job_id
@@ -5540,7 +5452,6 @@ def show_ai_multi_agent_scanner(client=None):
         early_scan_enabled = bool(saved_job["config"].get("include_early", early_scan_enabled))
         news_enabled = bool(saved_job["config"].get("news_enabled", news_enabled))
         news_limit = int(saved_job["config"].get("news_limit", news_limit))
-        depth_limit = int(saved_job["config"].get("depth_limit", depth_limit))
         all_rows = _scan_job_load_rows(job_id)
         batches = [
             saved_job["config"]["symbols"][i:i + int(saved_job["config"]["batch_size"])]
@@ -5562,8 +5473,8 @@ def show_ai_multi_agent_scanner(client=None):
             return
         restored_from_db = bool(st.session_state.pop("ma_restored_from_db", False))
 
-        # A browser refresh restores technical rows from SQLite. Do not repeat
-        # optional external calls (Yahoo news / FYERS depth) during that restore.
+        # A browser refresh restores technical rows from SQLite. News is optional;
+        # all market prices, candles and technical features come from Yahoo Finance.
         if restored_from_db:
             result["News Agent"] = "NOT FETCHED ON RESTORE" if news_enabled else "DISABLED"
             result["News Score"] = 0
@@ -5571,62 +5482,26 @@ def show_ai_multi_agent_scanner(client=None):
                 "Restored from SQLite; external news call intentionally skipped"
                 if news_enabled else "News disabled"
             )
-
-            depth_candidates = result[result["Final Signal"].isin(
+        elif news_enabled:
+            candidates = result[result["Final Signal"].isin(
                 ["BUY", "SELL", "PRE-BIG BUY", "PRE-BIG SELL"]
-            )].head(depth_limit)
-            depth_columns = [
-                "FYERS Symbol", "Depth Status", "Depth Signal", "Best Bid", "Best Ask",
-                "Spread", "Buy Qty (5L)", "Sell Qty (5L)", "Depth Imbalance %",
-                "Depth Time (IST)", "Depth Message",
-            ]
-            for col in depth_columns:
-                result[col] = None
-            result["Depth Status"] = "NOT FETCHED ON RESTORE"
-            result["Depth Message"] = "Restored from SQLite; FYERS depth call intentionally skipped"
-            depth_table = pd.DataFrame(columns=["Symbol"] + depth_columns)
+            )].head(news_limit)
+            news_map = {}
+            if len(candidates):
+                news_bar = st.progress(0.0)
+                for n, (_, item) in enumerate(candidates.iterrows(), 1):
+                    status.write(f"News context {n}/{len(candidates)}: {item['Symbol']}")
+                    news_map[item["Symbol"]] = _news_agent(item["Yahoo Symbol"])
+                    news_bar.progress(n / len(candidates))
+            default = {"direction": "NOT CHECKED", "score": 0, "reason": "Not in technical shortlist / news limit"}
+            result["News Agent"] = result["Symbol"].map(lambda sym: news_map.get(sym, default)["direction"])
+            result["News Score"] = result["Symbol"].map(lambda sym: news_map.get(sym, default)["score"])
+            result["News Reason"] = result["Symbol"].map(lambda sym: news_map.get(sym, default)["reason"])
         else:
-            if news_enabled:
-                candidates = result[result["Final Signal"].isin(
-                    ["BUY", "SELL", "PRE-BIG BUY", "PRE-BIG SELL"]
-                )].head(news_limit)
-                news_map = {}
-                if len(candidates):
-                    news_bar = st.progress(0.0)
-                    for n, (_, item) in enumerate(candidates.iterrows(), 1):
-                        status.write(f"News context {n}/{len(candidates)}: {item['Symbol']}")
-                        news_map[item["Symbol"]] = _news_agent(item["Yahoo Symbol"])
-                        news_bar.progress(n / len(candidates))
-                default = {"direction": "NOT CHECKED", "score": 0, "reason": "Not in technical shortlist / news limit"}
-                result["News Agent"] = result["Symbol"].map(lambda s: news_map.get(s, default)["direction"])
-                result["News Score"] = result["Symbol"].map(lambda s: news_map.get(s, default)["score"])
-                result["News Reason"] = result["Symbol"].map(lambda s: news_map.get(s, default)["reason"])
-            else:
-                result["News Agent"], result["News Score"], result["News Reason"] = "DISABLED", 0, "News disabled"
+            result["News Agent"], result["News Score"], result["News Reason"] = "DISABLED", 0, "News disabled"
 
-            # FYERS is called ONLY for the technical BUY/SELL/PRE-BIG shortlist.
-            depth_candidates = result[result["Final Signal"].isin(
-                ["BUY", "SELL", "PRE-BIG BUY", "PRE-BIG SELL"]
-            )].head(depth_limit)
-            depth_table = _fetch_fyers_depth_shortlist(client, depth_candidates, depth_limit)
-            if not depth_table.empty:
-                depth_columns = [c for c in depth_table.columns if c != "Symbol"]
-                result = result.merge(depth_table[["Symbol"] + depth_columns], on="Symbol", how="left")
-            else:
-                for col in ["FYERS Symbol", "Depth Status", "Depth Signal", "Best Bid", "Best Ask", "Spread",
-                            "Buy Qty (5L)", "Sell Qty (5L)", "Depth Imbalance %", "Depth Time (IST)", "Depth Message"]:
-                    result[col] = None
-            # Rows outside the technical shortlist must never receive FYERS depth data.
-            result.loc[~result["Final Signal"].isin(["BUY", "SELL", "PRE-BIG BUY", "PRE-BIG SELL"]),
-                       ["FYERS Symbol", "Depth Status", "Depth Signal", "Best Bid", "Best Ask", "Spread",
-                        "Buy Qty (5L)", "Sell Qty (5L)", "Depth Imbalance %", "Depth Time (IST)", "Depth Message"]] = None
-
-        st.session_state["multi_agent_depth"] = depth_table
-
-        # Direction Movement includes BUY/SELL and PRE-BIG direction votes.
-        # FYERS displayed depth only annotates alignment/conflict; it is not flow.
+        # Direction Movement and the 18th ranking analyst use Yahoo OHLCV features only.
         result["Direction Movement"] = result.apply(_direction_movement, axis=1)
-        # 18th Agent runs after technical consensus and optional FYERS depth are available.
         analyst = result.apply(_best_stock_analyst, axis=1, result_type="expand")
         result = pd.concat([result, analyst], axis=1)
 
@@ -5653,14 +5528,9 @@ def show_ai_multi_agent_scanner(client=None):
             "file_stamp": stamp.strftime("%Y%m%d_%H%M%S"),
         }
         if restored_from_db:
-            status.success(
-                f"Restored {len(result)} Yahoo rows from SQLite. News and FYERS depth were not re-fetched."
-            )
+            status.success(f"Restored {len(result)} Yahoo Finance rows from SQLite.")
         else:
-            status.success(
-                f"Scan completed: {len(result)} Yahoo rows; FYERS depth requested for "
-                f"{len(depth_candidates)} shortlisted stocks (limit {depth_limit})."
-            )
+            status.success(f"Scan completed: {len(result)} Yahoo Finance rows. No external broker depth calls were made.")
         st.session_state["ma_scan_finalized_job"] = job_id
         with _memory_connect() as conn:
             conn.execute(
@@ -5789,8 +5659,6 @@ def show_ai_multi_agent_scanner(client=None):
     for col_name, default_value in new_signal_defaults.items():
         if col_name not in result.columns:
             result[col_name] = default_value
-    if "Depth Signal" not in result.columns:
-        result["Depth Signal"] = None
     if "Confirmation Strength %" not in result.columns:
         result["Confirmation Strength %"] = 0
     if "Best Stock Score" not in result.columns:
@@ -5831,10 +5699,9 @@ def show_ai_multi_agent_scanner(client=None):
         "Liquidity State", "Upside Sweep", "Downside Sweep",
         "Buy-side Liquidity", "Sell-side Liquidity", "Big Volume Class", "Big Volume Side",
         "5M RVOL", "15M RVOL", "5M", "15M", "1H",
-        "Buy Qty (5L)", "Sell Qty (5L)", "Depth Imbalance %", "Depth Status",
         "Signal Time (IST)", "Scan Time (IST)", "Best Stock Reason",
     ] if c in quick_view.columns]
-    st.caption("5M = primary trigger • 15M = direction confirmation • 1H = context. PRE-BIG = early watch, not confirmed. FYERS depth is fetched only for the technical shortlist; depth is visible orders, not executed volume.")
+    st.caption("5M = primary trigger • 15M = direction confirmation • 1H = context. PRE-BIG = early watch, not confirmed. Order-book depth is not included; Yahoo Finance OHLCV is the only market-data source.")
     _show_blink_score_table(quick_view[quick_cols].head(300), score_col="Best Stock Score", threshold=80)
 
     with st.expander("🔎 ADVANCED REPORTS — LIQUIDITY, SWEEPS, AI, BIG MOVE & AGENT DETAILS", expanded=False):
@@ -5994,47 +5861,75 @@ def show_ai_multi_agent_scanner(client=None):
             st.info("ప్రస్తుతం 1M/5M ముందస్తు setup + 15M దిశ సరిపోలిన signal లేదు. WAIT అనేది కూడా valid result.")
         st.caption("Early Evidence Score is a screening score, not a probability. 1M/5M signals are WATCH only until confirmation; breakout needs retest/continuation checks. Legacy Final Signal and Action Signal remain unchanged.")
 
-        # Liquidity & sweep event-time panel (15M reference; timestamps are completed-candle close times).
-        st.subheader("💧 BUY / SELL LIQUIDITY + SWEEP SIGNAL TIME (IST)")
-        liquidity_time_cols = [
-            "Symbol", "Last Price", "Buy-side Liquidity", "Buy-side Liquidity Time (IST)",
-            "Sell-side Liquidity", "Sell-side Liquidity Time (IST)",
-            "Upside Sweep", "Upside Sweep Time (IST)",
-            "Downside Sweep", "Downside Sweep Time (IST)", "Liquidity Sweep Detail",
-            "15M Buy-side Liquidity", "15M Buy-side Liquidity Time (IST)",
-            "15M Sell-side Liquidity", "15M Sell-side Liquidity Time (IST)",
-            "15M Upside Sweep", "15M Upside Sweep Time (IST)",
-            "15M Downside Sweep", "15M Downside Sweep Time (IST)",
-        ]
-        liquidity_time_cols = [c for c in liquidity_time_cols if c in result.columns]
-        liquidity_event_mask = (
-            result.get("15M Upside Sweep", pd.Series("NO", index=result.index)).eq("YES")
-            | result.get("15M Downside Sweep", pd.Series("NO", index=result.index)).eq("YES")
-        )
-        liquidity_panel = result.loc[liquidity_event_mask, liquidity_time_cols].copy()
-        if not liquidity_panel.empty:
-            st.dataframe(liquidity_panel, hide_index=True, height=300, **_stretch())
-        else:
-            st.info("ప్రస్తుతం 15M completed candleలో confirmed Sweep Up / Sweep Down signal లేదు. Liquidity levels మరియు వాటి formation times క్రింది main reportలో ఉంటాయి.")
-        st.caption("Liquidity Time = ఆ liquidity level ఏర్పడిన pivot candle close time. Sweep Time = sweep confirm అయిన completed candle close time. అన్ని timestamps IST.")
+        big_move_tab, liquidity_tab = st.tabs(["🚀 BIG MOVE STOCKS", "💧 LIQUIDITY SIGNALS"])
 
-        st.subheader("🚀 V18 ADVANCED BIG MOVEMENT — FALSE BREAKOUT + CONTINUATION")
-        advanced_cols = [c for c in [
-            "Symbol", "Last Price", "Advanced Big Move", "Big Move Direction", "Big Move Score",
-            "False Breakout Risk", "Breakout Retest Status", "5M Retest Check", "15M Trend Check", "Momentum Continuation",
-            "Big Move Range High", "Big Move Range Low", "Big Move RVOL", "Big Move Reason",
-        ] if c in result.columns]
-        advanced_view = result[result.get("Advanced Big Move", pd.Series(index=result.index, dtype=str)).isin([
-            "PRE-BIG WATCH", "BREAKOUT DETECTED", "BREAKDOWN DETECTED", "RETEST WAITING",
-            "BUY CONFIRMED", "SELL CONFIRMED", "RETEST HELD — 15M WAIT",
-            "RETEST REJECTED — 15M WAIT", "FALSE BREAKOUT RISK", "WAIT — SESSION WARM-UP",
-        ])].copy()
-        if not advanced_view.empty:
-            advanced_view = advanced_view.sort_values("Big Move Score", ascending=False)
-            st.dataframe(advanced_view[advanced_cols], hide_index=True, height=420, **_stretch())
-        else:
-            st.info("No advanced big-movement setup currently meets the screening conditions.")
-        st.caption("Big Move Score is a rule-based screening score, not a probability or guaranteed return. Retest and continuation require subsequent completed candles; validate using historical trade backtesting.")
+        with big_move_tab:
+            st.subheader("🚀 BIG MOVE STOCKS — PRE-BIG / BREAKOUT / FALSE BREAKOUT")
+            advanced_cols = [c for c in [
+                "Symbol", "Last Price", "Advanced Big Move", "Big Move Direction", "Big Move Score",
+                "False Breakout Risk", "Breakout Retest Status", "5M Retest Check", "15M Trend Check",
+                "Momentum Continuation", "Big Move Range High", "Big Move Range Low",
+                "Big Move RVOL", "Big Move Reason", "Entry Price", "Stop Loss", "Target Price",
+                "AMD Stage", "AMD Signal", "AMD Base High", "AMD Base Low", "AMD RVOL", "AMD Reason",
+            ] if c in result.columns]
+            big_move_statuses = [
+                "PRE-BIG WATCH", "BREAKOUT DETECTED", "BREAKDOWN DETECTED", "RETEST WAITING",
+                "BUY CONFIRMED", "SELL CONFIRMED", "RETEST HELD — 15M WAIT",
+                "RETEST REJECTED — 15M WAIT", "FALSE BREAKOUT RISK", "WAIT — SESSION WARM-UP",
+            ]
+            big_move_mask = result.get("Advanced Big Move", pd.Series(index=result.index, dtype=str)).isin(big_move_statuses)
+            amd_mask = result.get("AMD Stage", pd.Series("NO AMD SETUP", index=result.index)).astype(str).ne("NO AMD SETUP")
+            advanced_view = result.loc[big_move_mask | amd_mask].copy()
+            if not advanced_view.empty:
+                advanced_view = advanced_view.sort_values("Big Move Score", ascending=False)
+                st.dataframe(advanced_view[advanced_cols], hide_index=True, height=440, **_stretch())
+            else:
+                st.info("No advanced Big Move setup currently meets the screening conditions. WAIT is valid; no signal is forced.")
+            st.caption("Big Move Score is a rule-based screening score, not a probability or guaranteed return. AMD Stage is a rule-based OHLCV approximation, not proof of institutional orders. Validate entries with historical trade backtesting.")
+
+        with liquidity_tab:
+            st.subheader("💧 BUY / SELL LIQUIDITY + SWEEP SIGNALS")
+            liquidity_time_cols = [
+                "Symbol", "Last Price", "Buy-side Liquidity", "Buy-side Liquidity Time (IST)",
+                "Sell-side Liquidity", "Sell-side Liquidity Time (IST)",
+                "Upside Sweep", "Upside Sweep Time (IST)",
+                "Downside Sweep", "Downside Sweep Time (IST)", "Liquidity Sweep Detail",
+                "5M Buy-side Liquidity", "5M Buy-side Liquidity Time (IST)",
+                "5M Sell-side Liquidity", "5M Sell-side Liquidity Time (IST)",
+                "5M Upside Sweep", "5M Upside Sweep Time (IST)",
+                "5M Downside Sweep", "5M Downside Sweep Time (IST)",
+                "15M Buy-side Liquidity", "15M Buy-side Liquidity Time (IST)",
+                "15M Sell-side Liquidity", "15M Sell-side Liquidity Time (IST)",
+                "15M Upside Sweep", "15M Upside Sweep Time (IST)",
+                "15M Downside Sweep", "15M Downside Sweep Time (IST)",
+                "1H Buy-side Liquidity", "1H Buy-side Liquidity Time (IST)",
+                "1H Sell-side Liquidity", "1H Sell-side Liquidity Time (IST)",
+                "1H Upside Sweep", "1H Upside Sweep Time (IST)",
+                "1H Downside Sweep", "1H Downside Sweep Time (IST)",
+            ]
+            liquidity_time_cols = [c for c in liquidity_time_cols if c in result.columns]
+            has_level = pd.Series(False, index=result.index)
+            for col in ("Buy-side Liquidity", "Sell-side Liquidity", "5M Buy-side Liquidity",
+                        "5M Sell-side Liquidity", "15M Buy-side Liquidity", "15M Sell-side Liquidity",
+                        "1H Buy-side Liquidity", "1H Sell-side Liquidity"):
+                if col in result.columns:
+                    has_level |= pd.to_numeric(result[col], errors="coerce").notna()
+            has_sweep = (
+                result.get("Upside Sweep", pd.Series("NO", index=result.index)).eq("YES")
+                | result.get("Downside Sweep", pd.Series("NO", index=result.index)).eq("YES")
+                | result.get("15M Upside Sweep", pd.Series("NO", index=result.index)).eq("YES")
+                | result.get("15M Downside Sweep", pd.Series("NO", index=result.index)).eq("YES")
+                | result.get("5M Upside Sweep", pd.Series("NO", index=result.index)).eq("YES")
+                | result.get("5M Downside Sweep", pd.Series("NO", index=result.index)).eq("YES")
+                | result.get("1H Upside Sweep", pd.Series("NO", index=result.index)).eq("YES")
+                | result.get("1H Downside Sweep", pd.Series("NO", index=result.index)).eq("YES")
+            )
+            liquidity_panel = result.loc[has_level | has_sweep, liquidity_time_cols].copy()
+            if not liquidity_panel.empty:
+                st.dataframe(liquidity_panel, hide_index=True, height=440, **_stretch())
+            else:
+                st.info("ప్రస్తుతం completed candles ఆధారంగా confirmed liquidity levels / sweep signals లేవు. Signal లేనప్పుడు కల్పిత data చూపించము.")
+            st.caption("BUY-side liquidity = previous swing highs పైన; SELL-side liquidity = previous swing lows కింద. Sweep UP = highs తీసుకొని close తిరిగి కిందకు; Sweep DOWN = lows తీసుకొని close తిరిగి పైకి. Level Time = pivot candle close; Sweep Time = confirmation candle close. All times IST.")
 
         # 18th Agent report: rank only qualified, actionable stocks.
         st.subheader("🏆 BEST PERFORMANCE STOCKS — 18th Ranking Analyst")
@@ -6044,7 +5939,7 @@ def show_ai_multi_agent_scanner(client=None):
         best_cols = [
             "Symbol", "Best Stock Side", "Final Signal", "Action Signal", "Breakout Signal", "Best Stock Score",
             "Best Stock Grade", "Entry Price", "Stop Loss", "Last Price",
-            "Signal Time (IST)", "5M", "15M", "1H", "Depth Signal",
+            "Signal Time (IST)", "5M", "15M", "1H",
             "Best Stock Reason",
         ]
         best = result[
@@ -6129,6 +6024,7 @@ def show_ai_multi_agent_scanner(client=None):
             "Advanced Big Move", "Big Move Direction", "Big Move Score", "False Breakout Risk",
             "Breakout Retest Status", "5M Retest Check", "15M Trend Check", "Momentum Continuation", "Big Move Range High",
             "Big Move Range Low", "Big Move RVOL", "Big Move Reason",
+            "AMD Stage", "AMD Signal", "AMD Base High", "AMD Base Low", "AMD RVOL", "AMD Reason", "Target Price",
             "18th Agent", "Best Stock Score", "Best Stock Side", "Best Stock Grade",
             "Best Stock Filter", "Best Stock Reason",
             "Early Signal", "Early Direction", "Early Evidence Score", "Early Confirmation",
@@ -6137,9 +6033,7 @@ def show_ai_multi_agent_scanner(client=None):
             "20M Range %", "20M RVOL", "20M Pressure %", "20M Last Close", "20M Reason",
             "5M", "15M", "1H", "5M Score", "15M Score", "1H Score",
             "5M Candles", "15M Candles", "1H Candles", "Last Price", "15M RSI",
-            "News Agent", "News Score", "News Reason", "Depth Status", "Depth Signal",
-            "Best Bid", "Best Ask", "Spread", "Buy Qty (5L)", "Sell Qty (5L)",
-            "Depth Imbalance %", "Depth Time (IST)", "Errors",
+            "News Agent", "News Score", "News Reason", "Errors",
         ]
         st.subheader("🚀 EARLY BIG MOVE CATCHER — 5M Compression + Volume Build-up")
         st.caption(f"{int(result.get('Symbol', pd.Series(dtype=str)).nunique()):,} unique scanned symbols: 13 completed 5M candles today (12-bar base + 1 completed trigger candle), rising volume and directional bias; breakout is confirmed only after a completed candle closes beyond the range with strong body and RVOL.")
@@ -6161,21 +6055,6 @@ def show_ai_multi_agent_scanner(client=None):
         st.caption(f"Showing top 300 of {len(view):,} rows in the main table. Full results remain available in CSV/Excel.")
         _show_blink_score_table(view[summary_cols].head(300), score_col="Best Stock Score", threshold=80)
 
-        st.subheader("📚 FYERS Live Market Depth — Shortlist Only")
-        depth_view = st.session_state.get("multi_agent_depth")
-        if isinstance(depth_view, pd.DataFrame) and not depth_view.empty:
-            st.caption(
-                f"FYERS depth requests: {len(depth_view)} • cache TTL: {FYERS_DEPTH_CACHE_TTL}s • "
-                "one request per symbol, paced at approximately one call/second."
-            )
-            st.dataframe(depth_view, hide_index=True, **_stretch())
-            st.caption(
-                "Buy Qty / Sell Qty = sum of displayed first five bid/ask levels. "
-                "Depth Imbalance = (Buy Qty − Sell Qty) ÷ total × 100. "
-                "This is a displayed-book snapshot, not executed buying/selling or a guaranteed direction."
-            )
-        else:
-            st.info("No BUY / SELL / PRE-BIG shortlist rows yet, or Market Depth has not been requested.")
         st.caption("CSV/Excel include all 51 timeframe-agent outputs, the Real AI Brain fields and the 18th Best Stock Analyst report and each agent reason. 5M PRE-BIG fields are calculated in the core scan; 20M early-movement fields need the optional 1M scan.")
         st.caption("Signal Time = latest completed 15M candle close (IST). Entry = 15M close. Stop Loss = 1.5 × 15M ATR; shown only for BUY/SELL and PRE-BIG signals.")
 
@@ -6221,7 +6100,7 @@ def show_ai_multi_agent_scanner(client=None):
             "it predicts the next 3-candle direction using a purged chronological holdout. "
             "Its class vote fractions are uncalibrated model estimates, not calibrated probabilities. "
             "The 18th Best Stock Analyst ranks actionable signals using timeframe alignment, "
-            "agent agreement, volume, structure and optional FYERS depth. It is a transparent "
+            "agent agreement, volume, structure and OHLCV volume/structure context. It is a transparent "
             "screening score, not a probability or an independent AI language model. News is a separate keyword-based "
             "headline context check, not a standalone trade signal. Chart Pattern uses OHLCV, "
             "not chart screenshots. Signals are screening outputs, not guaranteed entries."
