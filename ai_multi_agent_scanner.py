@@ -14,6 +14,7 @@ Yahoo Finance batch edition — advanced movement + false-breakout audit + Live 
 - AI model vote fractions are labelled MODEL ESTIMATES, never probabilities without calibrated out-of-sample trade backtesting.
 - Optional Yahoo headline context for the strongest technical shortlist.
 - Live Dashboard: one-minute display refresh, immutable signal events, and 1/5/10/15/30-minute Yahoo price snapshots.
+- Additive Pine-compatible 15M liquidity pivots/sweeps with separate pivot, confirmation, and sweep timestamps.
 - Compatible entry point: show_ai_multi_agent_scanner(client=None)
 
 requirements.txt:
@@ -220,6 +221,21 @@ def _memory_connect():
                         if col_name not in liq_columns:
                             conn.execute(f"ALTER TABLE liquidity_sweep_events ADD COLUMN {col_name} REAL")
                     conn.execute("CREATE INDEX IF NOT EXISTS idx_liquidity_events_time ON liquidity_sweep_events(signal_time_ist)")
+                    # Separate Pine-compatible 15M pivot/sweep ledger; existing event tables remain untouched.
+                    conn.execute("""CREATE TABLE IF NOT EXISTS pine_15m_liquidity_events (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        event_key TEXT NOT NULL UNIQUE,
+                        symbol TEXT NOT NULL,
+                        event_type TEXT NOT NULL,
+                        direction TEXT,
+                        level REAL,
+                        level_time_ist TEXT,
+                        confirmed_time_ist TEXT,
+                        sweep_time_ist TEXT,
+                        captured_at_ist TEXT NOT NULL,
+                        status TEXT NOT NULL DEFAULT 'WATCH'
+                    )""")
+                    conn.execute("CREATE INDEX IF NOT EXISTS idx_pine15_liq_time ON pine_15m_liquidity_events(captured_at_ist)")
                     conn.execute("""CREATE TABLE IF NOT EXISTS volume_expansion_events (
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
                         event_key TEXT NOT NULL UNIQUE,
@@ -889,6 +905,7 @@ def _render_live_dashboard_body():
         st.warning(f"Yahoo price update issue: {refresh_result['error']}. Last saved prices are retained and labelled by age.")
 
     _render_live_stock_boards()
+    _render_pine_15m_liquidity_panel()
     if events.empty:
         cols = st.columns(4)
         for col, label in zip(cols, ("Active Signals", "Fresh Signals", "Breakout Events", "Tracked Stocks")):
@@ -1399,6 +1416,195 @@ def _liquidity_levels_and_sweeps(df, lookback=30, timeframe_minutes=15):
         "Volume Signal": volume_signal,
         "Candle Direction": candle_direction,
     }
+
+
+def _pine_15m_liquidity_engine(df, pivot_len=5, atr_len=14, equal_atr_tolerance=0.15):
+    """Python port of the supplied Pine v6 15M pivot/equal-level/sweep rules.
+
+    Input must contain completed 15-minute OHLCV candles. Pivot labels use the
+    pivot candle's opening timestamp; confirmation uses the right-hand candle
+    close timestamp; sweep uses the actual trigger candle close timestamp.
+    """
+    empty = {
+        "Pine 15M Buy-side Liquidity": None, "Pine 15M Sell-side Liquidity": None,
+        "Pine 15M Buy Level Time (IST)": None, "Pine 15M Sell Level Time (IST)": None,
+        "Pine 15M Buy Pivot Confirmed (IST)": None, "Pine 15M Sell Pivot Confirmed (IST)": None,
+        "Pine 15M Equal High": "NO", "Pine 15M Equal Low": "NO",
+        "Pine 15M Buy-side Swept": "NO", "Pine 15M Sell-side Swept": "NO",
+        "Pine 15M Buy-side Sweep Time (IST)": None, "Pine 15M Sell-side Sweep Time (IST)": None,
+        "Pine 15M Sweep Detail": "NO DATA", "Pine 15M Signal Status": "NO DATA",
+        "Pine 15M Candle Volume": None, "Pine 15M Average Volume 20": None,
+        "Pine 15M RVOL": None,
+    }
+    required = {"Time", "Open", "High", "Low", "Close", "Volume"}
+    if not isinstance(df, pd.DataFrame) or not required.issubset(df.columns):
+        return empty
+    d = df[list(required)].copy()
+    d["Time"] = pd.to_datetime(d["Time"], errors="coerce")
+    for col in ("Open", "High", "Low", "Close", "Volume"):
+        d[col] = pd.to_numeric(d[col], errors="coerce")
+    d = d.dropna().sort_values("Time").drop_duplicates("Time", keep="last").reset_index(drop=True)
+    min_pivot_bars = 2 * pivot_len + 1
+    if len(d) < min_pivot_bars:
+        out = dict(empty)
+        out["Pine 15M Signal Status"] = f"NEED {min_pivot_bars} COMPLETED 15M CANDLES FOR PIVOT; HAVE {len(d)}"
+        return out
+
+    # Wilder ATR(14), matching ta.atr(14) rather than a simple rolling range.
+    prev_close = d["Close"].shift(1)
+    tr = pd.concat([(d["High"]-d["Low"]), (d["High"]-prev_close).abs(),
+                    (d["Low"]-prev_close).abs()], axis=1).max(axis=1)
+    atr_series = tr.ewm(alpha=1.0/atr_len, adjust=False, min_periods=atr_len).mean()
+    atr_now = _safe_num(atr_series.iloc[-1], 0.0)
+
+    piv_hi, piv_lo = [], []
+    highs, lows = d["High"].to_numpy(float), d["Low"].to_numpy(float)
+    # ta.pivothigh/low(left=pivot_len,right=pivot_len): confirmed only after right bars.
+    for center in range(pivot_len, len(d)-pivot_len):
+        left_h, right_h = highs[center-pivot_len:center], highs[center+1:center+pivot_len+1]
+        left_l, right_l = lows[center-pivot_len:center], lows[center+1:center+pivot_len+1]
+        if highs[center] >= np.max(left_h) and highs[center] > np.max(right_h):
+            piv_hi.append((center, float(highs[center]), center+pivot_len))
+        if lows[center] <= np.min(left_l) and lows[center] < np.min(right_l):
+            piv_lo.append((center, float(lows[center]), center+pivot_len))
+
+    last_hi = piv_hi[-1] if piv_hi else None
+    prev_hi = piv_hi[-2] if len(piv_hi) >= 2 else None
+    last_lo = piv_lo[-1] if piv_lo else None
+    prev_lo = piv_lo[-2] if len(piv_lo) >= 2 else None
+    last = d.iloc[-1]
+    opn, high, low, close = (_safe_num(last[k]) for k in ("Open", "High", "Low", "Close"))
+    body = abs(close-opn)
+    upper_wick = high-max(opn, close)
+    lower_wick = min(opn, close)-low
+    vol_avg = _safe_num(d["Volume"].iloc[-21:-1].mean(), 0.0) if len(d) >= 21 else 0.0
+    candle_vol = _safe_num(last["Volume"], 0.0)
+    rvol = candle_vol/vol_avg if vol_avg > 0 else 0.0
+
+    def fmt_time(value, close_bar=False):
+        try:
+            ts = pd.Timestamp(value)
+            ts = ts.tz_localize(IST) if ts.tzinfo is None else ts.tz_convert(IST)
+            if close_bar:
+                ts += pd.Timedelta(minutes=15)
+            return ts.strftime("%Y-%m-%d %H:%M:%S IST")
+        except Exception:
+            return None
+
+    buy_swept = bool(last_hi and high > last_hi[1] and close < last_hi[1] and upper_wick > body)
+    sell_swept = bool(last_lo and low < last_lo[1] and close > last_lo[1] and lower_wick > body)
+    # Pine equal-level test compares the last two confirmed pivots using current ATR.
+    eq_tol = atr_now * float(equal_atr_tolerance)
+    equal_high = bool(last_hi and prev_hi and abs(last_hi[1]-prev_hi[1]) <= eq_tol)
+    equal_low = bool(last_lo and prev_lo and abs(last_lo[1]-prev_lo[1]) <= eq_tol)
+
+    if buy_swept and sell_swept:
+        detail = "BOTH-SIDE SWEEP — WAIT FOR NEXT CANDLE"
+    elif buy_swept:
+        detail = "BUY-SIDE LIQUIDITY SWEPT — BEARISH REJECTION"
+    elif sell_swept:
+        detail = "SELL-SIDE LIQUIDITY SWEPT — BULLISH REJECTION"
+    else:
+        detail = "NO CONFIRMED SWEEP"
+
+    return {
+        "Pine 15M Buy-side Liquidity": round(last_hi[1], 2) if last_hi else None,
+        "Pine 15M Sell-side Liquidity": round(last_lo[1], 2) if last_lo else None,
+        "Pine 15M Buy Level Time (IST)": fmt_time(d["Time"].iloc[last_hi[0]]) if last_hi else None,
+        "Pine 15M Sell Level Time (IST)": fmt_time(d["Time"].iloc[last_lo[0]]) if last_lo else None,
+        "Pine 15M Buy Pivot Confirmed (IST)": fmt_time(d["Time"].iloc[last_hi[2]], True) if last_hi else None,
+        "Pine 15M Sell Pivot Confirmed (IST)": fmt_time(d["Time"].iloc[last_lo[2]], True) if last_lo else None,
+        "Pine 15M Equal High": "YES" if equal_high else "NO",
+        "Pine 15M Equal Low": "YES" if equal_low else "NO",
+        "Pine 15M Buy-side Swept": "YES" if buy_swept else "NO",
+        "Pine 15M Sell-side Swept": "YES" if sell_swept else "NO",
+        "Pine 15M Buy-side Sweep Time (IST)": fmt_time(last["Time"], True) if buy_swept else None,
+        "Pine 15M Sell-side Sweep Time (IST)": fmt_time(last["Time"], True) if sell_swept else None,
+        "Pine 15M Sweep Detail": detail,
+        "Pine 15M Signal Status": "CONFIRMED SWEEP" if (buy_swept or sell_swept) else "LEVEL WATCH",
+        "Pine 15M Candle Volume": round(candle_vol, 2),
+        "Pine 15M Average Volume 20": round(vol_avg, 2) if vol_avg > 0 else None,
+        "Pine 15M RVOL": round(rvol, 2),
+    }
+
+
+def _capture_pine_15m_liquidity_events(result, reference_time=None):
+    """Save Pine-style 15M levels and sweeps with separate pivot/confirm/sweep times."""
+    if not isinstance(result, pd.DataFrame) or result.empty:
+        return 0
+    now = _as_ist_timestamp(reference_time) or pd.Timestamp.now(tz=IST)
+    captured = now.isoformat(timespec="seconds")
+    rows = []
+    for _, row in result.iterrows():
+        if str(row.get("Data Quality", "PASS")).upper() != "PASS":
+            continue
+        symbol = str(row.get("Symbol", "")).strip()
+        if not symbol:
+            continue
+        specs = [
+            ("BUY-SIDE LEVEL", "Pine 15M Buy-side Liquidity", "Pine 15M Buy Level Time (IST)", "Pine 15M Buy Pivot Confirmed (IST)", None, "BUY"),
+            ("SELL-SIDE LEVEL", "Pine 15M Sell-side Liquidity", "Pine 15M Sell Level Time (IST)", "Pine 15M Sell Pivot Confirmed (IST)", None, "SELL"),
+            ("BUY-SIDE SWEEP", "Pine 15M Buy-side Liquidity", "Pine 15M Buy Level Time (IST)", "Pine 15M Buy Pivot Confirmed (IST)", "Pine 15M Buy-side Sweep Time (IST)", "DOWN"),
+            ("SELL-SIDE SWEEP", "Pine 15M Sell-side Liquidity", "Pine 15M Sell Level Time (IST)", "Pine 15M Sell Pivot Confirmed (IST)", "Pine 15M Sell-side Sweep Time (IST)", "UP"),
+        ]
+        for event_type, level_col, level_time_col, confirm_col, sweep_col, direction in specs:
+            if sweep_col and str(row.get(sweep_col, "NO")).upper() != "YES":
+                continue
+            level = _safe_num(row.get(level_col), np.nan)
+            level_time = _as_ist_timestamp(row.get(level_time_col))
+            confirmed = _as_ist_timestamp(row.get(confirm_col))
+            sweep_time = _as_ist_timestamp(row.get(sweep_col)) if sweep_col else None
+            event_time = sweep_time if sweep_col else confirmed
+            if not np.isfinite(level) or level_time is None or confirmed is None or event_time is None:
+                continue
+            # For a sweep, only persist a fresh candle event; pivot-level history is still retained.
+            if sweep_col and not _is_fresh_signal_time(sweep_time, now=now):
+                continue
+            key_time = sweep_time.isoformat(timespec="seconds") if sweep_col else level_time.isoformat(timespec="seconds")
+            event_key = f"{symbol}|{event_type}|{key_time}|{level:.6f}"
+            rows.append((event_key, symbol, event_type, direction, float(level),
+                         level_time.isoformat(timespec="seconds"), confirmed.isoformat(timespec="seconds"),
+                         sweep_time.isoformat(timespec="seconds") if sweep_time is not None else None,
+                         captured, "CONFIRMED SWEEP" if sweep_col else "LEVEL WATCH"))
+    if not rows:
+        return 0
+    with _memory_connect() as conn:
+        before = conn.total_changes
+        conn.executemany("""INSERT OR IGNORE INTO pine_15m_liquidity_events
+            (event_key,symbol,event_type,direction,level,level_time_ist,confirmed_time_ist,
+             sweep_time_ist,captured_at_ist,status) VALUES (?,?,?,?,?,?,?,?,?,?)""", rows)
+        return conn.total_changes-before
+
+
+def _render_pine_15m_liquidity_panel():
+    """Dedicated board: never mix pivot time with sweep candle time."""
+    st.markdown("#### 💧 PINE-MATCHED 15M LIQUIDITY — LEVEL / CONFIRM / SWEEP TIMES")
+    try:
+        with _memory_connect() as conn:
+            df = pd.read_sql_query("""SELECT symbol,event_type,direction,level,level_time_ist,
+                confirmed_time_ist,sweep_time_ist,captured_at_ist,status
+                FROM pine_15m_liquidity_events ORDER BY captured_at_ist DESC LIMIT 500""", conn)
+    except Exception as exc:
+        st.warning(f"15M Liquidity ledger unavailable: {exc}")
+        return
+    if df.empty:
+        st.info("Pine-compatible 15M Liquidity events ఇంకా లేవు. Completed 15M candles scan అయిన తర్వాత కనిపిస్తాయి.")
+        return
+    for col in ("level_time_ist", "confirmed_time_ist", "sweep_time_ist", "captured_at_ist"):
+        parsed = pd.to_datetime(df[col], errors="coerce", utc=True).dt.tz_convert(IST)
+        df[col.replace("_ist", " (IST)")] = parsed.dt.strftime("%H:%M:%S").fillna("—")
+    now = pd.Timestamp.now(tz=IST)
+    sweep_stamps = pd.to_datetime(df["sweep_time_ist"], errors="coerce", utc=True).dt.tz_convert(IST)
+    age = (now-sweep_stamps).dt.total_seconds()/60.0
+    df["Signal Age (min)"] = age.round(1)
+    df["Freshness"] = np.where(sweep_stamps.isna(), "LEVEL WATCH", np.where(age <= 15, "FRESH", "EXPIRED"))
+    view = df.rename(columns={"symbol":"Stock", "event_type":"Event", "direction":"Bias", "level":"Liquidity Level"})
+    cols = ["Stock", "Event", "Bias", "Liquidity Level", "level_time (IST)", "confirmed_time (IST)",
+            "sweep_time (IST)", "captured_at (IST)", "Signal Age (min)", "Freshness"]
+    # The generated display labels above are based on source column names.
+    cols = [c for c in cols if c in view.columns]
+    st.dataframe(view[cols].head(250), hide_index=True, use_container_width=True)
+    st.caption("Level Time = pivot candle; Confirmed Time = candle close after 5 right-hand candles; Sweep Time = actual sweep candle close. A level WATCH is not a BUY/SELL entry.")
 
 
 def _breakout_breakdown_signal(df, lookback=20):
@@ -2811,6 +3017,8 @@ def _make_result_row(symbol, yahoo_symbol, payload):
             row[f"{tf} {key}"] = value
     # Keep simple unprefixed fields for the main report, using 15M as the reference.
     row.update(_liquidity_levels_and_sweeps(frame_15m, timeframe_minutes=15))
+    # Additive Pine-compatible 15M pivot/sweep calculation; legacy liquidity fields stay intact.
+    row.update(_pine_15m_liquidity_engine(frame_15m, pivot_len=5, atr_len=14, equal_atr_tolerance=0.15))
     row.update(_extra_formulas(frame_5m, row))
     row.update(_breakout_breakdown_signal(frame_15m))
     row.update(_multi_tf_breakout(frames))
@@ -4635,6 +4843,7 @@ def _capture_all_dashboard_events(result, reference_time=None):
     counts = {}
     for name, fn in (("signals", _capture_signal_events),
                      ("liquidity_sweeps", _capture_liquidity_sweep_events),
+                     ("pine_15m_liquidity", _capture_pine_15m_liquidity_events),
                      ("big_volume", _capture_volume_expansion_events),
                      ("big_move", _capture_big_move_events),
                      ("liquidity_watch", _capture_liquidity_watch)):
@@ -4911,178 +5120,6 @@ def _primary_direction_confirmation(row):
         return "EARLY DOWN"
     return "WAIT"
 
-
-
-# =====================================================================
-# ADDITIVE LIVE LIQUIDITY MONITOR — 1M detection / 5-minute polling
-# Does not modify the legacy 5M/15M/1H agent, Final Signal, or report logic.
-# =====================================================================
-LIVE_LIQUIDITY_POLL_SECONDS = 300
-LIVE_LIQUIDITY_NEAR_PCT = 1.0
-LIVE_LIQUIDITY_DEFAULT_MAX_SYMBOLS = 250
-
-
-def _ensure_live_liquidity_1m_table():
-    with _memory_connect() as conn:
-        conn.execute("""CREATE TABLE IF NOT EXISTS live_liquidity_1m_events (
-            event_key TEXT PRIMARY KEY, symbol TEXT NOT NULL, yahoo_symbol TEXT,
-            event_type TEXT NOT NULL, bias TEXT, price REAL, liquidity_level REAL,
-            rvol REAL, candle_time_ist TEXT, detected_at_ist TEXT,
-            reason TEXT, status TEXT DEFAULT 'ACTIVE')""")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_live_liq_1m_time ON live_liquidity_1m_events(detected_at_ist)")
-
-
-def _live_liquidity_1m_candidates(result, max_symbols=LIVE_LIQUIDITY_DEFAULT_MAX_SYMBOLS):
-    """Prioritise nearest pre-existing 15M liquidity levels; no legacy fields are changed."""
-    if not isinstance(result, pd.DataFrame) or result.empty:
-        return []
-    d = result.copy()
-    if 'Data Quality' in d.columns:
-        d = d[d['Data Quality'].astype(str).str.upper().eq('PASS')]
-    if 'Yahoo Symbol' not in d.columns or 'Symbol' not in d.columns:
-        return []
-    candidates = []
-    for _, row in d.iterrows():
-        ticker = str(row.get('Yahoo Symbol') or '').strip()
-        symbol = str(row.get('Symbol') or '').strip()
-        price = _safe_num(row.get('Last Price'), 0.0)
-        if not ticker or not symbol or price <= 0:
-            continue
-        distances = []
-        for col, level_col in (('Liq Buy Dist %', '15M Buy-side Liquidity'),
-                               ('Liq Sell Dist %', '15M Sell-side Liquidity')):
-            dist = _safe_num(row.get(col), np.nan)
-            level = _safe_num(row.get(level_col), np.nan)
-            if not np.isfinite(dist) and np.isfinite(level):
-                dist = abs(level - price) / price * 100.0
-            if np.isfinite(dist):
-                distances.append(abs(float(dist)))
-        if not distances:
-            # Compatibility with older result schemas that contain only base fields.
-            for level_col in ('Buy-side Liquidity', 'Sell-side Liquidity'):
-                level = _safe_num(row.get(level_col), np.nan)
-                if np.isfinite(level):
-                    distances.append(abs(level - price) / price * 100.0)
-        nearest = min(distances) if distances else 999.0
-        if nearest <= LIVE_LIQUIDITY_NEAR_PCT:
-            candidates.append((nearest, symbol, ticker))
-    candidates.sort(key=lambda x: x[0])
-    # Keep the monitor's API footprint bounded. Raise the UI limit if required.
-    return [(symbol, ticker) for _, symbol, ticker in candidates[:int(max_symbols)]]
-
-
-def _run_live_liquidity_1m_once(result, max_symbols=LIVE_LIQUIDITY_DEFAULT_MAX_SYMBOLS):
-    """Fetch completed 1M candles for the closest liquidity candidates and persist events."""
-    _ensure_live_liquidity_1m_table()
-    candidates = _live_liquidity_1m_candidates(result, max_symbols=max_symbols)
-    if not candidates:
-        return pd.DataFrame(), 0, 'No PASS-quality stocks are within 1.0% of saved 15M liquidity levels.'
-    now = pd.Timestamp.now(tz=IST)
-    all_rows, errors = [], 0
-    # Batch size 50 uses the existing Yahoo TTL cache/lock and avoids per-symbol requests.
-    for start in range(0, len(candidates), 50):
-        batch = candidates[start:start + 50]
-        tickers = [ticker for _, ticker in batch]
-        frames, fetch_errors = _fetch_interval(tickers, '1m', 1, '7d', retries=0)
-        errors += len(fetch_errors)
-        symbol_by_ticker = {ticker: symbol for symbol, ticker in batch}
-        for ticker in tickers:
-            frame = frames.get(ticker, pd.DataFrame())
-            if frame is None or frame.empty or len(frame) < 31:
-                continue
-            # _fetch_interval already strips incomplete/current 1M candles.
-            sweep = _liquidity_levels_and_sweeps(frame, lookback=30, timeframe_minutes=1)
-            last = frame.iloc[-1]
-            price = _safe_num(last.get('Close'), 0.0)
-            if price <= 0:
-                continue
-            buy_level = _safe_num(sweep.get('Buy-side Liquidity'), np.nan)
-            sell_level = _safe_num(sweep.get('Sell-side Liquidity'), np.nan)
-            rvol = _safe_num(sweep.get('RVOL'), 0.0)
-            candle_time = _as_ist_timestamp(last.get('Time'))
-            candle_text = candle_time.strftime('%Y-%m-%d %H:%M:%S IST') if candle_time is not None else None
-            events = []
-            if sweep.get('Upside Sweep') == 'YES':
-                events.append(('1M SELL-SIDE BIAS — BUY-SIDE SWEEP', 'SELL', buy_level,
-                               'Price swept above buy-side liquidity and closed back below with bearish rejection.'))
-            if sweep.get('Downside Sweep') == 'YES':
-                events.append(('1M BUY-SIDE BIAS — SELL-SIDE SWEEP', 'BUY', sell_level,
-                               'Price swept below sell-side liquidity and closed back above with bullish rejection.'))
-            if not events:
-                # Watch state only; never promote a near-level touch to a confirmed sweep.
-                buy_dist = abs(buy_level - price) / price * 100 if np.isfinite(buy_level) else np.inf
-                sell_dist = abs(price - sell_level) / price * 100 if np.isfinite(sell_level) else np.inf
-                if buy_dist <= LIVE_LIQUIDITY_NEAR_PCT:
-                    events.append(('1M NEAR BUY-SIDE LIQUIDITY — WATCH', 'WATCH SELL / BREAKOUT', buy_level,
-                                   f'Within {buy_dist:.2f}% of buy-side liquidity; wait for completed-candle sweep/rejection.'))
-                if sell_dist <= LIVE_LIQUIDITY_NEAR_PCT:
-                    events.append(('1M NEAR SELL-SIDE LIQUIDITY — WATCH', 'WATCH BUY / BREAKDOWN', sell_level,
-                                   f'Within {sell_dist:.2f}% of sell-side liquidity; wait for completed-candle sweep/rejection.'))
-            for event_type, bias, level, reason in events:
-                if not candle_text:
-                    continue
-                key = f"{symbol}|{event_type}|{candle_text}"
-                all_rows.append((key, symbol_by_ticker[ticker], ticker, event_type, bias,
-                                 price, float(level) if np.isfinite(level) else None,
-                                 rvol, candle_text, now.strftime('%Y-%m-%d %H:%M:%S IST'), reason, 'ACTIVE'))
-    if all_rows:
-        with _memory_connect() as conn:
-            conn.executemany("""INSERT INTO live_liquidity_1m_events
-                (event_key,symbol,yahoo_symbol,event_type,bias,price,liquidity_level,rvol,
-                 candle_time_ist,detected_at_ist,reason,status)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
-                ON CONFLICT(event_key) DO UPDATE SET price=excluded.price,
-                 liquidity_level=excluded.liquidity_level,rvol=excluded.rvol,
-                 detected_at_ist=excluded.detected_at_ist,reason=excluded.reason""", all_rows)
-            conn.execute("DELETE FROM live_liquidity_1m_events WHERE substr(detected_at_ist,1,10)<>?",
-                         (now.strftime('%Y-%m-%d'),))
-    view = _load_today_table("""SELECT symbol,event_type,bias,price,liquidity_level,rvol,
-        candle_time_ist,detected_at_ist,reason FROM live_liquidity_1m_events
-        WHERE substr(detected_at_ist,1,10)=?
-        ORDER BY candle_time_ist DESC, detected_at_ist DESC LIMIT 500""",
-        (now.strftime('%Y-%m-%d'),))
-    status = f'Monitored {len(candidates)} near-liquidity stocks; {errors} ticker fetch errors.'
-    return view, len(all_rows), status
-
-
-def _render_live_liquidity_1m_monitor(result):
-    """Independent 5-minute poller; active only while this scanner page is open."""
-    st.subheader('⚡ LIVE LIQUIDITY DETECTION — 1M / 5-MINUTE MONITOR')
-    st.caption('Completed 1-minute candles only. NEAR = WATCH; SWEEP = liquidity taken + rejection. A sweep is not an automatic trade entry.')
-    max_symbols = st.selectbox('1M Monitor shortlist size', [50, 100, 250, 500], index=2,
-                               key='ma_live_liq_1m_max_symbols')
-    if not _is_market_hours():
-        st.info('NSE market hours వెలుపల 1M live monitor pauseలో ఉంటుంది. Saved events మాత్రం కనిపిస్తాయి.')
-    if hasattr(st, 'fragment'):
-        @st.fragment(run_every='300s')
-        def _live_liq_fragment():
-            if _is_market_hours():
-                try:
-                    view, new_count, status = _run_live_liquidity_1m_once(result, max_symbols=max_symbols)
-                    st.caption(f'{status} • Poll interval: 5 minutes • {datetime.now(IST).strftime("%H:%M:%S IST")}')
-                except Exception as exc:
-                    st.warning(f'Live 1M liquidity monitor error: {str(exc)[:220]}')
-                    view = _load_today_table("""SELECT symbol,event_type,bias,price,liquidity_level,rvol,
-                        candle_time_ist,detected_at_ist,reason FROM live_liquidity_1m_events
-                        WHERE substr(detected_at_ist,1,10)=? ORDER BY candle_time_ist DESC LIMIT 500""",
-                        (_today_text(),))
-            else:
-                view = _load_today_table("""SELECT symbol,event_type,bias,price,liquidity_level,rvol,
-                    candle_time_ist,detected_at_ist,reason FROM live_liquidity_1m_events
-                    WHERE substr(detected_at_ist,1,10)=? ORDER BY candle_time_ist DESC LIMIT 500""",
-                    (_today_text(),))
-            if view.empty:
-                st.info('ఇంకా 1M liquidity watch / sweep events లేవు. 1.0% proximity shortlist మరియు valid completed candles అవసరం.')
-            else:
-                st.dataframe(view, hide_index=True, use_container_width=True)
-        _live_liq_fragment()
-    else:
-        st.warning('5-minute automatic monitoring కోసం Streamlit fragments support అవసరం. Manual scan:')
-        if st.button('RUN 1M LIQUIDITY CHECK', key='ma_live_liq_1m_manual'):
-            view, _, status = _run_live_liquidity_1m_once(result, max_symbols=max_symbols)
-            st.caption(status)
-            if not view.empty:
-                st.dataframe(view, hide_index=True, use_container_width=True)
 
 def show_ai_multi_agent_scanner(client=None):
     """Streamlit page. client is retained for app.py compatibility."""
@@ -5633,10 +5670,6 @@ def show_ai_multi_agent_scanner(client=None):
     result["Scan Time (IST)"] = _scan_stamp
     # Keep the enriched result available to the existing report/export pipeline.
     st.session_state["multi_agent_results"] = result
-
-    # Additive 1M live liquidity layer; legacy scanner results remain unchanged.
-    _render_live_liquidity_1m_monitor(result)
-
     try:
         st.session_state["multi_agent_csv"] = result.to_csv(index=False).encode("utf-8-sig")
     except Exception:
