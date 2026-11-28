@@ -400,6 +400,9 @@ LIVE_EVENT_MAX_AGE_MINUTES = 180
 LIVE_YAHOO_BATCH_SIZE = 50
 _LIVE_PRICE_REFRESH_LOCK = threading.Lock()
 _LIVE_PRICE_LAST_REFRESH_MONOTONIC = 0.0
+_LIVE_LIQUIDITY_REFRESH_LOCK = threading.Lock()
+_LIVE_YF_LOCK = threading.Lock()  # independent from the full-scan download lock
+_LIVE_LIQUIDITY_LAST_REFRESH_MONOTONIC = 0.0
 
 
 def _as_ist_timestamp(value):
@@ -748,7 +751,7 @@ def _load_live_signal_events(limit=10000):
 def _refresh_live_signal_prices():
     """Refresh only symbols with active signal events; never launches a full NSE scan."""
     global _LIVE_PRICE_LAST_REFRESH_MONOTONIC
-    if yf is None or not _is_market_hours():
+    if yf is None:
         return {"updated": 0, "error": None, "symbols": 0, "skipped": True}
     with _LIVE_PRICE_REFRESH_LOCK:
         monotonic_now = time.monotonic()
@@ -782,7 +785,7 @@ def _refresh_live_signal_prices():
         # Chunking limits oversized requests; provider throttling can still occur.
         for start in range(0, len(tickers), LIVE_YAHOO_BATCH_SIZE):
             batch = tuple(tickers[start:start + LIVE_YAHOO_BATCH_SIZE])
-            with _YF_LOCK:
+            with _LIVE_YF_LOCK:
                 data = yf.download(
                     tickers=list(batch), period="1d", interval="1m",
                     auto_adjust=False, actions=False, progress=False,
@@ -898,9 +901,11 @@ def _render_live_volume_expansion_panel():
 def _render_live_dashboard_body():
     """Render dashboard using SQLite; price refresh is throttled by the fragment clock."""
     refresh_result = _refresh_live_signal_prices()
+    liquidity_refresh = _refresh_live_liquidity_touches(max_symbols=100)
     events, snapshots = _load_live_signal_events()
     st.subheader("📡 LIVE MARKET DASHBOARD")
-    st.caption("Dashboard refresh: 60 seconds • BUY / SELL / SWEEP + Volume ≥1.5x • 1:1.5 target tracking • Prices: Yahoo Finance 1M feed")
+    st.caption("Dashboard refresh: 60 seconds • Independent 1M liquidity-touch polling (nearest 100 saved levels) • Full Big Move scan remains separate")
+    _render_live_liquidity_touch_monitor(liquidity_refresh)
     if refresh_result.get("error"):
         st.warning(f"Yahoo price update issue: {refresh_result['error']}. Last saved prices are retained and labelled by age.")
 
@@ -1055,8 +1060,9 @@ def _show_blink_score_table(df, score_col="Best Stock Score", threshold=80, heig
         direction_text = " ".join(str(row.get(c, "")) for c in direction_cols).upper()
         high_score = pd.notna(score) and float(score) >= float(threshold)
 
-        is_sell = any(token in direction_text for token in ("SELL", "DOWN", "BEAR"))
-        is_buy = any(token in direction_text for token in ("BUY", "UP", "BULL"))
+        is_buy = bool(re.search(r"\b(BUY|BULL|UP)\b", direction_text)) and "SWEEP UP" not in direction_text
+        is_sell = (bool(re.search(r"\b(SELL|BEAR|DOWN|BREAKDOWN)\b", direction_text))
+                   or "SWEEP UP" in direction_text)
 
         if is_sell and high_score:
             style = "background-color: #991b1b; color: #ffffff; font-weight: 700;"
@@ -1603,7 +1609,7 @@ def _render_pine_15m_liquidity_panel():
             "sweep_time (IST)", "captured_at (IST)", "Signal Age (min)", "Freshness"]
     # The generated display labels above are based on source column names.
     cols = [c for c in cols if c in view.columns]
-    st.dataframe(view[cols].head(250), hide_index=True, use_container_width=True)
+    st.dataframe(view[cols].head(250), hide_index=True, **_stretch())
     st.caption("Level Time = pivot candle; Confirmed Time = candle close after 5 right-hand candles; Sweep Time = actual sweep candle close. A level WATCH is not a BUY/SELL entry.")
 
 
@@ -2929,15 +2935,15 @@ def _amd_stage_analysis(frame_5m, frame_15m=None):
         if prior_sweep_down and close > base_high and rvol >= 1.30:
             stage, signal, reason = "DISTRIBUTION UP", "BUY WATCH", "Sell-side liquidity sweep followed by high-volume close above base"
         elif prior_sweep_up and close < base_low and rvol >= 1.30:
-            stage, signal, reason = "DISTRIBUTION DOWN", "Buy-side liquidity sweep followed by high-volume close below base"
+            stage, signal, reason = "DISTRIBUTION DOWN", "SELL WATCH", "Buy-side liquidity sweep followed by high-volume close below base"
         elif sweep_down:
-            stage, signal, reason = "MANIPULATION DOWN-SWEEP", "Sell-side liquidity swept; candle closed back inside base — bullish reversal watch only"
+            stage, signal, reason = "MANIPULATION DOWN-SWEEP", "BUY WATCH", "Sell-side liquidity swept; candle closed back inside base — bullish reversal watch only"
         elif sweep_up:
-            stage, signal, reason = "MANIPULATION UP-SWEEP", "Buy-side liquidity swept; candle closed back inside base — bearish reversal watch only"
+            stage, signal, reason = "MANIPULATION UP-SWEEP", "SELL WATCH", "Buy-side liquidity swept; candle closed back inside base — bearish reversal watch only"
         elif accumulation:
-            stage, signal, reason = "ACCUMULATION WATCH", "Compressed base with contracting/contained volume; direction not confirmed"
+            stage, signal, reason = "ACCUMULATION WATCH", "WAIT", "Compressed base with contracting/contained volume; direction not confirmed"
         else:
-            stage, signal, reason = "NO AMD SETUP", "No completed accumulation → sweep → distribution sequence"
+            stage, signal, reason = "NO AMD SETUP", "WAIT", "No completed accumulation → sweep → distribution sequence"
         return {
             "AMD Stage": stage, "AMD Signal": signal,
             "AMD Base High": round(base_high, 2), "AMD Base Low": round(base_low, 2),
@@ -3125,9 +3131,15 @@ def _make_result_row(symbol, yahoo_symbol, payload):
     # liquidity event, not an automatic BUY/SELL entry; breakout needs confirmation.
     advanced_status = str(row.get("Advanced Big Move", "WAIT")).upper()
     if advanced_status == "BUY CONFIRMED":
-        row["Action Signal"] = "BUY CONFIRMED"
+        row["Action Signal"] = ("BUY CONFIRMED (+SWEEP UP — BEARISH CONTEXT)"
+                                 if row.get("Upside Sweep") == "YES" else
+                                 "BUY CONFIRMED (+SWEEP DOWN — BULLISH CONTEXT)"
+                                 if row.get("Downside Sweep") == "YES" else "BUY CONFIRMED")
     elif advanced_status == "SELL CONFIRMED":
-        row["Action Signal"] = "SELL CONFIRMED"
+        row["Action Signal"] = ("SELL CONFIRMED (+SWEEP UP — BEARISH CONTEXT)"
+                                 if row.get("Upside Sweep") == "YES" else
+                                 "SELL CONFIRMED (+SWEEP DOWN — BULLISH CONTEXT)"
+                                 if row.get("Downside Sweep") == "YES" else "SELL CONFIRMED")
     elif advanced_status in ("BREAKOUT DETECTED", "RETEST WAITING", "RETEST HELD — 15M WAIT"):
         row["Action Signal"] = "BREAKOUT DETECTED — WAIT RETEST / 15M"
     elif advanced_status in ("BREAKDOWN DETECTED", "RETEST REJECTED — 15M WAIT"):
@@ -3138,6 +3150,10 @@ def _make_result_row(symbol, yahoo_symbol, payload):
         row["Action Signal"] = "BREAKOUT DETECTED — WAIT RETEST / 15M"
     elif row.get("Multi-TF Breakout") == "BREAKDOWN CONFIRMED":
         row["Action Signal"] = "BREAKDOWN DETECTED — WAIT RETEST / 15M"
+    elif final_signal in ("BUY", "SELL") and row.get("Upside Sweep") == "YES":
+        row["Action Signal"] = f"{final_signal} (+SWEEP UP — BEARISH CONTEXT)"
+    elif final_signal in ("BUY", "SELL") and row.get("Downside Sweep") == "YES":
+        row["Action Signal"] = f"{final_signal} (+SWEEP DOWN — BULLISH CONTEXT)"
     elif row.get("Upside Sweep") == "YES":
         row["Action Signal"] = "SWEEP UP"
     elif row.get("Downside Sweep") == "YES":
@@ -4033,18 +4049,19 @@ def _build_excel(result, stamp):
         buffer = io.BytesIO()
         with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
             result.to_excel(writer, index=False, sheet_name="AI Scanner")
-            counts = result.get("Action Signal", pd.Series(dtype=str)).fillna("WAIT").value_counts()
+            sig = result.get("Action Signal", pd.Series(dtype=str)).fillna("WAIT").astype(str).str.upper()
+            cnt = lambda prefix: int(sig.str.startswith(prefix).sum())
             dash_rows = [
                 ["NSE AI PRO V18 — ADVANCED BIG MOVEMENT DASHBOARD", ""],
                 ["Generated (IST)", stamp.strftime("%Y-%m-%d %H:%M:%S IST")],
                 ["Total Stocks Scanned", int(len(result))],
-                ["BUY", int(counts.get("BUY", 0))],
-                ["SELL", int(counts.get("SELL", 0))],
-                ["SWEEP UP", int(counts.get("SWEEP UP", 0))],
-                ["SWEEP DOWN", int(counts.get("SWEEP DOWN", 0))],
-                ["BREAKOUT", int(counts.get("BREAKOUT", 0))],
-                ["BREAKDOWN", int(counts.get("BREAKDOWN", 0))],
-                ["WAIT", int(counts.get("WAIT", 0))],
+                ["BUY", cnt("BUY")],
+                ["SELL", cnt("SELL")],
+                ["SWEEP UP", cnt("SWEEP UP")],
+                ["SWEEP DOWN", cnt("SWEEP DOWN")],
+                ["BREAKOUT", cnt("BREAKOUT")],
+                ["BREAKDOWN", cnt("BREAKDOWN")],
+                ["WAIT", cnt("WAIT")],
                 ["", ""],
                 ["TOP QUALIFIED STOCKS", ""],
             ]
@@ -4438,9 +4455,9 @@ def _extra_formulas(frame_5m, row=None):
 
         # 9) Big-volume class (candle direction decides the side)
         side = "BUY" if c.iloc[-1] > o.iloc[-1] else "SELL" if c.iloc[-1] < o.iloc[-1] else "WAIT"
-        if rvol >= 3.0 and vz >= 2.0:
+        if rvol >= 3.0:
             vclass = "EXTREME VOLUME"
-        elif rvol >= BIG_VOL_RVOL_MIN:
+        elif rvol >= 2.0:
             vclass = "BIG VOLUME"
         elif rvol >= 1.5:
             vclass = "RISING VOLUME"
@@ -4827,8 +4844,156 @@ def _capture_liquidity_touch_events(result, reference_time=None):
         return conn.total_changes - before
 
 
+
+def _refresh_live_liquidity_touches(max_symbols=100):
+    """Poll Yahoo 1M OHLCV for the nearest saved liquidity levels, independently of full scan.
+
+    This is a minute-bar touch monitor, not a tick feed. It intentionally limits the
+    request universe to the nearest levels to reduce Yahoo throttling.
+    """
+    global _LIVE_LIQUIDITY_LAST_REFRESH_MONOTONIC
+    if yf is None or not _is_market_hours():
+        return {"checked": 0, "new_events": 0, "error": None, "skipped": True}
+    with _LIVE_LIQUIDITY_REFRESH_LOCK:
+        mono_now = time.monotonic()
+        if mono_now - _LIVE_LIQUIDITY_LAST_REFRESH_MONOTONIC < 55:
+            return {"checked": 0, "new_events": 0, "error": None, "skipped": True}
+        _LIVE_LIQUIDITY_LAST_REFRESH_MONOTONIC = mono_now
+    _ensure_patch_tables()
+    try:
+        with _memory_connect() as conn:
+            watch = pd.read_sql_query("""SELECT symbol,buy_level,buy_dist_pct,sell_level,sell_dist_pct
+                FROM liquidity_watch
+                WHERE buy_level IS NOT NULL OR sell_level IS NOT NULL""", conn)
+        if watch.empty:
+            return {"checked": 0, "new_events": 0, "error": None, "message": "No saved liquidity levels; run the full scanner once."}
+        watch = watch.copy()
+        watch["_near"] = pd.concat([
+            pd.to_numeric(watch.get("buy_dist_pct"), errors="coerce").abs(),
+            pd.to_numeric(watch.get("sell_dist_pct"), errors="coerce").abs()
+        ], axis=1).min(axis=1)
+        watch = watch.sort_values("_near", na_position="last").head(int(max_symbols))
+        ticker_to_row = {}
+        for _, row in watch.iterrows():
+            ticker = _to_yahoo_symbol(str(row.get("symbol", "")))
+            if ticker:
+                ticker_to_row[ticker] = row
+        tickers = list(ticker_to_row)
+        if not tickers:
+            return {"checked": 0, "new_events": 0, "error": "No valid Yahoo tickers in liquidity watch."}
+
+        detected_at = datetime.now(IST).isoformat(timespec="seconds")
+        inserted = 0
+        checked = 0
+        for start in range(0, len(tickers), LIVE_YAHOO_BATCH_SIZE):
+            batch = tuple(tickers[start:start + LIVE_YAHOO_BATCH_SIZE])
+            with _LIVE_YF_LOCK:
+                data = yf.download(
+                    tickers=list(batch), period="1d", interval="1m",
+                    auto_adjust=False, actions=False, progress=False,
+                    threads=False, group_by="ticker", timeout=20,
+                )
+            if not isinstance(data, pd.DataFrame) or data.empty:
+                continue
+            rows = []
+            for ticker in batch:
+                frame = _extract_one_ticker(data, ticker)
+                if frame is None or frame.empty or not {"High", "Low", "Close"}.issubset(frame.columns):
+                    continue
+                frame = frame.dropna(subset=["High", "Low", "Close"])
+                if frame.empty:
+                    continue
+                idx = pd.to_datetime(frame.index, errors="coerce")
+                if getattr(idx, "tz", None) is None:
+                    idx = idx.tz_localize(IST)
+                else:
+                    idx = idx.tz_convert(IST)
+                frame = frame.copy()
+                frame["_time"] = idx
+                frame = frame.sort_values("_time")
+                # Inspect a rolling 15-minute window so a delayed poll can recover missed bars.
+                now_ist = pd.Timestamp.now(tz=IST)
+                recent = frame[frame["_time"] >= now_ist - pd.Timedelta(minutes=15)]
+                if recent.empty:
+                    continue
+                checked += 1
+                item = ticker_to_row[ticker]
+                symbol = str(item.get("symbol", ticker))
+                candidates = (
+                    ("BUY-SIDE", _safe_num(item.get("buy_level"), np.nan), "High"),
+                    ("SELL-SIDE", _safe_num(item.get("sell_level"), np.nan), "Low"),
+                )
+                for side, level, extreme_col in candidates:
+                    if not np.isfinite(level) or level <= 0:
+                        continue
+                    # Cooldown is per stock + liquidity side, regardless of repeated minute bars.
+                    with _memory_connect() as conn:
+                        prior = conn.execute(
+                            "SELECT MAX(captured_at_ist) FROM liquidity_touch_events WHERE symbol=? AND side=? AND timeframe='1M'",
+                            (symbol, side),
+                        ).fetchone()
+                    prior_time = _as_ist_timestamp(prior[0]) if prior and prior[0] else None
+                    for _, bar in recent.iterrows():
+                        bar_time = pd.Timestamp(bar["_time"])
+                        if (now_ist - bar_time).total_seconds() > 15 * 60:
+                            continue
+                        high = _safe_num(bar.get("High"), np.nan)
+                        low = _safe_num(bar.get("Low"), np.nan)
+                        close = _safe_num(bar.get("Close"), np.nan)
+                        if not (np.isfinite(high) and np.isfinite(low) and np.isfinite(close) and high >= low and close > 0):
+                            continue
+                        if not (low <= level <= high):
+                            continue
+                        if prior_time is not None and (now_ist - prior_time).total_seconds() < 15 * 60:
+                            break
+                        event_time = bar_time.isoformat(timespec="seconds")
+                        extreme = _safe_num(bar.get(extreme_col), np.nan)
+                        event_key = f"{symbol}|{side}|1M|{event_time}|{level:.8f}"
+                        rows.append((event_key, symbol, side, "1M", float(level), float(extreme),
+                                     float(high), float(low), 0.0, event_time, detected_at))
+                        # One event per symbol/side in this polling pass; avoid minute-by-minute spam.
+                        break
+            if rows:
+                with _memory_connect() as conn:
+                    before = conn.total_changes
+                    conn.executemany("""INSERT OR IGNORE INTO liquidity_touch_events
+                        (event_key,symbol,side,timeframe,level,touch_price,candle_high,candle_low,rvol,
+                         signal_time_ist,captured_at_ist) VALUES (?,?,?,?,?,?,?,?,?,?,?)""", rows)
+                    inserted += conn.total_changes - before
+        return {"checked": checked, "new_events": inserted, "error": None, "symbols": len(tickers)}
+    except Exception as exc:
+        return {"checked": 0, "new_events": 0, "error": str(exc)[:240]}
+
+
+def _render_live_liquidity_touch_monitor(refresh_result=None):
+    """Display 1M liquidity touches with separate candle and detection timestamps."""
+    st.markdown("#### ⚡ LIVE 1M BUY-SIDE / SELL-SIDE LIQUIDITY TOUCH MONITOR")
+    if refresh_result and refresh_result.get("error"):
+        st.warning(f"Yahoo 1M liquidity monitor: {refresh_result['error']}")
+    if refresh_result and refresh_result.get("message"):
+        st.info(refresh_result["message"])
+    today = _today_text()
+    board = _load_today_table("""SELECT symbol,side,timeframe,level,touch_price,rvol,
+        signal_time_ist,captured_at_ist FROM liquidity_touch_events
+        WHERE substr(signal_time_ist,1,10)=? ORDER BY captured_at_ist DESC LIMIT 500""", (today,))
+    if board.empty:
+        st.caption("ఇంకా తాజా 1M BUY-side / SELL-side liquidity touch నమోదు కాలేదు. ముందుగా Full Scanner ద్వారా liquidity levels save చేయండి.")
+        return
+    board = board.copy()
+    board["Candle Time (IST)"] = pd.to_datetime(board["signal_time_ist"], errors="coerce", utc=True).dt.tz_convert(IST).dt.strftime("%H:%M:%S")
+    board["Detected Time (IST)"] = pd.to_datetime(board["captured_at_ist"], errors="coerce", utc=True).dt.tz_convert(IST).dt.strftime("%H:%M:%S")
+    board["Level"] = pd.to_numeric(board["level"], errors="coerce").round(2)
+    board["Touch Price"] = pd.to_numeric(board["touch_price"], errors="coerce").round(2)
+    board = board.rename(columns={"symbol":"Stock", "side":"Liquidity Side", "timeframe":"Touch TF"})
+    st.dataframe(board[["Detected Time (IST)","Candle Time (IST)","Stock","Liquidity Side","Touch TF","Level","Touch Price"]].head(150), hide_index=True, **_stretch())
+    st.caption("Detected Time = app poll చేసిన సమయం; Candle Time = Yahoo 1-minute bar timestamp. Yahoo data delay వల్ల ఇది tick-exact alert కాదు. BUY-side touch అంటే bar High ≥ level; SELL-side touch అంటే bar Low ≤ level.")
+
 def _capture_all_dashboard_events(result, reference_time=None):
-    """One call for every dashboard ledger; freshness is measured at scan completion."""
+    """One call for every dashboard ledger; stale scans never create fresh live events."""
+    ref = _as_ist_timestamp(reference_time) or pd.Timestamp.now(tz=IST)
+    age_seconds = (pd.Timestamp.now(tz=IST) - ref).total_seconds()
+    if age_seconds > 20 * 60:
+        return {"skipped": "scan older than 20 min"}
     _ensure_patch_tables()
     if isinstance(result, pd.DataFrame) and "Data Quality" in result.columns:
         result = result[result["Data Quality"].astype(str).str.strip().str.upper() == "PASS"].copy()
@@ -4924,7 +5089,7 @@ def _render_live_stock_boards():
                 "Timeframe": r.get("timeframe"),
                 "LTP / Level": r.get("level"),
                 "Score / RVOL": r.get("rvol"),
-                "Details": f"Touch price { _safe_num(r.get('touch_price')):.2f} | 5M range "
+                "Details": f"Touch price { _safe_num(r.get('touch_price')):.2f} | {r.get('timeframe')} bar range "
                            f"{_safe_num(r.get('candle_low')):.2f}–{_safe_num(r.get('candle_high')):.2f}"
             })
 
@@ -5008,7 +5173,7 @@ def _render_live_stock_boards():
         c3.metric("Liquidity / Sweeps", int(feed["Signal"].astype(str).str.contains("LIQUIDITY|SWEEP", case=False, regex=True).sum()))
         c4.metric("Buy / Sell Signals", int(feed["Signal"].astype(str).str.upper().str.contains(
             r"^(?:BUY|SELL|PRE-BIG BUY|PRE-BIG SELL)(?![- ]*(?:SIDE|LIQUIDITY))", regex=True).sum()))
-        st.dataframe(feed.head(1000), hide_index=True, height=520, use_container_width=True)
+        st.dataframe(feed.head(1000), hide_index=True, height=520, **_stretch())
 
     # Dedicated alert board: stocks whose latest completed 5M candle touched a 15M liquidity level.
     st.markdown("#### 🎯 LIVE BUY / SELL LIQUIDITY LEVEL TOUCH ALERTS")
@@ -5036,8 +5201,8 @@ def _render_live_stock_boards():
         tm1.metric("Stocks touched", int(touch_board["Stock"].nunique()))
         tm2.metric("BUY-side touches", int(touch_board["Liquidity Side"].eq("BUY-SIDE").sum()))
         tm3.metric("SELL-side touches", int(touch_board["Liquidity Side"].eq("SELL-SIDE").sum()))
-        st.dataframe(touch_board[touch_cols].head(200), hide_index=True, use_container_width=True)
-    st.caption("Touch time = completed 5M candle close time (IST). It identifies a level touched within that candle; it is not an exact tick timestamp or a BUY/SELL entry confirmation.")
+        st.dataframe(touch_board[touch_cols].head(200), hide_index=True, **_stretch())
+    st.caption("ఈ పట్టిక Full Scanner ద్వారా గుర్తించిన completed 5M touches. పై LIVE 1M monitor వేరుగా Yahoo 1M bars poll చేస్తుంది; రెండూ entry confirmation కావు.")
 
     # Dedicated, easy-to-read high-volume stock board (today's fresh completed candles).
     st.markdown("#### 🔊 HIGH VOLUME STOCKS — BUY VOLUME / SELL VOLUME")
@@ -5077,13 +5242,13 @@ def _render_live_stock_boards():
             if buy_vol.empty:
                 st.caption("No fresh BUY-volume rows.")
             else:
-                st.dataframe(buy_vol[volume_cols].head(100), hide_index=True, use_container_width=True)
+                st.dataframe(buy_vol[volume_cols].head(100), hide_index=True, **_stretch())
         with vb2:
             st.markdown("**🔴 SELL-side candle volume**")
             if sell_vol.empty:
                 st.caption("No fresh SELL-volume rows.")
             else:
-                st.dataframe(sell_vol[volume_cols].head(100), hide_index=True, use_container_width=True)
+                st.dataframe(sell_vol[volume_cols].head(100), hide_index=True, **_stretch())
         st.caption("RVOL = current completed candle volume ÷ previous 20 completed candles' average volume. This is abnormal activity, not confirmed net buying/selling.")
 
     # Dedicated early-movement / breakout board: keep WATCH separate from confirmed entries.
@@ -5110,7 +5275,7 @@ def _render_live_stock_boards():
         big_cols = ["Stock", "Watch / Breakout Status", "Direction", "Score", "LTP",
                     "Range High", "Range Low", "RVOL", "Source", "Signal Time (IST)",
                     "Last Seen (IST)", "Reason"]
-        st.dataframe(big_watch[big_cols].head(300), hide_index=True, use_container_width=True)
+        st.dataframe(big_watch[big_cols].head(300), hide_index=True, **_stretch())
         st.caption("WATCH = early setup only; BREAKOUT CONFIRMED / BUY CONFIRMED / SELL CONFIRMED remain separate states. Score is a screening score, not a probability.")
 
     # Standalone liquidity board: show both nearby levels and confirmed sweep bias.
@@ -5136,7 +5301,7 @@ def _render_live_stock_boards():
         liquidity_board = liquidity_board.sort_values(["RVOL", "updated_at_ist"], ascending=[False, False])
         liq_cols = ["symbol", "LTP", "BUY Liquidity", "BUY Dist %", "SELL Liquidity",
                     "SELL Dist %", "state", "bias", "sweep_tf", "RVOL", "Updated (IST)"]
-        st.dataframe(liquidity_board[liq_cols].head(200), hide_index=True, use_container_width=True)
+        st.dataframe(liquidity_board[liq_cols].head(200), hide_index=True, **_stretch())
         st.caption("BUY-side liquidity = prior swing highs; SELL-side liquidity = prior swing lows. Level watch మాత్రమే trade signal కాదు. Sweep తర్వాత rejection candle + volume + timeframe confirmation వచ్చినప్పుడే BUY/SELL confirmationగా చూడాలి.")
 
     st.download_button(
@@ -5352,11 +5517,14 @@ def show_ai_multi_agent_scanner(client=None):
             and not st.session_state.get("ma_discarded", False)
             and not (job and job["status"] in ("RUNNING", "PAUSED", "DONE"))):
         with _memory_connect() as conn:
+            today_key = _today_text()
             latest_job = conn.execute(
-                "SELECT job_id,status FROM scan_jobs ORDER BY created_at DESC LIMIT 1"
+                "SELECT job_id,status,updated_at FROM scan_jobs "
+                "WHERE status='FINALIZED' AND substr(updated_at,1,10)=? "
+                "ORDER BY updated_at DESC LIMIT 1", (today_key,)
             ).fetchone()
             # sqlite3.Row is not configured in _memory_connect(); fetchone() is a tuple.
-            finalized = latest_job if latest_job and latest_job[1] == "FINALIZED" else None
+            finalized = latest_job if latest_job else None
             if finalized:
                 conn.execute("UPDATE scan_jobs SET status='DONE' WHERE job_id=?", (finalized[0],))
         if finalized:
@@ -5505,7 +5673,10 @@ def show_ai_multi_agent_scanner(client=None):
         analyst = result.apply(_best_stock_analyst, axis=1, result_type="expand")
         result = pd.concat([result, analyst], axis=1)
 
-        stamp = datetime.now(IST)
+        stamp = (
+            _as_ist_timestamp(saved_job.get("updated_at"))
+            if restored_from_db else None
+        ) or datetime.now(IST)
         try:
             if not restored_from_db:
                 _save_scan_history(result, stamp.strftime("%Y-%m-%d %H:%M:%S %Z"))
@@ -5821,22 +5992,24 @@ def show_ai_multi_agent_scanner(client=None):
                 " Collect more completed 5M candle history and press TRAIN / REFRESH."
             )
 
-        # Idempotent event capture: repeated Streamlit reruns do not create duplicate events.
+        # The worker captures each healthy batch. Only run a final capture on the
+        # scan-completion turn; widget reruns must not rebuild event ledgers.
         try:
-            _capture_job = _scan_job_get(st.session_state.get("ma_scan_job_id"))
-            _capture_reference = (
-                _as_ist_timestamp(_capture_job.get("updated_at"))
-                if _capture_job else pd.Timestamp.now(tz=IST)
-            )
-            _cap = _capture_all_dashboard_events(result, reference_time=_capture_reference)
-            _n = lambda k: _cap.get(k) if isinstance(_cap.get(k), int) else 0
-            new_events, new_liquidity_events, new_volume_events = _n('signals'), _n('liquidity_sweeps'), _n('big_volume')
-            if new_events:
-                st.caption(f"Live Dashboard: {new_events} new signal event(s) saved to SQLite.")
-            if new_liquidity_events:
-                st.caption(f"Live Dashboard: {new_liquidity_events} new liquidity/sweep event(s) saved to SQLite.")
-            if new_volume_events:
-                st.caption(f"Live Dashboard: {new_volume_events} new high-volume event(s) saved to SQLite.")
+            if run_scan_now and not st.session_state.get("ma_restored_from_db", False):
+                _capture_job = _scan_job_get(st.session_state.get("ma_scan_job_id"))
+                _capture_reference = (
+                    _as_ist_timestamp(_capture_job.get("updated_at"))
+                    if _capture_job else pd.Timestamp.now(tz=IST)
+                )
+                _cap = _capture_all_dashboard_events(result, reference_time=_capture_reference)
+                _n = lambda k: _cap.get(k) if isinstance(_cap.get(k), int) else 0
+                new_events, new_liquidity_events, new_volume_events = _n('signals'), _n('liquidity_sweeps'), _n('big_volume')
+                if new_events:
+                    st.caption(f"Live Dashboard: {new_events} new signal event(s) saved to SQLite.")
+                if new_liquidity_events:
+                    st.caption(f"Live Dashboard: {new_liquidity_events} new liquidity/sweep event(s) saved to SQLite.")
+                if new_volume_events:
+                    st.caption(f"Live Dashboard: {new_volume_events} new high-volume event(s) saved to SQLite.")
         except Exception as event_exc:
             st.warning(f"Live signal event save issue: {event_exc}")
 
@@ -6005,9 +6178,9 @@ def show_ai_multi_agent_scanner(client=None):
         elif early_filter in ("BREAKOUT", "BREAKDOWN"):
             view = view[view["Breakout Signal"] == early_filter]
         elif early_filter == "ACTION BUY":
-            view = view[view["Action Signal"] == "BUY"]
+            view = view[view["Action Signal"].astype(str).str.upper().str.startswith("BUY")]
         elif early_filter == "ACTION SELL":
-            view = view[view["Action Signal"] == "SELL"]
+            view = view[view["Action Signal"].astype(str).str.upper().str.startswith("SELL")]
 
         view = view.sort_values(["20M Pre-Move Score", "Confirmation Strength %"], ascending=[False, False])
         summary_cols = [
